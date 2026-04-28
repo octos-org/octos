@@ -86,7 +86,7 @@ mod topology;
 
 pub use dispatcher::{
     AggregateValidator, MAX_RETRY_ROUNDS, NoopSwarmEventSink, Swarm, SwarmBudget, SwarmBuilder,
-    SwarmContext, SwarmEventSink, flatten_aggregate,
+    SwarmContext, SwarmCostBudget, SwarmEventSink, flatten_aggregate,
 };
 pub use ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
 pub use persistence::{DISPATCH_RECORD_SCHEMA_VERSION, DispatchRecord, DispatchStore};

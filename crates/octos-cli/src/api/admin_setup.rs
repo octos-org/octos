@@ -604,6 +604,16 @@ pub async fn post_smtp_test(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentModeBody {
     pub mode: String,
+    /// True when the `mode` field is explicitly present in `config.json`.
+    /// False when the value is the implicit default (file or field absent).
+    /// The wizard uses this to distinguish first-run nudges from a deliberate
+    /// user choice it must not silently overwrite.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explicit: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize)]
@@ -620,7 +630,7 @@ pub async fn get_deployment_mode(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DeploymentModeBody>, (StatusCode, Json<ErrorBody>)> {
     let path = require_config_path(&state)?;
-    let mode = if path.exists() {
+    let (mode, explicit) = if path.exists() {
         let body = std::fs::read_to_string(&path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -639,15 +649,14 @@ pub async fn get_deployment_mode(
                 }),
             )
         })?;
-        value
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("local")
-            .to_string()
+        match value.get("mode").and_then(|v| v.as_str()) {
+            Some(m) => (m.to_string(), true),
+            None => ("local".to_string(), false),
+        }
     } else {
-        "local".to_string()
+        ("local".to_string(), false)
     };
-    Ok(Json(DeploymentModeBody { mode }))
+    Ok(Json(DeploymentModeBody { mode, explicit }))
 }
 
 /// POST `/api/admin/deployment-mode` — persist the mode into `config.json`.
@@ -803,9 +812,10 @@ mod tests {
 
     #[tokio::test]
     async fn post_setup_step_accepts_boundary_values() {
+        // Handler rejects `step > 4`, so the valid inclusive range is 0..=4.
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_store(dir.path());
-        for step in [0u32, 5u32] {
+        for step in [0u32, 4u32] {
             let status = post_setup_step(State(state.clone()), Json(StepBody { step }))
                 .await
                 .unwrap();
@@ -1092,15 +1102,16 @@ mod tests {
     // ----- Deployment-mode endpoints -----
 
     #[tokio::test]
-    async fn get_deployment_mode_defaults_to_local() {
+    async fn get_deployment_mode_defaults_to_local_and_not_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let state = smtp_state(dir.path());
         let Json(body) = get_deployment_mode(State(state)).await.unwrap();
         assert_eq!(body.mode, "local");
+        assert!(!body.explicit, "implicit default must report explicit=false");
     }
 
     #[tokio::test]
-    async fn post_deployment_mode_round_trips() {
+    async fn post_deployment_mode_round_trips_and_marks_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let state = smtp_state(dir.path());
         for mode in ["local", "tenant", "cloud"] {
@@ -1108,6 +1119,7 @@ mod tests {
                 State(state.clone()),
                 Json(DeploymentModeBody {
                     mode: mode.to_string(),
+                    explicit: false,
                 }),
             )
             .await
@@ -1115,6 +1127,10 @@ mod tests {
             assert_eq!(status, StatusCode::NO_CONTENT);
             let Json(body) = get_deployment_mode(State(state.clone())).await.unwrap();
             assert_eq!(body.mode, mode);
+            assert!(
+                body.explicit,
+                "POSTing any mode must surface as explicit on subsequent GET"
+            );
         }
     }
 
@@ -1126,6 +1142,7 @@ mod tests {
             State(state),
             Json(DeploymentModeBody {
                 mode: "mainframe".into(),
+                explicit: false,
             }),
         )
         .await

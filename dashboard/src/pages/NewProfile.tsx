@@ -1,33 +1,16 @@
 import { useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useToast } from '../components/Toast'
 import { api } from '../api'
-import type { ProfileConfig } from '../types'
-import { WIZARD_DRAFT_KEY } from './wizard/StepLlmProvider'
-
-function readWizardDraft(): ProfileConfig | undefined {
-  try {
-    const raw = sessionStorage.getItem(WIZARD_DRAFT_KEY)
-    if (!raw) return undefined
-    return JSON.parse(raw) as ProfileConfig
-  } catch {
-    return undefined
-  }
-}
 
 export default function NewProfile() {
   const navigate = useNavigate()
-  const location = useLocation()
   const { toast } = useToast()
   const [loading, setLoading] = useState(false)
   const [id, setId] = useState('')
   const [name, setName] = useState('')
   const [publicSubdomain, setPublicSubdomain] = useState('')
   const [enabled, setEnabled] = useState(true)
-
-  const fromWizard = (location.state as { fromWizard?: boolean } | null)?.fromWizard === true
-  const draftConfig = fromWizard ? readWizardDraft() : undefined
-  const draftHasLlm = Boolean(draftConfig?.llm?.primary?.family_id)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -38,11 +21,7 @@ export default function NewProfile() {
         name,
         public_subdomain: publicSubdomain.trim() || null,
         enabled,
-        config: draftConfig,
       })
-      if (fromWizard) {
-        sessionStorage.removeItem(WIZARD_DRAFT_KEY)
-      }
       toast('Profile created')
       navigate(`/profile/${id}`)
     } catch (e: any) {
@@ -71,11 +50,6 @@ export default function NewProfile() {
       </div>
 
       <div className="bg-surface rounded-xl border border-gray-700/50 p-6 max-w-lg">
-        {draftHasLlm && (
-          <div className="mb-4 text-xs text-gray-400 bg-accent/10 border border-accent/30 rounded-lg px-3 py-2">
-            LLM provider from setup wizard will be applied to this profile.
-          </div>
-        )}
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-1.5">Profile ID</label>

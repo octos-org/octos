@@ -12,6 +12,7 @@ use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use metrics::counter;
+use octos_agent::compaction::CompactionRunner;
 use octos_agent::tools::spawn::{
     ChildSessionFailureAction, ChildSessionLifecycleKind, ChildSessionLifecyclePayload,
 };
@@ -20,9 +21,9 @@ use octos_agent::tools::{
     SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
-    Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResult, TaskSupervisor,
-    TokenTracker, TurnAttachmentContext, WorkspacePolicy, read_workspace_policy,
-    workspace_policy_path, write_workspace_policy,
+    Agent, AgentConfig, CompactionSummarizerKind, HookContext, HookExecutor, HookPayload,
+    HookResult, LoopRetryState, TaskSupervisor, TokenTracker, TurnAttachmentContext,
+    WorkspacePolicy, read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -112,9 +113,102 @@ struct PersistedSessionMessage {
     timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// Review A F-015: resolve the JSON sidecar path for a session's persistent
+/// retry-bucket state. Lives under `{data_dir}/sessions/retry_state_{id}.json`
+/// where `id` is a filesystem-safe hash of the session key. A collision-free
+/// URL-safe encoding would be more correct, but SHA-256 over the raw key is
+/// stable, short, and avoids any weird characters so we prefer it.
+fn retry_state_sidecar_path(
+    data_dir: &std::path::Path,
+    session_key: &SessionKey,
+) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_key.0.as_bytes());
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // 16 hex chars = 64 bits: plenty for per-user collision resistance and
+    // keeps the filename short. Full digest is available via debug logs.
+    let short = &hex[..16];
+    data_dir
+        .join("sessions")
+        .join(format!("retry_state_{short}.json"))
+}
+
+/// Review A F-015: read a session's persistent `LoopRetryState` from disk.
+/// Returns `LoopRetryState::default()` when the file is missing, empty,
+/// unreadable, or malformed — the schema is advisory (the state is safe to
+/// reset; the only downside is losing cross-turn accumulation for that
+/// session).
+fn load_retry_state(path: &std::path::Path) -> LoopRetryState {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return LoopRetryState::default();
+    };
+    match serde_json::from_str::<LoopRetryState>(&raw) {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "retry_state sidecar is malformed; starting fresh"
+            );
+            LoopRetryState::default()
+        }
+    }
+}
+
+/// Review A F-015: write the session's persistent retry state to disk via
+/// the atomic write-then-rename dance already used by session JSONL files.
+/// Silently logs failures — the sidecar is best-effort durability and must
+/// never block the agent loop.
+fn save_retry_state(path: &std::path::Path, state: &LoopRetryState) {
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            warn!(
+                path = %parent.display(),
+                error = %error,
+                "failed to create retry_state sidecar directory"
+            );
+            return;
+        }
+    }
+    let serialized = match serde_json::to_string_pretty(state) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to serialize retry_state sidecar"
+            );
+            return;
+        }
+    };
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(error) = std::fs::write(&tmp_path, serialized) {
+        warn!(
+            path = %tmp_path.display(),
+            error = %error,
+            "failed to write retry_state sidecar (tmp)"
+        );
+        return;
+    }
+    if let Err(error) = std::fs::rename(&tmp_path, path) {
+        warn!(
+            tmp = %tmp_path.display(),
+            path = %path.display(),
+            error = %error,
+            "failed to rename retry_state sidecar into place"
+        );
+    }
+}
+
 async fn persist_assistant_message(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
+    data_dir: &Path,
     content: String,
     media: Vec<String>,
 ) -> Option<PersistedSessionMessage> {
@@ -122,9 +216,31 @@ async fn persist_assistant_message(
     assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
 
+    // Funnel through the canonical helper so the per-key Tokio mutex
+    // serialises this write with `ApiChannel::persist_to_session` (and any
+    // other caller). Pre-fix, the actor opened its OWN `SessionHandle` and
+    // called `add_message_with_seq` directly — the channel and actor each
+    // observed their independent in-memory `len = N`, both returned the
+    // same `seq = N`, and the duplicate seqs broke watcher correlation.
+    //
+    // Holding `session_handle.lock()` across the canonical-helper call is
+    // safe (the helper's per-key map is independent of the actor's per-actor
+    // mutex; no deadlock) and serialises this write with the actor's other
+    // in-memory operations (read history, summary update, etc.). After the
+    // disk write commits we mirror the message into the actor's local Vec
+    // so subsequent `get_history` reads stay consistent.
     let mut handle = session_handle.lock().await;
-    match handle.add_message_with_seq(assistant_msg).await {
-        Ok(seq) => Some(PersistedSessionMessage { seq, timestamp }),
+    match octos_bus::session::persist_message_through_canonical_path(
+        data_dir,
+        session_key,
+        assistant_msg.clone(),
+    )
+    .await
+    {
+        Ok(seq) => {
+            handle.push_message_in_memory(assistant_msg);
+            Some(PersistedSessionMessage { seq, timestamp })
+        }
         Err(error) => {
             warn!(
                 session = %session_key,
@@ -133,6 +249,43 @@ async fn persist_assistant_message(
             );
             None
         }
+    }
+}
+
+/// Poll the session log briefly for the primary turn's assistant reply, then
+/// return the freshest history snapshot.
+///
+/// This exists to fix a stale-history bug on the speculative-overflow path:
+/// when a user sends a follow-up while the primary turn is still running, the
+/// overflow agent used to read a snapshot taken BEFORE the primary turn
+/// started, missing the answer the primary just produced. Polling for a new
+/// assistant message lets the overflow re-use that fresh context.
+///
+/// `pre_primary_assistant_count` is the number of assistant messages observed
+/// before the primary turn began. The loop exits once the live snapshot has
+/// strictly more, or once the deadline elapses (so a slow primary never blocks
+/// the overflow indefinitely — it just runs with whatever context it has).
+async fn wait_for_primary_assistant_reply(
+    session_handle: &Arc<Mutex<SessionHandle>>,
+    max_history: usize,
+    pre_primary_assistant_count: usize,
+    max_wait: Duration,
+    poll_interval: Duration,
+) -> Vec<Message> {
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let snapshot: Vec<Message> = {
+            let handle = session_handle.lock().await;
+            handle.get_history(max_history).to_vec()
+        };
+        let cur_assistant_count = snapshot
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Assistant))
+            .count();
+        if cur_assistant_count > pre_primary_assistant_count || Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -222,6 +375,7 @@ async fn send_outbound_with_timeout(
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
+    data_dir: &Path,
     out_tx: &mpsc::Sender<OutboundMessage>,
     channel: &str,
     chat_id: &str,
@@ -229,9 +383,14 @@ async fn persist_terminal_reply_and_fanout(
     content: String,
     media: Vec<String>,
 ) -> bool {
-    let Some(_persisted) =
-        persist_assistant_message(session_handle, session_key, content.clone(), media.clone())
-            .await
+    let Some(_persisted) = persist_assistant_message(
+        session_handle,
+        session_key,
+        data_dir,
+        content.clone(),
+        media.clone(),
+    )
+    .await
     else {
         record_result_delivery("terminal_reply", "history_not_persisted", "assistant");
         warn!(
@@ -283,6 +442,28 @@ fn record_timeout(reason: &'static str) {
 
 fn record_retry(reason: &'static str) {
     counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
+}
+
+/// Collect per-node cost rows from a turn's tool-result side-channel
+/// metadata into a flat array suitable for the SSE `done` event.
+///
+/// Bug 3 / W1.G4 — tools (today: `run_pipeline`) surface per-node cost
+/// rows via `ToolResult.structured_metadata` keyed under `"node_costs"`.
+/// The session actor walks every tool result and concatenates the rows so
+/// the dashboard CostBreakdown panel sees one cost row per pipeline node
+/// regardless of how many `run_pipeline` calls fired during the turn.
+///
+/// Returns an empty vector when no tool surfaced cost rows — the caller
+/// only writes the `node_costs` key on the SSE event when this is
+/// non-empty so legacy clients keep their byte-for-byte payload shape.
+fn collect_node_costs(tool_results: &[(String, serde_json::Value)]) -> Vec<serde_json::Value> {
+    let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
+    for (_tool_call_id, meta) in tool_results {
+        if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
+            all_node_costs.extend(arr.iter().cloned());
+        }
+    }
+    all_node_costs
 }
 
 fn record_result_delivery(path: &'static str, outcome: &'static str, kind: &'static str) {
@@ -679,6 +860,55 @@ impl SessionTaskQueryStore {
         }
     }
 
+    /// M7.9 / W2: locate the supervisor owning `task_id` and forward
+    /// `cancel(task_id)` to it. Returns `Ok(())` on success, mapping
+    /// supervisor errors back to the typed [`TaskCancelError`] enum so
+    /// the API layer can map them to HTTP status codes.
+    ///
+    /// Walks every live supervisor (pruning dropped ones) until it finds
+    /// the task. When no supervisor knows about `task_id`, returns
+    /// `Err(TaskCancelError::NotFound)`.
+    pub fn cancel_task(&self, task_id: &str) -> Result<(), octos_agent::TaskCancelError> {
+        for supervisor in self.live_supervisors() {
+            if supervisor.get_task(task_id).is_some() {
+                return supervisor.cancel(task_id);
+            }
+        }
+        Err(octos_agent::TaskCancelError::NotFound)
+    }
+
+    /// M7.9 / W2: locate the supervisor owning `task_id` and forward
+    /// `relaunch(task_id, opts)` to it. Returns `Ok(new_task_id)` on
+    /// success.
+    pub fn relaunch_task(
+        &self,
+        task_id: &str,
+        opts: octos_agent::RelaunchOpts,
+    ) -> Result<String, octos_agent::TaskRelaunchError> {
+        for supervisor in self.live_supervisors() {
+            if supervisor.get_task(task_id).is_some() {
+                return supervisor.relaunch(task_id, opts);
+            }
+        }
+        Err(octos_agent::TaskRelaunchError::NotFound)
+    }
+
+    /// Snapshot live supervisors, pruning dropped weak refs. Shared
+    /// helper for `cancel_task` / `relaunch_task` /
+    /// `mark_child_session_failed`.
+    fn live_supervisors(&self) -> Vec<Arc<TaskSupervisor>> {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        let mut alive = Vec::new();
+        guard.retain(|_, entry| match entry.supervisor.upgrade() {
+            Some(supervisor) => {
+                alive.push(supervisor);
+                true
+            }
+            None => false,
+        });
+        alive
+    }
+
     /// M8 fix-first item 8 (gap 3): mark the parent task that owns a
     /// child session as failed.
     ///
@@ -692,22 +922,7 @@ impl SessionTaskQueryStore {
     /// [`TaskSupervisor::mark_failed`] on it. Returns `true` when a
     /// matching task was found and updated; `false` otherwise.
     pub fn mark_child_session_failed(&self, child_session_key: &str, error: &str) -> bool {
-        // Snapshot live supervisors and prune dropped ones in one pass so
-        // we hold the inner lock for as little as possible.
-        let snapshot: Vec<Arc<TaskSupervisor>> = {
-            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-            let mut alive = Vec::new();
-            guard.retain(|_, entry| match entry.supervisor.upgrade() {
-                Some(supervisor) => {
-                    alive.push(supervisor);
-                    true
-                }
-                None => false,
-            });
-            alive
-        };
-
-        for supervisor in snapshot {
+        for supervisor in self.live_supervisors() {
             for task in supervisor.get_all_tasks() {
                 if task.child_session_key.as_deref() == Some(child_session_key) {
                     supervisor.mark_failed(&task.id, error.to_string());
@@ -785,6 +1000,40 @@ async fn dispatch_background_result_to_actor(
             false
         }
     }
+}
+
+/// Build the synthetic `[system-internal]` recovery prompt that the
+/// session actor enqueues when a `spawn_only` task transitions to
+/// `Failed` (M8.9). The prompt frames the failure for the LLM and asks
+/// it to offer a path forward — alternatives parsed from the error, or
+/// a safer fallback the model can attempt itself.
+pub(crate) fn build_recovery_prompt(signal: &octos_agent::SpawnOnlyFailureSignal) -> String {
+    let alternatives_block = if signal.suggested_alternatives.is_empty() {
+        String::new()
+    } else {
+        let list = signal
+            .suggested_alternatives
+            .iter()
+            .map(|alt| format!("- {alt}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\nDetected alternatives:\n{list}\n")
+    };
+    let input_block = if signal.tool_input.is_null() {
+        String::new()
+    } else {
+        let pretty = serde_json::to_string(&signal.tool_input).unwrap_or_else(|_| "{}".into());
+        format!("\nOriginal input: {pretty}")
+    };
+    format!(
+        "[system-internal] Your previous `{tool}` call failed.\n\
+         Error: {err}{input}{alts}\n\
+         Respond to the user with a path forward — offer the alternatives, or try the safest one yourself if appropriate. Do not just report failure.",
+        tool = signal.tool_name,
+        err = signal.error_message,
+        input = input_block,
+        alts = alternatives_block,
+    )
 }
 
 fn git_turn_summary(content: &str) -> String {
@@ -991,6 +1240,18 @@ pub enum ActorMessage {
     TaskStatusChanged {
         /// Serialized JSON of the BackgroundTask.
         task_json: String,
+    },
+    /// Synthetic recovery turn enqueued by the spawn_only failure-signal
+    /// callback (M8.9). Drives the LLM to re-engage on a failed background
+    /// task with the actionable error and (optionally parsed) alternatives.
+    RecoveryHint {
+        /// Task ID that triggered the recovery (used for de-duplication).
+        task_id: String,
+        /// Tool that failed — surfaced verbatim in the synthetic prompt.
+        tool_name: String,
+        /// Best-effort prompt body. Already framed as `[system-internal]` so
+        /// the LLM treats it as runtime guidance, not a user turn.
+        prompt: String,
     },
     /// Cancel the current operation.
     Cancel,
@@ -1438,13 +1699,6 @@ impl ActorFactory {
             .join("users")
             .join(&encoded_base)
             .join("workspace");
-        if let Err(e) = std::fs::create_dir_all(&user_workspace) {
-            warn!(
-                session = %session_key,
-                path = %user_workspace.display(),
-                "failed to create per-user workspace: {e}, falling back to shared cwd"
-            );
-        }
         // Create the per-actor session handle early so we can derive the
         // background task ledger path before any worker can mutate state.
         let mut session_handle = SessionHandle::open(&self.data_dir, &session_key);
@@ -1456,10 +1710,27 @@ impl ActorFactory {
         // M8.6: sanitize the loaded transcript. Dropping unresolved tool
         // calls, orphan thinking, and whitespace-only messages here
         // prevents the provider from 400-ing on the first request after a
-        // resume. `retry_state` and `workspace_root` are None for
-        // top-level sessions today — sub-agent workstreams will thread
-        // them in when M8.7 lands.
-        match session_handle.sanitize_loaded_messages(None, None) {
+        // resume. Pass the user_workspace so the sanitizer can detect a
+        // missing-on-disk workspace and hard-refuse — must run BEFORE
+        // create_dir_all below, otherwise the recreate would mask the
+        // missing-workspace condition we want to catch.
+        //
+        // Skip the worktree check entirely when there is no loaded
+        // transcript: every brand-new session (including pipeline workers
+        // and spawn_only children) hits this path before its workspace
+        // dir is materialised, and firing WorktreeMissing on a fresh
+        // session causes the is_child branch below to falsely
+        // mark_child_session_failed on the parent task — breaking
+        // run_pipeline. The check is only meaningful when there are
+        // messages whose tool-result references could be invalidated by a
+        // missing worktree.
+        let has_loaded_messages = !session_handle.get_history(1).is_empty();
+        let workspace_root_for_sanitize: Option<&Path> = if has_loaded_messages {
+            Some(&user_workspace)
+        } else {
+            None
+        };
+        match session_handle.sanitize_loaded_messages(None, workspace_root_for_sanitize) {
             Ok((report, refs)) => {
                 if report.input_len != report.output_len
                     || report.content_replacements_restored > 0
@@ -1525,58 +1796,74 @@ impl ActorFactory {
                 );
             }
         }
+        // Recreate the per-user workspace AFTER sanitize so the resume
+        // refusal above had a chance to detect the missing-on-disk state.
+        if let Err(e) = std::fs::create_dir_all(&user_workspace) {
+            warn!(
+                session = %session_key,
+                path = %user_workspace.display(),
+                "failed to create per-user workspace: {e}, falling back to shared cwd"
+            );
+        }
         let task_state_path = session_handle.task_state_path();
         let session_handle = Arc::new(Mutex::new(session_handle));
         let session_policy_path = workspace_policy_path(&user_workspace);
         let desired_session_policy = WorkspacePolicy::for_session();
-        match read_workspace_policy(&user_workspace) {
-            Ok(Some(mut existing_policy)) => {
-                let mut updated = false;
-                for (name, pattern) in &desired_session_policy.artifacts.entries {
-                    if !existing_policy.artifacts.entries.contains_key(name) {
-                        existing_policy
-                            .artifacts
-                            .entries
-                            .insert(name.clone(), pattern.clone());
-                        updated = true;
+        let active_workspace_policy: Option<WorkspacePolicy> =
+            match read_workspace_policy(&user_workspace) {
+                Ok(Some(mut existing_policy)) => {
+                    let mut updated = false;
+                    for (name, pattern) in &desired_session_policy.artifacts.entries {
+                        if !existing_policy.artifacts.entries.contains_key(name) {
+                            existing_policy
+                                .artifacts
+                                .entries
+                                .insert(name.clone(), pattern.clone());
+                            updated = true;
+                        }
                     }
-                }
-                for (name, task) in &desired_session_policy.spawn_tasks {
-                    if !existing_policy.spawn_tasks.contains_key(name) {
-                        existing_policy
-                            .spawn_tasks
-                            .insert(name.clone(), task.clone());
-                        updated = true;
+                    for (name, task) in &desired_session_policy.spawn_tasks {
+                        if !existing_policy.spawn_tasks.contains_key(name) {
+                            existing_policy
+                                .spawn_tasks
+                                .insert(name.clone(), task.clone());
+                            updated = true;
+                        }
                     }
+                    if updated {
+                        if let Err(error) =
+                            write_workspace_policy(&user_workspace, &existing_policy)
+                        {
+                            warn!(
+                                session = %session_key,
+                                path = %session_policy_path.display(),
+                                "failed to upgrade session workspace policy: {error}"
+                            );
+                        }
+                    }
+                    Some(existing_policy)
                 }
-                if updated {
-                    if let Err(error) = write_workspace_policy(&user_workspace, &existing_policy) {
+                Ok(None) => {
+                    if let Err(error) =
+                        write_workspace_policy(&user_workspace, &desired_session_policy)
+                    {
                         warn!(
                             session = %session_key,
                             path = %session_policy_path.display(),
-                            "failed to upgrade session workspace policy: {error}"
+                            "failed to write session workspace policy: {error}"
                         );
                     }
+                    Some(desired_session_policy.clone())
                 }
-            }
-            Ok(None) => {
-                if let Err(error) = write_workspace_policy(&user_workspace, &desired_session_policy)
-                {
+                Err(error) => {
                     warn!(
                         session = %session_key,
                         path = %session_policy_path.display(),
-                        "failed to write session workspace policy: {error}"
+                        "failed to read session workspace policy: {error}"
                     );
+                    None
                 }
-            }
-            Err(error) => {
-                warn!(
-                    session = %session_key,
-                    path = %session_policy_path.display(),
-                    "failed to read session workspace policy: {error}"
-                );
-            }
-        }
+            };
 
         // send_file resolves relative paths against user_workspace (same as
         // write_file/read_file) so the LLM can write+send in one flow.
@@ -1616,6 +1903,17 @@ impl ActorFactory {
         tools.register(message_tool);
         tools.register(send_file_tool);
 
+        // M8 Runtime Parity W2.B1: build the same M8.7 summary generator
+        // that goes onto the parent Agent so the child workers we spawn
+        // observe an identical contract. (The Agent::new wiring further
+        // down also consumes this Arc — keep them in sync.)
+        let subagent_summary_generator_for_spawn =
+            Arc::new(octos_agent::AgentSummaryGenerator::new(
+                self.llm_for_compaction.clone(),
+                self.subagent_output_router.clone(),
+                (*supervisor).clone(),
+            ));
+
         // Spawn tool (per-session context, fully configured)
         let mut spawn_tool = SpawnTool::with_context(
             self.llm.clone(),
@@ -1631,7 +1929,14 @@ impl ActorFactory {
             supervisor.clone(),
             session_key.to_string(),
             task_state_path.clone(),
-        );
+        )
+        // M8 Runtime Parity W2.B1: parent → child cache inheritance.
+        // Without these the spawned child Agent observes
+        // `file_state_cache: None` and `subagent_output_router: None`
+        // and the post-M8.4 / M8.7 contracts are silently bypassed.
+        .with_parent_file_state_cache(file_state_cache.clone())
+        .with_parent_subagent_output_router(self.subagent_output_router.clone())
+        .with_parent_subagent_summary_generator(subagent_summary_generator_for_spawn);
         if let Some(ref prompt) = self.worker_prompt {
             spawn_tool = spawn_tool.with_worker_prompt(prompt.clone());
         }
@@ -1703,6 +2008,21 @@ impl ActorFactory {
             if let Ok(json) = serde_json::to_string(&task_json) {
                 let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
             }
+        });
+
+        // Wire supervisor on_failure_signal callback (M8.9): when a
+        // spawn_only task transitions to Failed, enqueue a synthetic
+        // recovery turn so the LLM can offer alternatives or take a
+        // recovery action instead of leaving the user with only a
+        // terminal failure notification.
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+            });
         });
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
@@ -1845,6 +2165,11 @@ impl ActorFactory {
         // binds the per-registry supervisor (so it can mark_terminal /
         // start a watcher / etc. for THIS actor's tasks); the router
         // is shared across actors via the factory.
+        //
+        // M8 Runtime Parity W2.B1: the same Arc is also threaded onto
+        // the SpawnTool via `with_parent_subagent_summary_generator`
+        // (above) so child agents observe the same generator the
+        // parent does.
         let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
             self.llm_for_compaction.clone(),
             self.subagent_output_router.clone(),
@@ -1877,6 +2202,37 @@ impl ActorFactory {
         if let Some(ref ctx) = session_hook_context {
             agent = agent.with_hook_context(ctx.clone());
         }
+
+        // Harness M6.3/M6.4: wire the declarative compaction runner when the
+        // active workspace policy declares a compaction block. Selects the
+        // LLM-iterative summarizer when the policy asks for it (hands in the
+        // agent's LlmProvider); falls back to extractive otherwise.
+        if let Some(ref workspace_policy) = active_workspace_policy {
+            if let Some(compaction_policy) = workspace_policy.compaction.clone() {
+                let runner = match compaction_policy.summarizer {
+                    CompactionSummarizerKind::LlmIterative => {
+                        CompactionRunner::with_provider(compaction_policy, agent.llm_provider())
+                    }
+                    CompactionSummarizerKind::Extractive => {
+                        CompactionRunner::new(compaction_policy)
+                    }
+                }
+                .with_workspace_policy(workspace_policy);
+                agent = agent
+                    .with_compaction_runner(Arc::new(runner))
+                    .with_compaction_workspace(workspace_policy.clone());
+            }
+        }
+
+        // Review A F-015: attach a cross-turn persistent retry state handle
+        // so LoopRetryState buckets accumulate across consecutive
+        // `process_message` / `run_task` calls for this session. The sidecar
+        // is JSON so operators can inspect or purge it without opening redb;
+        // the handle is read-through / write-back owned by the agent loop.
+        let retry_state_path = retry_state_sidecar_path(&self.data_dir, &session_key);
+        let retry_state_initial = load_retry_state(&retry_state_path);
+        let persistent_retry_state = Arc::new(StdMutex::new(retry_state_initial));
+        agent = agent.with_persistent_retry_state(persistent_retry_state.clone());
 
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
@@ -1914,6 +2270,9 @@ impl ActorFactory {
             active_sessions: self.active_sessions.clone(),
             user_workspace: user_workspace.clone(),
             cron_tool: cron_tool_ref,
+            persistent_retry_state,
+            retry_state_path: Some(retry_state_path),
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -2078,6 +2437,20 @@ struct SessionActor {
     user_workspace: std::path::PathBuf,
     /// Per-session cron tool reference — updated with channel/chat_id on each message.
     cron_tool: Option<Arc<CronTool>>,
+    /// Review A F-015: cross-turn persistent retry-bucket handle. The
+    /// agent loop's `PersistentRetryStateGuard` hydrates from this at turn
+    /// start and writes back on drop. We hold a clone of the same `Arc` so
+    /// we can flush the state to a JSON sidecar after every turn.
+    persistent_retry_state: Arc<StdMutex<LoopRetryState>>,
+    /// Path of the retry-state JSON sidecar on disk. `None` when the path
+    /// could not be resolved (e.g. unusual test data dirs); in that case
+    /// the in-memory state still accumulates within this actor's lifetime
+    /// but is not durable across process restarts.
+    retry_state_path: Option<std::path::PathBuf>,
+    /// Set of `task_id`s that have already triggered an automatic recovery
+    /// turn (M8.9). Caps recovery at one attempt per task so a recovery
+    /// turn that itself fails cannot ignite a runaway loop.
+    recovered_tasks: Arc<StdMutex<std::collections::HashSet<String>>>,
 }
 
 impl SessionActor {
@@ -2164,6 +2537,35 @@ impl SessionActor {
             .get_active_topic(base_key)
             .to_string();
         my_topic == active_topic
+    }
+
+    /// Reserve a recovery slot for a task. Returns `true` if this is the
+    /// first recovery for the given task ID and the caller should proceed,
+    /// `false` if a recovery has already been triggered (and the second
+    /// signal should be dropped). Cap is one recovery attempt per task —
+    /// see M8.9.
+    fn claim_recovery_slot(&self, task_id: &str) -> bool {
+        let mut guard = self
+            .recovered_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(task_id.to_string())
+    }
+
+    /// Build a synthetic `InboundMessage` carrying the recovery prompt so
+    /// the existing inbound pipeline (history persistence, agent loop)
+    /// runs unchanged.
+    fn synthetic_recovery_inbound(&self, prompt: String) -> InboundMessage {
+        InboundMessage {
+            channel: self.channel.clone(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: self.chat_id.clone(),
+            content: prompt,
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::json!({ "_recovery_turn": true }),
+            message_id: None,
+        }
     }
 
     async fn run(mut self) {
@@ -2295,6 +2697,41 @@ impl SessionActor {
                                     "_task_status": task_json
                                 }),
                             }).await;
+                        }
+                        Some(ActorMessage::RecoveryHint {
+                            task_id,
+                            tool_name,
+                            prompt,
+                        }) => {
+                            // Cap recovery at one attempt per task to avoid
+                            // runaway loops if the recovery turn itself
+                            // fails. Subsequent failures from the same task
+                            // ID are silently dropped here.
+                            if !self.claim_recovery_slot(&task_id) {
+                                debug!(
+                                    session = %self.session_key,
+                                    task_id,
+                                    tool_name,
+                                    "skipping duplicate recovery hint"
+                                );
+                                continue;
+                            }
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "enqueueing synthetic recovery turn"
+                            );
+                            let synthetic = self.synthetic_recovery_inbound(prompt);
+                            let final_attachment_media = self
+                                .copy_media_to_workspace(Vec::new());
+                            self.process_inbound(
+                                synthetic,
+                                Vec::new(),
+                                final_attachment_media,
+                                None,
+                            )
+                            .await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -2878,6 +3315,21 @@ impl SessionActor {
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
                         }
+                        Ok(ActorMessage::RecoveryHint {
+                            task_id, tool_name, ..
+                        }) => {
+                            // Drain context: a turn is already running. The
+                            // claim guarantees we won't try to recover this
+                            // task again later. Trace and drop — the LLM
+                            // will see the failure via TaskStatusChanged.
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "dropping recovery hint received during drain"
+                            );
+                            self.claim_recovery_slot(&task_id);
+                        }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                             break;
@@ -2940,6 +3392,21 @@ impl SessionActor {
                         Ok(ActorMessage::TaskStatusChanged { .. }) => {
                             // Ignore in drain — status is pushed via the main loop
                         }
+                        Ok(ActorMessage::RecoveryHint {
+                            task_id, tool_name, ..
+                        }) => {
+                            // Drain context: a turn is already running. The
+                            // claim guarantees we won't try to recover this
+                            // task again later. Trace and drop — the LLM
+                            // will see the failure via TaskStatusChanged.
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "dropping recovery hint received during drain"
+                            );
+                            self.claim_recovery_slot(&task_id);
+                        }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                             break;
@@ -2964,6 +3431,7 @@ impl SessionActor {
         let persisted = persist_assistant_message(
             &self.session_handle,
             &self.session_key,
+            &self.data_dir,
             content.clone(),
             media.clone(),
         )
@@ -3245,12 +3713,58 @@ impl SessionActor {
             }
         };
 
-        let _ = user_seq; // sort comparator uses timestamp; seq retained for ledger.
-        let _ = user_msg_timestamp;
+        // Restore the forced-background user-message session_result emission
+        // dropped by 14ac3f3a. Same reasoning as the overflow path: the web
+        // client needs a routing signal so the workflow's spawn_only progress
+        // events bind to this user message's bubble, not a stale primary.
+        // See #616.
+        if let Some(seq) = user_seq {
+            let mut session_result = serde_json::json!({
+                "seq": seq,
+                "role": "user",
+                "content": persisted_user_content.to_string(),
+                "timestamp": user_msg_timestamp.to_rfc3339(),
+                "media": Vec::<String>::new(),
+            });
+            if let Some(cmid) = client_message_id.as_deref() {
+                session_result.as_object_mut().expect("json object").insert(
+                    "client_message_id".to_string(),
+                    serde_json::Value::String(cmid.to_string()),
+                );
+            }
+            let mut metadata_obj = serde_json::Map::new();
+            if let Some(topic) = self.session_key.topic() {
+                metadata_obj.insert(
+                    "topic".to_string(),
+                    serde_json::Value::String(topic.to_string()),
+                );
+            }
+            metadata_obj.insert(
+                "_history_persisted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            metadata_obj.insert("_session_result".to_string(), session_result);
+
+            let _ = send_outbound_with_timeout(
+                &self.session_key,
+                &self.out_tx,
+                OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::Value::Object(metadata_obj),
+                },
+                "user_message_session_result_forced_background",
+            )
+            .await;
+        }
         let ack_content = workflow_ack;
         let persisted = persist_assistant_message(
             &self.session_handle,
             &self.session_key,
+            &self.data_dir,
             ack_content.clone(),
             vec![],
         )
@@ -3362,22 +3876,20 @@ impl SessionActor {
 
         // Save the primary user message to session history BEFORE spawning
         // so overflow reads see it in context (chronological ordering).
+        // Persist BOTH image_media and attachment_media so future turns can
+        // re-reference uploaded audio/files. Without this, attachments only
+        // survived as TurnAttachmentContext for the current turn.
         let client_message_id = inbound_client_message_id(&inbound);
         let persisted_user_content_for_event = persisted_user_content.clone();
         let user_media_for_event = image_media.clone();
-        // Persist BOTH image_media and attachment_media so future turns can
-        // re-reference uploaded audio/files. Without this, a follow-up turn
-        // ("transcribe the wav again") loses the path because attachments
-        // only survived as TurnAttachmentContext for the current turn.
-        let combined_media: Vec<String> = image_media
-            .iter()
-            .chain(attachment_media.iter())
-            .cloned()
-            .collect();
         let user_msg = Message {
             role: MessageRole::User,
             content: persisted_user_content,
-            media: combined_media,
+            media: image_media
+                .iter()
+                .chain(attachment_media.iter())
+                .cloned()
+                .collect(),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -3644,6 +4156,20 @@ impl SessionActor {
                                 }),
                             }).await;
                         }
+                        Some(ActorMessage::RecoveryHint { task_id, tool_name, .. }) => {
+                            // Speculative-overflow context: the primary
+                            // turn is already running. Reserve the slot
+                            // (so we don't try again later) and drop the
+                            // hint — the failure will be visible via
+                            // TaskStatusChanged.
+                            debug!(
+                                session = %self.session_key,
+                                task_id,
+                                tool_name,
+                                "dropping recovery hint during speculative overflow"
+                            );
+                            self.claim_recovery_slot(&task_id);
+                        }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
                         }
@@ -3667,6 +4193,21 @@ impl SessionActor {
 
         // Drop the semaphore permit before &mut self operations below.
         drop(_permit);
+
+        // Review A F-015: flush the cross-turn persistent retry-bucket state
+        // to its JSON sidecar so the next `process_message` call on this
+        // session sees the accumulated buckets. The in-memory `Arc<Mutex<..>>`
+        // has already been mutated by the agent loop's guard; we just need
+        // to persist it before the next turn loads. Best-effort: if the
+        // sidecar write fails we log and carry on.
+        if let Some(ref retry_path) = self.retry_state_path {
+            let snapshot = self
+                .persistent_retry_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            save_retry_state(retry_path, &snapshot);
+        }
 
         // Handle any slash commands that arrived during the select loop.
         // We deferred them to avoid &mut self borrow conflicts in tokio::select!.
@@ -3760,7 +4301,7 @@ impl SessionActor {
                 );
             }
         }
-        let completion_meta = match &agent_result {
+        let mut completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
                 let provider_metadata = cr.provider_metadata.clone();
@@ -3784,7 +4325,14 @@ impl SessionActor {
                 let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
                     pricing.cost(cr.token_usage.input_tokens, cr.token_usage.output_tokens)
                 });
-                serde_json::json!({
+                // Bug 3 / W1.G4 cost panel — collect per-node cost rows that
+                // tools (today: `run_pipeline`) surfaced through their
+                // `ToolResult.structured_metadata` side-channel. Without this
+                // accumulator the data was being silently dropped between
+                // the tool boundary and the SSE `done` event, leaving the
+                // dashboard's CostBreakdown panel data-blind in production.
+                let all_node_costs = collect_node_costs(&cr.tool_results);
+                let mut meta_obj = serde_json::json!({
                     "_completion": true,
                     "model": model_label,
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
@@ -3796,7 +4344,16 @@ impl SessionActor {
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
                     "has_bg_tasks": had_bg_tasks,
                     "bg_tasks": bg_task_details,
-                })
+                });
+                if !all_node_costs.is_empty() {
+                    if let Some(map) = meta_obj.as_object_mut() {
+                        map.insert(
+                            "node_costs".to_string(),
+                            serde_json::Value::Array(all_node_costs),
+                        );
+                    }
+                }
+                meta_obj
             }
             Ok(Err(e)) => {
                 warn!(session = %self.session_key, error = %e, "agent returned error");
@@ -3817,6 +4374,7 @@ impl SessionActor {
                 // Save tool calls, tool results, and assistant reply to history.
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
+                let mut assistant_committed_seq: Option<u64> = None;
                 {
                     let mut handle = self.session_handle.lock().await;
                     let messages_to_save = if !conv_response.messages.is_empty()
@@ -3847,8 +4405,18 @@ impl SessionActor {
                             client_message_id: None,
                             timestamp: chrono::Utc::now(),
                         };
-                        if let Err(e) = handle.add_message(assistant_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                        // M8.10-A: capture the committed seq so the SSE `done`
+                        // event can thread it back to the web client. The
+                        // assistant timestamp is `Utc::now()` (newer than any
+                        // tool message) so the post-sort position matches the
+                        // append index returned here.
+                        match handle.add_message_with_seq(assistant_msg).await {
+                            Ok(seq) => {
+                                assistant_committed_seq = u64::try_from(seq).ok();
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                            }
                         }
                     }
 
@@ -3868,6 +4436,16 @@ impl SessionActor {
                     .await
                     {
                         warn!("session compaction failed: {e}");
+                    }
+                }
+
+                // M8.10-A: thread the committed assistant seq into the
+                // completion_meta so the SSE done event can carry it back to
+                // the web client. Live-streamed bubbles use this to populate
+                // their `historySeq` and stay in chronological order.
+                if let Some(seq) = assistant_committed_seq {
+                    if let Some(map) = completion_meta.as_object_mut() {
+                        map.insert("committed_seq".to_string(), serde_json::Value::from(seq));
                     }
                 }
 
@@ -3945,13 +4523,15 @@ impl SessionActor {
                         display_content
                     };
 
-                    // If overflow was served while this task ran, prepend a
-                    // marker so the user knows this is a delayed result.
-                    let display_content = if overflow_served {
-                        format!("⬆️ Earlier task completed:\n\n{display_content}")
-                    } else {
-                        display_content
-                    };
+                    // The legacy "⬆️ Earlier task completed:" prefix was
+                    // dropped because users misread it — the wording sounded
+                    // like a stray prior reply when it actually meant "I
+                    // also processed your follow-up below in parallel." Tool
+                    // chips and the message timeline already convey that
+                    // without confusing boilerplate. The `overflow_served`
+                    // flag stays in scope so a future UI surface can render
+                    // a richer indicator if needed.
+                    let _ = overflow_served;
 
                     // Append annotation as last line for non-API channels
                     let display_content = if self.channel != "api" {
@@ -3988,7 +4568,7 @@ impl SessionActor {
                                 if let Some(ref si) = self.status_indicator {
                                     let _ = si
                                         .channel()
-                                        .edit_message(&self.chat_id, mid, &display_content)
+                                        .finish_stream(&self.chat_id, mid, &display_content)
                                         .await;
                                 }
                                 true
@@ -4023,6 +4603,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -4039,6 +4620,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -4131,14 +4713,23 @@ impl SessionActor {
         let status_indicator = self.status_indicator.clone();
         let sender_user_id = self.sender_user_id.clone();
         let user_status_config = self.user_status_config.clone();
-        let history = pre_primary_history.to_vec();
+        let pre_primary_history_vec = pre_primary_history.to_vec();
+        let pre_primary_assistant_count = pre_primary_history_vec
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Assistant))
+            .count();
+        let max_history = self.max_history.load(Ordering::Acquire);
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
         let user_workspace = self.user_workspace.clone();
+        let data_dir = self.data_dir.clone();
         let overflow_client_message_id = inbound_client_message_id(msg);
 
         tokio::spawn(async move {
-            // Save user message to history first
+            // Save user message to history first so it survives even if the
+            // primary turn or this overflow agent fails — preserves the user's
+            // query in the session log no matter what.
+            let user_msg_timestamp = chrono::Utc::now();
             let user_msg = Message {
                 role: MessageRole::User,
                 content: content.clone(),
@@ -4147,22 +4738,106 @@ impl SessionActor {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: overflow_client_message_id.clone(),
-                timestamp: chrono::Utc::now(),
+                timestamp: user_msg_timestamp,
             };
-            let user_msg_timestamp = user_msg.timestamp;
             let user_seq_for_overflow = {
                 let mut handle = session_handle.lock().await;
                 handle.add_message_with_seq(user_msg).await.ok()
             };
 
-            // The overflow path also relies on the timestamp-primary
-            // comparator client-side; no per-user-message session_result
-            // emission needed. Seq retained for ledger.
-            let _ = user_seq_for_overflow;
-            let _ = user_msg_timestamp;
-            let _ = overflow_client_message_id;
+            // Restore the overflow user-message session_result emission that
+            // was removed by 14ac3f3a — without it the web client has no signal
+            // that user message B has a response slot, so streaming tokens for
+            // B's reply bind to A's bubble (or render nowhere). The
+            // timestamp-primary comparator handles ORDERING client-side; this
+            // session_result handles ROUTING server-side. The two are
+            // complementary, not exclusive. See #616. Channel-side fanout
+            // (api_channel.rs) only honours `_session_result` for the api
+            // channel; non-api adapters (telegram/etc) ignore it harmlessly.
+            if let Some(seq) = user_seq_for_overflow {
+                let mut session_result = serde_json::json!({
+                    "seq": seq,
+                    "role": "user",
+                    "content": content.clone(),
+                    "timestamp": user_msg_timestamp.to_rfc3339(),
+                    "media": Vec::<String>::new(),
+                });
+                if let Some(cmid) = overflow_client_message_id.as_deref() {
+                    session_result.as_object_mut().expect("json object").insert(
+                        "client_message_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
+                let mut metadata_obj = serde_json::Map::new();
+                if let Some(topic) = session_key.topic() {
+                    metadata_obj.insert(
+                        "topic".to_string(),
+                        serde_json::Value::String(topic.to_string()),
+                    );
+                }
+                metadata_obj.insert(
+                    "_history_persisted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                metadata_obj.insert("_session_result".to_string(), session_result);
 
-            let history: Vec<Message> = history;
+                let _ = send_outbound_with_timeout(
+                    &session_key,
+                    &out_tx,
+                    OutboundMessage {
+                        channel: channel.clone(),
+                        chat_id: chat_id.clone(),
+                        content: String::new(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::Value::Object(metadata_obj),
+                    },
+                    "user_message_session_result_overflow",
+                )
+                .await;
+            }
+
+            // Refresh the history snapshot so the overflow LLM sees the
+            // primary turn's assistant reply if it has already landed. The
+            // pre_primary_history_vec snapshot was captured before the primary
+            // agent even started, so it would otherwise miss any answer the
+            // primary just produced (e.g. a weather lookup the user asked
+            // about right before sending the overflow follow-up).
+            //
+            // Bounded wait: 2s is enough for typical primary turns to flush
+            // their final message; long-running primaries fall through with
+            // the original pre_primary_history snapshot to preserve the
+            // pre-fix safety property (overflow never sees the primary user
+            // message in isolation, which would tempt the LLM to re-answer
+            // it alongside the overflow question).
+            let fresh_snapshot = wait_for_primary_assistant_reply(
+                &session_handle,
+                max_history,
+                pre_primary_assistant_count,
+                Duration::from_millis(2_000),
+                Duration::from_millis(100),
+            )
+            .await;
+            let fresh_assistant_count = fresh_snapshot
+                .iter()
+                .filter(|m| matches!(m.role, MessageRole::Assistant))
+                .count();
+            let primary_assistant_landed = fresh_assistant_count > pre_primary_assistant_count;
+            let history: Vec<Message> = if primary_assistant_landed {
+                // Strip our just-saved overflow user message so
+                // process_message_tracked doesn't double-add it. Match by
+                // exact timestamp (we control both sides).
+                fresh_snapshot
+                    .into_iter()
+                    .filter(|m| {
+                        !(matches!(m.role, MessageRole::User) && m.timestamp == user_msg_timestamp)
+                    })
+                    .collect()
+            } else {
+                // Primary still mid-turn — fall back to the safe pre-primary
+                // snapshot (no primary user msg, no primary assistant reply).
+                pre_primary_history_vec
+            };
             let tracker = Arc::new(TokenTracker::new());
 
             // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
@@ -4270,20 +4945,42 @@ impl SessionActor {
                     // Intermediate tool_call/tool_result messages are NOT saved
                     // to avoid tool_call ID collisions when multiple overflow
                     // tasks run concurrently (e.g. two deep_search_0 IDs).
-                    {
+                    //
+                    // Capture the committed seq + timestamp so the outbound
+                    // fanout below can carry `_session_result` metadata. The
+                    // ApiChannel routes that metadata through
+                    // `broadcast_session_event` → watchers, which survives
+                    // the primary turn's SSE stream completion. Without this,
+                    // the overflow reply would only route through
+                    // `pending[session_id]` — already removed when the
+                    // primary turn completed — and would be silently dropped
+                    // (FA-11 defect B).
+                    let final_reply_timestamp = chrono::Utc::now();
+                    let final_reply = Message {
+                        role: MessageRole::Assistant,
+                        content: final_content.clone(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: conv_response.reasoning_content.clone(),
+                        client_message_id: None,
+                        timestamp: final_reply_timestamp,
+                    };
+                    let committed_seq = {
                         let mut handle = session_handle.lock().await;
-                        let final_reply = Message {
-                            role: MessageRole::Assistant,
-                            content: final_content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: conv_response.reasoning_content.clone(),
-                            client_message_id: None,
-                            timestamp: chrono::Utc::now(),
-                        };
-                        let _ = handle.add_message(final_reply).await;
-                    }
+                        handle
+                            .add_message_with_seq(final_reply)
+                            .await
+                            .map_err(|error| {
+                                warn!(
+                                    session = %session_key,
+                                    error = %error,
+                                    "failed to persist overflow assistant message"
+                                );
+                                error
+                            })
+                            .ok()
+                    };
 
                     let reply = strip_think_tags(&final_content);
                     // Prepend thinking content when show_thinking is enabled
@@ -4311,15 +5008,60 @@ impl SessionActor {
                             .as_ref()
                             .is_some_and(|sr| sr.message_id.is_some());
 
-                    if !reply.trim().is_empty() && !already_streamed {
+                    // FA-12 defect C: `already_streamed` is an unreliable
+                    // "content already delivered" signal for ApiChannel —
+                    // its `send_with_id` always returns `Some("sse-{chat_id}")`
+                    // so the first stream_forwarder flush marks the overflow
+                    // as "streamed", even if subsequent chunks silently no-op
+                    // because `pending[chat_id]` was removed by the primary
+                    // turn's `_completion`. Decouple the durable metadata
+                    // emission from the user-facing content rendering: when
+                    // we have a committed seq, always emit `_session_result`
+                    // metadata so `ApiChannel::send` routes via
+                    // `broadcast_session_event` → watchers (the durable
+                    // fanout that survives primary-turn completion). When
+                    // the channel already rendered the content inline, emit
+                    // with empty body so non-API channels don't produce a
+                    // duplicate bubble and the web side doesn't double-render.
+                    let have_durable_metadata = committed_seq.is_some();
+                    let should_emit =
+                        !reply.trim().is_empty() && (have_durable_metadata || !already_streamed);
+
+                    if should_emit {
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert(
+                            "_history_persisted".to_string(),
+                            serde_json::Value::Bool(committed_seq.is_some()),
+                        );
+                        if let Some(topic) = session_key.topic() {
+                            metadata.insert("topic".to_string(), serde_json::Value::from(topic));
+                        }
+                        if let Some(seq) = committed_seq {
+                            metadata.insert(
+                                "_session_result".to_string(),
+                                serde_json::json!({
+                                    "seq": seq,
+                                    "role": "assistant",
+                                    "content": reply.clone(),
+                                    "timestamp": final_reply_timestamp.to_rfc3339(),
+                                    "media": Vec::<String>::new(),
+                                    "response_to_client_message_id": overflow_reply_to.clone(),
+                                }),
+                            );
+                        }
+                        let outbound_content = if already_streamed {
+                            String::new()
+                        } else {
+                            reply
+                        };
                         let _ = out_tx
                             .send(OutboundMessage {
                                 channel: channel.clone(),
                                 chat_id: chat_id.clone(),
-                                content: reply,
+                                content: outbound_content,
                                 reply_to: overflow_reply_to.clone(),
                                 media: vec![],
-                                metadata: serde_json::json!({}),
+                                metadata: serde_json::Value::Object(metadata),
                             })
                             .await;
                     }
@@ -4330,6 +5072,7 @@ impl SessionActor {
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
                         &session_key,
+                        &data_dir,
                         &out_tx,
                         &channel,
                         &chat_id,
@@ -4345,6 +5088,7 @@ impl SessionActor {
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
                         &session_key,
+                        &data_dir,
                         &out_tx,
                         &channel,
                         &chat_id,
@@ -4389,6 +5133,33 @@ impl SessionActor {
             Ok(p) => p,
             Err(_) => return, // semaphore closed
         };
+
+        // M8.6 per-turn worktree-missing check: the spawn-time sanitize runs
+        // exactly once when the actor is created and cached in
+        // ActorRegistry. If the workspace dir is deleted out-of-band between
+        // turns, the cached actor would otherwise serve a stale in-memory
+        // transcript whose tool calls reference state that no longer exists.
+        // Clear the transcript and recreate the workspace so the next LLM
+        // call starts from a known-empty state.
+        if !self.user_workspace.exists() {
+            warn!(
+                session = %self.session_key,
+                path = %self.user_workspace.display(),
+                "per-turn worktree check: workspace missing on disk — \
+                 clearing in-memory transcript before next LLM call"
+            );
+            {
+                let mut handle = self.session_handle.lock().await;
+                handle.clear_messages_for_unsafe_resume();
+            }
+            if let Err(e) = std::fs::create_dir_all(&self.user_workspace) {
+                warn!(
+                    session = %self.session_key,
+                    path = %self.user_workspace.display(),
+                    "per-turn worktree check: failed to recreate workspace: {e}"
+                );
+            }
+        }
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
@@ -4706,7 +5477,7 @@ impl SessionActor {
                                 if let Some(ref si) = self.status_indicator {
                                     let _ = si
                                         .channel()
-                                        .edit_message(&self.chat_id, mid, &display_content)
+                                        .finish_stream(&self.chat_id, mid, &display_content)
                                         .await;
                                 }
                                 true
@@ -4741,6 +5512,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -4757,6 +5529,7 @@ impl SessionActor {
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
                     &self.session_key,
+                    &self.data_dir,
                     &self.out_tx,
                     &self.channel,
                     &self.chat_id,
@@ -4930,6 +5703,97 @@ mod tests {
         assert_eq!(
             strip_invoke_tags("a<invoke name=\"cron\" args='{}' />b"),
             "ab"
+        );
+    }
+
+    /// Gap 3.2 — when a tool surfaced `node_costs` via
+    /// `ToolResult.structured_metadata`, `process_inbound`'s metadata
+    /// builder must concatenate every row across tool results so the
+    /// SSE `done` event carries the per-node cost array. Tested through
+    /// the same `collect_node_costs` helper `process_inbound` calls.
+    #[test]
+    fn collect_node_costs_concatenates_rows_from_multiple_tool_results() {
+        let tool_results = vec![
+            (
+                "call_pipeline_1".to_string(),
+                serde_json::json!({
+                    "node_costs": [
+                        {"node_id": "draft",  "tokens_in": 320, "tokens_out": 110, "actual_usd": 0.0008},
+                        {"node_id": "refine", "tokens_in": 540, "tokens_out": 220, "actual_usd": 0.0032},
+                    ]
+                }),
+            ),
+            (
+                "call_pipeline_2".to_string(),
+                serde_json::json!({
+                    "node_costs": [
+                        {"node_id": "synthesize", "tokens_in": 720, "tokens_out": 410, "actual_usd": 0.0091}
+                    ]
+                }),
+            ),
+        ];
+
+        let collected = collect_node_costs(&tool_results);
+        assert_eq!(collected.len(), 3, "rows from both pipelines must merge");
+        assert_eq!(
+            collected[0].get("node_id").and_then(|v| v.as_str()),
+            Some("draft")
+        );
+        assert_eq!(
+            collected[2].get("node_id").and_then(|v| v.as_str()),
+            Some("synthesize")
+        );
+    }
+
+    /// When no tool produced cost rows, the helper returns an empty vector
+    /// so the calling code can omit the `node_costs` key from the SSE
+    /// payload entirely (legacy clients see byte-identical events).
+    #[test]
+    fn collect_node_costs_returns_empty_when_no_tool_surfaced_metadata() {
+        let tool_results: Vec<(String, serde_json::Value)> = Vec::new();
+        assert!(collect_node_costs(&tool_results).is_empty());
+
+        let unrelated = vec![(
+            "call_other_tool".to_string(),
+            serde_json::json!({"some_other_key": "value"}),
+        )];
+        assert!(collect_node_costs(&unrelated).is_empty());
+    }
+
+    /// End-to-end shape — drop the helper output into the same
+    /// `completion_meta` builder shape used by `process_inbound` and
+    /// confirm the SSE payload carries `node_costs`.
+    #[test]
+    fn completion_meta_carries_node_costs_when_tool_results_have_metadata() {
+        let tool_results = vec![(
+            "call_pipeline_1".to_string(),
+            serde_json::json!({
+                "node_costs": [
+                    {"node_id": "draft", "tokens_in": 320, "tokens_out": 110, "actual_usd": 0.0008}
+                ]
+            }),
+        )];
+
+        let collected = collect_node_costs(&tool_results);
+        let mut meta = serde_json::json!({
+            "_completion": true,
+            "tokens_in": 320,
+            "tokens_out": 110,
+        });
+        if !collected.is_empty() {
+            meta.as_object_mut().unwrap().insert(
+                "node_costs".to_string(),
+                serde_json::Value::Array(collected),
+            );
+        }
+        let arr = meta
+            .get("node_costs")
+            .and_then(|v| v.as_array())
+            .expect("completion_meta must carry node_costs once a tool surfaced rows");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("node_id").and_then(|v| v.as_str()),
+            Some("draft")
         );
     }
 
@@ -5396,6 +6260,145 @@ mod tests {
         }
     }
 
+    /// Mock LLM provider that scripts a sequence of responses (like
+    /// `DelayedMockProvider`) AND emits a single `StreamChunk` through the
+    /// task-local `TASK_REPORTER` before returning each one. The stream
+    /// chunk drives the overflow's `stream_forwarder` to call
+    /// `channel.send_with_id`, so `stream_result.message_id` captures
+    /// whatever that channel returns — exercising the API-channel path
+    /// where `send_with_id` returns `Some("sse-{chat_id}")` and therefore
+    /// triggers the `already_streamed` guard in `serve_overflow`.
+    struct StreamingMockProvider {
+        responses: std::sync::Mutex<Vec<(Duration, String, ChatResponse)>>,
+        name: String,
+    }
+
+    impl StreamingMockProvider {
+        fn new(name: &str, responses: Vec<(Duration, String, ChatResponse)>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let (delay, stream_chunk, response) = {
+                let mut responses = self.responses.lock().unwrap();
+                if responses.is_empty() {
+                    return Ok(ChatResponse {
+                        content: Some("(no more scripted responses)".into()),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        stop_reason: StopReason::EndTurn,
+                        usage: TokenUsage::default(),
+                        provider_index: None,
+                    });
+                }
+                responses.remove(0)
+            };
+            // Push a `StreamChunk` into the task-local reporter so the
+            // stream_forwarder sees it and calls `channel.send_with_id`.
+            // `try_with` fails open when no reporter is scoped (e.g. when
+            // called outside the overflow's TASK_REPORTER scope).
+            if !stream_chunk.is_empty() {
+                if let Ok(reporter) = octos_agent::TASK_REPORTER.try_with(|r| r.clone()) {
+                    reporter.report(octos_agent::ProgressEvent::StreamChunk {
+                        text: stream_chunk,
+                        iteration: 1,
+                    });
+                    // Give the stream_forwarder a chance to flush the chunk
+                    // through the channel (mimics real streaming latency).
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            Ok(response)
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            &self.name
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    /// Mimics `ApiChannel::send_with_id`, which always returns
+    /// `Some("sse-{chat_id}")` so the stream forwarder switches to
+    /// `edit_message` for subsequent chunks. `edit_message` is a no-op
+    /// here — equivalent to `pending[chat_id]` having been removed after
+    /// the primary turn emitted its `_completion` marker. This setup
+    /// reproduces FA-12 defect C exactly: the forwarder believes content
+    /// was streamed (message_id is `Some`), but the web client's pending
+    /// SSE channel never received the chunks.
+    struct FakeSseChannel {
+        name: String,
+    }
+
+    impl FakeSseChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl octos_bus::Channel for FakeSseChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn start(
+            &self,
+            _inbound_tx: tokio::sync::mpsc::Sender<InboundMessage>,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, _msg: &OutboundMessage) -> eyre::Result<()> {
+            // No-op: the real ApiChannel writes to `pending[chat_id]` which
+            // is removed when the primary turn emits `_completion`. We
+            // simulate the "pending is already gone" state by dropping
+            // everything silently.
+            Ok(())
+        }
+
+        async fn send_with_id(&self, msg: &OutboundMessage) -> eyre::Result<Option<String>> {
+            // Mirror ApiChannel::send_with_id exactly — always return
+            // Some("sse-{chat_id}"), flipping `stream_result.message_id`
+            // to Some and triggering the FA-12d defective branch.
+            Ok(Some(format!("sse-{}", msg.chat_id)))
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _new_content: &str,
+        ) -> eyre::Result<()> {
+            Ok(())
+        }
+
+        fn supports_edit(&self) -> bool {
+            true
+        }
+    }
+
     struct ErrorMockProvider {
         name: String,
         error: String,
@@ -5545,7 +6548,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -5561,6 +6564,9 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5613,7 +6619,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout,
@@ -5629,6 +6635,9 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5687,7 +6696,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -5703,6 +6712,9 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5808,7 +6820,7 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
-            data_dir: std::path::PathBuf::from("/tmp"),
+            data_dir: dir.path().to_path_buf(),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
             session_timeout: Duration::from_secs(120),
@@ -5824,6 +6836,9 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -5941,6 +6956,9 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: Some(cron_tool),
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
@@ -6014,6 +7032,97 @@ mod tests {
             status_indicator: None,
             sender_user_id: None,
             user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Speculative,
+            responsiveness,
+            adaptive_router: Some(router),
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    /// Variant of `setup_speculative_actor` that wires a real
+    /// `StatusComposer` backed by a caller-supplied `Channel`. Used by the
+    /// FA-12d regression test to route the overflow stream through a
+    /// channel whose `send_with_id` returns `Some("sse-{chat_id}")`, so
+    /// `stream_result.message_id.is_some()` evaluates to true.
+    async fn setup_speculative_actor_with_indicator(
+        agent_provider: Arc<dyn LlmProvider>,
+        router_providers: Vec<Arc<dyn LlmProvider>>,
+        status_channel: Arc<dyn octos_bus::Channel>,
+        reply_channel: &str,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+
+        let agent = Agent::new(AgentId::new("test-spec-api"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let router = Arc::new(
+            AdaptiveRouter::new(router_providers, &[], AdaptiveConfig::default())
+                .with_adaptive_config(AdaptiveMode::Hedge, false),
+        );
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let mut responsiveness = ResponsivenessObserver::new();
+        for _ in 0..5 {
+            responsiveness.record(Duration::from_millis(500));
+        }
+
+        // StatusComposer with our fake SSE channel — its `.channel()` is used
+        // by `run_stream_forwarder` to send/edit streaming chunks.
+        let status_indicator =
+            Arc::new(StatusComposer::new(status_channel, vec!["Thinking".into()]));
+
+        let session_key = SessionKey::new(reply_channel, "test-api-chat");
+        let actor = SessionActor {
+            session_key: session_key.clone(),
+            channel: reply_channel.to_string(),
+            chat_id: "test-api-chat".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(dir.path(), &session_key))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: Some(status_indicator),
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
             data_dir: std::path::PathBuf::from("/tmp"),
             max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
             idle_timeout: Duration::from_secs(60),
@@ -6030,10 +7139,32 @@ mod tests {
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
+            persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            retry_state_path: None,
+            recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         };
 
         let handle = tokio::spawn(actor.run());
         (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    /// Inbound helper that matches the fake SSE channel's chat_id.
+    fn make_inbound_api(content: &str, reply_channel: &str) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: reply_channel.to_string(),
+                chat_id: "test-api-chat".to_string(),
+                sender_id: "user".to_string(),
+                content: content.to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+                message_id: Some("client-msg-bravo".to_string()),
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        }
     }
 
     /// Core speculative overflow test:
@@ -6237,12 +7368,25 @@ mod tests {
         tx.send(make_inbound("What is 37 * 53?")).await.unwrap();
 
         // ── Phase 3: Collect all responses ──
-        // We expect 2 responses: overflow answer + slow primary answer (in some order)
+        // We expect 2 user-facing responses: overflow answer + slow primary
+        // answer (in some order). Skip metadata-only outbounds (the
+        // user-message session_result emission added by #616 fix carries
+        // routing metadata in `_session_result` but no body).
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while responses.len() < 2 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => responses.push(msg.content),
+                Ok(Some(msg)) => {
+                    let is_user_session_result = msg
+                        .metadata
+                        .get("_session_result")
+                        .and_then(|r| r.get("role"))
+                        .and_then(|v| v.as_str())
+                        == Some("user");
+                    if !is_user_session_result {
+                        responses.push(msg.content);
+                    }
+                }
                 Ok(None) => break,
                 Err(_) => break, // timeout
             }
@@ -6304,6 +7448,564 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    /// FA-11 defect B regression: the overflow assistant reply MUST carry
+    /// `_session_result` metadata so `ApiChannel::send` can route it via
+    /// `broadcast_session_event → watchers`. Without this metadata the reply
+    /// routes only through `pending[session_id]`, which was removed when
+    /// the primary turn emitted its `_completion` marker — so the overflow
+    /// reply was silently dropped.
+    #[tokio::test]
+    async fn should_emit_session_result_metadata_for_overflow_reply() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent: 5 fast warmups + slow (12s) primary + fast overflow response.
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("slow primary answer"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("overflow FA12 result payload"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warmup to establish responsiveness baseline.
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Slow primary prompt.
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+
+        // Wait past patience (10s) so the second prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("please answer FA-12 probe"))
+            .await
+            .unwrap();
+
+        // Collect OutboundMessage records until we've seen both non-empty
+        // replies (overflow + slow primary).
+        let mut outbound_replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while outbound_replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        outbound_replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert!(
+            outbound_replies.len() >= 2,
+            "expected at least 2 replies (overflow + primary), got {}: {:?}",
+            outbound_replies.len(),
+            outbound_replies
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let overflow = outbound_replies
+            .iter()
+            .find(|msg| msg.content.contains("FA12") || msg.content.contains("overflow"))
+            .expect("overflow reply not found");
+        let session_result = overflow.metadata.get("_session_result").unwrap_or_else(|| {
+            panic!(
+                "overflow outbound must carry `_session_result` metadata — \
+                 got metadata = {}",
+                overflow.metadata
+            )
+        });
+        assert_eq!(
+            session_result.get("role").and_then(|v| v.as_str()),
+            Some("assistant"),
+            "session_result role must be 'assistant'"
+        );
+        assert!(
+            session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq, got {}",
+            session_result
+        );
+        assert!(
+            session_result
+                .get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("FA12") || s.contains("overflow")),
+            "session_result.content must match reply content, got {}",
+            session_result
+        );
+        assert!(
+            session_result.get("timestamp").is_some(),
+            "session_result must include rfc3339 timestamp, got {}",
+            session_result
+        );
+        assert!(
+            overflow
+                .metadata
+                .get("_history_persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "overflow outbound must flag history as persisted"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// #616 regression: the overflow USER message must emit `_session_result`
+    /// metadata so the web client can bind streaming response tokens to the
+    /// overflow user-message bubble. Without this signal, when a fast follow-up
+    /// arrives mid-primary-turn, the web client receives streaming tokens with
+    /// no way to route them to the second user's bubble — the response renders
+    /// nowhere (or worse, overwrites the primary's bubble).
+    ///
+    /// 14ac3f3a removed this emission on the assumption that timestamp-primary
+    /// sort handles ordering. True for ordering, false for routing — both
+    /// roles are needed and they're complementary, not exclusive.
+    #[tokio::test]
+    async fn should_emit_session_result_for_overflow_user_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (Duration::from_secs(12), make_response("slow primary")),
+                (Duration::from_millis(400), make_response("overflow body")),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warmup so responsiveness baseline is established.
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Slow primary.
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+
+        // Sleep past patience so the second prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        // Fast follow-up with a known client_message_id so we can assert it
+        // round-trips on the session_result event. Construct the Inbound
+        // variant inline so we can set message_id (= client_message_id on the
+        // wire from api_channel.rs:1222 — see #616 audit).
+        let overflow_inbound = ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: "the overflow user question".to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                // Both fields carry client_message_id in production: api_channel
+                // sets metadata["client_message_id"] (which `inbound_client_message_id`
+                // reads) and message_id (which becomes overflow_reply_to). Mirror
+                // both so we exercise the same path.
+                metadata: serde_json::json!({
+                    "client_message_id": "client-msg-overflow-test",
+                }),
+                message_id: Some("client-msg-overflow-test".to_string()),
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        };
+        tx.send(overflow_inbound).await.unwrap();
+
+        // Collect outbound until we see a user-role session_result (which is
+        // the overflow user-message emission we're asserting on).
+        let mut user_session_result: Option<serde_json::Value> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while user_session_result.is_none() {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if let Some(result) = msg.metadata.get("_session_result") {
+                        if result.get("role").and_then(|v| v.as_str()) == Some("user") {
+                            user_session_result = Some(result.clone());
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let result = user_session_result.unwrap_or_else(|| {
+            panic!("overflow user message must emit _session_result with role=user")
+        });
+
+        assert_eq!(
+            result.get("role").and_then(|v| v.as_str()),
+            Some("user"),
+            "role must be user"
+        );
+        assert!(
+            result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq for the user message"
+        );
+        assert_eq!(
+            result.get("content").and_then(|v| v.as_str()),
+            Some("the overflow user question"),
+            "content must mirror the overflow user message"
+        );
+        assert_eq!(
+            result.get("client_message_id").and_then(|v| v.as_str()),
+            Some("client-msg-overflow-test"),
+            "client_message_id must round-trip from inbound — this is what the \
+             web client uses to bind subsequent streaming tokens to the \
+             overflow user bubble"
+        );
+        assert!(
+            result.get("timestamp").is_some(),
+            "session_result must include rfc3339 timestamp"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// Regression: when the speculative path serves an overflow during a slow
+    /// primary, the primary turn's final assistant reply must NOT be wrapped
+    /// in the legacy "⬆️ Earlier task completed:" prefix. Users misread the
+    /// prefix as a stray prior reply when it actually meant "I also processed
+    /// your follow-up below in parallel" — so the prefix is gone and tool
+    /// chips / message timeline carry the same meaning unambiguously.
+    #[tokio::test]
+    async fn should_drop_earlier_task_completed_prefix_when_overflow_served() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("PRIMARY_REPLY_BODY_marker"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("OVERFLOW_REPLY_BODY_marker"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        tx.send(make_inbound("please run a big analysis"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound("name follow-up")).await.unwrap();
+
+        let mut replies: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while replies.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if !msg.content.trim().is_empty() {
+                        replies.push(msg);
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Confirm both replies arrived (sanity for the overflow scenario).
+        assert!(
+            replies.len() >= 2,
+            "expected primary + overflow replies, got {}",
+            replies.len()
+        );
+
+        // No reply should carry the legacy prefix any longer.
+        for reply in &replies {
+            assert!(
+                !reply.content.contains("Earlier task completed"),
+                "legacy '⬆️ Earlier task completed:' prefix must be dropped, \
+                 but reply contained it: {}",
+                reply.content
+            );
+        }
+
+        // The primary reply must surface its body unchanged (no leading
+        // boilerplate that the user has to read past).
+        let primary = replies
+            .iter()
+            .find(|m| m.content.contains("PRIMARY_REPLY_BODY_marker"))
+            .expect("primary reply not found in collected outbound messages");
+        assert!(
+            primary.content.starts_with("PRIMARY_REPLY_BODY_marker"),
+            "primary reply must start with its own body (no prefix), got: {}",
+            primary.content
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// FA-12d defect-C regression: when the overflow runs against an
+    /// `ApiChannel`-like transport (whose `send_with_id` always returns
+    /// `Some("sse-{chat_id}")`) and the stream forwarder has flushed at
+    /// least one chunk, the old code set `already_streamed = true` and
+    /// silently skipped the `_session_result` emission — leaving the web
+    /// client's Q2 bubble blank. The durable watchers fanout only fires
+    /// when `ApiChannel::send` sees `_session_result` metadata, so the
+    /// emission MUST happen regardless of `stream_result.message_id`.
+    ///
+    /// Guards the fix that decouples the durable metadata emission from
+    /// the user-facing content rendering: the `_session_result` fanout
+    /// always runs; only the outbound content body is suppressed when the
+    /// channel already streamed the reply inline.
+    #[tokio::test]
+    async fn should_emit_session_result_metadata_for_api_channel_overflow_when_already_streamed() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Agent LLM: 5 fast warmups, slow (12s) primary, and a streaming
+        // overflow response. `StreamingMockProvider` pushes a `StreamChunk`
+        // into `TASK_REPORTER` before each response — on the overflow call
+        // that flows through `run_stream_forwarder` →
+        // `FakeSseChannel::send_with_id` → sets `message_id = Some(...)`,
+        // so `stream_result.message_id.is_some() == true` and the
+        // `already_streamed` branch is entered.
+        //
+        // `serve_overflow` invokes `agent.process_message_tracked` (NOT
+        // the adaptive router) for the overflow, so the agent's provider
+        // must emit the streaming chunk on the overflow call.
+        let agent_llm = Arc::new(StreamingMockProvider::new(
+            "agent-api",
+            vec![
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup1"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup2"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup3"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup4"),
+                ),
+                (
+                    Duration::from_millis(200),
+                    String::new(),
+                    make_response("warmup5"),
+                ),
+                (
+                    Duration::from_secs(12),
+                    String::new(),
+                    make_response("slow primary answer"),
+                ),
+                (
+                    Duration::from_millis(300),
+                    "streaming chunk".into(),
+                    make_response("FA12d overflow BRAVO answer"),
+                ),
+            ],
+        ));
+
+        // AdaptiveRouter providers are unused by the overflow path
+        // (`serve_overflow` calls the agent directly) but the actor
+        // requires the router to be wired so speculative mode is enabled.
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let status_channel: Arc<dyn octos_bus::Channel> = Arc::new(FakeSseChannel::new("api"));
+        let (tx, mut rx, handle, _session_mgr) = setup_speculative_actor_with_indicator(
+            agent_llm,
+            vec![router_a, router_b],
+            status_channel,
+            "api",
+            &dir,
+        )
+        .await;
+
+        // Warmup loop to establish responsiveness baseline; drain replies
+        // from the channel as they come in (don't filter on content since
+        // the new fix may emit empty-content OutboundMessages alongside
+        // session_result metadata).
+        for i in 0..5 {
+            tx.send(make_inbound_api(&format!("warmup {i}"), "api"))
+                .await
+                .unwrap();
+            // Drain until we see a _completion marker or timeout.
+            let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(Some(msg)) = tokio::time::timeout_at(warmup_deadline, rx.recv()).await {
+                if msg.metadata.get("_completion").is_some() {
+                    break;
+                }
+            }
+        }
+
+        // Slow primary prompt.
+        tx.send(make_inbound_api("please run a big analysis", "api"))
+            .await
+            .unwrap();
+
+        // Wait past patience (10s) so the next prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        tx.send(make_inbound_api("please answer FA-12d probe", "api"))
+            .await
+            .unwrap();
+
+        // Collect every OutboundMessage until we find one carrying the
+        // overflow's `_session_result` metadata, or we timeout.
+        let mut outbound_log: Vec<OutboundMessage> = Vec::new();
+        let mut overflow_emission: Option<OutboundMessage> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let carries_overflow_session_result = msg
+                        .metadata
+                        .get("_session_result")
+                        .and_then(|sr| sr.get("content"))
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|s| s.contains("FA12d") || s.contains("BRAVO"));
+                    outbound_log.push(msg.clone());
+                    if carries_overflow_session_result {
+                        overflow_emission = Some(msg);
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let overflow = overflow_emission.unwrap_or_else(|| {
+            panic!(
+                "expected an overflow OutboundMessage carrying `_session_result` \
+                 metadata via watchers fanout, got {} messages: {:?}",
+                outbound_log.len(),
+                outbound_log
+                    .iter()
+                    .map(|m| format!("content={:?} metadata={}", m.content, m.metadata))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+        let session_result = overflow
+            .metadata
+            .get("_session_result")
+            .expect("overflow must carry _session_result metadata");
+        assert_eq!(
+            session_result.get("role").and_then(|v| v.as_str()),
+            Some("assistant"),
+            "session_result role must be 'assistant'"
+        );
+        assert!(
+            session_result.get("seq").and_then(|v| v.as_u64()).is_some(),
+            "session_result must include committed seq, got {session_result}"
+        );
+        assert_eq!(
+            session_result
+                .get("response_to_client_message_id")
+                .and_then(|v| v.as_str()),
+            Some("client-msg-bravo"),
+            "session_result must carry response_to_client_message_id so \
+             the web reducer can merge into the optimistic Q2 bubble"
+        );
+        assert!(
+            overflow
+                .metadata
+                .get("_history_persisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "overflow outbound must flag history as persisted"
+        );
+        // When the channel already streamed the chunks (ApiChannel path),
+        // the durable emission omits the content body so non-API channels
+        // don't duplicate the bubble and the web doesn't double-render.
+        // The full reply is still captured inside `_session_result.content`.
+        assert!(
+            overflow.content.is_empty() || overflow.content == "FA12d overflow BRAVO answer",
+            "expected empty OR full-content body when already_streamed=true, got {:?}",
+            overflow.content
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     /// Test that messages within patience threshold are NOT served as overflow.
     #[tokio::test]
     async fn test_speculative_within_patience_serves_both() {
@@ -6348,11 +8050,22 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         tx.send(make_inbound("quick question")).await.unwrap();
 
-        // Collect responses — should get 2 (both overflow and primary)
+        // Collect responses — should get 2 (both overflow and primary).
+        // Skip metadata-only outbounds (the user-message session_result
+        // emission added by the #616 fix carries routing metadata in
+        // `_session_result` but no body).
         let mut responses = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
-            responses.push(msg.content);
+            let is_user_session_result = msg
+                .metadata
+                .get("_session_result")
+                .and_then(|r| r.get("role"))
+                .and_then(|v| v.as_str())
+                == Some("user");
+            if !is_user_session_result {
+                responses.push(msg.content);
+            }
         }
 
         assert_eq!(
@@ -6986,6 +8699,81 @@ mod tests {
             assert!(user_messages.contains(&"msg-b"));
             assert!(user_messages.contains(&"msg-c"));
         }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// M8.10-A: the primary-turn `_completion` OutboundMessage MUST carry
+    /// `committed_seq` so the API channel can thread it onto the SSE `done`
+    /// event. Without this, web clients can't populate `historySeq` on
+    /// live-streamed bubbles and they float to the end of the list.
+    #[tokio::test]
+    async fn primary_turn_completion_metadata_includes_committed_seq() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Single fast reply so the primary turn completes quickly and emits
+        // `_completion` metadata.
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("primary turn reply"),
+            )],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let status_channel: Arc<dyn octos_bus::Channel> = Arc::new(FakeSseChannel::new("api"));
+        let (tx, mut rx, handle, _session_mgr) = setup_speculative_actor_with_indicator(
+            agent_llm,
+            vec![router_a, router_b],
+            status_channel,
+            "api",
+            &dir,
+        )
+        .await;
+
+        tx.send(make_inbound_api("hello", "api")).await.unwrap();
+
+        // Drain until we see the primary-turn `_completion` marker.
+        let mut completion: Option<OutboundMessage> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if msg.metadata.get("_completion").is_some() {
+                        completion = Some(msg);
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let completion =
+            completion.expect("expected a `_completion` OutboundMessage from primary turn");
+        let seq = completion
+            .metadata
+            .get("committed_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| {
+                panic!(
+                    "primary-turn _completion metadata must carry `committed_seq`; got {}",
+                    completion.metadata
+                )
+            });
+        // Seq is a position index — must point past the user message (seq 0).
+        assert!(
+            seq >= 1,
+            "committed_seq must reference the persisted assistant slot, got {seq}"
+        );
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -7693,6 +9481,537 @@ mod tests {
                 "请同步等待完成，不要后台。对这个主题做深度研究并直接在这里输出。"
             ),
             None
+        );
+    }
+
+    /// Speculative-overflow stale-history regression: when the primary turn
+    /// finishes quickly (its assistant reply lands in session history before
+    /// the deadline), the overflow's history snapshot must reflect that fresh
+    /// reply rather than the pre-primary one captured before the primary
+    /// agent even started.
+    #[tokio::test]
+    async fn should_refresh_overflow_history_when_primary_finishes_quickly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "stale-history-fast");
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(dir.path(), &key)));
+
+        // Pre-primary history: 1 user + 1 assistant exchange.
+        {
+            let mut handle = session_handle.lock().await;
+            handle
+                .add_message(Message::user("hi"))
+                .await
+                .expect("seed user");
+            handle
+                .add_message(Message::assistant("hello, where to?"))
+                .await
+                .expect("seed assistant");
+        }
+        // Simulate process_inbound_speculative: primary user msg saved before
+        // primary spawn.
+        {
+            let mut handle = session_handle.lock().await;
+            handle
+                .add_message(Message::user("saratoga"))
+                .await
+                .expect("seed primary user");
+        }
+        // Pre-primary snapshot (without primary user msg, matching how
+        // process_inbound_speculative builds overflow_history).
+        let pre_primary_assistant_count = 1;
+
+        // Spawn a task that simulates the primary finishing and its assistant
+        // reply landing 200ms later.
+        let writer_handle = Arc::clone(&session_handle);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut handle = writer_handle.lock().await;
+            let _ = handle
+                .add_message(Message::assistant("Saratoga: 72°F sunny"))
+                .await;
+        });
+
+        let snapshot = wait_for_primary_assistant_reply(
+            &session_handle,
+            50,
+            pre_primary_assistant_count,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        // Snapshot must include the primary's fresh assistant reply.
+        assert!(
+            snapshot
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::Assistant)
+                    && m.content.contains("Saratoga")),
+            "snapshot must include primary's fresh assistant reply, got {:?}",
+            snapshot
+                .iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Speculative-overflow deadline regression: if the primary turn is still
+    /// running when the deadline elapses (no new assistant reply landed), the
+    /// helper must fall through with whatever snapshot is available rather
+    /// than blocking the overflow indefinitely.
+    #[tokio::test]
+    async fn should_fall_through_with_pre_primary_history_when_primary_slow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "stale-history-slow");
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(dir.path(), &key)));
+
+        // Pre-primary history: 1 user + 1 assistant exchange.
+        {
+            let mut handle = session_handle.lock().await;
+            handle
+                .add_message(Message::user("hi"))
+                .await
+                .expect("seed user");
+            handle
+                .add_message(Message::assistant("hello, where to?"))
+                .await
+                .expect("seed assistant");
+        }
+        let pre_primary_assistant_count = 1;
+
+        // No writer task — the helper must time out.
+        let started = std::time::Instant::now();
+        let snapshot = wait_for_primary_assistant_reply(
+            &session_handle,
+            50,
+            pre_primary_assistant_count,
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        // Helper must exit within ~deadline + one poll interval, not block forever.
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "helper must fall through within deadline, took {}ms",
+            elapsed.as_millis()
+        );
+        // Snapshot equals the pre-primary log (no new assistant landed).
+        let snapshot_assistant_count = snapshot
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Assistant))
+            .count();
+        assert_eq!(
+            snapshot_assistant_count,
+            pre_primary_assistant_count,
+            "no new assistant message should be present, got {:?}",
+            snapshot
+                .iter()
+                .map(|m| (m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// When the snapshot already has a fresh assistant message at call time,
+    /// the helper must return immediately without sleeping.
+    #[tokio::test]
+    async fn should_return_immediately_when_assistant_already_landed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "stale-history-immediate");
+        let session_handle = Arc::new(Mutex::new(SessionHandle::open(dir.path(), &key)));
+
+        // Seed pre_primary_assistant_count = 0; add 1 assistant before call.
+        {
+            let mut handle = session_handle.lock().await;
+            handle.add_message(Message::user("q")).await.expect("seed");
+            handle
+                .add_message(Message::assistant("a"))
+                .await
+                .expect("seed");
+        }
+
+        let started = std::time::Instant::now();
+        let snapshot = wait_for_primary_assistant_reply(
+            &session_handle,
+            50,
+            0,
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "helper must return immediately when condition already true, took {}ms",
+            elapsed.as_millis()
+        );
+        assert_eq!(snapshot.len(), 2);
+    }
+
+    // ── M8.9: Runtime failure recovery ─────────────────────────────────────
+
+    #[test]
+    fn recovery_prompt_includes_tool_name_and_error() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-1".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi"}),
+            error_message: "voice 'yangmi' not registered".into(),
+            suggested_alternatives: vec![],
+            parent_session_key: Some("api:test".into()),
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(prompt.starts_with("[system-internal]"));
+        assert!(prompt.contains("fm_tts"));
+        assert!(prompt.contains("voice 'yangmi' not registered"));
+        assert!(prompt.contains("path forward"));
+    }
+
+    #[test]
+    fn recovery_prompt_includes_alternatives_block_when_present() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-2".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::Value::Null,
+            error_message: "voice missing".into(),
+            suggested_alternatives: vec!["vivian".into(), "serena".into(), "longxiang".into()],
+            parent_session_key: None,
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(prompt.contains("Detected alternatives"));
+        assert!(prompt.contains("- vivian"));
+        assert!(prompt.contains("- serena"));
+        assert!(prompt.contains("- longxiang"));
+    }
+
+    #[test]
+    fn recovery_prompt_omits_alternatives_block_when_empty() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-3".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::Value::Null,
+            error_message: "internal error".into(),
+            suggested_alternatives: vec![],
+            parent_session_key: None,
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(!prompt.contains("Detected alternatives"));
+    }
+
+    #[test]
+    fn recovery_prompt_includes_tool_input_when_set() {
+        let signal = octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-4".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi", "text": "hello"}),
+            error_message: "voice missing".into(),
+            suggested_alternatives: vec![],
+            parent_session_key: None,
+        };
+        let prompt = build_recovery_prompt(&signal);
+        assert!(prompt.contains("Original input"));
+        assert!(prompt.contains("yangmi"));
+    }
+
+    #[tokio::test]
+    async fn should_enqueue_synthetic_recovery_turn_with_error_message() {
+        // End-to-end: a RecoveryHint pushed onto the inbox should drive a
+        // primary turn whose user/system content includes the recovery
+        // prompt, so the LLM (mock here) sees and responds to it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("acknowledging recovery"),
+            )],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm.clone(), QueueMode::Followup, None, false, &dir).await;
+
+        let prompt = build_recovery_prompt(&octos_agent::SpawnOnlyFailureSignal {
+            task_id: "task-rh-1".into(),
+            tool_name: "fm_tts".into(),
+            tool_input: serde_json::json!({"voice": "yangmi"}),
+            error_message: "voice 'yangmi' not registered. available: vivian, serena.".into(),
+            suggested_alternatives: vec!["vivian".into(), "serena".into()],
+            parent_session_key: Some("cli:test".into()),
+        });
+        tx.send(ActorMessage::RecoveryHint {
+            task_id: "task-rh-1".into(),
+            tool_name: "fm_tts".into(),
+            prompt,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if !responses.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            responses
+                .iter()
+                .any(|c| c.contains("acknowledging recovery")),
+            "expected LLM to produce recovery response, got: {:?}",
+            responses
+        );
+
+        // Verify the synthetic recovery prompt actually landed in history.
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let recovery_user_msgs: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::User
+                    && m.content.contains("[system-internal]")
+                    && m.content.contains("fm_tts")
+            })
+            .collect();
+        assert_eq!(
+            recovery_user_msgs.len(),
+            1,
+            "expected exactly one recovery prompt in history, got: {:?}",
+            session.messages
+        );
+        assert!(
+            recovery_user_msgs[0].content.contains("vivian"),
+            "recovery prompt should include parsed alternatives"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn should_not_enqueue_second_recovery_for_same_task_id() {
+        // Two RecoveryHints for the same task_id — only the first should
+        // produce a recovery turn. The second is silently dropped via the
+        // recovered_tasks claim slot.
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(50), make_response("first recovery")),
+                (Duration::from_millis(50), make_response("second recovery")),
+            ],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let prompt1 = "[system-internal] first recovery prompt".to_string();
+        let prompt2 = "[system-internal] second recovery prompt".to_string();
+        tx.send(ActorMessage::RecoveryHint {
+            task_id: "task-dup".into(),
+            tool_name: "fm_tts".into(),
+            prompt: prompt1,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(ActorMessage::RecoveryHint {
+            task_id: "task-dup".into(),
+            tool_name: "fm_tts".into(),
+            prompt: prompt2,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+        }
+        // Only the first recovery should have driven an LLM turn.
+        let first_seen = responses.iter().any(|c| c.contains("first recovery"));
+        let second_seen = responses.iter().any(|c| c.contains("second recovery"));
+        assert!(
+            first_seen,
+            "first recovery should have run: {:?}",
+            responses
+        );
+        assert!(
+            !second_seen,
+            "second recovery should have been suppressed: {:?}",
+            responses
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_failure_signal_generates_recovery_actor_message_end_to_end() {
+        // Full integration: install the failure-signal callback we set up
+        // in spawn(), trigger mark_failed, and assert the actor enqueues
+        // and processes a RecoveryHint.
+        use octos_agent::TaskSupervisor;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(50), make_response("recovery-handled"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        // Mirror the spawn() wiring: a TaskSupervisor whose failure signal
+        // dispatches a RecoveryHint into the actor inbox.
+        let supervisor = TaskSupervisor::new();
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+            });
+        });
+        let task_id = supervisor.register_with_input(
+            "fm_tts",
+            "call-int-1",
+            Some("cli:test"),
+            Some(serde_json::json!({"voice": "yangmi", "text": "hi"})),
+        );
+        supervisor.mark_failed(
+            &task_id,
+            "voice 'yangmi' not registered. available: vivian, serena.".into(),
+        );
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if responses.iter().any(|r| r.contains("recovery-handled")) {
+                break;
+            }
+        }
+        assert!(
+            responses.iter().any(|c| c.contains("recovery-handled")),
+            "expected recovery turn to drive an LLM response, got: {:?}",
+            responses
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let prompt_present = session.messages.iter().any(|m| {
+            m.role == MessageRole::User
+                && m.content.contains("[system-internal]")
+                && m.content.contains("fm_tts")
+                && m.content.contains("vivian")
+        });
+        assert!(
+            prompt_present,
+            "synthetic recovery prompt should be in session history: {:?}",
+            session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn actor_and_channel_persists_get_distinct_seqs_across_paths() {
+        // Pins the unified-serialisation contract for `SessionActor` and
+        // `ApiChannel::persist_to_session`. Pre-fix, the actor held its own
+        // `Arc<Mutex<SessionHandle>>` and called `add_message_with_seq`
+        // directly while `ApiChannel::persist_to_session` already routed
+        // through `persist_message_through_canonical_path`. The two paths
+        // held INDEPENDENT in-memory `messages` Vecs (the actor's grew
+        // forever, the channel always opened fresh from disk), so concurrent
+        // persists collided: the actor read `len = N` on its local Vec, the
+        // channel read disk-len `M`, both returned `seq = X` — duplicate
+        // seqs that broke watcher correlation.
+        //
+        // Post-fix, `persist_assistant_message` also routes through the
+        // canonical helper. Both paths contend on the per-key Tokio mutex
+        // and observe disk-canonical seqs, so concurrent persists across
+        // paths get distinct, monotonic seqs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = SessionKey::new("api", "actor-vs-channel");
+        let data_dir = dir.path().to_path_buf();
+
+        // Single shared actor handle (mirrors how `SessionActor` owns ONE
+        // long-lived `Arc<Mutex<SessionHandle>>` for the duration of the
+        // session). Pre-fix, a series of `add_message_with_seq` calls on
+        // this handle increment its local Vec — so seqs returned from this
+        // path collide with seqs returned from canonical-helper opens.
+        let actor_handle = std::sync::Arc::new(tokio::sync::Mutex::new(SessionHandle::open(
+            &data_dir, &key,
+        )));
+
+        const TOTAL: usize = 16;
+        let mut handles = Vec::with_capacity(TOTAL);
+
+        for i in 0..TOTAL {
+            let data_dir = data_dir.clone();
+            let key = key.clone();
+            let actor_handle = actor_handle.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // "Actor" path — uses the shared `Arc<Mutex<SessionHandle>>`.
+                    // Post-fix this call funnels through the canonical helper
+                    // so its seq is disk-canonical.
+                    let res = persist_assistant_message(
+                        &actor_handle,
+                        &key,
+                        &data_dir,
+                        format!("actor-{i}"),
+                        vec![],
+                    )
+                    .await;
+                    res.map(|p| p.seq)
+                } else {
+                    // "Channel" path — the canonical helper directly (this is
+                    // the same code `ApiChannel::persist_to_session` calls).
+                    let assistant = Message::assistant(format!("channel-{i}"));
+                    octos_bus::session::persist_message_through_canonical_path(
+                        &data_dir, &key, assistant,
+                    )
+                    .await
+                    .ok()
+                }
+            }));
+        }
+
+        let mut seqs = Vec::with_capacity(TOTAL);
+        for h in handles {
+            let seq = h.await.expect("join").expect("persist returned Some");
+            seqs.push(seq);
+        }
+        seqs.sort_unstable();
+
+        let unique: std::collections::HashSet<usize> = seqs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            TOTAL,
+            "actor + channel persists must each receive a distinct seq, got: {seqs:?}"
+        );
+        assert_eq!(
+            seqs,
+            (0..TOTAL).collect::<Vec<_>>(),
+            "seqs must form a contiguous 0..TOTAL range; got: {seqs:?}"
+        );
+
+        // Final disk transcript should hold all TOTAL messages.
+        let final_handle = SessionHandle::open(&data_dir, &key);
+        assert_eq!(
+            final_handle.session().messages.len(),
+            TOTAL,
+            "all persisted messages must land on disk: {:?}",
+            final_handle.session().messages
         );
     }
 }

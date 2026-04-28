@@ -1460,12 +1460,20 @@ pub(crate) fn config_from_profile(
         voice: None,
         mode: Default::default(),
         tunnel_domain: None,
+        base_domain: None,
         frps_server: None,
         allow_admin_shell: false,
         #[cfg(feature = "api")]
         dashboard_auth: None,
         #[cfg(feature = "api")]
         monitor: None,
+        // F-005: credential pool + content routing are per-profile
+        // fields on `ProfileConfig`; the flattened `Config` used by
+        // gateway consumers does not currently surface them, so leave
+        // these as `None`. Gateway runtime can still read them off
+        // `profile.config` directly when needed.
+        credential_pool: None,
+        content_routing: profile.config.content_routing.clone(),
     }
 }
 

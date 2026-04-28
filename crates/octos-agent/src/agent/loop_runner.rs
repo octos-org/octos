@@ -97,6 +97,80 @@ struct ShellRetryRecovery {
     content: String,
 }
 
+/// Coarse-grained control-flow hint returned by
+/// [`Agent::handle_loop_error_with_dispatch`]: the caller acts on this
+/// without having to re-match on [`LoopDecision`] at every error site.
+///
+/// Semantics:
+///   * `Retry` — the retry layer decided the loop should continue
+///     (optionally after compaction, which is performed inline for
+///     `CompactAndRetry`). The caller should `continue` its outer loop.
+///   * `Bail` — the error is structural, non-retryable, or the bucket
+///     for the variant has been exhausted. The caller must surface
+///     `Err(report)` to its own caller.
+///
+/// The in-band `RotateAndRetry` arm degrades to `Bail` in this release
+/// because no in-band credential-rotation hook is wired on `Agent` yet;
+/// lane rotation is already handled by the outer provider chain
+/// (`RetryProvider` → `AdaptiveRouter`) one layer down, so surfacing
+/// the error is safe — the next inbound message starts a fresh retry
+/// state anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopErrorAction {
+    /// Continue the outer agent loop with the next iteration.
+    Retry,
+    /// Abort the outer agent loop and surface `Err(report)`.
+    Bail,
+}
+
+/// Review A F-015 RAII guard. Loads a `LoopRetryState` from an optional
+/// shared `Arc<Mutex<...>>` at construction and writes back on drop so
+/// bucket counters persist across `process_message` / `run_task` calls
+/// for sessions that attach a persistent retry-state handle.
+///
+/// The loop body accesses the owned `state` field via `Deref`/`DerefMut`
+/// so existing code keeps its `&mut retry_state` call pattern.
+///
+/// Sessions that do not attach a handle see the legacy reset-per-turn
+/// behaviour — the guard just owns a fresh `LoopRetryState` and writes
+/// nowhere on drop.
+struct PersistentRetryStateGuard {
+    state: super::loop_state::LoopRetryState,
+    handle: Option<Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>>,
+}
+
+impl PersistentRetryStateGuard {
+    fn new(handle: Option<Arc<std::sync::Mutex<super::loop_state::LoopRetryState>>>) -> Self {
+        let state = handle
+            .as_ref()
+            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .unwrap_or_default();
+        Self { state, handle }
+    }
+}
+
+impl std::ops::Deref for PersistentRetryStateGuard {
+    type Target = super::loop_state::LoopRetryState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for PersistentRetryStateGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for PersistentRetryStateGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            let mut locked = handle.lock().unwrap_or_else(|e| e.into_inner());
+            *locked = self.state.clone();
+        }
+    }
+}
+
 impl Agent {
     /// Classify a raw error escaping the agent loop into a `HarnessError`,
     /// increment the `octos_loop_error_total{variant, recovery}` counter, and
@@ -202,7 +276,6 @@ impl Agent {
     /// still gets emitted, metrics still update, and the caller still owns
     /// the decision of whether to return `Err(report)` after the state
     /// machine has been driven.
-    #[allow(dead_code)]
     pub(crate) fn dispatch_loop_error(
         &self,
         error: &HarnessError,
@@ -226,6 +299,85 @@ impl Agent {
             }
         }
         decision
+    }
+
+    /// Run the harness error classifier, dispatch the classified error
+    /// through the `LoopRetryState` bucket machine, and return a coarse
+    /// [`LoopErrorAction`] the caller can act on with a plain
+    /// `match action { Retry => continue, Bail => return Err(e) }`.
+    ///
+    /// `CompactAndRetry` is handled in-band: the method calls
+    /// [`Self::maybe_run_turn_compaction`] before returning `Retry` so the
+    /// caller does not have to thread compaction state across error sites.
+    ///
+    /// This is the wiring seam added for Review A F-001. Prior to this
+    /// patch every error site in `process_message` / `run_task` classified
+    /// errors for metrics and then bailed with `Err(e)` unconditionally;
+    /// every `LoopDecision` other than `Escalate` was dead. Now every
+    /// decision arm is reachable.
+    fn handle_loop_error_with_dispatch(
+        &self,
+        error: &eyre::Report,
+        retry_state: &mut LoopRetryState,
+        iteration: u32,
+        messages: &mut Vec<Message>,
+    ) -> LoopErrorAction {
+        let classified = self.classify_loop_error(error, None);
+        let decision = self.dispatch_loop_error(&classified, retry_state, iteration);
+        match decision {
+            LoopDecision::Continue => {
+                tracing::info!(
+                    variant = classified.variant_name(),
+                    iteration,
+                    "loop retry: continuing after transient error"
+                );
+                LoopErrorAction::Retry
+            }
+            LoopDecision::CompactAndRetry => {
+                tracing::info!(
+                    variant = classified.variant_name(),
+                    iteration,
+                    "loop retry: compacting context before retry"
+                );
+                self.maybe_run_turn_compaction(messages, iteration);
+                LoopErrorAction::Retry
+            }
+            LoopDecision::RotateAndRetry => {
+                // No in-band credential rotation hook on Agent in this
+                // release — lane rotation is already owned by the outer
+                // provider chain. Degrade to Bail so the caller surfaces
+                // the error rather than looping on a sick lane.
+                tracing::warn!(
+                    variant = classified.variant_name(),
+                    iteration,
+                    "loop retry: rotate_and_retry requested but no hook wired; bailing"
+                );
+                LoopErrorAction::Bail
+            }
+            LoopDecision::Escalate => {
+                tracing::warn!(
+                    variant = classified.variant_name(),
+                    iteration,
+                    "loop retry: escalating non-recoverable error"
+                );
+                LoopErrorAction::Bail
+            }
+            LoopDecision::Exhausted => {
+                tracing::error!(
+                    variant = classified.variant_name(),
+                    iteration,
+                    "loop retry: bucket exhausted, bailing"
+                );
+                LoopErrorAction::Bail
+            }
+            LoopDecision::Grace => {
+                // Grace decisions come from observe_budget_exhaustion, not
+                // from observe(&HarnessError). Treat defensively as Retry
+                // so the grace path behaves consistently if it is ever
+                // reached via this code path (it isn't today).
+                LoopErrorAction::Retry
+            }
+        }
     }
 
     /// Budget grace-call dispatch (M6.2). When the loop hits a hard iteration
@@ -494,11 +646,23 @@ impl Agent {
                 let config = self.chat_config();
                 let mut files_modified = Vec::new();
                 let mut files_to_send = Vec::new();
+                // Accumulate the structured side-channel metadata that tools
+                // surface during this turn (today: `node_costs` from
+                // `run_pipeline`). Threaded into every `ConversationResponse`
+                // built below so the session actor can plumb it into the SSE
+                // `done` event for the W1.G4 cost panel.
+                let mut tool_structured_metadata: Vec<(String, serde_json::Value)> = Vec::new();
                 let mut turn = LoopTurnState::new(Instant::now());
                 // M6.2: per-turn retry-bucket state machine. Lives alongside
                 // `LoopTurnState` rather than inside it so the file boundary
                 // from issue #489 stays exact.
-                let mut retry_state = LoopRetryState::new();
+                //
+                // Review A F-015: when a persistent retry state is attached
+                // via `with_persistent_retry_state`, the guard hydrates from
+                // the shared handle on construction and writes back on drop,
+                // so bucket counters carry across turns for the same session.
+                let mut retry_state =
+                    PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
                 let mut loop_detector = LoopDetector::new(12);
 
                 loop {
@@ -520,6 +684,7 @@ impl Agent {
                                 files_to_send,
                                 streamed: false,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                     }
@@ -621,14 +786,28 @@ impl Agent {
                             {
                                 Ok(r) => r,
                                 Err(e) => {
-                                    let _ = self.classify_loop_error(&e, None);
-                                    return Err(e);
+                                    match self.handle_loop_error_with_dispatch(
+                                        &e,
+                                        &mut retry_state,
+                                        iteration,
+                                        &mut messages,
+                                    ) {
+                                        LoopErrorAction::Retry => continue,
+                                        LoopErrorAction::Bail => return Err(e),
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
-                            let _ = self.classify_loop_error(&e, None);
-                            return Err(e);
+                            match self.handle_loop_error_with_dispatch(
+                                &e,
+                                &mut retry_state,
+                                iteration,
+                                &mut messages,
+                            ) {
+                                LoopErrorAction::Retry => continue,
+                                LoopErrorAction::Bail => return Err(e),
+                            }
                         }
                     };
                     Self::normalize_inline_invokes(&mut response);
@@ -679,6 +858,7 @@ impl Agent {
                                 files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                         StopReason::ToolUse => {
@@ -711,6 +891,7 @@ impl Agent {
                                                 &messages,
                                                 history.len(),
                                             ),
+                                            tool_results: tool_structured_metadata.clone(),
                                         });
                                     }
                                     // Single-fire-per-burst: first fire emits the
@@ -733,6 +914,7 @@ impl Agent {
                                             &messages,
                                             history.len(),
                                         ),
+                                        tool_results: tool_structured_metadata.clone(),
                                     });
                                 }
                             }
@@ -745,11 +927,19 @@ impl Agent {
                                     &mut turn,
                                     &mut retry_state,
                                     tracker,
+                                    Some(&mut tool_structured_metadata),
                                 )
                                 .await
                             {
-                                let _ = self.classify_loop_error(&e, None);
-                                return Err(e);
+                                match self.handle_loop_error_with_dispatch(
+                                    &e,
+                                    &mut retry_state,
+                                    iteration,
+                                    &mut messages,
+                                ) {
+                                    LoopErrorAction::Retry => continue,
+                                    LoopErrorAction::Bail => return Err(e),
+                                }
                             }
 
                             let spiral_iteration = turn.iteration();
@@ -778,6 +968,7 @@ impl Agent {
                                         &messages,
                                         history.len(),
                                     ),
+                                    tool_results: tool_structured_metadata.clone(),
                                 });
                             }
 
@@ -814,6 +1005,7 @@ impl Agent {
                                     files_to_send,
                                     streamed,
                                     messages: LoopTurnState::new_messages(&messages, history.len()),
+                                    tool_results: tool_structured_metadata.clone(),
                                 });
                             }
                         }
@@ -830,6 +1022,7 @@ impl Agent {
                                 files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                         StopReason::ContentFiltered => {
@@ -852,6 +1045,7 @@ impl Agent {
                                 files_to_send,
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
+                                tool_results: tool_structured_metadata.clone(),
                             });
                         }
                     }
@@ -889,7 +1083,12 @@ impl Agent {
             // M6.2: per-run retry-bucket state machine. Same instance lives
             // across all iterations of the task loop so bucket counters
             // accumulate the way operators expect.
-            let mut retry_state = LoopRetryState::new();
+            //
+            // Review A F-015: hydrate from the persistent handle when set so
+            // task buckets survive across repeated `run_task` invocations on
+            // the same session (the guard's `Drop` impl writes back).
+            let mut retry_state =
+                PersistentRetryStateGuard::new(self.persistent_retry_state.clone());
             let config = self.chat_config();
 
             loop {
@@ -955,8 +1154,15 @@ impl Agent {
                 {
                     Ok(pair) => pair,
                     Err(e) => {
-                        let _ = self.classify_loop_error(&e, None);
-                        return Err(e);
+                        match self.handle_loop_error_with_dispatch(
+                            &e,
+                            &mut retry_state,
+                            iteration,
+                            &mut messages,
+                        ) {
+                            LoopErrorAction::Retry => continue,
+                            LoopErrorAction::Bail => return Err(e),
+                        }
                     }
                 };
                 Self::normalize_inline_invokes(&mut response);
@@ -1061,11 +1267,19 @@ impl Agent {
                                 &mut turn,
                                 &mut retry_state,
                                 None,
+                                None,
                             )
                             .await
                         {
-                            let _ = self.classify_loop_error(&e, None);
-                            return Err(e);
+                            match self.handle_loop_error_with_dispatch(
+                                &e,
+                                &mut retry_state,
+                                iteration,
+                                &mut messages,
+                            ) {
+                                LoopErrorAction::Retry => continue,
+                                LoopErrorAction::Bail => return Err(e),
+                            }
                         }
                     }
                     StopReason::MaxTokens => {
@@ -1143,6 +1357,7 @@ impl Agent {
         turn: &mut LoopTurnState,
         retry_state: &mut LoopRetryState,
         tracker: Option<&TokenTracker>,
+        tool_structured_metadata: Option<&mut Vec<(String, serde_json::Value)>>,
     ) -> Result<()> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
@@ -1208,16 +1423,21 @@ impl Agent {
         let mut tool_files = Vec::new();
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
+        let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
         for batch in tool_batches {
             let mut batch_response = limited_response.clone();
             batch_response.tool_calls = batch.to_vec();
-            let (batch_messages, batch_files, batch_send_files, batch_tokens) =
+            let (batch_messages, batch_files, batch_send_files, batch_tokens, batch_metadata) =
                 self.execute_tools(&batch_response).await?;
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
             tool_tokens.input_tokens += batch_tokens.input_tokens;
             tool_tokens.output_tokens += batch_tokens.output_tokens;
+            tool_metadata.extend(batch_metadata);
+        }
+        if let Some(sink) = tool_structured_metadata {
+            sink.extend(tool_metadata);
         }
 
         let merged = merge_tool_messages_in_order(
@@ -1530,7 +1750,9 @@ mod tests {
 
     use async_trait::async_trait;
     use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
-    use octos_llm::{ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage};
+    use octos_llm::{
+        ChatResponse, LlmError, LlmErrorKind, LlmProvider, StopReason, TokenUsage as LlmTokenUsage,
+    };
     use octos_memory::EpisodeStore;
 
     use crate::plugins::PluginTool;
@@ -2986,6 +3208,64 @@ printf '{"output":"voice saved","success":true}\n'
         assert!(!is_productive_tool_message(&body));
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Review A F-001 — dispatch_loop_error wiring.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Minimal placeholder provider for F-001 dispatch tests. The tests drive
+    /// `handle_loop_error_with_dispatch` directly and never call `chat()`, so
+    /// the provider's only requirement is to satisfy the trait bounds.
+    struct InertProvider;
+
+    #[async_trait]
+    impl LlmProvider for InertProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            unreachable!("InertProvider::chat must not be called in F-001 dispatch tests");
+        }
+
+        fn model_id(&self) -> &str {
+            "inert"
+        }
+
+        fn provider_name(&self) -> &str {
+            "inert"
+        }
+    }
+
+    /// Counting summarizer used to prove the `CompactAndRetry` arm of
+    /// `handle_loop_error_with_dispatch` actually drives `maybe_run_turn_compaction`.
+    struct CountingSummarizer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::summarizer::Summarizer for CountingSummarizer {
+        fn kind(&self) -> &'static str {
+            "counting_spy"
+        }
+
+        fn summarize(&self, messages: &[Message], budget_tokens: u32) -> Result<String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(crate::compaction::compact_messages(messages, budget_tokens))
+        }
+    }
+
+    async fn build_dispatch_test_agent() -> Agent {
+        let dir = tempfile::tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(InertProvider);
+        let tools = ToolRegistry::new();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        Agent::new(AgentId::new("test-dispatch"), provider, tools, memory)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // M8.10-C — LOOP DETECTED dedup.
+    // ─────────────────────────────────────────────────────────────────────
+
     /// Mock LLM that always returns the same shell tool call with the same
     /// arguments, forcing the loop detector to fire on iteration 4.
     struct AlwaysSameToolProvider;
@@ -3107,6 +3387,177 @@ printf '{"output":"voice saved","success":true}\n'
         assert!(
             !agent.is_loop_detected_recently(),
             "process_message should reset the loop_detected flag at start"
+        );
+    }
+
+    // ─── Back to Review A F-001 dispatch tests ───────────────────────────
+
+    #[tokio::test]
+    async fn should_compact_and_retry_on_context_overflow() {
+        // F-001 coverage #1: a ContextOverflow error must drive the
+        // CompactAndRetry arm, which runs `maybe_run_turn_compaction` (via
+        // the wired CompactionRunner) and returns Retry so the outer loop
+        // continues instead of bailing.
+        use crate::compaction::{CompactionPolicy, CompactionRunner};
+        use crate::workspace_policy::{CompactionSummarizerKind, WorkspacePolicy};
+
+        let policy = CompactionPolicy {
+            schema_version: crate::abi_schema::COMPACTION_POLICY_SCHEMA_VERSION,
+            // Budget sized so recent+system fits (≈6 kept messages at 400
+            // words ≈ 2.4k tokens) but overall messages still overflow the
+            // budget, which forces the runner into its summarise branch
+            // rather than the fallback-trim branch.
+            token_budget: 8_000,
+            preflight_threshold: Some(1_000),
+            prune_tool_results_after_turns: None,
+            preserved_artifacts: vec![],
+            preserved_invariants: vec![],
+            summarizer: CompactionSummarizerKind::Extractive,
+        };
+        let spy = Arc::new(AtomicUsize::new(0));
+        let runner = CompactionRunner::new(policy)
+            .with_summarizer(CountingSummarizer { calls: spy.clone() });
+        let workspace = WorkspacePolicy::for_session();
+        let agent = build_dispatch_test_agent()
+            .await
+            .with_compaction_runner(Arc::new(runner))
+            .with_compaction_workspace(workspace);
+
+        let mut retry_state = LoopRetryState::new();
+        // Build an eyre::Report wrapping a typed LlmError so the harness
+        // classifier downcasts it to HarnessError::ContextOverflow rather
+        // than the Internal fallback.
+        let raw_error: eyre::Report = LlmError::new(
+            LlmErrorKind::ContextOverflow {
+                limit: Some(200_000),
+                used: Some(201_000),
+            },
+            "prompt too long for model window",
+        )
+        .into();
+
+        // Conversation large enough that the compaction runner enters its
+        // summarise branch rather than the oldest-first fallback trim.
+        let filler = "word ".repeat(400);
+        let mut messages = vec![Message {
+            role: MessageRole::System,
+            content: "sys".to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        for i in 0..14 {
+            messages.push(Message {
+                role: MessageRole::User,
+                content: format!("turn {i} user question {filler}"),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                content: format!("turn {i} assistant reply {filler}"),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+
+        // iteration=2 so maybe_run_turn_compaction actually runs (iteration=1
+        // is reserved for the preflight path).
+        let action =
+            agent.handle_loop_error_with_dispatch(&raw_error, &mut retry_state, 2, &mut messages);
+        assert_eq!(
+            action,
+            LoopErrorAction::Retry,
+            "ContextOverflow must land on the Retry arm after compaction"
+        );
+        assert!(
+            spy.load(AtomicOrdering::SeqCst) >= 1,
+            "CompactAndRetry must invoke maybe_run_turn_compaction → summarizer at least once; got {}",
+            spy.load(AtomicOrdering::SeqCst)
+        );
+        assert_eq!(
+            retry_state.counters().context_overflow,
+            1,
+            "first ContextOverflow observation must bump the bucket counter once"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_escalate_when_bucket_exhausted() {
+        // F-001 coverage #2: once the retry bucket for a variant is
+        // saturated, the next observation MUST land on the Bail arm so the
+        // caller surfaces Err(report) instead of looping. Pre-fix the
+        // classified error was ignored and only Escalate was reachable;
+        // Exhausted was dead.
+        let agent = build_dispatch_test_agent().await;
+        let mut retry_state =
+            LoopRetryState::with_limits(crate::agent::loop_state::LoopRetryLimits {
+                rate_limited: 1,
+                ..Default::default()
+            });
+        let mut messages: Vec<Message> = Vec::new();
+
+        // First observation: transient rate-limit → Continue → Retry.
+        // Typed LlmError so classify_report maps to RateLimited rather than
+        // the Internal fallback.
+        let rate_limit_error: eyre::Report = LlmError::rate_limited(Some(2)).into();
+        let first_action = agent.handle_loop_error_with_dispatch(
+            &rate_limit_error,
+            &mut retry_state,
+            1,
+            &mut messages,
+        );
+        assert_eq!(
+            first_action,
+            LoopErrorAction::Retry,
+            "first rate-limit observation must land on Retry"
+        );
+
+        // Second observation: bucket exhausted (limit=1) → Exhausted → Bail.
+        let second_action = agent.handle_loop_error_with_dispatch(
+            &rate_limit_error,
+            &mut retry_state,
+            2,
+            &mut messages,
+        );
+        assert_eq!(
+            second_action,
+            LoopErrorAction::Bail,
+            "exhausted rate-limit bucket must land on Bail so the outer loop surfaces Err"
+        );
+        assert!(
+            retry_state.counters().rate_limited >= 2,
+            "bucket must be bumped for every observation, not just the first",
+        );
+    }
+
+    #[tokio::test]
+    async fn should_bail_on_authentication_error_without_compaction() {
+        // F-001 coverage #3: FailFast-hint variants (Authentication) must
+        // land on Bail immediately, regardless of whether a compaction
+        // runner is wired. Proves the Escalate arm reaches Bail.
+        let agent = build_dispatch_test_agent().await;
+        let mut retry_state = LoopRetryState::new();
+        let mut messages: Vec<Message> = Vec::new();
+
+        let auth_error: eyre::Report = LlmError::auth("invalid API key").into();
+        let action =
+            agent.handle_loop_error_with_dispatch(&auth_error, &mut retry_state, 1, &mut messages);
+        assert_eq!(
+            action,
+            LoopErrorAction::Bail,
+            "Authentication errors must never retry; they must bail"
         );
     }
 

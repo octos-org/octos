@@ -1,3 +1,14 @@
+//! Slides-delivery workflow definition.
+//!
+//! Pipeline-contract enforcement (coding-blue FA-7): the
+//! `workspace_policy()` helper below returns a typed
+//! [`WorkspacePolicy`] with `validation.on_completion` declaring the
+//! deck artifact + preview PNGs as required. When the session's
+//! working directory is initialised with `write_workspace_policy`,
+//! [`octos_pipeline::RunPipelineTool::build_workspace_context`] reads
+//! that policy on every `run_pipeline` invocation and propagates the
+//! validator block to the pipeline executor. Pipeline completion fails
+//! if the deck is missing — no new opt-in needed.
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
@@ -37,7 +48,7 @@ pub fn build() -> WorkflowInstance {
             forbid_intermediate_files: true,
             required_artifact_kind: "presentation".into(),
         },
-        additional_instructions: "You are a background slides producer. Follow the runtime-owned phases in order: design, generate_deck, deliver_result. Write the slide script first, validate it before generation, call mofa_slides once, and deliver only the final deck artifact. Do not send intermediate previews, scratch PNGs, or alternate deck exports.".to_string(),
+        additional_instructions: "You are a background slides producer. Follow the runtime-owned phases in order: design, generate_deck, deliver_result. Write the slide script first, validate it before generation, call mofa_slides once, and deliver only the final deck artifact. Do not send intermediate previews, scratch PNGs, or alternate deck exports.\n\nM8 Runtime Parity W2.E: at the end of each phase, call check_workspace_contract once and surface the typed result back to the user as a single-line confirmation of the form \"\u{2713} <phase> phase: validators passed (<n>/<n>)\" — for example \"\u{2713} design phase: validators passed (3/3)\". If a phase's validators reject the artifacts, instead emit \"\u{2717} <phase> phase: validators failed (<failed>/<total>) — <reason>\" before moving on.".to_string(),
     }
 }
 
@@ -114,6 +125,25 @@ mod tests {
                 .allowed_tools
                 .iter()
                 .any(|tool| tool == "check_workspace_contract")
+        );
+    }
+
+    #[test]
+    fn slides_workflow_surfaces_per_phase_validator_status() {
+        // M8 Runtime Parity W2.E: the spawned worker must surface a
+        // typed phase-completion line — frontend test selectors and
+        // the live e2e spec rely on this exact shape.
+        let workflow = build();
+        assert!(
+            workflow
+                .additional_instructions
+                .contains("phase: validators passed"),
+            "missing phase-validator hint: {}",
+            workflow.additional_instructions
+        );
+        assert!(
+            workflow.additional_instructions.contains("\u{2713}"),
+            "missing checkmark in phase confirmation"
         );
     }
 

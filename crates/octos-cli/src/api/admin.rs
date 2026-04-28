@@ -3317,7 +3317,7 @@ pub async fn admin_shell(
 
     // Spawn child explicitly so we can kill it on timeout (dropping the
     // future does NOT kill the child — it becomes an orphan process).
-    let mut child = cmd
+    let child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -4044,8 +4044,8 @@ mod register_setup_script_tests {
 #[cfg(test)]
 mod register_tenant_email_tests {
     use super::*;
+    use crate::api::AppState;
     use crate::api::router::AuthIdentity;
-    use crate::api::{AppState, SseBroadcaster};
     use crate::config::DeploymentMode;
     use crate::otp::{AuthManager, DashboardAuthConfig, SmtpConfig};
     use crate::user_store::{User, UserRole, UserStore};
@@ -4057,34 +4057,19 @@ mod register_tenant_email_tests {
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: chrono::Utc::now(),
-            auth_token: None,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
             user_store: Some(user_store),
-            allowlist_store: None,
             auth_manager,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(Arc::new(
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
+            ..AppState::empty_for_tests()
         })
     }
 
@@ -4199,8 +4184,8 @@ mod register_tenant_email_tests {
 #[cfg(test)]
 mod register_flow_tests {
     use super::*;
+    use crate::api::AppState;
     use crate::api::router::AuthIdentity;
-    use crate::api::{AppState, SseBroadcaster};
     use crate::config::DeploymentMode;
     use crate::user_store::{User, UserRole, UserStore};
     use std::sync::Arc;
@@ -4211,34 +4196,18 @@ mod register_flow_tests {
     ) -> (Arc<AppState>, Arc<UserStore>) {
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
         let state = Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: chrono::Utc::now(),
-            auth_token: None,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
             user_store: Some(user_store.clone()),
-            allowlist_store: None,
-            auth_manager: None,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(Arc::new(
                 crate::tenant::TenantStore::open(dir.path()).unwrap(),
             )),
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("163.192.33.32".into()),
             frps_port: Some(7000),
             deployment_mode: mode,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
+            ..AppState::empty_for_tests()
         });
         (state, user_store)
     }
@@ -5027,7 +4996,7 @@ pub struct WeChatQrPollResponse {
 /// POST /api/admin/profiles/{id}/wechat/qr-poll
 pub async fn wechat_qr_poll(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(_id): Path<String>,
     Json(req): Json<WeChatQrPollRequest>,
 ) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
     let client = reqwest::Client::builder()

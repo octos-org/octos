@@ -30,7 +30,8 @@ use tracing::{info, warn};
 use super::build_system_prompt;
 use super::message_preprocessing;
 use super::profile_factory::{
-    ProfileActorFactoryBuilder, build_plugin_env, profile_plugin_env, profile_search_provider_keys,
+    ProfileActorFactoryBuilder, build_plugin_env, build_synthesis_config, profile_plugin_env,
+    profile_search_provider_keys,
 };
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
@@ -47,6 +48,9 @@ use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
 use crate::status_layers::StatusComposer;
+
+#[cfg(feature = "matrix")]
+use octos_core::MAIN_PROFILE_ID;
 
 #[cfg(feature = "matrix")]
 use super::matrix_integration::*;
@@ -649,11 +653,18 @@ impl GatewayRuntime {
             }
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
-                match octos_agent::PluginLoader::load_into_with_work_dir(
+                // S2 plumbing: pass the agent's current provider config so
+                // plugins like deep_search can synthesize via host-injected
+                // args instead of the operator's plist `EnvironmentVariables`.
+                let synthesis_config = build_synthesis_config(&config, &provider_name);
+                match octos_agent::PluginLoader::load_into_with_options(
                     &mut tools,
                     &plugin_dirs,
                     &plugin_env,
-                    Some(&plugin_work_dir),
+                    octos_agent::PluginLoadOptions {
+                        work_dir: Some(&plugin_work_dir),
+                        synthesis_config,
+                    },
                 ) {
                     Ok(result) => plugin_result = result,
                     Err(e) => warn!("plugin loading failed: {e}"),
@@ -1182,6 +1193,13 @@ impl GatewayRuntime {
         let mut channel_mgr = ChannelManager::new();
         {
             let delete_tx = session_delete_tx.clone();
+            // M7.9 / W2: bridge SessionTaskQueryStore::cancel/relaunch
+            // through the adapter so the api channel can serve
+            // /tasks/{id}/cancel and /tasks/{id}/restart-from-node.
+            #[cfg(feature = "api")]
+            let task_cancel_store = task_query_store.clone();
+            #[cfg(feature = "api")]
+            let task_relaunch_store = task_query_store.clone();
             let mut reg_ctx = adapters::ChannelRegistrationCtx {
                 shutdown: &shutdown,
                 media_dir: &media_dir,
@@ -1190,6 +1208,35 @@ impl GatewayRuntime {
                 task_query: Some(Arc::new({
                     let store = task_query_store.clone();
                     move |session_key: &str| store.query_json(session_key)
+                })),
+                #[cfg(feature = "api")]
+                task_cancel: Some(Arc::new(move |task_id: &str| {
+                    match task_cancel_store.cancel_task(task_id) {
+                        Ok(()) => octos_bus::TaskCancelOutcome::Cancelled,
+                        Err(octos_agent::TaskCancelError::NotFound) => {
+                            octos_bus::TaskCancelOutcome::NotFound
+                        }
+                        Err(octos_agent::TaskCancelError::AlreadyTerminal) => {
+                            octos_bus::TaskCancelOutcome::AlreadyTerminal
+                        }
+                    }
+                })),
+                #[cfg(feature = "api")]
+                task_relaunch: Some(Arc::new(move |task_id: &str, from_node: Option<&str>| {
+                    let opts = octos_agent::RelaunchOpts {
+                        from_node: from_node.map(str::to_string),
+                    };
+                    match task_relaunch_store.relaunch_task(task_id, opts) {
+                        Ok(new_task_id) => {
+                            octos_bus::TaskRelaunchOutcome::Relaunched { new_task_id }
+                        }
+                        Err(octos_agent::TaskRelaunchError::NotFound) => {
+                            octos_bus::TaskRelaunchOutcome::NotFound
+                        }
+                        Err(octos_agent::TaskRelaunchError::StillActive) => {
+                            octos_bus::TaskRelaunchOutcome::StillActive
+                        }
+                    }
                 })),
                 #[cfg(feature = "api")]
                 metrics_handle: metrics_handle.clone(),

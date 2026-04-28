@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use octos_agent::cost_ledger::CostAccountant;
 use octos_agent::{Tool, ToolPolicy, ToolResult};
 use octos_llm::{LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use serde::Deserialize;
 
+use crate::context::PipelineContext;
 use crate::discovery::PipelineDiscovery;
 use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineStatusBridge};
 
@@ -25,6 +27,14 @@ pub struct RunPipelineTool {
     discovery: PipelineDiscovery,
     /// Per-message status bridge (set via `set_status_bridge` before each call).
     status_bridge: std::sync::Mutex<Option<PipelineStatusBridge>>,
+    /// Optional cost accountant (coding-blue FA-7). When set, every
+    /// pipeline run reserves a pipeline-level budget at dispatch start
+    /// and per-node sub-budgets for LLM-call nodes.
+    cost_accountant: Option<Arc<CostAccountant>>,
+    /// Logical contract id used when the pipeline context
+    /// auto-populates from the workspace policy. Defaults to the
+    /// graph id + `"pipeline"` fallback when empty.
+    contract_id: Option<String>,
 }
 
 impl RunPipelineTool {
@@ -44,7 +54,74 @@ impl RunPipelineTool {
             plugin_dirs: Vec::new(),
             discovery,
             status_bridge: std::sync::Mutex::new(None),
+            cost_accountant: None,
+            contract_id: None,
         }
+    }
+
+    /// Attach a [`CostAccountant`] (coding-blue FA-7). When set, pipeline
+    /// executions reserve budget against the configured contract id and
+    /// commit the cumulative token attribution at pipeline terminal.
+    pub fn with_cost_accountant(mut self, accountant: Arc<CostAccountant>) -> Self {
+        self.cost_accountant = Some(accountant);
+        self
+    }
+
+    /// Set the logical contract id for the cost ledger rollups
+    /// associated with this tool. Defaults to the pipeline graph id.
+    pub fn with_contract_id(mut self, contract_id: impl Into<String>) -> Self {
+        self.contract_id = Some(contract_id.into());
+        self
+    }
+
+    /// Build the [`PipelineContext`] for a single invocation.
+    ///
+    /// Reads the workspace policy from `self.working_dir` when present
+    /// and attaches the tool's LLM provider for LLM-iterative
+    /// compaction. When no policy is found the context is empty —
+    /// legacy behaviour intact. This is the adoption path for the
+    /// slides + site delivery workflows: a workspace with a
+    /// `workspace_policy.toml` automatically opts into terminal
+    /// validators + per-node compaction on every `run_pipeline` call
+    /// without threading new constructor args.
+    /// Build the pipeline workspace context, preferring the parent
+    /// session's `CostAccountant` from [`PipelineHostContext`] over the
+    /// tool's locally configured one. Keeps the pipeline ledger
+    /// attribution consistent with the parent session's accountant when
+    /// the tool runs inside a session actor (M8 parity W1.A4).
+    fn build_workspace_context_with_host(
+        &self,
+        host: &crate::host_context::PipelineHostContext,
+    ) -> PipelineContext {
+        let policy = match octos_agent::workspace_policy::read_workspace_policy(&self.working_dir) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    working_dir = %self.working_dir.display(),
+                    error = %error,
+                    "run_pipeline: failed to read workspace policy; running legacy path"
+                );
+                None
+            }
+        };
+        let mut ctx = PipelineContext::new();
+        if let Some(policy) = policy {
+            ctx = ctx.with_policy(policy);
+            ctx = ctx.with_agent_llm_provider(self.default_provider.clone());
+        }
+        // Prefer the host-context (parent session's) accountant. Falls
+        // back to the tool-configured one for non-session callers.
+        if let Some(accountant) = host
+            .cost_accountant
+            .clone()
+            .or_else(|| self.cost_accountant.clone())
+        {
+            ctx = ctx.with_cost_accountant(accountant);
+        }
+        if let Some(contract_id) = self.contract_id.as_deref() {
+            ctx = ctx.with_contract_id(contract_id);
+        }
+        ctx
     }
 
     /// Add the global octos-home skills directory as a search path.
@@ -234,6 +311,17 @@ impl Tool for RunPipelineTool {
         // Shutdown signal for cancelling all pipeline workers on timeout/drop.
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // M8 parity (W1.A1/A3/A4): pull the parent session's shared
+        // FileStateCache, SubAgentOutputRouter, AgentSummaryGenerator,
+        // TaskSupervisor, and CostAccountant from TOOL_CTX so pipeline
+        // workers inherit them via the M8 contract instead of
+        // constructing fresh per-run handles. Falls back to whatever
+        // self holds when the tool is invoked outside of a session
+        // (e.g. unit tests).
+        let host_context = octos_agent::tools::TOOL_CTX
+            .try_with(crate::host_context::PipelineHostContext::from_tool_context)
+            .unwrap_or_default();
+
         let config = ExecutorConfig {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
@@ -244,8 +332,18 @@ impl Tool for RunPipelineTool {
             status_bridge,
             shutdown: shutdown.clone(),
             max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
             checkpoint_store: None,
             hook_executor: None,
+            // coding-blue FA-7: adopt workspace-contract enforcement.
+            // Reads the policy from the working dir on every call so
+            // the slides + site delivery workflows (and any other
+            // opted-in workflow) get validator + compaction + cost
+            // reservation for free. When no policy is present the
+            // context is empty and the executor stays on the legacy
+            // path.
+            workspace_context: self.build_workspace_context_with_host(&host_context),
+            host_context,
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
@@ -310,6 +408,12 @@ impl Tool for RunPipelineTool {
         // Also set files_to_send so the execution loop auto-delivers
         let files_to_send = report_file.iter().filter(|p| p.exists()).cloned().collect();
 
+        // Surface per-node cost attribution in the structured side-channel so
+        // the session actor can pull it back into the SSE `done` event for the
+        // W1.G4 cost panel. The data was being silently dropped at the tool
+        // boundary before we extended `ToolResult` with `structured_metadata`.
+        let structured_metadata = node_costs_metadata(&result.node_costs);
+
         Ok(ToolResult {
             output: format!(
                 "{}\n\n---\nPipeline execution summary:\n{summary}\nTotal: {} input + {} output tokens",
@@ -319,7 +423,25 @@ impl Tool for RunPipelineTool {
             tokens_used: Some(result.token_usage),
             file_modified: report_file,
             files_to_send,
+            structured_metadata,
         })
+    }
+}
+
+/// Project a non-empty slice of [`NodeCost`] rows into the
+/// `ToolResult.structured_metadata` shape the session actor consumes.
+///
+/// Returns `None` when there are no cost rows so the side-channel stays
+/// absent for legacy callers (no accountant / no LLM-call nodes); returns
+/// `Some({"node_costs": [...]})` otherwise. Lifted out so tests can assert
+/// the projection without standing up a full pipeline run.
+fn node_costs_metadata(rows: &[crate::executor::NodeCost]) -> Option<serde_json::Value> {
+    if rows.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "node_costs": rows,
+        }))
     }
 }
 
@@ -356,4 +478,77 @@ fn sanitize_dot(dot: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::NodeCost;
+
+    /// Gap 3.1 — when a pipeline run reports per-node cost rows, the tool
+    /// surfaces them in `ToolResult.structured_metadata` under the
+    /// `"node_costs"` key so the session actor can project them onto the
+    /// SSE `done` event for the W1.G4 CostBreakdown panel.
+    #[test]
+    fn node_costs_metadata_emits_node_costs_array_for_multi_node_pipeline() {
+        let rows = vec![
+            NodeCost {
+                node_id: "draft".into(),
+                model: Some("anthropic/claude-haiku".into()),
+                reserved_usd: 0.0010,
+                actual_usd: 0.0008,
+                tokens_in: 320,
+                tokens_out: 110,
+                committed: true,
+            },
+            NodeCost {
+                node_id: "refine".into(),
+                model: Some("anthropic/claude-sonnet".into()),
+                reserved_usd: 0.0040,
+                actual_usd: 0.0032,
+                tokens_in: 540,
+                tokens_out: 220,
+                committed: true,
+            },
+        ];
+
+        let meta = node_costs_metadata(&rows).expect("multi-node pipeline must surface metadata");
+        let arr = meta
+            .get("node_costs")
+            .and_then(|v| v.as_array())
+            .expect("structured_metadata must carry a `node_costs` array");
+        assert_eq!(arr.len(), 2, "one row per pipeline node");
+        assert_eq!(
+            arr[0].get("node_id").and_then(|v| v.as_str()),
+            Some("draft")
+        );
+        assert_eq!(
+            arr[1].get("node_id").and_then(|v| v.as_str()),
+            Some("refine")
+        );
+        assert!(
+            arr[0]
+                .get("tokens_in")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 0,
+            "tokens_in must be threaded through the projection"
+        );
+        assert!(
+            arr[0]
+                .get("actual_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                > 0.0,
+            "actual_usd must be threaded through the projection"
+        );
+    }
+
+    /// When a pipeline runs without an accountant attached, no per-node cost
+    /// rows are produced; the side-channel stays absent so legacy callers
+    /// observe byte-identical behaviour.
+    #[test]
+    fn node_costs_metadata_returns_none_for_empty_rows() {
+        assert!(node_costs_metadata(&[]).is_none());
+    }
 }

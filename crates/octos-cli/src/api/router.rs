@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -14,11 +14,13 @@ use super::AppState;
 use super::admin;
 use super::admin_setup;
 use super::auth_handlers;
+use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
 use super::metrics;
 use super::purge;
 use super::static_files;
+use super::swarm as swarm_api;
 use super::user_admin;
 use super::webhook_proxy;
 use crate::user_store::UserRole;
@@ -32,28 +34,55 @@ pub enum AuthIdentity {
     User { id: String, role: UserRole },
 }
 
+/// Backward-compatible default when the operator has not configured a
+/// base domain via `config.base_domain` or `OCTOS_BASE_DOMAIN`.
+pub const DEFAULT_BASE_DOMAIN: &str = "crew.ominix.io";
+
+/// Compose the CORS allowlist for a given base domain.
+///
+/// The returned list always contains the bare-`ominix.io` entries and
+/// the loopback dev origins, plus the three `app./admin./api.` entries
+/// for the configured base domain. `None` falls back to the legacy
+/// `crew.ominix.io` triple so existing minis keep working without config
+/// changes.
+pub fn cors_allowlist_for_base_domain(base: Option<&str>) -> Vec<String> {
+    let base = base.unwrap_or(DEFAULT_BASE_DOMAIN);
+    vec![
+        "https://app.ominix.io".to_string(),
+        "https://admin.ominix.io".to_string(),
+        "https://api.ominix.io".to_string(),
+        format!("https://app.{base}"),
+        format!("https://admin.{base}"),
+        format!("https://api.{base}"),
+        "http://localhost:3000".to_string(),
+        "http://localhost:5173".to_string(),
+    ]
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     // Restrict CORS to an explicit allowlist of known origins.
     // Do NOT use suffix matching (e.g. ends_with(".ominix.io")) — a hijacked
     // subdomain would pass the check and enable cross-origin requests.
-    const ALLOWED_ORIGINS: &[&str] = &[
-        "https://app.ominix.io",
-        "https://admin.ominix.io",
-        "https://api.ominix.io",
-        "https://app.crew.ominix.io",
-        "https://admin.crew.ominix.io",
-        "https://api.crew.ominix.io",
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ];
-    let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
-            let o = origin.to_str().unwrap_or("");
-            ALLOWED_ORIGINS.contains(&o)
-        }))
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
+    //
+    // The allowlist is composed from `state.base_domain` at startup so each
+    // mini accepts its own public subdomain variants (`crew.`, `bot.`,
+    // `octos.`, `ocean.`) without redeploys. `None` preserves the legacy
+    // `crew.ominix.io` triple.
+    let allowed_origins: Arc<Vec<String>> =
+        Arc::new(cors_allowlist_for_base_domain(state.base_domain.as_deref()));
+    let cors = {
+        let allowed = allowed_origins.clone();
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::predicate(
+                move |origin, _| {
+                    let o = origin.to_str().unwrap_or("");
+                    allowed.iter().any(|s| s == o)
+                },
+            ))
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    };
 
     // Public auth endpoints (no auth required)
     let auth_api = Router::new()
@@ -66,6 +95,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/chat/stream", get(handlers::chat_stream))
+        .route("/api/events/harness", get(events_harness::events_harness))
         .route("/api/ws", get(handlers::ws_handler))
         .route(
             "/api/upload",
@@ -107,6 +137,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handlers::session_workspace_contract),
         )
         .route("/api/sessions/{id}", delete(handlers::delete_session))
+        .route(
+            "/api/sessions/{id}/title",
+            patch(handlers::update_session_title),
+        )
+        // M7.9 / W2 — task supervisor exposure
+        .route("/api/tasks/{task_id}/cancel", post(handlers::cancel_task))
+        .route(
+            "/api/tasks/{task_id}/restart-from-node",
+            post(handlers::restart_task_from_node),
+        )
         .route("/api/status", get(handlers::status));
 
     // User self-service endpoints (user or admin auth)
@@ -421,6 +461,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/tenants/{id}/setup-script",
             get(admin::tenant_setup_script),
+        )
+        // M7.6 — contract-authoring + swarm dispatch dashboard
+        .route("/api/swarm/dispatch", post(swarm_api::dispatch_swarm))
+        .route("/api/swarm/dispatches", get(swarm_api::list_dispatches))
+        .route(
+            "/api/swarm/dispatches/{id}",
+            get(swarm_api::dispatch_detail),
+        )
+        .route(
+            "/api/swarm/dispatches/{id}/review",
+            post(swarm_api::submit_review),
+        )
+        .route(
+            "/api/cost/attributions/{dispatch_id}",
+            get(swarm_api::cost_attributions),
         );
 
     // Conditionally enable admin shell endpoint (disabled by default).
@@ -731,7 +786,7 @@ async fn admin_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{AppState, SseBroadcaster};
+    use crate::api::AppState;
     use crate::config::DeploymentMode;
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::http::Request;
@@ -849,32 +904,16 @@ mod tests {
             .unwrap();
 
         let state = Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: Utc::now(),
             auth_token: Some("admin-secret".into()),
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
-            user_store: None,
-            allowlist_store: None,
-            auth_manager: None,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(store),
-            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
+            ..AppState::empty_for_tests()
         });
 
         let app = build_router(state);
@@ -953,5 +992,148 @@ mod tests {
         // the file.
         assert!(resolve_identity(&state, "boot").await.is_none());
         assert!(resolve_identity(&state, "rotated").await.is_none());
+    }
+
+    /// Bug 1 regression: `GET /api/events/harness` with a valid admin
+    /// Bearer token must return `200 text/event-stream`, NOT the
+    /// `307 Location: /admin/` that the SPA static-file fallback was
+    /// emitting for this documented-but-unwired endpoint. Live-sweep
+    /// against release/coding-blue surfaced this as Playwright's
+    /// `apiRequestContext.get: Max redirect count exceeded`.
+    #[tokio::test]
+    async fn events_harness_route_with_bearer_auth_returns_200_sse() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            auth_token: Some("admin-secret".into()),
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
+            ..AppState::empty_for_tests()
+        });
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let response = reqwest::Client::builder()
+            // Catch any lingering 307 as an explicit failure rather than
+            // letting reqwest silently follow it to `/admin/`.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{addr}/api/events/harness?kinds=swarm_dispatch"
+            ))
+            .bearer_auth("admin-secret")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "bearer-authed /api/events/harness must return 200 (not 307 to /admin/)"
+        );
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "content-type must be text/event-stream, got {ct:?}"
+        );
+
+        server.abort();
+    }
+
+    /// Bug 1 regression (fallback side): an unknown `/api/*` path reaches
+    /// the SPA fallback because no route matches. It must return
+    /// `404 application/json`, NOT `307 Location: /admin/`, so API
+    /// clients see a typed error instead of being redirected into the
+    /// SPA.
+    #[tokio::test]
+    async fn unmatched_api_path_returns_json_404_not_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState {
+            admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
+            setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
+            ..AppState::empty_for_tests()
+        });
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let response = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/api/definitely-not-a-route"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/json"), "got {ct:?}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "not_found");
+
+        server.abort();
+    }
+
+    #[test]
+    fn should_compose_cors_allowlist_from_base_domain() {
+        let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
+        assert!(
+            list.contains(&"https://app.bot.ominix.io".to_string()),
+            "missing app.bot.ominix.io in {list:?}"
+        );
+        assert!(
+            list.contains(&"https://admin.bot.ominix.io".to_string()),
+            "missing admin.bot.ominix.io in {list:?}"
+        );
+        assert!(
+            list.contains(&"https://api.bot.ominix.io".to_string()),
+            "missing api.bot.ominix.io in {list:?}"
+        );
+        // The bare ominix.io entries remain for shared landing pages.
+        assert!(list.contains(&"https://app.ominix.io".to_string()));
+    }
+
+    #[test]
+    fn should_default_cors_to_crew_ominix_io_when_unset() {
+        // Backward-compat: when no base_domain is configured the server
+        // must still accept the historical `*.crew.ominix.io` origins so
+        // existing minis keep working without a config change.
+        let list = cors_allowlist_for_base_domain(None);
+        assert!(list.contains(&"https://app.crew.ominix.io".to_string()));
+        assert!(list.contains(&"https://admin.crew.ominix.io".to_string()));
+        assert!(list.contains(&"https://api.crew.ominix.io".to_string()));
+    }
+
+    #[test]
+    fn should_not_accept_unrelated_origin_in_base_domain_allowlist() {
+        // Defence-in-depth: a subdomain of a different tenant must never
+        // appear in the composed list even when a base_domain is set.
+        let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
+        assert!(!list.iter().any(|s| s.contains("evil.example.com")));
+        assert!(!list.iter().any(|s| s.contains("ocean.ominix.io")));
     }
 }

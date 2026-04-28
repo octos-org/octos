@@ -19,7 +19,10 @@ use super::mcp_agent::{
     build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
 };
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
+use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
+use crate::subagent_output::SubAgentOutputRouter;
+use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::TaskSupervisor;
 use crate::workspace_git::{
     WorkspaceContractStatus, WorkspaceProjectKind,
@@ -33,6 +36,19 @@ use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResu
 /// [`SpawnTool::with_mcp_agent_backend`] for runtimes that expose a
 /// different entry point.
 pub const DEFAULT_MCP_AGENT_TOOL_NAME: &str = "run_task";
+
+/// Guard C (issue #607): maximum nesting depth for `spawn`-within-`spawn`
+/// invocations before [`SpawnTool::execute_with_context`] refuses further
+/// dispatch. Measured against [`super::ToolContext::spawn_depth`], which
+/// the spawn tool increments before forwarding into a child agent's
+/// `TOOL_CTX`.
+///
+/// At depth 0 (top-level tool call) up through depth 3 (great-grandchild)
+/// the spawn proceeds; an attempt at depth 4 surfaces the structured
+/// `"spawn depth limit (4) exceeded; refusing further nesting"` error.
+/// Bound chosen empirically: the longest legitimate workflow chain we
+/// observed in production is parent → planner → coder → tts (depth 3).
+pub const MAX_SPAWN_DEPTH: u8 = 4;
 
 /// Callback for delivering background task results directly to the session actor.
 /// Returns `true` if the result was delivered, `false` if the actor is dead
@@ -346,6 +362,18 @@ pub struct SpawnTool {
     /// When combined with a budget policy, the dispatcher rejects
     /// spawns whose projected spend breaches the ceiling.
     cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// M8 Runtime Parity W2.B1: parent session's `FileStateCache` so
+    /// spawned child Agents short-circuit re-reads of unchanged files
+    /// the same way the parent does. `None` keeps pre-W2 behaviour.
+    parent_file_state_cache: Option<Arc<FileStateCache>>,
+    /// M8 Runtime Parity W2.B1: parent session's M8.7 output router so
+    /// the child Agent's spawn_only background tools route output
+    /// through the same on-disk log the dashboard tails.
+    parent_subagent_output_router: Option<Arc<SubAgentOutputRouter>>,
+    /// M8 Runtime Parity W2.B1: parent session's M8.7 summary generator
+    /// so the child can spawn periodic-summary watchers under the same
+    /// LLM/budget contract.
+    parent_subagent_summary_generator: Option<Arc<AgentSummaryGenerator>>,
 }
 
 impl SpawnTool {
@@ -379,6 +407,9 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         }
     }
 
@@ -415,6 +446,9 @@ impl SpawnTool {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         }
     }
 
@@ -536,6 +570,51 @@ impl SpawnTool {
     ) -> Self {
         self.cost_accountant = Some(accountant);
         self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent session's
+    /// `FileStateCache` so spawned child Agents short-circuit re-reads
+    /// of unchanged files. Without this, every child re-reads the
+    /// entire workspace on every step.
+    pub fn with_parent_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.parent_file_state_cache = Some(cache);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 output router
+    /// so the child Agent's spawn_only background branch routes output
+    /// through the same on-disk log the parent dashboard tails.
+    pub fn with_parent_subagent_output_router(mut self, router: Arc<SubAgentOutputRouter>) -> Self {
+        self.parent_subagent_output_router = Some(router);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1: inherit the parent's M8.7 summary
+    /// generator so child agents can drive periodic-summary watchers
+    /// under the same LLM/budget contract.
+    pub fn with_parent_subagent_summary_generator(
+        mut self,
+        generator: Arc<AgentSummaryGenerator>,
+    ) -> Self {
+        self.parent_subagent_summary_generator = Some(generator);
+        self
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper — used by tests
+    /// and the parity audit harness to assert that a SpawnTool was
+    /// fully wired with parent caches.
+    pub fn parent_file_state_cache(&self) -> Option<&Arc<FileStateCache>> {
+        self.parent_file_state_cache.as_ref()
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper.
+    pub fn parent_subagent_output_router(&self) -> Option<&Arc<SubAgentOutputRouter>> {
+        self.parent_subagent_output_router.as_ref()
+    }
+
+    /// M8 Runtime Parity W2.B1 introspection helper.
+    pub fn parent_subagent_summary_generator(&self) -> Option<&Arc<AgentSummaryGenerator>> {
+        self.parent_subagent_summary_generator.as_ref()
     }
 
     /// Dispatch a task to the configured MCP-backed sub-agent. Public so
@@ -946,6 +1025,84 @@ fn extract_inline_podcast_script(task_desc: &str) -> Option<String> {
     }
 
     (script_lines.len() >= 2).then(|| script_lines.join("\n"))
+}
+
+/// M8 Runtime Parity W2.B2 — single-shot recovery wrapper around
+/// `Agent::run_task`. Mirrors the session_actor M8.9 contract:
+/// when the first attempt returns either a hard `Err` or a
+/// `TaskResult { success: false, .. }`, we synthesize a recovery
+/// instruction (using [`build_spawn_recovery_prompt`]) and re-engage
+/// the worker exactly once.
+///
+/// Conservative on purpose:
+/// - Only one recovery attempt — second failure bubbles up verbatim.
+/// - Reuses the *same* worker / Agent instance so file-state cache,
+///   compaction state, and persistent retry buckets are preserved.
+/// - The recovery turn is sent as an `additional_instructions`-style
+///   tail appended to the original task description, so the worker's
+///   conversation history stays linear.
+async fn run_task_with_m8_9_recovery(
+    worker: &Agent,
+    subtask: &Task,
+    task_desc: &str,
+) -> Result<TaskResult> {
+    let initial = worker.run_task(subtask).await;
+    let needs_recovery = match &initial {
+        Err(_) => true,
+        Ok(task_result) => !task_result.success,
+    };
+    if !needs_recovery {
+        return initial;
+    }
+
+    let error_message = match &initial {
+        Err(error) => format!("{error:#}"),
+        Ok(task_result) => {
+            // The caller's `output` is the LLM's last assistant message
+            // when the worker decided "I cannot continue". Surface that
+            // verbatim so the recovery prompt mirrors what the user
+            // would see in the chat bubble.
+            if task_result.output.trim().is_empty() {
+                "task ended unsuccessfully without an explanatory message".to_string()
+            } else {
+                task_result.output.clone()
+            }
+        }
+    };
+
+    let recovery_prompt = build_spawn_recovery_prompt(task_desc, &error_message);
+    let recovery_task = Task::new(
+        TaskKind::Code {
+            instruction: recovery_prompt,
+            files: Vec::new(),
+        },
+        subtask.context.clone(),
+    );
+    info!(
+        task_id = %subtask.id,
+        agent_id = %worker.id,
+        "M8.9 spawn-task recovery: re-engaging worker after initial failure"
+    );
+    worker.run_task(&recovery_task).await
+}
+
+/// Build the synthetic `[system-internal]` instruction the spawn-task
+/// recovery wrapper sends after a first-pass failure. The shape mirrors
+/// `session_actor::build_recovery_prompt` but operates on the
+/// pre-LLM task description (we don't have a tool_input here).
+fn build_spawn_recovery_prompt(task_desc: &str, error_message: &str) -> String {
+    format!(
+        "[system-internal] Your previous attempt at the task below failed.\n\
+         Original task: {task}\n\
+         Failure: {err}\n\n\
+         Re-attempt the task. Diagnose the root cause from the failure text, \
+         pick a different strategy if appropriate (different tool, different inputs, \
+         a smaller scope), and either complete the task or end with a clear \
+         explanation of why the task cannot be completed. Do not repeat the same \
+         failing step verbatim.",
+        task = task_desc,
+        err = error_message,
+    )
 }
 
 async fn maybe_generate_inline_research_podcast(
@@ -1507,6 +1664,31 @@ impl Tool for SpawnTool {
         ctx: &super::ToolContext,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        // Guard C (issue #607): refuse deeply-nested spawn calls before
+        // we touch any shared resource (worker counters, supervisor
+        // registrations, MCP backends). At `spawn_depth >= MAX_SPAWN_DEPTH`
+        // we surface a structured error so the LLM sees a typed failure
+        // and the runaway mutual-recursion path collapses.
+        if ctx.spawn_depth >= MAX_SPAWN_DEPTH {
+            warn!(
+                depth = ctx.spawn_depth,
+                cap = MAX_SPAWN_DEPTH,
+                "spawn refused: depth limit exceeded"
+            );
+            counter!(
+                "octos_spawn_depth_rejected_total",
+                "cap" => MAX_SPAWN_DEPTH.to_string()
+            )
+            .increment(1);
+            return Ok(ToolResult {
+                output: format!(
+                    "Status: FAILED\nspawn depth limit ({MAX_SPAWN_DEPTH}) exceeded; refusing further nesting"
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let mut input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid spawn tool input")?;
         // M8.2: if the caller referenced an AgentDefinition manifest by id,
@@ -1572,10 +1754,14 @@ impl Tool for SpawnTool {
                 "additional_instructions": input.additional_instructions,
             });
 
-            // Pre-dispatch budget projection (M7.4). Absent a
-            // configured accountant the check short-circuits and the
-            // dispatch proceeds unchanged — this keeps existing M7.1
-            // dispatch tests passing when no policy is configured.
+            // Pre-dispatch budget reservation (F-003). Absent a
+            // configured accountant the reservation short-circuits to
+            // `None` and the dispatch proceeds unchanged — this keeps
+            // existing M7.1 dispatch tests passing when no policy is
+            // configured. With a policy, `reserve` closes the TOCTOU
+            // race on concurrent dispatches by inserting the projected
+            // amount into the accountant's in-memory map under the
+            // same lock as the historical-spend read.
             let model_for_ledger = input
                 .model
                 .clone()
@@ -1583,53 +1769,47 @@ impl Tool for SpawnTool {
             let contract_id_for_ledger = workflow_kind
                 .clone()
                 .unwrap_or_else(|| session_key_for_event.clone());
-            if let Some(accountant) = self.cost_accountant.as_ref() {
-                if let Some(policy) = accountant.policy() {
-                    if policy.is_enforced() {
-                        // Pre-spawn estimate: tokens_in ≈ UTF-8 length of
-                        // the outbound task description divided by 4
-                        // (the classic 1 token ≈ 4 chars rule of thumb).
-                        // Good enough for budget rejection — the ledger
-                        // replaces this with the real count on success.
-                        let tokens_in_estimate = task_desc.len().div_ceil(4) as u32;
-                        let projected_usd = crate::cost_ledger::project_cost_usd(
-                            &model_for_ledger,
-                            tokens_in_estimate,
-                            0,
-                        )
-                        .unwrap_or(0.0);
-                        match accountant
-                            .project_dispatch(&contract_id_for_ledger, projected_usd)
-                            .await
-                        {
-                            Ok(crate::cost_ledger::BudgetProjection::Allowed { .. }) => {}
-                            Ok(crate::cost_ledger::BudgetProjection::Rejected {
-                                reason, ..
-                            }) => {
-                                let message = format!(
-                                    "Status: FAILED\nDispatch rejected by cost budget policy: {reason}"
-                                );
-                                warn!(
-                                    contract_id = %contract_id_for_ledger,
-                                    reason = %reason,
-                                    "rejecting MCP sub-agent dispatch before spawn"
-                                );
-                                return Ok(ToolResult {
-                                    output: message,
-                                    success: false,
-                                    ..Default::default()
-                                });
-                            }
-                            Err(error) => {
-                                warn!(
-                                    error = %error,
-                                    "cost budget projection failed; allowing dispatch"
-                                );
-                            }
+            let reservation = if let Some(accountant) = self.cost_accountant.as_ref() {
+                if accountant.policy().is_some_and(|p| p.is_enforced()) {
+                    // Pre-spawn estimate: tokens_in ≈ UTF-8 length of
+                    // the outbound task description divided by 4
+                    // (the classic 1 token ≈ 4 chars rule of thumb).
+                    // Good enough for budget rejection — the ledger
+                    // replaces this with the real count on success.
+                    let tokens_in_estimate = task_desc.len().div_ceil(4) as u32;
+                    let projected_usd = crate::cost_ledger::project_cost_usd(
+                        &model_for_ledger,
+                        tokens_in_estimate,
+                        0,
+                    )
+                    .unwrap_or(0.0);
+                    match accountant
+                        .reserve(&contract_id_for_ledger, projected_usd)
+                        .await
+                    {
+                        Ok(handle) => Some(handle),
+                        Err(breach) => {
+                            let message = format!(
+                                "Status: FAILED\nDispatch rejected by cost budget policy: {breach}"
+                            );
+                            warn!(
+                                contract_id = %contract_id_for_ledger,
+                                reason = %breach,
+                                "rejecting MCP sub-agent dispatch before spawn"
+                            );
+                            return Ok(ToolResult {
+                                output: message,
+                                success: false,
+                                ..Default::default()
+                            });
                         }
                     }
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
 
             let (response, event) = {
                 let request = DispatchRequest {
@@ -1670,10 +1850,12 @@ impl Tool for SpawnTool {
 
             let success = response.outcome == super::mcp_agent::DispatchOutcome::Success;
 
-            // Post-dispatch cost attribution (M7.4). Only record when
-            // the remote agent returned a ready artifact; failures and
-            // timeouts are already visible via the dispatch event and
-            // should not inflate the ledger.
+            // Post-dispatch cost attribution (M7.4 + F-003). Only
+            // record when the remote agent returned a ready artifact;
+            // failures and timeouts are already visible via the
+            // dispatch event and should not inflate the ledger. On the
+            // failure path the reservation handle is dropped below,
+            // auto-refunding the pre-dispatch projection.
             if success {
                 if let Some(accountant) = self.cost_accountant.as_ref() {
                     let tokens_in_est = task_desc.len().div_ceil(4) as u32;
@@ -1700,11 +1882,19 @@ impl Tool for SpawnTool {
                     );
                     let attribution_id_for_event = attribution.attribution_id.clone();
 
-                    // Commit to the ledger. Failing to persist is
-                    // non-fatal for the dispatch itself — we log and
-                    // continue so a bad disk does not mask a successful
-                    // agent run.
-                    if let Err(error) = accountant.ledger().record(attribution).await {
+                    // Commit through the reservation handle if we hold
+                    // one (policy-enforced path). Otherwise fall back
+                    // to the legacy direct-record path for the
+                    // no-policy configuration. Failure to persist is
+                    // non-fatal — we log and continue so a bad disk
+                    // does not mask a successful agent run.
+                    let record_result = if let Some(handle) = reservation.as_ref() {
+                        handle.commit(attribution).await
+                    } else {
+                        accountant.ledger().record(attribution).await
+                    };
+
+                    if let Err(error) = record_result {
                         warn!(
                             task_id = %task_id_for_event,
                             error = %error,
@@ -1752,6 +1942,11 @@ impl Tool for SpawnTool {
                     }
                 }
             }
+            // On the failure path, drop the reservation explicitly so
+            // the auto-refund fires before we return the `Status: FAILED`
+            // result. The handle is scoped to this block — either
+            // `commit` above consumed it successfully, or Drop refunds.
+            drop(reservation);
 
             let mut files_to_send = response.files_to_send.clone();
             // Workflow contract families always gate outputs through the
@@ -1776,25 +1971,86 @@ impl Tool for SpawnTool {
                 }
             }
 
+            // Review A F-004: for the agent_mcp dispatch path the child
+            // session runs inside the remote backend and never touches the
+            // parent's ValidatorRunner. Before, the parent trusted the
+            // remote `SUCCESS` label — if the remote skipped its own
+            // contract-gate, the parent happily forwarded a non-validated
+            // artifact. Running the declared completion-phase validators
+            // here, against the parent's workspace root, restores the
+            // invariant: any required validator failure demotes the
+            // response to a typed failure before it leaves the tool.
+            let mut mcp_success = success;
+            let mut mcp_output_override: Option<String> = None;
+            if mcp_success {
+                if let Ok(Some(policy)) =
+                    crate::workspace_policy::read_workspace_policy(&self.working_dir)
+                {
+                    if !policy.validation.validators.is_empty() {
+                        let registry_for_validators =
+                            ToolRegistry::with_builtins(&self.working_dir);
+                        if let Err(reason) = crate::workspace_contract::run_declared_validators(
+                            &registry_for_validators,
+                            &self.working_dir,
+                            &policy.validation.validators,
+                            "spawn-agent-mcp",
+                            crate::validators::ValidatorPhase::Completion,
+                        )
+                        .await
+                        {
+                            mcp_success = false;
+                            mcp_output_override = Some(format!(
+                                "Status: FAILED\nremote_agent_mcp: completion validator rejected child artifact: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+
             return Ok(ToolResult {
-                output: if success {
-                    format!("Status: SUCCESS\n\n{}", response.output)
+                output: mcp_output_override.unwrap_or_else(|| {
+                    if mcp_success {
+                        format!("Status: SUCCESS\n\n{}", response.output)
+                    } else {
+                        format!(
+                            "Status: FAILED\n{}",
+                            response
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| response.output.clone())
+                        )
+                    }
+                }),
+                success: mcp_success,
+                files_to_send: if mcp_success {
+                    files_to_send
                 } else {
-                    format!(
-                        "Status: FAILED\n{}",
-                        response
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| response.output.clone())
-                    )
+                    Vec::new()
                 },
-                success,
-                files_to_send,
                 ..Default::default()
             });
         }
 
         let sub_llm = self.resolve_sub_provider(input.model.as_deref(), input.context_window)?;
+
+        // Review A F-004: snapshot the parent workspace policy once so both the
+        // sync and async spawn branches propagate the same typed
+        // compaction / validator contracts to child sessions. Without this,
+        // the child Agent silently runs without preflight compaction even
+        // when the parent's workspace_policy.toml declares one.
+        let parent_workspace_policy =
+            match crate::workspace_policy::read_workspace_policy(&self.working_dir) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    warn!(
+                        working_dir = %self.working_dir.display(),
+                        error = %error,
+                        "spawn: failed to read parent workspace policy; \
+                         child will run without propagated compaction/validator contracts"
+                    );
+                    None
+                }
+            };
 
         if is_sync {
             // Sync mode: run subagent inline and return the result directly
@@ -1821,10 +2077,57 @@ impl Tool for SpawnTool {
             if let Some(ref pp) = self.provider_policy {
                 tools.set_provider_policy(pp.clone());
             }
-            let mut worker = Agent::new(worker_id, sub_llm, tools, self.memory.clone());
+            let mut worker = Agent::new(worker_id, sub_llm.clone(), tools, self.memory.clone())
+                // Guard C (issue #607): stamp the child agent's spawn
+                // nesting depth as `parent_depth + 1` so the child's
+                // own spawn tool calls see the higher value and the
+                // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
+                .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
+            // Keep an Arc handle to the child's tool registry so we can run
+            // declared validators against it after `run_task` returns.
+            let child_tools_handle = worker.tool_registry().clone();
             if let Some(ref config) = self.worker_config {
                 worker = worker.with_config(config.clone());
             }
+
+            // M8 Runtime Parity W2.B1: inherit parent caches so the child
+            // observes the same file_state_cache + subagent_output_router
+            // + subagent_summary_generator the session actor wired. This
+            // closes the gap where spawned subagents had `file_state_cache:
+            // None` and re-read the entire workspace on every step.
+            if let Some(ref cache) = self.parent_file_state_cache {
+                worker = worker.with_file_state_cache(cache.clone());
+            }
+            if let Some(ref router) = self.parent_subagent_output_router {
+                worker = worker.with_subagent_output_router(router.clone());
+            }
+            if let Some(ref summary_gen) = self.parent_subagent_summary_generator {
+                worker = worker.with_subagent_summary_generator(summary_gen.clone());
+            }
+
+            // Review A F-004: propagate the parent's declarative compaction
+            // policy onto the child Agent so the child honours the same token
+            // budget and preserved-artifact contract the parent committed to.
+            if let Some(ref policy) = parent_workspace_policy {
+                if let Some(compaction_policy) = policy.compaction.clone() {
+                    let runner = match compaction_policy.summarizer {
+                        crate::workspace_policy::CompactionSummarizerKind::LlmIterative => {
+                            crate::compaction::CompactionRunner::with_provider(
+                                compaction_policy,
+                                sub_llm.clone(),
+                            )
+                        }
+                        crate::workspace_policy::CompactionSummarizerKind::Extractive => {
+                            crate::compaction::CompactionRunner::new(compaction_policy)
+                        }
+                    }
+                    .with_workspace_policy(policy);
+                    worker = worker
+                        .with_compaction_runner(Arc::new(runner))
+                        .with_compaction_workspace(policy.clone());
+                }
+            }
+
             // Base prompt: configured worker prompt, or compiled-in default.
             // Additional instructions are appended, never replacing the base.
             let base_prompt = self
@@ -1848,14 +2151,49 @@ impl Tool for SpawnTool {
                 },
             );
 
-            let result = worker.run_task(&subtask).await;
+            // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
+            // M8.9 recovery so the synchronous spawn path mirrors the
+            // session-actor recovery contract.
+            let result = run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await;
             match result {
-                Ok(r) => Ok(ToolResult {
-                    output: r.output,
-                    success: r.success,
-                    tokens_used: Some(r.token_usage),
-                    ..Default::default()
-                }),
+                Ok(r) => {
+                    // Review A F-004: run declared completion-phase validators
+                    // against the child's artifacts before surfacing success.
+                    // Matches `enforce_spawn_task_contract`'s gating for
+                    // spawn-only tools and closes the "vacuous pass" hole in
+                    // `contract_failure_summary` (which only reads the ledger).
+                    let mut output = r.output;
+                    let mut success = r.success;
+                    if success {
+                        if let Some(ref policy) = parent_workspace_policy {
+                            if !policy.validation.validators.is_empty() {
+                                match crate::workspace_contract::run_declared_validators(
+                                    child_tools_handle.as_ref(),
+                                    &self.working_dir,
+                                    &policy.validation.validators,
+                                    "spawn",
+                                    crate::validators::ValidatorPhase::Completion,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {}
+                                    Err(reason) => {
+                                        success = false;
+                                        output = format!(
+                                            "Subagent failed: contract validator rejected child artifact: {reason}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(ToolResult {
+                        output,
+                        success,
+                        tokens_used: Some(r.token_usage),
+                        ..Default::default()
+                    })
+                }
                 Err(e) => Ok(ToolResult {
                     output: format!("Subagent failed: {e}"),
                     success: false,
@@ -1907,6 +2245,24 @@ impl Tool for SpawnTool {
             let parent_session_key = self.session_key.clone();
             let worker_hooks = self.hooks.clone();
             let hook_context_template = self.hook_context_template.clone();
+            // Review A F-004: carry the parent workspace policy into the
+            // background child task so the detached child inherits the same
+            // compaction + validator contracts the sync spawn path honours.
+            let child_workspace_policy = parent_workspace_policy.clone();
+            // M8 Runtime Parity W2.B1: capture parent caches into the
+            // detached background closure so the bg child Agent gets the
+            // same FileStateCache + Router + SummaryGenerator as the sync
+            // path. Without these the detached subagent silently runs
+            // without M8.4/M8.7 wiring even when the session actor
+            // configured everything.
+            let parent_file_state_cache = self.parent_file_state_cache.clone();
+            let parent_subagent_output_router = self.parent_subagent_output_router.clone();
+            let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
+            // Guard C (issue #607): snapshot the caller's spawn depth so
+            // the detached child Agent dispatched below sees
+            // `parent_depth + 1` and the [`MAX_SPAWN_DEPTH`] gate fires
+            // after a bounded number of nests.
+            let child_spawn_depth = ctx.spawn_depth.saturating_add(1);
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -2006,10 +2362,34 @@ impl Tool for SpawnTool {
                 if let Some(pp) = provider_policy {
                     tools.set_provider_policy(pp);
                 }
-                let mut worker = Agent::new(wid.clone(), llm, tools, memory);
+                // Review A F-004: clone the child LLM provider before the
+                // Agent takes ownership so it can also back an LLM-iterative
+                // compaction summarizer if the parent policy requests one.
+                let child_llm_for_compaction = llm.clone();
+                let mut worker = Agent::new(wid.clone(), llm, tools, memory)
+                    // Guard C (issue #607): inherit the parent's spawn
+                    // nesting depth + 1 so the detached child sees the
+                    // higher value when its own spawn calls run.
+                    .with_spawn_depth(child_spawn_depth);
+                // Keep an Arc to the child's tool registry for the
+                // post-`run_task` validator invocation below.
+                let child_tools_handle = worker.tool_registry().clone();
                 let mut effective_config = worker_config.clone().unwrap_or_default();
                 effective_config.suppress_auto_send_files = true;
                 worker = worker.with_config(effective_config);
+                // M8 Runtime Parity W2.B1: apply parent caches to the
+                // detached background child before it consumes any
+                // user-facing instruction. See `with_parent_file_state_cache`
+                // for the contract.
+                if let Some(ref cache) = parent_file_state_cache {
+                    worker = worker.with_file_state_cache(cache.clone());
+                }
+                if let Some(ref router) = parent_subagent_output_router {
+                    worker = worker.with_subagent_output_router(router.clone());
+                }
+                if let Some(ref summary_gen) = parent_subagent_summary_generator {
+                    worker = worker.with_subagent_summary_generator(summary_gen.clone());
+                }
                 if let Some(ref sink_path) = harness_event_sink_path {
                     worker = worker.with_harness_event_sink(sink_path.clone());
                 }
@@ -2024,6 +2404,32 @@ impl Tool for SpawnTool {
                 }) {
                     worker = worker.with_hook_context(ctx);
                 }
+
+                // Review A F-004: propagate the parent's declarative
+                // compaction policy onto the background child. The detached
+                // child would otherwise silently run without preflight
+                // compaction even when the parent's workspace_policy.toml
+                // declares one, undermining the contract the parent honours.
+                if let Some(ref policy) = child_workspace_policy {
+                    if let Some(compaction_policy) = policy.compaction.clone() {
+                        let runner = match compaction_policy.summarizer {
+                            crate::workspace_policy::CompactionSummarizerKind::LlmIterative => {
+                                crate::compaction::CompactionRunner::with_provider(
+                                    compaction_policy,
+                                    child_llm_for_compaction,
+                                )
+                            }
+                            crate::workspace_policy::CompactionSummarizerKind::Extractive => {
+                                crate::compaction::CompactionRunner::new(compaction_policy)
+                            }
+                        }
+                        .with_workspace_policy(policy);
+                        worker = worker
+                            .with_compaction_runner(Arc::new(runner))
+                            .with_compaction_workspace(policy.clone());
+                    }
+                }
+
                 let base_prompt = default_worker_prompt
                     .unwrap_or_else(|| crate::DEFAULT_WORKER_PROMPT.to_string());
                 let full_prompt = match additional_instructions {
@@ -2043,8 +2449,10 @@ impl Tool for SpawnTool {
                     },
                 );
 
+                // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
+                // M8.9 recovery for the detached background path too.
                 let mut result = match availability_check {
-                    Ok(()) => worker.run_task(&subtask).await,
+                    Ok(()) => run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await,
                     Err(error) => Err(error),
                 };
                 if let Ok(task_result) = result.as_mut() {
@@ -2056,16 +2464,46 @@ impl Tool for SpawnTool {
                     )
                     .await;
                 }
-                let mut contract_failure = match &result {
-                    Ok(task_result) if task_result.success => resolve_background_terminal_files(
-                        &working_dir,
-                        &task_result.files_to_send,
-                        &task_result.files_modified,
-                        workflow_metadata.as_ref(),
-                    )
-                    .err(),
-                    _ => None,
-                };
+
+                // Review A F-004: actively run declared completion-phase
+                // validators before the existing ledger-read checks. The
+                // pre-fix path relied on `resolve_background_terminal_files`
+                // + ledger inspection, which trivially passed when the child
+                // never ran validators (the ledger was empty). Running the
+                // validators here guarantees the required rail is exercised
+                // before any downstream gate consults the ledger.
+                let mut contract_failure: Option<String> = None;
+                if let (Ok(task_result), Some(policy)) =
+                    (result.as_ref(), child_workspace_policy.as_ref())
+                {
+                    if task_result.success && !policy.validation.validators.is_empty() {
+                        if let Err(reason) = crate::workspace_contract::run_declared_validators(
+                            child_tools_handle.as_ref(),
+                            &working_dir,
+                            &policy.validation.validators,
+                            "spawn",
+                            crate::validators::ValidatorPhase::Completion,
+                        )
+                        .await
+                        {
+                            contract_failure = Some(reason);
+                        }
+                    }
+                }
+                if contract_failure.is_none() {
+                    contract_failure = match &result {
+                        Ok(task_result) if task_result.success => {
+                            resolve_background_terminal_files(
+                                &working_dir,
+                                &task_result.files_to_send,
+                                &task_result.files_modified,
+                                workflow_metadata.as_ref(),
+                            )
+                            .err()
+                        }
+                        _ => None,
+                    };
+                }
                 let mut terminal_files = match (&result, contract_failure.as_ref()) {
                     (Ok(task_result), None) if task_result.success => {
                         resolve_background_terminal_files(
@@ -2553,6 +2991,9 @@ mod tests {
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
             cost_accountant: None,
+            parent_file_state_cache: None,
+            parent_subagent_output_router: None,
+            parent_subagent_summary_generator: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);
@@ -3780,5 +4221,333 @@ PY
 
         assert_eq!(input.allowed_tools, before.allowed_tools);
         assert_eq!(input.model, before.model);
+    }
+
+    // ────────── M8 Runtime Parity W2.B1 wiring tests ──────────
+
+    /// A SpawnTool built without explicit parent caches must keep the
+    /// pre-W2 default — `None` on every parent introspection helper —
+    /// so unrelated callers don't pay any cost from the new optional
+    /// fields.
+    #[tokio::test]
+    async fn spawn_tool_default_has_no_parent_caches() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+        assert!(tool.parent_file_state_cache().is_none());
+        assert!(tool.parent_subagent_output_router().is_none());
+        assert!(tool.parent_subagent_summary_generator().is_none());
+    }
+
+    // ────────── M8 Runtime Parity W2.B2 recovery prompt helper ──────────
+
+    #[test]
+    fn build_spawn_recovery_prompt_includes_task_and_error_text() {
+        let prompt = build_spawn_recovery_prompt(
+            "Generate a 5-slide deck on AI",
+            "validator rejected child artifact: deck.pptx missing",
+        );
+        assert!(prompt.contains("[system-internal]"));
+        assert!(prompt.contains("Generate a 5-slide deck on AI"));
+        assert!(
+            prompt.contains("validator rejected child artifact: deck.pptx missing"),
+            "recovery prompt must surface the verbatim failure: {prompt}"
+        );
+        assert!(
+            prompt.contains("different strategy") || prompt.contains("smaller scope"),
+            "recovery prompt must direct the LLM toward an alternative"
+        );
+    }
+
+    #[test]
+    fn build_spawn_recovery_prompt_handles_empty_task_desc() {
+        let prompt = build_spawn_recovery_prompt("", "boom");
+        assert!(prompt.contains("Original task: "));
+        assert!(prompt.contains("Failure: boom"));
+    }
+
+    /// Provider that returns a hard `Err` on the first call and a
+    /// successful EndTurn on every subsequent call. Used to drive the
+    /// M8.9 recovery wrapper.
+    struct FailThenSucceedProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FailThenSucceedProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Err(eyre::eyre!("simulated provider failure"));
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some("recovered".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_with_m8_9_recovery_retries_once_after_initial_failure() {
+        let provider = Arc::new(FailThenSucceedProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let calls_ref = provider.calls.load(Ordering::SeqCst);
+        assert_eq!(calls_ref, 0);
+
+        let memory = Arc::new(create_test_store().await);
+        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        let worker = Agent::new(
+            AgentId::new("test-worker"),
+            provider.clone(),
+            registry,
+            memory,
+        );
+        let subtask = Task::new(
+            TaskKind::Code {
+                instruction: "Recover me".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_with_m8_9_recovery(&worker, &subtask, "Recover me").await;
+        let task_result = result.expect("recovery succeeds");
+        assert!(task_result.success, "recovery turn must succeed");
+        assert!(
+            provider.calls.load(Ordering::SeqCst) >= 2,
+            "recovery must invoke the provider at least twice (one fail + one retry); got {}",
+            provider.calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Provider whose every call hard-fails. Drives the
+    /// "recovery still fails -> bubble up" branch.
+    struct AlwaysFailProvider;
+
+    #[async_trait]
+    impl LlmProvider for AlwaysFailProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Err(eyre::eyre!("simulated permanent failure"))
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_with_m8_9_recovery_bubbles_up_when_recovery_also_fails() {
+        let provider = Arc::new(AlwaysFailProvider);
+        let memory = Arc::new(create_test_store().await);
+        let registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        let worker = Agent::new(AgentId::new("test-worker"), provider, registry, memory);
+        let subtask = Task::new(
+            TaskKind::Code {
+                instruction: "do".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: PathBuf::from("/tmp"),
+                ..Default::default()
+            },
+        );
+
+        let result = run_task_with_m8_9_recovery(&worker, &subtask, "do").await;
+        assert!(result.is_err(), "permanent failure must bubble up");
+    }
+
+    /// Once wired with parent caches the SpawnTool must surface the
+    /// same `Arc` instances back through its introspection helpers —
+    /// session_actor / tests rely on identity to assert the parent
+    /// cache reaches the spawned child.
+    #[tokio::test]
+    async fn spawn_tool_propagates_parent_caches_via_builders() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let cache = Arc::new(crate::FileStateCache::new());
+        let router = Arc::new(crate::SubAgentOutputRouter::new(std::env::temp_dir().join(
+            format!(
+                "octos-w2-router-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ),
+        )));
+        let supervisor = TaskSupervisor::new();
+        let summary_gen = Arc::new(crate::AgentSummaryGenerator::new(
+            Arc::new(MockProvider),
+            router.clone(),
+            supervisor,
+        ));
+
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        )
+        .with_parent_file_state_cache(cache.clone())
+        .with_parent_subagent_output_router(router.clone())
+        .with_parent_subagent_summary_generator(summary_gen.clone());
+
+        // `Arc::ptr_eq` is the cheapest identity check that proves the
+        // child observed the same instance the parent wired in — not a
+        // freshly-built one.
+        assert!(Arc::ptr_eq(
+            tool.parent_file_state_cache().expect("cache wired"),
+            &cache,
+        ));
+        assert!(Arc::ptr_eq(
+            tool.parent_subagent_output_router().expect("router wired"),
+            &router,
+        ));
+        assert!(Arc::ptr_eq(
+            tool.parent_subagent_summary_generator()
+                .expect("summary generator wired"),
+            &summary_gen,
+        ));
+    }
+
+    /// Guard C regression: a spawn invocation at depth 4 must refuse
+    /// before any backend dispatch, surfacing a structured tool failure
+    /// the LLM can react to. The depth gate fires before
+    /// argument parsing — even invalid JSON returns the depth-limit
+    /// error rather than the legacy "invalid spawn tool input" path.
+    #[tokio::test]
+    async fn spawn_refuses_at_depth_4() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        // Build a ToolContext at the depth cap. The spawn tool reads
+        // `ctx.spawn_depth` and refuses before parsing args.
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.spawn_depth = MAX_SPAWN_DEPTH;
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "do something deeply nested"
+                }),
+            )
+            .await;
+        let tool_result = match result {
+            Ok(r) => r,
+            Err(error) => panic!("depth refusal should return Ok(failed) rather than Err: {error}"),
+        };
+        assert!(!tool_result.success, "spawn at the cap must report failure");
+        assert!(
+            tool_result
+                .output
+                .contains(&format!("spawn depth limit ({MAX_SPAWN_DEPTH}) exceeded")),
+            "structured reason missing from output: {}",
+            tool_result.output
+        );
+        assert!(
+            tool_result.output.contains("refusing further nesting"),
+            "structured reason missing from output: {}",
+            tool_result.output
+        );
+
+        // Sanity: at depth 0 the tool keeps working (no early refusal).
+        let mut ctx0 = super::super::ToolContext::zero();
+        ctx0.spawn_depth = 0;
+        // We pass an empty input so the legacy validation path runs. A
+        // zero-depth spawn does NOT short-circuit with the depth-limit
+        // refusal — it falls through into the regular pipeline (which
+        // surfaces an unrelated error for the empty input).
+        let baseline = tool
+            .execute_with_context(&ctx0, &serde_json::json!({}))
+            .await;
+        match baseline {
+            Ok(r) => {
+                assert!(
+                    !r.output.contains("spawn depth limit"),
+                    "below-cap spawn must not emit the depth-limit refusal: {}",
+                    r.output
+                );
+            }
+            Err(error) => {
+                let err_msg = format!("{error}");
+                assert!(
+                    !err_msg.contains("spawn depth limit"),
+                    "below-cap spawn must not emit the depth-limit refusal: {err_msg}"
+                );
+            }
+        }
+    }
+
+    /// Guard C boundary: depth 3 (one less than the cap) is still
+    /// allowed; the gate fires on depth 4 only.
+    #[tokio::test]
+    async fn spawn_allows_depth_below_cap() {
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            PathBuf::from("/tmp"),
+            in_tx,
+        );
+
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.spawn_depth = MAX_SPAWN_DEPTH - 1;
+
+        // An empty input still trips the legacy validation path; the
+        // important invariant is that depth-3 does NOT short-circuit
+        // with the structured "spawn depth limit" message.
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({}))
+            .await;
+        match result {
+            Ok(tool_result) => {
+                assert!(
+                    !tool_result.output.contains("spawn depth limit"),
+                    "depth below cap must not emit the depth-limit refusal: {}",
+                    tool_result.output
+                );
+            }
+            Err(error) => {
+                let err_msg = format!("{error}");
+                assert!(
+                    !err_msg.contains("spawn depth limit"),
+                    "depth below cap must not emit the depth-limit refusal: {err_msg}"
+                );
+            }
+        }
     }
 }

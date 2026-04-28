@@ -353,7 +353,7 @@ pub async fn frps_auth(
 #[cfg(test)]
 mod tests {
     use crate::api::admin::{CreateTenantRequest, create_tenant};
-    use crate::api::{AppState, RunIdCache, SseBroadcaster, build_router};
+    use crate::api::{AppState, build_router};
     use crate::config::DeploymentMode;
     use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::Json;
@@ -379,32 +379,15 @@ mod tests {
 
     fn test_state(dir: &tempfile::TempDir) -> Arc<AppState> {
         Arc::new(AppState {
-            agent: None,
-            sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
-            started_at: Utc::now(),
-            auth_token: None,
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
-            metrics_handle: None,
-            profile_store: None,
-            process_manager: None,
-            user_store: None,
-            allowlist_store: None,
-            auth_manager: None,
-            http_client: reqwest::Client::new(),
-            config_path: None,
-            watchdog_enabled: None,
-            alerts_enabled: None,
-            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
             tenant_store: Some(Arc::new(TenantStore::open(dir.path()).unwrap())),
-            run_id_cache: Arc::new(RunIdCache::new()),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
-            allow_admin_shell: false,
-            content_catalog_mgr: None,
+            ..AppState::empty_for_tests()
         })
     }
 

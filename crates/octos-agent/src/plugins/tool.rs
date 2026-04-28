@@ -21,6 +21,49 @@ use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
 
 use super::manifest::PluginToolDef;
 
+/// Synthesis LLM provider config injected into plugin args.
+///
+/// S2 plumbing: octos passes this struct under `synthesis_config` in the JSON
+/// args (alongside `query`, `depth`, etc.) when the plugin's manifest opts in
+/// via `x-octos-host-config-keys: ["synthesis_config"]`. Plugins that haven't
+/// declared the key never see this struct, so secrets stay scoped to the
+/// plugins that asked for them.
+///
+/// Token MUST NOT be logged. Audit `tracing::*` and `eprintln!` paths before
+/// adding diagnostics that touch this struct.
+#[derive(Clone, Debug)]
+pub struct SynthesisConfig {
+    /// OpenAI-compatible base URL (e.g. `https://api.deepseek.com/v1`).
+    pub endpoint: String,
+    /// Bearer token for the synthesis provider.
+    pub api_key: String,
+    /// Model id to request (e.g. `deepseek-chat`).
+    pub model: String,
+    /// Provider label for the v2 cost envelope (e.g. `deepseek`).
+    pub provider: String,
+}
+
+impl SynthesisConfig {
+    /// Whether all four fields are populated. Partial configs are dropped at
+    /// the inject site so the plugin's env-fallback still works.
+    pub fn is_complete(&self) -> bool {
+        !self.endpoint.is_empty()
+            && !self.api_key.is_empty()
+            && !self.model.is_empty()
+            && !self.provider.is_empty()
+    }
+
+    /// Encode the config as a JSON object suitable for inlining into plugin args.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": self.endpoint,
+            "api_key": self.api_key,
+            "model": self.model,
+            "provider": self.provider,
+        })
+    }
+}
+
 /// A tool backed by a plugin executable.
 ///
 /// Protocol: write JSON args to stdin, read JSON result from stdout.
@@ -38,6 +81,10 @@ pub struct PluginTool {
     work_dir: Option<PathBuf>,
     /// Execution timeout.
     timeout: Duration,
+    /// S2 plumbing: synthesis LLM provider config to inject into plugin args.
+    /// Only honoured when the tool's manifest opts in via
+    /// `x-octos-host-config-keys: ["synthesis_config"]`.
+    synthesis_config: Option<SynthesisConfig>,
 }
 
 impl PluginTool {
@@ -53,6 +100,7 @@ impl PluginTool {
             extra_env: vec![],
             work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
+            synthesis_config: None,
         }
     }
 
@@ -81,6 +129,14 @@ impl PluginTool {
         self
     }
 
+    /// S2 plumbing: set the synthesis LLM provider config injected into the
+    /// plugin's args. Only honoured when the tool's manifest opts in via
+    /// `x-octos-host-config-keys: ["synthesis_config"]`.
+    pub fn with_synthesis_config(mut self, cfg: SynthesisConfig) -> Self {
+        self.synthesis_config = Some(cfg);
+        self
+    }
+
     /// Create a copy of this plugin tool with a different work directory.
     /// Used to give each user session its own workspace for plugin output.
     pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
@@ -92,6 +148,174 @@ impl PluginTool {
             extra_env: self.extra_env.clone(),
             work_dir: Some(work_dir),
             timeout: self.timeout,
+            synthesis_config: self.synthesis_config.clone(),
+        }
+    }
+
+    /// Dispatch one line of plugin stderr to the host progress channel.
+    ///
+    /// Implements the plugin-protocol-v2 backward-compat shim:
+    ///   1. Trim the line and try parsing as a [`ProtocolV2Event`].
+    ///   2. On a known structured event, render a stable ToolProgress
+    ///      message and (for cost events) write a structured cost
+    ///      attribution to the harness sink so the ledger can pick it up.
+    ///   3. On a JSON line with an unknown `type`, pass the raw JSON
+    ///      through as ToolProgress (operator can still see the message).
+    ///   4. On any other line, fall back to the v1 behavior — emit the
+    ///      raw text as ToolProgress.
+    ///
+    /// The shim is intentionally side-effect-free aside from the reporter
+    /// callback and the harness sink write so it is safe to call from a
+    /// reader task without holding any locks.
+    fn dispatch_stderr_line(
+        plugin_name: &str,
+        tool_name: &str,
+        ctx: Option<&ToolContext>,
+        line: &str,
+    ) {
+        use octos_plugin::protocol_v2::{LineParse, ProtocolV2Event};
+
+        let parse = octos_plugin::protocol_v2::parse_event_line(line);
+        let message = match parse {
+            LineParse::Empty => return,
+            LineParse::Event(ProtocolV2Event::Progress(progress)) => {
+                let mut out = String::new();
+                if !progress.stage.is_empty() {
+                    out.push('[');
+                    out.push_str(&progress.stage);
+                    out.push(']');
+                }
+                if let Some(fraction) = progress.progress {
+                    let pct = (fraction.clamp(0.0, 1.0) * 100.0).round();
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&format!("{pct:.0}%"));
+                }
+                if !progress.message.is_empty() {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(&progress.message);
+                }
+                if out.is_empty() { progress.stage } else { out }
+            }
+            LineParse::Event(ProtocolV2Event::Phase(phase)) => {
+                if phase.message.is_empty() {
+                    format!("[phase] {}", phase.phase)
+                } else {
+                    format!("[{}] {}", phase.phase, phase.message)
+                }
+            }
+            LineParse::Event(ProtocolV2Event::Cost(cost)) => {
+                Self::record_cost_event(plugin_name, tool_name, ctx, &cost);
+                if let Some(usd) = cost.usd {
+                    format!(
+                        "[cost] {}: in={} out={} (${usd:.4})",
+                        cost.provider, cost.tokens_in, cost.tokens_out
+                    )
+                } else {
+                    format!(
+                        "[cost] {}: in={} out={}",
+                        cost.provider, cost.tokens_in, cost.tokens_out
+                    )
+                }
+            }
+            LineParse::Event(ProtocolV2Event::Artifact(artifact)) => {
+                if artifact.message.is_empty() {
+                    format!("[artifact:{}] {}", artifact.kind, artifact.path)
+                } else {
+                    format!(
+                        "[artifact:{}] {} ({})",
+                        artifact.kind, artifact.message, artifact.path
+                    )
+                }
+            }
+            LineParse::Event(ProtocolV2Event::Log(log)) => {
+                format!("[{}] {}", log.level, log.message)
+            }
+            LineParse::Event(ProtocolV2Event::Unknown) => {
+                // Should not be reached because the parser converts
+                // unknown variants to LineParse::UnknownEvent. Defensive
+                // fallback: pass raw line through.
+                line.to_string()
+            }
+            LineParse::UnknownEvent(raw) => raw,
+            LineParse::Legacy(text) => text,
+        };
+
+        if let Some(ctx) = ctx {
+            ctx.reporter.report(ProgressEvent::ToolProgress {
+                name: tool_name.to_string(),
+                tool_id: ctx.tool_id.clone(),
+                message,
+            });
+        }
+    }
+
+    /// Forward a v2 cost event to the harness event sink if one is wired.
+    ///
+    /// Writes a `cost_attribution`-shaped JSON payload that mirrors
+    /// `HarnessCostAttributionEvent` so existing ledger tooling can ingest
+    /// plugin-level spend without a schema migration. The generated
+    /// `attribution_id` is stable per (plugin, tool, provider, tokens) so
+    /// duplicate sink writes can be detected downstream if needed.
+    fn record_cost_event(
+        plugin_name: &str,
+        tool_name: &str,
+        ctx: Option<&ToolContext>,
+        cost: &octos_plugin::protocol_v2::CostEvent,
+    ) {
+        let Some(ctx) = ctx else {
+            return;
+        };
+        let Some(sink) = ctx.harness_event_sink.as_deref() else {
+            return;
+        };
+        let Some(sink_ctx) = lookup_event_sink_context(sink) else {
+            return;
+        };
+        let attribution_id = format!(
+            "plugin-cost-{}-{}-{}-{}-{}",
+            plugin_name, tool_name, cost.provider, cost.tokens_in, cost.tokens_out
+        );
+        let payload = serde_json::json!({
+            "schema": crate::harness_events::HARNESS_EVENT_SCHEMA_V1,
+            "kind": "cost_attribution",
+            "schema_version": 1,
+            "session_id": sink_ctx.session_id,
+            "task_id": sink_ctx.task_id,
+            "workflow": null,
+            "phase": null,
+            "attribution_id": attribution_id,
+            "contract_id": format!("plugin:{plugin_name}:{tool_name}"),
+            "model": cost.model.clone().unwrap_or_else(|| "unknown".to_string()),
+            "tokens_in": cost.tokens_in,
+            "tokens_out": cost.tokens_out,
+            "cost_usd": cost.usd.unwrap_or(0.0),
+            "outcome": "ok",
+            "provider": cost.provider,
+            "source": "plugin_v2",
+        });
+        let line = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::debug!(
+                    plugin = plugin_name,
+                    tool = tool_name,
+                    error = %error,
+                    "failed to serialize plugin cost event"
+                );
+                return;
+            }
+        };
+        if let Err(error) = crate::harness_events::write_event_line_to_sink(sink, &line) {
+            tracing::debug!(
+                plugin = plugin_name,
+                tool = tool_name,
+                error = %error,
+                "failed to write plugin cost attribution to harness sink"
+            );
         }
     }
 
@@ -199,7 +423,7 @@ impl PluginTool {
         serde_json::Value::Object(rewritten)
     }
 
-    fn prepare_effective_args(
+    pub(crate) fn prepare_effective_args(
         &self,
         args: &serde_json::Value,
         ctx: Option<&ToolContext>,
@@ -254,6 +478,32 @@ impl PluginTool {
                         serde_json::Value::String(format!("slides_{ts}.pptx")),
                     );
                     tracing::info!("injected default 'out' for mofa_slides");
+                }
+            }
+        }
+
+        // S2 plumbing: inject synthesis_config when the manifest opts in via
+        // `x-octos-host-config-keys: ["synthesis_config"]` and the host has a
+        // configured `SynthesisConfig`. The plugin still falls back to env if
+        // the LLM happens to skip injection. NOTE: tokens MUST NOT be logged
+        // — emit only the provider label.
+        if self.tool_def.accepts_host_config_key("synthesis_config") {
+            if let Some(cfg) = self.synthesis_config.as_ref() {
+                if cfg.is_complete() {
+                    if let Some(obj) = effective_args.as_object_mut() {
+                        // Don't override an explicitly-provided synthesis_config.
+                        // (The LLM should never set this, but we defend in depth
+                        // so a misbehaving caller can't be silently overwritten.)
+                        if !obj.contains_key("synthesis_config") {
+                            obj.insert("synthesis_config".into(), cfg.to_json());
+                            tracing::info!(
+                                plugin = %self.plugin_name,
+                                tool = %self.tool_def.name,
+                                provider = %cfg.provider,
+                                "injected synthesis_config into plugin args"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -608,24 +858,29 @@ impl Tool for PluginTool {
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
 
-        // Spawn stderr reader: streams lines as ToolProgress events
+        // Spawn stderr reader: streams lines as ToolProgress events.
+        // Plugin protocol v2 (see `octos-plugin/docs/protocol-v2.md`):
+        // each line is either a JSON-encoded `ProtocolV2Event` or legacy
+        // free-form text. We try v2 first and fall back to legacy text on
+        // any parse failure — this is the backward-compat shim required
+        // for v1 plugins to keep working unchanged.
         let tool_name = self.tool_def.name.clone();
         // Clone ctx for the stderr reader so we can still consult the
         // original after the reader task is spawned (needed for
         // `emit_plugin_error` on spawn/timeout/protocol failures).
         let stderr_ctx = ctx.clone();
+        let plugin_name_for_reader = self.plugin_name.clone();
         let stderr_task = tokio::spawn(async move {
             let mut collected = String::new();
             if let Some(stderr) = stderr_handle {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    if let Some(ref ctx) = stderr_ctx {
-                        ctx.reporter.report(ProgressEvent::ToolProgress {
-                            name: tool_name.clone(),
-                            tool_id: ctx.tool_id.clone(),
-                            message: line.clone(),
-                        });
-                    }
+                    Self::dispatch_stderr_line(
+                        &plugin_name_for_reader,
+                        &tool_name,
+                        stderr_ctx.as_ref(),
+                        &line,
+                    );
                     if !collected.is_empty() {
                         collected.push('\n');
                     }
@@ -1088,6 +1343,136 @@ mod tests {
         assert_eq!(prepared["file_path"], "/workspace/report.pdf");
     }
 
+    fn deep_search_def_with_opt_in() -> PluginToolDef {
+        PluginToolDef {
+            name: "deep_search".to_string(),
+            description: "Deep research".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "synthesis_config": {"type": "object"}
+                },
+                "x-octos-host-config-keys": ["synthesis_config"]
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
+    fn full_synthesis_config() -> SynthesisConfig {
+        SynthesisConfig {
+            endpoint: "https://api.deepseek.com/v1".to_string(),
+            api_key: "sk-host-injected".to_string(),
+            model: "deepseek-chat".to_string(),
+            provider: "deepseek".to_string(),
+        }
+    }
+
+    #[test]
+    fn synthesis_config_is_complete_only_when_all_fields_populated() {
+        let cfg = full_synthesis_config();
+        assert!(cfg.is_complete());
+
+        let mut partial = cfg.clone();
+        partial.api_key.clear();
+        assert!(!partial.is_complete());
+
+        let mut partial = cfg.clone();
+        partial.endpoint.clear();
+        assert!(!partial.is_complete());
+    }
+
+    #[test]
+    fn prepare_effective_args_injects_synthesis_config_when_opted_in() {
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_synthesis_config(full_synthesis_config());
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        let cfg = &prepared["synthesis_config"];
+        assert_eq!(cfg["endpoint"], "https://api.deepseek.com/v1");
+        assert_eq!(cfg["api_key"], "sk-host-injected");
+        assert_eq!(cfg["model"], "deepseek-chat");
+        assert_eq!(cfg["provider"], "deepseek");
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_synthesis_config_when_manifest_does_not_opt_in() {
+        // Same tool but without the x-octos-host-config-keys extension.
+        let mut def = deep_search_def_with_opt_in();
+        def.input_schema = json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}}
+        });
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_synthesis_config(full_synthesis_config());
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        assert!(
+            prepared.get("synthesis_config").is_none(),
+            "tools without opt-in must not receive synthesis_config: {prepared}",
+        );
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_synthesis_config_when_host_did_not_set_one() {
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        );
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        assert!(prepared.get("synthesis_config").is_none());
+    }
+
+    #[test]
+    fn prepare_effective_args_skips_synthesis_config_when_partial() {
+        let mut cfg = full_synthesis_config();
+        cfg.api_key.clear(); // Partial → fall through to env path.
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_synthesis_config(cfg);
+
+        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        assert!(prepared.get("synthesis_config").is_none());
+    }
+
+    #[test]
+    fn prepare_effective_args_does_not_overwrite_explicit_synthesis_config() {
+        // Defense in depth: if a caller already set synthesis_config (e.g. a
+        // unit test or a future LLM-controlled override), don't silently
+        // replace it.
+        let tool = PluginTool::new(
+            "deep-search".into(),
+            deep_search_def_with_opt_in(),
+            PathBuf::from("/bin/true"),
+        )
+        .with_synthesis_config(full_synthesis_config());
+
+        let prepared = tool.prepare_effective_args(
+            &json!({
+                "query": "AI policy",
+                "synthesis_config": {"api_key": "caller-supplied"}
+            }),
+            None,
+        );
+        assert_eq!(prepared["synthesis_config"]["api_key"], "caller-supplied");
+        assert!(
+            prepared["synthesis_config"].get("endpoint").is_none(),
+            "host config must not be merged into caller-supplied synthesis_config",
+        );
+    }
+
     /// Write a script to a file and make it executable, with fsync to avoid ETXTBSY
     /// on Linux overlayfs (Docker containers).
     #[cfg(unix)]
@@ -1432,5 +1817,237 @@ mod tests {
             ),
             Ok(_) => panic!("expected timeout error, but execute succeeded"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Plugin protocol v2 stderr dispatch tests (W3.F2).
+    // -------------------------------------------------------------------
+
+    use crate::progress::ProgressReporter;
+    use std::sync::Mutex as StdMutex;
+
+    /// Captures every reported event so tests can assert on the ToolProgress
+    /// messages the v2 shim emits.
+    struct CapturingReporter {
+        events: Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    }
+
+    impl ProgressReporter for CapturingReporter {
+        fn report(&self, event: crate::progress::ProgressEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        }
+    }
+
+    fn make_capturing_ctx() -> (
+        ToolContext,
+        Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    ) {
+        let events = Arc::new(StdMutex::new(Vec::<crate::progress::ProgressEvent>::new()));
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "tool-1".to_string();
+        ctx.reporter = Arc::new(CapturingReporter {
+            events: Arc::clone(&events),
+        });
+        (ctx, events)
+    }
+
+    fn last_progress_message(
+        events: &Arc<StdMutex<Vec<crate::progress::ProgressEvent>>>,
+    ) -> Option<String> {
+        events.lock().unwrap().last().and_then(|event| match event {
+            crate::progress::ProgressEvent::ToolProgress { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn v2_progress_event_renders_stage_and_message() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"progress","stage":"searching","message":"round 1/3","progress":0.25}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.contains("[searching]"), "expected stage badge: {msg}");
+        assert!(msg.contains("25%"), "expected percent: {msg}");
+        assert!(msg.contains("round 1/3"), "expected message: {msg}");
+    }
+
+    #[test]
+    fn v2_phase_event_renders_phase_label() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"phase","phase":"synthesizing","message":"calling LLM"}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.starts_with("[synthesizing]"), "got {msg}");
+        assert!(msg.contains("calling LLM"), "got {msg}");
+    }
+
+    #[test]
+    fn v2_cost_event_renders_cost_summary() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"cost","provider":"deepseek","model":"deepseek-chat","tokens_in":1024,"tokens_out":256,"usd":0.0034}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.contains("[cost]"), "got {msg}");
+        assert!(msg.contains("deepseek"), "got {msg}");
+        assert!(msg.contains("in=1024"), "got {msg}");
+        assert!(msg.contains("out=256"), "got {msg}");
+        assert!(msg.contains("0.0034"), "got {msg}");
+    }
+
+    #[test]
+    fn v2_log_event_renders_level() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"log","level":"warn","message":"low disk"}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert_eq!(msg, "[warn] low disk");
+    }
+
+    #[test]
+    fn v2_artifact_event_renders_kind_and_path() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"artifact","path":"/tmp/x.md","kind":"report","message":"final"}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert!(msg.contains("[artifact:report]"), "got {msg}");
+        assert!(msg.contains("/tmp/x.md"), "got {msg}");
+    }
+
+    #[test]
+    fn legacy_v1_text_passes_through_unchanged() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "old-plugin",
+            "old_tool",
+            Some(&ctx),
+            "[deep_crawl] launched chrome on port 9222",
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert_eq!(msg, "[deep_crawl] launched chrome on port 9222");
+    }
+
+    #[test]
+    fn legacy_starting_with_bracket_does_not_lose_data() {
+        // Plugins emitting `[1/3] Searching ...` style text must still flow
+        // through unchanged — they are not JSON, the shim must not eat them.
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            "[1/3] Searching: \"foo\"",
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        assert_eq!(msg, "[1/3] Searching: \"foo\"");
+    }
+
+    #[test]
+    fn malformed_json_falls_back_to_legacy() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "p",
+            "t",
+            Some(&ctx),
+            r#"{"type":"progress""#, // truncated, parse fails
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        // Falls back to the raw line (trimmed).
+        assert_eq!(msg, r#"{"type":"progress""#);
+    }
+
+    #[test]
+    fn empty_line_emits_no_progress() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line("p", "t", Some(&ctx), "");
+        PluginTool::dispatch_stderr_line("p", "t", Some(&ctx), "   \r\n");
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_event_type_passes_raw_through() {
+        let (ctx, events) = make_capturing_ctx();
+        PluginTool::dispatch_stderr_line(
+            "p",
+            "t",
+            Some(&ctx),
+            r#"{"type":"future_event","data":42}"#,
+        );
+        let msg = last_progress_message(&events).expect("emitted progress");
+        // The raw JSON is forwarded so the operator can still see it.
+        assert!(msg.contains("future_event"), "got {msg}");
+    }
+
+    #[test]
+    fn dispatch_with_no_ctx_is_noop() {
+        // No assertion — just confirm there's no panic. With no ctx the
+        // shim cannot dispatch but it must not crash.
+        PluginTool::dispatch_stderr_line(
+            "p",
+            "t",
+            None,
+            r#"{"type":"progress","stage":"init","message":"go"}"#,
+        );
+    }
+
+    #[test]
+    fn cost_event_writes_to_harness_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("events.ndjson");
+
+        // Wire up a sink context so record_cost_event has a session+task to
+        // attribute against.
+        let ctx_path = sink_path.display().to_string();
+        crate::harness_events::attach_event_sink_context(
+            ctx_path.clone(),
+            crate::harness_events::HarnessEventSinkContext {
+                session_id: "session-1".to_string(),
+                task_id: "task-1".to_string(),
+            },
+        );
+
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "tool-1".to_string();
+        ctx.harness_event_sink = Some(ctx_path.clone());
+
+        PluginTool::dispatch_stderr_line(
+            "deep-search",
+            "deep_search",
+            Some(&ctx),
+            r#"{"type":"cost","provider":"deepseek","model":"deepseek-chat","tokens_in":1024,"tokens_out":256,"usd":0.0034}"#,
+        );
+
+        let body = std::fs::read_to_string(&sink_path).expect("sink written");
+        assert!(body.contains(r#""kind":"cost_attribution""#), "got: {body}");
+        assert!(body.contains(r#""tokens_in":1024"#), "got: {body}");
+        assert!(body.contains(r#""tokens_out":256"#), "got: {body}");
+        assert!(body.contains(r#""cost_usd":0.0034"#), "got: {body}");
+        assert!(body.contains(r#""contract_id":"plugin:deep-search:deep_search""#));
+        assert!(body.contains(r#""provider":"deepseek""#));
+
+        // Cleanup the sink registration.
+        crate::harness_events::detach_event_sink_context(&ctx_path);
     }
 }

@@ -325,9 +325,28 @@ export type EmailTokenResult = {
 
 export type DeploymentMode = 'local' | 'tenant' | 'cloud'
 
-export type DeploymentModeBody = { mode: DeploymentMode }
+export type DeploymentModeBody = { mode: DeploymentMode; explicit?: boolean }
 
 export type DeploymentModeDetection = { detected: DeploymentMode }
+
+// ── Server info (public) ─────────────────────────────────────────────
+
+export interface ServerStatus {
+  version: string
+  model: string
+  provider: string
+  uptime_secs: number
+  agent_configured: boolean
+  /** Public-facing base domain this mini serves profiles under
+   *  (e.g. `"crew.ominix.io"`, `"bot.ominix.io"`). Always a concrete
+   *  string — the server substitutes `"crew.ominix.io"` when
+   *  unconfigured. */
+  base_domain: string
+}
+
+export const systemApi = {
+  status: () => authedRequest<ServerStatus>('/status'),
+}
 
 // ── Auth API (public) ───────────────────────────────────────────────
 
