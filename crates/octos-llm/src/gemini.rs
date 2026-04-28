@@ -771,6 +771,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -893,6 +894,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -903,6 +905,7 @@ mod tests {
                 tool_call_id: Some("tc1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
