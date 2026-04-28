@@ -127,10 +127,14 @@ export default function LoginPage() {
         <div className="bg-surface rounded-xl border border-gray-700/50 p-6">
           {step === 'token' ? (
             <form onSubmit={handleTokenLogin}>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label
+                htmlFor="admin-token"
+                className="block text-sm font-medium text-gray-300 mb-2"
+              >
                 Admin token
               </label>
               <input
+                id="admin-token"
                 type="password"
                 value={adminToken}
                 onChange={(e) => setAdminToken(e.target.value)}
@@ -160,10 +164,14 @@ export default function LoginPage() {
             </form>
           ) : step === 'email' ? (
             <form onSubmit={handleSendCode}>
-              <label className="block text-sm font-medium text-gray-300 mb-2">
+              <label
+                htmlFor="login-email"
+                className="block text-sm font-medium text-gray-300 mb-2"
+              >
                 Email address
               </label>
               <input
+                id="login-email"
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}

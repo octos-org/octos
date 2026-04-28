@@ -107,6 +107,12 @@ pub struct ConversationResponse {
     /// tool results). Includes the user message at the front. Callers should
     /// persist these to session history so subsequent calls see the full context.
     pub messages: Vec<Message>,
+    /// Structured side-channel metadata surfaced by tools that ran during
+    /// this conversation, keyed by `tool_call_id`. Used today for per-node
+    /// cost rows from `run_pipeline` (`{"node_costs": [...]}`); the session
+    /// actor pulls these into the SSE `done` event so the W1.G4 cost panel
+    /// can render real per-node attribution. Empty when no tool opted in.
+    pub tool_results: Vec<(String, serde_json::Value)>,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
@@ -179,6 +185,14 @@ pub struct Agent {
     /// Workspace policy associated with the compaction runner (used by the
     /// post-compaction validator rail to resolve preserved artifacts).
     pub(super) compaction_workspace: Option<crate::workspace_policy::WorkspacePolicy>,
+    /// Cross-turn persistent retry bucket state (Review A F-015). When
+    /// present, the loop uses this shared state instead of constructing a
+    /// fresh `LoopRetryState` per `process_message` / `run_task`. Callers
+    /// (e.g. `SessionActor`) own the save/load lifecycle via the
+    /// `LoopRetryState::Serialize + Deserialize` impls. Absent = legacy
+    /// per-turn-reset behaviour, identical to every pre-F-015 caller.
+    pub(super) persistent_retry_state:
+        Option<Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>>,
     /// M8.2 agent manifest registry shared with tools via `ToolContext`.
     /// Shared behind an `Arc` so every per-tool `ToolContext::agent_definitions`
     /// clone is O(1). When left at the default (empty registry) the agent
@@ -211,6 +225,23 @@ pub struct Agent {
     /// it on terminal completion. `None` keeps pre-M8.7 behaviour.
     pub(super) subagent_summary_generator:
         Option<Arc<crate::subagent_summary::AgentSummaryGenerator>>,
+    /// M8 parity (W1.A4): optional shared cost accountant. When set,
+    /// the agent threads it onto every `ToolContext` so background
+    /// sub-agents (pipeline workers, spawn children) reserve and commit
+    /// against the same ledger as the parent session.
+    pub(super) cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
+    /// M8 parity: optional parent session key. When the agent is owned
+    /// by a session actor, this carries the session key down through
+    /// `ToolContext.parent_session_key` so spawn children / pipeline
+    /// workers can register tasks against the owning session.
+    pub(super) parent_session_key: Option<String>,
+    /// Guard C (issue #607): nesting depth this agent's tool calls
+    /// inherit via `ToolContext.spawn_depth`. The session-actor's
+    /// top-level agent leaves this at 0; sub-agents created by the
+    /// `spawn` tool set it via [`Self::with_spawn_depth`] so the
+    /// child's own spawn calls see the higher value and the
+    /// `MAX_SPAWN_DEPTH` gate fires after a bounded number of nests.
+    pub(super) spawn_depth: u8,
 }
 
 impl Agent {
@@ -242,12 +273,16 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            persistent_retry_state: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
             subagent_output_router: None,
             subagent_summary_generator: None,
+            cost_accountant: None,
+            parent_session_key: None,
+            spawn_depth: 0,
         }
     }
 
@@ -280,12 +315,16 @@ impl Agent {
             realtime: None,
             compaction_runner: None,
             compaction_workspace: None,
+            persistent_retry_state: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
             subagent_output_router: None,
             subagent_summary_generator: None,
+            cost_accountant: None,
+            parent_session_key: None,
+            spawn_depth: 0,
         }
     }
 
@@ -438,6 +477,51 @@ impl Agent {
         self.subagent_summary_generator.as_ref()
     }
 
+    /// Wire a shared [`crate::cost_ledger::CostAccountant`] onto the
+    /// agent so background sub-agents (pipeline workers, spawn
+    /// children) inherit the same accountant via `TOOL_CTX` and commit
+    /// per-node spend to the same ledger. M8 parity (W1.A4).
+    pub fn with_cost_accountant(
+        mut self,
+        accountant: Arc<crate::cost_ledger::CostAccountant>,
+    ) -> Self {
+        self.cost_accountant = Some(accountant);
+        self
+    }
+
+    /// Access the configured cost accountant, if any.
+    pub fn cost_accountant(&self) -> Option<&Arc<crate::cost_ledger::CostAccountant>> {
+        self.cost_accountant.as_ref()
+    }
+
+    /// Record the owning session key so pipeline workers / spawn
+    /// children can register child tasks against the parent session
+    /// in the supervisor's task store. M8 parity.
+    pub fn with_parent_session_key(mut self, key: impl Into<String>) -> Self {
+        self.parent_session_key = Some(key.into());
+        self
+    }
+
+    /// Access the recorded parent session key, if any.
+    pub fn parent_session_key(&self) -> Option<&str> {
+        self.parent_session_key.as_deref()
+    }
+
+    /// Guard C (issue #607): record this agent's spawn nesting depth so
+    /// every tool call it dispatches inherits the value via
+    /// `ToolContext.spawn_depth`. The spawn tool consults this when
+    /// deciding whether the next nested spawn should be allowed; values
+    /// at or above [`crate::tools::spawn::MAX_SPAWN_DEPTH`] are refused.
+    pub fn with_spawn_depth(mut self, depth: u8) -> Self {
+        self.spawn_depth = depth;
+        self
+    }
+
+    /// Access the agent's recorded spawn nesting depth.
+    pub fn spawn_depth(&self) -> u8 {
+        self.spawn_depth
+    }
+
     /// Set the embedding provider for hybrid memory search.
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedder = Some(embedder);
@@ -511,6 +595,36 @@ impl Agent {
     /// Access the attached workspace policy used for compaction gating.
     pub fn compaction_workspace(&self) -> Option<&crate::workspace_policy::WorkspacePolicy> {
         self.compaction_workspace.as_ref()
+    }
+
+    /// Attach a cross-turn persistent [`LoopRetryState`]. When set, the
+    /// agent loop observes failures against this shared state instead of
+    /// constructing a fresh `LoopRetryState` per turn, so bucket counters
+    /// accumulate across `process_message` calls for the same session.
+    ///
+    /// The caller owns the save/load cycle — this is intentionally a shim
+    /// over `Arc<Mutex<...>>` so session actors can round-trip the state
+    /// to a JSON sidecar without re-implementing the bucket machine. See
+    /// Review A F-015 for the motivating bug: without this wiring, a
+    /// sequence of transient rate-limits spread across two turns never
+    /// triggers the per-bucket exhaustion path because the counters reset
+    /// on every turn boundary.
+    pub fn with_persistent_retry_state(
+        mut self,
+        state: Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>,
+    ) -> Self {
+        self.persistent_retry_state = Some(state);
+        self
+    }
+
+    /// Access the attached persistent retry state, if any. Exposed so
+    /// session actors can snapshot/serialize the bucket counters at turn
+    /// boundaries without having to plumb the handle back through a
+    /// separate field.
+    pub fn persistent_retry_state(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<crate::agent::loop_state::LoopRetryState>>> {
+        self.persistent_retry_state.clone()
     }
 
     /// Wire the M8.5 three-tier compaction runner. Tier 1 runs at the top

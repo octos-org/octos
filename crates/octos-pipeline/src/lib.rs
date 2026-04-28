@@ -6,15 +6,18 @@
 pub mod artifact;
 pub mod checkpoint;
 pub mod condition;
+pub mod context;
 pub mod discovery;
 pub mod events;
 pub mod executor;
 pub mod fidelity;
 pub mod graph;
 pub mod handler;
+pub mod host_context;
 pub mod human_gate;
 pub mod manager;
 pub mod parser;
+pub mod recovery;
 pub mod run_dir;
 pub mod server;
 pub mod stylesheet;
@@ -24,6 +27,7 @@ pub mod validate;
 
 pub use artifact::ArtifactStore;
 pub use checkpoint::{Checkpoint, CheckpointStore, FileSystemCheckpointStore, PersistedCheckpoint};
+pub use context::{PipelineContext, ValidatorsByNode};
 pub use events::{
     CollectingEventHandler, PipelineEvent, PipelineEventHandler, TracingEventHandler,
 };
@@ -40,11 +44,13 @@ pub use graph::{
 pub use handler::{
     CodergenHandler, GateHandler, Handler, HandlerRegistry, NoopHandler, ShellHandler,
 };
+pub use host_context::PipelineHostContext;
 pub use human_gate::{HumanInputProvider, HumanInputType, HumanRequest, HumanResponse};
 pub use manager::{
     ChildExecutor, ChildResult, ChildSpec, ManagerOutcome, PipelineManager, SupervisionStrategy,
 };
 pub use parser::parse_dot;
+pub use recovery::{RecoveryDecision, RecoveryOutcome, recover_node};
 pub use run_dir::{NodeStatus, PipelineRunSummary, RunDir};
 pub use server::{
     CancelRequest, PipelineServer, RunStatus, RunStatusResponse, SubmitRequest, SubmitResponse,

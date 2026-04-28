@@ -147,6 +147,83 @@ pub(crate) fn load_prompt(name: &str, compiled_default: &str) -> String {
     compiled_default.to_string()
 }
 
+/// Build a [`PersistentCredentialPool`](octos_llm::PersistentCredentialPool)
+/// from top-level `CredentialPoolConfig` (F-005). Returns `None` when
+/// the config is absent, has no declared `credential_ids`, or when
+/// opening the redb file fails — the caller falls back to the legacy
+/// single-credential flow in that case. Errors are logged but never
+/// fatal so a broken pool configuration cannot brick `octos serve`.
+pub(crate) fn build_credential_pool(
+    config: Option<&crate::config::CredentialPoolConfig>,
+    data_dir: &std::path::Path,
+) -> Option<std::sync::Arc<octos_llm::PersistentCredentialPool>> {
+    let cfg = config?;
+    if cfg.credential_ids.is_empty() {
+        tracing::debug!("credential pool config present but `credential_ids` empty; skipping");
+        return None;
+    }
+
+    let strategy = match cfg.strategy.as_str() {
+        "fill_first" => octos_llm::RotationStrategy::FillFirst,
+        "round_robin" => octos_llm::RotationStrategy::RoundRobin,
+        "random" => octos_llm::RotationStrategy::Random,
+        "least_used" => octos_llm::RotationStrategy::LeastUsed,
+        other => {
+            tracing::warn!(
+                strategy = other,
+                "unknown credential pool strategy; defaulting to round_robin"
+            );
+            octos_llm::RotationStrategy::RoundRobin
+        }
+    };
+
+    let credentials: Vec<octos_llm::Credential> = cfg
+        .credential_ids
+        .iter()
+        .map(|id| {
+            // Env var lookup: <ID>_API_KEY uppercased. Missing env →
+            // empty secret. The provider adapter will surface the
+            // explicit auth error on first use rather than at startup.
+            let env_var = format!("{}_API_KEY", id.replace('-', "_").to_uppercase());
+            let secret = std::env::var(&env_var).unwrap_or_default();
+            octos_llm::Credential::new(id.clone(), secret)
+        })
+        .collect();
+
+    let path = cfg
+        .state_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| data_dir.join(octos_llm::DEFAULT_CREDENTIAL_POOL_DB_FILENAME));
+
+    let mut options =
+        octos_llm::PersistentCredentialPoolOptions::new(cfg.name.clone(), credentials)
+            .with_strategy(strategy);
+    if let Some(ms) = cfg.default_cooldown_ms {
+        options = options.with_default_cooldown_us(ms.saturating_mul(1_000));
+    }
+
+    match octos_llm::PersistentCredentialPool::open(&path, options) {
+        Ok(pool) => {
+            tracing::info!(
+                path = %path.display(),
+                name = %cfg.name,
+                strategy = %cfg.strategy,
+                "credential pool opened"
+            );
+            Some(std::sync::Arc::new(pool))
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to open credential pool; falling back to single-credential flow"
+            );
+            None
+        }
+    }
+}
+
 /// Load optional bootstrap/personality files from the .octos/ directory.
 /// Used by both chat and gateway to build the system prompt from AGENTS.md, SOUL.md, etc.
 pub(crate) fn load_bootstrap_files(data_dir: &std::path::Path) -> String {

@@ -23,12 +23,14 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use octos_core::{Message, MessageRole};
+use octos_llm::LlmProvider;
 use octos_llm::context::{estimate_message_tokens, estimate_tokens};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::abi_schema::COMPACTION_POLICY_SCHEMA_VERSION;
 use crate::harness_events::{HarnessEvent, write_event_to_sink};
+use crate::summarizer::default_summarizer_for_with_provider;
 pub use crate::summarizer::{ExtractiveSummarizer, Summarizer};
 pub use crate::workspace_policy::{CompactionPolicy, CompactionSummarizerKind};
 use crate::workspace_policy::{WorkspaceArtifactsPolicy, WorkspacePolicy};
@@ -442,6 +444,28 @@ impl CompactionRunner {
     /// extractive fallback and leaves the event sink unset.
     pub fn new(policy: CompactionPolicy) -> Self {
         let summarizer: Arc<dyn Summarizer> = default_summarizer_for(policy.summarizer);
+        Self {
+            policy,
+            summarizer,
+            event_sink: None,
+            repo_label: None,
+            artifacts: WorkspaceArtifactsPolicy::default(),
+            resolved_preserved: Vec::new(),
+        }
+    }
+
+    /// Build a runner from a typed policy, enabling the LLM-iterative
+    /// summarizer when the policy declares
+    /// [`CompactionSummarizerKind::LlmIterative`].
+    ///
+    /// This is the wiring seam used by `octos-cli` when a workspace policy
+    /// requests the M6.4 iterative flavour: the caller hands in the agent's
+    /// [`LlmProvider`] and this constructor selects the matching summarizer
+    /// via [`default_summarizer_for_with_provider`]. Extractive policies
+    /// behave identically to [`Self::new`].
+    pub fn with_provider(policy: CompactionPolicy, provider: Arc<dyn LlmProvider>) -> Self {
+        let summarizer: Arc<dyn Summarizer> =
+            default_summarizer_for_with_provider(policy.summarizer, Some(provider));
         Self {
             policy,
             summarizer,

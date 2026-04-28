@@ -35,14 +35,17 @@
 //! the projection breaches any threshold. Budgets can be per-dispatch,
 //! per-contract, or global — whichever is most restrictive wins.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use metrics::{counter, histogram};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
 use crate::abi_schema::COST_ATTRIBUTION_SCHEMA_VERSION;
@@ -611,14 +614,46 @@ impl CostBudgetPolicy {
 /// can hold a single `Arc<CostAccountant>` without juggling two
 /// dependencies. [`SpawnTool::with_cost_accountant`](crate::tools::spawn::SpawnTool::with_cost_accountant)
 /// stores one of these.
+///
+/// # Reservation API (F-003)
+///
+/// Concurrent swarm dispatches against the same contract would otherwise
+/// race on a stale historical-spend read ([`CostAccountant::project_dispatch`]
+/// returning [`BudgetProjection::Allowed`] for every caller before any of
+/// them hit [`CostLedger::record`]). [`CostAccountant::reserve`] closes
+/// that window by atomically reading historical spend, summing
+/// outstanding reservations against the same contract, and inserting a
+/// new reservation under a single async lock.
+///
+/// Callers receive a [`ReservationHandle`]. On the success path they
+/// call [`ReservationHandle::commit`] with the actual cost attribution,
+/// which forwards to [`CostLedger::record`] and removes the reservation
+/// atomically. On the failure path they drop the handle and the
+/// reservation is refunded by [`Drop`]. Committing more than once is a
+/// no-op after the first call; dropping a committed handle does nothing.
+///
+/// FA-2 and future call sites (`spawn`, `delegate`, `mcp_agent`) use
+/// [`CostAccountant::reserve`] directly; [`CostAccountant::project_dispatch`]
+/// is retained for callers that only need an in-memory projection and
+/// do not participate in the reservation scheme.
 pub struct CostAccountant {
     ledger: Arc<dyn CostLedger>,
     policy: Option<CostBudgetPolicy>,
+    /// Outstanding reservations per contract_id, summed so
+    /// `historical + reserved + requested` is the authoritative
+    /// projection used by [`CostAccountant::reserve`]. Entries are
+    /// inserted on successful reservation and removed by
+    /// [`ReservationHandle::commit`] or [`ReservationHandle`]'s [`Drop`].
+    reservations: Arc<AsyncMutex<HashMap<String, f64>>>,
 }
 
 impl CostAccountant {
     pub fn new(ledger: Arc<dyn CostLedger>, policy: Option<CostBudgetPolicy>) -> Self {
-        Self { ledger, policy }
+        Self {
+            ledger,
+            policy,
+            reservations: Arc::new(AsyncMutex::new(HashMap::new())),
+        }
     }
 
     pub fn ledger(&self) -> &Arc<dyn CostLedger> {
@@ -629,10 +664,113 @@ impl CostAccountant {
         self.policy.as_ref()
     }
 
+    /// Atomically reserve budget for an about-to-dispatch sub-agent.
+    ///
+    /// Acquires the reservations lock, reads historical spend plus
+    /// existing reservations for `contract_id`, and evaluates the
+    /// policy against `historical + reserved + projected_usd`. On
+    /// success the projected amount is inserted into the reservations
+    /// map and a [`ReservationHandle`] is returned. On budget breach,
+    /// the reservation is NOT inserted and `Err(Breach)` is returned.
+    ///
+    /// Callers MUST call [`ReservationHandle::commit`] with a populated
+    /// [`CostAttributionEvent`] on the success path. On the failure
+    /// path the handle can simply be dropped — [`Drop`] auto-refunds
+    /// the reservation.
+    ///
+    /// Ledger read errors (e.g. transient disk failures) are logged and
+    /// treated as "zero historical spend" so a bad disk never masks a
+    /// dispatch that would otherwise have been allowed — mirroring the
+    /// pre-F-003 behavior. The returned handle still tracks the
+    /// reservation so concurrent callers see each other's projections
+    /// via the in-memory map.
+    pub async fn reserve(
+        &self,
+        contract_id: &str,
+        projected_usd: f64,
+    ) -> std::result::Result<ReservationHandle, Breach> {
+        let Some(policy) = self.policy.as_ref() else {
+            // No policy → always allowed. Still return a handle so
+            // callers have a uniform commit path across enforced and
+            // non-enforced configurations.
+            return Ok(ReservationHandle::new(
+                contract_id.to_string(),
+                projected_usd,
+                self.ledger.clone(),
+                self.reservations.clone(),
+                /* inserted */ false,
+            ));
+        };
+
+        let mut guard = self.reservations.lock().await;
+
+        let contract_historical = if policy.per_contract_usd.is_some() {
+            match self.ledger.list_for_contract(contract_id).await {
+                Ok(rows) => sum_cost(&rows),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        contract_id,
+                        "cost ledger read failed; treating historical spend as 0.0"
+                    );
+                    0.0
+                }
+            }
+        } else {
+            0.0
+        };
+
+        let global_historical = if policy.global_usd.is_some() {
+            match self.ledger.aggregate_per_contract().await {
+                Ok(rollups) => sum_cost_rollups(&rollups),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "cost ledger aggregate read failed; treating global spend as 0.0"
+                    );
+                    0.0
+                }
+            }
+        } else {
+            0.0
+        };
+
+        let reserved_for_contract = guard.get(contract_id).copied().unwrap_or(0.0);
+        let reserved_global: f64 = guard.values().copied().sum();
+
+        let contract_total = contract_historical + reserved_for_contract;
+        let global_total = global_historical + reserved_global;
+
+        match policy.project(projected_usd, contract_total, global_total) {
+            BudgetProjection::Allowed { .. } => {
+                *guard.entry(contract_id.to_string()).or_insert(0.0) += projected_usd;
+                drop(guard);
+                Ok(ReservationHandle::new(
+                    contract_id.to_string(),
+                    projected_usd,
+                    self.ledger.clone(),
+                    self.reservations.clone(),
+                    /* inserted */ true,
+                ))
+            }
+            BudgetProjection::Rejected {
+                reason,
+                projected_usd,
+            } => {
+                drop(guard);
+                Err(Breach {
+                    reason,
+                    projected_usd,
+                })
+            }
+        }
+    }
+
     /// Look up historical spend for a contract and evaluate the
-    /// policy. Returns [`BudgetProjection::Allowed`] when no policy is
-    /// attached — callers can treat an absent policy as "no cap" and
-    /// skip the check altogether.
+    /// policy without inserting a reservation. Retained for tests and
+    /// callers that only need an in-memory projection; new production
+    /// call sites should prefer [`CostAccountant::reserve`], which also
+    /// closes the TOCTOU race documented in F-003.
     pub async fn project_dispatch(
         &self,
         contract_id: &str,
@@ -641,17 +779,181 @@ impl CostAccountant {
         let Some(policy) = self.policy.as_ref() else {
             return Ok(BudgetProjection::Allowed { projected_usd });
         };
+        // Fold outstanding reservations into the projection so the
+        // pure-projection path agrees with [`Self::reserve`].
+        let guard = self.reservations.lock().await;
         let contract_spend = if policy.per_contract_usd.is_some() {
             sum_cost(&self.ledger.list_for_contract(contract_id).await?)
+                + guard.get(contract_id).copied().unwrap_or(0.0)
         } else {
             0.0
         };
         let global_spend = if policy.global_usd.is_some() {
             sum_cost_rollups(&self.ledger.aggregate_per_contract().await?)
+                + guard.values().copied().sum::<f64>()
         } else {
             0.0
         };
+        drop(guard);
         Ok(policy.project(projected_usd, contract_spend, global_spend))
+    }
+}
+
+/// Budget breach returned by [`CostAccountant::reserve`] when the
+/// projection would trip the configured policy. Mirrors
+/// [`BudgetProjection::Rejected`] but is its own error type so callers
+/// can match on `Err(Breach)` directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Breach {
+    pub reason: BudgetRejectionReason,
+    pub projected_usd: f64,
+}
+
+impl std::fmt::Display for Breach {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for Breach {}
+
+/// RAII reservation returned by [`CostAccountant::reserve`]. Callers
+/// must call [`ReservationHandle::commit`] with the actual cost on the
+/// success path; otherwise [`Drop`] auto-refunds the reservation by
+/// decrementing the shared in-memory counter.
+///
+/// Safe on the `Err` dispatch path — just drop the handle and the
+/// reservation is released without writing to the ledger.
+///
+/// Not `Clone`: the reservation is single-owner by design so the
+/// double-spend path is a type error.
+pub struct ReservationHandle {
+    contract_id: String,
+    amount_usd: f64,
+    ledger: Arc<dyn CostLedger>,
+    reservations: Arc<AsyncMutex<HashMap<String, f64>>>,
+    /// Whether the reservation amount was actually inserted into the
+    /// shared map. `false` when [`CostAccountant`] has no policy
+    /// attached — the handle still exists for uniformity but the
+    /// commit/drop logic skips the mutation.
+    inserted: bool,
+    committed: AtomicBool,
+}
+
+impl ReservationHandle {
+    fn new(
+        contract_id: String,
+        amount_usd: f64,
+        ledger: Arc<dyn CostLedger>,
+        reservations: Arc<AsyncMutex<HashMap<String, f64>>>,
+        inserted: bool,
+    ) -> Self {
+        Self {
+            contract_id,
+            amount_usd,
+            ledger,
+            reservations,
+            inserted,
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    /// Contract id bound to this reservation. Exposed for logs and
+    /// tests.
+    pub fn contract_id(&self) -> &str {
+        &self.contract_id
+    }
+
+    /// Reserved projection (in USD). Exposed for logs and tests.
+    pub fn reserved_amount_usd(&self) -> f64 {
+        self.amount_usd
+    }
+
+    /// Commit the actual post-dispatch attribution to the ledger and
+    /// release the reservation. The caller supplies a populated
+    /// [`CostAttributionEvent`] so the real post-dispatch token counts
+    /// and metadata land — the reservation only tracked the pre-spawn
+    /// projection.
+    ///
+    /// The reservation is released atomically with the ledger write:
+    /// if [`CostLedger::record`] fails the reservation is kept so the
+    /// caller can decide whether to retry. Double-commit is a no-op
+    /// guarded by an [`AtomicBool`].
+    pub async fn commit(&self, event: CostAttributionEvent) -> Result<()> {
+        if self.committed.swap(true, Ordering::AcqRel) {
+            // Already committed — treat as idempotent.
+            warn!(
+                contract_id = %self.contract_id,
+                "reservation already committed; ignoring duplicate commit"
+            );
+            return Ok(());
+        }
+
+        // Persist the attribution first; if the write fails we revert
+        // the committed flag so Drop can still refund.
+        if let Err(error) = self.ledger.record(event).await {
+            self.committed.store(false, Ordering::Release);
+            return Err(error);
+        }
+
+        if self.inserted {
+            self.release_reservation().await;
+        }
+        Ok(())
+    }
+
+    async fn release_reservation(&self) {
+        let mut guard = self.reservations.lock().await;
+        if let Some(entry) = guard.get_mut(&self.contract_id) {
+            *entry -= self.amount_usd;
+            // Prune entries that round to zero to keep the map tidy.
+            if *entry <= f64::EPSILON {
+                guard.remove(&self.contract_id);
+            }
+        }
+    }
+}
+
+impl Drop for ReservationHandle {
+    fn drop(&mut self) {
+        if self.committed.load(Ordering::Acquire) || !self.inserted {
+            return;
+        }
+        // Auto-refund: remove the reservation without recording. We
+        // can't `.await` from Drop, so spawn a short-lived task on the
+        // current tokio runtime to release the lock. If no runtime is
+        // active (tests that drop outside `#[tokio::test]`), fall back
+        // to a try_lock loop — acceptable because the contention
+        // window is single-digit microseconds.
+        let contract_id = std::mem::take(&mut self.contract_id);
+        let amount_usd = self.amount_usd;
+        let reservations = self.reservations.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut guard = reservations.lock().await;
+                if let Some(entry) = guard.get_mut(&contract_id) {
+                    *entry -= amount_usd;
+                    if *entry <= f64::EPSILON {
+                        guard.remove(&contract_id);
+                    }
+                }
+            });
+        } else {
+            loop {
+                match reservations.try_lock() {
+                    Ok(mut guard) => {
+                        if let Some(entry) = guard.get_mut(&contract_id) {
+                            *entry -= amount_usd;
+                            if *entry <= f64::EPSILON {
+                                guard.remove(&contract_id);
+                            }
+                        }
+                        break;
+                    }
+                    Err(_) => std::thread::yield_now(),
+                }
+            }
+        }
     }
 }
 

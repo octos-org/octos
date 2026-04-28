@@ -14,7 +14,7 @@ use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
 use super::manifest::{PluginManifest, PluginToolDef};
-use super::tool::PluginTool;
+use super::tool::{PluginTool, SynthesisConfig};
 
 const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
 const GENERATIVE_SKILL_ENV_ALLOWLIST: &[&str] = &[
@@ -41,6 +41,21 @@ pub struct PluginLoadResult {
     pub hooks: Vec<HookConfig>,
     /// Prompt fragments read from skill directories.
     pub prompt_fragments: Vec<String>,
+}
+
+/// Optional knobs for plugin loading beyond `extra_env` and `work_dir`.
+///
+/// Add new fields here when introducing host→plugin config injection so the
+/// existing `load_into` and `load_into_with_work_dir` signatures stay stable
+/// for callers that don't need the new functionality.
+#[derive(Debug, Default, Clone)]
+pub struct PluginLoadOptions<'a> {
+    /// Per-process working directory for plugin executions.
+    pub work_dir: Option<&'a Path>,
+    /// Synthesis LLM provider config injected into plugin args for tools that
+    /// opt in via `x-octos-host-config-keys: ["synthesis_config"]`. Tools
+    /// without the opt-in never receive this struct.
+    pub synthesis_config: Option<SynthesisConfig>,
 }
 
 impl PluginLoadResult {
@@ -82,6 +97,28 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         work_dir: Option<&Path>,
     ) -> Result<PluginLoadResult> {
+        Self::load_into_with_options(
+            registry,
+            dirs,
+            extra_env,
+            PluginLoadOptions {
+                work_dir,
+                synthesis_config: None,
+            },
+        )
+    }
+
+    /// Full-featured loader that accepts arbitrary [`PluginLoadOptions`].
+    ///
+    /// New host-controlled config (e.g. `synthesis_config`) is plumbed
+    /// through here so older `load_into` callers keep working without
+    /// signature churn.
+    pub fn load_into_with_options(
+        registry: &mut ToolRegistry,
+        dirs: &[PathBuf],
+        extra_env: &[(String, String)],
+        options: PluginLoadOptions<'_>,
+    ) -> Result<PluginLoadResult> {
         let mut result = PluginLoadResult::default();
 
         for dir in dirs {
@@ -101,7 +138,7 @@ impl PluginLoader {
                     continue;
                 }
 
-                match Self::load_plugin_with_work_dir(&path, extra_env, work_dir) {
+                match Self::load_plugin_with_options(&path, extra_env, options.clone()) {
                     Ok((tools, extras)) => {
                         let n = tools.len();
                         let spawn_only = extras.spawn_only_tools.clone();
@@ -172,6 +209,25 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         work_dir: Option<&Path>,
     ) -> Result<(Vec<PluginTool>, SkillExtras)> {
+        Self::load_plugin_with_options(
+            plugin_dir,
+            extra_env,
+            PluginLoadOptions {
+                work_dir,
+                synthesis_config: None,
+            },
+        )
+    }
+
+    /// Full-featured single-plugin loader that accepts arbitrary
+    /// [`PluginLoadOptions`].
+    pub fn load_plugin_with_options(
+        plugin_dir: &Path,
+        extra_env: &[(String, String)],
+        options: PluginLoadOptions<'_>,
+    ) -> Result<(Vec<PluginTool>, SkillExtras)> {
+        let work_dir = options.work_dir;
+        let synthesis_config = options.synthesis_config;
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
@@ -309,6 +365,14 @@ impl PluginLoader {
                     .with_timeout(timeout);
                 if let Some(dir) = work_dir {
                     tool = tool.with_work_dir(dir.to_path_buf());
+                }
+                // S2 plumbing: attach synthesis_config when the tool's
+                // manifest opts in. The runtime check inside
+                // `prepare_effective_args` is what gates injection — wiring
+                // it onto every tool is harmless because the gate keys off
+                // `accepts_host_config_key`.
+                if let Some(cfg) = synthesis_config.clone() {
+                    tool = tool.with_synthesis_config(cfg);
                 }
                 tool
             })
@@ -1033,5 +1097,119 @@ edition = "2021"
         let verified = plugin_dir.join(".perm-plugin_verified");
         let mode = std::fs::metadata(&verified).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_into_with_options_attaches_synthesis_config_to_opted_in_plugins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("research-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // Manifest opts in via x-octos-host-config-keys.
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+              "name": "research-plugin",
+              "version": "1.0",
+              "tools": [{
+                "name": "deep_search",
+                "description": "Research",
+                "input_schema": {
+                  "type": "object",
+                  "properties": {"query": {"type": "string"}},
+                  "x-octos-host-config-keys": ["synthesis_config"]
+                }
+              }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("research-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "sk-loader-test".to_string(),
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+        };
+
+        let (tools, _extras) = PluginLoader::load_plugin_with_options(
+            &plugin_dir,
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: Some(cfg),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tools.len(), 1);
+        // Inject through prepare_effective_args to verify the loader propagated
+        // the config into the constructed PluginTool.
+        let prepared = tools[0].prepare_effective_args(&serde_json::json!({"query": "x"}), None);
+        assert_eq!(prepared["synthesis_config"]["api_key"], "sk-loader-test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_into_with_options_skips_synthesis_config_for_non_opted_in_plugins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("other-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // No x-octos-host-config-keys → should not receive synthesis_config.
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+              "name": "other-plugin",
+              "version": "1.0",
+              "tools": [{
+                "name": "innocuous",
+                "description": "Does not need credentials",
+                "input_schema": {"type": "object"}
+              }]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("other-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "sk-must-not-leak".to_string(),
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+        };
+
+        let (tools, _extras) = PluginLoader::load_plugin_with_options(
+            &plugin_dir,
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: Some(cfg),
+            },
+        )
+        .unwrap();
+        assert_eq!(tools.len(), 1);
+        let prepared = tools[0].prepare_effective_args(&serde_json::json!({}), None);
+        assert!(
+            prepared.get("synthesis_config").is_none(),
+            "non-opted-in plugin must not see synthesis_config: {prepared}"
+        );
     }
 }

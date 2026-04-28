@@ -476,9 +476,9 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>$DATA_DIR/serve.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>$DATA_DIR/serve.log</string>
+    <string>/dev/null</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -555,7 +555,7 @@ EOF
     done
     if [ $RETRIES -eq 0 ]; then
         warn "octos serve did not respond within 10 seconds"
-        echo "    Check logs: tail -f $DATA_DIR/serve.log"
+        echo "    Check logs: tail -f $DATA_DIR/logs/serve.\$(date +%F).log"
     fi
 else
     if [ "$SETUP_SERVICE" = true ]; then
@@ -625,7 +625,7 @@ if [ -n "$CLI_FEATURES" ]; then
     echo "    3. Open browser:      http://localhost:8080/admin/"
     echo ""
     echo "  Auth token:   $AUTH_TOKEN"
-    echo "  Logs:         tail -f $DATA_DIR/serve.log"
+    echo "  Logs:         tail -f $DATA_DIR/logs/serve.\$(date +%F).log"
     case "$OS" in
         Darwin)
             echo "  Status:       sudo launchctl print system/io.octos.serve"

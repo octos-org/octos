@@ -506,6 +506,7 @@ fn lifecycle_label(state: TaskLifecycleState) -> &'static str {
         TaskLifecycleState::Verifying => "verifying",
         TaskLifecycleState::Ready => "ready",
         TaskLifecycleState::Failed => "failed",
+        TaskLifecycleState::Cancelled => "cancelled",
     }
 }
 
@@ -589,6 +590,11 @@ impl SessionLifecycleObserver for SupervisorObserver<'_> {
             }
             TaskLifecycleState::Failed => {
                 // Same reasoning as Ready — finalization happens outside.
+            }
+            TaskLifecycleState::Cancelled => {
+                // Cancellation is driven by the supervisor's `cancel`
+                // primitive; the observer just acknowledges that the
+                // outer caller already moved the task into Cancelled.
             }
         }
     }

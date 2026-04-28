@@ -28,6 +28,34 @@ struct Input {
     /// Research depth: 1=quick (single search), 2=standard (3 rounds), 3=thorough (5 rounds).
     #[serde(default = "default_depth")]
     depth: u8,
+    /// Synthesis LLM provider config injected by the host (S2 plumbing).
+    ///
+    /// When present and complete, `resolve_synthesis_config` prefers this over
+    /// reading API keys from environment variables. This lets the host route
+    /// per-tenant or per-session credentials without requiring plist `EnvironmentVariables`.
+    #[serde(default)]
+    synthesis_config: Option<SynthesisConfig>,
+}
+
+/// Synthesis LLM provider config passed by the host.
+///
+/// Mirrors the `(endpoint, api_key, model, provider)` quadruple that
+/// [`resolve_synthesis_config`] used to read from environment variables. All
+/// fields are required for the args path to take precedence — partial configs
+/// fall through to the env-var path so the operator can still set defaults.
+#[derive(Deserialize, Clone, Debug)]
+struct SynthesisConfig {
+    /// OpenAI-compatible base URL, e.g. `https://api.deepseek.com/v1`.
+    endpoint: String,
+    /// Bearer token for the synthesis provider.
+    ///
+    /// Tokens MUST NOT be logged. Audit `tracing::*` and `eprintln!` paths
+    /// before adding new diagnostics.
+    api_key: String,
+    /// Model id to request (e.g. `deepseek-chat`).
+    model: String,
+    /// Provider label used by the v2 cost envelope (e.g. `deepseek`).
+    provider: String,
 }
 
 fn default_max_results() -> u8 {
@@ -37,10 +65,65 @@ fn default_depth() -> u8 {
     2
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Output {
     output: String,
     success: bool,
+    /// Plugin-protocol-v2 summary. The host's
+    /// `SubAgentSummaryGenerator` consumes this to build the parent
+    /// agent's view of the call without re-running an LLM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<ResultSummary>,
+    /// Plugin-protocol-v2 roll-up cost. Sums all internal LLM/API
+    /// spend incurred during this invocation. Per-call costs are also
+    /// emitted as stderr `cost` events for finer-grained ledger
+    /// attribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<ResultCost>,
+    /// Files the host should auto-deliver to chat. Mirrors v1
+    /// behavior; we name the synthesized `_report.md` here so the
+    /// chat UI shows the report file, not the search-engine dump.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files_to_send: Vec<String>,
+}
+
+/// v2 result summary: discriminator + headline + sources. Mirrors
+/// `octos_plugin::protocol_v2::ResultSummary` field-for-field. Avoids a
+/// dependency on `octos-plugin` from the standalone plugin binary
+/// (plugin binaries should be self-contained per the SDK contract).
+#[derive(Serialize, Deserialize, Default)]
+struct ResultSummary {
+    kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    headline: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sources: Vec<ResultSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rounds: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ResultSource {
+    url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    title: String,
+    #[serde(default)]
+    cited: bool,
+}
+
+/// v2 roll-up cost. Mirrors `octos_plugin::protocol_v2::ResultCost`.
+#[derive(Serialize, Deserialize, Default)]
+struct ResultCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    tokens_in: u32,
+    tokens_out: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usd: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -117,11 +200,20 @@ struct CrawledPage {
 
 #[tokio::main]
 async fn main() {
+    // Plugin-protocol-v2 SIGTERM handler (W3.C3): on SIGTERM we stop
+    // scheduling new work and exit cleanly within the 10-second host
+    // budget. We don't carry long-lived browsers in-process here
+    // (deep_crawl spawns its own), so the cleanup path is light: emit
+    // a final progress event, kill in-flight HTTP via dropping the
+    // client, and exit 130 (128 + SIGTERM=2).
+    install_sigterm_handler();
+
     let mut stdin_buf = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut stdin_buf) {
         print_output(&Output {
             output: format!("Failed to read stdin: {e}"),
             success: false,
+            ..Default::default()
         });
         return;
     }
@@ -132,6 +224,7 @@ async fn main() {
             print_output(&Output {
                 output: format!("Invalid input JSON: {e}"),
                 success: false,
+                ..Default::default()
             });
             return;
         }
@@ -156,6 +249,7 @@ async fn main() {
             max_results,
             depth,
             input.search_engine.as_deref(),
+            input.synthesis_config.as_ref(),
         ),
     )
     .await;
@@ -165,8 +259,45 @@ async fn main() {
         Err(_) => print_output(&Output {
             output: format!("Deep search timed out after {}s", timeout.as_secs()),
             success: false,
+            ..Default::default()
         }),
     }
+}
+
+/// Install a SIGTERM handler that emits a final v2 progress event and
+/// exits with status 130 within the host's 10-second cancel budget.
+///
+/// On Windows there is no SIGTERM; the host falls back to job-object
+/// kill which doesn't run user code. The handler is therefore a no-op
+/// on Windows and the host's SIGKILL handles cleanup.
+#[cfg(unix)]
+fn install_sigterm_handler() {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async {
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[deep_search] failed to install SIGTERM handler: {e}");
+                return;
+            }
+        };
+        if term.recv().await.is_some() {
+            // Best-effort final progress event so the operator sees
+            // why we're exiting in the chat UI.
+            emit_v2_progress(
+                "cleanup",
+                "SIGTERM received, shutting down deep_search",
+                None,
+            );
+            // 130 = 128 + SIGTERM(2). Convention for "killed by signal 2".
+            std::process::exit(130);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_sigterm_handler() {
+    // No SIGTERM on Windows; deep_search exits via host SIGKILL.
 }
 
 async fn run_deep_search(
@@ -175,6 +306,7 @@ async fn run_deep_search(
     max_results: u8,
     depth: u8,
     engine: Option<&str>,
+    synthesis_config: Option<&SynthesisConfig>,
 ) -> Output {
     let max_rounds = match depth {
         1 => 1,
@@ -193,6 +325,7 @@ async fn run_deep_search(
         return Output {
             output: format!("Failed to create research directory: {e}"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -213,6 +346,7 @@ async fn run_deep_search(
         return Output {
             output: r1.output,
             success: false,
+            ..Default::default()
         };
     }
 
@@ -419,60 +553,109 @@ async fn run_deep_search(
     }
 
     // -----------------------------------------------------------------------
-    // Build structured report
+    // Synthesize an answer from the raw search dump + crawled excerpts.
+    //
+    // This is the W3.C1 "highest user-impact" change: instead of returning
+    // a wall of search snippets, we hand the corpus to an LLM and ask it
+    // to write a coherent multi-paragraph answer with `[N]` citations
+    // pointing at our `Sources` list. The LLM call is best-effort: if no
+    // API key is configured we fall back to the v1 behavior so the plugin
+    // still works in airgapped/dev setups.
     // -----------------------------------------------------------------------
     progress_simple(ProgressPhase::Synthesize, "Synthesizing report...");
+    emit_v2_progress(
+        "synthesizing",
+        "Synthesizing report from sources...",
+        Some(0.85),
+    );
+
+    let synthesis_input = SynthesisInput {
+        query,
+        rounds: search_queries.len(),
+        sources: saved_files
+            .iter()
+            .enumerate()
+            .map(|(i, (_, url, preview))| SynthesisSource {
+                index: i + 1,
+                url: url.clone(),
+                excerpt: preview.clone(),
+            })
+            .collect(),
+    };
+
+    let synthesis = synthesize(client, &synthesis_input, synthesis_config).await;
+
     progress_simple(ProgressPhase::ReportBuild, "Building report...");
+    emit_v2_progress(
+        "building_report",
+        "Assembling final document...",
+        Some(0.95),
+    );
 
-    let mut report = String::new();
-    report.push_str(&format!("# Deep Research: {query}\n\n"));
-
-    // Overview section
-    report.push_str("## Overview\n\n");
-    report.push_str(&initial_answer);
-    report.push_str("\n\n");
-
-    // Source details with inline previews
-    report.push_str(&format!(
-        "## Sources ({} pages crawled)\n\n",
-        saved_files.len()
-    ));
-    for (i, (filename, url, preview)) in saved_files.iter().enumerate() {
-        report.push_str(&format!("### Source [{}]: {}\n", i + 1, url));
-        report.push_str(&format!(
-            "_Full content: {}/{}_\n\n",
-            dir.display(),
-            filename
-        ));
-        report.push_str(preview);
-        report.push_str("\n\n---\n\n");
-    }
-
-    // Search queries used
-    report.push_str("## Search Queries Used\n\n");
-    for (i, q) in search_queries.iter().enumerate() {
-        report.push_str(&format!("{}. {}\n", i + 1, q));
-    }
-    report.push('\n');
-
-    // Summary line
     let report_path = dir.join("_report.md");
-    report.push_str(&format!(
-        "\n---\n{} pages crawled across {} search rounds.\n\
-         Report saved to: {}\n",
-        saved_files.len(),
-        search_queries.len(),
-        report_path.display(),
-    ));
+    let report = build_report(
+        query,
+        synthesis.as_ref(),
+        &initial_answer,
+        &saved_files,
+        &search_queries,
+        &dir,
+        &report_path,
+    );
 
     // Save report
     let _ = fs::write(dir.join("_report.md"), &report);
 
     progress_simple_with_fraction(ProgressPhase::Completion, "Deep search complete", Some(1.0));
+    emit_v2_progress("complete", "Deep search complete", Some(1.0));
+
+    // Build the v2 result summary from the synthesis output (if any) so
+    // the parent agent can render a useful tool-call pill without
+    // re-parsing the report markdown.
+    let cited_indexes: HashSet<usize> = synthesis
+        .as_ref()
+        .map(|s| s.cited_indexes())
+        .unwrap_or_default();
+    let mut summary_sources = Vec::with_capacity(saved_files.len());
+    for (i, (_filename, url, _)) in saved_files.iter().enumerate() {
+        summary_sources.push(ResultSource {
+            url: url.clone(),
+            title: String::new(),
+            cited: cited_indexes.contains(&(i + 1)),
+        });
+    }
+    let summary = ResultSummary {
+        kind: "deep_research".to_string(),
+        headline: synthesis
+            .as_ref()
+            .map(|s| s.headline.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "Researched '{query}' across {} sources in {} rounds",
+                    saved_files.len(),
+                    search_queries.len()
+                )
+            }),
+        confidence: synthesis.as_ref().and_then(|s| s.confidence),
+        sources: summary_sources,
+        rounds: Some(search_queries.len() as u32),
+    };
+
+    let cost = synthesis.as_ref().map(|s| ResultCost {
+        provider: Some(s.provider.clone()),
+        model: Some(s.model.clone()),
+        tokens_in: s.tokens_in,
+        tokens_out: s.tokens_out,
+        usd: s.usd,
+    });
 
     Output {
         output: report,
         success: true,
+        summary: Some(summary),
+        cost,
+        files_to_send: vec![report_path.display().to_string()],
     }
 }
 
@@ -1139,11 +1322,49 @@ async fn brave_search(
 // Bing CDP Search (headless Chrome via deep-crawl binary)
 // ---------------------------------------------------------------------------
 
+/// Cap on the number of concurrent `deep_crawl` invocations (and thus
+/// concurrent headless Chromium processes) per `deep_search` invocation.
+///
+/// Pre-W3.D1 history: with `parallel_all_engines` + per-round retries,
+/// a single deep_search call could spawn 6+ Chromium processes at once,
+/// pegging memory on small VMs. The semaphore caps it at 3.
+///
+/// Operators can override via `DEEP_SEARCH_MAX_BROWSERS` (1..16). Useful
+/// when deep_search itself runs N times in parallel (e.g. swarm mode):
+/// the cap on the binary's own scope-internal concurrency stays at the
+/// configured value, so total chromiums = N × cap.
+fn max_browsers() -> usize {
+    std::env::var("DEEP_SEARCH_MAX_BROWSERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or(3)
+}
+
+fn browser_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(max_browsers()))
+}
+
 /// Search Bing via headless Chrome. Calls the `deep_crawl` sibling binary
 /// to render the SERP, then extracts result links from the text output.
 /// No API key needed — just Chromium installed. Uses Bing instead of Google
 /// because Google CAPTCHAs automated requests from datacenter IPs.
+///
+/// W3.D1: gated by [`browser_semaphore`] so this binary cannot launch
+/// more than `DEEP_SEARCH_MAX_BROWSERS` concurrent chromiums.
 async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
+    // Acquire the semaphore before launching deep_crawl so we never
+    // exceed the configured cap on concurrent chromiums.
+    let _permit = match browser_semaphore().acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            return SearchResult {
+                output: "bing_cdp:browser semaphore closed".into(),
+                success: false,
+            };
+        }
+    };
     // Find deep_crawl binary: check sibling dir, cargo bin, and PATH
     let crawl_bin = {
         let candidates: Vec<std::path::PathBuf> = [
@@ -1990,6 +2211,539 @@ fn research_dir(slug: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Report assembly (W3.C1)
+// ---------------------------------------------------------------------------
+
+/// Build the full markdown research report from the synthesis output and
+/// the raw crawled corpus.
+///
+/// Pure function: doesn't touch the filesystem or stderr, so it's easy to
+/// unit-test the structural guarantees ("must contain a `## Synthesis`
+/// section when synthesis is available", "must list all sources",
+/// "must end with the report path").
+fn build_report(
+    query: &str,
+    synthesis: Option<&SynthesisResult>,
+    initial_answer: &str,
+    saved_files: &[(String, String, String)],
+    search_queries: &[String],
+    dir: &Path,
+    report_path: &Path,
+) -> String {
+    let mut report = String::new();
+    report.push_str(&format!("# Deep Research: {query}\n\n"));
+
+    // Synthesis section — prose with citations, replaces the old "Overview".
+    match synthesis {
+        Some(syn) if !syn.synthesis.trim().is_empty() => {
+            if !syn.headline.is_empty() {
+                report.push_str(&format!("_{}_\n\n", syn.headline));
+            }
+            report.push_str("## Synthesis\n\n");
+            report.push_str(syn.synthesis.trim());
+            report.push_str("\n\n");
+            if let Some(conf) = syn.confidence {
+                report.push_str(&format!("_Self-reported confidence: {conf:.2}_\n\n"));
+            }
+        }
+        _ => {
+            // Fallback when no LLM is available or synthesis was empty:
+            // keep the v1 "Overview" but label it so it's clear we did
+            // NOT synthesize, and operators know the result is raw.
+            report.push_str("## Overview\n\n");
+            report.push_str("_LLM synthesis unavailable — showing raw search results below._\n\n");
+            report.push_str(initial_answer);
+            report.push_str("\n\n");
+        }
+    }
+
+    // Source details with inline previews. These are always present so
+    // the synthesis citations resolve to concrete URLs and the operator
+    // can verify each claim.
+    report.push_str(&format!(
+        "## Sources ({} pages crawled)\n\n",
+        saved_files.len()
+    ));
+    for (i, (filename, url, preview)) in saved_files.iter().enumerate() {
+        report.push_str(&format!("### Source [{}]: {}\n", i + 1, url));
+        report.push_str(&format!(
+            "_Full content: {}/{}_\n\n",
+            dir.display(),
+            filename
+        ));
+        report.push_str(preview);
+        report.push_str("\n\n---\n\n");
+    }
+
+    // Search queries used
+    report.push_str("## Search Queries Used\n\n");
+    for (i, q) in search_queries.iter().enumerate() {
+        report.push_str(&format!("{}. {}\n", i + 1, q));
+    }
+    report.push('\n');
+
+    // Summary footer — kept for v1 compatibility (the host's
+    // `Report saved to: ...` detector keys off this line).
+    report.push_str(&format!(
+        "\n---\n{} pages crawled across {} search rounds.\n\
+         Report saved to: {}\n",
+        saved_files.len(),
+        search_queries.len(),
+        report_path.display(),
+    ));
+
+    report
+}
+
+// ---------------------------------------------------------------------------
+// Synthesis (W3.C1)
+// ---------------------------------------------------------------------------
+
+/// Inputs to the synthesis LLM call: the original query plus the corpus of
+/// crawled excerpts the LLM should ground its answer on.
+struct SynthesisInput<'a> {
+    query: &'a str,
+    rounds: usize,
+    sources: Vec<SynthesisSource>,
+}
+
+struct SynthesisSource {
+    /// 1-based index used in `[N]` citations the LLM emits.
+    index: usize,
+    url: String,
+    excerpt: String,
+}
+
+/// Output of a successful synthesis call: prose with citations + metadata
+/// for the v2 result envelope.
+struct SynthesisResult {
+    /// Multi-paragraph synthesized answer with `[N]` citations.
+    synthesis: String,
+    /// Optional one-line headline. Used for the parent's tool-call pill.
+    headline: String,
+    /// Self-reported confidence in `[0, 1]`. Heuristic; the LLM is asked
+    /// to assess source quality and agreement.
+    confidence: Option<f64>,
+    /// Provider / model used. Reported in the v2 cost envelope.
+    provider: String,
+    model: String,
+    tokens_in: u32,
+    tokens_out: u32,
+    usd: Option<f64>,
+}
+
+impl SynthesisResult {
+    /// Extract the set of `[N]` citation indexes referenced in the prose.
+    fn cited_indexes(&self) -> HashSet<usize> {
+        let mut out = HashSet::new();
+        let bytes = self.synthesis.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'[' {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 && j < bytes.len() && bytes[j] == b']' {
+                    if let Ok(s) = std::str::from_utf8(&bytes[i + 1..j]) {
+                        if let Ok(n) = s.parse::<usize>() {
+                            out.insert(n);
+                        }
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Run the synthesis LLM call. Returns `None` when no API key is
+/// configured, the call fails, or the response is unusable. The deep_search
+/// flow falls back to the v1 raw-dump report in that case.
+async fn synthesize(
+    client: &reqwest::Client,
+    input: &SynthesisInput<'_>,
+    args_config: Option<&SynthesisConfig>,
+) -> Option<SynthesisResult> {
+    let (endpoint, api_key, model, provider) = resolve_synthesis_config(args_config)?;
+
+    let prompt = build_synthesis_prompt(input);
+    let prompt_chars = prompt.len();
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYNTHESIS_SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "max_tokens": 1500,
+        "temperature": 0.3,
+    });
+
+    let response = match client
+        .post(format!("{endpoint}/chat/completions"))
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[synthesis] LLM call failed: {e}");
+            emit_v2_progress("synthesizing", &format!("LLM call failed: {e}"), None);
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        eprintln!(
+            "[synthesis] HTTP {status}: {}",
+            truncate_utf8(&text, 300, "")
+        );
+        emit_v2_progress("synthesizing", &format!("LLM HTTP {status}"), None);
+        return None;
+    }
+
+    let json: serde_json::Value = match response.json().await {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[synthesis] failed to parse response: {e}");
+            return None;
+        }
+    };
+
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim();
+    if content.is_empty() {
+        eprintln!("[synthesis] empty response");
+        return None;
+    }
+
+    // OpenAI-compatible providers return token usage under "usage".
+    let tokens_in = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    let tokens_out = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
+    let usd = project_usd(&model, tokens_in, tokens_out);
+
+    let (synthesis_text, headline, confidence) = parse_synthesis_response(content);
+
+    // Emit a v2 cost event so the host can attribute spend.
+    emit_v2_cost(&provider, &model, tokens_in, tokens_out, usd);
+
+    eprintln!(
+        "[synthesis] ok: prompt_chars={} sources={} tokens_in={} tokens_out={} synthesis_chars={}",
+        prompt_chars,
+        input.sources.len(),
+        tokens_in,
+        tokens_out,
+        synthesis_text.len()
+    );
+
+    Some(SynthesisResult {
+        synthesis: synthesis_text,
+        headline,
+        confidence,
+        provider,
+        model,
+        tokens_in,
+        tokens_out,
+        usd,
+    })
+}
+
+/// System prompt for the synthesis call.
+///
+/// The output format is a strict 3-section markdown doc:
+/// 1. `## Headline` — one line summarizing the answer
+/// 2. `## Confidence` — numeric in `[0, 1]`
+/// 3. `## Synthesis` — multi-paragraph prose with `[N]` citations
+///
+/// We parse this in [`parse_synthesis_response`] so we can lift each piece
+/// into the v2 result envelope.
+const SYNTHESIS_SYSTEM_PROMPT: &str = "\
+You are a research analyst. You write grounded, cited answers from the source \
+material the user provides. Rules: (1) Every factual claim MUST end with one or \
+more `[N]` citations referencing the numbered sources. (2) Use multiple \
+paragraphs; do NOT bulletpoint the entire answer. (3) Acknowledge contradiction \
+between sources when present. (4) If the sources don't cover an aspect of the \
+question, say so explicitly rather than guess. (5) Output exactly three \
+sections, in this order:\n\n\
+## Headline\n\
+<one-line answer, no citations>\n\n\
+## Confidence\n\
+<a number from 0.0 to 1.0 reflecting source agreement and depth>\n\n\
+## Synthesis\n\
+<3-6 paragraphs of cited prose>\n";
+
+fn build_synthesis_prompt(input: &SynthesisInput<'_>) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(&format!("Question: {}\n\n", input.query));
+    prompt.push_str(&format!(
+        "Researcher gathered {} sources across {} search rounds. Source excerpts \
+         (truncated):\n\n",
+        input.sources.len(),
+        input.rounds
+    ));
+    // Cap the excerpts so the prompt stays within reasonable LLM context.
+    // 1500 chars * 12 sources = 18k chars ≈ 4-5k tokens.
+    const PER_SOURCE_CHARS: usize = 1500;
+    const MAX_SOURCES: usize = 12;
+    for src in input.sources.iter().take(MAX_SOURCES) {
+        prompt.push_str(&format!("---\n[{}] {}\n", src.index, src.url));
+        let excerpt = if src.excerpt.len() > PER_SOURCE_CHARS {
+            truncate_utf8(&src.excerpt, PER_SOURCE_CHARS, "\n... (truncated)")
+        } else {
+            src.excerpt.clone()
+        };
+        prompt.push_str(&excerpt);
+        prompt.push_str("\n\n");
+    }
+    if input.sources.len() > MAX_SOURCES {
+        prompt.push_str(&format!(
+            "---\n(+ {} more sources omitted from this prompt for brevity; \
+             they are still listed in the final report.)\n",
+            input.sources.len() - MAX_SOURCES
+        ));
+    }
+    prompt.push_str(
+        "---\n\nWrite the answer. Cite each numbered source at least once if it \
+         is used. Sources you do not cite will not appear in the final summary.\n",
+    );
+    prompt
+}
+
+/// Parse the strict 3-section synthesis response.
+///
+/// Tolerant of section reordering and missing sections. The synthesis body
+/// is the section labeled `## Synthesis` (or, falling back, everything
+/// after the first heading we don't recognize).
+fn parse_synthesis_response(text: &str) -> (String, String, Option<f64>) {
+    let mut headline = String::new();
+    let mut confidence: Option<f64> = None;
+    let mut synthesis = String::new();
+    let mut current = SectionTag::None;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("##") {
+            let label = rest.trim().to_lowercase();
+            current = match label.as_str() {
+                "headline" => SectionTag::Headline,
+                "confidence" => SectionTag::Confidence,
+                "synthesis" | "answer" | "report" => SectionTag::Synthesis,
+                _ => SectionTag::Other,
+            };
+            continue;
+        }
+        match current {
+            SectionTag::Headline if !trimmed.is_empty() && headline.is_empty() => {
+                headline = trimmed.to_string();
+            }
+            SectionTag::Confidence if confidence.is_none() && !trimmed.is_empty() => {
+                // Find the first run of digits/decimal/sign so we can
+                // tolerate prose like "Confidence: ~0.85 (high)" while
+                // still preserving negative signs (which we then clamp
+                // to 0).
+                let cleaned =
+                    trimmed.trim_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-');
+                if let Ok(v) = cleaned.parse::<f64>() {
+                    confidence = Some(v.clamp(0.0, 1.0));
+                }
+            }
+            SectionTag::Synthesis => {
+                synthesis.push_str(line);
+                synthesis.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    let synthesis = synthesis.trim().to_string();
+    // Fallback: if we didn't find an explicit `## Synthesis` section, the
+    // whole text is treated as the synthesis. Keeps the renderer robust to
+    // model misbehavior.
+    let synthesis = if synthesis.is_empty() {
+        text.trim().to_string()
+    } else {
+        synthesis
+    };
+    (synthesis, headline, confidence)
+}
+
+#[derive(Clone, Copy)]
+enum SectionTag {
+    None,
+    Headline,
+    Confidence,
+    Synthesis,
+    Other,
+}
+
+/// Resolve synthesis provider config: prefer host-injected args over env.
+///
+/// S2 plumbing: when the host populates `Input::synthesis_config`, we use it
+/// directly so secrets stay in the agent's typed config instead of operator
+/// plists. When it's missing or incomplete (any of the four fields blank), we
+/// fall back to environment variables in the legacy priority order. This
+/// preserves backward compat with operators who still set `DEEPSEEK_API_KEY`
+/// in the launchd plist.
+///
+/// Returns `(endpoint, api_key, model, provider)`.
+///
+/// Tokens MUST NOT be logged. The function only emits a `provider` label on
+/// success so debugging the resolution path doesn't leak credentials.
+fn resolve_synthesis_config(
+    args_config: Option<&SynthesisConfig>,
+) -> Option<(String, String, String, String)> {
+    // Args path: take everything from the host-injected struct when all four
+    // fields are non-empty. Allow operators to still override the model via
+    // env even when the args path is used — keeps the
+    // `DEEP_SEARCH_SYNTHESIS_MODEL` knob meaningful.
+    if let Some(cfg) = args_config {
+        if !cfg.endpoint.is_empty()
+            && !cfg.api_key.is_empty()
+            && !cfg.model.is_empty()
+            && !cfg.provider.is_empty()
+        {
+            let model = std::env::var("DEEP_SEARCH_SYNTHESIS_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| cfg.model.clone());
+            eprintln!("[synthesis] using host-injected provider: {}", cfg.provider);
+            return Some((
+                cfg.endpoint.clone(),
+                cfg.api_key.clone(),
+                model,
+                cfg.provider.clone(),
+            ));
+        }
+    }
+
+    // Env path: legacy fallback for operators who haven't migrated to S2.
+    let model_override = std::env::var("DEEP_SEARCH_SYNTHESIS_MODEL").ok();
+
+    let configs: &[(&str, &str, &str, &str)] = &[
+        (
+            "DEEPSEEK_API_KEY",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+            "deepseek",
+        ),
+        (
+            "KIMI_API_KEY",
+            "https://api.moonshot.ai/v1",
+            "kimi-2.5",
+            "moonshot",
+        ),
+        (
+            "DASHSCOPE_API_KEY",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "qwen-plus",
+            "dashscope",
+        ),
+        (
+            "OPENAI_API_KEY",
+            "https://api.openai.com/v1",
+            "gpt-4o-mini",
+            "openai",
+        ),
+        (
+            "GEMINI_API_KEY",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-2.0-flash",
+            "google",
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            "https://api.anthropic.com/v1",
+            "claude-3-5-haiku-20241022",
+            "anthropic",
+        ),
+    ];
+    for &(env_var, endpoint, default_model, provider) in configs {
+        if let Ok(key) = std::env::var(env_var) {
+            if !key.is_empty() {
+                let model = model_override
+                    .clone()
+                    .unwrap_or_else(|| default_model.to_string());
+                return Some((endpoint.to_string(), key, model, provider.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Project a USD cost from token counts. Conservative estimate for the
+/// known small/cheap models. Returns `None` for unknown models so the
+/// host's pricing catalog can fill in (or operators can compute it
+/// post-hoc).
+fn project_usd(model: &str, tokens_in: u32, tokens_out: u32) -> Option<f64> {
+    let lower = model.to_lowercase();
+    let (input_per_million, output_per_million) = match lower.as_str() {
+        "deepseek-chat" | "deepseek-coder" => (0.27, 1.10),
+        m if m.starts_with("kimi") => (0.20, 0.80),
+        m if m.starts_with("qwen-plus") => (0.20, 0.60),
+        "gpt-4o-mini" => (0.15, 0.60),
+        "gemini-2.0-flash" | "gemini-1.5-flash" => (0.075, 0.30),
+        "claude-3-5-haiku-20241022" => (1.0, 5.0),
+        _ => return None,
+    };
+    let cost = (tokens_in as f64) * input_per_million / 1_000_000.0
+        + (tokens_out as f64) * output_per_million / 1_000_000.0;
+    Some(cost)
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-protocol-v2 stderr events
+// ---------------------------------------------------------------------------
+
+/// Emit a v2 `progress` event on stderr. Best-effort: serialization is
+/// infallible for these small structs in practice; if it ever does fail
+/// we fall back to a legacy free-form line.
+fn emit_v2_progress(stage: &str, message: &str, progress: Option<f64>) {
+    let event = serde_json::json!({
+        "type": "progress",
+        "stage": stage,
+        "message": message,
+        "progress": progress,
+    });
+    match serde_json::to_string(&event) {
+        Ok(line) => eprintln!("{line}"),
+        Err(_) => eprintln!("[{stage}] {message}"),
+    }
+}
+
+/// Emit a v2 `cost` event on stderr.
+fn emit_v2_cost(provider: &str, model: &str, tokens_in: u32, tokens_out: u32, usd: Option<f64>) {
+    let event = serde_json::json!({
+        "type": "cost",
+        "provider": provider,
+        "model": model,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "usd": usd,
+    });
+    match serde_json::to_string(&event) {
+        Ok(line) => eprintln!("{line}"),
+        Err(_) => eprintln!("[cost] {provider}/{model} in={tokens_in} out={tokens_out}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Progress output (stderr for gateway to stream)
 // ---------------------------------------------------------------------------
 
@@ -2001,6 +2755,9 @@ fn progress(step: usize, total: usize, msg: &str) {
         Some((step as f64 / total as f64).min(0.95))
     };
     emit_progress_event(ProgressPhase::Search, msg, progress_fraction);
+    // Plugin-protocol-v2 mirror: structured event so downstream
+    // consumers don't have to scrape `[step/total] message`.
+    emit_v2_progress(ProgressPhase::Search.v2_stage(), msg, progress_fraction);
 }
 
 fn progress_simple(phase: ProgressPhase, msg: &str) {
@@ -2010,6 +2767,7 @@ fn progress_simple(phase: ProgressPhase, msg: &str) {
 fn progress_simple_with_fraction(phase: ProgressPhase, msg: &str, progress_fraction: Option<f64>) {
     eprintln!("[*] {msg}");
     emit_progress_event(phase, msg, progress_fraction);
+    emit_v2_progress(phase.v2_stage(), msg, progress_fraction);
 }
 
 #[derive(Copy, Clone)]
@@ -2029,6 +2787,19 @@ impl ProgressPhase {
             ProgressPhase::Synthesize => "synthesize",
             ProgressPhase::ReportBuild => "report_build",
             ProgressPhase::Completion => "completion",
+        }
+    }
+
+    /// Plugin-protocol-v2 stage label. Slightly different from the
+    /// internal harness phase name (which is preserved for backwards
+    /// compatibility with the existing harness sink schema).
+    fn v2_stage(self) -> &'static str {
+        match self {
+            ProgressPhase::Search => "searching",
+            ProgressPhase::Fetch => "fetching",
+            ProgressPhase::Synthesize => "synthesizing",
+            ProgressPhase::ReportBuild => "building_report",
+            ProgressPhase::Completion => "complete",
         }
     }
 }
@@ -2217,6 +2988,195 @@ mod tests {
         assert_eq!(input.search_engine.as_deref(), Some("perplexity"));
     }
 
+    // ---- S2: synthesis_config plumbing ---------------------------------
+    //
+    // These tests share process-wide env-var state, so they serialize on a
+    // local mutex. Every test snapshots the env keys it touches before the
+    // case and restores them on exit so no test leaks into another.
+
+    /// Mutex serializing synthesis-config env tests in this module.
+    fn synthesis_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// All synthesis-related env keys that the resolver consults.
+    /// We snapshot+restore these so concurrently-running test orderings stay safe.
+    const SYNTHESIS_ENV_KEYS: &[&str] = &[
+        "DEEPSEEK_API_KEY",
+        "KIMI_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEP_SEARCH_SYNTHESIS_MODEL",
+    ];
+
+    fn snapshot_synthesis_env() -> Vec<(&'static str, Option<String>)> {
+        SYNTHESIS_ENV_KEYS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect()
+    }
+
+    fn clear_synthesis_env() {
+        for key in SYNTHESIS_ENV_KEYS {
+            // SAFETY: tests serialize on `synthesis_env_lock()`.
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    fn restore_synthesis_env(snapshot: Vec<(&'static str, Option<String>)>) {
+        for (key, value) in snapshot {
+            // SAFETY: tests serialize on `synthesis_env_lock()`.
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+
+    #[test]
+    fn test_input_deserialization_with_synthesis_config() {
+        let json = r#"{
+            "query": "test",
+            "synthesis_config": {
+                "endpoint": "https://api.example.com/v1",
+                "api_key": "sk-host-injected",
+                "model": "deepseek-chat",
+                "provider": "deepseek"
+            }
+        }"#;
+        let input: Input = serde_json::from_str(json).unwrap();
+        let cfg = input.synthesis_config.expect("synthesis_config parsed");
+        assert_eq!(cfg.endpoint, "https://api.example.com/v1");
+        assert_eq!(cfg.api_key, "sk-host-injected");
+        assert_eq!(cfg.model, "deepseek-chat");
+        assert_eq!(cfg.provider, "deepseek");
+    }
+
+    #[test]
+    fn test_synthesis_config_args_path_takes_precedence_over_env() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // Set BOTH a real env key (would normally win) and pass an args
+        // config: args must take precedence, leaving env untouched.
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "from-env") };
+
+        let args = SynthesisConfig {
+            endpoint: "https://api.host-injected.example/v1".to_string(),
+            api_key: "from-args".to_string(),
+            model: "host-model".to_string(),
+            provider: "host-provider".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("resolves");
+        assert_eq!(resolved.0, "https://api.host-injected.example/v1");
+        assert_eq!(resolved.1, "from-args");
+        assert_eq!(resolved.2, "host-model");
+        assert_eq!(resolved.3, "host-provider");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_args_path_with_no_env() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+
+        let args = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "sk-args-only".to_string(),
+            model: "args-model".to_string(),
+            provider: "args-provider".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("resolves from args");
+        assert_eq!(resolved.1, "sk-args-only");
+        assert_eq!(resolved.3, "args-provider");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_falls_back_to_env_when_args_missing() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("KIMI_API_KEY", "kimi-from-env") };
+
+        let resolved = resolve_synthesis_config(None).expect("env path resolves");
+        assert_eq!(resolved.0, "https://api.moonshot.ai/v1");
+        assert_eq!(resolved.1, "kimi-from-env");
+        assert_eq!(resolved.3, "moonshot");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_falls_back_to_env_when_args_incomplete() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "openai-from-env") };
+
+        // Args missing api_key → fall through to env.
+        let args = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "".to_string(),
+            model: "some-model".to_string(),
+            provider: "some-provider".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("env path resolves");
+        assert_eq!(resolved.1, "openai-from-env");
+        assert_eq!(resolved.3, "openai");
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_config_returns_none_when_neither_set() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+
+        assert!(resolve_synthesis_config(None).is_none());
+        // Empty args also falls through to none.
+        let empty_args = SynthesisConfig {
+            endpoint: "".to_string(),
+            api_key: "".to_string(),
+            model: "".to_string(),
+            provider: "".to_string(),
+        };
+        assert!(resolve_synthesis_config(Some(&empty_args)).is_none());
+
+        restore_synthesis_env(snapshot);
+    }
+
+    #[test]
+    fn test_synthesis_model_env_override_applies_to_args_path() {
+        let _guard = synthesis_env_lock().lock().unwrap();
+        let snapshot = snapshot_synthesis_env();
+        clear_synthesis_env();
+        // SAFETY: test holds `synthesis_env_lock` for the duration of the case.
+        unsafe { std::env::set_var("DEEP_SEARCH_SYNTHESIS_MODEL", "override-model") };
+
+        let args = SynthesisConfig {
+            endpoint: "https://api.example.com/v1".to_string(),
+            api_key: "sk-args".to_string(),
+            model: "default-from-args".to_string(),
+            provider: "deepseek".to_string(),
+        };
+        let resolved = resolve_synthesis_config(Some(&args)).expect("resolves");
+        assert_eq!(resolved.2, "override-model");
+
+        restore_synthesis_env(snapshot);
+    }
+
     #[test]
     fn test_same_origin_links() {
         let seen: HashSet<String> = HashSet::new();
@@ -2336,5 +3296,403 @@ mod tests {
         let actual = std::fs::read_to_string(&sink).unwrap();
         assert_eq!(actual, fixture);
         let _ = std::fs::remove_file(&sink);
+    }
+
+    // -------------------------------------------------------------------
+    // Synthesis (W3.C1) tests.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_synthesis_response_extracts_three_sections() {
+        let raw = "## Headline\n\
+Foo is a programming language [1][2].\n\n\
+## Confidence\n\
+0.85\n\n\
+## Synthesis\n\
+Foo is a programming language used for systems programming [1]. It \
+emphasizes safety and performance [2].\n\n\
+A second paragraph explores tooling [3].\n";
+        let (synthesis, headline, confidence) = parse_synthesis_response(raw);
+        assert_eq!(headline, "Foo is a programming language [1][2].");
+        assert_eq!(confidence, Some(0.85));
+        assert!(synthesis.contains("systems programming [1]"));
+        assert!(synthesis.contains("A second paragraph"));
+        // Synthesis MUST NOT contain the headline or confidence lines.
+        assert!(
+            !synthesis.contains("## Headline"),
+            "synthesis leaked headline section"
+        );
+    }
+
+    #[test]
+    fn parse_synthesis_response_falls_back_when_no_sections() {
+        let raw = "Just a paragraph of text without explicit sections [1]. \
+And another sentence [2].";
+        let (synthesis, headline, confidence) = parse_synthesis_response(raw);
+        assert_eq!(headline, "");
+        assert_eq!(confidence, None);
+        assert!(synthesis.contains("[1]"));
+        assert!(synthesis.contains("[2]"));
+    }
+
+    #[test]
+    fn parse_synthesis_clamps_confidence() {
+        let raw = "## Confidence\n2.5\n## Synthesis\nbody";
+        let (_, _, confidence) = parse_synthesis_response(raw);
+        assert_eq!(confidence, Some(1.0));
+
+        let raw = "## Confidence\n-0.5\n## Synthesis\nbody";
+        let (_, _, confidence) = parse_synthesis_response(raw);
+        assert_eq!(confidence, Some(0.0));
+    }
+
+    #[test]
+    fn parse_synthesis_tolerates_renamed_sections() {
+        // Some models emit "## Answer" instead of "## Synthesis".
+        let raw = "## Headline\nshort\n\n## Answer\nThe real body [1].\n";
+        let (synthesis, headline, _) = parse_synthesis_response(raw);
+        assert_eq!(headline, "short");
+        assert!(synthesis.contains("real body"));
+    }
+
+    #[test]
+    fn cited_indexes_extracts_referenced_sources() {
+        let result = SynthesisResult {
+            synthesis: "Claim one [1]. Claim two [2][3]. Repeat [1] and [10].".to_string(),
+            headline: String::new(),
+            confidence: None,
+            provider: String::new(),
+            model: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            usd: None,
+        };
+        let cited = result.cited_indexes();
+        assert!(cited.contains(&1));
+        assert!(cited.contains(&2));
+        assert!(cited.contains(&3));
+        assert!(cited.contains(&10));
+        assert_eq!(cited.len(), 4); // [1] is deduplicated
+    }
+
+    #[test]
+    fn cited_indexes_ignores_non_numeric_brackets() {
+        let result = SynthesisResult {
+            synthesis: "Claim one [1]. Claim with [bracketed text]. Edge [99x] case.".to_string(),
+            headline: String::new(),
+            confidence: None,
+            provider: String::new(),
+            model: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            usd: None,
+        };
+        let cited = result.cited_indexes();
+        assert!(cited.contains(&1));
+        assert_eq!(cited.len(), 1);
+    }
+
+    #[test]
+    fn build_synthesis_prompt_caps_per_source_chars() {
+        let huge_excerpt = "x".repeat(5_000);
+        let input = SynthesisInput {
+            query: "test",
+            rounds: 1,
+            sources: vec![SynthesisSource {
+                index: 1,
+                url: "https://x".to_string(),
+                excerpt: huge_excerpt,
+            }],
+        };
+        let prompt = build_synthesis_prompt(&input);
+        // 1500 char cap + suffix → cap is enforced
+        assert!(prompt.contains("(truncated)"));
+    }
+
+    #[test]
+    fn build_synthesis_prompt_omits_sources_beyond_cap() {
+        let sources = (1..=20)
+            .map(|i| SynthesisSource {
+                index: i,
+                url: format!("https://x{i}"),
+                excerpt: format!("text {i}"),
+            })
+            .collect();
+        let input = SynthesisInput {
+            query: "test",
+            rounds: 1,
+            sources,
+        };
+        let prompt = build_synthesis_prompt(&input);
+        // Should mention 8 omitted (12 cap + 8 = 20)
+        assert!(
+            prompt.contains("8 more sources omitted"),
+            "got: {}",
+            &prompt[prompt.len().saturating_sub(300)..]
+        );
+        assert!(prompt.contains("https://x1"));
+        assert!(prompt.contains("https://x12"));
+        assert!(!prompt.contains("https://x13"));
+    }
+
+    #[test]
+    fn project_usd_handles_known_models() {
+        // Only check that costs are positive and roughly sane (sub-cent
+        // for typical synthesis sizes). Brittle pricing assertions are
+        // not the point — we want a sanity floor.
+        let cost = project_usd("deepseek-chat", 1000, 500).unwrap();
+        assert!(cost > 0.0);
+        assert!(cost < 0.01); // synthesis at 1k+500 should be sub-cent
+
+        let cost = project_usd("gpt-4o-mini", 1000, 500).unwrap();
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn project_usd_returns_none_for_unknown_model() {
+        assert!(project_usd("custom-private-model-v9", 100, 100).is_none());
+    }
+
+    #[test]
+    fn build_report_with_synthesis_includes_synthesis_section_and_sources() {
+        let saved = vec![
+            (
+                "01_a.md".to_string(),
+                "https://a.example/x".to_string(),
+                "Full text from a [1].".to_string(),
+            ),
+            (
+                "02_b.md".to_string(),
+                "https://b.example/y".to_string(),
+                "Full text from b [2].".to_string(),
+            ),
+        ];
+        let queries = vec!["topic".to_string(), "topic 2026".to_string()];
+        let syn = SynthesisResult {
+            synthesis: "Foo is widely used [1]. Bar is alternative [2].\n\n\
+A second paragraph elaborates on alternatives [2]."
+                .to_string(),
+            headline: "Foo and bar are alternatives".to_string(),
+            confidence: Some(0.85),
+            provider: "deepseek".to_string(),
+            model: "deepseek-chat".to_string(),
+            tokens_in: 1000,
+            tokens_out: 200,
+            usd: Some(0.0009),
+        };
+        let dir = std::path::PathBuf::from("/tmp/research/topic");
+        let report_path = dir.join("_report.md");
+        let report = build_report(
+            "topic",
+            Some(&syn),
+            "ignored when synthesis present",
+            &saved,
+            &queries,
+            &dir,
+            &report_path,
+        );
+
+        // Critical structural guarantees the test enforces:
+        assert!(report.starts_with("# Deep Research: topic\n\n"));
+        assert!(
+            report.contains("## Synthesis\n\nFoo is widely used [1]"),
+            "expected synthesis section with citations: {report}"
+        );
+        assert!(
+            report.contains("_Foo and bar are alternatives_"),
+            "expected italic headline: {report}"
+        );
+        assert!(
+            report.contains("_Self-reported confidence: 0.85_"),
+            "expected confidence line: {report}"
+        );
+        // Source listing must be present.
+        assert!(report.contains("### Source [1]: https://a.example/x"));
+        assert!(report.contains("### Source [2]: https://b.example/y"));
+        // No "LLM synthesis unavailable" disclaimer when synthesis IS available.
+        assert!(
+            !report.contains("LLM synthesis unavailable"),
+            "synthesis fallback leaked into successful path"
+        );
+        // Trailer with report path stays for v1 host compatibility.
+        assert!(report.contains("Report saved to: /tmp/research/topic/_report.md"));
+        // Multi-paragraph structure is preserved (we have a blank line in
+        // the synthesis input → there should be at least 4 newlines around
+        // the synthesis body).
+        let synthesis_section = report.split("## Sources").next().unwrap();
+        assert!(
+            synthesis_section.matches("\n\n").count() >= 3,
+            "synthesis should have multi-paragraph structure: {synthesis_section}"
+        );
+    }
+
+    #[test]
+    fn build_report_without_synthesis_falls_back_with_disclaimer() {
+        let saved = vec![(
+            "01_a.md".to_string(),
+            "https://a.example/x".to_string(),
+            "Snippet".to_string(),
+        )];
+        let queries = vec!["topic".to_string()];
+        let dir = std::path::PathBuf::from("/tmp/research/topic");
+        let report_path = dir.join("_report.md");
+        let report = build_report(
+            "topic",
+            None,
+            "Initial Bing dump:\n1. Result one",
+            &saved,
+            &queries,
+            &dir,
+            &report_path,
+        );
+        assert!(report.contains("## Overview"));
+        assert!(report.contains("LLM synthesis unavailable"));
+        assert!(report.contains("Initial Bing dump"));
+        assert!(report.contains("### Source [1]"));
+        assert!(!report.contains("## Synthesis"));
+    }
+
+    #[test]
+    fn build_report_with_empty_synthesis_falls_back() {
+        // If the LLM returns an empty body (rare but possible), the
+        // report should fall back to the raw initial answer rather than
+        // emit an empty synthesis section.
+        let syn = SynthesisResult {
+            synthesis: "   \n  ".to_string(),
+            headline: "Headline only".to_string(),
+            confidence: None,
+            provider: "x".to_string(),
+            model: "y".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            usd: None,
+        };
+        let report = build_report(
+            "topic",
+            Some(&syn),
+            "raw initial",
+            &[],
+            &["topic".to_string()],
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/_report.md"),
+        );
+        assert!(!report.contains("## Synthesis"));
+        assert!(report.contains("LLM synthesis unavailable"));
+        assert!(report.contains("raw initial"));
+    }
+
+    #[test]
+    fn max_browsers_default_is_three() {
+        // Avoid clobbering a real env var the developer set.
+        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
+        // SAFETY: tests are single-threaded by default.
+        unsafe {
+            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
+        }
+        assert_eq!(max_browsers(), 3);
+        // Restore for other tests.
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
+            }
+        }
+    }
+
+    #[test]
+    fn max_browsers_clamps_to_range() {
+        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "0");
+        }
+        assert_eq!(max_browsers(), 1, "clamps zero to 1");
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "100");
+        }
+        assert_eq!(max_browsers(), 16, "clamps high to 16");
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "5");
+        }
+        assert_eq!(max_browsers(), 5, "passes through valid value");
+        unsafe {
+            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "not-a-number");
+        }
+        assert_eq!(max_browsers(), 3, "falls back to default on parse fail");
+        // Cleanup.
+        unsafe {
+            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
+        }
+        if let Some(v) = prev {
+            unsafe {
+                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn browser_semaphore_caps_concurrency() {
+        // The OnceLock-backed semaphore is initialized at first call.
+        // We can't read its capacity directly, but we can validate that
+        // permits decrement when held and that exceeding the cap blocks.
+        let sem = browser_semaphore();
+        let cap = sem.available_permits();
+        assert!((1..=16).contains(&cap), "cap must be in [1, 16], got {cap}");
+
+        // Hold the bindings so the permits are NOT dropped immediately.
+        let permit1 = sem.try_acquire().ok();
+        assert!(permit1.is_some(), "first acquire should succeed");
+        let after_one = sem.available_permits();
+        assert_eq!(
+            after_one,
+            cap - 1,
+            "permit should decrement available count"
+        );
+        drop(permit1);
+        // Restored after drop.
+        assert_eq!(sem.available_permits(), cap);
+    }
+
+    #[test]
+    fn output_serializes_v2_summary() {
+        let mut output = Output {
+            output: "report".to_string(),
+            success: true,
+            summary: Some(ResultSummary {
+                kind: "deep_research".to_string(),
+                headline: "5 sources answering test".to_string(),
+                confidence: Some(0.8),
+                sources: vec![ResultSource {
+                    url: "https://example.com".to_string(),
+                    title: "Example".to_string(),
+                    cited: true,
+                }],
+                rounds: Some(3),
+            }),
+            cost: Some(ResultCost {
+                provider: Some("deepseek".to_string()),
+                model: Some("deepseek-chat".to_string()),
+                tokens_in: 1024,
+                tokens_out: 256,
+                usd: Some(0.0034),
+            }),
+            files_to_send: vec!["/tmp/report.md".to_string()],
+        };
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["summary"]["kind"], "deep_research");
+        assert_eq!(json["summary"]["confidence"], 0.8);
+        assert_eq!(json["summary"]["sources"][0]["cited"], true);
+        assert_eq!(json["cost"]["tokens_in"], 1024);
+        assert_eq!(json["files_to_send"][0], "/tmp/report.md");
+
+        // Default-empty fields elide so existing v1 code keeps working.
+        output.summary = None;
+        output.cost = None;
+        output.files_to_send.clear();
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(json.get("summary").is_none(), "summary should be omitted");
+        assert!(json.get("cost").is_none(), "cost should be omitted");
+        assert!(
+            json.get("files_to_send").is_none(),
+            "files_to_send should be omitted"
+        );
     }
 }

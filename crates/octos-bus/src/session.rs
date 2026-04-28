@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use eyre::Result;
 use lru::LruCache;
 use metrics::counter;
-use octos_core::{Message, SessionKey};
+use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -78,6 +78,32 @@ pub fn child_session_key(parent: &SessionKey, child_id: &str) -> SessionKey {
 
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
+}
+
+/// Derive a 50-char display title from a user message's text content.
+///
+/// Trims whitespace, strips JSON content-array wrappers if present, and
+/// truncates to 50 Unicode characters at a UTF-8 boundary so the result
+/// is safe to persist and round-trip through serde.
+fn derive_title_from_message(content: &str) -> String {
+    let plain = content.trim();
+    // Many UI clients send `[{"type":"text","text":"..."}]`-shaped content;
+    // unwrap to the inner text part if so. Plain strings pass through.
+    let text = serde_json::from_str::<Vec<serde_json::Value>>(plain)
+        .ok()
+        .and_then(|parts| {
+            parts
+                .into_iter()
+                .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
+        })
+        .unwrap_or_else(|| plain.to_string());
+    let trimmed = text.trim();
+    trimmed
+        .chars()
+        .take(50)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn record_session_persist(outcome: &'static str) {
@@ -188,6 +214,13 @@ struct SessionMeta {
     /// Short summary of the session (first user message, truncated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    /// Display title for sidebar/listings. Auto-derived from first user
+    /// message; preserved if set manually via [`SessionManager::update_title`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Whether `title` was set manually (preserved across auto-derivation).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    title_manual: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     child_contracts: Vec<ChildSessionContract>,
     created_at: DateTime<Utc>,
@@ -204,6 +237,12 @@ pub struct Session {
     pub topic: Option<String>,
     /// Short summary of the session content.
     pub summary: Option<String>,
+    /// Display title (auto-derived from first user message; manual rename via
+    /// [`SessionManager::update_title`] preserves across new messages).
+    pub title: Option<String>,
+    /// True if title was set manually and should not be overwritten by
+    /// auto-derivation.
+    pub title_manual: bool,
     /// Durable child-session contracts associated with this session.
     pub child_contracts: Vec<ChildSessionContract>,
     pub messages: Vec<Message>,
@@ -220,6 +259,8 @@ impl Session {
             parent_key: None,
             topic,
             summary: None,
+            title: None,
+            title_manual: false,
             child_contracts: vec![],
             messages: vec![],
             created_at: now,
@@ -324,12 +365,147 @@ impl SessionManager {
         self
     }
 
-    /// List all sessions (ID + message count) from disk.
+    /// List all sessions (ID + message count) from disk, including internal
+    /// runtime topics (`child-*`, `*.tasks`).
     ///
     /// Scans both the legacy flat layout (`sessions/*.jsonl`) and the per-user
     /// layout (`users/{base_key}/sessions/{topic}.jsonl`).
     /// Counts lines efficiently using `BufRead` to avoid loading entire files.
+    ///
+    /// Use [`Self::list_top_level_sessions`] for the user-facing listing path:
+    /// the all-inclusive walk is O(N) over every JSONL on disk and becomes a
+    /// hard bottleneck once spawn-fanout sessions accumulate (one user dir
+    /// observed in the wild had 65k+ `child-*.jsonl` siblings, each
+    /// line-counted by [`Self::count_lines`], hanging `/api/sessions` for
+    /// 30 s+).
     pub fn list_sessions(&self) -> Vec<(String, usize)> {
+        self.list_sessions_inner(false)
+    }
+
+    /// Like [`Self::list_sessions`] but also returns persisted title.
+    ///
+    /// None for sessions persisted before #617. Used by the gateway's
+    /// `GET /sessions` endpoint to surface server-authoritative titles.
+    pub fn list_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
+        self.list_sessions_inner_with_title(false)
+    }
+
+    /// List only top-level sessions — those whose topic is empty (the
+    /// canonical `default.jsonl` per user dir) or a user-facing topic such
+    /// as `research`. Internal runtime topics (`child-*` spawn fanouts and
+    /// `*.tasks` background-task ledgers) are skipped at the directory walk,
+    /// before any line counting, so the cost stays O(top-level sessions)
+    /// regardless of how many child sessions a parent has accumulated.
+    ///
+    /// This is the helper that should back the user-facing
+    /// `GET /api/sessions` path. Child sessions are surfaced only when an
+    /// individual session's history is explicitly opened via
+    /// `/api/sessions/{id}/messages`.
+    pub fn list_top_level_sessions(&self) -> Vec<(String, usize)> {
+        self.list_sessions_inner(true)
+    }
+
+    /// Like [`Self::list_top_level_sessions`] but also returns the persisted
+    /// title for each session (None when the file has no `title` field, e.g.
+    /// pre-#617 sessions).
+    pub fn list_top_level_sessions_with_title(&self) -> Vec<(String, usize, Option<String>)> {
+        self.list_sessions_inner_with_title(true)
+    }
+
+    fn list_sessions_inner_with_title(
+        &self,
+        skip_internal_topics: bool,
+    ) -> Vec<(String, usize, Option<String>)> {
+        // Reuse the path discovery from list_sessions_inner, but read each
+        // file's first line to extract the title alongside the line count.
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        let push_with_title =
+            |path: &Path,
+             session_key: String,
+             seen: &mut std::collections::HashSet<String>,
+             out: &mut Vec<(String, usize, Option<String>)>| {
+                if seen.contains(&session_key) {
+                    return;
+                }
+                // Read just the first line for metadata; fall back to count_lines
+                // for the message count.
+                let title = std::fs::read_to_string(path).ok().and_then(|content| {
+                    content
+                        .lines()
+                        .next()
+                        .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
+                        .and_then(|meta| meta.title)
+                });
+                let count = Self::count_lines(path);
+                seen.insert(session_key.clone());
+                out.push((session_key, count, title));
+            };
+
+        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let decoded = Self::decode_filename(name);
+                if skip_internal_topics && Self::is_internal_session_key(&decoded) {
+                    continue;
+                }
+                push_with_title(&path, decoded, &mut seen, &mut result);
+            }
+        }
+
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
+            for user_entry in user_entries.flatten() {
+                let user_path = user_entry.path();
+                if !user_path.is_dir() {
+                    continue;
+                }
+                let base_key_encoded = match user_path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let base_key = Self::decode_filename(base_key_encoded);
+                let sessions_subdir = user_path.join("sessions");
+                if let Ok(session_files) = std::fs::read_dir(&sessions_subdir) {
+                    for file_entry in session_files.flatten() {
+                        let file_path = file_entry.path();
+                        if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                            continue;
+                        }
+                        let topic_encoded = match file_path.file_stem().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        let topic = Self::decode_filename(topic_encoded);
+                        if skip_internal_topics && Self::is_internal_session_topic(&topic) {
+                            continue;
+                        }
+                        let session_key = if topic == "default" {
+                            base_key.clone()
+                        } else {
+                            format!("{base_key}#{topic}")
+                        };
+                        push_with_title(&file_path, session_key, &mut seen, &mut result);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    fn list_sessions_inner(&self, skip_internal_topics: bool) -> Vec<(String, usize)> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
 
@@ -339,8 +515,11 @@ impl SessionManager {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                     if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
-                        let count = Self::count_lines(&path);
                         let decoded = Self::decode_filename(name);
+                        if skip_internal_topics && Self::is_internal_session_key(&decoded) {
+                            continue;
+                        }
+                        let count = Self::count_lines(&path);
                         if seen.insert(decoded.clone()) {
                             result.push((decoded, count));
                         }
@@ -378,6 +557,14 @@ impl SessionManager {
                             None => continue,
                         };
                         let topic = Self::decode_filename(topic_encoded);
+                        if skip_internal_topics && Self::is_internal_session_topic(&topic) {
+                            // Skip child-* and *.tasks files BEFORE counting
+                            // lines: line counting opens every file, and on
+                            // user dirs with tens of thousands of spawn
+                            // children the cumulative I/O blocks the
+                            // /api/sessions handler for tens of seconds.
+                            continue;
+                        }
                         // Reconstruct the full session key
                         let session_key = if topic == "default" {
                             base_key.clone()
@@ -394,6 +581,21 @@ impl SessionManager {
         }
 
         result
+    }
+
+    /// True for runtime-internal topics that should never appear in the
+    /// user-facing session listing (`child-*` spawn fanouts and `*.tasks`
+    /// background-task ledger sidecars).
+    fn is_internal_session_topic(topic: &str) -> bool {
+        topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
+    }
+
+    /// True for full session keys (legacy flat layout, encoded as
+    /// `{base}#{topic}` after decoding) whose topic is internal.
+    fn is_internal_session_key(decoded_key: &str) -> bool {
+        decoded_key
+            .split_once('#')
+            .is_some_and(|(_, topic)| Self::is_internal_session_topic(topic))
     }
 
     /// Count lines in a JSONL session file, skipping oversized files.
@@ -447,6 +649,19 @@ impl SessionManager {
         key: &SessionKey,
         message: Message,
     ) -> Result<usize> {
+        // Auto-derive title from first user message before persistence so the
+        // first append_to_disk includes the title in the JSONL meta line.
+        // Manual titles (set via update_title) are preserved.
+        if matches!(message.role, MessageRole::User) {
+            let session = self.get_or_create(key).await;
+            if !session.title_manual && session.title.is_none() {
+                let derived = derive_title_from_message(&message.content);
+                if !derived.is_empty() {
+                    session.title = Some(derived);
+                }
+            }
+        }
+
         let _ = self.get_or_create(key).await;
         if let Err(error) = self.append_to_disk(key, &message).await {
             record_session_persist("failed");
@@ -601,6 +816,8 @@ impl SessionManager {
                     parent_key: meta.parent_key.map(SessionKey),
                     topic: meta.topic,
                     summary: meta.summary,
+                    title: meta.title,
+                    title_manual: meta.title_manual,
                     child_contracts: meta.child_contracts,
                     messages,
                     created_at: meta.created_at,
@@ -639,6 +856,8 @@ impl SessionManager {
                         parent_key: per_user.parent_key.or(flat.parent_key),
                         topic: per_user.topic.or(flat.topic),
                         summary: per_user.summary.or(flat.summary),
+                        title: per_user.title.or(flat.title),
+                        title_manual: per_user.title_manual || flat.title_manual,
                         child_contracts: merge_child_contracts(
                             flat.child_contracts,
                             per_user.child_contracts,
@@ -677,6 +896,8 @@ impl SessionManager {
         let parent_key = session_peek.and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
         let topic = session_peek.and_then(|s| s.topic.clone());
         let summary = session_peek.and_then(|s| s.summary.clone());
+        let title = session_peek.and_then(|s| s.title.clone());
+        let title_manual = session_peek.map(|s| s.title_manual).unwrap_or(false);
         let child_contracts = session_peek
             .map(|session| session.child_contracts.clone())
             .unwrap_or_default();
@@ -714,6 +935,8 @@ impl SessionManager {
                     parent_key,
                     topic,
                     summary,
+                    title,
+                    title_manual,
                     child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -746,6 +969,8 @@ impl SessionManager {
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: session.topic.clone(),
             summary: session.summary.clone(),
+            title: session.title.clone(),
+            title_manual: session.title_manual,
             child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
@@ -805,6 +1030,8 @@ impl SessionManager {
             parent_key: Some(parent_key.clone()),
             topic: None,
             summary: None,
+            title: None,
+            title_manual: false,
             child_contracts: vec![],
             messages,
             created_at: now,
@@ -923,6 +1150,53 @@ impl SessionManager {
         removed
     }
 
+    /// Drop the cached in-memory copy of a session so the next read consults
+    /// disk. Required by callers that write through alternate channels (e.g.
+    /// `SessionHandle`) and must keep the manager's LRU cache from serving
+    /// stale post-write reads.
+    pub fn invalidate_cache(&mut self, key: &SessionKey) {
+        self.cache.pop(&key.0);
+    }
+
+    /// Scan the per-user layout for every JSONL belonging to `base_key` and
+    /// return their reconstructed `SessionKey`s. The default file maps back to
+    /// the base key (no topic suffix); other files map to `{base_key}#{topic}`.
+    ///
+    /// Used by topic-less watcher reconnects so the replay path can union
+    /// every topic-specific JSONL the actor has written under this user even
+    /// when the URL didn't carry an explicit `?topic=...` parameter.
+    pub fn list_user_session_keys(&self, base_key: &str) -> Vec<SessionKey> {
+        let encoded_base = encode_path_component(base_key);
+        let user_sessions_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions");
+        let mut keys = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(&user_sessions_dir) else {
+            return keys;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let topic = Self::decode_filename(stem);
+            let session_key = if topic == "default" {
+                SessionKey(base_key.to_string())
+            } else {
+                SessionKey(format!("{base_key}#{topic}"))
+            };
+            keys.push(session_key);
+        }
+        keys
+    }
+
     /// Ensure a session file exists in the per-user layout so that
     /// `list_user_sessions` can discover it.  Creates an empty JSONL
     /// (metadata-only) if the file does not already exist.
@@ -960,6 +1234,8 @@ impl SessionManager {
                     Some(topic.to_string())
                 },
                 summary: None,
+                title: None,
+                title_manual: false,
                 child_contracts: vec![],
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
@@ -991,6 +1267,63 @@ pub struct SessionHandle {
     session: Session,
 }
 
+/// Per-key persist lock map.
+///
+/// Two writers (e.g. `SessionActor` and `ApiChannel::persist_to_session`) can
+/// each open a fresh `SessionHandle` for the same session_key concurrently.
+/// Each handle loads disk into its OWN per-instance `messages: Vec<_>`.
+/// Without serialisation, both observe `len = N`, both append, both return
+/// `seq = N` — duplicate seqs that break watcher correlation.
+///
+/// This map gives `persist_message_through_canonical_path` a per-key Tokio
+/// mutex so all writes for the same `SessionKey.0` serialise. The mutex is
+/// scoped to the session_key string (NOT the file path) so callers reaching
+/// the canonical per-user JSONL via different code paths still contend on
+/// the same lock.
+///
+/// Memory note: entries leak forever, one per active session_key. In a long-
+/// lived bus process this grows with active distinct sessions; given
+/// production keys are typically `<profile>:api:<chat>` and bounded by user
+/// count, this is acceptable. We can add LRU eviction later if needed.
+fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("persist lock map poisoned");
+    guard
+        .entry(key.0.clone())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Persist a single message to the canonical per-user `<topic>.jsonl` file
+/// the `SessionActor` and `ApiChannel` both target. Returns the committed
+/// per-session sequence number.
+///
+/// Writes for the same `key` serialise via a per-key Tokio mutex (see
+/// [`persist_lock_for`]). This is the contract that closed the concurrent-
+/// persist seq race: every caller — `SessionActor::persist_assistant_message`,
+/// `ApiChannel::persist_to_session`, and the standalone `octos serve` `/chat`
+/// handlers — funnels through this helper so the storage layer is the single
+/// ordering point. Callers that also keep an in-memory `SessionHandle` mirror
+/// the message via [`SessionHandle::push_message_in_memory`] AFTER the disk
+/// write commits, so their local Vec stays consistent without double-writing.
+///
+/// Preserves the canonical migration path (legacy flat → per-user) inside
+/// `SessionHandle::open`.
+pub async fn persist_message_through_canonical_path(
+    data_dir: &Path,
+    key: &SessionKey,
+    message: Message,
+) -> Result<usize> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let mut handle = SessionHandle::open(data_dir, key);
+    handle.add_message_with_seq(message).await
+}
+
 impl SessionHandle {
     /// Open or create a session handle for the given key.
     ///
@@ -1002,28 +1335,86 @@ impl SessionHandle {
         let user_sessions_dir = data_dir.join("users").join(&encoded_base).join("sessions");
         let _ = std::fs::create_dir_all(&user_sessions_dir);
 
-        // Try loading from new per-user path first
         let topic_filename = Self::topic_filename(key);
         let new_path = user_sessions_dir.join(&topic_filename);
+        let marker_path = Self::migration_marker_path(&user_sessions_dir, key);
+        let legacy_dir = data_dir.join("sessions");
+        let legacy_path = SessionManager::session_path_static(&legacy_dir, key);
 
-        let session = if new_path.exists() {
+        // Migration state machine — three real cases:
+        //   (A) marker present              -> migration is done; per-user is
+        //                                      authoritative. Skip legacy load
+        //                                      AND skip legacy delete (a stale
+        //                                      legacy file is left in place so
+        //                                      operator-level cleanup can find
+        //                                      it; the per-user merge in
+        //                                      `list_user_sessions` would still
+        //                                      dedup if it surfaces).
+        //   (B) per-user + legacy + no marker
+        //                                   -> previous boot's `rewrite_blocking`
+        //                                      succeeded but `remove_file(legacy)`
+        //                                      failed. Best-effort retry the
+        //                                      removal; on success write the
+        //                                      marker. On failure log and keep
+        //                                      going (per-user already wins).
+        //   (C) per-user only               -> normal read.
+        //   (D) legacy only                 -> first-time migration: load,
+        //                                      rewrite into per-user, remove
+        //                                      legacy, write marker.
+        //   (else)                          -> empty session.
+        let session = if marker_path.exists() {
+            // Case (A): marker says migration is done. The per-user file is
+            // authoritative even if a stale legacy file co-exists.
             Self::load_from_file(&new_path, key)
-        } else {
-            // Fall back to legacy flat path for migration
-            let legacy_dir = data_dir.join("sessions");
-            let legacy_path = SessionManager::session_path_static(&legacy_dir, key);
+        } else if new_path.exists() {
             if legacy_path.exists() {
-                debug!(key = %key, "migrating session from legacy flat layout");
-                let session = Self::load_from_file(&legacy_path, key);
-                // Migration: if loaded from legacy, we'll write to new path on next save
-                if session.is_some() {
-                    // Remove legacy file after successful load
-                    let _ = std::fs::remove_file(&legacy_path);
+                // Case (B): partial-migration leftover. Retry the legacy
+                // removal so subsequent boots take the cheap (A) path.
+                match std::fs::remove_file(&legacy_path) {
+                    Ok(()) => {
+                        let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
+                    }
+                    Err(error) => {
+                        warn!(
+                            key = %key,
+                            legacy_path = %legacy_path.display(),
+                            error = %error,
+                            "failed to retry legacy session removal during open; \
+                             per-user file remains authoritative"
+                        );
+                    }
                 }
-                session
-            } else {
-                None
             }
+            // Case (C): per-user only — straight read.
+            Self::load_from_file(&new_path, key)
+        } else if legacy_path.exists() {
+            // Case (D): first-time migration. Persist into the per-user JSONL
+            // BEFORE removing the legacy file so a subsequent incremental
+            // `add_message_with_seq` (which only appends a single line) does
+            // not silently drop the pre-migration messages.
+            debug!(key = %key, "migrating session from legacy flat layout");
+            let session = Self::load_from_file(&legacy_path, key);
+            if let Some(loaded) = session.as_ref() {
+                if let Err(error) = Self::rewrite_blocking(&new_path, loaded) {
+                    warn!(
+                        key = %key,
+                        path = %new_path.display(),
+                        error = %error,
+                        "failed to materialize legacy session into per-user layout; \
+                         leaving legacy file in place"
+                    );
+                    return Self {
+                        sessions_dir: user_sessions_dir,
+                        session: loaded.clone(),
+                    };
+                }
+                if std::fs::remove_file(&legacy_path).is_ok() {
+                    let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
+                }
+            }
+            session
+        } else {
+            None
         }
         .unwrap_or_else(|| Session::new(key.clone()));
 
@@ -1031,6 +1422,17 @@ impl SessionHandle {
             sessions_dir: user_sessions_dir,
             session,
         }
+    }
+
+    /// Path of the per-key migration marker written after a successful
+    /// rewrite + legacy-remove pair. Used by [`Self::open`] to detect a
+    /// completed migration on subsequent opens (so a stale legacy file —
+    /// e.g. from a remove_file failure on a prior boot — does not cause
+    /// double-history reads).
+    fn migration_marker_path(user_sessions_dir: &Path, key: &SessionKey) -> PathBuf {
+        let topic = key.topic().unwrap_or("default");
+        let encoded = encode_path_component(topic);
+        user_sessions_dir.join(format!(".migrated.{encoded}"))
     }
 
     /// Check whether a session file exists in either the per-user or legacy layout.
@@ -1215,6 +1617,19 @@ impl SessionHandle {
 
     /// Add a message to the session, persist it, and return its committed sequence.
     pub async fn add_message_with_seq(&mut self, message: Message) -> Result<usize> {
+        // Auto-derive title from first user message before persistence so the
+        // first append_to_disk includes the title in the JSONL meta line.
+        // Manual titles set via update_title elsewhere are preserved.
+        if matches!(message.role, MessageRole::User)
+            && !self.session.title_manual
+            && self.session.title.is_none()
+        {
+            let derived = derive_title_from_message(&message.content);
+            if !derived.is_empty() {
+                self.session.title = Some(derived);
+            }
+        }
+
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
         if let Err(error) = self.append_to_disk(&message).await {
@@ -1223,6 +1638,17 @@ impl SessionHandle {
         }
         record_session_persist("committed");
         Ok(self.session.messages.len().saturating_sub(1))
+    }
+
+    /// Append a message to the in-memory transcript only — no disk I/O.
+    ///
+    /// Used by callers that funneled the persist through
+    /// [`persist_message_through_canonical_path`] and now need to keep the
+    /// per-actor handle's in-memory `messages` consistent with disk WITHOUT
+    /// double-writing (the canonical helper already wrote the JSONL line).
+    pub fn push_message_in_memory(&mut self, message: Message) {
+        self.session.messages.push(message);
+        self.session.updated_at = Utc::now();
     }
 
     /// Insert or update a durable child-session contract and persist it.
@@ -1246,6 +1672,8 @@ impl SessionHandle {
             parent_key: self.session.parent_key.as_ref().map(|k| k.0.clone()),
             topic: self.session.topic.clone(),
             summary: self.session.summary.clone(),
+            title: self.session.title.clone(),
+            title_manual: self.session.title_manual,
             child_contracts: self.session.child_contracts.clone(),
             created_at: self.session.created_at,
             updated_at: self.session.updated_at,
@@ -1302,12 +1730,70 @@ impl SessionHandle {
             .join(Self::topic_filename(&self.session.key))
     }
 
+    /// Synchronously rewrite a session JSONL at `path` from an in-memory
+    /// `Session`. Used by the migration path in [`Self::open`] where the
+    /// caller is not yet inside an async context. Atomic write-then-rename.
+    ///
+    /// Cleans up the tmp file if the write or rename fails so a partial
+    /// migration does not leak `<path>.<pid>-<seq>.tmp` files on disk.
+    /// Records the same `octos_session_rewrite_total` metric as the async
+    /// `rewrite()` so operators see a unified rewrite count regardless of
+    /// the originating call path.
+    fn rewrite_blocking(path: &Path, session: &Session) -> Result<()> {
+        let result = Self::rewrite_blocking_inner(path, session);
+        match &result {
+            Ok(()) => record_session_rewrite("committed"),
+            Err(_) => record_session_rewrite("failed"),
+        }
+        result
+    }
+
+    fn rewrite_blocking_inner(path: &Path, session: &Session) -> Result<()> {
+        use std::io::Write;
+        let meta = SessionMeta {
+            schema_version: CURRENT_SESSION_SCHEMA,
+            session_key: session.key.0.clone(),
+            parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
+            topic: session.topic.clone(),
+            summary: session.summary.clone(),
+            title: session.title.clone(),
+            title_manual: session.title_manual,
+            child_contracts: session.child_contracts.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        };
+        let mut content = serde_json::to_string(&meta)?;
+        content.push('\n');
+        for msg in &session.messages {
+            content.push_str(&serde_json::to_string(msg)?);
+            content.push('\n');
+        }
+        let tmp_path = rewrite_tmp_path(path);
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.flush()?;
+            std::fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            // Best-effort tmp cleanup. If the rename succeeded but a later
+            // step failed (currently impossible — rename is the last step)
+            // we'd skip this; if `File::create` or `write_all` fail, the
+            // tmp file may exist and must not leak.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_result
+    }
+
     /// Append a single message to the JSONL file.
     async fn append_to_disk(&self, message: &Message) -> Result<()> {
         let path = self.session_path();
         let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
         let topic = self.session.topic.clone();
         let summary = self.session.summary.clone();
+        let title = self.session.title.clone();
+        let title_manual = self.session.title_manual;
         let child_contracts = self.session.child_contracts.clone();
         let key_str = self.session.key.0.clone();
         let msg_json = serde_json::to_string(message)?;
@@ -1339,6 +1825,8 @@ impl SessionHandle {
                     parent_key,
                     topic,
                     summary,
+                    title,
+                    title_manual,
                     child_contracts,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -1387,6 +1875,8 @@ impl SessionHandle {
             parent_key: meta.parent_key.map(SessionKey),
             topic: meta.topic,
             summary: meta.summary,
+            title: meta.title,
+            title_manual: meta.title_manual,
             child_contracts: meta.child_contracts,
             messages,
             created_at: meta.created_at,
@@ -1406,6 +1896,8 @@ pub struct SessionListEntry {
     pub updated_at: DateTime<Utc>,
     /// Short summary of the session.
     pub summary: Option<String>,
+    /// Display title (derived from first user message or set manually).
+    pub title: Option<String>,
 }
 
 impl SessionManager {
@@ -1466,6 +1958,7 @@ impl SessionManager {
                 message_count,
                 updated_at: meta.updated_at,
                 summary: meta.summary,
+                title: meta.title,
             });
         }
 
@@ -1477,6 +1970,16 @@ impl SessionManager {
     pub async fn update_summary(&mut self, key: &SessionKey, summary: String) -> Result<()> {
         let session = self.get_or_create(key).await;
         session.summary = Some(summary);
+        self.rewrite(key).await
+    }
+
+    /// Set a manual title for a session (rewrites metadata line). Once set,
+    /// the title persists across new messages — auto-derivation in
+    /// [`add_message_with_seq`] only fires when no manual title exists.
+    pub async fn update_title(&mut self, key: &SessionKey, title: String) -> Result<()> {
+        let session = self.get_or_create(key).await;
+        session.title = Some(title);
+        session.title_manual = true;
         self.rewrite(key).await
     }
 
@@ -1563,6 +2066,7 @@ impl SessionManager {
                 message_count,
                 updated_at: meta.updated_at,
                 summary: meta.summary,
+                title: meta.title,
             });
         }
 
@@ -1671,6 +2175,10 @@ struct StoredActiveSessions {
 }
 
 /// Validate a topic name. Returns Err with a message if invalid.
+///
+/// Rejects the literal `"default"` because the per-user storage layout
+/// uses `default.jsonl` as the no-topic filename — a user-named `"default"`
+/// topic would silently collide with the topic-less mapping.
 pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str> {
     if topic.is_empty() {
         return Err("topic name cannot be empty");
@@ -1683,6 +2191,9 @@ pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str>
     }
     if topic.chars().any(|c| c.is_control()) {
         return Err("topic name cannot contain control characters");
+    }
+    if topic.eq_ignore_ascii_case("default") {
+        return Err("topic name 'default' is reserved (used as the no-topic filename in storage)");
     }
     Ok(())
 }
@@ -2380,6 +2891,126 @@ mod tests {
         assert_eq!(sessions[0].0, "feishu:oc_abc123");
     }
 
+    /// Issue #607 §D: `/api/sessions` hung 30 s+ on a user dir with 65 535
+    /// `child-*.jsonl` siblings because the listing iterated every JSONL.
+    /// `list_top_level_sessions` must skip `child-*` and `*.tasks` files at
+    /// the directory walk so the cost stays O(top-level sessions).
+    #[tokio::test]
+    async fn list_top_level_sessions_skips_child_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let parent = SessionKey::new("api", "web-parent");
+
+        // 1 top-level session.
+        mgr.add_message(&parent, make_message(MessageRole::User, "parent"))
+            .await
+            .unwrap();
+
+        // 100 child sessions written via the same canonical handle code path
+        // production uses (so the test exercises real filename encoding).
+        for i in 0..100 {
+            let child = child_session_key(&parent, &format!("task-{i:03}"));
+            mgr.add_message(&child, make_message(MessageRole::Assistant, "child"))
+                .await
+                .unwrap();
+        }
+
+        // The all-inclusive walk reflects every jsonl on disk (1 parent +
+        // 100 children).
+        let all = mgr.list_sessions();
+        assert_eq!(all.len(), 101, "internal walk should include children");
+
+        // The user-facing listing must surface only the top-level session.
+        let top = mgr.list_top_level_sessions();
+        assert_eq!(
+            top.len(),
+            1,
+            "list_top_level_sessions must skip child-* fanouts; got {top:?}"
+        );
+        assert_eq!(top[0].0, "api:web-parent");
+    }
+
+    /// Sidecar `*.tasks.jsonl` ledgers (e.g. `default.tasks.jsonl`) are an
+    /// internal runtime detail and must never appear in the user-facing
+    /// listing.
+    #[test]
+    fn list_top_level_sessions_skips_tasks_sidecar_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        // Construct a per-user dir directly so we can drop in both a
+        // top-level `default.jsonl` and an internal `default.tasks.jsonl`
+        // without having to drive the task-ledger writers in this unit.
+        let user_dir = tmp.path().join("users/api%3Aweb-tasks/sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": "api:web-tasks",
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        });
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+        // Sidecar — must be ignored.
+        std::fs::write(
+            user_dir.join("default.tasks.jsonl"),
+            "{\"task_id\":\"t-1\",\"state\":\"queued\"}\n",
+        )
+        .unwrap();
+
+        let top = mgr.list_top_level_sessions();
+        let ids: Vec<&str> = top.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["api:web-tasks"], "got {top:?}");
+    }
+
+    /// Regression guard for the O(N) hang. With 5 000 synthetic
+    /// `child-*.jsonl` files on disk, `list_top_level_sessions` must stay
+    /// well under the 500 ms bound — the original `list_sessions`
+    /// `count_lines`-per-file loop blew past 30 s in the wild on a dir
+    /// 13× larger.
+    #[test]
+    fn list_top_level_sessions_is_fast_with_many_child_jsonls() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+
+        let user_dir = tmp.path().join("users/api%3Aweb-river/sessions");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        // Top-level session.
+        std::fs::write(
+            user_dir.join("default.jsonl"),
+            "{\"schema_version\":1,\"session_key\":\"api:web-river\",\
+             \"created_at\":\"2024-01-01T00:00:00Z\",\
+             \"updated_at\":\"2024-01-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+
+        // Synthetic spawn fanout.
+        const FANOUT: usize = 5_000;
+        for i in 0..FANOUT {
+            std::fs::write(
+                user_dir.join(format!("child-task-{i:05}.jsonl")),
+                "{\"schema_version\":1}\n{\"role\":\"assistant\",\"content\":\"x\"}\n",
+            )
+            .unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let top = mgr.list_top_level_sessions();
+        let elapsed = start.elapsed();
+
+        assert_eq!(top.len(), 1, "only top-level session should surface");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "list_top_level_sessions took {elapsed:?} for {FANOUT} child files; \
+             the per-file count_lines fallback regressed",
+        );
+    }
+
     #[test]
     fn test_short_key_no_hash_suffix() {
         let tmp = TempDir::new().unwrap();
@@ -2468,6 +3099,112 @@ mod tests {
         assert_eq!(session.summary.as_deref(), Some("A test session"));
     }
 
+    #[tokio::test]
+    async fn should_persist_title_separately_from_summary_when_renamed() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+        mgr.update_title(&key, "Custom title".into()).await.unwrap();
+        mgr.update_summary(&key, "Long-form summary".into())
+            .await
+            .unwrap();
+
+        // Reload from disk and verify title + summary are independent.
+        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
+        let session = mgr2.get_or_create(&key).await;
+        assert_eq!(session.title.as_deref(), Some("Custom title"));
+        assert_eq!(session.summary.as_deref(), Some("Long-form summary"));
+    }
+
+    #[tokio::test]
+    async fn should_auto_derive_title_from_first_user_message_when_unset() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message(
+            &key,
+            make_message(MessageRole::User, "What is the weather today?"),
+        )
+        .await
+        .unwrap();
+
+        let session = mgr.get_or_create(&key).await;
+        assert_eq!(
+            session.title.as_deref(),
+            Some("What is the weather today?"),
+            "first user message should auto-populate title"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_overwrite_manual_title_when_subsequent_messages_arrive() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.update_title(&key, "Manual title".into()).await.unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "first user message"))
+            .await
+            .unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "second user message"))
+            .await
+            .unwrap();
+
+        let session = mgr.get_or_create(&key).await;
+        assert_eq!(
+            session.title.as_deref(),
+            Some("Manual title"),
+            "manual title must be preserved across new messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_handle_should_auto_derive_title_from_first_user_message() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "fix-617b-handle-derive-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        handle
+            .add_message(make_message(
+                MessageRole::User,
+                "What's the weather in San Francisco?",
+            ))
+            .await
+            .unwrap();
+
+        // Reload from disk via SessionHandle::open (forces JSONL deserialize)
+        let handle2 = SessionHandle::open(tmp.path(), &key);
+        assert_eq!(
+            handle2.session().title.as_deref(),
+            Some("What's the weather in San Francisco?"),
+            "SessionHandle::add_message_with_seq must auto-derive title"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_truncate_auto_derived_title_to_50_chars() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let long_message = "a".repeat(200);
+        mgr.add_message(&key, make_message(MessageRole::User, &long_message))
+            .await
+            .unwrap();
+
+        let session = mgr.get_or_create(&key).await;
+        let title = session.title.as_deref().unwrap();
+        assert!(
+            title.chars().count() <= 50,
+            "title should be at most 50 chars, got {}",
+            title.chars().count()
+        );
+    }
+
     #[test]
     fn test_active_session_store() {
         let tmp = TempDir::new().unwrap();
@@ -2518,6 +3255,13 @@ mod tests {
         assert!(validate_topic_name("a:b").is_err());
         assert!(validate_topic_name("a/b").is_err());
         assert!(validate_topic_name(&"x".repeat(51)).is_err());
+
+        // Reserved: "default" is the no-topic filename in the per-user
+        // layout. Allowing a user-named "default" topic would silently
+        // collide with the topic-less mapping.
+        assert!(validate_topic_name("default").is_err());
+        assert!(validate_topic_name("DEFAULT").is_err());
+        assert!(validate_topic_name("Default").is_err());
     }
 
     #[tokio::test]
@@ -3095,5 +3839,142 @@ mod tests {
         // Parent linkage survives the clear so the supervisor can find
         // the parent on its mark-failed lookup.
         assert_eq!(child_handle.session.parent_key, Some(parent));
+    }
+
+    /// Helper to build the legacy-flat path for a key.
+    fn legacy_session_path(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        SessionManager::session_path_static(&data_dir.join("sessions"), key)
+    }
+
+    /// Helper to build the per-user session path for a key.
+    fn per_user_session_path(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        let encoded_base = encode_path_component(key.base_key());
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        data_dir
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"))
+    }
+
+    /// Helper to build the migration marker path for a key.
+    fn migration_marker_path_for(data_dir: &Path, key: &SessionKey) -> PathBuf {
+        let encoded_base = encode_path_component(key.base_key());
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        data_dir
+            .join("users")
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!(".migrated.{encoded_topic}"))
+    }
+
+    /// Write a minimal JSONL with one user message at `path`.
+    fn write_jsonl_with_one_user_message(path: &Path, key: &SessionKey, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let meta = serde_json::json!({
+            "schema_version": 1,
+            "session_key": key.0,
+            "topic": key.topic(),
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+        });
+        let msg = make_message(MessageRole::User, content);
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&meta).unwrap(),
+            serde_json::to_string(&msg).unwrap()
+        );
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn migration_marker_skips_redundant_migration_when_present() {
+        // Pre-condition: a per-user JSONL exists, the legacy flat file ALSO
+        // exists (e.g. from a stale prior boot), and the per-key migration
+        // marker is present — meaning a previous open already migrated and
+        // confirmed remove. On `SessionHandle::open` we must skip the legacy
+        // load AND the legacy delete entirely: the marker is the authoritative
+        // signal that migration completed, so the per-user file wins and the
+        // stale legacy file is left untouched (a separate operator cleanup
+        // can remove it).
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "marker-skip");
+
+        // 1) Per-user JSONL with the canonical content.
+        let per_user_path = per_user_session_path(tmp.path(), &key);
+        write_jsonl_with_one_user_message(&per_user_path, &key, "canonical");
+
+        // 2) Stale legacy file with DIFFERENT content. If migration runs
+        //    redundantly it would overwrite the per-user file with this
+        //    legacy content — the test catches that.
+        let legacy_path = legacy_session_path(tmp.path(), &key);
+        write_jsonl_with_one_user_message(&legacy_path, &key, "STALE-LEGACY");
+
+        // 3) Migration marker present.
+        let marker = migration_marker_path_for(tmp.path(), &key);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"migrated-from-flat\n").unwrap();
+
+        // Open the handle — must skip legacy entirely.
+        let handle = SessionHandle::open(tmp.path(), &key);
+        let session = handle.session();
+
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "marker present: must load per-user only, not merge legacy"
+        );
+        assert_eq!(
+            session.messages[0].content, "canonical",
+            "marker present: per-user content must win, legacy must NOT overwrite"
+        );
+
+        // Stale legacy file must remain untouched (we didn't delete it).
+        assert!(
+            legacy_path.exists(),
+            "marker present + stale legacy: legacy file must remain (no redundant remove)"
+        );
+        // Marker still present.
+        assert!(marker.exists(), "marker must remain after open");
+    }
+
+    #[test]
+    fn migration_retries_legacy_remove_when_marker_absent_but_per_user_exists() {
+        // Pre-condition: a previous open succeeded `rewrite_blocking` (per-user
+        // file written) but `remove_file(legacy)` failed (transient errno) —
+        // so we ended up with both files on disk and NO marker. The next open
+        // must detect this partial-migration shape and best-effort RETRY the
+        // legacy removal. On success the marker is written.
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "marker-retry");
+
+        // 1) Per-user JSONL exists — canonical state.
+        let per_user_path = per_user_session_path(tmp.path(), &key);
+        write_jsonl_with_one_user_message(&per_user_path, &key, "canonical");
+
+        // 2) Legacy file ALSO exists (the failed-remove leftover).
+        let legacy_path = legacy_session_path(tmp.path(), &key);
+        write_jsonl_with_one_user_message(&legacy_path, &key, "legacy-leftover");
+
+        // 3) Marker is ABSENT.
+        let marker = migration_marker_path_for(tmp.path(), &key);
+        assert!(
+            !marker.exists(),
+            "precondition: marker must not exist for this case"
+        );
+
+        // Open the handle — must retry the legacy removal.
+        let _handle = SessionHandle::open(tmp.path(), &key);
+
+        assert!(
+            !legacy_path.exists(),
+            "legacy file must be removed by the retry-on-open path"
+        );
+        assert!(
+            marker.exists(),
+            "marker must be written after the retry succeeds"
+        );
     }
 }

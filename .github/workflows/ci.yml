@@ -46,6 +46,42 @@ jobs:
       - name: Verify dashboard build script runs cleanly
         run: ./scripts/build-dashboard.sh
 
+  swarm-app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: swarm-app/package-lock.json
+
+      - name: Install swarm-app deps
+        working-directory: swarm-app
+        run: npm ci
+
+      - name: Swarm-app typecheck
+        working-directory: swarm-app
+        run: npm run typecheck
+
+      - name: Swarm-app build
+        working-directory: swarm-app
+        run: npm run build
+
+      - name: Swarm-app unit tests
+        working-directory: swarm-app
+        run: npx vitest run
+
+      - name: Verify embedded swarm-app assets are up to date
+        run: |
+          ./scripts/build-swarm-app.sh
+          if [ -n "$(git status --porcelain -- crates/octos-cli/static/swarm)" ]; then
+            echo "Embedded swarm-app assets are out of date. Run ./scripts/build-swarm-app.sh and commit changes."
+            git status --short -- crates/octos-cli/static/swarm
+            exit 1
+          fi
+
   typos:
     runs-on: ubuntu-latest
     steps:
@@ -54,6 +90,17 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
+    env:
+      # Cap parallel cargo build jobs at 2 so concurrent rustc/linker invocations
+      # do not exceed the 16GB ubuntu-latest runner budget. Linking the
+      # octos-agent --lib unit-test binary (78MB stripped, ~2GB+ peak rustc RSS
+      # against a 144MB rlib + chromiumoxide/lettre/etc.) at default parallelism
+      # was OOM-killing the runner during the `Test octos-agent (lib)` step,
+      # producing the "hosted runner lost communication with the server" error
+      # (~45min into the run before the runner died). Mirrors the existing
+      # CARGO_BUILD_JOBS="2" guard on check-arm and check-riscv, which already
+      # use this mitigation for the same 16GB memory budget.
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -71,9 +118,69 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
+      # ── Sharded workspace tests ─────────────────────────────────────────────
+      # The previous `cargo test --workspace` step OOM-killed the 16GB ubuntu
+      # runner during peak link of the octos-agent integration test binaries
+      # (27 of them). Splitting per crate (and splitting heavy crates further
+      # into --lib vs --tests) keeps each step's resident set within budget
+      # while preserving the same aggregate coverage. The Swatinem cache makes
+      # subsequent steps incremental against the prior step's target/.
 
+      # Foundation crates (no internal deps, lib-only)
+      - name: Test octos-core
+        run: cargo test -p octos-core
+
+      - name: Test octos-memory
+        run: cargo test -p octos-memory
+
+      # Mid-tier libs + their integration tests
+      - name: Test octos-llm (lib)
+        run: cargo test -p octos-llm --lib
+
+      - name: Test octos-llm (integration)
+        run: cargo test -p octos-llm --tests
+
+      - name: Test octos-bus
+        run: cargo test -p octos-bus
+
+      - name: Test octos-pipeline
+        run: cargo test -p octos-pipeline
+
+      - name: Test octos-plugin
+        run: cargo test -p octos-plugin
+
+      - name: Test octos-swarm
+        run: cargo test -p octos-swarm
+
+      # octos-agent: the heaviest crate. Library and integration test binaries
+      # are split so neither step pulls all 27 test binaries into memory at
+      # once during link.
+      - name: Test octos-agent (lib)
+        run: cargo test -p octos-agent --lib
+
+      - name: Test octos-agent (integration)
+        run: cargo test -p octos-agent --tests
+
+      # Top of the dep tree
+      - name: Test octos-cli (lib)
+        run: cargo test -p octos-cli --lib
+
+      - name: Test octos-cli (integration)
+        run: cargo test -p octos-cli --tests
+
+      # Bundled harness starter skills (each has small lib + 1 smoke test)
+      - name: Test harness starter skills
+        run: |
+          cargo test -p harness-starter-generic
+          cargo test -p harness-starter-report
+          cargo test -p harness-starter-audio
+          cargo test -p harness-starter-coding
+
+      # Doc tests — preserved from the prior `cargo test --workspace` coverage
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+      # ── Targeted regression filters (already pre-existing) ──────────────────
       - name: API feature tests
         run: cargo test -p octos-cli --features api api::auth_handlers
 
@@ -86,6 +193,29 @@ jobs:
 
       - name: activate_tools regression tests
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+
+  # Lightweight check that exercises the `matrix` feature gate. The default
+  # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
+  # job lean, but the Dockerfile and several release configurations enable it.
+  # Without this job, feature-gated compile errors (e.g. an identifier referenced
+  # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
+  # during docker builds. Keep this job intentionally tiny: `cargo check` only,
+  # no tests, no clippy — its sole job is to catch the feature-gated compile.
+  check-matrix:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: matrix-feature
+
+      - name: Check octos-cli with matrix feature
+        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,slack,whatsapp,feishu,email,matrix
 
   check-arm:
     if: github.event_name != 'pull_request'
@@ -109,8 +239,39 @@ jobs:
       - name: Build test binaries
         run: cargo test --workspace --no-run
 
-      - name: Test
-        run: cargo test --workspace
+      # Sharded per-crate tests — same rationale as the `check` job.
+      - name: Test octos-core
+        run: cargo test -p octos-core
+      - name: Test octos-memory
+        run: cargo test -p octos-memory
+      - name: Test octos-llm (lib)
+        run: cargo test -p octos-llm --lib
+      - name: Test octos-llm (integration)
+        run: cargo test -p octos-llm --tests
+      - name: Test octos-bus
+        run: cargo test -p octos-bus
+      - name: Test octos-pipeline
+        run: cargo test -p octos-pipeline
+      - name: Test octos-plugin
+        run: cargo test -p octos-plugin
+      - name: Test octos-swarm
+        run: cargo test -p octos-swarm
+      - name: Test octos-agent (lib)
+        run: cargo test -p octos-agent --lib
+      - name: Test octos-agent (integration)
+        run: cargo test -p octos-agent --tests
+      - name: Test octos-cli (lib)
+        run: cargo test -p octos-cli --lib
+      - name: Test octos-cli (integration)
+        run: cargo test -p octos-cli --tests
+      - name: Test harness starter skills
+        run: |
+          cargo test -p harness-starter-generic
+          cargo test -p harness-starter-report
+          cargo test -p harness-starter-audio
+          cargo test -p harness-starter-coding
+      - name: Doc tests
+        run: cargo test --workspace --doc
 
   check-riscv:
     if: github.event_name != 'pull_request'
@@ -134,8 +295,39 @@ jobs:
       - name: Build test binaries
         run: cargo test --workspace --no-run
 
-      - name: Test
-        run: cargo test --workspace
+      # Sharded per-crate tests — same rationale as the `check` job.
+      - name: Test octos-core
+        run: cargo test -p octos-core
+      - name: Test octos-memory
+        run: cargo test -p octos-memory
+      - name: Test octos-llm (lib)
+        run: cargo test -p octos-llm --lib
+      - name: Test octos-llm (integration)
+        run: cargo test -p octos-llm --tests
+      - name: Test octos-bus
+        run: cargo test -p octos-bus
+      - name: Test octos-pipeline
+        run: cargo test -p octos-pipeline
+      - name: Test octos-plugin
+        run: cargo test -p octos-plugin
+      - name: Test octos-swarm
+        run: cargo test -p octos-swarm
+      - name: Test octos-agent (lib)
+        run: cargo test -p octos-agent --lib
+      - name: Test octos-agent (integration)
+        run: cargo test -p octos-agent --tests
+      - name: Test octos-cli (lib)
+        run: cargo test -p octos-cli --lib
+      - name: Test octos-cli (integration)
+        run: cargo test -p octos-cli --tests
+      - name: Test harness starter skills
+        run: |
+          cargo test -p harness-starter-generic
+          cargo test -p harness-starter-report
+          cargo test -p harness-starter-audio
+          cargo test -p harness-starter-coding
+      - name: Doc tests
+        run: cargo test --workspace --doc
 
   check-windows:
     if: github.event_name != 'pull_request'
@@ -154,8 +346,39 @@ jobs:
           cargo build --workspace
           cargo build -p octos-cli --features ${{ env.FEATURES }}
 
-      - name: Test
-        run: cargo test --workspace
+      # Sharded per-crate tests — same rationale as the `check` job.
+      - name: Test octos-core
+        run: cargo test -p octos-core
+      - name: Test octos-memory
+        run: cargo test -p octos-memory
+      - name: Test octos-llm (lib)
+        run: cargo test -p octos-llm --lib
+      - name: Test octos-llm (integration)
+        run: cargo test -p octos-llm --tests
+      - name: Test octos-bus
+        run: cargo test -p octos-bus
+      - name: Test octos-pipeline
+        run: cargo test -p octos-pipeline
+      - name: Test octos-plugin
+        run: cargo test -p octos-plugin
+      - name: Test octos-swarm
+        run: cargo test -p octos-swarm
+      - name: Test octos-agent (lib)
+        run: cargo test -p octos-agent --lib
+      - name: Test octos-agent (integration)
+        run: cargo test -p octos-agent --tests
+      - name: Test octos-cli (lib)
+        run: cargo test -p octos-cli --lib
+      - name: Test octos-cli (integration)
+        run: cargo test -p octos-cli --tests
+      - name: Test harness starter skills
+        run: |
+          cargo test -p harness-starter-generic
+          cargo test -p harness-starter-report
+          cargo test -p harness-starter-audio
+          cargo test -p harness-starter-coding
+      - name: Doc tests
+        run: cargo test --workspace --doc
 
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:

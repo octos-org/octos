@@ -10,6 +10,6 @@ pub mod manifest;
 pub mod tool;
 
 pub use extras::{SkillExtras, resolve_extras};
-pub use loader::{PluginLoadResult, PluginLoader};
+pub use loader::{PluginLoadOptions, PluginLoadResult, PluginLoader};
 pub use manifest::{PluginManifest, PluginToolDef};
-pub use tool::PluginTool;
+pub use tool::{PluginTool, SynthesisConfig};

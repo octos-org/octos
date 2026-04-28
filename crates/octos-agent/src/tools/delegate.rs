@@ -37,9 +37,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{Tool, ToolContext, ToolPolicy, ToolRegistry, ToolResult};
+use crate::compaction::CompactionRunner;
 use crate::harness_errors::HarnessError;
 use crate::harness_events::HARNESS_EVENT_SCHEMA_V1;
 use crate::task_supervisor::{TaskLifecycleState, TaskSupervisor};
+use crate::validators::ValidatorPhase;
+use crate::workspace_contract::run_declared_validators;
+use crate::workspace_policy::{CompactionSummarizerKind, read_workspace_policy};
 use crate::{Agent, AgentConfig};
 
 /// Group that deny-lists every child surface forbidden under delegation.
@@ -578,14 +582,62 @@ impl Tool for DelegateTool {
             tools.set_provider_policy(pp.clone());
         }
 
+        // Step 4b (Review A F-004): snapshot the parent's workspace policy so
+        // the child session inherits the declared compaction and validator
+        // contracts. The child session is otherwise invisible to
+        // `read_workspace_policy` — it runs in the same working directory but
+        // constructs its own Agent from scratch, which means any declared
+        // compaction block is silently skipped. Reading the policy once here
+        // and feeding the typed fields into the child agent (and later into
+        // `run_declared_validators`) closes that propagation gap.
+        let parent_workspace_policy = match read_workspace_policy(&self.working_dir) {
+            Ok(policy) => policy,
+            Err(error) => {
+                warn!(
+                    working_dir = %self.working_dir.display(),
+                    error = %error,
+                    "delegate: failed to read parent workspace policy; \
+                     child will run without propagated compaction/validator contracts"
+                );
+                None
+            }
+        };
+
         // Step 5: run the child synchronously.
         let worker_id = AgentId::new(format!("delegate-{child_num}"));
         let mut worker = Agent::new(worker_id, self.llm.clone(), tools, self.memory.clone());
+        // Keep an Arc handle to the child's tool registry so we can run
+        // declared validators against it after `run_task` returns. `Agent::new`
+        // wraps the passed registry in an `Arc`, so we clone that Arc here
+        // rather than re-building the registry.
+        let child_tools_handle = worker.tool_registry().clone();
         if let Some(ref config) = self.worker_config {
             worker = worker.with_config(config.clone());
         }
         if let Some(ref prompt) = self.worker_prompt {
             worker = worker.with_system_prompt(prompt.clone());
+        }
+
+        // Review A F-004: propagate the parent's declarative compaction policy
+        // onto the child Agent. Without this, the child silently runs without
+        // preflight compaction even when the parent's workspace_policy.toml
+        // declares one — a cross-session inconsistency that lets the child
+        // blow past a token budget the parent committed to honouring.
+        if let Some(ref policy) = parent_workspace_policy {
+            if let Some(compaction_policy) = policy.compaction.clone() {
+                let runner = match compaction_policy.summarizer {
+                    CompactionSummarizerKind::LlmIterative => {
+                        CompactionRunner::with_provider(compaction_policy, self.llm.clone())
+                    }
+                    CompactionSummarizerKind::Extractive => {
+                        CompactionRunner::new(compaction_policy)
+                    }
+                }
+                .with_workspace_policy(policy);
+                worker = worker
+                    .with_compaction_runner(Arc::new(runner))
+                    .with_compaction_workspace(policy.clone());
+            }
         }
 
         let subtask = Task::new(
@@ -601,10 +653,35 @@ impl Tool for DelegateTool {
 
         let run_result = worker.run_task(&subtask).await;
 
-        // Step 6: run the contract-gate. A ready workspace contract must
-        // hold before we declare success. Absence of any contract is legal.
+        // Step 6 (Review A F-004 + F-017): run the contract-gate. Previously we
+        // only called `contract_failure_summary`, which READS stale rows from
+        // `validator_outcomes.jsonl` — meaning an empty ledger silently
+        // admitted an un-validated child artifact. Fix: explicitly
+        // `run_declared_validators` so the completion-phase validators ACTUALLY
+        // execute against the child's output before any gate check reads the
+        // ledger. `contract_failure_summary` still runs as a secondary check —
+        // it now sees the real outcomes we just appended.
         let contract_failure = match run_result.as_ref() {
-            Ok(task_result) if task_result.success => contract_failure_summary(&self.working_dir),
+            Ok(task_result) if task_result.success => {
+                let validator_failure = if let Some(ref policy) = parent_workspace_policy {
+                    if policy.validation.validators.is_empty() {
+                        None
+                    } else {
+                        run_declared_validators(
+                            child_tools_handle.as_ref(),
+                            &self.working_dir,
+                            &policy.validation.validators,
+                            "delegate",
+                            ValidatorPhase::Completion,
+                        )
+                        .await
+                        .err()
+                    }
+                } else {
+                    None
+                };
+                validator_failure.or_else(|| contract_failure_summary(&self.working_dir))
+            }
             _ => None,
         };
 

@@ -56,9 +56,9 @@ pub use abi_schema::{
     CREDENTIAL_POOL_CONFIG_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
     HOOK_PAYLOAD_SCHEMA_VERSION, PROGRESS_EVENT_SCHEMA_VERSION, SESSION_SUMMARY_SCHEMA_VERSION,
     SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
-    SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION, TASK_RESULT_SCHEMA_VERSION,
-    UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION, check_supported,
-    default_credential_pool_config_schema_version,
+    SWARM_REVIEW_DECISION_SCHEMA_VERSION, SWARM_SUPERVISOR_CONFIG_SCHEMA_VERSION,
+    TASK_RESULT_SCHEMA_VERSION, UnsupportedSchemaVersionError, WORKSPACE_POLICY_SCHEMA_VERSION,
+    check_supported, default_credential_pool_config_schema_version,
 };
 pub use agent::{
     Agent, AgentConfig, ConversationResponse, DEFAULT_SESSION_TIMEOUT_SECS,
@@ -97,7 +97,7 @@ pub use harness_events::{
     HarnessEventPayload, HarnessEventSink, HarnessFailureEvent, HarnessMcpServerCallEvent,
     HarnessPhaseEvent, HarnessProgressEvent, HarnessRetryEvent, HarnessSessionSanitizedEvent,
     HarnessSubAgentDispatchEvent, HarnessSubagentProgressEvent, HarnessSwarmDispatchEvent,
-    HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
+    HarnessSwarmReviewDecisionEvent, HarnessValidatorResultEvent, MAX_HARNESS_EVENT_LINE_BYTES,
     emit_registered_credential_rotation_event,
 };
 pub use hooks::{
@@ -105,7 +105,7 @@ pub use hooks::{
 };
 pub use mcp::{McpClient, McpServerConfig};
 pub use permissions::{InvalidSafetyTier, SafetyTier};
-pub use plugins::{PluginLoadResult, PluginLoader};
+pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisConfig};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
@@ -123,7 +123,9 @@ pub use subagent_summary::{
 };
 pub use summarizer::{ExtractiveSummarizer, Summarizer};
 pub use task_supervisor::{
-    BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
+    ArtifactMimeClass, BackgroundTask, RelaunchOpts, RelaunchRequest, SpawnOnlyFailureSignal,
+    TaskCancelError, TaskCancelToken, TaskLifecycleState, TaskRelaunchError, TaskRuntimeState,
+    TaskStatus, TaskSupervisor, parse_alternatives, validate_spawn_only_artifacts,
 };
 pub use tools::{
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,

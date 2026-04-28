@@ -31,6 +31,7 @@ pub mod discovery;
 pub mod gating;
 pub mod lifecycle;
 pub mod manifest;
+pub mod protocol_v2;
 pub mod types;
 
 // Re-export primary types for convenience.
@@ -42,4 +43,9 @@ pub use lifecycle::{
     is_safe_shell_command,
 };
 pub use manifest::{InstallSpec, PluginManifest, PluginType, Requirements, ToolDefinition};
+pub use protocol_v2::{
+    ArtifactEvent, CostEvent, LineParse, LogEvent, PhaseEvent, ProgressEvent, ProtocolV2Event,
+    ResultCost, ResultSource, ResultSummary, emit_cost, emit_event, emit_progress,
+    parse_event_line,
+};
 pub use types::{DiscoveredPlugin, PluginOrigin, PluginStatus};

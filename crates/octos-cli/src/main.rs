@@ -6,6 +6,23 @@ use color_eyre::eyre::Result;
 #[cfg_attr(not(feature = "api"), allow(unused_imports))]
 use octos_cli::commands::{self, Args, Executable};
 
+/// Interactive = at least one of stdout/stderr is a TTY. When running as a
+/// launchd daemon both are redirected to /dev/null, so this returns false and
+/// log init drops the console layer in favour of the rolling file logger —
+/// giving the service "one primary logging path" instead of duplicated sinks.
+fn is_interactive_terminal() -> bool {
+    use std::io::IsTerminal as _;
+
+    std::io::stdout().is_terminal() || std::io::stderr().is_terminal()
+}
+
+/// Enable the console tracing layer only when the invocation is interactive
+/// (dev/debug) OR when no rolling-file sink is configured (fallback so logs
+/// don't vanish entirely).
+fn should_enable_console_logs(has_rolling_file_logs: bool, interactive: bool) -> bool {
+    !has_rolling_file_logs || interactive
+}
+
 fn main() -> Result<()> {
     // Initialize error handling
     color_eyre::install()?;
@@ -38,7 +55,9 @@ fn main() -> Result<()> {
 fn init_tracing(
     log_dir: Option<&std::path::Path>,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+    use std::io::IsTerminal as _;
+    use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -47,22 +66,17 @@ fn init_tracing(
 
     // Check if JSON format is requested via environment
     let json_logs = std::env::var("OCTOS_LOG_JSON").is_ok();
+    let has_rolling_file_logs = log_dir.is_some();
+    let console_enabled =
+        should_enable_console_logs(has_rolling_file_logs, is_interactive_terminal());
 
-    // Console layer (boxed so we can unify json vs compact types)
-    let console_layer: Box<dyn Layer<_> + Send + Sync> = if json_logs {
-        fmt::layer()
-            .json()
-            .with_target(true)
-            .with_span_list(true)
-            .with_current_span(true)
-            .boxed()
-    } else {
-        fmt::layer()
-            .with_target(false)
-            .with_thread_ids(false)
-            .compact()
-            .boxed()
-    };
+    // Console layer routing: when the operator has a rolling-file sink AND is
+    // not running interactively (is_terminal() == false), suppress stderr to
+    // avoid the launchd StandardErrorPath double-capturing what the rolling
+    // appender is already persisting. When interactive, keep stderr alive so
+    // `octos chat`/debugging still prints.
+    let enable_console = console_enabled && (log_dir.is_none() || std::io::stderr().is_terminal());
+    let _unused_has_rolling = has_rolling_file_logs; // retained for future use
 
     if let Some(dir) = log_dir {
         // Rolling daily log file, keep last 7 days
@@ -75,26 +89,87 @@ fn init_tracing(
             .map_err(|e| eyre::eyre!("failed to create log file appender: {e}"))?;
 
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let writer = if enable_console {
+            BoxMakeWriter::new(std::io::stderr.and(non_blocking))
+        } else {
+            BoxMakeWriter::new(non_blocking)
+        };
 
-        let file_layer = fmt::layer()
-            .with_ansi(false)
-            .with_target(false)
-            .compact()
-            .with_writer(non_blocking);
-
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .with(file_layer)
-            .with(filter)
-            .init();
+        if json_logs {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_span_list(true)
+                        .with_current_span(true)
+                        .with_writer(writer),
+                )
+                .with(filter)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .with_target(false)
+                        .compact()
+                        .with_writer(writer),
+                )
+                .with(filter)
+                .init();
+        }
 
         Ok(Some(guard))
     } else {
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .with(filter)
-            .init();
+        if json_logs {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_span_list(true)
+                        .with_current_span(true),
+                )
+                .with(filter)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(
+                    fmt::layer()
+                        .with_target(false)
+                        .with_thread_ids(false)
+                        .compact(),
+                )
+                .with(filter)
+                .init();
+        }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_enable_console_logs;
+
+    #[test]
+    fn interactive_tty_with_file_logs_still_gets_console() {
+        assert!(should_enable_console_logs(true, true));
+    }
+
+    #[test]
+    fn daemon_with_file_logs_drops_console() {
+        assert!(!should_enable_console_logs(true, false));
+    }
+
+    #[test]
+    fn daemon_without_file_logs_falls_back_to_console() {
+        assert!(should_enable_console_logs(false, false));
+    }
+
+    #[test]
+    fn interactive_without_file_logs_gets_console() {
+        assert!(should_enable_console_logs(false, true));
     }
 }
