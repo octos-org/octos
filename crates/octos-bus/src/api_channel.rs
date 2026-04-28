@@ -244,6 +244,13 @@ pub struct ApiChannel {
     watchers: Arc<Mutex<HashMap<String, SseSender>>>,
     /// Track last sent content per chat_id for delta computation.
     last_content: Arc<Mutex<HashMap<String, String>>>,
+    /// M8.10 follow-up (#632): sticky most-recent thread_id per chat_id.
+    /// Populated whenever an outbound metadata or synthetic SSE message_id
+    /// carries a thread_id. Used as the fallback for `edit_message` and
+    /// `send_raw_sse` when the per-call source lacks one (the race window
+    /// between the session actor's first text event and `send_with_id`
+    /// observed in production on mini3).
+    last_thread_id: Arc<Mutex<HashMap<String, String>>>,
     sessions: Arc<Mutex<SessionManager>>,
     /// Optional callback for querying background tasks by session key.
     task_query: Option<Arc<TaskQueryFn>>,
@@ -275,6 +282,7 @@ impl ApiChannel {
             pending: Arc::new(Mutex::new(HashMap::new())),
             watchers: Arc::new(Mutex::new(HashMap::new())),
             last_content: Arc::new(Mutex::new(HashMap::new())),
+            last_thread_id: Arc::new(Mutex::new(HashMap::new())),
             sessions,
             task_query: None,
             task_cancel: None,
@@ -771,6 +779,14 @@ impl Channel for ApiChannel {
         // to the overflow user's cmid so two concurrent threads on the same
         // chat_id can be demultiplexed by web clients.
         let thread_id = outbound_thread_id(&msg.metadata);
+        // M8.10 follow-up (#632): record the bound thread_id so subsequent
+        // `edit_message` and `send_raw_sse` calls on the same chat_id can
+        // recover it when their per-call source lacks one. Closes the race
+        // window where the session actor sends the user-message
+        // session_result (with thread_id) and only later does
+        // `flush_to_channel` invoke `send_with_id` with naked metadata.
+        self.remember_thread_id(&msg.chat_id, thread_id.as_deref())
+            .await;
 
         if !msg.media.is_empty() {
             if !history_already_persisted
@@ -1027,6 +1043,18 @@ impl Channel for ApiChannel {
         // Reset delta tracking — new message stream starts fresh
         self.last_content.lock().await.remove(&msg.chat_id);
         self.send(msg).await?;
+        // M8.10 follow-up (#632): seed `last_content` with what `send`
+        // just emitted on the wire so the FIRST subsequent `edit_message`
+        // can produce a delta `token` event instead of a wasteful full
+        // `replace`. Without this seeding, the stream forwarder's first
+        // edit re-rendered the entire buffer even though only a suffix
+        // changed (matches the documented intent of `last_content`).
+        if !msg.content.is_empty() {
+            self.last_content
+                .lock()
+                .await
+                .insert(msg.chat_id.clone(), msg.content.clone());
+        }
         // Return a dummy ID so the stream forwarder uses edit_message() for
         // subsequent updates instead of calling send_with_id() again.
         //
@@ -1049,7 +1077,25 @@ impl Channel for ApiChannel {
         // synthetic message_id so streaming `token`/`replace` events can be
         // demultiplexed by web clients running multiple in-flight threads
         // against the same chat_id.
-        let (_, thread_id) = decode_sse_message_id(message_id);
+        let (_, decoded_thread_id) = decode_sse_message_id(message_id);
+        // M8.10 follow-up (#632): the synthetic message_id is bound by
+        // `send_with_id`, but the FIRST `edit_message` of a turn can fire
+        // BEFORE that bind happens (the placeholder bubble's first text
+        // streams in via `flush_to_channel`'s `send_with_id` call, but
+        // `do_flush` builds outbound metadata that lacks `thread_id`). Fall
+        // back to the sticky map populated by earlier `send`/`send_with_id`
+        // events on the same chat_id so the streaming `token`/`replace`
+        // payload still carries the right thread.
+        let sticky_thread_id = if decoded_thread_id.is_none() {
+            self.sticky_thread_id(chat_id).await
+        } else {
+            None
+        };
+        let thread_id = decoded_thread_id.or(sticky_thread_id.as_deref());
+        // Update the sticky map whenever we resolved a thread_id, so a
+        // subsequent edit on a different (legacy single-segment) message_id
+        // still recovers it.
+        self.remember_thread_id(chat_id, thread_id).await;
         let pending = self.pending.lock().await;
         if let Some(tx) = pending.get(chat_id) {
             let mut last = self.last_content.lock().await;
@@ -1091,9 +1137,40 @@ impl Channel for ApiChannel {
     }
 
     async fn send_raw_sse(&self, chat_id: &str, json: &str) -> Result<()> {
+        // M8.10 follow-up (#632): the stream reporter forwards discrete
+        // events (thinking, response, tool_start, ...) here as pre-rendered
+        // JSON. When the reporter constructed its payload before
+        // `with_thread_id` had been bound, the JSON arrives without a
+        // `thread_id` field. Inject from the sticky map so wire events are
+        // still tagged with the right thread.
+        let payload = match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(mut value) => {
+                let already_has = value
+                    .get("thread_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .is_some();
+                if already_has {
+                    if let Some(tid) = value
+                        .get("thread_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                    {
+                        self.remember_thread_id(chat_id, Some(tid.as_str())).await;
+                    }
+                    json.to_string()
+                } else if let Some(sticky) = self.sticky_thread_id(chat_id).await {
+                    inject_thread_id(&mut value, Some(sticky.as_str()));
+                    value.to_string()
+                } else {
+                    json.to_string()
+                }
+            }
+            Err(_) => json.to_string(),
+        };
         let pending = self.pending.lock().await;
         if let Some(tx) = pending.get(chat_id) {
-            let _ = tx.send(json.to_string());
+            let _ = tx.send(payload);
         }
         Ok(())
     }
@@ -1113,6 +1190,24 @@ async fn handle_metrics(State(state): State<ApiState>) -> String {
 }
 
 impl ApiChannel {
+    /// M8.10 follow-up (#632): record `thread_id` as the most-recent bound
+    /// value for `chat_id`. No-op when `thread_id` is `None` or empty so
+    /// late legacy events on the same chat_id can never erase a previously
+    /// bound thread (the sticky property the bug fix relies on).
+    async fn remember_thread_id(&self, chat_id: &str, thread_id: Option<&str>) {
+        let Some(tid) = thread_id.filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let mut map = self.last_thread_id.lock().await;
+        map.insert(chat_id.to_string(), tid.to_string());
+    }
+
+    /// M8.10 follow-up (#632): look up the sticky thread_id for `chat_id`,
+    /// returning `None` if nothing has been bound yet on this chat.
+    async fn sticky_thread_id(&self, chat_id: &str) -> Option<String> {
+        self.last_thread_id.lock().await.get(chat_id).cloned()
+    }
+
     async fn should_suppress_duplicate_slides_delivery(
         &self,
         chat_id: &str,
@@ -2487,6 +2582,8 @@ mod tests {
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 sessions: test_sessions(),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2544,6 +2641,8 @@ mod tests {
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 sessions: test_sessions(),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2594,6 +2693,8 @@ mod tests {
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 sessions: test_sessions(),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2639,6 +2740,8 @@ mod tests {
                         { "id": "task-1", "tool_name": "run_pipeline", "status": "running" }
                     ])
                 })),
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -2697,6 +2800,8 @@ mod tests {
                         serde_json::json!([])
                     }
                 })),
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -3354,6 +3459,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -3535,6 +3642,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -3618,6 +3727,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -3694,6 +3805,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -3781,6 +3894,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -3848,6 +3963,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -4067,6 +4184,8 @@ mod tests {
             profile_id: Some(TEST_PROFILE_ID.to_string()),
             sessions,
             task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -4111,6 +4230,8 @@ mod tests {
                     }
                 ])
             })),
+            task_cancel: None,
+            task_relaunch: None,
             on_session_deleted: None,
             metrics_renderer: None,
         };
@@ -4343,6 +4464,240 @@ mod tests {
         assert_eq!(parsed["type"], "token");
         assert_eq!(parsed["text"], " there");
         assert_eq!(parsed["thread_id"], "cmid-thread-EDIT");
+    }
+
+    /// M8.10 follow-up (#632): production probe of mini3 showed the FIRST
+    /// `replace` event of a turn leaving the daemon with `thread_id=null`,
+    /// even though the user-message session_result outbound (sent by the
+    /// session actor BEFORE streaming starts) carries thread_id metadata.
+    /// The stream forwarder's `do_flush` builds outbound metadata that
+    /// only includes `streaming: true`, so when `send_with_id` falls
+    /// through to the encoder it has no thread_id to embed in the
+    /// synthetic message_id. Subsequent `edit_message` calls then decode
+    /// `(_, None)` from the synthetic id and emit untagged events.
+    ///
+    /// Fix: when `decode_sse_message_id` returns `None` for thread_id,
+    /// `edit_message` falls back to a sticky map keyed by chat_id.
+    /// The map is populated whenever `send` (or `send_with_id`) sees a
+    /// thread_id in metadata — including the user-message session_result
+    /// emission that fires before streaming.
+    #[tokio::test]
+    async fn edit_message_emits_thread_id_via_sticky_map_when_synthetic_id_lacks_one() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-sticky".into(), tx);
+        }
+
+        // Step 1: simulate the session actor emitting the user-message
+        // session_result outbound BEFORE the stream forwarder ever calls
+        // send_with_id. This is exactly the order observed in mini3:
+        // the session actor publishes a thread_id-tagged outbound, then
+        // the agent loop emits the first thinking + replace events while
+        // `do_flush`'s send_with_id is still racing with them.
+        let bind_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-sticky".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_session_result": {
+                    "seq": 1,
+                    "role": "user",
+                    "content": "hello",
+                    "client_message_id": "cmid-sticky-T",
+                },
+                "thread_id": "cmid-sticky-T",
+            }),
+        };
+        ch.send(&bind_msg).await.unwrap();
+        // Drain the session_result event so the assertion below sees the
+        // `replace` we care about.
+        let _ = rx.recv().await.unwrap();
+
+        // Step 2: stream forwarder's `do_flush` builds outbound metadata
+        // that does NOT include `thread_id` (only `streaming: true` and
+        // optionally a sender_user_id). Mirror that here.
+        let stream_initial = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-sticky".into(),
+            content: "Hi".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({"streaming": true}),
+        };
+        let message_id = ch.send_with_id(&stream_initial).await.unwrap().unwrap();
+        // The synthetic message_id was built without thread_id, so
+        // decoding it returns None for the thread side.
+        assert!(decode_sse_message_id(&message_id).1.is_none());
+        // Drain the initial replace event emitted by send_with_id.
+        let _ = rx.recv().await.unwrap();
+
+        // Step 3: subsequent edit_message must still tag the streaming
+        // payload with the bound thread_id by falling back to the sticky
+        // map populated in step 1.
+        ch.edit_message("chat-sticky", &message_id, "Hi there")
+            .await
+            .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "token");
+        assert_eq!(parsed["text"], " there");
+        assert_eq!(
+            parsed["thread_id"], "cmid-sticky-T",
+            "edit_message must recover thread_id from the sticky map when the \
+             synthetic message_id lacks one (production race window observed \
+             on mini3 — see #632)"
+        );
+
+        // Step 4: another edit on the same chat_id continues to inherit
+        // the sticky thread_id (the binding is "sticky" — once set it
+        // does not erase).
+        ch.edit_message("chat-sticky", &message_id, "Hi there friend")
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["thread_id"], "cmid-sticky-T");
+    }
+
+    /// M8.10 follow-up (#632): the stream reporter forwards discrete
+    /// events (thinking, response, cost_update, ...) as pre-rendered JSON
+    /// via `send_raw_sse`. If the reporter has not yet bound thread_id
+    /// (the first `Thinking` of a turn observed in production) the JSON
+    /// arrives without a `thread_id` field. The api_channel's sticky map
+    /// is the second-line defence: if the session actor previously
+    /// emitted a thread_id-tagged outbound on this chat_id (e.g. the
+    /// user-message session_result), the wire event still carries the
+    /// right thread.
+    ///
+    /// This test drives the production sequence: send a bind via `send`,
+    /// then forward two raw SSE thinking events with no thread_id field,
+    /// and assert both events leave the channel tagged. The "BOTH" guard
+    /// is the regression hook — without the sticky lookup, only the
+    /// second event would carry thread_id (after the reporter
+    /// rebound) and the first would race on the wire.
+    #[tokio::test]
+    async fn early_thinking_event_emits_thread_id_via_sticky_map() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-thinking".into(), tx);
+        }
+
+        // Bind thread_id sticky via the user-message session_result
+        // outbound the session actor emits before streaming starts.
+        let bind_msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-thinking".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_session_result": {
+                    "seq": 1,
+                    "role": "user",
+                    "content": "hi",
+                    "client_message_id": "cmid-thinking-Q",
+                },
+                "thread_id": "cmid-thinking-Q",
+            }),
+        };
+        ch.send(&bind_msg).await.unwrap();
+        // Drain the session_result event.
+        let _ = rx.recv().await.unwrap();
+
+        // First Thinking event arrives via send_raw_sse with NO thread_id
+        // field (the reporter had not bound one when it constructed this
+        // payload).
+        let raw_thinking_1 = serde_json::json!({"type": "thinking", "iteration": 0});
+        ch.send_raw_sse("chat-thinking", &raw_thinking_1.to_string())
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "thinking");
+        assert_eq!(
+            parsed["thread_id"], "cmid-thinking-Q",
+            "first thinking must inherit thread_id from sticky map even \
+             though the raw JSON lacked it (#632)"
+        );
+
+        // Second Thinking — even if the reporter had now bound thread_id
+        // upstream, sticky lookup must remain consistent on the daemon
+        // side. Drive ANOTHER unbound payload to prove the sticky hit
+        // is not a one-shot.
+        let raw_thinking_2 = serde_json::json!({"type": "thinking", "iteration": 1});
+        ch.send_raw_sse("chat-thinking", &raw_thinking_2.to_string())
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "thinking");
+        assert_eq!(
+            parsed["thread_id"], "cmid-thinking-Q",
+            "second thinking must continue to receive thread_id via \
+             sticky map (regression guard for the M8.10 SSE race)"
+        );
+    }
+
+    /// M8.10 follow-up (#632): when the raw SSE JSON already carries a
+    /// thread_id, `send_raw_sse` must respect it (and not overwrite via
+    /// the sticky map). It also updates the sticky map so subsequent
+    /// untagged events on the same chat_id can recover the value.
+    #[tokio::test]
+    async fn send_raw_sse_preserves_explicit_thread_id_and_updates_sticky() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-explicit".into(), tx);
+        }
+
+        // Tagged thinking — must pass through unchanged AND populate
+        // sticky for any subsequent untagged events.
+        let tagged = serde_json::json!({
+            "type": "thinking",
+            "iteration": 0,
+            "thread_id": "cmid-explicit-A",
+        });
+        ch.send_raw_sse("chat-explicit", &tagged.to_string())
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["thread_id"], "cmid-explicit-A");
+
+        // Subsequent untagged thinking inherits the sticky binding.
+        let untagged = serde_json::json!({"type": "thinking", "iteration": 1});
+        ch.send_raw_sse("chat-explicit", &untagged.to_string())
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["thread_id"], "cmid-explicit-A");
     }
 
     /// Pre-cmid clients send messages with no thread_id metadata. The wire
@@ -5015,6 +5370,8 @@ mod tests {
                 sessions,
                 profile_id: Some("dspfac".into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -5079,6 +5436,8 @@ mod tests {
                 sessions,
                 profile_id: Some("dspfac".into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -5138,6 +5497,8 @@ mod tests {
                 sessions,
                 profile_id: Some(TEST_PROFILE_ID.into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -5199,6 +5560,8 @@ mod tests {
                 sessions,
                 profile_id: Some(TEST_PROFILE_ID.into()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -5248,6 +5611,8 @@ mod tests {
                 sessions: sessions.clone(),
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
@@ -5293,6 +5658,8 @@ mod tests {
                 sessions: sessions.clone(),
                 profile_id: Some(TEST_PROFILE_ID.to_string()),
                 task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
                 on_session_deleted: None,
                 metrics_renderer: None,
             });
