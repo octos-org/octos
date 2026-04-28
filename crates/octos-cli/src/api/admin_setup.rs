@@ -465,6 +465,93 @@ pub async fn post_smtp(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EmailTokenBody {
+    pub to: String,
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailTokenResult {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST `/api/admin/token/email` — email the freshly rotated admin token to
+/// the given address. Requires SMTP to already be configured (typically by
+/// the CLI installer before the dashboard came up).
+pub async fn post_token_email(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<EmailTokenBody>,
+) -> Json<EmailTokenResult> {
+    if !body.to.contains('@') {
+        return Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("recipient address must contain '@'".into()),
+        });
+    }
+    if body.token.trim().is_empty() {
+        return Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("token must not be empty".into()),
+        });
+    }
+    let Some(ref auth_mgr) = state.auth_manager else {
+        return Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("SMTP is not configured on the server".into()),
+        });
+    };
+    let escaped = html_escape(&body.token);
+    let html = format!(
+        "<p>Your new octos admin token:</p>\
+         <pre style=\"font-family:monospace;font-size:14px;padding:12px;background:#f4f4f4;border-radius:6px;word-break:break-all\">{}</pre>\
+         <p style=\"color:#666;font-size:12px\">Save this somewhere safe — it won't be shown in the dashboard again.</p>",
+        escaped
+    );
+    match auth_mgr
+        .send_html_email(&body.to, "Your octos admin token", &html)
+        .await
+    {
+        Ok(true) => Json(EmailTokenResult {
+            ok: true,
+            message: Some(format!("token emailed to {}", body.to)),
+            error: None,
+        }),
+        Ok(false) => Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some("SMTP is not configured on the server".into()),
+        }),
+        Err(e) => Json(EmailTokenResult {
+            ok: false,
+            message: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// POST `/api/admin/smtp/test` — send a diagnostic email to the caller.
 pub async fn post_smtp_test(
     State(state): State<Arc<AppState>>,
@@ -517,6 +604,16 @@ pub async fn post_smtp_test(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeploymentModeBody {
     pub mode: String,
+    /// True when the `mode` field is explicitly present in `config.json`.
+    /// False when the value is the implicit default (file or field absent).
+    /// The wizard uses this to distinguish first-run nudges from a deliberate
+    /// user choice it must not silently overwrite.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explicit: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize)]
@@ -533,7 +630,7 @@ pub async fn get_deployment_mode(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<DeploymentModeBody>, (StatusCode, Json<ErrorBody>)> {
     let path = require_config_path(&state)?;
-    let mode = if path.exists() {
+    let (mode, explicit) = if path.exists() {
         let body = std::fs::read_to_string(&path).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -552,15 +649,14 @@ pub async fn get_deployment_mode(
                 }),
             )
         })?;
-        value
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("local")
-            .to_string()
+        match value.get("mode").and_then(|v| v.as_str()) {
+            Some(m) => (m.to_string(), true),
+            None => ("local".to_string(), false),
+        }
     } else {
-        "local".to_string()
+        ("local".to_string(), false)
     };
-    Ok(Json(DeploymentModeBody { mode }))
+    Ok(Json(DeploymentModeBody { mode, explicit }))
 }
 
 /// POST `/api/admin/deployment-mode` — persist the mode into `config.json`.
@@ -1006,15 +1102,16 @@ mod tests {
     // ----- Deployment-mode endpoints -----
 
     #[tokio::test]
-    async fn get_deployment_mode_defaults_to_local() {
+    async fn get_deployment_mode_defaults_to_local_and_not_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let state = smtp_state(dir.path());
         let Json(body) = get_deployment_mode(State(state)).await.unwrap();
         assert_eq!(body.mode, "local");
+        assert!(!body.explicit, "implicit default must report explicit=false");
     }
 
     #[tokio::test]
-    async fn post_deployment_mode_round_trips() {
+    async fn post_deployment_mode_round_trips_and_marks_explicit() {
         let dir = tempfile::tempdir().unwrap();
         let state = smtp_state(dir.path());
         for mode in ["local", "tenant", "cloud"] {
@@ -1022,6 +1119,7 @@ mod tests {
                 State(state.clone()),
                 Json(DeploymentModeBody {
                     mode: mode.to_string(),
+                    explicit: false,
                 }),
             )
             .await
@@ -1029,6 +1127,10 @@ mod tests {
             assert_eq!(status, StatusCode::NO_CONTENT);
             let Json(body) = get_deployment_mode(State(state.clone())).await.unwrap();
             assert_eq!(body.mode, mode);
+            assert!(
+                body.explicit,
+                "POSTing any mode must surface as explicit on subsequent GET"
+            );
         }
     }
 
@@ -1040,6 +1142,7 @@ mod tests {
             State(state),
             Json(DeploymentModeBody {
                 mode: "mainframe".into(),
+                explicit: false,
             }),
         )
         .await

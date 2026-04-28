@@ -16,7 +16,7 @@
 # Tunnel options (auto-enabled with --full, set up frpc to connect to VPS relay):
 #   --no-tunnel              Skip frpc tunnel setup even in --full mode
 #   --tenant-name NAME       Tenant subdomain (e.g. "alice")
-#   --frps-token TOKEN       shared frps auth token
+#   --frps-token TOKEN       per-tenant tunnel token (written to metadatas.token; issued by your cloud operator)
 #   --frps-server ADDR       frps server address (default: 163.192.33.32)
 #   --ssh-port PORT          SSH tunnel remote port (default: 6001)
 #   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
@@ -581,10 +581,11 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
 
     if [ -z "$FRPS_TOKEN" ]; then
         echo ""
-        echo "    Enter the shared frps auth token from your operator or cloud host:"
+        echo "    Enter the per-tenant tunnel token issued by your cloud operator"
+        echo "    (registered in the cloud node's tenant store; written to metadatas.token):"
         printf "    > "
         read -r FRPS_TOKEN < /dev/tty
-        [ -z "$FRPS_TOKEN" ] && err "shared frps token is required for tunnel setup"
+        [ -z "$FRPS_TOKEN" ] && err "per-tenant tunnel token is required for tunnel setup"
     fi
 
     # ── Show summary before proceeding ────────────────────────────────
@@ -592,7 +593,7 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
     echo ""
     echo "    Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "    frps server:  ${FRPS_SERVER}:7000"
-    echo "    shared frps token: ${FRPS_TOKEN:0:8}..."
+    echo "    per-tenant token: ${FRPS_TOKEN:0:8}..."
     echo "    SSH port:     ${SSH_PORT}"
     echo "    Local port:   8080"
     echo ""
