@@ -27,13 +27,25 @@ export default function SetupWizard() {
   }, [searchParams, setSearchParams, step])
 
   useEffect(() => {
-    // Load the saved deployment mode once so StepSmtp knows whether SMTP is
-    // required. StepDeploymentMode will update this as the user clicks.
+    // Load the saved deployment mode and detection together so StepSmtp's
+    // required-field gating sees the right mode from the start. On a first-run
+    // host (mode field absent from config.json) where detection disagrees with
+    // the implicit "local" default, persist the detected value here — before
+    // the user reaches step 2 — so SMTP correctly treats tenant/cloud as
+    // required. StepDeploymentMode will not re-save once `explicit` is true.
     let cancelled = false
-    api
-      .getDeploymentMode()
-      .then((m) => {
-        if (!cancelled) setMode(m.mode)
+    Promise.all([api.getDeploymentMode(), api.detectDeploymentMode()])
+      .then(([current, detection]) => {
+        if (cancelled) return
+        const detectedMode = detection.detected
+        if (!current.explicit && detectedMode && detectedMode !== current.mode) {
+          setMode(detectedMode)
+          api.saveDeploymentMode(detectedMode).catch((e) => {
+            console.warn('preload saveDeploymentMode failed', e)
+          })
+        } else {
+          setMode(current.mode)
+        }
       })
       .catch(() => {})
     return () => {

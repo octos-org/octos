@@ -325,7 +325,7 @@ export type EmailTokenResult = {
 
 export type DeploymentMode = 'local' | 'tenant' | 'cloud'
 
-export type DeploymentModeBody = { mode: DeploymentMode }
+export type DeploymentModeBody = { mode: DeploymentMode; explicit?: boolean }
 
 export type DeploymentModeDetection = { detected: DeploymentMode }
 
