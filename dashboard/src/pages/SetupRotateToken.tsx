@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { useAuth } from '../contexts/AuthContext'
@@ -20,6 +20,27 @@ export default function SetupRotateToken() {
   const [rotated, setRotated] = useState(false)
   const [copied, setCopied] = useState(false)
 
+  const [smtpReady, setSmtpReady] = useState(false)
+  const [emailTo, setEmailTo] = useState('')
+  const [emailSending, setEmailSending] = useState(false)
+  const [emailStatus, setEmailStatus] = useState<{ ok: boolean; text: string } | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .getSmtp()
+      .then((s) => {
+        if (cancelled) return
+        setSmtpReady(Boolean(s.host?.trim()) && s.password_configured)
+      })
+      .catch(() => {
+        if (!cancelled) setSmtpReady(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   const handleGenerate = () => {
     setValue(generateToken())
     setCopied(false)
@@ -38,6 +59,10 @@ export default function SetupRotateToken() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (rotated) {
+      navigate('/setup/wizard', { replace: true })
+      return
+    }
     setError('')
     setLoading(true)
     try {
@@ -51,8 +76,21 @@ export default function SetupRotateToken() {
     }
   }
 
-  const handleContinue = () => {
-    navigate('/setup/wizard', { replace: true })
+  const handleSendEmail = async () => {
+    setEmailStatus(null)
+    setEmailSending(true)
+    try {
+      const res = await api.emailToken(emailTo, value)
+      if (res.ok) {
+        setEmailStatus({ ok: true, text: res.message || `Sent to ${emailTo}` })
+      } else {
+        setEmailStatus({ ok: false, text: res.error || 'Failed to send email' })
+      }
+    } catch (e: any) {
+      setEmailStatus({ ok: false, text: e.message || 'Failed to send email' })
+    } finally {
+      setEmailSending(false)
+    }
   }
 
   return (
@@ -64,21 +102,26 @@ export default function SetupRotateToken() {
           required before you can access the dashboard.
         </p>
 
-        {!rotated && (
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label className="block text-xs font-medium text-gray-400 mb-1">
-                New admin token
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={value}
-                  onChange={(e) => setValue(e.target.value)}
-                  className="flex-1 px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-accent"
-                  placeholder="At least 32 characters"
-                  autoFocus
-                />
+        <div className="text-sm text-yellow-300 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-3 mb-4">
+          Save this somewhere safe — it won't be shown again after you continue.
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-gray-400 mb-1">
+              {rotated ? 'New admin token' : 'New admin token'}
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                readOnly={rotated}
+                className="flex-1 px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-accent disabled:opacity-60 read-only:opacity-90"
+                placeholder="At least 32 characters"
+                autoFocus
+              />
+              {!rotated && (
                 <button
                   type="button"
                   onClick={handleGenerate}
@@ -86,57 +129,72 @@ export default function SetupRotateToken() {
                 >
                   Generate
                 </button>
+              )}
+              <button
+                type="button"
+                onClick={handleCopy}
+                disabled={!value}
+                className="px-3 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {copied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+          </div>
+
+          {rotated && smtpReady && (
+            <div className="border-t border-gray-700/50 pt-4 space-y-2">
+              <label className="block text-xs font-medium text-gray-400">
+                Email this token (optional)
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="email"
+                  value={emailTo}
+                  onChange={(e) => setEmailTo(e.target.value)}
+                  placeholder="you@example.com"
+                  className="flex-1 px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-accent"
+                />
                 <button
                   type="button"
-                  onClick={handleCopy}
-                  disabled={!value}
+                  onClick={handleSendEmail}
+                  disabled={emailSending || !emailTo.includes('@')}
                   className="px-3 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
                 >
-                  {copied ? 'Copied' : 'Copy'}
+                  {emailSending ? 'Sending…' : 'Send'}
                 </button>
               </div>
+              {emailStatus && (
+                <div
+                  className={
+                    emailStatus.ok
+                      ? 'text-xs text-green-400'
+                      : 'text-xs text-red-400'
+                  }
+                >
+                  {emailStatus.text}
+                </div>
+              )}
             </div>
+          )}
 
-            {error && (
-              <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
-                {error}
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={loading || !value}
-              className="w-full px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {loading ? 'Submitting…' : 'Submit'}
-            </button>
-          </form>
-        )}
-
-        {rotated && (
-          <div className="space-y-4">
-            <div className="text-sm text-yellow-300 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-3">
-              Save this somewhere safe — it won't be shown again.
+          {error && (
+            <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+              {error}
             </div>
-            <div className="px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white font-mono break-all">
-              {value}
-            </div>
-            <button
-              type="button"
-              onClick={handleCopy}
-              className="w-full px-3 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition"
-            >
-              {copied ? 'Copied' : 'Copy token'}
-            </button>
-            <button
-              type="button"
-              onClick={handleContinue}
-              className="w-full px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition"
-            >
-              I've saved it, continue
-            </button>
-          </div>
-        )}
+          )}
+
+          <button
+            type="submit"
+            disabled={loading || !value}
+            className="w-full px-4 py-2 text-sm font-medium bg-accent hover:bg-accent/90 text-white rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {rotated
+              ? "I've saved it, continue"
+              : loading
+              ? 'Submitting…'
+              : 'Submit'}
+          </button>
+        </form>
       </div>
     </div>
   )

@@ -1,150 +1,119 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import LlmProviderTab from '../../components/tabs/LlmProviderTab'
 import { api } from '../../api'
-import providersData from '../../providers.json'
+import type { ProfileConfig } from '../../types'
 
-type ProviderChoice = {
-  id: string
-  label: string
-  defaultModel: string
-  needsBaseUrl?: boolean
+const ADMIN_PROFILE_ID = 'admin'
+
+const DEFAULT_CONFIG: ProfileConfig = {
+  channels: [],
+  gateway: {},
+  env_vars: {},
 }
 
-const LOCAL_PROVIDERS = new Set(['ollama', 'vllm'])
-
-const PROVIDERS: ProviderChoice[] = [
-  ...Object.entries(providersData as Record<string, { models: { id: string }[] }>)
-    .map(([id, data]) => ({
-      id,
-      label: id.charAt(0).toUpperCase() + id.slice(1),
-      defaultModel: data.models?.[0]?.id ?? '',
-      needsBaseUrl: LOCAL_PROVIDERS.has(id),
-    })),
-  { id: 'openai-compatible', label: 'OpenAI-compatible', defaultModel: 'gpt-4o-mini', needsBaseUrl: true },
-]
-
-type TestState =
-  | { kind: 'idle' }
+type SaveState =
   | { kind: 'loading' }
-  | { kind: 'ok'; message: string }
+  | { kind: 'idle' }
+  | { kind: 'saving' }
+  | { kind: 'saved' }
   | { kind: 'err'; error: string }
 
 export default function StepLlmProvider() {
-  const [providerId, setProviderId] = useState(PROVIDERS[0].id)
-  const provider = PROVIDERS.find((p) => p.id === providerId) ?? PROVIDERS[0]
-  const [apiKey, setApiKey] = useState('')
-  const [model, setModel] = useState(provider.defaultModel)
-  const [baseUrl, setBaseUrl] = useState('')
-  const [test, setTest] = useState<TestState>({ kind: 'idle' })
+  const [config, setConfig] = useState<ProfileConfig | null>(null)
+  const [save, setSave] = useState<SaveState>({ kind: 'loading' })
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Holds the latest unsaved config so unmount/beforeunload can flush it
+  // even when the debounce window hasn't elapsed.
+  const pendingConfig = useRef<ProfileConfig | null>(null)
 
-  const handleProviderChange = (id: string) => {
-    setProviderId(id)
-    const next = PROVIDERS.find((p) => p.id === id)
-    if (next) {
-      setModel(next.defaultModel)
-    }
-    setTest({ kind: 'idle' })
-  }
-
-  const handleTest = async () => {
-    setTest({ kind: 'loading' })
-    try {
-      const res = await api.testProvider({
-        provider: provider.id === 'openai-compatible' ? (baseUrl || 'openai-compatible') : provider.id,
-        model,
-        api_key: apiKey,
-        base_url: provider.needsBaseUrl ? baseUrl || undefined : undefined,
+  useEffect(() => {
+    let cancelled = false
+    api
+      .getProfile(ADMIN_PROFILE_ID)
+      .then((p) => {
+        if (cancelled) return
+        setConfig({ ...DEFAULT_CONFIG, ...p.config })
+        setSave({ kind: 'idle' })
       })
-      if (res.ok) {
-        setTest({ kind: 'ok', message: res.message || 'Connection verified.' })
-      } else {
-        setTest({ kind: 'err', error: res.error || 'Test failed.' })
-      }
-    } catch (e: any) {
-      setTest({ kind: 'err', error: e?.message || 'Test request failed.' })
+      .catch((e: any) => {
+        if (cancelled) return
+        console.warn('failed to load admin profile', e)
+        setConfig(DEFAULT_CONFIG)
+        setSave({ kind: 'err', error: e?.message || 'Could not load admin profile' })
+      })
+    return () => {
+      cancelled = true
     }
-  }
+  }, [])
 
-  const canTest = apiKey.trim().length > 0 && model.trim().length > 0 && !(provider.needsBaseUrl && !baseUrl.trim())
+  // On unmount and on tab close, fire any pending save instead of dropping it.
+  useEffect(() => {
+    const flushPending = () => {
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current)
+        saveTimer.current = null
+      }
+      const cfg = pendingConfig.current
+      if (!cfg) return
+      pendingConfig.current = null
+      // Fire-and-forget: we may already be unmounting, so the response can't
+      // update UI. The data still lands on the server.
+      api.updateProfile(ADMIN_PROFILE_ID, { config: cfg }).catch((e: any) => {
+        console.warn('flush updateProfile failed', e)
+      })
+    }
+    window.addEventListener('beforeunload', flushPending)
+    return () => {
+      window.removeEventListener('beforeunload', flushPending)
+      flushPending()
+    }
+  }, [])
+
+  const handleChange = (next: ProfileConfig) => {
+    setConfig(next)
+    setSave({ kind: 'saving' })
+    pendingConfig.current = next
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = setTimeout(async () => {
+      saveTimer.current = null
+      pendingConfig.current = null
+      try {
+        await api.updateProfile(ADMIN_PROFILE_ID, { config: next })
+        setSave({ kind: 'saved' })
+      } catch (e: any) {
+        setSave({ kind: 'err', error: e?.message || 'Save failed' })
+      }
+    }, 500)
+  }
 
   return (
     <div className="space-y-4">
       <div>
         <h2 className="text-lg font-semibold text-white mb-1">LLM Provider</h2>
         <p className="text-sm text-gray-400">
-          Pick a default model provider and verify that your API key works.
+          Configure the LLM for your admin profile. Changes are saved automatically to the
+          admin profile (also editable later under Profile → LLM).
         </p>
       </div>
 
-      <div>
-        <label className="block text-xs font-medium text-gray-400 mb-1">Provider</label>
-        <select
-          value={providerId}
-          onChange={(e) => handleProviderChange(e.target.value)}
-          className="w-full px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-accent"
-        >
-          {PROVIDERS.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.label}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div>
-        <label className="block text-xs font-medium text-gray-400 mb-1">Model</label>
-        <input
-          type="text"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          className="w-full px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-accent"
+      {config ? (
+        <LlmProviderTab
+          config={config}
+          onChange={handleChange}
+          profileId={ADMIN_PROFILE_ID}
         />
-      </div>
-
-      {provider.needsBaseUrl && (
-        <div>
-          <label className="block text-xs font-medium text-gray-400 mb-1">Base URL</label>
-          <input
-            type="text"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="https://api.example.com/v1"
-            className="w-full px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-accent"
-          />
-        </div>
+      ) : (
+        <div className="text-sm text-gray-500">Loading admin profile…</div>
       )}
 
-      <div>
-        <label className="block text-xs font-medium text-gray-400 mb-1">API key</label>
-        <input
-          type="password"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          autoComplete="off"
-          className="w-full px-3 py-2 bg-background border border-gray-700 rounded-lg text-sm text-white font-mono focus:outline-none focus:border-accent"
-        />
-      </div>
-
-      <div className="flex items-center gap-3">
-        <button
-          type="button"
-          onClick={handleTest}
-          disabled={!canTest || test.kind === 'loading'}
-          className="px-3 py-2 text-sm font-medium bg-white/5 hover:bg-white/10 text-gray-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          {test.kind === 'loading' ? 'Testing…' : 'Test Connection'}
-        </button>
-        {test.kind === 'ok' && (
-          <span className="text-sm text-green-400">✓ {test.message}</span>
-        )}
-        {test.kind === 'err' && (
-          <span className="text-sm text-red-400 break-all">✗ {test.error}</span>
+      <div className="text-xs">
+        {save.kind === 'loading' && <span className="text-gray-400">Loading…</span>}
+        {save.kind === 'saving' && <span className="text-gray-400">Saving…</span>}
+        {save.kind === 'saved' && <span className="text-green-400">Saved</span>}
+        {save.kind === 'err' && (
+          <span className="text-red-400 break-all">✗ {save.error}</span>
         )}
       </div>
-
-      <p className="text-xs text-gray-500 border-t border-gray-700/50 pt-3">
-        Configured providers are saved when you create your first profile (Profiles → New).
-        This step only verifies that the credentials work.
-      </p>
     </div>
   )
 }

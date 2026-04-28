@@ -224,6 +224,12 @@ export const api = {
       body: JSON.stringify({ new_token }),
     }),
 
+  emailToken: (to: string, token: string) =>
+    request<EmailTokenResult>('/token/email', {
+      method: 'POST',
+      body: JSON.stringify({ to, token }),
+    }),
+
   getSetupState: () => request<SetupState>('/setup/state'),
 
   postSetupStep: (step: number) =>
@@ -311,9 +317,15 @@ export type SmtpTestResult = {
   error?: string
 }
 
+export type EmailTokenResult = {
+  ok: boolean
+  message?: string
+  error?: string
+}
+
 export type DeploymentMode = 'local' | 'tenant' | 'cloud'
 
-export type DeploymentModeBody = { mode: DeploymentMode }
+export type DeploymentModeBody = { mode: DeploymentMode; explicit?: boolean }
 
 export type DeploymentModeDetection = { detected: DeploymentMode }
 
