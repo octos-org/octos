@@ -909,6 +909,7 @@ mod tests {
             setup_state_store: Arc::new(crate::setup_state_store::SetupStateStore::new(dir.path())),
             tenant_store: Some(store),
             tunnel_domain: Some("octos-cloud.org".into()),
+            base_domain: None,
             frps_server: Some("127.0.0.1".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
