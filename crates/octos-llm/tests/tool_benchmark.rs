@@ -597,6 +597,7 @@ async fn test_stability_at_tool_count(
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }];
 
@@ -689,6 +690,7 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         }];
 
@@ -719,6 +721,7 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         }];
 
@@ -760,6 +763,7 @@ async fn test_quality(provider: &dyn LlmProvider) -> QualityResult {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         }];
 
@@ -801,6 +805,7 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }];
 
@@ -852,6 +857,7 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }];
 
@@ -892,6 +898,7 @@ async fn test_stress(provider: &dyn LlmProvider) -> StressResult {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         }];
         if let Ok(resp) = provider.chat(&messages, &tool_specs, &config).await {
