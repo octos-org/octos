@@ -608,6 +608,7 @@ impl Agent {
                     tool_call_id: None,
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: chrono::Utc::now(),
                 }];
 
@@ -640,6 +641,7 @@ impl Agent {
                     tool_call_id: None,
                     reasoning_content: None,
                     client_message_id: None,
+                    thread_id: None,
                     timestamp: chrono::Utc::now(),
                 });
 
@@ -1529,6 +1531,7 @@ fn session_limit_message(tool_call: &octos_core::ToolCall, content: String) -> M
         tool_call_id: Some(tool_call.id.clone()),
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -2374,6 +2377,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2384,6 +2388,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2399,6 +2404,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2409,6 +2415,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2424,6 +2431,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2434,6 +2442,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2449,6 +2458,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2459,6 +2469,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -2486,6 +2497,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2496,6 +2508,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2511,6 +2524,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2521,6 +2535,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_edit_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2536,6 +2551,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2546,6 +2562,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2561,6 +2578,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2571,6 +2589,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2586,6 +2605,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2596,6 +2616,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -2623,6 +2644,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2633,6 +2655,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2648,6 +2671,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2658,6 +2682,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2673,6 +2698,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2683,6 +2709,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2698,6 +2725,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2708,6 +2736,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -2735,6 +2764,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2745,6 +2775,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2760,6 +2791,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2770,6 +2802,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2785,6 +2818,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2795,6 +2829,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2810,6 +2845,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2820,6 +2856,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -2844,6 +2881,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2854,6 +2892,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2869,6 +2908,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2879,6 +2919,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2894,6 +2935,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2904,6 +2946,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2919,6 +2962,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2929,6 +2973,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -2956,6 +3001,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2966,6 +3012,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2981,6 +3028,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -2991,6 +3039,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3006,6 +3055,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3016,6 +3066,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3031,6 +3082,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3041,6 +3093,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -3065,6 +3118,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3075,6 +3129,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_1".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3090,6 +3145,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3100,6 +3156,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_2".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3115,6 +3172,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3125,6 +3183,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_3".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3140,6 +3199,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
             Message {
@@ -3150,6 +3210,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: Some("call_shell_4".into()),
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             },
         ];
@@ -3447,6 +3508,7 @@ printf '{"output":"voice saved","success":true}\n'
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         }];
         for i in 0..14 {
@@ -3458,6 +3520,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             });
             messages.push(Message {
@@ -3468,6 +3531,7 @@ printf '{"output":"voice saved","success":true}\n'
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: None,
+                thread_id: None,
                 timestamp: chrono::Utc::now(),
             });
         }

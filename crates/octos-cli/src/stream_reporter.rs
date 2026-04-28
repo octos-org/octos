@@ -43,18 +43,48 @@ pub enum StreamProgressEvent {
 ///
 /// Because `ProgressReporter::report()` is synchronous, we use `unbounded_send()`
 /// which never blocks. The receiving async task handles actual channel I/O.
+///
+/// M8.10 PR #2: every emitted SSE payload includes `thread_id` (the
+/// client_message_id of the user message that owns this turn). Reporters are
+/// constructed per-turn so the thread_id is bound for the reporter's lifetime.
+/// When `thread_id` is `None`, the field is omitted (preserves wire compat for
+/// non-API channels and pre-cmid clients).
 pub struct ChannelStreamReporter {
     tx: mpsc::UnboundedSender<StreamProgressEvent>,
+    thread_id: Option<String>,
 }
 
 impl ChannelStreamReporter {
     pub fn new(tx: mpsc::UnboundedSender<StreamProgressEvent>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            thread_id: None,
+        }
+    }
+
+    /// Bind a `thread_id` (typically the user message's `client_message_id`)
+    /// to every SSE payload this reporter emits.
+    pub fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
+        self.thread_id = thread_id.filter(|s| !s.is_empty());
+        self
+    }
+}
+
+/// Insert the bound `thread_id` into a JSON object payload (if any). Mutates
+/// the value in place. No-op when `thread_id` is `None` or the value is not
+/// an object.
+fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
+    if let (Some(tid), Some(obj)) = (thread_id, value.as_object_mut()) {
+        obj.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(tid.to_string()),
+        );
     }
 }
 
 impl ProgressReporter for ChannelStreamReporter {
     fn report(&self, event: ProgressEvent) {
+        let thread_id = self.thread_id.as_deref();
         let mapped = match event {
             ProgressEvent::StreamChunk { text, iteration } => {
                 StreamProgressEvent::Chunk { text, iteration }
@@ -67,13 +97,14 @@ impl ProgressReporter for ChannelStreamReporter {
                 ref tool_id,
             } => {
                 // Also send raw SSE for web client status indicators
+                let mut payload = serde_json::json!({
+                    "type": "tool_start",
+                    "tool": name,
+                    "tool_call_id": tool_id,
+                });
+                inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({
-                        "type": "tool_start",
-                        "tool": name,
-                        "tool_call_id": tool_id,
-                    })
-                    .to_string(),
+                    json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolStarted { name: name.clone() }
             }
@@ -83,14 +114,15 @@ impl ProgressReporter for ChannelStreamReporter {
                 success,
                 ..
             } => {
+                let mut payload = serde_json::json!({
+                    "type": "tool_end",
+                    "tool": name,
+                    "tool_call_id": tool_id,
+                    "success": success,
+                });
+                inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({
-                        "type": "tool_end",
-                        "tool": name,
-                        "tool_call_id": tool_id,
-                        "success": success,
-                    })
-                    .to_string(),
+                    json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolCompleted {
                     name: name.clone(),
@@ -102,14 +134,15 @@ impl ProgressReporter for ChannelStreamReporter {
                 ref tool_id,
                 ref message,
             } => {
+                let mut payload = serde_json::json!({
+                    "type": "tool_progress",
+                    "tool": name,
+                    "tool_call_id": tool_id,
+                    "message": message,
+                });
+                inject_thread_id(&mut payload, thread_id);
                 let _ = self.tx.send(StreamProgressEvent::RawSse {
-                    json: serde_json::json!({
-                        "type": "tool_progress",
-                        "tool": name,
-                        "tool_call_id": tool_id,
-                        "message": message,
-                    })
-                    .to_string(),
+                    json: payload.to_string(),
                 });
                 StreamProgressEvent::ToolProgress {
                     name: name.clone(),
@@ -120,26 +153,37 @@ impl ProgressReporter for ChannelStreamReporter {
             ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             // Forward discrete progress events as raw SSE JSON for the web client.
-            ProgressEvent::Thinking { iteration } => StreamProgressEvent::RawSse {
-                json: serde_json::json!({"type": "thinking", "iteration": iteration}).to_string(),
-            },
-            ProgressEvent::Response { iteration, .. } => StreamProgressEvent::RawSse {
-                json: serde_json::json!({"type": "response", "iteration": iteration}).to_string(),
-            },
+            ProgressEvent::Thinking { iteration } => {
+                let mut payload = serde_json::json!({"type": "thinking", "iteration": iteration});
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
+            ProgressEvent::Response { iteration, .. } => {
+                let mut payload = serde_json::json!({"type": "response", "iteration": iteration});
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             ProgressEvent::CostUpdate {
                 session_input_tokens,
                 session_output_tokens,
                 session_cost,
                 ..
-            } => StreamProgressEvent::RawSse {
-                json: serde_json::json!({
+            } => {
+                let mut payload = serde_json::json!({
                     "type": "cost_update",
                     "input_tokens": session_input_tokens,
                     "output_tokens": session_output_tokens,
                     "session_cost": session_cost,
-                })
-                .to_string(),
-            },
+                });
+                inject_thread_id(&mut payload, thread_id);
+                StreamProgressEvent::RawSse {
+                    json: payload.to_string(),
+                }
+            }
             _ => return,
         };
         let _ = self.tx.send(mapped);
@@ -708,6 +752,97 @@ mod tests {
 
         let event = rx.try_recv().unwrap();
         assert!(matches!(event, StreamProgressEvent::BufferReset));
+    }
+
+    /// M8.10 PR #2: every raw SSE payload emitted by the reporter must
+    /// include a `thread_id` field equal to the bound cmid. Drives every
+    /// variant that produces a `RawSse` event to confirm none are missed.
+    #[test]
+    fn should_inject_thread_id_into_every_raw_sse_event() {
+        use octos_agent::progress::ProgressEvent;
+        use std::time::Duration;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter =
+            ChannelStreamReporter::new(tx).with_thread_id(Some("cmid-thread-A".to_string()));
+
+        reporter.report(ProgressEvent::ToolStarted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+        });
+        reporter.report(ProgressEvent::ToolCompleted {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            success: true,
+            output_preview: "ok".into(),
+            duration: Duration::from_millis(5),
+        });
+        reporter.report(ProgressEvent::ToolProgress {
+            name: "shell".into(),
+            tool_id: "t1".into(),
+            message: "step 1".into(),
+        });
+        reporter.report(ProgressEvent::Thinking { iteration: 0 });
+        reporter.report(ProgressEvent::Response {
+            content: "answer".into(),
+            iteration: 1,
+        });
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 10,
+            session_output_tokens: 20,
+            response_cost: None,
+            session_cost: None,
+        });
+
+        let mut raw_payloads: Vec<String> = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamProgressEvent::RawSse { json } = event {
+                raw_payloads.push(json);
+            }
+        }
+
+        // ToolStarted, ToolCompleted, ToolProgress emit RawSse + a typed
+        // mapped event each, so 6 reports → 6 RawSse JSON payloads.
+        assert_eq!(
+            raw_payloads.len(),
+            6,
+            "expected 6 RawSse payloads, got {}: {:?}",
+            raw_payloads.len(),
+            raw_payloads
+        );
+        for json in &raw_payloads {
+            let parsed: serde_json::Value = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("payload `{json}` failed to parse: {e}"));
+            assert_eq!(
+                parsed.get("thread_id").and_then(|v| v.as_str()),
+                Some("cmid-thread-A"),
+                "payload `{json}` missing `thread_id` field",
+            );
+        }
+    }
+
+    /// When the reporter is constructed without a thread_id (or with an
+    /// empty string), payloads must NOT carry a `thread_id` field. This
+    /// preserves wire compatibility with non-API channels and pre-cmid
+    /// clients that expect the field to be absent.
+    #[test]
+    fn should_omit_thread_id_when_not_bound() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::Thinking { iteration: 0 });
+
+        if let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() {
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(
+                parsed.get("thread_id").is_none(),
+                "thread_id field must be absent when reporter has no bound id, got {parsed}"
+            );
+        } else {
+            panic!("expected RawSse for Thinking event");
+        }
     }
 
     #[test]

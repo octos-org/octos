@@ -39,6 +39,7 @@ fn system_msg(content: &str) -> Message {
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -52,6 +53,7 @@ fn user_msg(content: &str) -> Message {
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -65,6 +67,7 @@ fn assistant_msg(content: &str) -> Message {
         tool_call_id: None,
         reasoning_content: None,
         client_message_id: None,
+        thread_id: None,
         timestamp: chrono::Utc::now(),
     }
 }

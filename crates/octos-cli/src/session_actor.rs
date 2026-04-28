@@ -371,6 +371,10 @@ async fn send_outbound_with_timeout(
     }
 }
 
+/// M8.10 PR #2: optional `thread_id` is the user message's
+/// client_message_id. When present, the outbound the helper emits is
+/// tagged with `thread_id` metadata so the API channel can stamp SSE
+/// payloads with the correct per-cmid routing key.
 #[allow(clippy::too_many_arguments)]
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
@@ -382,6 +386,7 @@ async fn persist_terminal_reply_and_fanout(
     reply_to: Option<String>,
     content: String,
     media: Vec<String>,
+    thread_id: Option<&str>,
 ) -> bool {
     let Some(_persisted) = persist_assistant_message(
         session_handle,
@@ -400,6 +405,18 @@ async fn persist_terminal_reply_and_fanout(
         return false;
     };
 
+    let mut metadata = serde_json::json!({});
+    if let Some(tid) = thread_id {
+        if !tid.is_empty() {
+            if let Some(map) = metadata.as_object_mut() {
+                map.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
+        }
+    }
+
     send_outbound_with_timeout(
         session_key,
         out_tx,
@@ -409,7 +426,7 @@ async fn persist_terminal_reply_and_fanout(
             content,
             reply_to,
             media,
-            metadata: serde_json::json!({}),
+            metadata,
         },
         "terminal_reply",
     )
@@ -3695,6 +3712,7 @@ impl SessionActor {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: client_message_id.clone(),
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         };
         let user_msg_timestamp = user_msg.timestamp;
@@ -3744,6 +3762,15 @@ impl SessionActor {
                 serde_json::Value::Bool(true),
             );
             metadata_obj.insert("_session_result".to_string(), session_result);
+            // M8.10 PR #2: tag the user-message session_result emission with
+            // thread_id so the API channel can stamp it on subsequent
+            // wire events for this turn.
+            if let Some(cmid) = client_message_id.as_deref() {
+                metadata_obj.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(cmid.to_string()),
+                );
+            }
 
             let _ = send_outbound_with_timeout(
                 &self.session_key,
@@ -3770,6 +3797,22 @@ impl SessionActor {
         )
         .await;
 
+        // M8.10 PR #2: tag the forced-background ack and the trailing
+        // _completion with the user's cmid so the SSE events the API
+        // channel emits carry thread_id back to the web client. Same
+        // events as the speculative path — just a different thread.
+        let mut ack_metadata = serde_json::json!({
+            "_history_persisted": persisted,
+            "spawn_output": spawn_result.output,
+        });
+        if let Some(ref tid) = client_message_id {
+            if let Some(map) = ack_metadata.as_object_mut() {
+                map.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.clone()),
+                );
+            }
+        }
         let _ = self
             .out_tx
             .send(OutboundMessage {
@@ -3778,10 +3821,7 @@ impl SessionActor {
                 content: ack_content,
                 reply_to,
                 media: vec![],
-                metadata: serde_json::json!({
-                    "_history_persisted": persisted,
-                    "spawn_output": spawn_result.output,
-                }),
+                metadata: ack_metadata,
             })
             .await;
 
@@ -3794,6 +3834,19 @@ impl SessionActor {
                 .map(|task| sanitize_task_for_response(&self.data_dir, &task))
                 .collect::<Vec<_>>();
 
+            let mut completion_metadata = serde_json::json!({
+                "_completion": true,
+                "has_bg_tasks": !bg_tasks.is_empty(),
+                "bg_tasks": bg_tasks,
+            });
+            if let Some(ref tid) = client_message_id {
+                if let Some(map) = completion_metadata.as_object_mut() {
+                    map.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(tid.clone()),
+                    );
+                }
+            }
             let _ = self
                 .out_tx
                 .send(OutboundMessage {
@@ -3802,11 +3855,7 @@ impl SessionActor {
                     content: String::new(),
                     reply_to: None,
                     media: vec![],
-                    metadata: serde_json::json!({
-                        "_completion": true,
-                        "has_bg_tasks": !bg_tasks.is_empty(),
-                        "bg_tasks": bg_tasks,
-                    }),
+                    metadata: completion_metadata,
                 })
                 .await;
         }
@@ -3894,6 +3943,7 @@ impl SessionActor {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: client_message_id.clone(),
+            thread_id: None,
             timestamp: chrono::Utc::now(),
         };
         let user_msg_timestamp = user_msg.timestamp;
@@ -3945,11 +3995,18 @@ impl SessionActor {
             )
         });
 
-        // Set up progressive streaming reporter
+        // Set up progressive streaming reporter.
+        //
+        // M8.10 PR #2: bind the user message's `client_message_id` to the
+        // reporter so every emitted SSE payload (token, tool_start, ...)
+        // carries `thread_id`. Speculative overflow + forced-background paths
+        // construct their own reporter with their own cmid below — the same
+        // event types flow through, just tagged with a different thread_id.
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx.clone(),
-        ));
+        let reporter = Arc::new(
+            crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
+                .with_thread_id(client_message_id.clone()),
+        );
         self.agent.set_reporter(reporter);
 
         // Wire adaptive router status callback to forward through the stream channel.
@@ -4403,6 +4460,7 @@ impl SessionActor {
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             client_message_id: None,
+                            thread_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         // M8.10-A: capture the committed seq so the SSE `done`
@@ -4583,6 +4641,18 @@ impl SessionActor {
                     };
 
                     if !streamed {
+                        // M8.10 PR #2: tag the assistant reply with the
+                        // turn's thread_id so the API channel can stamp
+                        // it onto the SSE `replace` event it emits.
+                        let mut reply_metadata = serde_json::json!({});
+                        if let Some(ref tid) = client_message_id {
+                            if let Some(map) = reply_metadata.as_object_mut() {
+                                map.insert(
+                                    "thread_id".to_string(),
+                                    serde_json::Value::String(tid.clone()),
+                                );
+                            }
+                        }
                         let _ = self
                             .out_tx
                             .send(OutboundMessage {
@@ -4591,7 +4661,7 @@ impl SessionActor {
                                 content: display_content,
                                 reply_to: inbound_message_id.clone(),
                                 media: vec![],
-                                metadata: serde_json::json!({}),
+                                metadata: reply_metadata,
                             })
                             .await;
                     }
@@ -4610,6 +4680,7 @@ impl SessionActor {
                     inbound_message_id.clone(),
                     content,
                     vec![],
+                    client_message_id.as_deref(),
                 )
                 .await;
             }
@@ -4627,6 +4698,7 @@ impl SessionActor {
                     inbound_message_id.clone(),
                     content,
                     vec![],
+                    client_message_id.as_deref(),
                 )
                 .await;
             }
@@ -4640,6 +4712,19 @@ impl SessionActor {
         // This must happen AFTER the agent finishes, so it has had a chance to
         // observe the shutdown signal during its iteration loop.
         self.cancelled.store(false, Ordering::Release);
+
+        // M8.10 PR #2: tag the completion event with this turn's thread_id
+        // (= the user message's client_message_id) so ApiChannel can stamp
+        // it onto the SSE `done` payload. Applied uniformly across success,
+        // error, and timeout branches above.
+        if let Some(ref tid) = client_message_id {
+            if let Some(map) = completion_meta.as_object_mut() {
+                map.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.clone()),
+                );
+            }
+        }
 
         // Send completion marker so the API channel can close the SSE stream.
         if self.channel == "api" {
@@ -4738,6 +4823,7 @@ impl SessionActor {
                 tool_call_id: None,
                 reasoning_content: None,
                 client_message_id: overflow_client_message_id.clone(),
+                thread_id: None,
                 timestamp: user_msg_timestamp,
             };
             let user_seq_for_overflow = {
@@ -4780,6 +4866,16 @@ impl SessionActor {
                     serde_json::Value::Bool(true),
                 );
                 metadata_obj.insert("_session_result".to_string(), session_result);
+                // M8.10 PR #2: tag the user-message session_result emission
+                // with thread_id so any SSE event the API channel emits in
+                // response (e.g. when this metadata path also wraps content
+                // into a `replace`) carries the right per-cmid routing key.
+                if let Some(cmid) = overflow_client_message_id.as_deref() {
+                    metadata_obj.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
 
                 let _ = send_outbound_with_timeout(
                     &session_key,
@@ -4853,9 +4949,16 @@ impl SessionActor {
             });
 
             // ── Per-overflow stream reporter (own chat bubble) ──────────────
+            //
+            // M8.10 PR #2: tag every SSE payload emitted by this reporter
+            // with the overflow user's cmid so the web client can route
+            // streaming tokens to the right per-thread bubble. This is the
+            // critical bit that makes overflow stop being a special case —
+            // same code path, same events, just a different thread_id.
             let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
             let overflow_reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
-                crate::stream_reporter::ChannelStreamReporter::new(stream_tx),
+                crate::stream_reporter::ChannelStreamReporter::new(stream_tx)
+                    .with_thread_id(overflow_client_message_id.clone()),
             );
 
             // Spawn stream forwarder — edits its OWN message, not the primary's
@@ -4964,6 +5067,7 @@ impl SessionActor {
                         tool_call_id: None,
                         reasoning_content: conv_response.reasoning_content.clone(),
                         client_message_id: None,
+                        thread_id: None,
                         timestamp: final_reply_timestamp,
                     };
                     let committed_seq = {
@@ -5054,6 +5158,19 @@ impl SessionActor {
                         } else {
                             reply
                         };
+                        // M8.10 PR #2: tag the overflow assistant reply
+                        // with the overflow user's cmid so any wire events
+                        // ApiChannel emits (replace, file, …) carry the
+                        // correct thread_id. The done event for the overflow
+                        // is the primary completion's done — that one is
+                        // tagged with the primary's cmid, so an overflow
+                        // can render before the primary completes.
+                        if let Some(ref tid) = overflow_client_message_id {
+                            metadata.insert(
+                                "thread_id".to_string(),
+                                serde_json::Value::String(tid.clone()),
+                            );
+                        }
                         let _ = out_tx
                             .send(OutboundMessage {
                                 channel: channel.clone(),
@@ -5079,6 +5196,7 @@ impl SessionActor {
                         overflow_reply_to.clone(),
                         content,
                         vec![],
+                        overflow_client_message_id.as_deref(),
                     )
                     .await;
                 }
@@ -5095,6 +5213,7 @@ impl SessionActor {
                         overflow_reply_to.clone(),
                         content,
                         vec![],
+                        overflow_client_message_id.as_deref(),
                     )
                     .await;
                 }
@@ -5127,6 +5246,11 @@ impl SessionActor {
     ) {
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
+        // M8.10 PR #2: capture the user's client_message_id so every
+        // OutboundMessage we emit (assistant reply, _completion, errors)
+        // carries `thread_id` metadata. The API channel reads it back to
+        // tag SSE payloads with the right per-cmid thread.
+        let client_message_id = inbound_client_message_id(&inbound);
 
         // Acquire concurrency permit
         let _permit = match self.semaphore.acquire().await {
@@ -5208,11 +5332,20 @@ impl SessionActor {
             )
         });
 
-        // Set up progressive streaming reporter if we have a channel
+        // Set up progressive streaming reporter if we have a channel.
+        //
+        // M8.10 follow-up (#636): bind the inbound's `client_message_id`
+        // to the reporter (matching the speculative-overflow path at
+        // line 4006) so SSE payloads from this serial-delivery path
+        // also carry `thread_id`. Most callers of `process_inbound`
+        // are non-API channels (telegram/etc) where cmid is None, but
+        // the recovery-hint path here is also reached from the API
+        // channel and must thread cmid through for parity.
         let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reporter = Arc::new(crate::stream_reporter::ChannelStreamReporter::new(
-            stream_tx.clone(),
-        ));
+        let reporter = Arc::new(
+            crate::stream_reporter::ChannelStreamReporter::new(stream_tx.clone())
+                .with_thread_id(client_message_id.clone()),
+        );
         self.agent.set_reporter(reporter);
 
         // Wire adaptive router status callback for failover notifications
@@ -5405,6 +5538,7 @@ impl SessionActor {
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             client_message_id: None,
+                            thread_id: None,
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {
@@ -5492,6 +5626,18 @@ impl SessionActor {
                     };
 
                     if !streamed {
+                        // M8.10 PR #2: tag the assistant reply with the
+                        // turn's thread_id so the API channel can stamp
+                        // it onto the SSE `replace` event it emits.
+                        let mut reply_metadata = serde_json::json!({});
+                        if let Some(ref tid) = client_message_id {
+                            if let Some(map) = reply_metadata.as_object_mut() {
+                                map.insert(
+                                    "thread_id".to_string(),
+                                    serde_json::Value::String(tid.clone()),
+                                );
+                            }
+                        }
                         let _ = self
                             .out_tx
                             .send(OutboundMessage {
@@ -5500,7 +5646,7 @@ impl SessionActor {
                                 content: display_content,
                                 reply_to: inbound_message_id.clone(),
                                 media: vec![],
-                                metadata: serde_json::json!({}),
+                                metadata: reply_metadata,
                             })
                             .await;
                     }
@@ -5519,6 +5665,7 @@ impl SessionActor {
                     inbound_message_id.clone(),
                     content,
                     vec![],
+                    client_message_id.as_deref(),
                 )
                 .await;
             }
@@ -5536,6 +5683,7 @@ impl SessionActor {
                     inbound_message_id.clone(),
                     content,
                     vec![],
+                    client_message_id.as_deref(),
                 )
                 .await;
             }
@@ -5550,6 +5698,17 @@ impl SessionActor {
 
         // Send completion marker so the API channel can close the SSE stream.
         if self.channel == "api" {
+            // M8.10 PR #2: tag the completion with the turn's thread_id
+            // so ApiChannel stamps it onto the SSE `done` payload.
+            let mut completion_metadata = serde_json::json!({"_completion": true});
+            if let Some(ref tid) = client_message_id {
+                if let Some(map) = completion_metadata.as_object_mut() {
+                    map.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(tid.clone()),
+                    );
+                }
+            }
             let _ = self
                 .out_tx
                 .send(OutboundMessage {
@@ -5558,7 +5717,7 @@ impl SessionActor {
                     content: String::new(),
                     reply_to: None,
                     media: vec![],
-                    metadata: serde_json::json!({"_completion": true}),
+                    metadata: completion_metadata,
                 })
                 .await;
         }
@@ -7705,6 +7864,210 @@ mod tests {
             result.get("timestamp").is_some(),
             "session_result must include rfc3339 timestamp"
         );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// M8.10 PR #2 regression: every outbound message that fans out into
+    /// SSE events on the API channel MUST carry `thread_id` metadata
+    /// (= the user message's client_message_id) so the wire-side `done`,
+    /// `replace`, `file`, etc. payloads can be tagged. Drives the same
+    /// 2-POST rapid-succession pattern as
+    /// `should_emit_session_result_for_overflow_user_message` and asserts
+    /// that BOTH threads' outbound messages have thread_id populated and
+    /// match the expected user cmid for that message's logical thread.
+    ///
+    /// The whole point of M8.10 is that overflow stops being a special
+    /// case — same code path, same events, just a different thread_id.
+    #[tokio::test]
+    async fn should_emit_thread_id_on_every_event_for_speculative_overflow_pair() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![
+                (Duration::from_millis(200), make_response("warmup1")),
+                (Duration::from_millis(200), make_response("warmup2")),
+                (Duration::from_millis(200), make_response("warmup3")),
+                (Duration::from_millis(200), make_response("warmup4")),
+                (Duration::from_millis(200), make_response("warmup5")),
+                (
+                    Duration::from_secs(12),
+                    make_response("primary thread reply"),
+                ),
+                (
+                    Duration::from_millis(400),
+                    make_response("overflow thread reply"),
+                ),
+                (Duration::from_millis(200), make_response("post-overflow")),
+            ],
+        ));
+        let router_a: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-a",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+        let router_b: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "router-b",
+            vec![(Duration::from_millis(500), make_response("unused"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_speculative_actor(agent_llm, vec![router_a, router_b], &dir).await;
+
+        // Warmup so responsiveness baseline is established.
+        for i in 0..5 {
+            tx.send(make_inbound(&format!("warmup {i}"))).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        }
+
+        // Primary (slow) prompt with its own cmid.
+        let primary_cmid = "cmid-primary-thread-A";
+        let primary_inbound = ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: "primary slow prompt".to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({
+                    "client_message_id": primary_cmid,
+                }),
+                message_id: Some(primary_cmid.to_string()),
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        };
+        tx.send(primary_inbound).await.unwrap();
+
+        // Sleep past patience so the second prompt is served as overflow.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        // Overflow follow-up with a DIFFERENT cmid.
+        let overflow_cmid = "cmid-overflow-thread-B";
+        let overflow_inbound = ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: "overflow follow-up".to_string(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({
+                    "client_message_id": overflow_cmid,
+                }),
+                message_id: Some(overflow_cmid.to_string()),
+            },
+            image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        };
+        tx.send(overflow_inbound).await.unwrap();
+
+        // Collect outbound messages until both replies have arrived.
+        let mut outbounds: Vec<OutboundMessage> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    outbounds.push(msg);
+                    let primary_reply = outbounds
+                        .iter()
+                        .any(|m| m.content.contains("primary thread reply"));
+                    let overflow_reply = outbounds
+                        .iter()
+                        .any(|m| m.content.contains("overflow thread reply"));
+                    if primary_reply && overflow_reply {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        // Tag each outbound with the cmid of the thread it belongs to,
+        // identified by content fingerprint. Filter out warmup leftovers
+        // and unrelated metadata-only messages.
+        let mut primary_outbounds: Vec<&OutboundMessage> = Vec::new();
+        let mut overflow_outbounds: Vec<&OutboundMessage> = Vec::new();
+        for msg in &outbounds {
+            // Match by user cmid first (covers user-message session_result
+            // emissions which echo the cmid).
+            let session_result_cmid = msg
+                .metadata
+                .get("_session_result")
+                .and_then(|sr| sr.get("client_message_id"))
+                .and_then(|v| v.as_str());
+            if session_result_cmid == Some(primary_cmid)
+                || msg.content.contains("primary thread reply")
+            {
+                primary_outbounds.push(msg);
+                continue;
+            }
+            if session_result_cmid == Some(overflow_cmid)
+                || msg.content.contains("overflow thread reply")
+            {
+                overflow_outbounds.push(msg);
+                continue;
+            }
+        }
+
+        assert!(
+            !primary_outbounds.is_empty(),
+            "expected at least one outbound for the primary thread, got outbounds = {:?}",
+            outbounds
+                .iter()
+                .map(|m| (m.content.as_str(), m.metadata.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !overflow_outbounds.is_empty(),
+            "expected at least one outbound for the overflow thread, got outbounds = {:?}",
+            outbounds
+                .iter()
+                .map(|m| (m.content.as_str(), m.metadata.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // Helper: assert that an outbound's metadata.thread_id matches
+        // the expected cmid for its logical thread. Skip outbounds that
+        // are pure-content (no metadata fan-out), since those don't go
+        // through the API channel's SSE wrapping.
+        fn assert_thread_id(msg: &OutboundMessage, expected_cmid: &str) {
+            let actual = msg.metadata.get("thread_id").and_then(|v| v.as_str());
+            assert_eq!(
+                actual,
+                Some(expected_cmid),
+                "outbound for thread `{expected_cmid}` is missing thread_id metadata; \
+                 content = {:?}, metadata = {}",
+                msg.content,
+                msg.metadata,
+            );
+        }
+
+        // Every primary-thread outbound that carries fanout metadata must
+        // bear the primary cmid. Overflow likewise.
+        for msg in &primary_outbounds {
+            // Filter to outbounds that produce SSE events: assistant reply
+            // (non-empty content) OR completion marker OR session_result
+            // user-message emission.
+            let is_sse_producing = !msg.content.trim().is_empty()
+                || msg.metadata.get("_completion").is_some()
+                || msg.metadata.get("_session_result").is_some();
+            if is_sse_producing {
+                assert_thread_id(msg, primary_cmid);
+            }
+        }
+        for msg in &overflow_outbounds {
+            let is_sse_producing = !msg.content.trim().is_empty()
+                || msg.metadata.get("_completion").is_some()
+                || msg.metadata.get("_session_result").is_some();
+            if is_sse_producing {
+                assert_thread_id(msg, overflow_cmid);
+            }
+        }
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;

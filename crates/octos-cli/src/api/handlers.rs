@@ -373,10 +373,16 @@ async fn chat_streaming(
         session.get_history(50).to_vec()
     };
 
-    // Create per-request channel and reporter
+    // Create per-request channel and reporter.
+    //
+    // M8.10 PR #2: bind the user message's `client_message_id` to the
+    // reporter so every emitted SSE payload carries `thread_id`. The
+    // standalone `serve` mode shares a single chat_id across turns, but
+    // each turn gets a fresh ChannelReporter scoped to its cmid.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let client_message_id = req.client_message_id.clone();
     let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
-        Arc::new(ChannelReporter::new(tx.clone())),
+        Arc::new(ChannelReporter::new(tx.clone()).with_thread_id(client_message_id.clone())),
     ));
 
     // Build per-request agent sharing resources with the base agent
@@ -406,7 +412,6 @@ async fn chat_streaming(
 
     let message = req.message;
     let media = req.media;
-    let client_message_id = req.client_message_id;
     let topic_for_event = req.topic.clone();
 
     // Spawn the agent task
@@ -557,6 +562,14 @@ async fn chat_streaming(
                 });
                 if let Some(seq) = assistant_committed_seq {
                     done["committed_seq"] = serde_json::Value::from(seq);
+                }
+                // M8.10 PR #2: tag the done event with thread_id so the web
+                // client can route the committed_seq onto the right per-cmid
+                // bubble.
+                if let Some(ref tid) = client_message_id {
+                    if !tid.is_empty() {
+                        done["thread_id"] = serde_json::Value::String(tid.clone());
+                    }
                 }
                 // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
                 // tool results' structured side-channel into the SSE done
@@ -828,6 +841,7 @@ pub async fn session_messages(
                     role: m.role.to_string(),
                     content: m.content.clone(),
                     timestamp: m.timestamp.to_rfc3339(),
+                    thread_id: m.thread_id.clone(),
                 })
                 .collect();
             if !messages.is_empty() {
@@ -862,6 +876,12 @@ pub struct MessageInfo {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    /// M8.10 PR #1 thread grouping key. Lets the web client render chat
+    /// history as `Vec<Thread>` rather than a flat message list. Omitted
+    /// from the JSON when `None` so legacy clients that don't read the
+    /// field continue to round-trip cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 /// GET /api/sessions/:id/status -- check if session has an active task.
@@ -3222,11 +3242,29 @@ mod tests {
             role: "user".into(),
             content: "hello".into(),
             timestamp: "2025-01-01T00:00:00Z".into(),
+            thread_id: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["role"], "user");
         assert_eq!(json["content"], "hello");
         assert_eq!(json["timestamp"], "2025-01-01T00:00:00Z");
+        // None thread_id must be omitted so legacy clients keep round-tripping.
+        assert!(json.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn message_info_serialize_with_thread_id_includes_field() {
+        // M8.10 PR #1: when thread_id is populated the messages endpoint
+        // must surface it in the JSON so the web client (PR #3) can group
+        // messages into threads without a backfill round-trip.
+        let info = MessageInfo {
+            role: "assistant".into(),
+            content: "answer".into(),
+            timestamp: "2026-04-26T00:00:00Z".into(),
+            thread_id: Some("thread-cmid-1".into()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["thread_id"], "thread-cmid-1");
     }
 
     #[test]
