@@ -141,6 +141,16 @@ pub enum ProgressEvent {
 pub trait ProgressReporter: Send + Sync {
     /// Called when a progress event occurs.
     fn report(&self, event: ProgressEvent);
+
+    /// M8.10 follow-up (#649): the per-turn `thread_id` (typically the user
+    /// message's `client_message_id`) bound to this reporter. Tools that
+    /// spawn long-running background work read this so the late-arriving
+    /// completion can be stamped with the originating turn's id rather than
+    /// inheriting whatever the per-chat sticky map currently holds.
+    /// Default is `None` — silent / console reporters don't track threads.
+    fn thread_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Default reporter that does nothing (silent mode).
