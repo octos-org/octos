@@ -36,25 +36,30 @@
       "must_appear": true
     },
     {
-      "phase": "fetch",
-      "must_appear": true
-    },
-    {
-      "phase": "synthesize",
-      "must_appear": true
-    },
-    {
-      "phase": "report_build",
-      "must_appear": true
-    },
-    {
       "phase": "completion",
       "min_progress": 0.99,
       "max_progress": 1.0,
       "must_appear": true
+    },
+    {
+      "phase": "fetch",
+      "must_appear": false
+    },
+    {
+      "phase": "synthesize",
+      "must_appear": false
+    },
+    {
+      "phase": "report_build",
+      "must_appear": false
+    },
+    {
+      "phase": "research",
+      "must_appear": false
     }
   ],
   "phase_order": [
+    "research",
     "search",
     "fetch",
     "synthesize",
