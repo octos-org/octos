@@ -91,16 +91,44 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      # Cap parallel cargo build jobs at 2 so concurrent rustc/linker invocations
-      # do not exceed the 16GB ubuntu-latest runner budget. Linking the
-      # octos-agent --lib unit-test binary (78MB stripped, ~2GB+ peak rustc RSS
-      # against a 144MB rlib + chromiumoxide/lettre/etc.) at default parallelism
-      # was OOM-killing the runner during the `Test octos-agent (lib)` step,
-      # producing the "hosted runner lost communication with the server" error
-      # (~45min into the run before the runner died). Mirrors the existing
-      # CARGO_BUILD_JOBS="2" guard on check-arm and check-riscv, which already
-      # use this mitigation for the same 16GB memory budget.
-      CARGO_BUILD_JOBS: "2"
+      # OOM mitigation for the 16GB ubuntu-latest runner (4 CPU, 16GB —
+      # public-repo standard). Two layers, defense-in-depth:
+      #
+      # 1. CARGO_BUILD_JOBS=1 (was 2). The earlier =2 cap (#606) is
+      #    insufficient — runs still OOM-kill during `Test octos-agent
+      #    (lib)`, with the canonical "hosted runner lost communication
+      #    with the server" annotation appearing ~51min into the job
+      #    (e.g. run 25133705908: lib step started at 21:08:53Z, runner
+      #    died at 21:53Z, zero log output in between). Two concurrent
+      #    rustc/linker processes each touching the 144MB octos-agent
+      #    rlib closure (chromiumoxide + lettre + hyper) overlap their
+      #    peaks and cross the budget. Serializing fully removes the
+      #    aggregate-memory failure mode.
+      #
+      # 2. CARGO_PROFILE_{TEST,DEV}_DEBUG=line-tables-only. JOBS=1 alone
+      #    only addresses overlap; it does not shrink the peak memory of
+      #    the single linker invocation that links the octos-agent --lib
+      #    test binary. Dropping from full DWARF (`debug=2`, the
+      #    dev/test profile default) to line-tables-only drops local-
+      #    variable and parameter debug info while preserving file/line
+      #    info — i.e. panic backtraces still report `file.rs:line`,
+      #    which is all CI ever consumes from debug-info. Both the test
+      #    profile (octos-agent --lib) and the dev profile (build
+      #    dependencies and any plain `cargo build` invocations) get the
+      #    cap; otherwise a build-dep compiled at `debug=2` could feed a
+      #    huge object back into the test link. Test correctness,
+      #    debug_assertions, and overflow checks are unchanged.
+      #
+      # Using cargo's profile env vars rather than RUSTFLAGS avoids
+      # invalidating the Swatinem/rust-cache key for unrelated tools
+      # (e.g. clippy on a different debuginfo level) and is the
+      # cargo-recommended way to override a profile field.
+      #
+      # The same JOBS=2 guard remains in place on check-arm/check-riscv
+      # where it has been working (those runners are 16GB ARM/RISCV).
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
         with:
