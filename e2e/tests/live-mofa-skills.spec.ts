@@ -9,7 +9,8 @@
  */
 import { expect, test, type Page } from '@playwright/test';
 
-const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
+import { ensureAdminTokenRotated } from './live-browser-helpers';
+
 const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
 const INSTALL_SOURCE = process.env.OCTOS_MOFA_INSTALL_SOURCE || 'mofa-org/mofa-skills/mofa-cli';
 const SKILL_NAME = process.env.OCTOS_MOFA_SKILL_NAME || 'mofa-cli';
@@ -31,13 +32,18 @@ function removeButtonForSkill(page: Page, skillName: string) {
 }
 
 async function loginToDashboard(page: Page) {
+  // BootstrapGate redirects all `/admin/*` routes to `/admin/setup/welcome`
+  // until the bootstrap token has been rotated. Rotate once and use the
+  // strong token thereafter so the SPA renders the real dashboard.
+  const effectiveToken = await ensureAdminTokenRotated();
+
   await page.addInitScript(
     ({ token, profile }) => {
       localStorage.setItem('octos_session_token', token);
       localStorage.setItem('octos_auth_token', token);
       localStorage.setItem('selected_profile', profile);
     },
-    { token: AUTH_TOKEN, profile: PROFILE_ID },
+    { token: effectiveToken, profile: PROFILE_ID },
   );
 
   await page.goto(`/admin/profile/${PROFILE_ID}/skills`, { waitUntil: 'networkidle' });
@@ -47,7 +53,7 @@ async function loginToDashboard(page: Page) {
     if (await tokenTab.isVisible().catch(() => false)) {
       await tokenTab.click();
     }
-    await page.getByLabel('Admin token').fill(AUTH_TOKEN);
+    await page.getByLabel('Admin token').fill(effectiveToken);
     await page.getByRole('button', { name: 'Login' }).click();
     await page.waitForURL(/\/admin(\/|$)/, { timeout: 20_000 });
     await page.goto(`/admin/profile/${PROFILE_ID}/skills`, { waitUntil: 'networkidle' });
