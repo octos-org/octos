@@ -61,11 +61,20 @@ export async function ensureAdminTokenRotated(
             },
             body: JSON.stringify({ new_token: STRONG_ADMIN_TOKEN }),
           });
-          if (!rotateResp.ok && rotateResp.status !== 409) {
-            const text = await rotateResp.text().catch(() => '');
-            throw new Error(
-              `failed to rotate admin token: ${rotateResp.status} ${text}`,
-            );
+          if (!rotateResp.ok) {
+            // Cross-worker race: another Playwright worker process may have
+            // rotated first, which leaves us with a 401 (current bootstrap
+            // token now invalid) or a 409 (token store already populated).
+            // In both cases, probe with STRONG_ADMIN_TOKEN; if it works,
+            // the other worker rotated to the same target and we're done.
+            const fallbackStatus = await probe(STRONG_ADMIN_TOKEN);
+            if (fallbackStatus) return STRONG_ADMIN_TOKEN;
+            if (rotateResp.status !== 409) {
+              const text = await rotateResp.text().catch(() => '');
+              throw new Error(
+                `failed to rotate admin token: ${rotateResp.status} ${text}`,
+              );
+            }
           }
           return STRONG_ADMIN_TOKEN;
         }
