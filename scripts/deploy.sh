@@ -32,6 +32,11 @@
 #   ./scripts/deploy.sh admin@10.0.1.50 --key ~/.ssh/id_ed25519 --init
 #   ./scripts/deploy.sh user@host --password s3cret --clone-from 1
 #   ./scripts/deploy.sh user@host --remote-bin /opt/octos/bin --remote-data /opt/octos/data
+#
+# Post-restart phase auto-registers voice clones from each profile's
+# voice_profiles/ dir into ~/.OminiX/models/voices.json. See
+# scripts/register-fleet-voices.sh to run that step on its own when
+# you only need to refresh voices without redeploying.
 set -euo pipefail
 
 # --- Built-in targets ---
@@ -955,6 +960,59 @@ echo "  ominix-api plist generated"'"'"
 
     echo "==> Starting launchd service..."
     ssh_target "$i" "launchctl load ~/Library/LaunchAgents/${PLIST}.plist"
+
+    # Register voice clones from voice_profiles dirs into ominix-api.
+    # OminiX-API only loads voices from ~/.OminiX/models/voices.json at
+    # startup; voice .wav files saved by mofa-fm are not auto-discovered.
+    # Without this step, fm_tts pre-validation rejects every clone voice
+    # because /v1/voices doesn't list it. See
+    # scripts/register-fleet-voices.sh for the standalone version.
+    if [[ "$SKIP_OMINIX" == false ]]; then
+        echo "==> Registering voice clones with ominix-api..."
+        ssh_target "$i" 'bash -c '"'"'
+            mkdir -p ~/.OminiX/models
+            python3 << "PYEOF"
+import json, os, glob, sys
+home = os.path.expanduser("~")
+path = os.path.join(home, ".OminiX/models/voices.json")
+if os.path.exists(path):
+    try:
+        cfg = json.loads(open(path).read())
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception as e:
+        print(f"warning: voices.json malformed ({e}); rewriting", file=sys.stderr)
+        cfg = {}
+else:
+    cfg = {}
+voices = cfg.get("voices") if isinstance(cfg.get("voices"), dict) else {}
+added = []
+for wav in sorted(glob.glob(os.path.join(home, ".octos/profiles/*/data/voice_profiles/*.wav"))):
+    name = os.path.splitext(os.path.basename(wav))[0]
+    if name in voices:
+        continue
+    voices[name] = {
+        "ref_audio": wav,
+        "ref_text": "",
+        "aliases": [],
+        "speed_factor": 1.0,
+    }
+    added.append(name)
+cfg.setdefault("default_voice", "vivian")
+cfg.setdefault("models_base_path", "~/.OminiX/models")
+cfg["voices"] = voices
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+shown = added if added else "(none)"
+print(f"  voices.json: {len(voices)} custom entries (added: {shown})")
+PYEOF
+            # Bounce ominix-api so the new voices.json is picked up.
+            launchctl kickstart -k "gui/$(id -u)/io.ominix.ominix-api" 2>/dev/null || \
+                (launchctl unload ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null; \
+                 sleep 1; \
+                 launchctl load ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null) || true
+        '"'"
+    fi
 
     echo "==> Verifying..."
     sleep 2
