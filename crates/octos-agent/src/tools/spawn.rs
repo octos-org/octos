@@ -120,6 +120,18 @@ struct WorkflowMetadata {
     allowed_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_output: Option<WorkflowTerminalOutputPolicy>,
+    /// Coarse progress fraction in [0.0, 1.0] for this phase. Populated
+    /// on every workflow_runtime-driven `mark_runtime_state` so the
+    /// dashboard `runtime_detail.progress` field is non-null even for
+    /// workflows whose internal tools (e.g. `run_pipeline`) do not emit
+    /// per-event `HarnessEvent::progress`. Increments roughly with phase
+    /// transitions: 0.05 at workflow start (`research`/initial phase),
+    /// 0.95 when the runtime advances to `deliver_result`. The
+    /// task_supervisor's [`mark_completed`] path lets the lifecycle
+    /// state speak for terminal completion; we do not synthesize a
+    /// 1.0 sentinel here to avoid stepping on real progress events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<f64>,
 }
 
 fn is_retryable_child_failure(text: &str) -> bool {
@@ -851,6 +863,32 @@ fn should_deliver_output_files(files: &[PathBuf]) -> bool {
 
 fn encode_workflow_detail(workflow: &WorkflowMetadata) -> Option<String> {
     serde_json::to_string(workflow).ok()
+}
+
+/// Coarse progress fraction (0.0–1.0) the workflow_runtime path attaches
+/// to `runtime_detail.progress` for a given phase. The runtime owns only
+/// two phases per workflow family — the initial phase (`research` /
+/// `design` / `scaffold` / etc.) and `deliver_result` after artifacts
+/// pass validation — so the curve is deliberately coarse: the runtime
+/// stamps a small starting value at spawn and a near-terminal value at
+/// the deliver_result transition. Finer-grained values come from the
+/// inner tools (e.g. `deep_search` inside `run_pipeline`) emitting
+/// `HarnessEvent::progress`, which `task_supervisor::apply_harness_event`
+/// folds into the same `runtime_detail.progress` field.
+///
+/// Without this seed, `runtime_detail.progress` is `null` for the entire
+/// initial phase of any workflow whose internal tools do not emit per-event
+/// progress, which the e2e live-progress gate spec relies on being non-null.
+fn workflow_phase_progress(phase: &str) -> f64 {
+    match phase {
+        "deliver_result" => 0.95,
+        "verify_outputs" | "verify_contract" => 0.9,
+        // The initial workflow_runtime phase is family-specific
+        // (`research`, `design`, `scaffold`, ...) — treat any non-terminal
+        // phase as "just started" so the runtime advertises a non-null
+        // progress value rather than `null`.
+        _ => 0.05,
+    }
 }
 
 fn workflow_artifact_matches_kind(path: &Path, kind: &str) -> bool {
@@ -2270,10 +2308,21 @@ impl Tool for SpawnTool {
                 {
                     supervisor.mark_running(task_id);
                     if let Some(workflow) = workflow_metadata.as_ref() {
+                        // Seed `runtime_detail.progress` with a small non-null
+                        // value at workflow start. Without this, dashboards
+                        // (and the e2e live-progress gate) see
+                        // `runtime_detail.progress == null` for the entire
+                        // initial phase on workflows that drive a
+                        // `run_pipeline` graph rather than emitting their
+                        // own `HarnessEvent::progress`. The deep_search
+                        // built-in still overwrites this with finer values
+                        // (~0.1, 0.4, 0.8, 1.0) as the pipeline cycles.
+                        let mut start = workflow.clone();
+                        start.progress = Some(workflow_phase_progress(&start.current_phase));
                         supervisor.mark_runtime_state(
                             task_id,
                             crate::task_supervisor::TaskRuntimeState::ExecutingTool,
-                            encode_workflow_detail(workflow),
+                            encode_workflow_detail(&start),
                         );
                     }
                 }
@@ -2603,6 +2652,7 @@ impl Tool for SpawnTool {
                     ) {
                         let mut deliver = workflow.clone();
                         deliver.current_phase = "deliver_result".to_string();
+                        deliver.progress = Some(workflow_phase_progress("deliver_result"));
                         supervisor.mark_runtime_state(
                             task_id,
                             crate::task_supervisor::TaskRuntimeState::DeliveringOutputs,
@@ -3338,6 +3388,7 @@ mod tests {
                 forbid_intermediate_files: true,
                 required_artifact_kind: "audio".to_string(),
             }),
+            progress: None,
         };
 
         let files_to_send = vec![
@@ -3365,6 +3416,7 @@ mod tests {
                 forbid_intermediate_files: true,
                 required_artifact_kind: "audio".to_string(),
             }),
+            progress: None,
         };
 
         let files_modified = vec![
@@ -3390,6 +3442,7 @@ mod tests {
                 forbid_intermediate_files: true,
                 required_artifact_kind: "audio".to_string(),
             }),
+            progress: None,
         };
 
         let error = resolve_background_terminal_files(temp.path(), &[], &[], Some(&workflow))
@@ -3409,6 +3462,7 @@ mod tests {
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
+            progress: None,
         };
 
         let files_to_send = vec![
@@ -3434,6 +3488,7 @@ mod tests {
                 forbid_intermediate_files: true,
                 required_artifact_kind: "site".to_string(),
             }),
+            progress: None,
         };
 
         let files_to_send = vec![
@@ -3459,12 +3514,46 @@ mod tests {
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
+            progress: None,
         };
 
         let policy = build_subagent_tool_policy(workflow.allowed_tools.clone(), Some(&workflow));
 
         assert!(policy.deny.contains(&"spawn".to_string()));
         assert!(policy.deny.contains(&"send_file".to_string()));
+    }
+
+    #[test]
+    fn workflow_phase_progress_is_coarse_but_non_null_and_monotonic() {
+        // Initial phases of every workflow family — research_runtime path
+        // names them differently per family; the helper must seed a small
+        // non-null fraction for each so `runtime_detail.progress` is never
+        // null on the first phase transition.
+        for initial_phase in &["research", "design", "scaffold", "outline"] {
+            let value = workflow_phase_progress(initial_phase);
+            assert!(
+                value > 0.0 && value <= 0.5,
+                "initial phase {initial_phase} should map to a small non-null fraction, got {value}"
+            );
+        }
+
+        // The terminal-ish phases must produce values strictly greater
+        // than initial-phase values so the dashboard sees forward motion.
+        let initial = workflow_phase_progress("research");
+        let verifying = workflow_phase_progress("verify_outputs");
+        let deliver = workflow_phase_progress("deliver_result");
+        assert!(
+            verifying > initial,
+            "verify_outputs ({verifying}) must exceed initial ({initial})"
+        );
+        assert!(
+            deliver > verifying,
+            "deliver_result ({deliver}) must exceed verify_outputs ({verifying})"
+        );
+        assert!(
+            deliver < 1.0,
+            "deliver_result ({deliver}) must stay strictly under 1.0 — terminal completion is signalled by lifecycle state, not by a synthesized progress sentinel"
+        );
     }
 
     #[test]
@@ -3635,6 +3724,7 @@ PY
                 forbid_intermediate_files: true,
                 required_artifact_kind: "presentation".to_string(),
             }),
+            progress: None,
         };
 
         let selected = resolve_contract_terminal_files(&repo_root, Some(&workflow))
@@ -3667,6 +3757,7 @@ PY
                 forbid_intermediate_files: true,
                 required_artifact_kind: "site".to_string(),
             }),
+            progress: None,
         };
 
         let error = resolve_contract_terminal_files(&repo_root, Some(&workflow)).unwrap_err();
@@ -3767,6 +3858,39 @@ PY
             detail.get("workflow_kind").and_then(|v| v.as_str()) == Some("research_podcast")
                 && detail.get("current_phase").and_then(|v| v.as_str()) == Some("deliver_result")
         }));
+
+        // The workflow_runtime path must seed `progress` on every phase
+        // transition so dashboards (and the e2e live-progress gate) never
+        // see `runtime_detail.progress == null` for workflows whose
+        // internal tools do not emit per-event progress. The exact values
+        // are coarse — a small starting fraction at the initial phase and
+        // a near-terminal fraction once `deliver_result` is reached.
+        let initial_progress = details
+            .iter()
+            .find(|detail| detail.get("current_phase").and_then(|v| v.as_str()) == Some("research"))
+            .and_then(|detail| detail.get("progress"))
+            .and_then(|v| v.as_f64())
+            .expect("research phase must populate progress");
+        assert!(
+            (0.0..=0.5).contains(&initial_progress),
+            "research-phase progress should be small but non-null, got {initial_progress}"
+        );
+        let deliver_progress = details
+            .iter()
+            .find(|detail| {
+                detail.get("current_phase").and_then(|v| v.as_str()) == Some("deliver_result")
+            })
+            .and_then(|detail| detail.get("progress"))
+            .and_then(|v| v.as_f64())
+            .expect("deliver_result phase must populate progress");
+        assert!(
+            (0.85..=1.0).contains(&deliver_progress),
+            "deliver_result progress should be near-terminal, got {deliver_progress}"
+        );
+        assert!(
+            deliver_progress > initial_progress,
+            "progress must monotonically advance from research ({initial_progress}) to deliver_result ({deliver_progress})"
+        );
 
         let script =
             std::fs::read_to_string(&script_seen).expect("podcast_generate should receive script");
