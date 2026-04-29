@@ -1,11 +1,18 @@
 /**
- * M8.10 stress test: thread_id binding under realistic 3-5 user overflow.
+ * M8.10 stress test: thread_id binding under realistic 3-10 user overflow.
  *
  * Existing live-thread-interleave.spec.ts only sends 2 messages with a
- * fixed 1.5s gap. Real users (issue #649) send 3-5 messages with random
+ * fixed 1.5s gap. Real users (issue #649) send 3-10 messages with random
  * gaps and at least one slow tool. The narrow scope kept letting
  * variations of the thread_id binding bug ship to production
  * (#629 -> #635 -> #637 -> #649).
+ *
+ * The 7- and 10-message scenarios were added to catch sticky-map drift
+ * across many turn rotations: a fast-only 5-message rapid-fire test
+ * exercises one rotation pattern; mixing slow tools at both ends of a
+ * 7-message run exercises spawn-time AND finalise-time pressure on the
+ * sticky map; a 10-message normal-pacing session catches stale-state
+ * accumulation that only shows up after the cache warms.
  *
  * Each scenario sends multiple messages within a short window, waits for
  * all responses to land, then verifies that the assistant response BELOW
@@ -81,7 +88,7 @@ const SCENARIOS: Scenario[] = [
     timeout_ms: 240_000,
   },
   {
-    name: 'three-fast-then-one-slow',
+    name: 'two-fast-then-one-slow',
     messages: [
       {
         gap_ms: 0,
@@ -111,6 +118,52 @@ const SCENARIOS: Scenario[] = [
       { gap_ms: 800, text: '5+5 = ?', expected_in_response: ['10', '十'] },
     ],
     timeout_ms: 180_000,
+  },
+  {
+    // Slow + 5 fast + slow (7 user msgs). The trailing slow operation
+    // exercises sticky-map pressure at finalise-time after 5 rotations,
+    // which is the failure window most likely to be missed by the
+    // 5-message rapid-fire scenario.
+    name: 'seven-messages-mixed-pacing',
+    messages: [
+      {
+        gap_ms: 0,
+        text:
+          'Use deep research to find latest Rust language news. Run pipeline directly. One paragraph.',
+        expected_in_response: ['rust', 'research', 'language', 'news'],
+      },
+      { gap_ms: 4000, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
+      { gap_ms: 1200, text: '2+2 = ?', expected_in_response: ['4', '四'] },
+      { gap_ms: 1200, text: '3+3 = ?', expected_in_response: ['6', '六'] },
+      { gap_ms: 1200, text: '4+4 = ?', expected_in_response: ['8', '八'] },
+      { gap_ms: 1200, text: '5+5 = ?', expected_in_response: ['10', '十'] },
+      {
+        gap_ms: 3000,
+        text: '搜索一下今天的天气情况 (deep search)',
+        expected_in_response: ['weather', '天气', 'temperature', '温度', 'forecast'],
+      },
+    ],
+    timeout_ms: 480_000,
+  },
+  {
+    // Normal-paced 10-message session (30s gaps). Catches sticky-map
+    // staleness that only surfaces after the cache has rotated many
+    // times; each turn is well-separated so any drift across turns
+    // shows as a binding collision or content-mismatch in the DOM.
+    name: 'long-session-ten-messages',
+    messages: [
+      { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
+      { gap_ms: 30000, text: '2+2 = ?', expected_in_response: ['4', '四'] },
+      { gap_ms: 30000, text: '3+3 = ?', expected_in_response: ['6', '六'] },
+      { gap_ms: 30000, text: '4+4 = ?', expected_in_response: ['8', '八'] },
+      { gap_ms: 30000, text: '5+5 = ?', expected_in_response: ['10', '十'] },
+      { gap_ms: 30000, text: '6+6 = ?', expected_in_response: ['12', '十二'] },
+      { gap_ms: 30000, text: '7+7 = ?', expected_in_response: ['14', '十四'] },
+      { gap_ms: 30000, text: '8+8 = ?', expected_in_response: ['16', '十六'] },
+      { gap_ms: 30000, text: '9+9 = ?', expected_in_response: ['18', '十八'] },
+      { gap_ms: 30000, text: '10+10 = ?', expected_in_response: ['20', '二十'] },
+    ],
+    timeout_ms: 480_000,
   },
 ];
 
@@ -282,8 +335,11 @@ function assertPairing(
   return { violations, debug };
 }
 
-test.describe('M8.10 stress: thread_id binding under realistic 3-5 user overflow', () => {
-  test.setTimeout(420_000);
+test.describe('M8.10 stress: thread_id binding under realistic 3-10 user overflow', () => {
+  // 900_000 (15 min) covers the longest scenario: long-session-ten-messages
+  // sends 10 msgs with 30s gaps (= 270s send time) plus a settle window for
+  // the last response, plus playwright fixture overhead.
+  test.setTimeout(900_000);
 
   for (const scenario of SCENARIOS) {
     test(`stress scenario: ${scenario.name}`, async ({ page }) => {
