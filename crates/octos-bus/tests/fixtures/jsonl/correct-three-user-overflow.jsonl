@@ -1,0 +1,8 @@
+{"role":"user","content":"slow research","client_message_id":"cmid-1","thread_id":"cmid-1","timestamp":"2026-04-29T05:55:36Z"}
+{"role":"assistant","content":"backgrounded","thread_id":"cmid-1","response_to_client_message_id":"cmid-1","timestamp":"2026-04-29T05:55:36Z"}
+{"role":"user","content":"stock query","client_message_id":"cmid-2","thread_id":"cmid-2","timestamp":"2026-04-29T05:55:50Z"}
+{"role":"user","content":"voices","client_message_id":"cmid-3","thread_id":"cmid-3","timestamp":"2026-04-29T05:55:55Z"}
+{"role":"assistant","content":"empty","thread_id":"cmid-3","response_to_client_message_id":"cmid-3","timestamp":"2026-04-29T05:55:56Z"}
+{"role":"assistant","content":"voices answer","thread_id":"cmid-3","response_to_client_message_id":"cmid-3","timestamp":"2026-04-29T05:56:03Z"}
+{"role":"tool","content":"deep research stock","thread_id":"cmid-2","response_to_client_message_id":"cmid-2","timestamp":"2026-04-29T05:56:03Z"}
+{"role":"assistant","content":"stock answer","thread_id":"cmid-2","response_to_client_message_id":"cmid-2","timestamp":"2026-04-29T05:56:14Z"}
