@@ -14,6 +14,13 @@
  * sticky map; a 10-message normal-pacing session catches stale-state
  * accumulation that only shows up after the cache warms.
  *
+ * The `media-mix-soak-five-skills` scenario is the canonical soaking
+ * test — 5 different spawn_only skills (builtin-voice TTS, cloned-voice
+ * TTS, news-digest + TTS, deep research, FM podcast) all running in
+ * parallel. Each finalises asynchronously, putting sustained pressure
+ * on the sticky-map. This mirrors the realistic "user opens the app
+ * and tries many features at once" load.
+ *
  * Each scenario sends multiple messages within a short window, waits for
  * all responses to land, then verifies that the assistant response BELOW
  * each user bubble in DOM order matches the prompt by content.
@@ -144,6 +151,51 @@ const SCENARIOS: Scenario[] = [
       },
     ],
     timeout_ms: 480_000,
+  },
+  {
+    // Soaking test: 5 different media-producing skills running in
+    // parallel. Each is spawn_only and finalises asynchronously,
+    // putting sustained pressure on the sticky-map across multiple
+    // thread rotations for the duration of the slowest tool
+    // (typically deep_research at 3-5 min). Mirrors the canonical
+    // "real user trying many features at once" load — builtin-voice
+    // TTS, cloned-voice TTS, news-digest + TTS, deep research, and
+    // an FM-style podcast.
+    //
+    // Pre-#649: at least one bubble orphans because late-arriving
+    // spawn_only results collide with the rotated sticky-map.
+    // Post-fix: all five thread_ids are stamped at spawn time, so
+    // late finalises bind correctly regardless of which slot the
+    // sticky-map currently holds.
+    name: 'media-mix-soak-five-skills',
+    messages: [
+      {
+        gap_ms: 0,
+        text: '用 vivian 说一段：今天是个好日子，让我们开始吧',
+        expected_in_response: ['vivian', 'audio', '.wav', '.mp3', '语音', '好日子'],
+      },
+      {
+        gap_ms: 8000,
+        text: '用 yangmi 念这段：我是你的数字助理',
+        expected_in_response: ['yangmi', 'audio', '.wav', '.mp3', '数字', '助理'],
+      },
+      {
+        gap_ms: 6000,
+        text: '总结一下今日科技新闻并用 vivian 朗读 (news digest + tts)',
+        expected_in_response: ['news', '新闻', 'tech', '科技', 'audio', '.mp3'],
+      },
+      {
+        gap_ms: 5000,
+        text: '深度搜索今日Rust语言进展 (deep search)',
+        expected_in_response: ['rust', 'research', 'language', '语言', 'news'],
+      },
+      {
+        gap_ms: 5000,
+        text: '做一个关于AI智能体平台的FM播客 (mofa podcast)',
+        expected_in_response: ['podcast', 'audio', '.mp3', 'episode', '播客', '智能体'],
+      },
+    ],
+    timeout_ms: 720_000,
   },
   {
     // Normal-paced 10-message session (30s gaps). Catches sticky-map
@@ -336,10 +388,11 @@ function assertPairing(
 }
 
 test.describe('M8.10 stress: thread_id binding under realistic 3-10 user overflow', () => {
-  // 900_000 (15 min) covers the longest scenario: long-session-ten-messages
-  // sends 10 msgs with 30s gaps (= 270s send time) plus a settle window for
-  // the last response, plus playwright fixture overhead.
-  test.setTimeout(900_000);
+  // 1_200_000 (20 min) covers the longest scenario:
+  // media-mix-soak-five-skills runs 5 spawn_only skills in parallel and
+  // waits for the slowest (deep_research / podcast) to finalise — typically
+  // 5-12 min wall, plus playwright fixture overhead and the 24s send window.
+  test.setTimeout(1_200_000);
 
   for (const scenario of SCENARIOS) {
     test(`stress scenario: ${scenario.name}`, async ({ page }) => {
