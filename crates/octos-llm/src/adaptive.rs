@@ -2971,7 +2971,8 @@ mod tests {
         assert!(
             warm_good.metrics.latency_ema_ms > 0.0,
             "slow-good latency_ema_ms should be > 0 after {} successful chats; got {}. EMA may be frozen even though success counters move.",
-            RUNS, warm_good.metrics.latency_ema_ms,
+            RUNS,
+            warm_good.metrics.latency_ema_ms,
         );
 
         // (1) Both scores must MOVE from cold start.
