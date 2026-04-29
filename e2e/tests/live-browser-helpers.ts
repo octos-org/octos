@@ -3,6 +3,104 @@ import { expect, type Page } from '@playwright/test';
 const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
 const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
 const TEST_EMAIL = process.env.OCTOS_TEST_EMAIL || 'dspfac@gmail.com';
+const BASE_URL = process.env.OCTOS_TEST_URL || 'http://localhost:3000';
+
+// When the daemon comes up with no `admin_token.json` (bootstrap mode), the
+// dashboard's BootstrapGate redirects every `/admin/*` route to
+// `/admin/setup/welcome` until the bootstrap token has been rotated to a
+// hashed persistent record. That breaks any spec that drives the dashboard
+// SPA. The token below is what we rotate to on first use; it satisfies the
+// daemon's strength check (>=32 chars, >=3 char classes from
+// {lowercase, uppercase, digits, symbols}).
+const STRONG_ADMIN_TOKEN =
+  process.env.OCTOS_TEST_ADMIN_TOKEN || 'Octos-E2E-Strong-Token-2026-XYZ-123!';
+
+let tokenRotationPromise: Promise<string> | null = null;
+
+/**
+ * Rotate the bootstrap admin token to a known strong value if the daemon is
+ * still in bootstrap mode. Returns the token that callers should use for all
+ * subsequent auth — either the rotated strong token, or the original token
+ * if rotation isn't needed (or isn't possible because it was already rotated
+ * to a different value).
+ *
+ * The returned token is memoised at the module level so multiple specs in
+ * the same Playwright process share the work.
+ */
+export async function ensureAdminTokenRotated(
+  baseUrl: string = BASE_URL,
+  currentToken: string = AUTH_TOKEN,
+): Promise<string> {
+  if (!tokenRotationPromise) {
+    tokenRotationPromise = (async () => {
+      const probe = async (token: string): Promise<{ rotated?: boolean } | null> => {
+        try {
+          const resp = await fetch(`${baseUrl}/api/admin/token/status`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (!resp.ok) return null;
+          return (await resp.json().catch(() => null)) as
+            | { rotated?: boolean }
+            | null;
+        } catch {
+          return null;
+        }
+      };
+
+      // 1) Probe with the caller-provided token first.
+      const currentStatus = await probe(currentToken);
+
+      if (currentStatus) {
+        if (!currentStatus.rotated) {
+          // Bootstrap mode — rotate to the strong token now.
+          const rotateResp = await fetch(`${baseUrl}/api/admin/token/rotate`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${currentToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ new_token: STRONG_ADMIN_TOKEN }),
+          });
+          if (!rotateResp.ok && rotateResp.status !== 409) {
+            const text = await rotateResp.text().catch(() => '');
+            throw new Error(
+              `failed to rotate admin token: ${rotateResp.status} ${text}`,
+            );
+          }
+          return STRONG_ADMIN_TOKEN;
+        }
+        // Already rotated and the current token still works — caller passed
+        // the rotated token directly. Use it as-is.
+        return currentToken;
+      }
+
+      // 2) currentToken didn't authenticate. Common case after the first
+      //    run on a host: the bootstrap token is gone but the caller is
+      //    still passing it. Fall back to the strong token we previously
+      //    rotated to (or that someone matching `OCTOS_TEST_ADMIN_TOKEN`
+      //    rotated to). If THAT works, use it.
+      const strongStatus = await probe(STRONG_ADMIN_TOKEN);
+      if (strongStatus) {
+        return STRONG_ADMIN_TOKEN;
+      }
+
+      // 3) Neither token works. Return currentToken so the spec fails
+      //    with the original auth error rather than a silent fallback.
+      return currentToken;
+    })();
+  }
+  return tokenRotationPromise;
+}
+
+/**
+ * The token consumers should use for `Authorization: Bearer ...` and for the
+ * `octos_session_token` / `octos_auth_token` localStorage entries. Resolves
+ * to the rotated strong token when the helper had to bootstrap the daemon,
+ * otherwise to whatever `OCTOS_AUTH_TOKEN` was passed in.
+ */
+export async function getEffectiveAdminToken(): Promise<string> {
+  return ensureAdminTokenRotated();
+}
 
 export const SEL = {
   chatInput: "[data-testid='chat-input']",
@@ -21,13 +119,18 @@ export const SEL = {
 } as const;
 
 export async function login(page: Page) {
+  // Bootstrap-mode daemons reject every `/admin/*` page until the admin
+  // token has been rotated. Do this once per Playwright process and use the
+  // rotated value everywhere below.
+  const effectiveToken = await ensureAdminTokenRotated();
+
   await page.addInitScript(
     ({ token, profile }) => {
       localStorage.setItem('octos_session_token', token);
       localStorage.setItem('octos_auth_token', token);
       localStorage.setItem('selected_profile', profile);
     },
-    { token: AUTH_TOKEN, profile: PROFILE_ID },
+    { token: effectiveToken, profile: PROFILE_ID },
   );
 
   await page.goto('/chat', { waitUntil: 'networkidle' });
@@ -55,7 +158,7 @@ export async function login(page: Page) {
     .first();
   if (await authTokenTab.isVisible().catch(() => false)) {
     await authTokenTab.click();
-    await page.locator(SEL.loginTokenInput).fill(AUTH_TOKEN);
+    await page.locator(SEL.loginTokenInput).fill(effectiveToken);
     await page.locator(SEL.loginButton).click();
     const tokenChatVisible = await page
       .locator(SEL.chatInput)
@@ -78,7 +181,7 @@ export async function login(page: Page) {
         localStorage.setItem('octos_session_token', data.token);
         return data.token as string;
       },
-      { email: TEST_EMAIL, code: AUTH_TOKEN },
+      { email: TEST_EMAIL, code: effectiveToken },
     );
 
     if (apiLoginResult) {
