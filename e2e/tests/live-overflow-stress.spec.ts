@@ -198,6 +198,51 @@ const SCENARIOS: Scenario[] = [
     timeout_ms: 720_000,
   },
   {
+    // Heavy soaking test focused on MoFA deliverable artifacts: a
+    // generated slide deck, a generated website preview, and an FM
+    // podcast — the three slowest spawn_only flows in the platform.
+    // Each takes ~3-8 min to finalise. Two simple questions interleaved
+    // keep the sticky-map rotating during the long settle window.
+    //
+    // Catches binding races where the delivered artifact (a .pptx, a
+    // /preview/* HTML page, an .mp3) attaches to the wrong user
+    // bubble — this is the failure mode users notice first because the
+    // artifact is visibly mis-paired in the chat history.
+    name: 'mofa-deliverables-soak',
+    messages: [
+      {
+        gap_ms: 0,
+        text: '生成一个关于 AI 智能体技术发展的幻灯片 (mofa slides, full deck)',
+        expected_in_response: [
+          'slides', '幻灯片', '.pptx', 'deck', 'slide', 'pptx',
+        ],
+      },
+      {
+        gap_ms: 8000,
+        text: '生成一个产品介绍网站 (mofa sites, full site preview)',
+        expected_in_response: [
+          'site', 'preview', '网站', 'preview/', '.html', 'index',
+        ],
+      },
+      {
+        gap_ms: 4000,
+        text: '1+1 = ?',
+        expected_in_response: ['2', '两', '二'],
+      },
+      {
+        gap_ms: 5000,
+        text: '做一个关于AI发展的FM播客 (mofa podcast)',
+        expected_in_response: ['podcast', 'audio', '.mp3', 'episode', '播客'],
+      },
+      {
+        gap_ms: 4000,
+        text: '今天日期是？',
+        expected_in_response: ['2026', 'date', '日期', '月', 'april'],
+      },
+    ],
+    timeout_ms: 900_000,
+  },
+  {
     // Normal-paced 10-message session (30s gaps). Catches sticky-map
     // staleness that only surfaces after the cache has rotated many
     // times; each turn is well-separated so any drift across turns
