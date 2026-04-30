@@ -64,6 +64,10 @@ export default function StepSmtp({ mode, onContinue }: Props) {
     fromAddress.includes('@') &&
     (password.length > 0 || passwordConfigured)
   const canContinue = !isRequired || allFieldsFilled
+  // Server-side truth for "is SMTP usable right now". The host/from/etc. can
+  // be set without a stored password; without the password OTP delivery
+  // fails, so the warning is gated on both pieces being present.
+  const smtpConfigured = loaded && host.trim().length > 0 && passwordConfigured
 
   const handleSave = async () => {
     setSave({ kind: 'saving' })
@@ -129,6 +133,33 @@ export default function StepSmtp({ mode, onContinue }: Props) {
               : 'Pick a deployment mode first to know whether this step is required.'}
         </p>
       </div>
+
+      {loaded && !smtpConfigured && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+          <div className="text-sm font-medium text-amber-300 mb-1">
+            SMTP is not configured
+          </div>
+          <div className="text-gray-300">
+            {isRequired
+              ? "Tenants log in via email OTP only — without working SMTP they cannot sign in, and registration/install emails issued by the portal won't be delivered. Strongly recommended to configure here before continuing."
+              : 'OTP login codes will be logged to the server console only. The dashboard will work via admin-token login, but email-based login will not deliver to mailboxes.'}
+          </div>
+          <div className="text-gray-400 mt-2">
+            You can skip this step ("Skip This Step" below) and revisit any time from the sidebar — but tenant onboarding and email login will not work until it's configured.
+          </div>
+        </div>
+      )}
+
+      {loaded && smtpConfigured && (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-3 text-xs">
+          <div className="text-sm font-medium text-emerald-300 mb-1">
+            SMTP is configured
+          </div>
+          <div className="text-gray-300">
+            A host and password are stored. You can adjust the fields below or run "Send Test" to verify delivery before continuing.
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <div className="col-span-2">
