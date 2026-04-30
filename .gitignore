@@ -23,6 +23,10 @@ Thumbs.db
 # Node
 node_modules/
 
+# Playwright/tmux test artifacts
+e2e/test-results/
+e2e/test-results-tmux/
+
 # Dashboard build output.
 #
 # Policy: ephemeral bundle — the compiled dashboard lives in a release binary

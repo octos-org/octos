@@ -10,11 +10,13 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use tokio::time::timeout;
 
-use super::{ConcurrencyClass, Tool, ToolResult};
+use super::{
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
+    ToolResult,
+};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
-use crate::tools::TOOL_CTX;
 
 /// Tool for executing shell commands.
 pub struct ShellTool {
@@ -203,15 +205,40 @@ impl Tool for ShellTool {
                 });
             }
             Decision::Ask => {
-                tracing::warn!(command = %input.command, "command requires approval — denied (no interactive approval available)");
-                return Ok(ToolResult {
-                    output: format!(
-                        "Command requires approval and was denied: {}\n\nThis command matches a potentially dangerous pattern (e.g. sudo, rm -rf, git push --force). It cannot be executed without interactive approval.",
-                        input.command
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
+                let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
+                let Some(requester) = requester else {
+                    tracing::warn!(command = %input.command, "command requires approval — denied (no interactive approval available)");
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Command requires approval and was denied: {}\n\nThis command matches a potentially dangerous pattern (e.g. sudo, rm -rf, git push --force). It cannot be executed without interactive approval.",
+                            input.command
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                };
+
+                let tool_id = TOOL_CTX
+                    .try_with(|ctx| ctx.tool_id.clone())
+                    .unwrap_or_default();
+                let decision = requester
+                    .request_approval(ToolApprovalRequest {
+                        tool_id,
+                        tool_name: self.name().to_owned(),
+                        title: "Approve shell command".to_owned(),
+                        body: format!("Run command: {}", input.command),
+                        command: Some(input.command.clone()),
+                        cwd: Some(self.cwd.to_string_lossy().into_owned()),
+                    })
+                    .await;
+                if matches!(decision, ToolApprovalDecision::Deny) {
+                    tracing::warn!(command = %input.command, "command denied by interactive approval");
+                    return Ok(ToolResult {
+                        output: format!("Command denied by user approval: {}", input.command),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
             }
             Decision::Allow => {}
         }
