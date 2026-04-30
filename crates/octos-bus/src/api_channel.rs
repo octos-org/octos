@@ -249,7 +249,17 @@ pub struct ApiChannel {
     shutdown: Arc<AtomicBool>,
     pending: Arc<Mutex<HashMap<String, SseSender>>>,
     watchers: Arc<Mutex<HashMap<String, SseSender>>>,
-    /// Track last sent content per chat_id for delta computation.
+    /// Track last sent content per `(chat_id, thread_id)` for delta computation.
+    /// Keyed by the encoded `last_content_key` so two concurrent streams on
+    /// the same chat (speculative-overflow / rapid-fire) compute their token
+    /// deltas independently. Without per-thread keying, when turn A's
+    /// `prev` content happens to be a prefix of turn B's incoming text,
+    /// `edit_message` emits a misleading `token` delta for B that contains
+    /// content originally from A — the web client then mis-paints A's
+    /// trailing text under B's bubble (overflow-stress phantom-content
+    /// regression observed on mini1 #680 follow-up).
+    /// The `chat_id`-only key is preserved as a fallback for legacy events
+    /// that arrive without a thread_id.
     last_content: Arc<Mutex<HashMap<String, String>>>,
     /// M8.10 follow-up (#632): sticky most-recent thread_id per chat_id.
     /// Populated whenever an outbound metadata or synthetic SSE message_id
@@ -610,6 +620,20 @@ fn outbound_thread_id(metadata: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Build the per-(chat_id, thread_id) key used by `last_content` to track
+/// per-stream delta state. When `thread_id` is `None`/empty (legacy daemon
+/// or pre-bind events) the key falls back to the bare `chat_id`, preserving
+/// the historical behaviour for that path. Two concurrent same-chat streams
+/// each carrying their own `thread_id` get separate keys, so neither
+/// stream's `prev` content can poison the other's delta computation
+/// (overflow-stress phantom-content regression — mini1).
+fn last_content_key(chat_id: &str, thread_id: Option<&str>) -> String {
+    match thread_id.filter(|tid| !tid.is_empty()) {
+        Some(tid) => format!("{chat_id}\x1F{tid}"),
+        None => chat_id.to_string(),
+    }
 }
 
 /// Sentinel that delimits the chat_id and the thread_id inside the synthetic
@@ -1060,7 +1084,13 @@ impl Channel for ApiChannel {
                 let _ = tx.send(done.to_string());
                 pending.remove(&msg.chat_id);
                 drop(pending);
-                self.last_content.lock().await.remove(&msg.chat_id);
+                // Drop both the per-thread and the legacy chat-only entries
+                // for this turn so subsequent turns start fresh. The
+                // chat-only key is removed defensively — older code paths
+                // may have written to it for events without thread_id.
+                let mut last = self.last_content.lock().await;
+                last.remove(&last_content_key(&msg.chat_id, thread_id.as_deref()));
+                last.remove(&msg.chat_id);
             } else if !msg.content.is_empty() {
                 // Regular message — send as replace event (full text replacement).
                 let mut event = serde_json::json!({
@@ -1077,8 +1107,23 @@ impl Channel for ApiChannel {
     }
 
     async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {
-        // Reset delta tracking — new message stream starts fresh
-        self.last_content.lock().await.remove(&msg.chat_id);
+        // Resolve the thread_id ahead of `send`/seeding so the per-thread
+        // last_content key matches what `edit_message` uses on the next
+        // chunk. We re-read it after `send` populates the sticky map.
+        let metadata_thread_id = outbound_thread_id(&msg.metadata);
+        // Reset delta tracking for this stream — keyed by (chat, thread)
+        // so that turn A's reset never wipes turn B's prev-content under
+        // concurrent overflow. The chat-only entry is also cleared so
+        // legacy single-keyed state from before per-thread keying does
+        // not leak across.
+        {
+            let mut last = self.last_content.lock().await;
+            last.remove(&last_content_key(
+                &msg.chat_id,
+                metadata_thread_id.as_deref(),
+            ));
+            last.remove(&msg.chat_id);
+        }
         self.send(msg).await?;
         // M8.10 follow-up (#632): seed `last_content` with what `send`
         // just emitted on the wire so the FIRST subsequent `edit_message`
@@ -1086,11 +1131,20 @@ impl Channel for ApiChannel {
         // `replace`. Without this seeding, the stream forwarder's first
         // edit re-rendered the entire buffer even though only a suffix
         // changed (matches the documented intent of `last_content`).
+        // Use the resolved thread_id (metadata first, sticky fallback)
+        // so the seed lands under the same key the next `edit_message`
+        // will read from — otherwise a chat-only seed would force a
+        // wasteful first `replace` and re-introduce cross-talk under
+        // concurrent overflow.
+        let seed_thread_id = match metadata_thread_id.clone() {
+            Some(tid) => Some(tid),
+            None => self.sticky_thread_id(&msg.chat_id).await,
+        };
         if !msg.content.is_empty() {
-            self.last_content
-                .lock()
-                .await
-                .insert(msg.chat_id.clone(), msg.content.clone());
+            self.last_content.lock().await.insert(
+                last_content_key(&msg.chat_id, seed_thread_id.as_deref()),
+                msg.content.clone(),
+            );
         }
         // Return a dummy ID so the stream forwarder uses edit_message() for
         // subsequent updates instead of calling send_with_id() again.
@@ -1107,13 +1161,12 @@ impl Channel for ApiChannel {
         // every subsequent `edit_message` call. Without this fallback,
         // every `token` / `replace` event of a turn leaked
         // `thread_id=null`.
-        let thread_id = match outbound_thread_id(&msg.metadata) {
-            Some(tid) => Some(tid),
-            None => self.sticky_thread_id(&msg.chat_id).await,
-        };
+        // We already resolved this above (`seed_thread_id`) — reuse it
+        // so the encoded message_id matches the key under which the
+        // first chunk was seeded.
         Ok(Some(encode_sse_message_id(
             &msg.chat_id,
-            thread_id.as_deref(),
+            seed_thread_id.as_deref(),
         )))
     }
 
@@ -1147,7 +1200,16 @@ impl Channel for ApiChannel {
         let pending = self.pending.lock().await;
         if let Some(tx) = pending.get(chat_id) {
             let mut last = self.last_content.lock().await;
-            let prev = last.get(chat_id).map(|s| s.as_str()).unwrap_or("");
+            // Per-(chat, thread) keying: two concurrent streams on the same
+            // chat must NOT share `prev`. Pre-fix, turn A producing "Hello"
+            // would seed prev["chat"]="Hello" — and when turn B's
+            // `edit_message` arrived with new_content "Hello world" (B's
+            // own first chunk), `starts_with(prev)` was TRUE so an
+            // erroneous token delta " world" leaked out tagged with
+            // thread_B, even though B never streamed "Hello". The web
+            // client then painted A's trailing text under B's bubble.
+            let key = last_content_key(chat_id, thread_id);
+            let prev = last.get(&key).map(|s| s.as_str()).unwrap_or("");
 
             // If new content starts with the previous content, send only the delta.
             // This avoids re-rendering the entire message on each streaming update.
@@ -1171,7 +1233,7 @@ impl Channel for ApiChannel {
                 inject_thread_id(&mut event, thread_id);
                 let _ = tx.send(event.to_string());
             }
-            last.insert(chat_id.to_string(), new_content.to_string());
+            last.insert(key, new_content.to_string());
         }
         Ok(())
     }
@@ -5292,6 +5354,214 @@ mod tests {
                 "replace event for {expected_text} mis-tagged. Expected {expected_cmid}, got: {event}"
             );
         }
+    }
+
+    /// overflow-stress regression (#680 follow-up): when two concurrent
+    /// streams on the same chat have prefix-overlapping content, the
+    /// `chat_id`-only `last_content` key let turn A's prev poison turn B's
+    /// delta computation. A specific failure mode observed in the live
+    /// soak: turn A produces "Hello" first, turn B then sends its own
+    /// independent "Hello world" as a fresh `replace` chunk — pre-fix,
+    /// `edit_message` saw `prev["chat"]="Hello"` and emitted a misleading
+    /// `token` delta " world" tagged with thread B, with the result that
+    /// the web client painted A's earlier content under B's user bubble.
+    /// Per-(chat, thread) keying isolates the two streams so each computes
+    /// its delta against its OWN prev.
+    ///
+    /// The post-fix wire shape: turn A's edit emits a `token` delta from
+    /// its own prev; turn B's first edit emits a full `replace` (because
+    /// no prev exists for B yet). Either way, neither stream cross-talks.
+    #[tokio::test]
+    async fn concurrent_same_chat_streams_do_not_cross_talk_via_last_content() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-overflow".into(), tx);
+        }
+
+        // Step 1: Turn A starts streaming. send_with_id seeds prev for A.
+        let a_initial = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-overflow".into(),
+            content: "Hello".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-A",
+            }),
+        };
+        let a_msg_id = ch.send_with_id(&a_initial).await.unwrap().unwrap();
+        // Drain the initial replace event for A.
+        let _ = rx.recv().await.unwrap();
+
+        // Step 2: Turn B starts streaming on the SAME chat with a DIFFERENT
+        // thread_id. send_with_id must NOT inherit A's prev as B's seed —
+        // that's the cross-talk root cause.
+        let b_initial = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-overflow".into(),
+            content: "Hello world".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-B",
+            }),
+        };
+        let b_msg_id = ch.send_with_id(&b_initial).await.unwrap().unwrap();
+        // Drain the initial replace event for B.
+        let _ = rx.recv().await.unwrap();
+
+        // Step 3: Turn A's stream forwarder emits the next chunk via
+        // edit_message. Pre-fix, the chat-only key now holds B's "Hello
+        // world" so A's edit computed `prev = "Hello world"` (not a prefix
+        // of A's "Hello there") → emitted a wasteful full `replace`. With
+        // per-thread keying, A's prev is its OWN "Hello", so the delta
+        // " there" emits as a `token` tagged for cmid-A.
+        ch.edit_message("chat-overflow", &a_msg_id, "Hello there")
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            parsed["thread_id"], "cmid-A",
+            "edit on A must tag thread_id=cmid-A, not B's. Got: {parsed}"
+        );
+        assert_eq!(
+            parsed["type"], "token",
+            "A's edit should emit a token delta against A's own prev. Got: {parsed}"
+        );
+        assert_eq!(
+            parsed["text"], " there",
+            "A's delta must be from A's own prev (\"Hello\"), not B's (\"Hello world\"). Got: {parsed}"
+        );
+
+        // Step 4: Turn B's edit_message arrives next with content that
+        // happens to share A's "Hello there" prefix. Pre-fix, A's just-
+        // recorded "Hello there" would seed prev["chat"], and B's "Hello
+        // there is something" would emit a `token` " is something" stamped
+        // with cmid-B that contained text *originally produced by A*. With
+        // per-thread keying, B's prev is "Hello world" (B's own seed), and
+        // "Hello there is something" does NOT start with "Hello world", so
+        // we fall through to the safe `replace` path.
+        ch.edit_message("chat-overflow", &b_msg_id, "Hello there is something")
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            parsed["thread_id"], "cmid-B",
+            "B's edit must tag thread_id=cmid-B. Got: {parsed}"
+        );
+        // The critical regression assertion: B's wire payload must NEVER
+        // contain a token delta that *starts with* content originally
+        // produced by A. We assert the non-token shape (full replace)
+        // since "Hello there is something" doesn't extend B's own prev
+        // ("Hello world").
+        assert_eq!(
+            parsed["type"], "replace",
+            "B should emit a full replace (B's prev was \"Hello world\", not a prefix of \"Hello there is something\"). Pre-fix this leaked a cmid-B-tagged token delta containing A's content. Got: {parsed}"
+        );
+        assert_eq!(parsed["text"], "Hello there is something");
+    }
+
+    /// overflow-stress regression: when one concurrent stream finalizes
+    /// (`done`), the `last_content` cleanup must drop ONLY that turn's
+    /// per-thread entry — never wipe a sibling turn's prev. Without per-
+    /// thread keying, A's `done` cleared the chat-wide key, forcing the
+    /// next B chunk to emit a wasteful `replace`. Worse, since the
+    /// chat-only key had been seeded by whichever turn last ran, A's
+    /// `done` could discard B's prev entirely. Per-thread keying scopes
+    /// the cleanup to A and leaves B's stream state untouched.
+    #[tokio::test]
+    async fn done_cleanup_does_not_wipe_concurrent_thread_last_content() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-cleanup".into(), tx);
+        }
+
+        // Turn A and turn B both seed last_content under their own
+        // per-thread keys.
+        let a = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-cleanup".into(),
+            content: "Apples".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-A",
+            }),
+        };
+        let _ = ch.send_with_id(&a).await.unwrap().unwrap();
+        let _ = rx.recv().await.unwrap();
+        let b = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-cleanup".into(),
+            content: "Bananas".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-B",
+            }),
+        };
+        let b_msg_id = ch.send_with_id(&b).await.unwrap().unwrap();
+        let _ = rx.recv().await.unwrap();
+
+        // Turn A finalizes first. The `done` cleanup must scope its
+        // last_content removal to cmid-A only — not blow away B's seed.
+        let a_done = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-cleanup".into(),
+            content: String::new(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_completion": true,
+                "thread_id": "cmid-A",
+            }),
+        };
+        ch.send(&a_done).await.unwrap();
+        // Re-add the broadcast subscriber, since `_completion` removes
+        // the pending channel.
+        let (tx2, mut rx2) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-cleanup".into(), tx2);
+        }
+
+        // Turn B's next chunk should still see B's prev ("Bananas") and
+        // emit a delta `token` for the suffix. Pre-fix this would have
+        // emitted a wasteful full `replace` (or worse, nothing visible)
+        // because A's done wiped the chat-only prev key.
+        ch.edit_message("chat-cleanup", &b_msg_id, "Bananas are yellow")
+            .await
+            .unwrap();
+        let event = rx2.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["thread_id"], "cmid-B");
+        assert_eq!(
+            parsed["type"], "token",
+            "B's prev ('Bananas') must survive A's done cleanup. Got: {parsed}"
+        );
+        assert_eq!(parsed["text"], " are yellow");
     }
 
     /// Pre-cmid clients send messages with no thread_id metadata. The wire
