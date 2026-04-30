@@ -63,7 +63,7 @@ octos serve（控制面板 + 仪表盘，约 140 个 REST 端点）
        ├── 任务监督者（限流扇出、孤立任务清理、运行时恢复）
        ├── 会话存储（JSONL，sticky thread_id，committed_seq，三层压缩）
        ├── 记忆（MEMORY.md + 实体库 + episodes.redb + HNSW）
-       └── 技能（内置 + 自定义；voice_profiles 注册克隆音色）
+       └── 技能（内置 + 自定义；mofa-fm 克隆音色经由 voice_profiles 注册）
 ```
 
 每个配置文件完全隔离 — 拥有独立的数据目录、记忆、会话、技能和 API 密钥。可以在配置文件下创建子账户，子账户继承父配置的 LLM 设置。
@@ -151,7 +151,7 @@ export SMTP_PASSWORD="your-app-password"
 - **日志查看** — 每个 gateway 进程的实时 SSE 日志流
 - **提供商测试** — 在部署前测试 LLM 提供商/模型/API 密钥组合
 - **WhatsApp 二维码** — 扫描二维码绑定 WhatsApp 号码
-- **平台技能** — 监控并管理 ASR/TTS 服务以及 voice_profiles 音色克隆注册
+- **平台技能** — 监控并管理 ASR/TTS 服务；mofa-fm 克隆音色通过 voice_profiles 部署脚本注册
 - **Swarm 调度** — 查看进行中的扇出调度、产物以及单次调度账本
 - **Pipeline 运行** — 节点树、单节点成本、对进行中的运行进行取消/重启
 - **指标** — 每个配置文件的 LLM 提供商 QoS 指标（延迟、错误率）
@@ -186,7 +186,7 @@ Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对�
 |--------|----------|----------|----------|------|
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | 原生 Anthropic | — |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | 原生 OpenAI | — |
-| `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | 原生 Gemini | — |
+| `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | 原生 Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | 原生 OpenRouter | — |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI 自动判定 | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI 兼容 | — |
@@ -195,7 +195,7 @@ Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对�
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI 兼容 | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI 兼容 | — |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI 兼容 | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5 | Anthropic 兼容 | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic 兼容 | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | — |
 | `vllm` | `VLLM_API_KEY` | *（必须指定）* | OpenAI 兼容 | — |
@@ -343,7 +343,7 @@ octos chat --model gpt-4o  # 从模型名称自动检测提供商
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
@@ -395,7 +395,7 @@ octos auth logout --provider openai
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]
@@ -825,7 +825,7 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
          - anthropic（默认：claude-sonnet-4-20250514）[就绪]
          - openai（默认：gpt-4o）[就绪]
          - deepseek（默认：deepseek-chat）[就绪]
-         - gemini（默认：gemini-2.0-flash）[就绪]
+         - gemini（默认：gemini-2.5-flash）[就绪]
          - moonshot（默认：kimi-k2.5）[就绪] [别名：kimi]
          - ollama（默认：llama3.2）[无需密钥]
          ...
@@ -1076,7 +1076,11 @@ octos cron enable <job-id> --disable
 
 ## 12. 内置应用技能
 
-内置应用技能作为编译好的二进制文件随 `octos` 一起发布。它们在 gateway 启动时自动安装到 `.octos/skills/` — 无需手动安装。
+内置应用技能作为编译好的二进制文件随 `octos` 一起发布。Gateway 启动时会写入 `~/.octos/bundled-app-skills/<name>/`（与用户自定义的 `~/.octos/skills/` 分开，重新部署不会覆盖运维/用户的修改）。完整列表见 `BUNDLED_APP_SKILLS`（`crates/octos-agent/src/bundled_app_skills.rs`）：
+
+> **自动安装的内置技能：** news、deep-search、deep-crawl、send-email、account-manager、time（二进制名 `clock`）、weather、pipeline-guard、skill-evolve。加上平台技能 `voice`。
+
+下文的 12.8（微信桥接）和 12.11（启动模板）描述的是 `crates/app-skills/` 下**仅在 workspace 中作为示例的 crate**，并未列入 `BUNDLED_APP_SKILLS`。它们以源码形式随仓库分发，作为模板或传输助手，不会被 gateway 自动安装为运行时技能。
 
 ### 12.1 新闻获取
 
@@ -1459,10 +1463,20 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 ### 12.10 Skill Evolve
 
 **二进制：** `skill-evolve`
+**工具：** `skill_evolve`（单一工具，前台运行 —— 并非 `spawn_only`）
 
-`spawn_only` 技能：观察 Agent 对其他技能的使用情况，识别摩擦点（频繁失败、冗余调用、缺参数），并对某个技能的 `manifest.json` 或 `SKILL.md` 提出有针对性的修改建议。把启动模板适配到具体部署时尤其有用。
+管理**技能演进补丁**：当某个插件工具调用失败时，运行时会自动针对其 `SKILL.md` 生成一条建议修改（澄清参数描述、补充触发关键字等）。Agent 调用 `skill_evolve` 来查看与处理待办队列。
 
-输出是结构化 JSON 提案，由操作员审阅后手动合并 —— 该技能不会自我改写。
+`action` 字段选择具体操作：
+
+| action | 作用 |
+|---|---|
+| `list` | 列出所有技能的待处理补丁 |
+| `apply` | 把一条补丁应用到目标 `SKILL.md` |
+| `discard` | 不应用直接丢弃 |
+| `consolidate` | 合并多条相关补丁为一次编辑 |
+
+补丁须经过本工具复核后方才落盘 —— 技能不会静默自我改写。在把启动模板适配到具体部署、或长时间深度搜索任务积累了反复出现的摩擦反馈时，特别有用。
 
 ### 12.11 Harness Starter（启动模板）
 
@@ -1555,35 +1569,27 @@ curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
        [发送音频文件给用户]
 ```
 
-### 13.5 语音克隆 (`voice_clone_synthesize`)
+### 13.5 语音克隆（由 `mofa-fm` 处理，不在平台 voice 技能内）
 
-从参考音频样本克隆语音进行合成。
+平台 `voice` 技能（即本节）只暴露预设音色 TTS（`voice_synthesize`）。**音色克隆和自定义音色由独立的 `mofa-fm` 技能通过 `fm_tts` 工具处理** —— 克隆接口请参阅 `mofa-fm` 技能仓库。平台 voice 技能的 manifest 中也明确指出该路由：
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `text` | 字符串 | *（必填）* | 要合成的文本 |
-| `reference_audio` | 字符串 | *（必填）* | 参考音频路径（3-10 秒） |
-| `output_path` | 字符串 | 自动 | 输出文件路径 |
-| `language` | 字符串 | `"chinese"` | 目标语言 |
+> "NOTE: This tool only supports preset voices. For voice cloning or custom voice profiles, use mofa-fm (`fm_tts`)."
 
+若 `voice_synthesize` 被传入非预设音色名称，会返回错误，并提示调用方改用 `fm_tts`。
+
+#### 13.5.1 部署时注册克隆音色（#653）
+
+`fm_tts` 把克隆参考 WAV 输出到 `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`。`fm_tts` 在调用前会和 OminiX-API 的音色注册表对照校验；该注册表是进程内内存表，启动时从 `~/.OminiX/models/voices.json` 加载 —— 落盘的 profile WAV **不会被自动发现**。
+
+`scripts/register-fleet-voices.sh` 在远端主机上写入 `voices.json`，让 OminiX-API 的 `/v1/voices` 列出所有已保存的 profile，然后通知守护进程重新加载。该脚本是幂等的（运维手工微调过的 `ref_text` / 别名会被保留）。可作为 `./scripts/deploy.sh` 部署后步骤运行，也可直接修单机：
+
+```bash
+./scripts/register-fleet-voices.sh           # 所有 mini（跳过 mini5）
+./scripts/register-fleet-voices.sh 1         # 仅 mini1
+./scripts/register-fleet-voices.sh user@host --password <pw>
 ```
-用户：用我的声音样本克隆并说"早上好，团队"
-     参考：/tmp/my-voice-sample.wav
 
-机器人：[使用 voice_clone_synthesize，reference_audio="/tmp/my-voice-sample.wav"，
-        text="早上好，团队"，language="chinese"]
-       已用你的声音生成语音。[发送音频]
-```
-
-#### 13.5.1 部署时注册音色（#653）
-
-多租户部署中，可一次性为每个配置注册可复用的音色，无需每次调用都传 `reference_audio`：
-
-1. 把参考样本放入 `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`
-2. 运行 `scripts/register-fleet-voices.sh`（也由 `cloud-host-deploy.sh` 与租户部署脚本自动调用）
-3. 平台技能 voice 运行时会把每个 `<name>.wav` 注册为该配置下的具名音色
-
-注册完成后，Agent 调用 `voice_clone_synthesize` 时只需传具名音色（如 `voice: "alice"`）而无需参考音频路径。再次执行注册脚本会重新读取目录并更新已变化的音色。
+注册完成后，`fm_tts` 引用这些音色名称即可成功调用；未注册时会失败并提示 `"voice 'X' is not registered on ominix-api"`。
 
 ### 13.6 播客生成 (`generate_podcast`)
 
@@ -2058,7 +2064,7 @@ chmod +x .octos/skills/translator/main
 │   └── <profile-id>/
 │       ├── config.json
 │       └── data/
-│           ├── voice_profiles/  # 用于音色克隆注册的参考 WAV
+│           ├── voice_profiles/  # mofa-fm 克隆参考 WAV（由 scripts/register-fleet-voices.sh 注册到 OminiX-API）
 │           ├── media/           # 持久化的音频/图片附件
 │           └── skills/          # 配置专属技能覆盖
 ├── skills/                     # 全局自定义技能
@@ -2086,7 +2092,7 @@ chmod +x .octos/skills/translator/main
 │   ├── time/                   # 内置：时间查询
 │   ├── weather/                # 内置：天气信息
 │   ├── pipeline-guard/         # 内置：pipeline 前置 hook 校验
-│   ├── skill-evolve/           # 内置：技能自我改进（spawn_only）
+│   ├── skill-evolve/           # 内置：技能 SKILL.md 补丁队列（前台）
 │   ├── wechat-bridge/          # 内置：微信 WebSocket 桥接
 │   ├── harness-starter-{audio,coding,generic,report}/  # 启动模板
 │   └── my-custom-skill/        # 用户安装的技能

@@ -63,7 +63,7 @@ octos serve (control plane + dashboard, ~140 REST endpoints)
        ├── Task Supervisor (bounded fan-out, orphan-task reaper, runtime recovery)
        ├── Session Store (JSONL, sticky thread_id, committed_seq, three-tier compaction)
        ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
-       └── Skills (bundled + custom; voice clones registered from voice_profiles)
+       └── Skills (bundled + custom; mofa-fm voice clones registered via voice_profiles)
 ```
 
 Each profile is fully isolated — its own data directory, memory, sessions, skills, and API keys. Sub-accounts can be created under a profile and inherit the parent's LLM configuration.
@@ -213,7 +213,7 @@ Once logged in, the dashboard provides:
 - **Log Viewer** — Real-time SSE log streaming for each gateway process
 - **Provider Testing** — Test LLM provider/model/API key combinations before deploying
 - **WhatsApp QR** — Scan QR code to link a WhatsApp number
-- **Platform Skills** — Monitor and manage ASR/TTS services and voice-clone registration
+- **Platform Skills** — Monitor and manage ASR/TTS services; mofa-fm voice-clone registration via the voice_profiles deploy script
 - **Swarm Dispatch** — Inspect running fan-out dispatches, artifacts, and per-dispatch ledger
 - **Pipeline Runs** — Node tree, per-node cost, cancel/restart for in-flight runs
 - **Metrics** — Per-profile LLM provider QoS metrics (latency, error rates)
@@ -248,7 +248,7 @@ Octos supports 15 LLM providers out of the box. Each provider requires an API ke
 |----------|-------------|---------------|------------|---------|
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native Anthropic | — |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | — |
-| `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | Native Gemini | — |
+| `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | — |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI auto-detected | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | — |
@@ -257,7 +257,7 @@ Octos supports 15 LLM providers out of the box. Each provider requires an API ke
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5 | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
@@ -413,7 +413,7 @@ The `api_type` field forces a specific API wire format:
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
@@ -465,7 +465,7 @@ Configure a priority-ordered fallback chain. If the primary provider fails (401,
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]
@@ -896,7 +896,7 @@ Bot: [uses switch_model tool with action="list"]
        - anthropic (default: claude-sonnet-4-20250514) [ready]
        - openai (default: gpt-4o) [ready]
        - deepseek (default: deepseek-chat) [ready]
-       - gemini (default: gemini-2.0-flash) [ready]
+       - gemini (default: gemini-2.5-flash) [ready]
        - moonshot (default: kimi-k2.5) [ready] [aliases: kimi]
        - ollama (default: llama3.2) [no key needed]
        ...
@@ -1147,7 +1147,11 @@ Check for new issues in the GitHub repo and summarize any urgent ones.
 
 ## 12. Bundled App Skills
 
-Bundled app skills ship as compiled binaries alongside the `octos` binary. They are automatically bootstrapped into `.octos/skills/` on gateway startup — no installation required.
+Bundled app skills ship as compiled binaries alongside the `octos` binary. On gateway startup they are written into `~/.octos/bundled-app-skills/<name>/` (a separate directory from user-installed skills under `~/.octos/skills/`, so a re-deploy never overwrites operator/user customizations). The full list lives in `BUNDLED_APP_SKILLS` (`crates/octos-agent/src/bundled_app_skills.rs`):
+
+> **Bundled (auto-installed):** news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve. Plus the platform-skill `voice`.
+
+Sections 12.8 (WeChat Bridge) and 12.11 (Harness Starters) below describe **workspace example crates** under `crates/app-skills/` that are *not* in `BUNDLED_APP_SKILLS` — they ship in the source tree as templates / transport helpers, not as auto-installed runtime skills.
 
 ### 12.1 News Fetch
 
@@ -1538,10 +1542,20 @@ Validates DOT graphs and injects optimal model assignments before `run_pipeline`
 ### 12.10 Skill Evolve
 
 **Binary:** `skill-evolve`
+**Tool:** `skill_evolve` (single tool, foreground — not `spawn_only`)
 
-`spawn_only` skill that observes how the agent uses other skills, identifies friction points (frequent failures, redundant calls, missing arguments), and proposes targeted edits to a skill's `manifest.json` or `SKILL.md`. Useful when adapting a starter template to a specific deployment.
+Manages **skill-evolution patches** that the runtime auto-generates whenever a plugin tool fails. Patches are proposed edits to a skill's `SKILL.md` that would have prevented the failure (clarified argument descriptions, missing trigger keywords, etc.). The agent invokes `skill_evolve` to inspect and act on the queue.
 
-Output is a structured JSON proposal — operators review and merge changes manually rather than the skill self-modifying.
+`action` field selects the operation:
+
+| action | Effect |
+|---|---|
+| `list` | Show pending patches across all skills |
+| `apply` | Apply a queued patch to its target `SKILL.md` |
+| `discard` | Drop a queued patch without applying |
+| `consolidate` | Fold multiple related patches into a single edit |
+
+Patches are reviewed/applied through this tool — the skill does not self-modify silently. Useful when adapting a starter template to a specific deployment, or when a long-running deep-search session generated repeated friction-pattern feedback.
 
 ### 12.11 Harness Starters
 
@@ -1634,35 +1648,27 @@ Bot: [uses voice_synthesize with text="Welcome to the daily briefing",
      [sends audio file to user]
 ```
 
-### 13.5 Voice Cloning (`voice_clone_synthesize`)
+### 13.5 Voice Cloning (handled by `mofa-fm`, not the platform voice skill)
 
-Synthesizes speech in a cloned voice from a reference audio sample.
+The platform `voice` skill (this section) only exposes preset-voice TTS via `voice_synthesize`. **Voice cloning and custom voice profiles are handled by the separate `mofa-fm` skill via its `fm_tts` tool** — see the `mofa-fm` skill repo for the cloning interface. The platform voice skill's manifest documents this routing:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `text` | string | *(required)* | Text to synthesize |
-| `reference_audio` | string | *(required)* | Path to reference audio (3-10 seconds) |
-| `output_path` | string | auto | Output file path |
-| `language` | string | `"chinese"` | Target language |
+> "NOTE: This tool only supports preset voices. For voice cloning or custom voice profiles, use mofa-fm (`fm_tts`)."
 
+If `voice_synthesize` is called with a name that isn't a preset, it returns an error directing the caller to use `fm_tts` instead.
+
+#### 13.5.1 Registering Cloned Voices on Deploy (#653)
+
+`fm_tts` produces clone reference WAVs under `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`. The OminiX-API voice registry that `fm_tts` validates against is in-memory at startup and loads from `~/.OminiX/models/voices.json` — saved profile WAVs are **not** auto-discovered.
+
+`scripts/register-fleet-voices.sh` writes `voices.json` on the remote host so OminiX-API's `/v1/voices` enumerates every saved voice profile, then nudges the daemon to pick up the change. It is idempotent (operator hand-tunes to `ref_text` / aliases are preserved). Run it as part of `./scripts/deploy.sh` post-deploy, or directly to fix a single host:
+
+```bash
+./scripts/register-fleet-voices.sh           # all minis (skips mini5)
+./scripts/register-fleet-voices.sh 1         # mini1 only
+./scripts/register-fleet-voices.sh user@host --password <pw>
 ```
-User: Clone my voice from this sample and say "Good morning team"
-      Reference: /tmp/my-voice-sample.wav
 
-Bot: [uses voice_clone_synthesize with reference_audio="/tmp/my-voice-sample.wav",
-      text="Good morning team", language="english"]
-     Generated speech in your voice. [sends audio]
-```
-
-#### 13.5.1 Voice Profile Registration on Deploy (#653)
-
-For multi-tenant deployments, declare reusable voice clones once per profile rather than passing `reference_audio` on every call:
-
-1. Drop reference samples into `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`
-2. Run `scripts/register-fleet-voices.sh` (also called automatically as part of `cloud-host-deploy.sh` and tenant deploy scripts)
-3. The platform-skill voice runtime registers each `<name>.wav` as a named voice clone for that profile
-
-After registration, agents can call `voice_clone_synthesize` with a registered name (e.g. `voice: "alice"`) instead of passing a reference audio path. Re-running the registration script picks up new files and re-registers any updates.
+After registration, `fm_tts` calls referencing those voice names succeed; without it they fail with `"voice 'X' is not registered on ominix-api"`.
 
 ### 13.6 Podcast Generation (`generate_podcast`)
 
@@ -2145,7 +2151,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 │   └── <profile-id>/
 │       ├── config.json
 │       └── data/
-│           ├── voice_profiles/  # Reference WAVs for voice-clone registration
+│           ├── voice_profiles/  # mofa-fm clone-reference WAVs (registered with OminiX-API by scripts/register-fleet-voices.sh)
 │           ├── media/           # Persisted audio/image attachments
 │           └── skills/          # Per-profile skill overrides
 ├── skills/                     # Global custom skills
@@ -2173,7 +2179,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 │   ├── time/                   # Bundled: time queries
 │   ├── weather/                # Bundled: weather info
 │   ├── pipeline-guard/         # Bundled: pipeline before-hook validator
-│   ├── skill-evolve/           # Bundled: skill self-improvement (spawn_only)
+│   ├── skill-evolve/           # Bundled: skill SKILL.md patch queue (foreground)
 │   ├── wechat-bridge/          # Bundled: WeChat WebSocket bridge
 │   ├── harness-starter-{audio,coding,generic,report}/  # Starter templates
 │   └── my-custom-skill/        # User-installed skill

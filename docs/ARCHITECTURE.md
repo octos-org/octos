@@ -9,8 +9,10 @@ For the next hardening/generalization round after the runtime refactor, see [OCT
 
 **Workspace members**:
 - **10 octos-* crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli, octos-pipeline, octos-plugin, **octos-sandbox** (Windows AppContainer helper binary), **octos-swarm** (PM/swarm dispatcher, ledger, topology)
-- **14 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather, wechat-bridge, pipeline-guard, skill-evolve, harness-starter-{audio, coding, generic, report}
-- **1 platform-skill crate**: voice
+- **14 app-skill workspace crates**, of which **9 are auto-bootstrapped at gateway startup** (the contents of `BUNDLED_APP_SKILLS` in `crates/octos-agent/src/bundled_app_skills.rs`):
+  - **Bundled (9)**: news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve
+  - **Not bundled (5) — workspace example/utility crates only**: `harness-starter-{audio, coding, generic, report}` (templates for new skill authors), `wechat-bridge` (transport helper, not a tool-providing skill)
+- **1 platform-skill crate**: voice (auto-bootstrapped)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -260,7 +262,7 @@ pub struct CreateParams {
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
 | R9S | r9s.ai | api.r9s.ai/v1 | claude-sonnet-4-6 | R9S_API_KEY |
 
 ### ModelHints (OpenAI provider)
@@ -452,18 +454,12 @@ File-based persistent memory at `{data_dir}/memory/`:
 
 ### HybridIndex — BM25 + Vector Search
 
-```rust
-pub struct HybridIndex {
-    inverted: HashMap<String, Vec<(usize, f32)>>,  // term → [(doc_idx, tf)]
-    doc_lengths: Vec<usize>,
-    avg_dl: f64,
-    ids: Vec<String>,
-    texts: Vec<String>,
-    hnsw: Option<Hnsw<'static, f32, DistCosine>>,
-    has_embedding: Vec<bool>,
-    dimension: usize,                               // default: 1536
-}
-```
+`HybridIndex` (`crates/octos-memory/src/hybrid_search.rs`) combines a BM25 keyword index with an HNSW vector index. State it tracks:
+
+- **BM25 side**: an inverted index `HashMap<term, Vec<(doc_idx, u32 raw_count)>>`, per-doc token lengths, a running `total_len` (so `avg_dl` doesn't need an O(n) recomputation on every insert), and `avg_dl`.
+- **Vector side**: optional `Hnsw<'static, f32, DistCosine>` plus a `has_embedding: Vec<bool>` parallel to the doc list and a fixed `dimension`.
+- **Doc identity**: episode IDs in insertion order (`Vec<String>`). The full episode text is **not** stored in the index — callers fetch documents by ID from the episode store after ranking.
+- **Hybrid weights**: `vector_weight` and `bm25_weight` (defaults 0.7 / 0.3, configurable via `with_weights(..)`).
 
 **BM25 scoring** (constants: K1=1.2, B=0.75):
 - Tokenization: lowercase, split on non-alphanumeric, filter tokens < 2 chars
@@ -570,7 +566,7 @@ pub struct AgentConfig {
 
 **Wall-clock timeout**: Agent aborts after `max_timeout` (default 600s) regardless of iteration count.
 
-**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. See `crates/octos-agent/tests/` replay-harness fixtures.
+**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. The replay harness lives at `crates/octos-bus/tests/jsonl_replay_thread_binding.rs` (#656); end-to-end coverage is in `e2e/tests/live-overflow-thread-binding.spec.ts` and `e2e/tests/live-thread-interleave.spec.ts`.
 
 ### Tool Output Sanitization
 
@@ -595,11 +591,27 @@ Triggered when estimated tokens exceed 80% of context window / 1.2 safety margin
 
 ### Bundled App Skills (`bundled_app_skills.rs`)
 
-Compile-time embedded app-skill entries. Each app-skill crate (news, deep-search, deep-crawl, account-manager, send-email, time, weather, pipeline-guard, skill-evolve, plus the four `harness-starter-*` template skills) is registered as a bundled skill available at runtime.
+`BUNDLED_APP_SKILLS` is a `&[(dir_name, binary_name, SKILL.md, manifest.json)]` slice of nine entries — the only app-skills that ship inside the `octos` binary and get auto-installed at gateway startup:
+
+| dir | binary | purpose |
+|---|---|---|
+| `news` | `news_fetch` | News digest |
+| `deep-search` | `deep-search` | Multi-step research (plugin protocol v2) |
+| `deep-crawl` | `deep_crawl` | Site crawl + synthesis (plugin protocol v2) |
+| `send-email` | `send_email` | SMTP send |
+| `account-manager` | `account_manager` | Sub-account ops |
+| `time` | `clock` | Time/timezone |
+| `weather` | `weather` | Weather API |
+| `pipeline-guard` | `pipeline-guard` | DOT pipeline before-hook validator |
+| `skill-evolve` | `skill-evolve` | Patch-management for skill SKILL.md drift |
+
+`PLATFORM_SKILLS` adds one more entry — `voice` — bootstrapped once by `octos serve` at admin-bot startup, shared across all gateway profiles, only installed when its OminiX-API backend is reachable. Voice cloning is **not** part of the platform voice skill — it is handled by the separate `mofa-fm` skill (`fm_tts`).
+
+The other workspace `app-skills/*` crates (`harness-starter-{audio,coding,generic,report}`, `wechat-bridge`) are **not** in `BUNDLED_APP_SKILLS`. They build as part of `cargo build --workspace` but are not auto-installed by the gateway; harness-starters are templates new skill authors copy, and `wechat-bridge` is a WebSocket transport helper rather than a tool-providing skill.
 
 ### Bootstrap (`bootstrap.rs`)
 
-Bootstraps bundled skills at gateway startup. Ensures all bundled app-skills are registered and available.
+`bootstrap.rs` writes the contents of each `BUNDLED_APP_SKILLS` entry into `~/.octos/bundled-app-skills/<dir>/` (constant: `BUNDLED_APP_SKILLS_DIR = "bundled-app-skills"`) at gateway startup, then drops the matching binary alongside it. The runtime resolves these in addition to user-installed skills under `~/.octos/skills/` and per-profile `~/.octos/profiles/<id>/data/skills/`. Operators or sideloaded user skills go into `~/.octos/skills/` so they aren't overwritten on next bootstrap.
 
 ### Sub-Agent Output Router (M8.7)
 
@@ -655,8 +667,8 @@ pub struct ToolResult {
 | **send_file** | path, caption? | Delivers files to chat channels via OutboundMessage. Path validated against `data_dir`. **Gateway-only** |
 | **git** | subcommand, args | Git operations within workspace |
 | **diff_edit** | path, diff | Unified diff with fuzzy matching (+-3 lines), reverse hunk application |
-| **save_memory** | key, content | Persist memory entries |
-| **recall_memory** | query | Retrieve relevant memories via hybrid search |
+| **save_memory** | name, content | Save / update an entity page in the memory bank. `name` is slugified (lowercase, spaces → hyphens); `content` is full markdown. `Exclusive` concurrency to avoid mid-write reads. |
+| **recall_memory** | name | Load the full markdown content of a memory bank entity by name. Names are listed in the Memory Bank section of the system prompt. |
 | **deep_search** | query | Multi-step research with web search + synthesis |
 | **site_crawl** | url, depth? | Crawl website pages for content extraction |
 | **take_photo** | — | Camera capture (platform-skill integration) |
@@ -1491,11 +1503,16 @@ crates/
 ├── octos-swarm/src/
 │   └── lib.rs, dispatcher.rs, ledger.rs, topology.rs,
 │       persistence.rs, result.rs
-├── app-skills/    (14 crates: account-manager, deep-crawl, deep-search,
-│                    harness-starter-{audio, coding, generic, report},
-│                    news, pipeline-guard, send-email, skill-evolve,
-│                    time, weather, wechat-bridge)
-└── platform-skills/voice/   (TTS / ASR / voice clone runtime)
+├── app-skills/    (14 workspace crates; only 9 are auto-bootstrapped via
+│                    BUNDLED_APP_SKILLS:
+│                      news, deep-search, deep-crawl, send-email,
+│                      account-manager, time, weather, pipeline-guard,
+│                      skill-evolve.
+│                    Workspace-only (not bundled):
+│                      harness-starter-{audio, coding, generic, report},
+│                      wechat-bridge)
+└── platform-skills/voice/   (preset-voice TTS + ASR via OminiX-API.
+                              Cloning lives in mofa-fm / fm_tts, not here.)
 ```
 
 ---
@@ -1649,7 +1666,7 @@ Highlights of the current suite:
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing
 - **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries
 - **Queue modes**: Followup, Collect, Steer, Interrupt, Speculative — overflow + auto-escalation/deescalation
-- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (replay-harness fixtures, #656)
+- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (`crates/octos-bus/tests/jsonl_replay_thread_binding.rs`, #656)
 - **M8 runtime invariants**: `e2e/tests/m8-runtime-invariants-live.spec.ts` — sub-agent output router, structured resume, orphan reaper, supervisor caps
 - **Live progress gate**: `e2e/tests/live-progress-gate.spec.ts` — background-task UX (#655)
 - **Plugin contract**: `crates/octos-plugin/tests/lifecycle_sandbox.rs` — protocol v2 events
