@@ -191,6 +191,17 @@ impl ToolRegistry {
         self.workspace_root.as_deref()
     }
 
+    /// Record a workspace cwd on this registry without re-creating the
+    /// cwd-bound tools. Used by the AppUi `session_tool_registry` Tier-2
+    /// fallback so an operator-configured default folder shows up in
+    /// `workspace_root()` and the per-session `rebind_cwd` path can pick
+    /// it up. The existing `rebind_cwd` API mints a fresh registry, which
+    /// is wasteful when we only want to update the recorded path on a
+    /// freshly-built registry; this setter mutates in place.
+    pub fn set_workspace_root(&mut self, cwd: PathBuf) {
+        self.workspace_root = Some(cwd);
+    }
+
     /// Register a background task and return its ID.
     pub fn register_task(&self, tool_name: &str, tool_call_id: &str) -> String {
         self.supervisor
@@ -1106,6 +1117,18 @@ mod cwd_isolation_tests {
             rebound_task.session_key.is_none(),
             "session key must be supplied by the new session actor, not inherited"
         );
+    }
+
+    #[test]
+    fn set_workspace_root_records_path_for_session_tool_registry_fallback() {
+        let mut reg = ToolRegistry::new();
+        assert!(
+            reg.workspace_root().is_none(),
+            "fresh registry must not advertise a workspace_root"
+        );
+        let cwd = std::path::PathBuf::from("/tmp/test-default-cwd");
+        reg.set_workspace_root(cwd.clone());
+        assert_eq!(reg.workspace_root(), Some(cwd.as_path()));
     }
 }
 

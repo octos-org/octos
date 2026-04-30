@@ -800,6 +800,47 @@ impl Agent {
         self.sandbox_config.clone()
     }
 
+    /// Anchor the agent's tool registry to a workspace cwd.
+    ///
+    /// This is the Tier-2 hook used by the AppUi `session_tool_registry`
+    /// fallback chain in `octos serve`: when a client did not advertise
+    /// the `session.workspace_cwd.v1` capability and so cannot send its
+    /// own per-session cwd, the registry's `workspace_root()` becomes the
+    /// rebind target. Without this builder, the API agent's registry
+    /// always reports `None` and Tier-2 is dead.
+    ///
+    /// Mutates the registry in place when this builder owns the only
+    /// strong `Arc` (the typical post-`Agent::new` chain). If the `Arc`
+    /// is already shared, falls back to copying via `snapshot_excluding`
+    /// so we still anchor a fresh registry rather than silently dropping
+    /// the request.
+    ///
+    /// **Call ordering:** invoke this builder BEFORE
+    /// [`Self::wire_activate_tools`]. `wire_activate_tools` plants a
+    /// `Weak<ToolRegistry>` inside the `ActivateToolsTool` instance; if
+    /// this builder hits the fallback `snapshot_excluding(&[])` branch
+    /// (because the `Arc` was already shared by then), the Weak ref will
+    /// still point at the pre-copy registry and `ActivateToolsTool`
+    /// would observe a stale view. The current `serve.rs`/`session_actor`
+    /// flow calls `wire_activate_tools` strictly later (in
+    /// `session_actor.rs`), so this is fine; future refactors should
+    /// preserve that order or re-wire after copying.
+    pub fn with_workspace_root(mut self, cwd: PathBuf) -> Self {
+        if let Some(tools) = Arc::get_mut(&mut self.tools) {
+            tools.set_workspace_root(cwd);
+        } else {
+            // The Arc is already shared. Fall back to a deep copy so the
+            // new workspace_root still wins. ToolRegistry is intentionally
+            // not Clone, so use the existing snapshot helper which handles
+            // interior mutex state correctly. See call-ordering note
+            // above re: `wire_activate_tools`.
+            let mut copy = self.tools.snapshot_excluding(&[]);
+            copy.set_workspace_root(cwd);
+            self.tools = Arc::new(copy);
+        }
+        self
+    }
+
     /// Get a snapshot of the current system prompt.
     pub fn system_prompt_snapshot(&self) -> String {
         self.system_prompt
