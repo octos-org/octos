@@ -593,6 +593,14 @@ fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
         obj.remove("$ref");
         obj.remove("$id");
 
+        // Gemini's tool API rejects unknown field names with HTTP 400
+        // ("Unknown name <field>"), even for the conventional `x-*` JSON
+        // Schema vendor-extension namespace. Strip them before the schema
+        // reaches the wire so host-only metadata (e.g. octos's
+        // `x-octos-host-config-keys` on the deep-search manifest) doesn't
+        // crash plan_and_search workers when routing lands on Gemini.
+        obj.retain(|k, _| !k.starts_with("x-"));
+
         // Gemini requires `items` to have a type when present.
         // Replace empty `"items": {}` with `"items": {"type": "string"}`.
         if let Some(items) = obj.get("items") {
@@ -802,6 +810,29 @@ mod tests {
         assert!(schema.get("$ref").is_none());
         assert!(schema.get("$id").is_none());
         assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn test_sanitize_strips_x_extension_keys() {
+        // Pins the fix for the deep-search → Gemini 400 regression where
+        // `x-octos-host-config-keys` in input_schema crashed plan_and_search
+        // workers. Gemini's tool API rejects unknown field names (including
+        // the conventional `x-*` extension namespace) with HTTP 400.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "synthesis_config": {"type": "object"},
+                "query": {"type": "string"}
+            },
+            "x-octos-host-config-keys": ["synthesis_config"],
+            "x-some-other-extension": {"nested": true}
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert!(schema.get("x-octos-host-config-keys").is_none());
+        assert!(schema.get("x-some-other-extension").is_none());
+        // Non-x-prefixed fields preserved.
+        assert!(schema.get("type").is_some());
+        assert!(schema.get("properties").is_some());
     }
 
     #[test]
