@@ -252,8 +252,14 @@ Octos uses `"mode"` in `~/.octos/config.json` to describe how a running node beh
 For development against an unreleased checkout:
 
 ```bash
-# Build and install
-cargo install --path crates/octos-cli
+# Build and install. The features below are the canonical default
+# (matches scripts/milestone-ci.sh) — `octos serve` requires `api`,
+# and the gateway needs the relevant channel feature for each
+# transport (telegram, discord, etc.). A bare `cargo install --path
+# crates/octos-cli` will give you a binary missing `serve` and
+# without channel adapters.
+cargo install --path crates/octos-cli \
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
 
 # Initialize workspace
 octos init
@@ -275,7 +281,7 @@ For a repo-local tenant deploy (builds from source, sets up the same service + t
 
 ### Iterating on a system-installed octos
 
-`cargo install --path crates/octos-cli` only drops a binary into `~/.cargo/bin`. It does **not** rebuild the embedded admin dashboard or touch the service installed by `scripts/install.sh` (the LaunchDaemon on macOS / systemd unit on Linux runs `/usr/local/bin/octos`). If you have already run `install.sh` and want to redeploy local changes, use:
+`cargo install --path crates/octos-cli --features "api,..."` only drops a binary into `~/.cargo/bin`. It does **not** rebuild the embedded admin dashboard or touch the service installed by `scripts/install.sh` (the LaunchDaemon on macOS / systemd unit on Linux runs `/usr/local/bin/octos`). If you have already run `install.sh` and want to redeploy local changes, use:
 
 ```bash
 ./scripts/build-local-bundle.sh --install           # build + bundle + reinstall
@@ -296,7 +302,7 @@ Use this when:
 - You changed Rust **or** dashboard code and need to see it running under the installed service.
 - You want to exercise the full installer flow against a local build.
 
-Skip it when you just need the CLI (`octos chat`, `octos gateway`) — `cargo install --path crates/octos-cli` is faster.
+Skip it when you just need the CLI — `cargo install --path crates/octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"` is faster. Trim the feature list to only the channels you need (or just `api` for `octos chat` + `octos serve`); leaving `api` off is what causes `octos serve` to fail with `unrecognized subcommand 'serve'`.
 
 ## Documentation
 

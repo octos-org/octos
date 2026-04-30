@@ -1233,7 +1233,10 @@ case "$TRIPLE" in
     aarch64-apple-darwin|x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) ;; # published in release workflow
     x86_64-apple-darwin)
         err "macOS x86_64 does not have pre-built binaries yet."
-        hint "Build from source: cargo install --path crates/octos-cli"
+        hint "Build from source with the canonical feature set:"
+        hint "  cargo install --path crates/octos-cli \\"
+        hint "      --features \"api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot\""
+        hint "(matches scripts/milestone-ci.sh; \`api\` is required for \`octos serve\`.)"
         ;;
 esac
 
