@@ -305,7 +305,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // First-run setup wizard
         .route("/api/admin/token/status", get(admin_setup::token_status))
         .route("/api/admin/token/rotate", post(admin_setup::rotate_token))
-        .route("/api/admin/token/email", post(admin_setup::post_token_email))
+        .route(
+            "/api/admin/token/email",
+            post(admin_setup::post_token_email),
+        )
         .route("/api/admin/setup/state", get(admin_setup::get_setup_state))
         .route("/api/admin/setup/step", post(admin_setup::post_setup_step))
         .route(

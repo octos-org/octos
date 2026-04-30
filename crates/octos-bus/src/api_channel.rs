@@ -963,8 +963,15 @@ impl Channel for ApiChannel {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
             };
-            if let Some(event) = build_session_result_event(result, &data_dir, None, topic) {
+            if let Some(mut event) = build_session_result_event(result, &data_dir, None, topic) {
                 record_result_delivery("session_result_event", "metadata", "session_result");
+                // M8.10 follow-up (#649): tag the wire-side session_result
+                // with the resolved thread_id so the web client routes it
+                // under the originating bubble. Without this, late-arriving
+                // background results (deep_research, spawn_only completions)
+                // appear under whichever turn happens to hold the sticky
+                // thread_id, NOT the turn that actually launched them.
+                inject_thread_id(&mut event, thread_id.as_deref());
                 self.broadcast_session_event(&msg.chat_id, topic, event)
                     .await;
             }
@@ -3504,6 +3511,137 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// M8.10 follow-up (#649) regression: when the api_channel sticky map
+    /// has rotated through three turns (A → B → C) and a long-running
+    /// background task originating in turn A finally finalises, the wire
+    /// event MUST carry turn A's thread_id (sourced from explicit
+    /// metadata) and NOT the most-recent sticky value (turn C).
+    ///
+    /// Reproduces the live mini3 trace (2026-04-29, session
+    /// `web-1777402538752-zn7jfr`) where the deep_research turn's late
+    /// output landed under the voices turn's bubble — the bug this PR
+    /// fixes.
+    #[tokio::test]
+    async fn late_tool_result_for_overflow_turn_keeps_originating_thread_id_under_3_user_race() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-race-chat".into(), tx);
+        }
+
+        // Simulate the production scenario: 3 user turns rotate the
+        // sticky map A → B → C as their first SSE events go out. We
+        // drive the rotation directly by calling `remember_thread_id`
+        // (the same hook every `send`/`send_with_id` uses).
+        ch.remember_thread_id("test-race-chat", Some("cmid-A-deep-research"))
+            .await;
+        ch.remember_thread_id("test-race-chat", Some("cmid-B-stocks"))
+            .await;
+        ch.remember_thread_id("test-race-chat", Some("cmid-C-voices"))
+            .await;
+        // After this, the sticky map points at C — the WRONG thread for
+        // a late-arriving turn-A result.
+
+        // Now turn A's background task finally finalises. It carries
+        // `thread_id=cmid-A-deep-research` in OutboundMessage metadata
+        // (the fix). The api_channel must honour this explicit metadata
+        // INSTEAD of falling through to the sticky map.
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-race-chat".into(),
+            content: "Deep research report on space exploration".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_history_persisted": true,
+                "thread_id": "cmid-A-deep-research",
+                "_session_result": {
+                    "seq": 9,
+                    "role": "assistant",
+                    "content": "Deep research report on space exploration",
+                    "timestamp": "2026-04-29T05:56:03Z",
+                    "media": [],
+                    "thread_id": "cmid-A-deep-research",
+                }
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "session_result");
+        assert_eq!(
+            parsed.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-A-deep-research"),
+            "wire-side session_result MUST be tagged with the turn A cmid \
+             carried explicitly in OutboundMessage metadata; the sticky \
+             map (which now points at turn C) must NOT win. Got: {parsed}"
+        );
+        assert_eq!(
+            parsed["message"].get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-A-deep-research"),
+            "the embedded message body must also carry the originating \
+             thread_id so the web client renders it under the right bubble \
+             (the v2 thread-store keys off `message.thread_id`)"
+        );
+    }
+
+    /// M8.10 follow-up (#649) regression: explicit `thread_id` in
+    /// OutboundMessage metadata MUST win over the sticky map for the
+    /// `replace`/wire-side text path too. This pins the contract that
+    /// `outbound_thread_id(metadata)` is consulted BEFORE
+    /// `sticky_thread_id(chat_id)` in `send()`.
+    #[tokio::test]
+    async fn explicit_metadata_thread_id_wins_over_sticky_for_replace_event() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-explicit-chat".into(), tx);
+        }
+
+        // Sticky map says C.
+        ch.remember_thread_id("test-explicit-chat", Some("cmid-sticky-C"))
+            .await;
+
+        // Outbound carries A explicitly.
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-explicit-chat".into(),
+            content: "originating turn A reply".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({ "thread_id": "cmid-explicit-A" }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "replace");
+        assert_eq!(
+            parsed.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-explicit-A"),
+            "explicit metadata.thread_id must outrank the sticky map; got {parsed}"
+        );
+    }
+
     #[tokio::test]
     async fn broadcasts_session_result_for_user_message_with_client_message_id() {
         // Verifies that the api_channel `send()` path emits a session_result
@@ -4979,6 +5117,181 @@ mod tests {
         let event = rx.recv().await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
         assert_eq!(parsed["thread_id"], "cmid-explicit-A");
+    }
+
+    /// #649 follow-up (rapid-fire): when 5 chat streams interleave on the
+    /// same chat_id, each turn's stream forwarder must call `send_with_id`
+    /// with its OWN cmid in metadata so subsequent `edit_message` /
+    /// `send_raw_sse` calls can recover the right thread.
+    ///
+    /// Pre-fix the stream forwarder built outbound metadata containing only
+    /// `streaming: true` and let `send_with_id` fall back to the sticky
+    /// map. Under rapid-fire (Q1..Q5 lining up on the same session before
+    /// any of them finishes), the sticky map has rotated to the LAST
+    /// request's cmid by the time Q1's first chunk reaches the channel —
+    /// so Q1's encoded message_id captures Q5's cmid and every subsequent
+    /// streaming `token` / `replace` for Q1 mis-routes to Q5's bubble on
+    /// the web client. This drives that exact ordering and asserts each
+    /// turn's encoded message_id carries its OWN thread_id when supplied
+    /// explicitly via the OutboundMessage metadata.
+    #[tokio::test]
+    async fn send_with_id_uses_explicit_metadata_thread_id_over_sticky() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, _rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-rapid-fire".into(), tx);
+        }
+
+        // Five rapid-fire `handle_chat`-equivalent sticky rotations: the
+        // PRODUCTION race is each new request pinning sticky to its own
+        // cmid before any earlier turn has produced its first stream
+        // chunk. By the time Q1's stream forwarder calls `send_with_id`,
+        // sticky already holds Q5's cmid.
+        for cmid in ["cmid-A", "cmid-B", "cmid-C", "cmid-D", "cmid-E"] {
+            ch.remember_thread_id("chat-rapid-fire", Some(cmid)).await;
+        }
+
+        // Q1's stream forwarder calls `send_with_id` with metadata that
+        // EXPLICITLY carries Q1's cmid (the post-fix shape). The encoded
+        // message_id must capture cmid-A — NOT the sticky's cmid-E.
+        let q1 = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-rapid-fire".into(),
+            content: "first chunk for Q1".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-A",
+            }),
+        };
+        let q1_msg_id = ch
+            .send_with_id(&q1)
+            .await
+            .unwrap()
+            .expect("send_with_id always returns Some");
+        let (_, q1_decoded) = decode_sse_message_id(&q1_msg_id);
+        assert_eq!(
+            q1_decoded.as_deref(),
+            Some("cmid-A"),
+            "Q1's encoded message_id must capture its OWN cmid, not the sticky's last value (cmid-E). Got: {q1_msg_id}"
+        );
+
+        // Q3 lands next, also with explicit metadata. Same expectation —
+        // Q3's encoded id must reflect Q3's cmid even though sticky still
+        // points elsewhere.
+        let q3 = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-rapid-fire".into(),
+            content: "first chunk for Q3".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-C",
+            }),
+        };
+        let q3_msg_id = ch
+            .send_with_id(&q3)
+            .await
+            .unwrap()
+            .expect("send_with_id always returns Some");
+        let (_, q3_decoded) = decode_sse_message_id(&q3_msg_id);
+        assert_eq!(
+            q3_decoded.as_deref(),
+            Some("cmid-C"),
+            "Q3's encoded message_id must capture its OWN cmid even with concurrent sticky rotations. Got: {q3_msg_id}"
+        );
+    }
+
+    /// #649 follow-up (rapid-fire): drive an end-to-end interleaved
+    /// 5-turn rapid-fire scenario through `send` and assert each turn's
+    /// `replace` event carries its OWN cmid when the OutboundMessage
+    /// metadata supplies one explicitly. This exercises the path the
+    /// stream forwarder takes for non-first chunks (the inner `send` call
+    /// from `send_with_id`).
+    #[tokio::test]
+    async fn rapid_fire_streaming_chunks_carry_per_turn_thread_id() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-rapid".into(), tx);
+        }
+
+        // Simulate `handle_chat` rotating sticky to the LATEST cmid as
+        // each rapid-fire request arrives.
+        for cmid in ["cmid-A", "cmid-B", "cmid-C", "cmid-D", "cmid-E"] {
+            ch.remember_thread_id("chat-rapid", Some(cmid)).await;
+        }
+
+        // Each turn's first chunk arrives via `send` with explicit
+        // thread_id metadata. The `replace` event emitted on the wire
+        // must be tagged with that cmid, NOT the latest sticky value.
+        let cases = [
+            ("cmid-A", "Q1 reply"),
+            ("cmid-B", "Q2 reply"),
+            ("cmid-C", "Q3 reply"),
+            ("cmid-D", "Q4 reply"),
+        ];
+        for (cmid, content) in &cases {
+            let msg = OutboundMessage {
+                channel: "api".into(),
+                chat_id: "chat-rapid".into(),
+                content: (*content).into(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({
+                    "streaming": true,
+                    "thread_id": cmid,
+                }),
+            };
+            ch.send(&msg).await.unwrap();
+            // Reset last_content so each turn's chunk emits as a `replace`,
+            // not a delta `token` (the production stream forwarder calls
+            // `send_with_id` first which clears last_content; we mimic that
+            // by clearing it inline here).
+            ch.last_content.lock().await.remove("chat-rapid");
+        }
+
+        // Drain wire events and verify each carries its OWN cmid.
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            events.push(serde_json::from_str(&payload).unwrap());
+        }
+        let replaces: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["type"] == "replace").collect();
+        assert_eq!(
+            replaces.len(),
+            cases.len(),
+            "expected {} replace events, got {}: {:?}",
+            cases.len(),
+            replaces.len(),
+            events,
+        );
+        for ((expected_cmid, expected_text), event) in cases.iter().zip(replaces.iter()) {
+            assert_eq!(
+                event["text"], *expected_text,
+                "replace event text mismatch: {event}"
+            );
+            assert_eq!(
+                event["thread_id"], *expected_cmid,
+                "replace event for {expected_text} mis-tagged. Expected {expected_cmid}, got: {event}"
+            );
+        }
     }
 
     /// Pre-cmid clients send messages with no thread_id metadata. The wire

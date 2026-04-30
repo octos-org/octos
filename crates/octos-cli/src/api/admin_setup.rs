@@ -1107,7 +1107,10 @@ mod tests {
         let state = smtp_state(dir.path());
         let Json(body) = get_deployment_mode(State(state)).await.unwrap();
         assert_eq!(body.mode, "local");
-        assert!(!body.explicit, "implicit default must report explicit=false");
+        assert!(
+            !body.explicit,
+            "implicit default must report explicit=false"
+        );
     }
 
     #[tokio::test]

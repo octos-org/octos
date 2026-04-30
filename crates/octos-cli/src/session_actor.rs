@@ -211,9 +211,25 @@ async fn persist_assistant_message(
     data_dir: &Path,
     content: String,
     media: Vec<String>,
+    thread_id: Option<String>,
 ) -> Option<PersistedSessionMessage> {
     let mut assistant_msg = Message::assistant(content);
     assistant_msg.media = media;
+    // M8.10 follow-up (#649): pre-stamp `thread_id` BEFORE handing the
+    // message to the canonical persist helper. `add_message_with_seq`'s
+    // derivation falls back to "most recent user in history" — for a
+    // late-arriving background result that's the WRONG user (a later turn
+    // that happened after the originating one). When the caller knows the
+    // originating turn (background results carry `originating_thread_id`
+    // through `BackgroundResultPayload`), passing it here pins the
+    // persisted JSONL row to the correct thread so reload pairs the
+    // assistant under the originating user bubble. Foreground turns pass
+    // `None` and continue to use the derivation fallback (correct).
+    if let Some(tid) = thread_id {
+        if !tid.is_empty() {
+            assistant_msg.thread_id = Some(tid);
+        }
+    }
     let timestamp = assistant_msg.timestamp;
 
     // Funnel through the canonical helper so the per-key Tokio mutex
@@ -394,6 +410,7 @@ async fn persist_terminal_reply_and_fanout(
         data_dir,
         content.clone(),
         media.clone(),
+        thread_id.map(str::to_string),
     )
     .await
     else {
@@ -970,6 +987,7 @@ async fn dispatch_background_result_to_actor(
             content: payload.content,
             kind: payload.kind,
             media: payload.media,
+            originating_thread_id: payload.originating_thread_id,
             ack: Some(ack_tx),
         }),
     )
@@ -1250,6 +1268,13 @@ pub enum ActorMessage {
         kind: BackgroundResultKind,
         /// Media files attached to this terminal background result.
         media: Vec<String>,
+        /// M8.10 follow-up (#649): the user message's `client_message_id`
+        /// from the turn that originated this background task. Stamped onto
+        /// the outbound's `metadata.thread_id` so wire-side SSE events land
+        /// under the originating bubble even after subsequent unrelated user
+        /// turns have rotated the per-chat sticky thread_id. `None` for
+        /// legacy callers and tests that pre-date #649.
+        originating_thread_id: Option<String>,
         /// Completion acknowledgment for durable persistence.
         ack: Option<oneshot::Sender<bool>>,
     },
@@ -2692,10 +2717,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -3320,10 +3352,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -3397,10 +3436,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -3443,7 +3489,19 @@ impl SessionActor {
 
     /// Persist an assistant-visible background result and emit the matching
     /// committed session-result event metadata for the web/runtime surfaces.
-    async fn deliver_background_notification(&self, content: String, media: Vec<String>) -> bool {
+    ///
+    /// M8.10 follow-up (#649): `originating_thread_id` is the
+    /// `client_message_id` of the user message that started the background
+    /// task. When present it is stamped onto the OutboundMessage metadata
+    /// so the api_channel routes the wire-side SSE event under the correct
+    /// turn — even when subsequent unrelated user turns have rotated the
+    /// per-chat sticky thread_id.
+    async fn deliver_background_notification(
+        &self,
+        content: String,
+        media: Vec<String>,
+        originating_thread_id: Option<String>,
+    ) -> bool {
         let content = finalize_assistant_content(&self.session_key, &self.user_workspace, &content);
         let persisted = persist_assistant_message(
             &self.session_handle,
@@ -3451,6 +3509,7 @@ impl SessionActor {
             &self.data_dir,
             content.clone(),
             media.clone(),
+            originating_thread_id.clone(),
         )
         .await;
 
@@ -3467,7 +3526,7 @@ impl SessionActor {
             return false;
         };
 
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "topic": self.session_key.topic(),
             "_history_persisted": true,
             "_session_result": {
@@ -3478,6 +3537,36 @@ impl SessionActor {
                 "media": media.clone(),
             }
         });
+
+        // M8.10 follow-up (#649): stamp `thread_id` onto the OutboundMessage
+        // metadata so the api_channel resolves it via the explicit-metadata
+        // path (NOT the per-chat sticky-map fallback). Without this stamp,
+        // a deep_research / spawn_only result that completes after later
+        // user turns inherits the WRONG turn's thread_id from the sticky
+        // map (cf. live mini3 trace, 2026-04-29). The non-empty guard mirrors
+        // `persist_assistant_message`'s — wire and disk agree on what counts
+        // as a usable origin id, so a degenerate `Some("")` falls through to
+        // the api_channel sticky-map fallback rather than poisoning routing.
+        if let Some(tid) = originating_thread_id
+            .as_deref()
+            .filter(|tid| !tid.is_empty())
+        {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+                if let Some(sr) = obj
+                    .get_mut("_session_result")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    sr.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(tid.to_string()),
+                    );
+                }
+            }
+        }
 
         let _ = send_outbound_with_timeout(
             &self.session_key,
@@ -3503,15 +3592,16 @@ impl SessionActor {
         content: &str,
         kind: BackgroundResultKind,
         media: Vec<String>,
+        originating_thread_id: Option<String>,
     ) -> bool {
         if kind == BackgroundResultKind::Notification {
-            self.deliver_background_notification(content.to_string(), media)
+            self.deliver_background_notification(content.to_string(), media, originating_thread_id)
                 .await
         } else {
             let report_message = self
                 .prepare_background_report_result(task_label, content)
                 .await;
-            self.deliver_background_notification(report_message, Vec::new())
+            self.deliver_background_notification(report_message, Vec::new(), originating_thread_id)
                 .await
         }
     }
@@ -3794,6 +3884,7 @@ impl SessionActor {
             &self.data_dir,
             ack_content.clone(),
             vec![],
+            client_message_id.clone(),
         )
         .await;
 
@@ -4046,6 +4137,14 @@ impl SessionActor {
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
                     op_updater,
+                    // #649 follow-up (rapid-fire): forward THIS turn's
+                    // cmid so the forwarder stamps every `send_with_id` /
+                    // `edit_message` outbound with it. Concurrent overflow
+                    // turns each get their OWN forwarder + their OWN
+                    // cmid — under rapid-fire 5 turns that prevents the
+                    // shared sticky map from collapsing them onto one
+                    // bubble.
+                    client_message_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -4191,10 +4290,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -4977,6 +5083,13 @@ impl SessionActor {
                     session_key.clone(),
                     sender_user_id.clone(),
                     op_updater,
+                    // #649 follow-up (rapid-fire): each overflow turn
+                    // captures its OWN cmid up front so its stream
+                    // forwarder stamps every outbound with it. Without
+                    // this, 5 concurrent rapid-fire overflow forwarders
+                    // fight over the shared sticky map and collapse onto
+                    // the bubble of whichever turn arrived last.
+                    overflow_client_message_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -5386,6 +5499,9 @@ impl SessionActor {
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
                     op_updater,
+                    // #649 follow-up (rapid-fire): forward this turn's
+                    // cmid so streaming chunks stamp it on the wire.
+                    client_message_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -8495,6 +8611,7 @@ mod tests {
             content: "Background research completed with 5 findings.".to_string(),
             kind: BackgroundResultKind::Report,
             media: vec![],
+            originating_thread_id: None,
             ack: None,
         })
         .await
@@ -8572,6 +8689,7 @@ mod tests {
             content: "Background research completed with 5 findings.".to_string(),
             kind: BackgroundResultKind::Report,
             media: vec![],
+            originating_thread_id: None,
             ack: None,
         })
         .await
@@ -8644,6 +8762,7 @@ mod tests {
             content: String::new(),
             kind: BackgroundResultKind::Notification,
             media: vec![media_path.to_string_lossy().to_string()],
+            originating_thread_id: None,
             ack: Some(ack_tx),
         })
         .await
@@ -8678,6 +8797,269 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    /// M8.10 follow-up (#649) regression: when a `BackgroundResult` carries
+    /// an `originating_thread_id` (the user message's `client_message_id`
+    /// from the turn that started the background task), the OutboundMessage
+    /// the actor emits MUST stamp that id onto the metadata so the
+    /// api_channel routes the wire-side SSE event under the originating
+    /// turn — NOT whatever the per-chat sticky map currently holds.
+    ///
+    /// Drives the production scenario from mini3 (2026-04-29): three user
+    /// turns rotate the sticky map, then a long-running deep_research
+    /// background task originating in turn A finally finalises. Pre-fix,
+    /// the OutboundMessage metadata lacked thread_id and the sticky map
+    /// (now pointing at turn C) won; post-fix, the explicit metadata
+    /// thread_id always pins the result to turn A.
+    #[tokio::test]
+    async fn late_tool_result_for_overflow_turn_keeps_originating_thread_id_under_3_user_race() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // No active turn: the actor is idle, simulating "background task
+        // finalises long after the originating turn ended". This is the
+        // exact production failure mode.
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let originating_cmid = "cmid-A-deep-research-originator";
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "deep_research".to_string(),
+            content: "Deep research report on space exploration.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            originating_thread_id: Some(originating_cmid.to_string()),
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background result must be persisted"
+        );
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+
+        // The OutboundMessage metadata MUST carry thread_id at the top
+        // level so api_channel's `outbound_thread_id(&msg.metadata)` lookup
+        // returns Some(originating_cmid) and bypasses the sticky-map
+        // fallback. This is the contract the bug fix relies on.
+        assert_eq!(
+            outbound.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some(originating_cmid),
+            "OutboundMessage metadata must carry the originating turn's \
+             thread_id so api_channel resolves it via the explicit-metadata \
+             path; got metadata = {}",
+            outbound.metadata,
+        );
+
+        // The embedded `_session_result` ALSO carries thread_id so the
+        // wire-side session_result event the api_channel emits has it
+        // baked into the message body the web client renders. The v2
+        // thread-store keys off `message.thread_id` for routing.
+        assert_eq!(
+            outbound
+                .metadata
+                .get("_session_result")
+                .and_then(|sr| sr.get("thread_id"))
+                .and_then(|v| v.as_str()),
+            Some(originating_cmid),
+            "embedded _session_result must also carry thread_id so the web \
+             client renders the late result under the originating bubble; \
+             got metadata = {}",
+            outbound.metadata,
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// M8.10 follow-up (#649) PERSISTENCE regression: when a late-arriving
+    /// `BackgroundResult` carries an `originating_thread_id`, the PERSISTED
+    /// JSONL row for the assistant message must carry that thread_id —
+    /// NOT whatever `derive_thread_id_for_new_message`'s "most recent user
+    /// in history" fallback would pick.
+    ///
+    /// PR #664 stamped `thread_id` on the wire-side `OutboundMessage.metadata`
+    /// so the live SSE event routed correctly, but `persist_assistant_message`
+    /// kept building the message via `Message::assistant(content)` (no
+    /// `thread_id`). On the canonical persist path, `add_message_with_seq`
+    /// derives `thread_id` from the most recent USER message in history —
+    /// for a deep-research result that arrives after Q3, that's Q3's cmid,
+    /// not Q1's. Reload from JSONL therefore mis-pairs the assistant under
+    /// the WRONG bubble.
+    ///
+    /// This test pre-seeds three users (Q1/Q2/Q3) into the on-disk session
+    /// transcript, sends a late `BackgroundResult` carrying Q1's cmid as
+    /// `originating_thread_id`, and verifies the persisted JSONL row picks
+    /// up Q1's cmid — proving the new pre-stamp short-circuits the
+    /// derivation fallback before it can mis-attribute.
+    #[tokio::test]
+    async fn late_background_result_persists_with_originating_thread_id_not_derived_from_latest_user()
+     {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::new("cli", "test");
+
+        // Pre-seed three user messages, each with its own client_message_id,
+        // through the canonical persist path so the JSONL has the same
+        // shape the actor would observe on reload. After this loop the
+        // disk transcript is [Q1, Q2, Q3] — Q3 is the "most recent user".
+        let originating_cmid = "originating-A-deep-research-Q1";
+        let later_cmids = ["B-stocks-Q2", "C-voices-Q3"];
+        {
+            let user_a = Message::user("Q1: kick off deep research")
+                .with_client_message_id(originating_cmid);
+            octos_bus::session::persist_message_through_canonical_path(
+                dir.path(),
+                &session_key,
+                user_a,
+            )
+            .await
+            .expect("persist Q1");
+            for cmid in later_cmids {
+                let user = Message::user(format!("user msg {cmid}")).with_client_message_id(cmid);
+                octos_bus::session::persist_message_through_canonical_path(
+                    dir.path(),
+                    &session_key,
+                    user,
+                )
+                .await
+                .expect("persist later user");
+            }
+        }
+
+        // Spawn the actor — its `SessionHandle::open` will load the three
+        // pre-seeded users so the actor's in-memory mirror agrees with disk.
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        // Drive the late background result. `originating_thread_id` is Q1 —
+        // pre-fix, derivation in `add_message_with_seq` would pick Q3
+        // because Q3 is the most recent user. Post-fix, the persist helper
+        // pre-stamps Q1 onto the assistant message so the derivation
+        // fallback is skipped.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "deep_research".to_string(),
+            content: "Deep research findings for Q1.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            originating_thread_id: Some(originating_cmid.to_string()),
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background result must be persisted"
+        );
+
+        // Drain one outbound (the wire fanout) to keep the channel from
+        // back-pressuring the actor; we already pin wire behaviour in the
+        // sibling test so we only need the metadata as a sanity check.
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+        assert_eq!(
+            outbound.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some(originating_cmid),
+            "wire metadata still must agree with persistence (sibling \
+             contract); got metadata = {}",
+            outbound.metadata,
+        );
+
+        // Reload the session JSONL from disk and find the persisted
+        // assistant message. Its `thread_id` MUST equal Q1's cmid — NOT
+        // Q3's (which is what the derivation fallback would have chosen).
+        let session_handle = SessionHandle::open(dir.path(), &session_key);
+        let session = session_handle.session();
+        let assistant_messages: Vec<&Message> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::Assistant && m.content.contains("Deep research findings")
+            })
+            .collect();
+        assert_eq!(
+            assistant_messages.len(),
+            1,
+            "expected exactly one persisted assistant message for the \
+             background result; got messages = {:?}",
+            session.messages,
+        );
+        let persisted_assistant = assistant_messages[0];
+        assert_eq!(
+            persisted_assistant.thread_id.as_deref(),
+            Some(originating_cmid),
+            "PERSISTED assistant message must carry originating thread_id \
+             (Q1's cmid={originating_cmid:?}) so reload pairs it under the \
+             correct user bubble; got thread_id={:?}. The derive fallback \
+             would have picked Q3's cmid={:?} which is the bug.",
+            persisted_assistant.thread_id,
+            later_cmids.last(),
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// M8.10 follow-up (#649): when no `originating_thread_id` is supplied
+    /// (legacy callers, pre-fix BackgroundResult senders), the
+    /// OutboundMessage metadata must NOT carry a `thread_id` field. This
+    /// pins the wire-compat property: callers without a tracked origin
+    /// continue to fall through to the api_channel sticky-map fallback,
+    /// not surface a phantom empty/null thread_id that would mis-route.
+    #[tokio::test]
+    async fn legacy_background_result_without_originating_thread_id_omits_metadata_thread_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "legacy_task".to_string(),
+            content: "Legacy result with no origin tracking.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            originating_thread_id: None,
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), ack_rx).await;
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+
+        assert!(
+            outbound.metadata.get("thread_id").is_none(),
+            "legacy callers (originating_thread_id=None) must NOT populate \
+             metadata.thread_id — sticky map fallback handles wire compat. \
+             got metadata = {}",
+            outbound.metadata,
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     #[tokio::test]
     async fn test_background_notification_ack_stays_persisted_when_live_fanout_is_closed() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8692,6 +9074,7 @@ mod tests {
             content: "Background research completed.".to_string(),
             kind: BackgroundResultKind::Report,
             media: vec![],
+            originating_thread_id: None,
             ack: Some(ack_tx),
         })
         .await
@@ -10333,6 +10716,7 @@ mod tests {
                         &data_dir,
                         format!("actor-{i}"),
                         vec![],
+                        None,
                     )
                     .await;
                     res.map(|p| p.seq)
