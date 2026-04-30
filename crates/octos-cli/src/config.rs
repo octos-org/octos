@@ -180,6 +180,37 @@ pub struct Config {
     /// (preserves pre-M6.6 routing behavior).
     #[serde(default)]
     pub content_routing: Option<octos_llm::RoutingConfig>,
+
+    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by the
+    /// API agent inside `octos serve`. Operators can anchor every AppUi
+    /// session that does not advertise the `session.workspace_cwd.v1`
+    /// capability to a chosen folder via `appui.default_session_cwd`,
+    /// so clients like octos-app — which sends `cwd: None` — get a
+    /// useful workspace root transparently. Capability-gated client-sent
+    /// cwds (Tier-1 of `session_tool_registry`) still take precedence.
+    #[serde(default)]
+    pub appui: AppUiConfig,
+}
+
+/// AppUi session defaults applied by `octos serve`'s API agent.
+///
+/// All fields are optional; an empty `[appui]` section preserves the
+/// historical behavior (no server-side default cwd, every session falls
+/// through Tier-3 of the `session_tool_registry` chain unchanged).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AppUiConfig {
+    /// Optional default workspace cwd for AppUi sessions. When set, every
+    /// `session/open` call against this server falls back to this cwd
+    /// (Tier-2 of `session_tool_registry`'s fallback chain) when the
+    /// client does not advertise `session.workspace_cwd.v1` and send its
+    /// own cwd. Capability-gated client-sent cwds (Tier-1) take precedence.
+    ///
+    /// Use absolute paths. Tilde (`~`) is not expanded — operators who
+    /// prefer a home-relative path should resolve it before writing
+    /// `config.json`.
+    #[serde(default)]
+    pub default_session_cwd: Option<PathBuf>,
 }
 
 /// Top-level credential-pool configuration for `chat` / `serve`. Mirrors

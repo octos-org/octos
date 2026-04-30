@@ -967,6 +967,36 @@ impl ServeCommand {
             // read paths).
             .with_sandbox_config(config.sandbox.clone());
 
+        // Tier-2 of the AppUi `session_tool_registry` fallback chain: when
+        // operators set `appui.default_session_cwd` in `config.json`, anchor
+        // the API agent's tool registry to that path so clients without the
+        // `session.workspace_cwd.v1` capability (e.g. octos-app, which sends
+        // `cwd: None`) inherit the folder transparently. Tier-1
+        // (capability-gated client-sent cwds) still wins for clients that
+        // do advertise it, e.g. octos-tui.
+        //
+        // We do not canonicalize here — the path is recorded as-is on the
+        // tool registry and reused verbatim by `session_tool_registry`'s
+        // rebind path. Operators must use absolute paths; tilde (`~`) is
+        // not expanded. A `warn!` log on a missing/non-directory path
+        // surfaces config drift early without aborting startup, since the
+        // path may be created later (or may live under a network mount
+        // that mounts asynchronously).
+        if let Some(cwd) = config.appui.default_session_cwd.as_ref() {
+            if !cwd.is_dir() {
+                tracing::warn!(
+                    cwd = %cwd.display(),
+                    "appui.default_session_cwd does not point at an existing directory; \
+                     sessions will fail authorization until it is created",
+                );
+            }
+            agent = agent.with_workspace_root(cwd.clone());
+            tracing::info!(
+                cwd = %cwd.display(),
+                "appui: anchoring api agent to operator-configured default cwd",
+            );
+        }
+
         // Inject skill prompt fragments
         for fragment in &plugin_result.prompt_fragments {
             agent.append_system_prompt(fragment);
