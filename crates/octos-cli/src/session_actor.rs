@@ -211,9 +211,25 @@ async fn persist_assistant_message(
     data_dir: &Path,
     content: String,
     media: Vec<String>,
+    thread_id: Option<String>,
 ) -> Option<PersistedSessionMessage> {
     let mut assistant_msg = Message::assistant(content);
     assistant_msg.media = media;
+    // M8.10 follow-up (#649): pre-stamp `thread_id` BEFORE handing the
+    // message to the canonical persist helper. `add_message_with_seq`'s
+    // derivation falls back to "most recent user in history" — for a
+    // late-arriving background result that's the WRONG user (a later turn
+    // that happened after the originating one). When the caller knows the
+    // originating turn (background results carry `originating_thread_id`
+    // through `BackgroundResultPayload`), passing it here pins the
+    // persisted JSONL row to the correct thread so reload pairs the
+    // assistant under the originating user bubble. Foreground turns pass
+    // `None` and continue to use the derivation fallback (correct).
+    if let Some(tid) = thread_id {
+        if !tid.is_empty() {
+            assistant_msg.thread_id = Some(tid);
+        }
+    }
     let timestamp = assistant_msg.timestamp;
 
     // Funnel through the canonical helper so the per-key Tokio mutex
@@ -394,6 +410,7 @@ async fn persist_terminal_reply_and_fanout(
         data_dir,
         content.clone(),
         media.clone(),
+        thread_id.map(str::to_string),
     )
     .await
     else {
@@ -3492,6 +3509,7 @@ impl SessionActor {
             &self.data_dir,
             content.clone(),
             media.clone(),
+            originating_thread_id.clone(),
         )
         .await;
 
@@ -3525,8 +3543,14 @@ impl SessionActor {
         // path (NOT the per-chat sticky-map fallback). Without this stamp,
         // a deep_research / spawn_only result that completes after later
         // user turns inherits the WRONG turn's thread_id from the sticky
-        // map (cf. live mini3 trace, 2026-04-29).
-        if let Some(tid) = originating_thread_id.as_deref() {
+        // map (cf. live mini3 trace, 2026-04-29). The non-empty guard mirrors
+        // `persist_assistant_message`'s — wire and disk agree on what counts
+        // as a usable origin id, so a degenerate `Some("")` falls through to
+        // the api_channel sticky-map fallback rather than poisoning routing.
+        if let Some(tid) = originating_thread_id
+            .as_deref()
+            .filter(|tid| !tid.is_empty())
+        {
             if let Some(obj) = metadata.as_object_mut() {
                 obj.insert(
                     "thread_id".to_string(),
@@ -3860,6 +3884,7 @@ impl SessionActor {
             &self.data_dir,
             ack_content.clone(),
             vec![],
+            client_message_id.clone(),
         )
         .await;
 
@@ -8839,6 +8864,141 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    /// M8.10 follow-up (#649) PERSISTENCE regression: when a late-arriving
+    /// `BackgroundResult` carries an `originating_thread_id`, the PERSISTED
+    /// JSONL row for the assistant message must carry that thread_id —
+    /// NOT whatever `derive_thread_id_for_new_message`'s "most recent user
+    /// in history" fallback would pick.
+    ///
+    /// PR #664 stamped `thread_id` on the wire-side `OutboundMessage.metadata`
+    /// so the live SSE event routed correctly, but `persist_assistant_message`
+    /// kept building the message via `Message::assistant(content)` (no
+    /// `thread_id`). On the canonical persist path, `add_message_with_seq`
+    /// derives `thread_id` from the most recent USER message in history —
+    /// for a deep-research result that arrives after Q3, that's Q3's cmid,
+    /// not Q1's. Reload from JSONL therefore mis-pairs the assistant under
+    /// the WRONG bubble.
+    ///
+    /// This test pre-seeds three users (Q1/Q2/Q3) into the on-disk session
+    /// transcript, sends a late `BackgroundResult` carrying Q1's cmid as
+    /// `originating_thread_id`, and verifies the persisted JSONL row picks
+    /// up Q1's cmid — proving the new pre-stamp short-circuits the
+    /// derivation fallback before it can mis-attribute.
+    #[tokio::test]
+    async fn late_background_result_persists_with_originating_thread_id_not_derived_from_latest_user()
+     {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::new("cli", "test");
+
+        // Pre-seed three user messages, each with its own client_message_id,
+        // through the canonical persist path so the JSONL has the same
+        // shape the actor would observe on reload. After this loop the
+        // disk transcript is [Q1, Q2, Q3] — Q3 is the "most recent user".
+        let originating_cmid = "originating-A-deep-research-Q1";
+        let later_cmids = ["B-stocks-Q2", "C-voices-Q3"];
+        {
+            let user_a = Message::user("Q1: kick off deep research")
+                .with_client_message_id(originating_cmid);
+            octos_bus::session::persist_message_through_canonical_path(
+                dir.path(),
+                &session_key,
+                user_a,
+            )
+            .await
+            .expect("persist Q1");
+            for cmid in later_cmids {
+                let user = Message::user(format!("user msg {cmid}")).with_client_message_id(cmid);
+                octos_bus::session::persist_message_through_canonical_path(
+                    dir.path(),
+                    &session_key,
+                    user,
+                )
+                .await
+                .expect("persist later user");
+            }
+        }
+
+        // Spawn the actor — its `SessionHandle::open` will load the three
+        // pre-seeded users so the actor's in-memory mirror agrees with disk.
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        // Drive the late background result. `originating_thread_id` is Q1 —
+        // pre-fix, derivation in `add_message_with_seq` would pick Q3
+        // because Q3 is the most recent user. Post-fix, the persist helper
+        // pre-stamps Q1 onto the assistant message so the derivation
+        // fallback is skipped.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "deep_research".to_string(),
+            content: "Deep research findings for Q1.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            originating_thread_id: Some(originating_cmid.to_string()),
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background result must be persisted"
+        );
+
+        // Drain one outbound (the wire fanout) to keep the channel from
+        // back-pressuring the actor; we already pin wire behaviour in the
+        // sibling test so we only need the metadata as a sanity check.
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+        assert_eq!(
+            outbound.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some(originating_cmid),
+            "wire metadata still must agree with persistence (sibling \
+             contract); got metadata = {}",
+            outbound.metadata,
+        );
+
+        // Reload the session JSONL from disk and find the persisted
+        // assistant message. Its `thread_id` MUST equal Q1's cmid — NOT
+        // Q3's (which is what the derivation fallback would have chosen).
+        let session_handle = SessionHandle::open(dir.path(), &session_key);
+        let session = session_handle.session();
+        let assistant_messages: Vec<&Message> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::Assistant && m.content.contains("Deep research findings")
+            })
+            .collect();
+        assert_eq!(
+            assistant_messages.len(),
+            1,
+            "expected exactly one persisted assistant message for the \
+             background result; got messages = {:?}",
+            session.messages,
+        );
+        let persisted_assistant = assistant_messages[0];
+        assert_eq!(
+            persisted_assistant.thread_id.as_deref(),
+            Some(originating_cmid),
+            "PERSISTED assistant message must carry originating thread_id \
+             (Q1's cmid={originating_cmid:?}) so reload pairs it under the \
+             correct user bubble; got thread_id={:?}. The derive fallback \
+             would have picked Q3's cmid={:?} which is the bug.",
+            persisted_assistant.thread_id,
+            later_cmids.last(),
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     /// M8.10 follow-up (#649): when no `originating_thread_id` is supplied
     /// (legacy callers, pre-fix BackgroundResult senders), the
     /// OutboundMessage metadata must NOT carry a `thread_id` field. This
@@ -10538,6 +10698,7 @@ mod tests {
                         &data_dir,
                         format!("actor-{i}"),
                         vec![],
+                        None,
                     )
                     .await;
                     res.map(|p| p.seq)
