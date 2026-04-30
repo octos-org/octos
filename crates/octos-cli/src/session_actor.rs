@@ -2108,6 +2108,13 @@ impl ActorFactory {
         if let Some(ref pf) = self.pipeline_factory {
             let pt = pf.create();
             tools.register_arc(pt);
+            tools.mark_spawn_only(
+                "run_pipeline",
+                Some(
+                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
+                        .to_string(),
+                ),
+            );
         }
 
         // Defer rarely-used per-session tools to keep active tool count low
