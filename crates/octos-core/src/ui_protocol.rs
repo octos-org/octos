@@ -2070,6 +2070,13 @@ pub enum TaskRuntimeState {
     Running,
     Completed,
     Failed,
+    /// M9 review fix (MEDIUM #4) — governed by accepted UPCR-2026-004:
+    /// background tasks cancelled mid-flight (e.g. via the
+    /// `POST /api/tasks/{id}/cancel` endpoint) emit lifecycle state
+    /// `cancelled` from the agent's `TaskLifecycleState`. Without this
+    /// variant the AppUi mapper fell back to `Running` and rendered
+    /// cancelled tasks as still running. Wire form: `"cancelled"`.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2683,6 +2690,36 @@ mod tests {
                             "message": "served from task snapshot"
                         }
                     ]
+                }
+            })
+        );
+
+        // M9 review fix MEDIUM #4 (UPCR-2026-004): pin the literal wire form
+        // for `task/updated` carrying the new `cancelled` lifecycle state so a
+        // future rename of the variant or a serializer regression that drops
+        // the snake_case shape is caught by the representative-payload golden
+        // gate, not just by the variant-level round-trip tests at the bottom
+        // of this module.
+        let task_cancelled = UiNotification::TaskUpdated(TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            task_id: task_id.clone(),
+            title: "spawn_only_runner".into(),
+            state: TaskRuntimeState::Cancelled,
+            runtime_detail: Some("user cancelled".into()),
+        })
+        .into_rpc_notification()
+        .expect("serialize task/updated cancelled");
+        assert_eq!(
+            serde_json::to_value(task_cancelled).expect("task/updated cancelled json"),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "task/updated",
+                "params": {
+                    "session_id": "local:demo",
+                    "task_id": task_id,
+                    "title": "spawn_only_runner",
+                    "state": "cancelled",
+                    "runtime_detail": "user cancelled"
                 }
             })
         );
@@ -3842,5 +3879,38 @@ mod tests {
                 .any(|method| method == methods::APPROVAL_CANCELLED),
             "approval/cancelled must be advertised so clients can render it",
         );
+    }
+
+    // ----- M9 review fix MEDIUM #4 (UPCR-2026-004): Cancelled task state -----
+
+    #[test]
+    fn task_runtime_state_cancelled_round_trips_as_snake_case_cancelled() {
+        // Wire form must be exactly `"cancelled"` so the agent's
+        // `TaskLifecycleState::Cancelled` (also `snake_case`-serialized as
+        // `"cancelled"`) flows through the protocol mapper without falling
+        // back to `Running`. UPCR-2026-004 promises `"cancelled"` (the British
+        // spelling) as the wire literal.
+        let value = serde_json::to_value(TaskRuntimeState::Cancelled).expect("serialize Cancelled");
+        assert_eq!(value, json!("cancelled"));
+        let parsed: TaskRuntimeState = serde_json::from_value(value).expect("round-trip Cancelled");
+        assert_eq!(parsed, TaskRuntimeState::Cancelled);
+    }
+
+    #[test]
+    fn task_updated_event_round_trips_with_cancelled_state() {
+        let event = UiNotification::TaskUpdated(TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(7)),
+            title: "spawn_only_runner".into(),
+            state: TaskRuntimeState::Cancelled,
+            runtime_detail: Some("user cancelled".into()),
+        });
+        let rpc = event
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize task/updated cancelled");
+        let decoded =
+            UiNotification::from_rpc_notification(rpc).expect("deserialize task/updated cancelled");
+        assert_eq!(decoded, event);
     }
 }
