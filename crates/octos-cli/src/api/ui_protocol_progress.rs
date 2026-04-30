@@ -181,12 +181,34 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
 
     let title =
         string_field(event, &["title", "tool", "tool_name"]).unwrap_or_else(|| "Task".into());
-    let state = string_field(
+    // M9 review fix MEDIUM #4: distinguish "no state field at all" (legacy
+    // task_started events) from "state field present but unrecognised".
+    // The former keeps the historical default of `Running` so legacy callers
+    // continue to render correctly. The latter emits a `warning` notification
+    // — the previous unwrap_or fallback masked typos and unmapped terminal
+    // states (notably `cancelled` before this PR) by reporting them as
+    // running, so adding a recognised variant would only fix one symptom and
+    // the next future state would regress the same way.
+    let raw_state = string_field(
         event,
         &["state", "lifecycle_state", "status", "runtime_state"],
-    )
-    .and_then(|state| ui_task_runtime_state(&state))
-    .unwrap_or(UiTaskRuntimeState::Running);
+    );
+    let state = match raw_state.as_deref() {
+        Some(raw) => match ui_task_runtime_state(raw) {
+            Some(state) => state,
+            None => {
+                return UiProgressMapping::warning(
+                    context,
+                    "invalid_progress",
+                    format!(
+                        "task_updated progress event has unrecognised lifecycle state `{raw}`; \
+                         dropping notification to avoid rendering it as still running",
+                    ),
+                );
+            }
+        },
+        None => UiTaskRuntimeState::Running,
+    };
 
     UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(TaskUpdatedEvent {
         session_id: context.session_id.clone(),
@@ -449,6 +471,13 @@ fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
         | "delivering_outputs" | "cleaning_up" | "verifying" => Some(UiTaskRuntimeState::Running),
         "completed" | "ready" => Some(UiTaskRuntimeState::Completed),
         "failed" => Some(UiTaskRuntimeState::Failed),
+        // M9 review fix (MEDIUM #4) — governed by accepted UPCR-2026-004.
+        // The agent emits `TaskLifecycleState::Cancelled` (snake_case
+        // `"cancelled"`) for tasks cancelled via the supervisor's `cancel()`
+        // primitive (e.g. `POST /api/tasks/{id}/cancel`). The US-spelling
+        // alias `"canceled"` is accepted defensively because some upstream
+        // sources spell it that way.
+        "cancelled" | "canceled" => Some(UiTaskRuntimeState::Cancelled),
         _ => None,
     }
 }
@@ -755,6 +784,72 @@ mod tests {
         assert_eq!(updated.title, "deep_search");
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
+    }
+
+    #[test]
+    fn ui_protocol_progress_warns_on_unknown_task_state_instead_of_silently_running() {
+        // M9 review fix MEDIUM #4: codex 2nd-opinion finding — the old
+        // `unwrap_or(UiTaskRuntimeState::Running)` fallback masked future
+        // unmapped terminal states (e.g. before this PR, `cancelled` rendered
+        // as still running). With a recognised state list, an unrecognised
+        // lifecycle string now emits a structured `invalid_progress` warning
+        // instead of synthesising a misleading `Running` notification.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-000000000004",
+                "title": "spawn_only_runner",
+                "state": "definitely_not_a_real_lifecycle_state"
+            }),
+        );
+
+        assert!(
+            mapping.notifications.is_empty(),
+            "unrecognised lifecycle state must not synthesise a TaskUpdated notification",
+        );
+        let warning = mapping
+            .warning
+            .expect("expected invalid_progress warning for unknown lifecycle state");
+        assert_eq!(warning.code, "invalid_progress");
+        assert!(
+            warning
+                .message
+                .contains("definitely_not_a_real_lifecycle_state"),
+            "warning should surface the offending raw state string, got: {}",
+            warning.message,
+        );
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_cancelled_task_state_to_cancelled_variant() {
+        // M9 review fix (MEDIUM #4) — governed by accepted UPCR-2026-004.
+        // Before this fix the `"cancelled"` lifecycle state did not match any
+        // variant of `UiTaskRuntimeState` and the unwrap_or fallback rendered
+        // the task as still `Running`. Now the mapper recognises both the
+        // canonical British spelling and the US-spelling alias.
+        for spelling in ["cancelled", "canceled"] {
+            let mapping = map_progress_json(
+                &context(),
+                &json!({
+                    "type": "task_updated",
+                    "task_id": "01900000-0000-7000-8000-000000000003",
+                    "title": "spawn_only_runner",
+                    "state": spelling,
+                    "runtime_detail": "user cancelled"
+                }),
+            );
+
+            let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+                panic!("expected task updated notification for spelling={spelling}");
+            };
+            assert_eq!(
+                updated.state,
+                UiTaskRuntimeState::Cancelled,
+                "spelling {spelling} should map to Cancelled, not fall back to Running",
+            );
+            assert_eq!(updated.runtime_detail.as_deref(), Some("user cancelled"));
+        }
     }
 
     #[test]

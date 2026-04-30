@@ -245,6 +245,16 @@ pub struct Agent {
     /// child's own spawn calls see the higher value and the
     /// `MAX_SPAWN_DEPTH` gate fires after a bounded number of nests.
     pub(super) spawn_depth: u8,
+    /// M9 review fix (HIGH #1): the effective [`crate::sandbox::SandboxConfig`]
+    /// that built this agent's `ShellTool` sandbox. Recorded so per-session
+    /// callers (notably the AppUi `session_tool_registry` rebind path) can
+    /// re-create a sandbox that inherits the running server's policy
+    /// (mode, network, read paths, profile) instead of silently dropping
+    /// back to `SandboxConfig::default()` and disabling features like
+    /// `npm install` that need network or specific read paths.
+    /// `None` keeps legacy behaviour — callers that don't track the sandbox
+    /// config (chat, gateway, tests) get the previous default.
+    pub(super) sandbox_config: Option<crate::sandbox::SandboxConfig>,
 }
 
 impl Agent {
@@ -286,6 +296,7 @@ impl Agent {
             cost_accountant: None,
             parent_session_key: None,
             spawn_depth: 0,
+            sandbox_config: None,
         }
     }
 
@@ -328,6 +339,7 @@ impl Agent {
             cost_accountant: None,
             parent_session_key: None,
             spawn_depth: 0,
+            sandbox_config: None,
         }
     }
 
@@ -763,6 +775,29 @@ impl Agent {
     /// Get a clone of the agent config.
     pub fn agent_config(&self) -> AgentConfig {
         self.config.clone()
+    }
+
+    /// Record the effective [`crate::sandbox::SandboxConfig`] that built this
+    /// agent's `ShellTool` sandbox.
+    ///
+    /// Callers that need to recreate a sandbox for a per-session
+    /// [`crate::tools::ToolRegistry::rebind_cwd`] (e.g. AppUi session cwd
+    /// binding) can read it back via [`Self::sandbox_config`] and pass it to
+    /// [`crate::sandbox::create_sandbox`] so the new shell tool inherits
+    /// network access, read-allow paths, profile name, and mode from the
+    /// running server's configuration instead of falling back to
+    /// `SandboxConfig::default()`.
+    pub fn with_sandbox_config(mut self, sandbox: crate::sandbox::SandboxConfig) -> Self {
+        self.sandbox_config = Some(sandbox);
+        self
+    }
+
+    /// Return the recorded effective [`crate::sandbox::SandboxConfig`], if
+    /// any was supplied via [`Self::with_sandbox_config`]. `None` keeps
+    /// pre-M9 behaviour — callers should fall back to
+    /// `SandboxConfig::default()` only when this is `None`.
+    pub fn sandbox_config(&self) -> Option<crate::sandbox::SandboxConfig> {
+        self.sandbox_config.clone()
     }
 
     /// Get a snapshot of the current system prompt.
