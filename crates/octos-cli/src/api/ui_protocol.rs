@@ -49,7 +49,9 @@ use super::ui_protocol_ledger::{
     LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
     spawn_eviction_task,
 };
-use super::ui_protocol_progress::{ProgressMappingContext, UiProgressMapping, map_progress_json};
+use super::ui_protocol_progress::{
+    ProgressMappingContext, UiProgressMapping, background_task_to_progress_json, map_progress_json,
+};
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
 use super::ui_protocol_task_output;
@@ -1387,7 +1389,10 @@ fn session_tool_registry(
     session_id: &SessionKey,
 ) -> Result<(Arc<octos_agent::ToolRegistry>, Option<PathBuf>), String> {
     let base_tools = base_agent.tool_registry();
-    let Some(workspace_root) = session_workspaces().get(session_id) else {
+    let Some(workspace_root) = session_workspaces()
+        .get(session_id)
+        .or_else(|| base_tools.workspace_root().map(Path::to_path_buf))
+    else {
         return Ok((base_tools.clone(), None));
     };
 
@@ -2710,6 +2715,19 @@ async fn run_standalone_turn(
             progress_dropped.clone(),
         ))));
     let progress_tx_for_result = progress_tx.clone();
+    let progress_tx_for_tasks = progress_tx.clone();
+    let task_progress_dropped = progress_dropped.clone();
+    tool_registry.supervisor().set_on_change(move |task| {
+        let event = background_task_to_progress_json(task);
+        let Ok(json) = serde_json::to_string(&event) else {
+            return;
+        };
+        if progress_tx_for_tasks.try_send(json).is_err() {
+            task_progress_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("ws.send.drop.backpressure", "method" => "task_progress")
+                .increment(1);
+        }
+    });
     drop(progress_tx);
     let request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),

@@ -5,13 +5,13 @@
 
 #![allow(dead_code)]
 
-use octos_core::SessionKey;
 use octos_core::ui_protocol::{
-    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, ToolCompletedEvent, ToolProgressEvent,
-    ToolStartedEvent, TurnId, UiFileMutationNotice, UiNotification, UiProgressEvent,
-    UiProgressMetadata, UiRetryBackoff, UiTokenCostUpdate, WarningEvent, file_mutation_operations,
-    progress_kinds,
+    ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, TaskRuntimeState as UiTaskRuntimeState,
+    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnId,
+    UiFileMutationNotice, UiNotification, UiProgressEvent, UiProgressMetadata, UiRetryBackoff,
+    UiTokenCostUpdate, WarningEvent, file_mutation_operations, progress_kinds,
 };
+use octos_core::{SessionKey, TaskId};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +102,14 @@ pub(crate) fn map_progress_json(
         "tool_progress" => map_tool_progress(context, event),
         "tool_end" => map_tool_end(context, event),
         "task_started" => map_task_started(context, event),
+        "task_updated" => map_task_updated(context, event),
+        "task_completed" => map_task_completed(context, event),
+        "task_interrupted" => map_task_interrupted(context, event),
+        "max_iterations_reached" => map_budget_stop(context, event, "max iterations reached"),
+        "token_budget_exceeded" => map_budget_stop(context, event, "token budget exceeded"),
+        "activity_timeout_reached" => map_budget_stop(context, event, "activity timeout reached"),
+        "llm_status" => map_simple_status(context, event, progress_kinds::STATUS),
+        "stream_retry" => map_stream_retry(context, event),
         "thinking" => map_simple_status(context, event, progress_kinds::THINKING),
         "response" => map_simple_status(context, event, progress_kinds::RESPONSE),
         "cost_update" => map_cost_update(context, event),
@@ -142,11 +150,100 @@ fn map_approval_requested(context: &ProgressMappingContext, event: &Value) -> Ui
 }
 
 fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    if let Some(task_id) = task_id_field(event, &["task_id"]) {
+        return UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(
+            TaskUpdatedEvent {
+                session_id: context.session_id.clone(),
+                task_id,
+                title: string_field(event, &["title"]).unwrap_or_else(|| "Task".into()),
+                state: UiTaskRuntimeState::Running,
+                runtime_detail: Some("task started".into()),
+            },
+        )]);
+    }
+
     let mut metadata = UiProgressMetadata::new(progress_kinds::STATUS);
     metadata.message = Some("task started".into());
     if let Some(task_id) = string_field(event, &["task_id"]) {
         metadata.extra.insert("task_id".into(), json!(task_id));
     }
+    UiProgressMapping::status(context, metadata)
+}
+
+fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let Some(task_id) = task_id_field(event, &["task_id", "id"]) else {
+        return UiProgressMapping::warning(
+            context,
+            "invalid_progress",
+            "task_updated progress event is missing valid UUID field `task_id`".to_string(),
+        );
+    };
+
+    let title =
+        string_field(event, &["title", "tool", "tool_name"]).unwrap_or_else(|| "Task".into());
+    let state = string_field(
+        event,
+        &["state", "lifecycle_state", "status", "runtime_state"],
+    )
+    .and_then(|state| ui_task_runtime_state(&state))
+    .unwrap_or(UiTaskRuntimeState::Running);
+
+    UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(TaskUpdatedEvent {
+        session_id: context.session_id.clone(),
+        task_id,
+        title,
+        state,
+        runtime_detail: string_field(event, &["runtime_detail", "message", "status_message"]),
+    })])
+}
+
+fn map_task_completed(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let success = bool_field(event, &["success"]);
+    let mut metadata = UiProgressMetadata::new(progress_kinds::STATUS);
+    metadata.message = Some(match success {
+        Some(false) => "task failed".into(),
+        _ => "task completed".into(),
+    });
+    metadata.iteration = u32_field(event, &["iterations", "iteration"]);
+    if let Some(success) = success {
+        metadata.extra.insert("success".into(), json!(success));
+    }
+    if let Some(duration_ms) = u64_field(event, &["duration_ms", "elapsed_ms"]) {
+        metadata
+            .extra
+            .insert("duration_ms".into(), json!(duration_ms));
+    }
+    UiProgressMapping::status(context, metadata)
+}
+
+fn map_task_interrupted(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let mut metadata = UiProgressMetadata::new(progress_kinds::STATUS);
+    metadata.message = Some("task interrupted".into());
+    metadata.iteration = u32_field(event, &["iterations", "iteration"]);
+    UiProgressMapping::status(context, metadata)
+}
+
+fn map_budget_stop(
+    context: &ProgressMappingContext,
+    event: &Value,
+    message: &'static str,
+) -> UiProgressMapping {
+    let mut metadata = UiProgressMetadata::new(progress_kinds::STATUS);
+    metadata.message = Some(message.into());
+    for key in ["used", "limit", "elapsed_ms", "limit_ms"] {
+        if let Some(value) = event.get(key) {
+            metadata.extra.insert(key.into(), value.clone());
+        }
+    }
+    UiProgressMapping::status(context, metadata)
+}
+
+fn map_stream_retry(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let mut retry = UiRetryBackoff::new();
+    retry.reason = string_field(event, &["reason", "message"]);
+    let mut metadata = UiProgressMetadata::retry_backoff(retry);
+    metadata.message = string_field(event, &["message", "status"]);
+    metadata.iteration = u32_field(event, &["iteration"]);
     UiProgressMapping::status(context, metadata)
 }
 
@@ -341,10 +438,57 @@ fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
         .find_map(|key| value.get(*key).and_then(Value::as_bool))
 }
 
+fn task_id_field(value: &Value, keys: &[&str]) -> Option<TaskId> {
+    string_field(value, keys).and_then(|task_id| task_id.parse().ok())
+}
+
+fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
+    match state {
+        "pending" | "queued" | "spawned" => Some(UiTaskRuntimeState::Pending),
+        "running" | "executing_tool" | "resolving_outputs" | "verifying_outputs"
+        | "delivering_outputs" | "cleaning_up" | "verifying" => Some(UiTaskRuntimeState::Running),
+        "completed" | "ready" => Some(UiTaskRuntimeState::Completed),
+        "failed" => Some(UiTaskRuntimeState::Failed),
+        _ => None,
+    }
+}
+
+pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTask) -> Value {
+    json!({
+        "type": "task_updated",
+        "task_id": task.id,
+        "title": task.tool_name,
+        "state": task.lifecycle_state(),
+        "runtime_detail": stable_task_runtime_detail(task),
+    })
+}
+
+fn stable_task_runtime_detail(task: &octos_agent::BackgroundTask) -> Option<String> {
+    if let Some(error) = task.error.as_deref() {
+        return Some(error.to_string());
+    }
+
+    let detail = task.runtime_detail.as_deref()?;
+    match serde_json::from_str::<Value>(detail) {
+        Ok(value) => {
+            if let Some(message) = value.get("progress_message").and_then(Value::as_str) {
+                return Some(message.to_string());
+            }
+            let phase = value.get("current_phase").and_then(Value::as_str)?;
+            match value.get("workflow_kind").and_then(Value::as_str) {
+                Some(kind) => Some(format!("{kind}: {phase}")),
+                None => Some(phase.to_string()),
+            }
+        }
+        Err(_) => Some(detail.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use octos_core::ui_protocol::{TurnId, UiNotification};
+    use chrono::Utc;
+    use octos_core::ui_protocol::{TaskRuntimeState as UiTaskRuntimeState, TurnId, UiNotification};
     use uuid::Uuid;
 
     fn context() -> ProgressMappingContext {
@@ -422,18 +566,35 @@ mod tests {
             }),
         );
 
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.task_id.to_string(),
+            "01900000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(updated.state, UiTaskRuntimeState::Running);
+        assert_eq!(updated.runtime_detail.as_deref(), Some("task started"));
+        assert_eq!(mapping.status, None);
+        assert_eq!(mapping.warning, None);
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_invalid_task_started_to_status() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_started",
+                "task_id": "legacy-non-uuid"
+            }),
+        );
+
         let status = mapping.status.expect("status mapping");
         assert_eq!(status.event.metadata.kind, progress_kinds::STATUS);
         assert_eq!(
-            status.event.metadata.message.as_deref(),
-            Some("task started")
-        );
-        assert_eq!(
             status.event.metadata.extra.get("task_id"),
-            Some(&json!("01900000-0000-7000-8000-000000000001"))
+            Some(&json!("legacy-non-uuid"))
         );
-        assert!(mapping.notifications.is_empty());
-        assert_eq!(mapping.warning, None);
     }
 
     #[test]
@@ -569,5 +730,126 @@ mod tests {
         assert!(warning.message.contains("surprise"));
         assert!(mapping.notifications.is_empty());
         assert_eq!(mapping.status, None);
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_task_updated_to_notification() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-000000000002",
+                "title": "deep_search",
+                "state": "verifying",
+                "runtime_detail": "checking outputs"
+            }),
+        );
+
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert_eq!(
+            updated.task_id.to_string(),
+            "01900000-0000-7000-8000-000000000002"
+        );
+        assert_eq!(updated.title, "deep_search");
+        assert_eq!(updated.state, UiTaskRuntimeState::Running);
+        assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_dropped_agent_events_to_status() {
+        let completed = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_completed",
+                "success": false,
+                "iterations": 3,
+                "duration_ms": 125
+            }),
+        )
+        .status
+        .expect("task completed status");
+        assert_eq!(
+            completed.event.metadata.message.as_deref(),
+            Some("task failed")
+        );
+        assert_eq!(completed.event.metadata.iteration, Some(3));
+        assert_eq!(
+            completed.event.metadata.extra.get("duration_ms"),
+            Some(&json!(125))
+        );
+
+        let interrupted = map_progress_json(
+            &context(),
+            &json!({"type": "task_interrupted", "iterations": 2}),
+        )
+        .status
+        .expect("task interrupted status");
+        assert_eq!(
+            interrupted.event.metadata.message.as_deref(),
+            Some("task interrupted")
+        );
+
+        let budget = map_progress_json(
+            &context(),
+            &json!({"type": "token_budget_exceeded", "used": 12, "limit": 10}),
+        )
+        .status
+        .expect("budget status");
+        assert_eq!(
+            budget.event.metadata.message.as_deref(),
+            Some("token budget exceeded")
+        );
+        assert_eq!(budget.event.metadata.extra.get("used"), Some(&json!(12)));
+
+        let retry = map_progress_json(
+            &context(),
+            &json!({"type": "stream_retry", "message": "retrying", "iteration": 4}),
+        )
+        .status
+        .expect("retry status");
+        assert_eq!(retry.event.metadata.kind, progress_kinds::RETRY_BACKOFF);
+        assert_eq!(retry.event.metadata.iteration, Some(4));
+    }
+
+    #[test]
+    fn background_task_progress_json_uses_stable_detail() {
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000003".into(),
+            tool_name: "deep_search".into(),
+            tool_call_id: "call-1".into(),
+            parent_session_key: Some("local:demo".into()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::DeliveringOutputs,
+            runtime_detail: Some(
+                json!({
+                    "workflow_kind": "research",
+                    "current_phase": "writing",
+                    "progress_message": "Writing report"
+                })
+                .to_string(),
+            ),
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:demo".into()),
+            tool_input: None,
+        };
+
+        let event = background_task_to_progress_json(&task);
+        assert_eq!(event["type"], "task_updated");
+        assert_eq!(event["task_id"], "01900000-0000-7000-8000-000000000003");
+        assert_eq!(event["title"], "deep_search");
+        assert_eq!(event["state"], "verifying");
+        assert_eq!(event["runtime_detail"], "Writing report");
     }
 }
