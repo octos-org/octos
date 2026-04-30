@@ -764,6 +764,12 @@ if [ "$ENABLE_SMTP" = true ]; then
     prompt_value SMTP_FROM "SMTP from address" "$SMTP_USERNAME"
     prompt_yes_no ALLOW_SELF_REGISTRATION "Allow self-registration via email OTP" false
     [ -n "${SMTP_PASSWORD:-}" ] || err "SMTP_PASSWORD is required for SMTP. Export it and re-run."
+else
+    # Self-registration sends an OTP via email, so it is meaningless without
+    # SMTP. Default to false so the downstream validator accepts the value
+    # and the dashboard_auth block (which is omitted when SMTP is off) does
+    # not need this field at all.
+    ALLOW_SELF_REGISTRATION=false
 fi
 if [ -z "$AUTH_TOKEN" ]; then
     AUTH_TOKEN="$(openssl rand -hex 32)"
