@@ -296,6 +296,16 @@ async fn is_session_active(
 /// `active_sessions` + `session_key` — used to check if this session is currently
 /// active before sending/editing channel messages. When inactive, all direct
 /// channel operations are skipped to prevent cross-session message leaks.
+///
+/// `thread_id` — #649 follow-up (rapid-fire): the originating turn's
+/// `client_message_id`, captured ONCE at forwarder construction. Every
+/// `send_with_id` / `edit_message` call this forwarder issues stamps the
+/// outbound metadata with this value so the channel does not have to
+/// fall back to the per-chat sticky map. Under rapid-fire 5 concurrent
+/// turns, sticky has rotated to the LATEST cmid by the time an earlier
+/// turn produces its first chunk — pre-fix that earlier chunk's encoded
+/// message_id captured the rotated value and every subsequent edit
+/// inherited the wrong thread_id, collapsing 4 turns onto one bubble.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_stream_forwarder(
     mut rx: mpsc::UnboundedReceiver<StreamProgressEvent>,
@@ -307,6 +317,7 @@ pub async fn run_stream_forwarder(
     session_key: SessionKey,
     sender_user_id: Option<String>,
     operation_updater: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    thread_id: Option<String>,
 ) -> StreamResult {
     let mut buffer = String::new();
     let mut message_id: Option<String> = None;
@@ -377,6 +388,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                         last_edit = Instant::now();
@@ -399,6 +411,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                     }
@@ -425,6 +438,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                     }
@@ -451,6 +465,7 @@ pub async fn run_stream_forwarder(
                                 &mut message_id,
                                 &mut no_edit_support,
                                 sender_user_id.as_deref(),
+                                thread_id.as_deref(),
                             )
                             .await;
                         }
@@ -489,6 +504,7 @@ pub async fn run_stream_forwarder(
                             &mut message_id,
                             &mut no_edit_support,
                             sender_user_id.as_deref(),
+                            thread_id.as_deref(),
                         )
                         .await;
                     }
@@ -521,6 +537,7 @@ pub async fn run_stream_forwarder(
                         &mut message_id,
                         &mut no_edit_support,
                         sender_user_id.as_deref(),
+                        thread_id.as_deref(),
                     )
                     .await;
                     last_edit = Instant::now();
@@ -545,6 +562,7 @@ pub async fn run_stream_forwarder(
                                 &mut message_id,
                                 &mut no_edit_support,
                                 sender_user_id.as_deref(),
+                                thread_id.as_deref(),
                             )
                             .await;
                         }
@@ -582,6 +600,7 @@ pub async fn run_stream_forwarder(
                 &mut message_id,
                 &mut no_edit_support,
                 sender_user_id.as_deref(),
+                thread_id.as_deref(),
             )
             .await;
         }
@@ -598,6 +617,7 @@ pub async fn run_stream_forwarder(
 /// If `send_with_id` returns `None` (channel doesn't support message editing),
 /// sets `no_edit_support` to true so the caller stops attempting to stream.
 /// The final reply will go through the normal `out_tx` path instead.
+#[allow(clippy::too_many_arguments)]
 async fn flush_to_channel(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
@@ -605,6 +625,7 @@ async fn flush_to_channel(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
     sender_user_id: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     do_flush(
         channel,
@@ -614,6 +635,7 @@ async fn flush_to_channel(
         no_edit_support,
         false,
         sender_user_id,
+        thread_id,
     )
     .await;
 }
@@ -622,6 +644,7 @@ async fn flush_to_channel(
 ///
 /// Channels that need special finalization (e.g. WeCom `finish: true`) will
 /// receive this via `Channel::finish_stream()`.
+#[allow(clippy::too_many_arguments)]
 async fn finish_flush_to_channel(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
@@ -629,6 +652,7 @@ async fn finish_flush_to_channel(
     message_id: &mut Option<String>,
     no_edit_support: &mut bool,
     sender_user_id: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     // Preserve the asserted virtual-user identity when the final flush is the
     // first send; otherwise Matrix falls back to the main bot user.
@@ -640,10 +664,12 @@ async fn finish_flush_to_channel(
         no_edit_support,
         true,
         sender_user_id,
+        thread_id,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_flush(
     channel: &Arc<dyn Channel>,
     chat_id: &str,
@@ -652,6 +678,7 @@ async fn do_flush(
     no_edit_support: &mut bool,
     finish: bool,
     sender_user_id: Option<&str>,
+    thread_id: Option<&str>,
 ) {
     if let Some(mid) = message_id.as_ref() {
         let result = if finish {
@@ -664,15 +691,34 @@ async fn do_flush(
         }
     } else {
         // Send new message and capture its ID
+        //
+        // #649 follow-up (rapid-fire): stamp the originating turn's
+        // `thread_id` into the outbound metadata so the API channel's
+        // `send_with_id` captures THIS turn's cmid into the encoded
+        // message_id rather than falling back to the per-chat sticky
+        // map (which has been rotated by every concurrent rapid-fire
+        // request that arrived between this turn's bind and first chunk).
+        let mut metadata = match sender_user_id {
+            Some(uid) => {
+                serde_json::json!({ METADATA_SENDER_USER_ID: uid, "streaming": true })
+            }
+            None => serde_json::json!({ "streaming": true }),
+        };
+        if let Some(tid) = thread_id.filter(|s| !s.is_empty()) {
+            if let Some(map) = metadata.as_object_mut() {
+                map.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+            }
+        }
         let msg = OutboundMessage {
             channel: channel.name().to_string(),
             chat_id: chat_id.to_string(),
             content: text.to_string(),
             reply_to: None,
             media: vec![],
-            metadata: sender_user_id
-                .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid, "streaming": true }))
-                .unwrap_or_else(|| serde_json::json!({ "streaming": true })),
+            metadata,
         };
         match channel.send_with_id(&msg).await {
             Ok(Some(mid)) => {
@@ -889,6 +935,7 @@ mod tests {
             &mut message_id,
             &mut no_edit_support,
             Some("@bot_mybot:localhost"),
+            None,
         )
         .await;
 
@@ -917,6 +964,7 @@ mod tests {
             &mut message_id,
             &mut no_edit_support,
             Some("@bot_mybot:localhost"),
+            None,
         )
         .await;
 
@@ -928,6 +976,139 @@ mod tests {
                 .get(METADATA_SENDER_USER_ID)
                 .and_then(|v| v.as_str()),
             Some("@bot_mybot:localhost")
+        );
+    }
+
+    /// #649 follow-up (rapid-fire): the streaming path must stamp the
+    /// originating turn's `thread_id` into the OutboundMessage metadata
+    /// every time `do_flush` opens a new bubble via `send_with_id`. Pre-fix
+    /// the metadata was `{streaming: true}` only, so under rapid-fire the
+    /// API channel's `send_with_id` fell back to the per-chat sticky map
+    /// (rotated to the LATEST cmid by every concurrent `handle_chat`
+    /// arrival) and 4 of 5 turns mis-tagged onto a single bubble.
+    ///
+    /// This test drives the exact pre-fix shape (per-turn `thread_id`
+    /// captured at forwarder construction) and asserts the wire-side
+    /// outbound carries it. Pre-fix the assert fails — the metadata only
+    /// has `streaming: true`. Post-fix the assert passes.
+    #[tokio::test]
+    async fn flush_to_channel_stamps_outbound_with_thread_id() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        flush_to_channel(
+            &channel,
+            "chat-rapid-fire",
+            "first chunk",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-A"),
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent
+            .first()
+            .expect("stream message should be sent through send_with_id");
+        assert_eq!(
+            first.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-A"),
+            "outbound metadata must carry the per-turn thread_id so \
+             ApiChannel does not fall back to the rotated sticky map. \
+             Got metadata: {}",
+            first.metadata
+        );
+    }
+
+    /// #649 follow-up (rapid-fire): same property for the FINAL flush
+    /// path (StreamDone). The final outbound also goes through
+    /// `send_with_id` when the bubble was never opened, so it must
+    /// stamp `thread_id`.
+    #[tokio::test]
+    async fn finish_flush_to_channel_stamps_outbound_with_thread_id() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        finish_flush_to_channel(
+            &channel,
+            "chat-rapid-fire",
+            "final chunk",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-E"),
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent
+            .first()
+            .expect("final stream message should be sent through send_with_id");
+        assert_eq!(
+            first.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-E"),
+            "final-flush outbound metadata must carry the per-turn thread_id"
+        );
+    }
+
+    /// Backwards-compat: when `thread_id` is None or empty, the outbound
+    /// metadata MUST NOT include a `thread_id` field so non-API channels
+    /// (Matrix, Telegram, …) and pre-cmid clients keep observing the
+    /// pre-fix wire shape.
+    #[tokio::test]
+    async fn flush_omits_thread_id_when_unbound() {
+        let mock = Arc::new(MockChannel::default());
+        let channel: Arc<dyn Channel> = mock.clone();
+        let mut message_id = None;
+        let mut no_edit_support = false;
+
+        flush_to_channel(
+            &channel,
+            "chat-legacy",
+            "hello",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            None,
+        )
+        .await;
+
+        let sent = mock.sent.lock().await;
+        let first = sent.first().expect("stream message should be sent");
+        assert!(
+            first.metadata.get("thread_id").is_none(),
+            "thread_id field must be absent when forwarder has no bound id, got {}",
+            first.metadata
+        );
+
+        // Also verify empty-string thread_id is treated as absent (legacy
+        // pre-cmid clients send `client_message_id: ""` on some paths).
+        drop(sent);
+        let mock2 = Arc::new(MockChannel::default());
+        let channel2: Arc<dyn Channel> = mock2.clone();
+        let mut message_id2 = None;
+        let mut no_edit_support2 = false;
+        flush_to_channel(
+            &channel2,
+            "chat-legacy-empty",
+            "hello",
+            &mut message_id2,
+            &mut no_edit_support2,
+            None,
+            Some(""),
+        )
+        .await;
+        let sent2 = mock2.sent.lock().await;
+        let first2 = sent2.first().expect("stream message should be sent");
+        assert!(
+            first2.metadata.get("thread_id").is_none(),
+            "empty-string thread_id must be treated as absent, got {}",
+            first2.metadata
         );
     }
 }

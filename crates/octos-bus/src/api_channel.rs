@@ -5119,6 +5119,181 @@ mod tests {
         assert_eq!(parsed["thread_id"], "cmid-explicit-A");
     }
 
+    /// #649 follow-up (rapid-fire): when 5 chat streams interleave on the
+    /// same chat_id, each turn's stream forwarder must call `send_with_id`
+    /// with its OWN cmid in metadata so subsequent `edit_message` /
+    /// `send_raw_sse` calls can recover the right thread.
+    ///
+    /// Pre-fix the stream forwarder built outbound metadata containing only
+    /// `streaming: true` and let `send_with_id` fall back to the sticky
+    /// map. Under rapid-fire (Q1..Q5 lining up on the same session before
+    /// any of them finishes), the sticky map has rotated to the LAST
+    /// request's cmid by the time Q1's first chunk reaches the channel —
+    /// so Q1's encoded message_id captures Q5's cmid and every subsequent
+    /// streaming `token` / `replace` for Q1 mis-routes to Q5's bubble on
+    /// the web client. This drives that exact ordering and asserts each
+    /// turn's encoded message_id carries its OWN thread_id when supplied
+    /// explicitly via the OutboundMessage metadata.
+    #[tokio::test]
+    async fn send_with_id_uses_explicit_metadata_thread_id_over_sticky() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, _rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-rapid-fire".into(), tx);
+        }
+
+        // Five rapid-fire `handle_chat`-equivalent sticky rotations: the
+        // PRODUCTION race is each new request pinning sticky to its own
+        // cmid before any earlier turn has produced its first stream
+        // chunk. By the time Q1's stream forwarder calls `send_with_id`,
+        // sticky already holds Q5's cmid.
+        for cmid in ["cmid-A", "cmid-B", "cmid-C", "cmid-D", "cmid-E"] {
+            ch.remember_thread_id("chat-rapid-fire", Some(cmid)).await;
+        }
+
+        // Q1's stream forwarder calls `send_with_id` with metadata that
+        // EXPLICITLY carries Q1's cmid (the post-fix shape). The encoded
+        // message_id must capture cmid-A — NOT the sticky's cmid-E.
+        let q1 = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-rapid-fire".into(),
+            content: "first chunk for Q1".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-A",
+            }),
+        };
+        let q1_msg_id = ch
+            .send_with_id(&q1)
+            .await
+            .unwrap()
+            .expect("send_with_id always returns Some");
+        let (_, q1_decoded) = decode_sse_message_id(&q1_msg_id);
+        assert_eq!(
+            q1_decoded.as_deref(),
+            Some("cmid-A"),
+            "Q1's encoded message_id must capture its OWN cmid, not the sticky's last value (cmid-E). Got: {q1_msg_id}"
+        );
+
+        // Q3 lands next, also with explicit metadata. Same expectation —
+        // Q3's encoded id must reflect Q3's cmid even though sticky still
+        // points elsewhere.
+        let q3 = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-rapid-fire".into(),
+            content: "first chunk for Q3".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "streaming": true,
+                "thread_id": "cmid-C",
+            }),
+        };
+        let q3_msg_id = ch
+            .send_with_id(&q3)
+            .await
+            .unwrap()
+            .expect("send_with_id always returns Some");
+        let (_, q3_decoded) = decode_sse_message_id(&q3_msg_id);
+        assert_eq!(
+            q3_decoded.as_deref(),
+            Some("cmid-C"),
+            "Q3's encoded message_id must capture its OWN cmid even with concurrent sticky rotations. Got: {q3_msg_id}"
+        );
+    }
+
+    /// #649 follow-up (rapid-fire): drive an end-to-end interleaved
+    /// 5-turn rapid-fire scenario through `send` and assert each turn's
+    /// `replace` event carries its OWN cmid when the OutboundMessage
+    /// metadata supplies one explicitly. This exercises the path the
+    /// stream forwarder takes for non-first chunks (the inner `send` call
+    /// from `send_with_id`).
+    #[tokio::test]
+    async fn rapid_fire_streaming_chunks_carry_per_turn_thread_id() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-rapid".into(), tx);
+        }
+
+        // Simulate `handle_chat` rotating sticky to the LATEST cmid as
+        // each rapid-fire request arrives.
+        for cmid in ["cmid-A", "cmid-B", "cmid-C", "cmid-D", "cmid-E"] {
+            ch.remember_thread_id("chat-rapid", Some(cmid)).await;
+        }
+
+        // Each turn's first chunk arrives via `send` with explicit
+        // thread_id metadata. The `replace` event emitted on the wire
+        // must be tagged with that cmid, NOT the latest sticky value.
+        let cases = [
+            ("cmid-A", "Q1 reply"),
+            ("cmid-B", "Q2 reply"),
+            ("cmid-C", "Q3 reply"),
+            ("cmid-D", "Q4 reply"),
+        ];
+        for (cmid, content) in &cases {
+            let msg = OutboundMessage {
+                channel: "api".into(),
+                chat_id: "chat-rapid".into(),
+                content: (*content).into(),
+                reply_to: None,
+                media: vec![],
+                metadata: serde_json::json!({
+                    "streaming": true,
+                    "thread_id": cmid,
+                }),
+            };
+            ch.send(&msg).await.unwrap();
+            // Reset last_content so each turn's chunk emits as a `replace`,
+            // not a delta `token` (the production stream forwarder calls
+            // `send_with_id` first which clears last_content; we mimic that
+            // by clearing it inline here).
+            ch.last_content.lock().await.remove("chat-rapid");
+        }
+
+        // Drain wire events and verify each carries its OWN cmid.
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        while let Ok(payload) = rx.try_recv() {
+            events.push(serde_json::from_str(&payload).unwrap());
+        }
+        let replaces: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["type"] == "replace").collect();
+        assert_eq!(
+            replaces.len(),
+            cases.len(),
+            "expected {} replace events, got {}: {:?}",
+            cases.len(),
+            replaces.len(),
+            events,
+        );
+        for ((expected_cmid, expected_text), event) in cases.iter().zip(replaces.iter()) {
+            assert_eq!(
+                event["text"], *expected_text,
+                "replace event text mismatch: {event}"
+            );
+            assert_eq!(
+                event["thread_id"], *expected_cmid,
+                "replace event for {expected_text} mis-tagged. Expected {expected_cmid}, got: {event}"
+            );
+        }
+    }
+
     /// Pre-cmid clients send messages with no thread_id metadata. The wire
     /// schema must remain backwards-compatible: events emitted in this
     /// case must NOT include a `thread_id` field at all.
