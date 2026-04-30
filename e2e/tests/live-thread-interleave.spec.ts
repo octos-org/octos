@@ -42,7 +42,19 @@ const SLOW_PROMPT =
 const FAST_PROMPT =
   process.env.OCTOS_INTERLEAVE_FAST_PROMPT || '1+1 等于几？只回答数字。';
 
-const SLOW_HINT_RE = /rust|news|research|pipeline|update/i;
+// Marker used to detect the actual deep_research RESULT (not the
+// spawn-ack). The slow prompt asks for "latest news about Rust
+// language" — any real research output will reference "Rust" by name
+// (it's the literal subject). The Chinese ack
+// "深度研究已在后台启动…" contains zero Latin tokens, so this regex
+// cannot match the ack. Word boundary keeps it from matching incidental
+// substrings (e.g. "trust" or "robust"). We deliberately use a tight
+// single-word marker rather than the looser
+// `/rust|news|research|pipeline|update/i` that the original
+// `FAST_HINT_RE`-mirrored constant suggested, because any English ack
+// from a future workflow ("Deep research started…") would match
+// `research` and re-introduce the false-pass.
+const SLOW_HINT_RE = /\brust\b/i;
 const FAST_HINT_RE = /\b2\b|二|两/;
 
 const FLAG_KEY = 'octos_thread_store_v2';
@@ -72,13 +84,42 @@ async function getOrderedBubbles(page: Page) {
   });
 }
 
+/**
+ * Wait until both Q1 (slow) and Q2 (fast) have finalised.
+ *
+ * NOTE — #649 hardening: counting "filled" bubbles by `text.length > 8`
+ * alone is not enough, because the slow deep_research path emits a
+ * spawn-ack ("深度研究已在后台启动…") within ~1-3 s of the send. That
+ * ack satisfies the length threshold and would let this poll declare
+ * victory while the actual research RESULT — the late background-
+ * completion that #649 misroutes — has not arrived yet. The pairing
+ * assertions then run on an already-paired-by-cmid ack and false-pass.
+ *
+ * Fix: require Q1's paired bubble (the first assistant bubble after
+ * the first user bubble in the new region) to contain a content marker
+ * (`slowMarker`) before we accept the count as final. `SLOW_HINT_RE`
+ * (`/\brust\b/i`) matches the actual research output and does NOT
+ * match the Chinese ack — so this poll only releases once the
+ * deep_research RESULT lands, exercising the late-binding code path
+ * the #649 fix targets.
+ *
+ * Early-fail diagnostic: while polling, we also look at Q2's paired
+ * bubble. If the slow marker shows up THERE before showing up under
+ * Q1, that's the smoking-gun #649 misroute (late background result
+ * inherited Q2's thread_id). We throw immediately with a clear
+ * diagnostic instead of letting the test silently time out.
+ */
 async function waitForBothFinished(
   page: Page,
   expectedAssistantCount: number,
   maxWaitMs: number,
+  baseUserBubbles: number,
+  baseAssistantBubbles: number,
+  slowMarker: RegExp,
 ) {
   const start = Date.now();
   let lastFilled = 0;
+  let lastSlowMatched = false;
   let stable = 0;
   while (Date.now() - start < maxWaitMs) {
     const isStreaming = await page
@@ -93,19 +134,67 @@ async function waitForBothFinished(
       }).length;
     }, SEL.assistantMessage);
 
-    if (filled >= expectedAssistantCount && !isStreaming) {
+    // Inspect Q1's vs Q2's paired bubbles. Q1's assistants live in the
+    // new region between the first user bubble and the second user
+    // bubble; Q2's assistants live after the second user bubble.
+    const regionTexts = await page.evaluate(
+      ({ baseUsers, baseAssistants }) => {
+        const nodes = document.querySelectorAll(
+          "[data-testid='user-message'], [data-testid='assistant-message']",
+        );
+        const all = Array.from(nodes);
+        const newRegion = all.slice(baseUsers + baseAssistants);
+        const firstUserIdx = newRegion.findIndex(
+          (el) => el.getAttribute('data-testid') === 'user-message',
+        );
+        if (firstUserIdx < 0) return { slow: '', fast: '' };
+        const secondUserRel = newRegion
+          .slice(firstUserIdx + 1)
+          .findIndex((el) => el.getAttribute('data-testid') === 'user-message');
+        const slowEnd =
+          secondUserRel < 0
+            ? newRegion.length
+            : firstUserIdx + 1 + secondUserRel;
+        const slowSlice = newRegion.slice(firstUserIdx + 1, slowEnd);
+        const fastSlice =
+          secondUserRel < 0 ? [] : newRegion.slice(slowEnd + 1);
+        const collect = (arr: Element[]) =>
+          arr
+            .filter(
+              (el) => el.getAttribute('data-testid') === 'assistant-message',
+            )
+            .map((el) => ((el as HTMLElement).innerText || '').trim())
+            .join('\n');
+        return { slow: collect(slowSlice), fast: collect(fastSlice) };
+      },
+      { baseUsers: baseUserBubbles, baseAssistants: baseAssistantBubbles },
+    );
+    const slowMatched = slowMarker.test(regionTexts.slow);
+    const fastHasSlowMarker = slowMarker.test(regionTexts.fast);
+
+    // Smoking-gun: late deep_research result landed under Q2's bubble
+    // instead of Q1's. Fail fast with full diagnostics rather than
+    // burning the rest of the 6-min budget.
+    if (fastHasSlowMarker && !slowMatched) {
+      throw new Error(
+        `BROKEN PAIRING (#649 misroute): slow-Q research-content marker (${slowMarker}) appeared under Q2's bubble while Q1's bubble has no such marker. This is exactly the #649 symptom: late background result inherited Q2's thread_id from the sticky map.\nQ1 region text: ${JSON.stringify(regionTexts.slow.slice(0, 400))}\nQ2 region text: ${JSON.stringify(regionTexts.fast.slice(0, 400))}`,
+      );
+    }
+
+    if (filled >= expectedAssistantCount && !isStreaming && slowMatched) {
       stable += 1;
       if (stable >= 2) return filled;
     } else {
       stable = 0;
     }
 
-    if (filled !== lastFilled) {
+    if (filled !== lastFilled || slowMatched !== lastSlowMatched) {
       const elapsed = ((Date.now() - start) / 1000).toFixed(0);
       console.log(
-        `  [interleave] ${elapsed}s: filled=${filled}/${expectedAssistantCount} streaming=${isStreaming}`,
+        `  [interleave] ${elapsed}s: filled=${filled}/${expectedAssistantCount} streaming=${isStreaming} slowMatched=${slowMatched} slowSnippet=${JSON.stringify(regionTexts.slow.slice(0, 120))}`,
       );
       lastFilled = filled;
+      lastSlowMatched = slowMatched;
     }
     await page.waitForTimeout(3_000);
   }
@@ -135,22 +224,31 @@ test.describe('Live thread interleave (M8.10 PR #4)', () => {
     //    background — `deep_search` / `run_pipeline` are spawn_only, so
     //    the foreground SSE turn ends with a "background started" ack
     //    within ~2-3s and the cancel button disappears even though the
-    //    real research is still running. The threading invariant we
-    //    test below holds either way: each user message's responses
+    //    real research is still running. We DO NOT gate on
+    //    `cancelButton.isVisible()` here: gating on it caused a
+    //    pre-existing failure that blocked this spec from ever
+    //    reaching the pairing-assertion stage. The threading invariant
+    //    we test below holds either way: each user message's responses
     //    (including any later background-completion bubble) bind to
-    //    its own thread by clientMessageId.
+    //    its own thread by clientMessageId / cmid.
     await page.waitForTimeout(SEND_GAP_MS);
 
     await getInput(page).fill(FAST_PROMPT);
     await getSendButton(page).click();
     await expect.poll(() => countUserBubbles(page)).toBe(userBubblesBefore + 2);
 
-    // 3. Wait until both answers are complete.
+    // 3. Wait until both answers are complete AND Q1's paired bubble
+    //    contains the actual research-content marker (not just the
+    //    spawn-ack). See `waitForBothFinished` doc comment for the
+    //    #649 hardening rationale.
     const assistantsExpected = assistantBubblesBefore + 2;
     const filled = await waitForBothFinished(
       page,
       assistantsExpected,
       SLOW_MAX_WAIT_MS,
+      userBubblesBefore,
+      assistantBubblesBefore,
+      SLOW_HINT_RE,
     );
     expect(
       filled,
@@ -219,11 +317,25 @@ test.describe('Live thread interleave (M8.10 PR #4)', () => {
       expect(slowThreadIds[0]).not.toBe(fastThreadIds[0]);
     }
 
+    // Hard content check (#649 hardening): the slow assistant's text
+    // MUST contain a research-content marker — this is what proves the
+    // late deep_research RESULT actually attached to Q1's bubble (and
+    // not Q2's, which is the #649 misrouting symptom). Without this
+    // assertion the spec would false-pass on the spawn-ack alone.
+    // `waitForBothFinished` already polls for this marker, so by the
+    // time we reach here it should be present; if it's not, the late
+    // result either timed out (raise SLOW_MAX_WAIT_MS) or got bound to
+    // the wrong bubble (the #649 regression).
+    const slowText = slowAssistantBetween.map((b) => b.text).join(' ');
+    const fastText = fastAssistantAfter.map((b) => b.text).join(' ');
+    expect(
+      SLOW_HINT_RE.test(slowText),
+      `Slow-Q's paired bubble has no research-content marker. This means the deep_research result either never arrived under Q1's bubble (possibly bound to Q2's bubble — the #649 regression) or the spawn-ack alone is what got rendered. slow="${slowText.slice(0, 400)}" fast="${fastText.slice(0, 200)}"`,
+    ).toBe(true);
+
     // Soft semantic check: the slow assistant's text should NOT include
     // any "1+1=2" content (that's the fast Q's answer). If it does, the
     // wires got crossed.
-    const slowText = slowAssistantBetween.map((b) => b.text).join(' ');
-    const fastText = fastAssistantAfter.map((b) => b.text).join(' ');
     if (FAST_HINT_RE.test(slowText) && !SLOW_HINT_RE.test(slowText)) {
       throw new Error(
         `BROKEN PAIRING: slow assistant text contains fast-Q answer marker but no slow-Q content. slow="${slowText.slice(0, 200)}" fast="${fastText.slice(0, 200)}"`,
