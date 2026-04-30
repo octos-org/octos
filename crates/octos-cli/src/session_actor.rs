@@ -865,33 +865,59 @@ impl SessionTaskQueryStore {
         );
     }
 
-    pub fn query_json(&self, session_key: &str) -> serde_json::Value {
-        let upgraded = {
-            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.get(session_key).and_then(|entry| {
-                entry
-                    .supervisor
-                    .upgrade()
-                    .map(|supervisor| (supervisor, entry.data_dir.clone()))
-            }) {
-                Some(entry) => Some(entry),
-                None => {
-                    guard.remove(session_key);
-                    None
-                }
+    /// Look up the live supervisor + data dir for `session_key`, pruning a
+    /// stale entry if the underlying `Arc<TaskSupervisor>` has been dropped.
+    fn lookup_live_supervisor(&self, session_key: &str) -> Option<(Arc<TaskSupervisor>, PathBuf)> {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.get(session_key).and_then(|entry| {
+            entry
+                .supervisor
+                .upgrade()
+                .map(|supervisor| (supervisor, entry.data_dir.clone()))
+        }) {
+            Some(entry) => Some(entry),
+            None => {
+                guard.remove(session_key);
+                None
             }
-        };
-
-        match upgraded {
-            Some((supervisor, data_dir)) => serde_json::Value::Array(
-                supervisor
-                    .get_tasks_for_session(session_key)
-                    .iter()
-                    .map(|task| sanitize_task_for_response(&data_dir, task))
-                    .collect(),
-            ),
-            None => serde_json::json!([]),
         }
+    }
+
+    /// Return the JSON task list for `session_key` and every reachable
+    /// descendant session. The walk follows each task's
+    /// [`octos_agent::BackgroundTask::child_session_key`] to the next
+    /// supervisor (when one is registered and still alive) so that, e.g., a
+    /// `run_pipeline` task running inside a child session shows up in its
+    /// parent's `/api/sessions/:id/tasks` view. Without this, UIs cannot
+    /// correlate the parent's rendered tool_call_id bubble with the actual
+    /// child-session task.
+    ///
+    /// Traversal is breadth-first with a `visited` guard so cycles or
+    /// duplicate child keys do not trigger redundant work. Auth/ownership
+    /// checks happen at the API layer for the parent — descendants inherit
+    /// access by virtue of being spawned from the authorized parent.
+    pub fn query_json(&self, session_key: &str) -> serde_json::Value {
+        let mut tasks: Vec<serde_json::Value> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        queue.push_back(session_key.to_string());
+        visited.insert(session_key.to_string());
+
+        while let Some(current) = queue.pop_front() {
+            let Some((supervisor, data_dir)) = self.lookup_live_supervisor(&current) else {
+                continue;
+            };
+            for task in supervisor.get_tasks_for_session(&current) {
+                if let Some(child_key) = task.child_session_key.as_deref() {
+                    if visited.insert(child_key.to_string()) {
+                        queue.push_back(child_key.to_string());
+                    }
+                }
+                tasks.push(sanitize_task_for_response(&data_dir, &task));
+            }
+        }
+
+        serde_json::Value::Array(tasks)
     }
 
     /// M7.9 / W2: locate the supervisor owning `task_id` and forward
@@ -6473,6 +6499,187 @@ mod tests {
             !was_marked,
             "mark_child_session_failed must return false when no task matches"
         );
+    }
+
+    #[test]
+    fn query_json_includes_descendant_session_tasks() {
+        // Server-side bug fix: `/api/sessions/:id/tasks` previously
+        // returned ONLY the parent session's tasks. When a workflow runs
+        // `run_pipeline` in a CHILD session (parent spawns child via
+        // spawn_only), that task was invisible from the parent view —
+        // blocking UIs that cross-correlate the rendered tool_call_id
+        // bubble with the actual run_pipeline task.
+        //
+        // After the fix, query_json walks the parent's session_key and
+        // every reachable descendant (via each task's `child_session_key`)
+        // breadth-first, returning a flat array carrying both sets. Each
+        // entry's existing `session_key` field lets callers filter
+        // parent-only when needed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Parent session: register a `spawn` task. The supervisor derives
+        // a deterministic child_session_key the way the live spawn tool
+        // would.
+        let parent_supervisor = Arc::new(TaskSupervisor::new());
+        let parent_ledger = data_dir.join("parent-tasks.jsonl");
+        parent_supervisor
+            .enable_persistence(&parent_ledger)
+            .unwrap();
+        let parent_session_key = SessionKey::new("api", "parent-session");
+        let parent_task_id = parent_supervisor.register_with_lineage(
+            "spawn",
+            "call-spawn",
+            Some(&parent_session_key.to_string()),
+            Some(parent_ledger.to_str().unwrap()),
+        );
+        parent_supervisor.mark_running(&parent_task_id);
+
+        // Pull the derived child session key the supervisor recorded.
+        let parent_task = parent_supervisor
+            .get_task(&parent_task_id)
+            .expect("parent task tracked");
+        let child_session_key_str = parent_task
+            .child_session_key
+            .clone()
+            .expect("register_with_lineage derives a child key");
+        let child_session_key = SessionKey(child_session_key_str.clone());
+
+        // Child session: register its own supervisor with a `run_pipeline`
+        // task (the workflow whose tool_call_id the UI wants to correlate
+        // back from the parent).
+        let child_supervisor = Arc::new(TaskSupervisor::new());
+        let child_ledger = data_dir.join("child-tasks.jsonl");
+        child_supervisor.enable_persistence(&child_ledger).unwrap();
+        let child_task_id = child_supervisor.register_with_lineage(
+            "run_pipeline",
+            "call-pipeline",
+            Some(&child_session_key_str),
+            Some(child_ledger.to_str().unwrap()),
+        );
+        child_supervisor.mark_running(&child_task_id);
+
+        // Both supervisors register against the shared store, the way
+        // ActorRunner does at startup for each session it serves.
+        let store = SessionTaskQueryStore::default();
+        store.register(&parent_session_key, &parent_supervisor, &data_dir);
+        store.register(&child_session_key, &child_supervisor, &data_dir);
+
+        // ACT: query the parent. Both tasks should surface in one flat
+        // array.
+        let payload = store.query_json(&parent_session_key.to_string());
+        let tasks = payload.as_array().expect("array response");
+        assert_eq!(
+            tasks.len(),
+            2,
+            "parent /tasks must surface its own task plus the child's run_pipeline task"
+        );
+
+        let parent_entry = tasks
+            .iter()
+            .find(|t| t["tool_name"] == "spawn")
+            .expect("parent spawn task present");
+        assert_eq!(parent_entry["session_key"], "api:parent-session");
+        assert_eq!(
+            parent_entry["child_session_key"], child_session_key_str,
+            "parent task carries its derived child_session_key"
+        );
+
+        let child_entry = tasks
+            .iter()
+            .find(|t| t["tool_name"] == "run_pipeline")
+            .expect("child run_pipeline task surfaces from parent view");
+        assert_eq!(child_entry["session_key"], child_session_key_str);
+        assert_eq!(child_entry["tool_call_id"], "call-pipeline");
+    }
+
+    #[test]
+    fn query_json_walks_multi_level_descendants_without_cycling() {
+        // The traversal must follow chains deeper than one level
+        // (parent -> spawn -> run_pipeline can go 3+ levels in
+        // research/podcast workflows) and must terminate even when a
+        // child's child_session_key happens to point back to an already
+        // visited session.
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let parent_session_key = SessionKey::new("api", "deep-research");
+
+        // Level 1: parent spawns child A.
+        let parent_supervisor = Arc::new(TaskSupervisor::new());
+        let parent_ledger = data_dir.join("parent.jsonl");
+        parent_supervisor
+            .enable_persistence(&parent_ledger)
+            .unwrap();
+        let level1_id = parent_supervisor.register_with_lineage(
+            "spawn",
+            "call-l1",
+            Some(&parent_session_key.to_string()),
+            Some(parent_ledger.to_str().unwrap()),
+        );
+        let level1_child_key = parent_supervisor
+            .get_task(&level1_id)
+            .and_then(|t| t.child_session_key)
+            .expect("level-1 child key");
+
+        // Level 2: child A spawns child B.
+        let mid_supervisor = Arc::new(TaskSupervisor::new());
+        let mid_ledger = data_dir.join("mid.jsonl");
+        mid_supervisor.enable_persistence(&mid_ledger).unwrap();
+        let level2_id = mid_supervisor.register_with_lineage(
+            "spawn",
+            "call-l2",
+            Some(&level1_child_key),
+            Some(mid_ledger.to_str().unwrap()),
+        );
+        let level2_child_key = mid_supervisor
+            .get_task(&level2_id)
+            .and_then(|t| t.child_session_key)
+            .expect("level-2 child key");
+
+        // Level 3: leaf task running inside child B. We also register a
+        // synthetic task whose child_session_key points back at the
+        // already-visited parent — the visited guard must prevent a loop.
+        let leaf_supervisor = Arc::new(TaskSupervisor::new());
+        let leaf_ledger = data_dir.join("leaf.jsonl");
+        leaf_supervisor.enable_persistence(&leaf_ledger).unwrap();
+        let leaf_id = leaf_supervisor.register_with_lineage(
+            "run_pipeline",
+            "call-l3",
+            Some(&level2_child_key),
+            Some(leaf_ledger.to_str().unwrap()),
+        );
+        leaf_supervisor.mark_running(&leaf_id);
+
+        let store = SessionTaskQueryStore::default();
+        store.register(&parent_session_key, &parent_supervisor, &data_dir);
+        store.register(
+            &SessionKey(level1_child_key.clone()),
+            &mid_supervisor,
+            &data_dir,
+        );
+        store.register(
+            &SessionKey(level2_child_key.clone()),
+            &leaf_supervisor,
+            &data_dir,
+        );
+
+        let payload = store.query_json(&parent_session_key.to_string());
+        let tasks = payload.as_array().expect("array response");
+        assert_eq!(
+            tasks.len(),
+            3,
+            "depth-3 descendant traversal must surface every task exactly once"
+        );
+
+        let tool_names: std::collections::HashSet<&str> = tasks
+            .iter()
+            .filter_map(|t| t["tool_name"].as_str())
+            .collect();
+        assert!(tool_names.contains("spawn"));
+        assert!(tool_names.contains("run_pipeline"));
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
