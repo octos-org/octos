@@ -1053,12 +1053,20 @@ impl ServeCommand {
                 .await
                 .wrap_err("failed to open persistent cost ledger for swarm")?,
         );
+        // M7 req 7: production-grade swarm dispatch policy. We default
+        // to a no-op policy (matches the pre-fix behaviour) so CLI
+        // callers without an explicit policy are not surprised by
+        // approval prompts. Operators that want enforcement should
+        // wire `DispatchPolicy` here (a follow-up PR will add a
+        // `--swarm-dispatch-policy <path>` flag — out of scope for the
+        // M7 req 7 close).
         let state = crate::api::build_swarm_state(
             backend,
             swarm_dir,
             cost_ledger,
             broadcaster,
             harness_sink,
+            None,
         )
         .await
         .wrap_err("failed to build swarm state")?;
