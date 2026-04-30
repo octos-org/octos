@@ -20,12 +20,15 @@ This auto-detects the best available backend for your platform.
 
 ### Auto-Detection Order
 
-When `mode` is `"auto"` (default), octos probes in order:
+When `mode` is `"auto"` (default), octos probes in order, picking the first match for the host OS:
 
 1. **bwrap** on Linux (checked via `which bwrap`)
 2. **sandbox-exec** on macOS (checked via `which sandbox-exec`)
-3. **docker** on any platform (checked via `which docker`)
-4. **none** — pass-through if nothing is found
+3. **AppContainer** on Windows (uses the `octos-sandbox` helper binary built on `rappct`)
+4. **docker** on any platform as a fallback (checked via `which docker`)
+5. **none** — pass-through if nothing is found
+
+Sandbox source lives in `crates/octos-agent/src/sandbox/` (`mod.rs`, `bwrap.rs`, `macos.rs`, `docker.rs`, `windows.rs`). The Windows helper binary is the standalone `crates/octos-sandbox/` crate.
 
 ### Bwrap (Linux)
 
@@ -96,6 +99,28 @@ Uses Apple's Seatbelt sandbox framework with a [SBPL](https://reverse.put.as/wp-
 - `sandbox-exec` is deprecated by Apple but still functional as of macOS 15 (Sequoia).
 - Paths containing SBPL metacharacters (`(`, `)`, `\`, `"`) or control characters are rejected to prevent profile injection. The command fails closed with an error instead of running unsandboxed.
 
+### Windows AppContainer
+
+Uses Windows AppContainer isolation via the `octos-sandbox` helper binary (built on the [`rappct`](https://crates.io/crates/rappct) crate).
+
+**No installation needed** — the helper ships with the Octos binary on Windows.
+
+**What it does:**
+
+| Resource | Policy |
+|----------|--------|
+| Process token | Restricted token + per-process AppContainer SID |
+| File system | Workdir granted via per-AppContainer ACL; everything else denied by default |
+| Integrity level | Low |
+| Network | Per-capability — denied by default unless `allow_network: true` |
+| Capabilities | None of the standard Windows capabilities granted (no `lpacAppExperience`, etc.) |
+
+**Limitations:**
+
+- AppContainer is per-process, so very short-lived commands pay the per-launch isolation setup cost.
+- Some legacy Windows tools (those that try to talk to the parent console directly) may fail under low IL.
+- Paths containing control characters, NUL, or drive-escape sequences are rejected.
+
 ### Docker
 
 Full container isolation using Docker.
@@ -147,8 +172,9 @@ Full container isolation using Docker.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch. When `false`, commands run without isolation. |
-| `mode` | string | `"auto"` | Backend selection. One of: `auto`, `bwrap`, `macos`, `docker`, `none`. |
+| `mode` | string | `"auto"` | Backend selection. One of: `auto`, `bwrap`, `macos`, `docker`, `appcontainer`, `none`. |
 | `allow_network` | bool | `false` | Allow network access inside the sandbox. |
+| `read_allow_paths` | array<string> | (none) | macOS only: tighten read access to just these paths. When unset, file-read* is allowed (matches legacy behaviour). |
 | `docker` | object | (see below) | Docker-specific settings. Ignored for other backends. |
 
 ### Docker Fields

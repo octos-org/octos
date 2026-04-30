@@ -1,10 +1,10 @@
 # Octos 🐙
 
-> Like an octopus — 9 brains (1 central + 8 in each arm), every arm thinks independently, but they share one brain.
+> Like an octopus — 9 brains (1 central + 8 in the arms, one per arm). Every arm thinks independently, but they share one brain.
 
 **Open Cognitive Tasks Orchestration System** — a Rust-native, API-first Agentic OS.
 
-31MB static binary. 91 REST endpoints. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero dependencies.
+31MB static binary. ~140 REST endpoints. 15 LLM providers. 14 messaging channels. Multi-tenant. Zero external runtime services.
 
 ## What is Octos?
 
@@ -22,16 +22,18 @@ The important part for new users is that Octos can be used in three distinct way
 
 Most agentic systems are single-tenant chat assistants — one user, one model, one conversation at a time. Octos is different:
 
-- **API-first Agentic OS**: 91 REST endpoints (chat, sessions, admin, profiles, skills, metrics, webhooks). Any frontend — web, mobile, CLI, CI/CD — can be built on top.
+- **API-first Agentic OS**: ~140 REST endpoints (chat, sessions, admin, profiles, skills, swarm, pipeline, metrics, webhooks, SSE). Any frontend — web, mobile, CLI, CI/CD — can be built on top.
 - **Multi-tenant by design**: One 31MB binary serves 200+ profiles on a 16GB machine. Each profile is a separate OS process with isolated memory, sessions, and data. Family Plan sub-accounts.
-- **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime.
-- **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, Lane scoring, circuit breakers.
-- **LRU tool deferral**: 15 active tools for fast LLM reasoning, 34+ on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
+- **Multi-LLM DOT pipelines**: Define workflows as DOT graphs. Per-node model selection. Dynamic parallel fan-out spawns N concurrent workers at runtime, with bounded concurrency for fleet stability.
+- **Swarm dispatcher**: Fan contracts to N sub-agents, aggregate artifacts, gate through validator, roll up cost — wired into `/api/swarm/dispatch`.
+- **3-layer provider failover**: RetryProvider → ProviderChain → AdaptiveRouter. Hedge racing, lane scoring, circuit breakers.
+- **LRU tool deferral**: ~15 active tools for fast LLM reasoning, ~50 on demand. Idle tools auto-evict. `spawn_only` tools auto-redirect to background execution.
 - **5 queue modes per session**: Followup, Collect, Steer, Interrupt, Speculative — users control agent concurrency via `/queue`.
-- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp.
-- **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction).
+- **Session control in any channel**: `/new`, `/s <name>`, `/sessions`, `/back` — works in Telegram, Discord, Slack, WhatsApp, Matrix, Feishu.
+- **Sticky thread_id + committed_seq**: Every SSE event is bound to a thread; replay is deterministic by committed sequence number (M8.10).
+- **3-layer memory**: Long-term (entity bank, auto-injected), episodic (task outcomes in redb), session (JSONL + LLM compaction, three-tier).
 - **Native office suite**: PPTX/DOCX/XLSX via pure Rust (zip + quick-xml).
-- **Sandbox isolation**: bwrap + sandbox-exec + Docker. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
+- **Sandbox isolation**: bwrap + sandbox-exec + Docker + Windows AppContainer. `deny(unsafe_code)` workspace-wide. 67 prompt injection tests.
 
 ## Choose a setup path
 
@@ -314,20 +316,39 @@ Skip it when you just need the CLI (`octos chat`, `octos gateway`) — `cargo in
 
 ## Architecture
 
+10 `octos-*` crates + 14 app-skill crates + 1 platform-skill crate (25 workspace members total). The runtime auto-installs only the 9 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
+
 ```
-octos serve (control plane + dashboard)
-  ├── Profile A → gateway process (Telegram, WhatsApp)
-  ├── Profile B → gateway process (Feishu, Slack)
-  └── Profile C → gateway process (CLI)
-       │
-       ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, ...)
-       │   └── AdaptiveRouter → ProviderChain → RetryProvider
-       ├── Tool Registry (25 built-in + plugins + 9 app-skills)
-       │   └── LRU Deferral (15 active, activate on demand)
-       ├── Pipeline Engine (DOT graphs, per-node model, parallel fan-out)
-       ├── Session Store (JSONL, LRU cache, LLM compaction)
-       ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
-       └── Skills (bundled + installable from octos-hub)
+octos-cli   (CLI entrypoint, REST API server, dashboard, config watcher, wizard)
+   │
+octos-agent (agent loop, tool registry, MCP, hooks, three-tier compaction,
+             profile system, sub-agent output router, task supervisor)
+   │
+   ├─ octos-bus       (14 channels, sessions w/ sticky thread_id, coalescing, cron)
+   ├─ octos-llm       (15 providers, AdaptiveRouter → ProviderChain → RetryProvider)
+   ├─ octos-memory    (long-term + episodic + HNSW vector + BM25 hybrid search)
+   ├─ octos-pipeline  (DOT-graph workflows, per-node model, bounded fan-out)
+   ├─ octos-plugin    (skill manifest, discovery, gating, lifecycle, protocol v2)
+   ├─ octos-sandbox   (Windows AppContainer helper binary)
+   ├─ octos-swarm     (PM/swarm dispatcher, ledger, topology, validator gate)
+   └─ octos-core      (Task, Message, Error types — no internal deps)
+
+Runtime view:
+  octos serve (control plane + dashboard, ~140 REST endpoints)
+    ├── Profile A → gateway process (Telegram, WhatsApp)
+    ├── Profile B → gateway process (Feishu, Slack, Matrix)
+    └── Profile C → gateway process (CLI)
+         │
+         ├── LLM Provider (Anthropic, OpenAI, Gemini, DeepSeek, Moonshot, …)
+         │   └── AdaptiveRouter → ProviderChain → RetryProvider
+         ├── Tool Registry (~50 built-in + plugins + 9 app-skills)
+         │   └── LRU Deferral (~15 active, activate on demand)
+         ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
+         ├── Swarm Dispatcher (fan-out → aggregate → validator gate → cost rollup)
+         ├── Sandbox (bwrap / sandbox-exec / Docker / AppContainer)
+         ├── Session Store (JSONL, LRU cache, three-tier compaction, thread_id)
+         ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
+         └── Skills (bundled + installable from octos-hub)
 ```
 
 ## License
