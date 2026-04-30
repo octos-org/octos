@@ -1,5 +1,5 @@
 {
-  "$schema_doc": "Expected phase ladder for the M4.1A live release gate (issue #474). This is authoritative for the validate-m4-1a-live.sh script and the e2e live-progress-gate specs. Keep field names in sync with crates/octos-agent/src/harness_events.rs and crates/app-skills/deep-search/src/main.rs.",
+  "$schema_doc": "Expected phase ladder for the M4.1A live release gate (issue #474). This is authoritative for the validate-m4-1a-live.sh script and the e2e live-progress-gate specs. Keep field names in sync with crates/octos-agent/src/harness_events.rs, crates/octos-agent/src/tools/deep_search.rs, and crates/octos-cli/src/workflows/research_report.rs. The live deep_research workflow uses the run_pipeline path (not the standalone deep-search skill binary), so phases come from a mix of: (a) the workflow runtime — `research` (initial) and `deliver_result` (after artifacts are produced), and (b) the deep_search built-in tool invoked by the pipeline graph — `search`, `synthesize`, `completion`. The legacy `fetch` and `report_build` phases were emitted only by the standalone deep-search skill binary, which is not on the live run_pipeline path; they remain in this fixture as observability hints (`must_appear: false`) for backwards compatibility with older skill-binary code paths.",
   "schema": "octos.harness.event.v1",
   "kind": "progress",
   "workflow": "deep_research",
@@ -30,14 +30,26 @@
   ],
   "required_phases": [
     {
-      "phase": "search",
+      "phase": "research",
       "min_progress": 0.0,
       "max_progress": 0.95,
       "must_appear": true
     },
     {
+      "phase": "search",
+      "must_appear": true
+    },
+    {
+      "phase": "synthesize",
+      "must_appear": true
+    },
+    {
       "phase": "completion",
-      "min_progress": 0.99,
+      "must_appear": true
+    },
+    {
+      "phase": "deliver_result",
+      "min_progress": 0.9,
       "max_progress": 1.0,
       "must_appear": true
     },
@@ -46,25 +58,16 @@
       "must_appear": false
     },
     {
-      "phase": "synthesize",
-      "must_appear": false
-    },
-    {
       "phase": "report_build",
-      "must_appear": false
-    },
-    {
-      "phase": "research",
       "must_appear": false
     }
   ],
   "phase_order": [
     "research",
     "search",
-    "fetch",
     "synthesize",
-    "report_build",
-    "completion"
+    "completion",
+    "deliver_result"
   ],
   "runtime_detail_fields": [
     "schema",
@@ -108,16 +111,17 @@
     "deep_research": "Do a deep research on the latest Rust programming language developments in 2026. Run the pipeline directly, don't ask me to choose."
   },
   "limits": {
-    "per_run_timeout_seconds": 600,
+    "per_run_timeout_seconds": 1200,
     "poll_interval_seconds": 5,
     "min_progress_events": 3,
     "max_duplicate_sessions": 0
   },
   "notes": [
-    "A deep_research run MUST emit progress events for every phase in `required_phases` before the task transitions to `ready`.",
-    "`phase_order` is the canonical ordering; the monotonic check allows repeats but never a backward jump.",
+    "A deep_research run MUST emit progress events for every phase in `required_phases` whose `must_appear` is true before the task transitions to `ready`.",
+    "`phase_order` is the canonical ordering; the monotonic check allows repeats but never a backward jump. `research` is the initial workflow_runtime phase, then the run_pipeline graph cycles `search`/`synthesize`/`completion` (potentially multiple passes), and finally the workflow_runtime advances to `deliver_result` once artifacts pass validation.",
     "Field names mirror the canonical ABI: `progress` (not `progress_fraction`) in the HarnessEvent struct. Skills that still emit `progress_fraction` are acceptable as an aliased rendering; validators consume whichever the runtime exposes in `runtime_detail.progress`.",
     "The `ui_selectors` map is the source of truth for the e2e live-progress-gate spec; keep it synchronized with crates/octos-cli/static/app.js.",
-    "This fixture is consumed by both scripts/validate-m4-1a-live.sh and e2e/tests/live-progress-gate.spec.ts."
+    "This fixture is consumed by both scripts/validate-m4-1a-live.sh and e2e/tests/live-progress-gate.spec.ts.",
+    "`per_run_timeout_seconds` is sized for a real deep_research run: roughly 4-10 minutes of pipeline work plus stack reload overhead on freshly redeployed minis."
   ]
 }
