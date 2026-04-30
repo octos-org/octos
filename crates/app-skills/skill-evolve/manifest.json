@@ -5,6 +5,7 @@
     {
       "name": "skill_evolve",
       "description": "Manage skill evolution patches: list pending corrections, apply them to SKILL.md, or discard them. Patches are auto-generated when plugin tools fail.",
+      "concurrency_class": "exclusive",
       "env": [
         "DEEPSEEK_API_KEY",
         "KIMI_API_KEY",
