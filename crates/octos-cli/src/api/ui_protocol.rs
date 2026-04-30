@@ -60,6 +60,13 @@ const FRAME_TOO_LARGE: i64 = -32005;
 const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
+/// Wall-clock budget for delivering a *terminal* task lifecycle update
+/// (`completed` / `failed` / `cancelled`) when the bounded progress
+/// channel is full. Long enough that real WebSocket backpressure can
+/// drain (UI repaint, network blip), short enough that we don't pile up
+/// zombie sends if the consumer is permanently gone. See
+/// `forward_task_progress_to_channel` for the durability contract.
+const TERMINAL_TASK_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Per-session ring buffer cap. Bumped from 1024 (M9.6 default) to
 /// 4096 in M9-FIX-05 — a tool-heavy turn was clipping the start of the
 /// current turn from replay. Disk log is now the source of truth, so
@@ -613,6 +620,81 @@ impl octos_agent::ProgressReporter for BoundedChannelReporter {
             );
         }
     }
+}
+
+/// Forward a `BackgroundTask` snapshot from `TaskSupervisor::set_on_change`
+/// into the per-turn progress channel.
+///
+/// **Terminal updates** (`completed` / `failed` / `cancelled`) MUST NOT be
+/// dropped under WebSocket backpressure — dropping one leaves the UI
+/// stuck on `running` indefinitely even though the agent has long since
+/// moved on (M9 review finding #6). For these, a `try_send` failure
+/// upgrades to a spawned `tx.send().await` with a [`TERMINAL_TASK_SEND_TIMEOUT`]
+/// budget so the update is durable through ordinary backpressure but does
+/// not pile up zombies if the consumer is permanently gone.
+///
+/// **Non-terminal updates** are coalesce-friendly: the next update will
+/// overwrite, so a drop has no correctness impact and we keep the
+/// non-blocking `try_send` fast-path.
+///
+/// `progress_dropped` increments on the immediate `try_send` failure (so
+/// the `protocol/replay_lossy` machinery is informed), regardless of
+/// terminal status. The dedicated `ws.send.timeout.terminal` metric fires
+/// only when even the awaited send hits the timeout — i.e., the case the
+/// fix exists to make observable.
+fn forward_task_progress_to_channel(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    progress_dropped: &Arc<AtomicU64>,
+    task: &octos_agent::BackgroundTask,
+) {
+    let event = background_task_to_progress_json(task);
+    let Ok(json) = serde_json::to_string(&event) else {
+        return;
+    };
+    if tx.try_send(json.clone()).is_ok() {
+        return;
+    }
+    progress_dropped.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("ws.send.drop.backpressure", "method" => "task_progress").increment(1);
+    if !task.status.is_terminal() {
+        // Non-terminal: drop is fine, next update overwrites.
+        return;
+    }
+    // Terminal: spawn a durable awaited send. The runtime owns the JoinHandle,
+    // so this survives the sync callback returning. A `tx.send().await` failure
+    // means the receiver was dropped (turn over) — nothing to deliver to. The
+    // timeout protects against a permanently-stuck consumer.
+    let tx = tx.clone();
+    let task_id = task.id.clone();
+    let lifecycle = task.lifecycle_state();
+    tokio::spawn(async move {
+        match tokio::time::timeout(TERMINAL_TASK_SEND_TIMEOUT, tx.send(json)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_send_err)) => {
+                // Receiver dropped; nothing observable to deliver. Not a bug.
+                tracing::debug!(
+                    target: "octos::ui_protocol::ws",
+                    %task_id,
+                    ?lifecycle,
+                    "terminal task update dropped: progress receiver gone"
+                );
+            }
+            Err(_elapsed) => {
+                metrics::counter!(
+                    "ws.send.timeout.terminal",
+                    "method" => "task_progress"
+                )
+                .increment(1);
+                tracing::warn!(
+                    target: "octos::ui_protocol::ws",
+                    %task_id,
+                    ?lifecycle,
+                    timeout_ms = TERMINAL_TASK_SEND_TIMEOUT.as_millis() as u64,
+                    "terminal task update timed out under sustained backpressure"
+                );
+            }
+        }
+    });
 }
 
 struct UiProtocolApprovalRequester {
@@ -2729,15 +2811,11 @@ async fn run_standalone_turn(
     let progress_tx_for_tasks = progress_tx.clone();
     let task_progress_dropped = progress_dropped.clone();
     tool_registry.supervisor().set_on_change(move |task| {
-        let event = background_task_to_progress_json(task);
-        let Ok(json) = serde_json::to_string(&event) else {
-            return;
-        };
-        if progress_tx_for_tasks.try_send(json).is_err() {
-            task_progress_dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("ws.send.drop.backpressure", "method" => "task_progress")
-                .increment(1);
-        }
+        // M9-06: terminal updates (completed/failed/cancelled) must not be
+        // dropped under WebSocket backpressure — dropping one would leave the
+        // UI stuck on `running` indefinitely. See
+        // `forward_task_progress_to_channel`.
+        forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
     });
     drop(progress_tx);
     let request_agent = Agent::new_shared(
@@ -6640,5 +6718,146 @@ mod tests {
         assert!(saw_requested, "replay missing approval/requested");
         assert!(saw_decided, "replay missing approval/decided");
         assert!(outcome.pending_approvals.is_empty());
+    }
+
+    // ====================================================================
+    // M9-06 — terminal task lifecycle durability under WS backpressure
+    // ====================================================================
+
+    fn make_background_task(
+        id: &str,
+        status: octos_agent::TaskStatus,
+        runtime_state: octos_agent::TaskRuntimeState,
+    ) -> octos_agent::BackgroundTask {
+        octos_agent::BackgroundTask {
+            id: id.into(),
+            tool_name: "deep_search".into(),
+            tool_call_id: "call-1".into(),
+            parent_session_key: Some("local:test".into()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status,
+            runtime_state,
+            runtime_detail: None,
+            started_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:test".into()),
+            tool_input: None,
+        }
+    }
+
+    /// FIX-06: when the progress channel is full and a *terminal* task
+    /// snapshot arrives, the helper must keep the update durable — `try_send`
+    /// fails fast, then a spawned awaited send delivers it once the consumer
+    /// drains a slot. Pre-fix, the bare `try_send` dropped the terminal
+    /// update and the UI was stuck on `running` forever.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn terminal_task_update_survives_backpressure() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // Fill the channel so the next try_send fails.
+        tx.try_send("filler".into()).expect("fill channel");
+
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000aa",
+            octos_agent::TaskStatus::Completed,
+            octos_agent::TaskRuntimeState::Completed,
+        );
+        forward_task_progress_to_channel(&tx, &dropped, &task);
+
+        // The synchronous try_send must have failed (channel was full),
+        // bumping the drop counter that feeds the replay_lossy machinery.
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "immediate try_send failure must increment the drop counter so replay_lossy stays accurate"
+        );
+
+        // Drain the filler to make room for the spawned awaited send.
+        let filler = rx.recv().await.expect("filler must be there");
+        assert_eq!(filler, "filler");
+
+        // Yield the runtime so the spawned send task gets to run, then
+        // advance virtual time within the timeout budget.
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+
+        // The terminal update must arrive.
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal update must be delivered within timeout")
+            .expect("channel must still be open");
+        let parsed: serde_json::Value = serde_json::from_str(&terminal).expect("valid json");
+        assert_eq!(parsed["type"], "task_updated");
+        assert_eq!(parsed["task_id"], "01900000-0000-7000-8000-0000000000aa");
+        assert_eq!(parsed["state"], "ready"); // Completed -> Ready in the lifecycle mapping
+    }
+
+    /// Pin the existing behavior for *non-terminal* updates: under
+    /// backpressure they MAY be dropped (the next update will overwrite),
+    /// and the drop must be visible via the counter + metric so the WS
+    /// layer can flush a `protocol/replay_lossy` later.
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_terminal_update_drops_under_backpressure_and_increments_counter() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        // Fill the channel.
+        tx.try_send("filler".into()).expect("fill channel");
+
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000bb",
+            octos_agent::TaskStatus::Running,
+            octos_agent::TaskRuntimeState::ExecutingTool,
+        );
+        forward_task_progress_to_channel(&tx, &dropped, &task);
+
+        // Drop counter must increment — same as before the fix.
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        // Now drain the filler. There must be NO pending non-terminal send
+        // queued behind it; the helper's contract is "drop is fine for
+        // non-terminal" and we don't want a spawned-await on every running
+        // update piling up zombie tasks.
+        let filler = rx.recv().await.expect("filler must be present");
+        assert_eq!(filler, "filler");
+
+        // Give any (incorrectly) spawned send task a chance to run, then
+        // assert nothing follows.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let next = rx.try_recv();
+        assert!(
+            next.is_err(),
+            "non-terminal updates must not be durably retried under backpressure (got {next:?})"
+        );
+    }
+
+    /// Sanity-check the fast path: when the channel has capacity, the
+    /// helper sends synchronously without spawning anything and without
+    /// touching the drop counter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_update_fast_path_when_channel_has_capacity() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let task = make_background_task(
+            "01900000-0000-7000-8000-0000000000cc",
+            octos_agent::TaskStatus::Failed,
+            octos_agent::TaskRuntimeState::Failed,
+        );
+        forward_task_progress_to_channel(&tx, &dropped, &task);
+
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        let event = rx.try_recv().expect("event must be available immediately");
+        let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
+        assert_eq!(parsed["state"], "failed");
     }
 }
