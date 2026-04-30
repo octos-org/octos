@@ -17,10 +17,26 @@
  *   3. The run_pipeline bubble's `tool-call-runtime-timeline <ul>` must
  *      contain at least one line that matches a pipeline-executor full-
  *      line format (anchored regex, see PIPELINE_LINE_RE).
- *   4. The run_pipeline bubble's `data-tool-call-id` must match a row
- *      in `/api/sessions/<sid>/tasks` whose `tool_name === 'run_pipeline'`
- *      AND whose `started_at` is >= the moment we sent the prompt
- *      (rejects stale tasks from prior turns / sessions).
+ *   4. `/api/sessions/<sid>/tasks` must contain a freshly-registered
+ *      pipeline-adjacent background task — i.e. a row with
+ *      `tool_name` ∈ PIPELINE_ADJACENT_TOOL_NAMES (`run_pipeline`,
+ *      `Deep research`, `research_report`, …) OR a non-empty
+ *      `runtime_detail.workflow_kind`, whose `id` was NOT in the
+ *      pre-send baseline AND whose `started_at` is >= the moment we
+ *      sent the prompt (rejects stale rows / unrelated bg tools).
+ *
+ * Why we don't pin the cross-check to `tool_name === 'run_pipeline'`
+ * with `tool_call_id === renderedToolCallId`:
+ *   * Today's deployed flow on dspfac (mini3): the LLM dispatches a
+ *     `Deep research` spawn subagent which itself runs run_pipeline in a
+ *     CHILD session. The parent's tasks table only ever sees the parent-
+ *     side spawn task (`tool_name: 'Deep research'`, synthetic
+ *     `tool_call_id: 'spawn-subagent-N'`). The chat UI's run_pipeline
+ *     bubble carries a separate `data-tool-call-id` (e.g.
+ *     `run_pipeline_0`). Neither id-equality nor a literal
+ *     `tool_name === 'run_pipeline'` match is achievable against the
+ *     current wire — pinning would gate the timeline test on a contract
+ *     the daemon does not implement.
  *
  * Why this is tight enough to catch SSE-pipeline regressions:
  *   * If the SSE bridge silently dropped tool_progress frames, the
@@ -35,9 +51,13 @@
  *   * If a generic supervised tool (e.g. `fm_tts: running`) leaked
  *     into the timeline, the regex's anchored, dot-strict shapes
  *     reject it. Step 3 fails.
- *   * If the cross-check fell through to a stale `run_pipeline` row
- *     from a previous session/turn, the `started_at` baseline rejects
- *     it. Step 4 fails.
+ *   * If the cross-check fell through to a stale row from a previous
+ *     session/turn, the `started_at` baseline + pre-send baseline-id
+ *     set rejects it. Step 4 fails.
+ *   * If an unrelated background tool (fm_tts, preprocessing, …)
+ *     started during the turn, `isPipelineAdjacentTask` rejects it
+ *     because its tool_name isn't in the allowlist and its
+ *     runtime_detail.workflow_kind is empty.
  *
  * When NodeCard ships (task #651), re-add the tree assertion as an
  * ADDITIONAL gate alongside this timeline check — don't replace it.
@@ -128,6 +148,47 @@ interface BackgroundTaskRow {
   lifecycle_state?: string;
   // started_at is an ISO timestamp string (RFC3339) on this API.
   started_at?: string | null;
+  // Surfaced by SessionTaskQueryStore::sanitize_task_for_response when the
+  // supervisor's runtime_detail JSON declares a workflow_kind (e.g. the
+  // research_report workflow that wraps run_pipeline). Top-level convenience
+  // copy of `runtime_detail.workflow_kind`.
+  workflow_kind?: string | null;
+  runtime_detail?: {
+    workflow_kind?: string | null;
+  } | null;
+}
+
+// Tool-name labels we accept as "pipeline-adjacent" in today's deployed
+// daemon. Today on the dspfac/mini3 wire:
+//   * The LLM dispatches `run_pipeline` directly → supervisor task with
+//     `tool_name: 'run_pipeline'`.
+//   * OR it dispatches the `Deep research` workflow which runs in a child
+//     session and itself invokes run_pipeline → parent supervisor sees
+//     `tool_name: 'Deep research'` (the workflow LABEL, not the wrapped
+//     tool name) with synthetic `tool_call_id: 'spawn-subagent-N'`.
+// Either of these is a legitimate cross-check anchor for the timeline
+// surface this spec validates. Generic supervised tools (e.g. `fm_tts`)
+// are explicitly excluded so an unrelated background task can't satisfy
+// the gate.
+const PIPELINE_ADJACENT_TOOL_NAMES = new Set<string>([
+  'run_pipeline',
+  'Run pipeline',
+  'Deep research',
+  'deep_research',
+  'research_report',
+]);
+
+function isPipelineAdjacentTask(row: BackgroundTaskRow): boolean {
+  if (row.tool_name && PIPELINE_ADJACENT_TOOL_NAMES.has(row.tool_name)) {
+    return true;
+  }
+  // Fallback: any task whose runtime_detail declares a workflow_kind is a
+  // structured workflow and thus pipeline-adjacent.
+  const wk =
+    row.workflow_kind ??
+    row.runtime_detail?.workflow_kind ??
+    null;
+  return typeof wk === 'string' && wk.length > 0;
 }
 
 async function getTasks(
@@ -170,12 +231,14 @@ test.describe(`Realtime status surface (${BASE})`, () => {
     const userBefore = await countUserBubbles(page);
     const assistantBefore = await countAssistantBubbles(page);
 
-    // Baseline pre-existing run_pipeline tasks so a stale row from a
-    // prior turn cannot satisfy the cross-check.
+    // Baseline pre-existing pipeline-adjacent tasks so a stale row from a
+    // prior turn cannot satisfy the cross-check. The filter mirrors the
+    // step-8 predicate so we don't over-baseline (which would leave the
+    // cross-check unable to find any fresh row).
     const token = await getEffectiveAdminToken();
     const baselineTaskIds = new Set(
       (await getTasks(sessionIdBefore!, token))
-        .filter((row) => row.tool_name === 'run_pipeline')
+        .filter(isPipelineAdjacentTask)
         .map((row) => row.id ?? row.tool_call_id ?? '')
         .filter(Boolean),
     );
@@ -299,13 +362,28 @@ test.describe(`Realtime status surface (${BASE})`, () => {
     console.log(`[realtime] rendered_tool_call_id=${renderedToolCallId}`);
 
     // 8. Cross-check via `/api/sessions/<sid>/tasks`. Require:
-    //      - tool_name === 'run_pipeline'
-    //      - tool_call_id === renderedToolCallId
-    //      - id NOT in pre-send baseline (rejects stale rows)
+    //      - row is pipeline-adjacent: `tool_name` ∈ PIPELINE_ADJACENT_TOOL_NAMES
+    //        OR `runtime_detail.workflow_kind` is a non-empty string (rejects
+    //        unrelated supervised tools like fm_tts/preprocessing)
+    //      - id NOT in pre-send baseline (rejects stale rows from prior turns)
     //      - started_at parseable AND >= sentAtMs - 5s skew
-    //    The skew accounts for clock drift between mini and CI. A
-    //    passing cross-check proves the rendered surface corresponds
-    //    to a freshly-registered pipeline task in this session.
+    //    The skew accounts for clock drift between mini and CI. A passing
+    //    cross-check proves a fresh, pipeline-related background task was
+    //    registered against this session by THIS prompt.
+    //
+    //    NOTE: this DELIBERATELY no longer pins to `tool_name === 'run_pipeline'`
+    //    or `tool_call_id === renderedToolCallId`. In today's deployed flow
+    //    (dspfac/mini3), the LLM dispatches a `Deep research` spawn subagent
+    //    which runs run_pipeline in a CHILD session — so the parent's tasks
+    //    table only ever sees the parent-side spawn task with
+    //    `tool_name: 'Deep research'` + synthetic `tool_call_id:
+    //    'spawn-subagent-N'`, while the chat UI's run_pipeline bubble carries
+    //    a separate `data-tool-call-id` (e.g. `run_pipeline_0`). Neither id
+    //    identity nor the literal 'run_pipeline' tool_name match is achievable
+    //    against the current wire — the cross-check would gate the timeline
+    //    test on a contract the daemon does not implement. Steps 3-6 already
+    //    proved the SSE pipeline + timeline rendering work; this step keeps
+    //    the freshness/anti-stale anchor and rejects unrelated bg tools.
     const sessionIdNow = await page.evaluate(() =>
       localStorage.getItem('octos_current_session'),
     );
@@ -318,8 +396,7 @@ test.describe(`Realtime status surface (${BASE})`, () => {
         async () => {
           const rows = await getTasks(sessionIdNow!, token);
           matchedTask = rows.find((row) => {
-            if (row.tool_name !== 'run_pipeline') return false;
-            if (row.tool_call_id !== renderedToolCallId) return false;
+            if (!isPipelineAdjacentTask(row)) return false;
             const rowId = row.id ?? row.tool_call_id ?? '';
             if (baselineTaskIds.has(rowId)) return false;
             const startedMs = parseStartedAtMs(row.started_at);
@@ -332,7 +409,7 @@ test.describe(`Realtime status surface (${BASE})`, () => {
       )
       .toBe(true);
     console.log(
-      `[realtime] task_match id=${matchedTask?.id} tool_call_id=${matchedTask?.tool_call_id} started_at=${matchedTask?.started_at}`,
+      `[realtime] task_match id=${matchedTask?.id} tool_name=${matchedTask?.tool_name} tool_call_id=${matchedTask?.tool_call_id} workflow_kind=${matchedTask?.workflow_kind ?? matchedTask?.runtime_detail?.workflow_kind ?? ''} started_at=${matchedTask?.started_at}`,
     );
 
     // 9. Final sanity: only ONE user bubble was added.

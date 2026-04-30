@@ -91,16 +91,29 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      # Cap parallel cargo build jobs at 2 so concurrent rustc/linker invocations
-      # do not exceed the 16GB ubuntu-latest runner budget. Linking the
-      # octos-agent --lib unit-test binary (78MB stripped, ~2GB+ peak rustc RSS
-      # against a 144MB rlib + chromiumoxide/lettre/etc.) at default parallelism
-      # was OOM-killing the runner during the `Test octos-agent (lib)` step,
-      # producing the "hosted runner lost communication with the server" error
-      # (~45min into the run before the runner died). Mirrors the existing
-      # CARGO_BUILD_JOBS="2" guard on check-arm and check-riscv, which already
-      # use this mitigation for the same 16GB memory budget.
-      CARGO_BUILD_JOBS: "2"
+      # Defense-in-depth OOM caps. Even after sharding the heaviest crates
+      # (octos-agent, octos-cli) into dedicated jobs (#672), the lean `check`
+      # job still compiles the full workspace for clippy + light-crate tests,
+      # so we keep the same caps that PR #672's prior commit established:
+      #
+      # 1. CARGO_BUILD_JOBS=1 — serialize rustc/linker invocations so two
+      #    peaks never overlap on the 16GB ubuntu-latest runner.
+      #
+      # 2. CARGO_PROFILE_{TEST,DEV}_DEBUG=line-tables-only — drop full DWARF
+      #    (debug=2) to file/line only, shrinking each linker invocation's
+      #    peak RSS while preserving panic-backtrace usefulness.
+      #
+      # The actual OOM that JOBS=1 + line-tables-only could not fix was
+      # memory accumulation across N sequential heavy-crate test steps in
+      # the same runner (run 25137059453, job 73677952504 — runner lost
+      # communication with the server during `Test octos-agent (lib)`,
+      # 54min in). The structural fix is sharding: see test-octos-agent
+      # (matrix: lib + integration) and test-octos-cli below, which each
+      # get their own fresh 16GB runner. This `check` job now only handles
+      # the light crates and workspace-level checks (fmt, clippy, doc tests).
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
         with:
@@ -118,13 +131,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # ── Sharded workspace tests ─────────────────────────────────────────────
-      # The previous `cargo test --workspace` step OOM-killed the 16GB ubuntu
-      # runner during peak link of the octos-agent integration test binaries
-      # (27 of them). Splitting per crate (and splitting heavy crates further
-      # into --lib vs --tests) keeps each step's resident set within budget
-      # while preserving the same aggregate coverage. The Swatinem cache makes
-      # subsequent steps incremental against the prior step's target/.
+      # ── Light-crate tests ───────────────────────────────────────────────────
+      # The two heavy crates (octos-agent, octos-cli) live in their own
+      # dedicated jobs (test-octos-agent, test-octos-cli) so each gets a
+      # fresh 16GB runner — see #672. This `check` job runs the remaining
+      # crates plus workspace-level checks.
 
       # Foundation crates (no internal deps, lib-only)
       - name: Test octos-core
@@ -152,22 +163,6 @@ jobs:
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
 
-      # octos-agent: the heaviest crate. Library and integration test binaries
-      # are split so neither step pulls all 27 test binaries into memory at
-      # once during link.
-      - name: Test octos-agent (lib)
-        run: cargo test -p octos-agent --lib
-
-      - name: Test octos-agent (integration)
-        run: cargo test -p octos-agent --tests
-
-      # Top of the dep tree
-      - name: Test octos-cli (lib)
-        run: cargo test -p octos-cli --lib
-
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
-
       # Bundled harness starter skills (each has small lib + 1 smoke test)
       - name: Test harness starter skills
         run: |
@@ -180,19 +175,103 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
-      # ── Targeted regression filters (already pre-existing) ──────────────────
-      - name: API feature tests
-        run: cargo test -p octos-cli --features api api::auth_handlers
-
-      - name: QoS adaptive/runtime catalog regressions
+      # ── Targeted regression filters that fit on the lean runner ─────────────
+      # The octos-llm-only regressions stay here (octos-llm already builds
+      # in this job for `Test octos-llm`). The octos-cli regressions and
+      # octos-agent regression test moved to their respective sharded jobs.
+      - name: QoS adaptive/runtime catalog regressions (octos-llm)
         run: |
           cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
           cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
           cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
-          cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
 
+  # ── Sharded heavy-crate test jobs ────────────────────────────────────────
+  # These crates each pull in a >100MB rlib closure (chromiumoxide, lettre,
+  # hyper, …) and link 27+ test binaries. Running them sequentially in the
+  # `check` job exhausted the 16GB ubuntu-latest runner mid-link (run
+  # 25137059453 — "hosted runner lost communication with the server" 54min
+  # in). Each crate now runs on its own fresh runner with its own cache.
+  #
+  # octos-agent goes one step further: its lib + integration test compile
+  # phases EACH peak around the 16GB ceiling (run on PR #672 — integration
+  # step was cancelled after lib step's compile already used a chunk of
+  # RAM in the same runner). So lib and integration are split into two
+  # SEPARATE jobs (each fresh 16GB runner), via a matrix on `test-mode`.
+  #
+  # Cache keys are distinct (shared-key: octos-agent-tests-{lib,integration}
+  # / octos-cli-tests) so they don't fight the lean `check` job's
+  # default-keyed cache and don't fight each other.
+
+  test-octos-agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        # `lib` runs `--lib` only. `integration` runs `--tests` (every
+        # integration test binary, including activate_tools_regression).
+        # Splitting these onto separate runners means each gets a fresh
+        # 16GB allocation and neither inherits residual RAM from the
+        # other's compile phase.
+        test-mode: [lib, integration]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: octos-agent-tests-${{ matrix.test-mode }}
+
+      - name: Test octos-agent (lib)
+        if: matrix.test-mode == 'lib'
+        run: cargo test -p octos-agent --lib
+
+      - name: Test octos-agent (integration)
+        if: matrix.test-mode == 'integration'
+        run: cargo test -p octos-agent --tests
+
+      # Co-located in the integration job so it reuses the warm octos-agent
+      # integration test build cache (activate_tools_regression is itself an
+      # integration test binary). Skipped in the lib job.
       - name: activate_tools regression tests
+        if: matrix.test-mode == 'integration'
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+
+  test-octos-cli:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "1"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: octos-cli-tests
+
+      - name: Test octos-cli (lib)
+        run: cargo test -p octos-cli --lib
+
+      - name: Test octos-cli (integration)
+        run: cargo test -p octos-cli --tests
+
+      # Co-located here so they reuse this job's warm octos-cli build cache.
+      - name: API feature tests
+        run: cargo test -p octos-cli --features api api::auth_handlers
+
+      - name: gateway_runtime regression (octos-cli)
+        run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
 
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
@@ -383,7 +462,7 @@ jobs:
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:
     if: github.event_name == 'push'
-    needs: check
+    needs: [check, test-octos-agent, test-octos-cli]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
@@ -411,7 +490,7 @@ jobs:
 
   build-linux-x86:
     if: github.event_name == 'push'
-    needs: check
+    needs: [check, test-octos-agent, test-octos-cli]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -500,7 +579,7 @@ jobs:
 
   e2e-tool-regression:
     runs-on: macos-14
-    needs: check
+    needs: [check, test-octos-agent, test-octos-cli]
     # Run on pushes to main or when tool/sandbox/agent files change
     if: |
       github.event_name == 'push' ||
@@ -569,7 +648,7 @@ jobs:
 
   security:
     runs-on: macos-14
-    needs: check
+    needs: [check, test-octos-agent, test-octos-cli]
     # Only run when security-related files change
     if: |
       github.event_name == 'push' ||
