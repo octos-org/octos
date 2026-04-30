@@ -4137,6 +4137,14 @@ impl SessionActor {
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
                     op_updater,
+                    // #649 follow-up (rapid-fire): forward THIS turn's
+                    // cmid so the forwarder stamps every `send_with_id` /
+                    // `edit_message` outbound with it. Concurrent overflow
+                    // turns each get their OWN forwarder + their OWN
+                    // cmid — under rapid-fire 5 turns that prevents the
+                    // shared sticky map from collapsing them onto one
+                    // bubble.
+                    client_message_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -5075,6 +5083,13 @@ impl SessionActor {
                     session_key.clone(),
                     sender_user_id.clone(),
                     op_updater,
+                    // #649 follow-up (rapid-fire): each overflow turn
+                    // captures its OWN cmid up front so its stream
+                    // forwarder stamps every outbound with it. Without
+                    // this, 5 concurrent rapid-fire overflow forwarders
+                    // fight over the shared sticky map and collapse onto
+                    // the bubble of whichever turn arrived last.
+                    overflow_client_message_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
@@ -5484,6 +5499,9 @@ impl SessionActor {
                     self.session_key.clone(),
                     self.sender_user_id.clone(),
                     op_updater,
+                    // #649 follow-up (rapid-fire): forward this turn's
+                    // cmid so streaming chunks stamp it on the wire.
+                    client_message_id.clone(),
                 )))
             } else {
                 drop(stream_rx);
