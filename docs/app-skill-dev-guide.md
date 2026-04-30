@@ -103,7 +103,10 @@ The manifest declares what tools the skill provides. The LLM reads this to decid
 | `timeout_secs` | No | 30 | Max execution time per tool call (1-600) |
 | `requires_network` | No | false | Informational flag |
 | `sha256` | No | — | Binary integrity check (hex hash). TOCTOU-safe: verified copy written to `.{name}_verified` |
-| `tools` | No | `[]` | Array of tool definitions (each may include `spawn_only: true` for background execution) |
+| `protocol_version` | No | 1 | `1` = stdin/stdout JSON only (default). `2` = also emit structured events on stderr. See [Plugin Protocol v2](#plugin-protocol-v2). |
+| `synthesis_config` | No | — | v2 only: declare a synthesis LLM call so the host injects provider/model + env keys |
+| `x-octos-host-config-keys` | No | `[]` | v2 only: env keys the host should forward into the skill (e.g. provider API keys for synthesis) |
+| `tools` | No | `[]` | Array of tool definitions. Each may set `spawn_only: true` to be auto-routed to background execution by `agent/execution.rs` |
 | `mcp_servers` | No | `[]` | MCP server declarations |
 | `hooks` | No | `[]` | Lifecycle hook definitions |
 | `prompts` | No | — | Prompt fragment config |
@@ -153,13 +156,15 @@ Explain what this tool does with examples.
 
 The binary implements the stdin/stdout JSON protocol.
 
-**Protocol:**
+**Protocol v1 (default):**
 
 1. **argv[1]** = tool name (e.g., `get_weather`)
 2. **stdin** = JSON object matching the tool's `input_schema`
 3. **stdout** = JSON with `output` (string) and `success` (bool)
 4. **exit code** = 0 for success, non-zero for failure
-5. **stderr** = ignored (use for debug logging)
+5. **stderr** = ignored (free-form debug logging)
+
+**Protocol v2 (opt-in)** — see [Plugin Protocol v2](#plugin-protocol-v2) below for the full reporting contract used by `deep-search`, `deep-crawl`, and other long-running skills. To opt in, set `"protocol_version": 2` in your `manifest.json`. Stdout still carries the final result; stderr becomes a structured event channel.
 
 **Rust template:**
 
@@ -655,6 +660,53 @@ cp target/release/my_skill ~/.octos/skills/my-skill/main
 
 ## Advanced Topics
 
+### Plugin Protocol v2
+
+Long-running skills (research, crawls, voice training, multi-step pipelines) need to surface progress, partial results, and per-step cost back to the host while they run. Protocol v2 adds a structured event channel on **stderr** while keeping the v1 stdout contract for the final result.
+
+**Opting in:** add `"protocol_version": 2` to `manifest.json`.
+
+**Stderr event format:** one JSON object per line; each line is a tagged event:
+
+| Event | Fields | Purpose |
+|---|---|---|
+| `LogEvent` | `{level, message}` | Free-form text log line (debug/info/warn/error) |
+| `PhaseEvent` | `{phase, summary}` | Phase transitions (`planning`, `searching`, `synthesizing`, `verifying`, …) |
+| `ProgressEvent` | `{current, total, label}` | Numeric progress |
+| `CostEvent` | `{step, provider, model, input_tokens, output_tokens, usd}` | Per-step LLM cost — rolls up via `cost_ledger.rs` |
+| `ArtifactEvent` | `{name, path, mime}` | Pointer to a produced artifact (file path or URL) |
+
+The host parses each line, surfaces phase/progress events as `tool_progress` SSE events to the dashboard/clients, and aggregates `CostEvent` lines into the parent's per-turn cost rollup. Lines that don't parse as events are treated as plain log lines (downgraded to `LogEvent` with `level=info`).
+
+**Stdout** still carries the final v1-shaped JSON: `{"output": "<final result>", "success": true, "files_to_send": [...]}`.
+
+**Synthesis-style skills (`deep-search`, `deep-crawl`)** declare `synthesis_config` plus `x-octos-host-config-keys` so the host injects the correct LLM provider/model and forwards env keys for the synthesis call:
+
+```json
+{
+  "name": "deep-search",
+  "protocol_version": 2,
+  "synthesis_config": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514"
+  },
+  "x-octos-host-config-keys": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+}
+```
+
+The host resolves these keys from the active profile's auth store and passes them on the skill's environment for the synthesis sub-call only.
+
+**Contract tests:** if you author a v2 skill, mirror the contract tests at `crates/octos-plugin/tests/lifecycle_sandbox.rs` so CI verifies that your binary emits well-formed events and respects the BLOCKED_ENV_VARS list.
+
+**spawn_only mechanics in detail** — when a tool's manifest declares `spawn_only: true`, the agent execution loop (`crates/octos-agent/src/agent/execution.rs`) intercepts the call **before** the LLM round-trip:
+
+1. The tool invocation is wrapped in `tokio::spawn` and immediately returns an acknowledgement to the LLM.
+2. `task_supervisor.rs` registers the task, applies the per-profile fan-out cap (#610), and sets up the orphan reaper.
+3. The skill binary runs to completion in the background, emitting protocol v2 events.
+4. On completion (or failure), the supervisor commits a `session_result` event with `committed_seq` and re-engages the LLM if needed (M8.9 runtime failure recovery).
+
+`spawn_only` tools cannot be evicted from the LRU tool registry, and their `SKILL.md` is auto-injected into the system prompt so the LLM knows how to use them.
+
 ### Multiple Tools in One Skill
 
 A single binary can serve multiple tools. Route on `argv[1]`:
@@ -845,6 +897,30 @@ crates/app-skills/send-email/
 ├── SKILL.md            # requires_env: SMTP_HOST,SMTP_USERNAME,SMTP_PASSWORD
 └── src/main.rs         # SMTP with credential validation
 ```
+
+### Example 4: Deep Search (Protocol v2 + Synthesis)
+
+```
+crates/app-skills/deep-search/
+├── Cargo.toml          # reqwest, async runtime, serde
+├── manifest.json       # protocol_version: 2, synthesis_config + x-octos-host-config-keys
+├── SKILL.md            # spawn_only: true (long-running)
+└── src/main.rs         # Multi-step research; emits PhaseEvent + ProgressEvent
+                        # + CostEvent on stderr; final synthesis on stdout
+```
+
+Demonstrates the full v2 protocol: structured stderr events, host-injected synthesis LLM config, spawn_only background execution, and contract tests under `crates/octos-plugin/tests/lifecycle_sandbox.rs`.
+
+### Example 5: Harness Starters (Templates to Copy)
+
+The four `crates/app-skills/harness-starter-*` crates are working examples of harnessed skills you can copy and adapt:
+
+- `harness-starter-generic` — minimal echo-style harness for any text task
+- `harness-starter-coding` — code-task harness with worktree integration
+- `harness-starter-report` — report-generation harness with artifact production
+- `harness-starter-audio` — audio-task harness with attachment validation (header + silence + duration)
+
+Their `SKILL.md` says "Replace with a real ... when adapting the starter." Use them as the structural starting point — they include the manifest fields, contract tests, and event-emission scaffolding for v2.
 
 ---
 
