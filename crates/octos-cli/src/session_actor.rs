@@ -970,6 +970,7 @@ async fn dispatch_background_result_to_actor(
             content: payload.content,
             kind: payload.kind,
             media: payload.media,
+            originating_thread_id: payload.originating_thread_id,
             ack: Some(ack_tx),
         }),
     )
@@ -1250,6 +1251,13 @@ pub enum ActorMessage {
         kind: BackgroundResultKind,
         /// Media files attached to this terminal background result.
         media: Vec<String>,
+        /// M8.10 follow-up (#649): the user message's `client_message_id`
+        /// from the turn that originated this background task. Stamped onto
+        /// the outbound's `metadata.thread_id` so wire-side SSE events land
+        /// under the originating bubble even after subsequent unrelated user
+        /// turns have rotated the per-chat sticky thread_id. `None` for
+        /// legacy callers and tests that pre-date #649.
+        originating_thread_id: Option<String>,
         /// Completion acknowledgment for durable persistence.
         ack: Option<oneshot::Sender<bool>>,
     },
@@ -2692,10 +2700,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -3320,10 +3335,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -3397,10 +3419,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -3443,7 +3472,19 @@ impl SessionActor {
 
     /// Persist an assistant-visible background result and emit the matching
     /// committed session-result event metadata for the web/runtime surfaces.
-    async fn deliver_background_notification(&self, content: String, media: Vec<String>) -> bool {
+    ///
+    /// M8.10 follow-up (#649): `originating_thread_id` is the
+    /// `client_message_id` of the user message that started the background
+    /// task. When present it is stamped onto the OutboundMessage metadata
+    /// so the api_channel routes the wire-side SSE event under the correct
+    /// turn — even when subsequent unrelated user turns have rotated the
+    /// per-chat sticky thread_id.
+    async fn deliver_background_notification(
+        &self,
+        content: String,
+        media: Vec<String>,
+        originating_thread_id: Option<String>,
+    ) -> bool {
         let content = finalize_assistant_content(&self.session_key, &self.user_workspace, &content);
         let persisted = persist_assistant_message(
             &self.session_handle,
@@ -3467,7 +3508,7 @@ impl SessionActor {
             return false;
         };
 
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "topic": self.session_key.topic(),
             "_history_persisted": true,
             "_session_result": {
@@ -3478,6 +3519,30 @@ impl SessionActor {
                 "media": media.clone(),
             }
         });
+
+        // M8.10 follow-up (#649): stamp `thread_id` onto the OutboundMessage
+        // metadata so the api_channel resolves it via the explicit-metadata
+        // path (NOT the per-chat sticky-map fallback). Without this stamp,
+        // a deep_research / spawn_only result that completes after later
+        // user turns inherits the WRONG turn's thread_id from the sticky
+        // map (cf. live mini3 trace, 2026-04-29).
+        if let Some(tid) = originating_thread_id.as_deref() {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    "thread_id".to_string(),
+                    serde_json::Value::String(tid.to_string()),
+                );
+                if let Some(sr) = obj
+                    .get_mut("_session_result")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    sr.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(tid.to_string()),
+                    );
+                }
+            }
+        }
 
         let _ = send_outbound_with_timeout(
             &self.session_key,
@@ -3503,15 +3568,16 @@ impl SessionActor {
         content: &str,
         kind: BackgroundResultKind,
         media: Vec<String>,
+        originating_thread_id: Option<String>,
     ) -> bool {
         if kind == BackgroundResultKind::Notification {
-            self.deliver_background_notification(content.to_string(), media)
+            self.deliver_background_notification(content.to_string(), media, originating_thread_id)
                 .await
         } else {
             let report_message = self
                 .prepare_background_report_result(task_label, content)
                 .await;
-            self.deliver_background_notification(report_message, Vec::new())
+            self.deliver_background_notification(report_message, Vec::new(), originating_thread_id)
                 .await
         }
     }
@@ -4191,10 +4257,17 @@ impl SessionActor {
                             content,
                             kind,
                             media,
+                            originating_thread_id,
                             ack,
                         }) => {
                             let persisted = self
-                                .handle_background_result(&task_label, &content, kind, media)
+                                .handle_background_result(
+                                    &task_label,
+                                    &content,
+                                    kind,
+                                    media,
+                                    originating_thread_id,
+                                )
                                 .await;
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
@@ -8495,6 +8568,7 @@ mod tests {
             content: "Background research completed with 5 findings.".to_string(),
             kind: BackgroundResultKind::Report,
             media: vec![],
+            originating_thread_id: None,
             ack: None,
         })
         .await
@@ -8572,6 +8646,7 @@ mod tests {
             content: "Background research completed with 5 findings.".to_string(),
             kind: BackgroundResultKind::Report,
             media: vec![],
+            originating_thread_id: None,
             ack: None,
         })
         .await
@@ -8644,6 +8719,7 @@ mod tests {
             content: String::new(),
             kind: BackgroundResultKind::Notification,
             media: vec![media_path.to_string_lossy().to_string()],
+            originating_thread_id: None,
             ack: Some(ack_tx),
         })
         .await
@@ -8678,6 +8754,134 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
+    /// M8.10 follow-up (#649) regression: when a `BackgroundResult` carries
+    /// an `originating_thread_id` (the user message's `client_message_id`
+    /// from the turn that started the background task), the OutboundMessage
+    /// the actor emits MUST stamp that id onto the metadata so the
+    /// api_channel routes the wire-side SSE event under the originating
+    /// turn — NOT whatever the per-chat sticky map currently holds.
+    ///
+    /// Drives the production scenario from mini3 (2026-04-29): three user
+    /// turns rotate the sticky map, then a long-running deep_research
+    /// background task originating in turn A finally finalises. Pre-fix,
+    /// the OutboundMessage metadata lacked thread_id and the sticky map
+    /// (now pointing at turn C) won; post-fix, the explicit metadata
+    /// thread_id always pins the result to turn A.
+    #[tokio::test]
+    async fn late_tool_result_for_overflow_turn_keeps_originating_thread_id_under_3_user_race() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // No active turn: the actor is idle, simulating "background task
+        // finalises long after the originating turn ended". This is the
+        // exact production failure mode.
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let originating_cmid = "cmid-A-deep-research-originator";
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "deep_research".to_string(),
+            content: "Deep research report on space exploration.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            originating_thread_id: Some(originating_cmid.to_string()),
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background result must be persisted"
+        );
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+
+        // The OutboundMessage metadata MUST carry thread_id at the top
+        // level so api_channel's `outbound_thread_id(&msg.metadata)` lookup
+        // returns Some(originating_cmid) and bypasses the sticky-map
+        // fallback. This is the contract the bug fix relies on.
+        assert_eq!(
+            outbound.metadata.get("thread_id").and_then(|v| v.as_str()),
+            Some(originating_cmid),
+            "OutboundMessage metadata must carry the originating turn's \
+             thread_id so api_channel resolves it via the explicit-metadata \
+             path; got metadata = {}",
+            outbound.metadata,
+        );
+
+        // The embedded `_session_result` ALSO carries thread_id so the
+        // wire-side session_result event the api_channel emits has it
+        // baked into the message body the web client renders. The v2
+        // thread-store keys off `message.thread_id` for routing.
+        assert_eq!(
+            outbound
+                .metadata
+                .get("_session_result")
+                .and_then(|sr| sr.get("thread_id"))
+                .and_then(|v| v.as_str()),
+            Some(originating_cmid),
+            "embedded _session_result must also carry thread_id so the web \
+             client renders the late result under the originating bubble; \
+             got metadata = {}",
+            outbound.metadata,
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// M8.10 follow-up (#649): when no `originating_thread_id` is supplied
+    /// (legacy callers, pre-fix BackgroundResult senders), the
+    /// OutboundMessage metadata must NOT carry a `thread_id` field. This
+    /// pins the wire-compat property: callers without a tracked origin
+    /// continue to fall through to the api_channel sticky-map fallback,
+    /// not surface a phantom empty/null thread_id that would mis-route.
+    #[tokio::test]
+    async fn legacy_background_result_without_originating_thread_id_omits_metadata_thread_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "legacy_task".to_string(),
+            content: "Legacy result with no origin tracking.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            originating_thread_id: None,
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), ack_rx).await;
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+
+        assert!(
+            outbound.metadata.get("thread_id").is_none(),
+            "legacy callers (originating_thread_id=None) must NOT populate \
+             metadata.thread_id — sticky map fallback handles wire compat. \
+             got metadata = {}",
+            outbound.metadata,
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     #[tokio::test]
     async fn test_background_notification_ack_stays_persisted_when_live_fanout_is_closed() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8692,6 +8896,7 @@ mod tests {
             content: "Background research completed.".to_string(),
             kind: BackgroundResultKind::Report,
             media: vec![],
+            originating_thread_id: None,
             ack: Some(ack_tx),
         })
         .await
