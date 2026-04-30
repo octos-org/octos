@@ -848,6 +848,69 @@ fn sanitize_task_for_response(
     })
 }
 
+/// Forward a `BackgroundTask` snapshot from the supervisor's
+/// `set_on_change` callback into the session actor's bounded inbox.
+///
+/// **Terminal updates** (`completed` / `failed` / `cancelled`) MUST NOT
+/// be dropped under inbox backpressure — dropping one leaves any SSE /
+/// UI consumer stuck on `running` (M9 review finding #6). On try_send
+/// failure the helper upgrades to a spawned `tx.send().await` bounded
+/// by [`BACKGROUND_RESULT_ACK_TIMEOUT`] so the update is durable
+/// through transient backpressure but does not pile up zombies if the
+/// actor is permanently gone.
+///
+/// **Non-terminal updates** are coalesce-friendly (the next update
+/// overwrites) and stay on the non-blocking `try_send` fast-path.
+fn forward_task_status_to_actor_inbox(
+    tx: &tokio::sync::mpsc::Sender<ActorMessage>,
+    data_dir: &Path,
+    task: &octos_agent::BackgroundTask,
+) {
+    let task_json = sanitize_task_for_response(data_dir, task);
+    let Ok(json) = serde_json::to_string(&task_json) else {
+        return;
+    };
+    let msg = ActorMessage::TaskStatusChanged { task_json: json };
+    let Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) = tx.try_send(msg) else {
+        // Either Ok (delivered) or Closed (actor gone — nothing to deliver to).
+        return;
+    };
+    counter!(
+        "session_actor.task_status.try_send.full",
+        "terminal" => task.status.is_terminal().to_string()
+    )
+    .increment(1);
+    if !task.status.is_terminal() {
+        return;
+    }
+    let durable_tx = tx.clone();
+    let task_id = task.id.clone();
+    let lifecycle = task.lifecycle_state();
+    tokio::spawn(async move {
+        match tokio::time::timeout(BACKGROUND_RESULT_ACK_TIMEOUT, durable_tx.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_send_err)) => {
+                tracing::debug!(
+                    target: "octos::session_actor",
+                    %task_id,
+                    ?lifecycle,
+                    "terminal task_status_changed dropped: actor inbox closed"
+                );
+            }
+            Err(_elapsed) => {
+                counter!("session_actor.task_status.timeout.terminal").increment(1);
+                tracing::warn!(
+                    target: "octos::session_actor",
+                    %task_id,
+                    ?lifecycle,
+                    timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis() as u64,
+                    "terminal task_status_changed timed out under sustained backpressure"
+                );
+            }
+        }
+    });
+}
+
 impl SessionTaskQueryStore {
     pub fn register(
         &self,
@@ -2077,14 +2140,14 @@ impl ActorFactory {
         }));
 
         // Wire supervisor on_change callback to push task status via SSE.
-        // Uses try_send to avoid blocking the sync Mutex context.
+        // M9-06: terminal lifecycle states (Completed/Failed/Cancelled) MUST
+        // NOT be silently dropped under inbox backpressure (32 slots), or the
+        // UI / SSE consumers stay stuck on `running`. See
+        // [`forward_task_status_to_actor_inbox`].
         let status_tx = tx.clone();
         let task_data_dir = self.data_dir.clone();
         supervisor.set_on_change(move |task| {
-            let task_json = sanitize_task_for_response(&task_data_dir, task);
-            if let Ok(json) = serde_json::to_string(&task_json) {
-                let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
-            }
+            forward_task_status_to_actor_inbox(&status_tx, &task_data_dir, task);
         });
 
         // Wire supervisor on_failure_signal callback (M8.9): when a
@@ -10995,6 +11058,104 @@ mod tests {
             TOTAL,
             "all persisted messages must land on disk: {:?}",
             final_handle.session().messages
+        );
+    }
+
+    // ========================================================================
+    // M9-06 — terminal task lifecycle durability under actor inbox backpressure
+    // ========================================================================
+
+    fn make_supervisor_task(
+        id: &str,
+        status: octos_agent::TaskStatus,
+        runtime_state: octos_agent::TaskRuntimeState,
+    ) -> octos_agent::BackgroundTask {
+        octos_agent::BackgroundTask {
+            id: id.into(),
+            tool_name: "deep_search".into(),
+            tool_call_id: "call-1".into(),
+            parent_session_key: Some("local:test".into()),
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status,
+            runtime_state,
+            runtime_detail: None,
+            started_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:test".into()),
+            tool_input: None,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn terminal_task_status_survives_actor_inbox_backpressure() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ActorMessage>(1);
+        let data_dir = std::path::PathBuf::from("/tmp/octos-test-data-dir");
+
+        // Pre-fill the inbox so try_send fails.
+        tx.try_send(ActorMessage::TaskStatusChanged {
+            task_json: "{\"filler\":true}".into(),
+        })
+        .expect("fill inbox");
+
+        let task = make_supervisor_task(
+            "01900000-0000-7000-8000-0000000000aa",
+            octos_agent::TaskStatus::Completed,
+            octos_agent::TaskRuntimeState::Completed,
+        );
+        forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+
+        // Drain the filler so the spawned awaited send can proceed.
+        let _ = rx.recv().await.expect("filler");
+
+        tokio::time::advance(std::time::Duration::from_millis(50)).await;
+
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("terminal must be delivered within timeout")
+            .expect("inbox open");
+        match delivered {
+            ActorMessage::TaskStatusChanged { task_json } => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&task_json).expect("valid json");
+                assert_eq!(parsed["id"], "01900000-0000-7000-8000-0000000000aa");
+                assert_eq!(parsed["lifecycle_state"], "ready");
+            }
+            _ => panic!("expected TaskStatusChanged"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_terminal_task_status_drops_under_inbox_backpressure() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ActorMessage>(1);
+        let data_dir = std::path::PathBuf::from("/tmp/octos-test-data-dir");
+
+        tx.try_send(ActorMessage::TaskStatusChanged {
+            task_json: "{\"filler\":true}".into(),
+        })
+        .expect("fill inbox");
+
+        let task = make_supervisor_task(
+            "01900000-0000-7000-8000-0000000000bb",
+            octos_agent::TaskStatus::Running,
+            octos_agent::TaskRuntimeState::ExecutingTool,
+        );
+        forward_task_status_to_actor_inbox(&tx, &data_dir, &task);
+
+        // Drain filler. There must be no durable retry queued behind it.
+        let _ = rx.recv().await.expect("filler");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "non-terminal task statuses must not durably retry under backpressure"
         );
     }
 }
