@@ -387,7 +387,7 @@ impl Tool for RunPipelineTool {
         // The session actor auto-delivers .md files via file_modified on ToolResult,
         // so no LLM instruction needed.
         // Ensure absolute path so session actor can find and deliver the file.
-        let report_file = result
+        let real_report_file = result
             .files_modified
             .iter()
             .find(|f| {
@@ -401,6 +401,39 @@ impl Tool for RunPipelineTool {
                     std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())
                 }
             });
+
+        // run_pipeline is registered as spawn_only, so the execution-loop
+        // background-success branch in `crates/octos-agent/src/agent/execution.rs`
+        // requires `files_to_send` to be non-empty (otherwise it marks the task
+        // failed with "no output files produced"). Inline DOT pipelines that
+        // only return text in `result.output` produce no .md report. Synthesize
+        // one so the spawn_only delivery path always has a payload to attach.
+        let synthesized_report_file = if real_report_file.is_none() && !result.output.is_empty() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let filename = format!("run_pipeline_{timestamp}_{pid}.md");
+            let dir = std::env::temp_dir().join("octos_pipeline_synthetic");
+            match std::fs::create_dir_all(&dir).and_then(|_| {
+                let path = dir.join(&filename);
+                std::fs::write(&path, &result.output).map(|_| path)
+            }) {
+                Ok(path) => {
+                    tracing::info!(file = %path.display(), "wrote synthetic pipeline report");
+                    Some(path)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to write synthetic pipeline report");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let report_file = real_report_file.or(synthesized_report_file);
         if let Some(ref path) = report_file {
             tracing::info!(file = %path.display(), "pipeline produced report file");
         }
