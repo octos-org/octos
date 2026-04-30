@@ -1652,6 +1652,15 @@ pub struct ActorFactory {
     pub sandbox_config: octos_agent::SandboxConfig,
     /// Provider policy for SpawnTool and PipelineTool.
     pub provider_policy: Option<ToolPolicy>,
+    /// Global `tool_policy` from config. The base registry has this applied
+    /// at construction time, but per-session tools (notably `run_pipeline`)
+    /// are registered later by [`ActorFactory::spawn`]. Re-applying after
+    /// per-session registration ensures globally denied tools cannot slip
+    /// in through the per-session registration path. See PR #688 follow-up
+    /// (MEDIUM #4): `gateway_runtime.rs` calls `apply_policy` BEFORE the
+    /// `ActorFactory` adds `run_pipeline`, so without this re-application
+    /// the global deny is bypassed for spawn_only-marked tools.
+    pub tool_policy: Option<ToolPolicy>,
     /// Worker system prompt for SpawnTool subagents.
     pub worker_prompt: Option<String>,
     /// Provider router for SpawnTool and PipelineTool.
@@ -2115,6 +2124,18 @@ impl ActorFactory {
                         .to_string(),
                 ),
             );
+        }
+
+        // PR #688 follow-up — MEDIUM #4: re-apply the global tool_policy
+        // AFTER the per-session pipeline tool was registered. The base
+        // registry already had `apply_policy` invoked during construction
+        // (in `gateway_runtime.rs`), but `run_pipeline` is only registered
+        // here at session-spawn time. Without this second pass, a config
+        // `tool_policy.deny: ["run_pipeline"]` is silently ignored on
+        // gateway-spawned actors. Mirrors the chat.rs pattern that already
+        // applies policy AFTER registering the pipeline tool.
+        if let Some(ref policy) = self.tool_policy {
+            tools.apply_policy(policy);
         }
 
         // Defer rarely-used per-session tools to keep active tool count low
@@ -9942,6 +9963,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             sandbox_config: octos_agent::SandboxConfig::default(),
             provider_policy: None,
+            tool_policy: None,
             worker_prompt: None,
             provider_router: None,
             embedder: None,
