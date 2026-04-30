@@ -1,11 +1,16 @@
 {
   "private": true,
   "devDependencies": {
-    "@playwright/test": "^1.50.0"
+    "@playwright/test": "^1.50.0",
+    "@types/ws": "^8.5.13",
+    "ws": "^8.18.0"
   },
   "scripts": {
     "test": "npx playwright test",
     "test:headed": "npx playwright test --headed",
+    "test:m9-protocol": "npx playwright test --workers=1 tests/m9-protocol-*.spec.ts",
+    "test:m9-protocol:list": "npx playwright test --list tests/m9-protocol-*.spec.ts",
+    "test:tmux:m9-protocol": "cd .. && bash e2e/tmux/run.sh m9-protocol",
     "test:milestone": "./scripts/milestone-suite.sh all",
     "test:milestone:crew": "./scripts/milestone-suite.sh crew-core",
     "test:milestone:bot": "./scripts/milestone-suite.sh bot-runtime",
