@@ -666,14 +666,19 @@ pub struct ToolResult {
 | **browser** | action, url?, selector?, text?, expression? | Headless Chrome via CDP (always compiled). Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
 | **send_file** | path, caption? | Delivers files to chat channels via OutboundMessage. Path validated against `data_dir`. **Gateway-only** |
 | **git** | subcommand, args | Git operations within workspace |
-| **diff_edit** | path, diff | Unified diff with fuzzy matching (+-3 lines), reverse hunk application |
 | **save_memory** | name, content | Save / update an entity page in the memory bank. `name` is slugified (lowercase, spaces → hyphens); `content` is full markdown. `Exclusive` concurrency to avoid mid-write reads. |
 | **recall_memory** | name | Load the full markdown content of a memory bank entity by name. Names are listed in the Memory Bank section of the system prompt. |
-| **deep_search** | query | Multi-step research with web search + synthesis |
-| **site_crawl** | url, depth? | Crawl website pages for content extraction |
-| **take_photo** | — | Camera capture (platform-skill integration) |
+| **deep_search** | query | Multi-step research (built-in entrypoint into the deep-search app-skill) |
+| **deep_crawl** | url, max_pages?, max_depth? | Recursively crawl a website via headless Chrome (CDP), extract text, save to disk. Source: `tools/site_crawl.rs` — the file name is historical; `Tool::name()` returns `"deep_crawl"`. |
+| **synthesize_research** | … | Synthesis pass paired with `deep_search` / `deep_crawl` (plugin protocol v2 wiring). |
 | **code_structure** | path? | Extract code structure (AST-based) |
 | **manage_skills** | action, name? | List/install/remove skills programmatically |
+| **configure_tool** | tool, settings | Per-tool runtime config overrides (source: `tools/tool_config.rs`) |
+| **delegate_task** | … | Scoped child agent (M8.7 sub-agent output router) |
+| **check_background_tasks** | — | Inspect outstanding background / `spawn_only` tasks held by `task_supervisor` |
+| **activate_tools** | groups | Pull deferred LRU-evicted tools back into the active registry |
+| **check_workspace_contract** | — | Verify the worktree against `workspace_contract.rs` invariants |
+| **workspace_history** | action | Worktree event-log queries (source: `tools/workspace_history.rs`) |
 
 **Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, send_file, and cron are registered only in gateway mode (`gateway.rs`).
 
@@ -1461,17 +1466,17 @@ crates/
 │   ├── sandbox/       (mod, bwrap, macos, docker, windows)
 │   ├── plugins/       (mod, loader, manifest, tool, lifecycle)
 │   ├── skills/        (cron, skill-store, skill-creator SKILL.md)
-│   └── tools/         (mod, policy, shell, read_file, write_file,
+│   └── tools/         (mod, policy, registry, shell, read_file, write_file,
 │                        edit_file, diff_edit, list_dir, glob_tool,
 │                        grep_tool, web_search, web_fetch, message,
-│                        spawn, delegate, browser, ssrf, tool_config,
-│                        check_background_tasks, configure_tool,
+│                        spawn, delegate, browser, ssrf,
+│                        check_background_tasks, tool_config,
 │                        activate_tools, check_workspace_contract,
-│                        deep_search, site_crawl, recall_memory,
-│                        save_memory, send_file, take_photo,
+│                        deep_search, site_crawl  (registers as deep_crawl),
+│                        recall_memory, save_memory, send_file,
 │                        code_structure, git, synthesize_research,
-│                        research_utils, manage_skills,
-│                        workspace_log/show/diff,
+│                        research_utils, manage_skills, mcp_agent,
+│                        robot_groups, workspace_history,
 │                        admin/ (profiles, skills, sub_accounts, system,
 │                                platform_skills, voice_clones, update))
 ├── octos-bus/src/
