@@ -316,7 +316,7 @@ Skip it when you just need the CLI (`octos chat`, `octos gateway`) — `cargo in
 
 ## Architecture
 
-10-crate Rust workspace + bundled skills:
+10 `octos-*` crates + 14 app-skill crates + 1 platform-skill crate (25 workspace members total). The runtime auto-installs only the 9 entries in `BUNDLED_APP_SKILLS` plus the `voice` platform-skill — see `crates/octos-agent/src/bundled_app_skills.rs`.
 
 ```
 octos-cli   (CLI entrypoint, REST API server, dashboard, config watcher, wizard)

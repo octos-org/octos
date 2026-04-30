@@ -620,7 +620,7 @@ When multiple directories contain a skill with the same name, first match wins:
 |----------|----------|--------|
 | 1 (highest) | `<profile-data>/skills/` | Per-profile install |
 | 2 | `<project-dir>/skills/` | Project-local |
-| 3 | `<project-dir>/bundled-skills/` | Bundled app-skills |
+| 3 | `<project-dir>/bundled-app-skills/` | Bundled app-skills (constant `BUNDLED_APP_SKILLS_DIR` in `octos-agent/src/bootstrap.rs`; scanned by `Config::plugin_dirs_from_project`) |
 | 4 (lowest) | `~/.octos/skills/` | Global install |
 
 ---

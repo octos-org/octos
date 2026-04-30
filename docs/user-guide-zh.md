@@ -541,6 +541,8 @@ export PERPLEXITY_API_KEY="pplx-your-key"
 
 ### 7.2 命名分组
 
+权威定义：`crates/octos-agent/src/tools/policy.rs:154-223` 中的 `TOOL_GROUPS`。具体工具清单：
+
 | 分组 | 展开为 |
 |------|--------|
 | `group:fs` | `read_file`、`write_file`、`edit_file`、`diff_edit` |
@@ -548,13 +550,13 @@ export PERPLEXITY_API_KEY="pplx-your-key"
 | `group:web` | `web_search`、`web_fetch`、`browser` |
 | `group:search` | `glob`、`grep`、`list_dir` |
 | `group:sessions` | `spawn` |
-| `group:memory` | `save_memory`、`recall_memory` |
-| `group:research` | `deep_search`、`site_crawl`、`synthesize_research` |
-| `group:admin` | 全部 `admin_*` 工具（配置/技能/音色克隆等管理类） |
-| `group:media` | `send_file`、`take_photo`、语音合成相关工具 |
-| `group:delegated` | 在被委派的子 Agent 中必须禁用的工具集（写入子 Agent 策略后递归 deny-wins） |
+| `group:memory` | `recall_memory`、`save_memory` |
+| `group:research` | `deep_search`、`synthesize_research`、`deep_crawl` |
+| `group:admin` | `manage_skills`、`configure_tool`、`model_check` |
+| `group:media` | `mofa_comic`、`mofa_slides`、`mofa_infographic`、`mofa_cards`、`fm_tts`、`fm_voice_list` |
+| `group:delegated` | `delegate_task`、`spawn`、`send_message`、`message`、`save_memory`、`execute_code` —— 委派子 Agent 通用的拒绝列表。把它加到子 Agent 的 deny 列表，即可一次性关闭再委派、后台扇出、用户消息、记忆写入和任意代码执行。 |
 
-权威定义：`crates/octos-agent/src/tools/policy.rs:128-213`。
+`group:robot:*` 系列机器人分级分组在 `docs/OCTOS_ROBOTICS_ARCHITECTURE.md` 描述，由 `robot_groups::group_covers_tool` 解析，而不通过 `TOOL_GROUPS`。
 
 ### 7.3 通配符匹配
 
@@ -2083,25 +2085,34 @@ chmod +x .octos/skills/translator/main
 ├── memory/                     # 记忆文件
 │   ├── MEMORY.md               # 长期持久化记忆
 │   └── 2026-04-30.md           # 每日笔记
-├── skills/                     # 自定义技能（优先级：项目 > 配置 > 全局）
-│   ├── news/                   # 内置：新闻获取
-│   ├── deep-search/            # 内置：深度搜索（插件协议 v2）
-│   ├── deep-crawl/             # 内置：深度爬取（插件协议 v2）
-│   ├── send-email/             # 内置：邮件发送
-│   ├── account-manager/        # 内置：子账户管理
-│   ├── time/                   # 内置：时间查询
-│   ├── weather/                # 内置：天气信息
-│   ├── pipeline-guard/         # 内置：pipeline 前置 hook 校验
-│   ├── skill-evolve/           # 内置：技能 SKILL.md 补丁队列（前台）
-│   ├── wechat-bridge/          # 内置：微信 WebSocket 桥接
-│   ├── harness-starter-{audio,coding,generic,report}/  # 启动模板
-│   └── my-custom-skill/        # 用户安装的技能
-├── platform-skills/            # 平台技能（ASR/TTS、音色克隆）
+├── bundled-app-skills/         # gateway 启动时由 bootstrap 自动安装
+│   │                           #（常量 BUNDLED_APP_SKILLS_DIR = "bundled-app-skills"；
+│   │                           # 内容来自
+│   │                           # crates/octos-agent/src/bundled_app_skills.rs）。
+│   │                           # 重新部署会刷新此目录；用户改动会被覆盖 ——
+│   │                           # 自定义请放到 skills/。
+│   ├── news/                   # news_fetch
+│   ├── deep-search/            # 多步研究（插件协议 v2）
+│   ├── deep-crawl/             # 站点爬取 + 合成（插件协议 v2）
+│   ├── send-email/             # SMTP 发送
+│   ├── account-manager/        # 子账户管理
+│   ├── time/                   # 时间 / 时区（二进制名 "clock"）
+│   ├── weather/                # Open-Meteo 天气
+│   ├── pipeline-guard/         # DOT pipeline 前置 hook 校验
+│   └── skill-evolve/           # SKILL.md 补丁队列（前台）
+├── skills/                     # 用户安装的自定义技能
+│   │                           #（优先级：项目 > 配置 > 全局；重新部署不覆盖）。
+│   └── my-custom-skill/
+├── platform-skills/            # 平台技能数据（voice ASR/TTS）。
+│                               # 音色克隆由 OminiX-API + mofa-fm/fm_tts 完成；
+│                               # 平台 voice 技能本身只支持预设音色。
 ├── episodes.redb               # 回忆录数据库
 ├── tool_config.json            # 工具配置覆盖
 └── history/
     └── chat_history            # Readline 历史（CLI）
 ```
+
+> **运行时目录里看不到**：`harness-starter-{audio,coding,generic,report}` 与 `wechat-bridge` 都是仅在 workspace 中的示例/工具 crate，位于 `crates/app-skills/`。它们能被 `cargo build --workspace` 编译，但不在 `BUNDLED_APP_SKILLS` 中，因此 gateway 不会把它们写入 `~/.octos/bundled-app-skills/`。需要看模板请直接打开源码树。
 
 ---
 

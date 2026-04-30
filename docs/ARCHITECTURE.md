@@ -686,17 +686,17 @@ pub struct ToolPolicy {
 }
 ```
 
-**Groups** (registered in `tools/policy.rs:128-213`):
+**Groups** (`TOOL_GROUPS` in `tools/policy.rs:154-223`):
 - `group:fs` — read_file, write_file, edit_file, diff_edit
 - `group:runtime` — shell
 - `group:web` — web_search, web_fetch, browser
 - `group:search` — glob, grep, list_dir
 - `group:sessions` — spawn
-- `group:memory` — save_memory, recall_memory
-- `group:research` — deep_search, site_crawl, synthesize_research
-- `group:admin` — admin_* tools (provisioning, profiles, channels, voice clones, …)
-- `group:media` — send_file, take_photo, voice synthesis
-- `group:delegated` — tools that must be denied under a delegated child agent (deny-wins recursive policy)
+- `group:memory` — recall_memory, save_memory
+- `group:research` — deep_search, synthesize_research, deep_crawl
+- `group:admin` — manage_skills, configure_tool, model_check
+- `group:media` — mofa_comic, mofa_slides, mofa_infographic, mofa_cards, fm_tts, fm_voice_list
+- `group:delegated` — delegate_task, spawn, send_message, message, save_memory, execute_code (canonical deny list every DelegateTool child receives; deny-wins recursion gates re-delegation, background spawning, user messaging, memory writes, and arbitrary code execution)
 
 **Wildcards**: `exec*` matches prefix. Provider-specific policies via config `tools.byProvider`.
 
@@ -1652,7 +1652,7 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 
 **Auto-rotate admin token** (#650): on `octos serve` boot, if a stored admin token is older than the configured threshold or has been invalidated, it is rotated automatically and the new value is persisted to `~/.octos/auth.json`.
 
-**Voice clone registration** (#653): on deploy, voice clones declared under `~/.octos/profiles/<profile>/data/voice_profiles/*.wav` are registered with the platform-skill voice runtime via `scripts/register-fleet-voices.sh`.
+**Voice clone registration** (#653): voice cloning is owned by the separate `mofa-fm` skill (`fm_tts`), not the platform `voice` skill (which only does preset-voice TTS). Per-profile clone reference WAVs live under `~/.octos/profiles/<profile>/data/voice_profiles/*.wav`. On deploy, `scripts/register-fleet-voices.sh` merges those filenames into OminiX-API's `~/.OminiX/models/voices.json` on each fleet host so that `fm_tts`'s pre-call validation against `/v1/voices` succeeds. Without that merge step `fm_tts` rejects calls with `"voice 'X' is not registered on ominix-api"`.
 
 ---
 

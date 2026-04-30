@@ -611,6 +611,8 @@ Tool policies control which tools the agent can use. They can be set globally, p
 
 ### 7.2 Named Groups
 
+Source of truth: `TOOL_GROUPS` in `crates/octos-agent/src/tools/policy.rs:154-223`. The exact tool list:
+
 | Group | Expands To |
 |-------|-----------|
 | `group:fs` | `read_file`, `write_file`, `edit_file`, `diff_edit` |
@@ -618,13 +620,13 @@ Tool policies control which tools the agent can use. They can be set globally, p
 | `group:web` | `web_search`, `web_fetch`, `browser` |
 | `group:search` | `glob`, `grep`, `list_dir` |
 | `group:sessions` | `spawn` |
-| `group:memory` | `save_memory`, `recall_memory` |
-| `group:research` | `deep_search`, `site_crawl`, `synthesize_research` |
-| `group:admin` | All `admin_*` tools (profile/skill/voice-clone provisioning) |
-| `group:media` | `send_file`, `take_photo`, voice synthesis tools |
-| `group:delegated` | Tools that must be denied under a delegated child agent — added to a child policy makes the deny-wins recursion close that surface for sub-agents |
+| `group:memory` | `recall_memory`, `save_memory` |
+| `group:research` | `deep_search`, `synthesize_research`, `deep_crawl` |
+| `group:admin` | `manage_skills`, `configure_tool`, `model_check` |
+| `group:media` | `mofa_comic`, `mofa_slides`, `mofa_infographic`, `mofa_cards`, `fm_tts`, `fm_voice_list` |
+| `group:delegated` | `delegate_task`, `spawn`, `send_message`, `message`, `save_memory`, `execute_code` — the canonical deny list every delegated child receives. Adding it to a child's deny list closes re-delegation, background-spawn, user-messaging, memory writes, and arbitrary code execution all at once. |
 
-Source of truth: `crates/octos-agent/src/tools/policy.rs:128-213`.
+Robot-tier groups under `group:robot:*` are documented in the robotics architecture (`docs/OCTOS_ROBOTICS_ARCHITECTURE.md`) and resolved by `robot_groups::group_covers_tool` rather than `TOOL_GROUPS`.
 
 ### 7.3 Wildcard Matching
 
@@ -2170,25 +2172,35 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 ├── memory/                     # Memory files
 │   ├── MEMORY.md               # Long-term persistent memory
 │   └── 2026-04-30.md           # Daily notes
-├── skills/                     # Custom skills (precedence: project > profile > global)
-│   ├── news/                   # Bundled: news fetch
-│   ├── deep-search/            # Bundled: deep web search (plugin protocol v2)
-│   ├── deep-crawl/             # Bundled: deep crawl (plugin protocol v2)
-│   ├── send-email/             # Bundled: email sending
-│   ├── account-manager/        # Bundled: sub-account management
-│   ├── time/                   # Bundled: time queries
-│   ├── weather/                # Bundled: weather info
-│   ├── pipeline-guard/         # Bundled: pipeline before-hook validator
-│   ├── skill-evolve/           # Bundled: skill SKILL.md patch queue (foreground)
-│   ├── wechat-bridge/          # Bundled: WeChat WebSocket bridge
-│   ├── harness-starter-{audio,coding,generic,report}/  # Starter templates
-│   └── my-custom-skill/        # User-installed skill
-├── platform-skills/            # Platform skills (ASR/TTS, voice clones)
+├── bundled-app-skills/         # Auto-installed by gateway bootstrap
+│   │                           # (BUNDLED_APP_SKILLS_DIR = "bundled-app-skills";
+│   │                           #  contents come from
+│   │                           #  crates/octos-agent/src/bundled_app_skills.rs).
+│   │                           # Re-deploy refreshes this; user edits here are
+│   │                           # overwritten — put customizations under skills/.
+│   ├── news/                   # news_fetch
+│   ├── deep-search/            # multi-step research (plugin protocol v2)
+│   ├── deep-crawl/             # site crawl + synthesis (plugin protocol v2)
+│   ├── send-email/             # SMTP send
+│   ├── account-manager/        # sub-account ops
+│   ├── time/                   # time / timezone (binary "clock")
+│   ├── weather/                # Open-Meteo weather
+│   ├── pipeline-guard/         # DOT-pipeline before-hook validator
+│   └── skill-evolve/           # SKILL.md patch queue (foreground)
+├── skills/                     # User-installed custom skills (precedence:
+│   │                           #  project > profile > global; not overwritten
+│   │                           #  by re-deploy).
+│   └── my-custom-skill/
+├── platform-skills/            # Platform-skill data (voice ASR/TTS).
+│                               # Voice cloning is OminiX-API + mofa-fm/fm_tts;
+│                               # the platform voice skill itself is preset-only.
 ├── episodes.redb               # Episodic memory database
 ├── tool_config.json            # Tool configuration overrides
 └── history/
     └── chat_history            # Readline history (CLI)
 ```
+
+> **Not present in the runtime tree:** `harness-starter-{audio,coding,generic,report}` and `wechat-bridge` are workspace-only example/utility crates under `crates/app-skills/`. They build with `cargo build --workspace` but are not part of `BUNDLED_APP_SKILLS`, so the gateway never copies them into `~/.octos/bundled-app-skills/`. Don't expect to find them at runtime — open the source tree if you want the templates.
 
 ---
 

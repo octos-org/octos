@@ -280,7 +280,7 @@ manage_skills(action="search", query="comic")
 
 1. `<profile-data>/skills/` — 配置文件级（最高优先级）
 2. `<project-dir>/skills/` — 项目本地
-3. `<project-dir>/bundled-skills/` — 内置应用技能
+3. `<project-dir>/bundled-app-skills/` — 内置应用技能（常量 `BUNDLED_APP_SKILLS_DIR`，位于 `octos-agent/src/bootstrap.rs`，由 `Config::plugin_dirs_from_project` 扫描）
 4. `~/.octos/skills/` — 全局（最低优先级）
 
 ### 发布到注册中心
