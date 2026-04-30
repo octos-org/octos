@@ -669,7 +669,7 @@ pub struct ToolResult {
 | **save_memory** | name, content | Save / update an entity page in the memory bank. `name` is slugified (lowercase, spaces → hyphens); `content` is full markdown. `Exclusive` concurrency to avoid mid-write reads. |
 | **recall_memory** | name | Load the full markdown content of a memory bank entity by name. Names are listed in the Memory Bank section of the system prompt. |
 | **deep_search** | query | Multi-step research (built-in entrypoint into the deep-search app-skill) |
-| **deep_crawl** | url, max_pages?, max_depth? | Recursively crawl a website via headless Chrome (CDP), extract text, save to disk. Source: `tools/site_crawl.rs` — the file name is historical; `Tool::name()` returns `"deep_crawl"`. |
+| **deep_crawl** | url, max_depth, max_pages, path_prefix? | Recursively crawl a website via headless Chrome (CDP), extract text, save to disk. **All three of `url`, `max_depth` (1-10), `max_pages` (1-100) are required** — the description prompts the LLM to ask the user before calling. Source: `tools/site_crawl.rs` — the file name is historical; `Tool::name()` returns `"deep_crawl"`. |
 | **synthesize_research** | … | Synthesis pass paired with `deep_search` / `deep_crawl` (plugin protocol v2 wiring). |
 | **code_structure** | path? | Extract code structure (AST-based) |
 | **manage_skills** | action, name? | List/install/remove skills programmatically |
@@ -678,7 +678,9 @@ pub struct ToolResult {
 | **check_background_tasks** | — | Inspect outstanding background / `spawn_only` tasks held by `task_supervisor` |
 | **activate_tools** | groups | Pull deferred LRU-evicted tools back into the active registry |
 | **check_workspace_contract** | — | Verify the worktree against `workspace_contract.rs` invariants |
-| **workspace_history** | action | Worktree event-log queries (source: `tools/workspace_history.rs`) |
+| **workspace_log** | path? | Worktree event-log query (source: `tools/workspace_history.rs:101`) |
+| **workspace_show** | path | Show a single worktree event entry (`workspace_history.rs:199`) |
+| **workspace_diff** | path? | Diff worktree state against the last logged baseline (`workspace_history.rs:322`) |
 
 **Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, send_file, and cron are registered only in gateway mode (`gateway.rs`).
 
