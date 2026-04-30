@@ -235,6 +235,14 @@ impl Agent {
                 tools.mark_spawn_only_invoked();
                 let bg_supervisor = tools.supervisor();
                 let bg_reporter = reporter.clone();
+                // M8.10 follow-up (#649): snapshot the originating turn's
+                // thread_id NOW, before any other turn can swap reporters
+                // or rotate the api_channel sticky map. Late-arriving
+                // background results stamp this onto their OutboundMessage
+                // metadata so the wire-side SSE event lands under the
+                // correct turn even after subsequent unrelated user turns
+                // have advanced the per-chat sticky thread_id.
+                let bg_originating_thread_id = bg_reporter.thread_id().map(str::to_string);
                 // F004 B2: bridge supervised runtime-state transitions onto
                 // the per-request reporter so spawn_only tasks emit
                 // ToolProgress events keyed by `tool_call_id`. This is what
@@ -411,6 +419,7 @@ impl Agent {
                                             content: String::new(),
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
+                                            originating_thread_id: bg_originating_thread_id.clone(),
                                         })
                                         .await
                                     } else {
@@ -439,6 +448,8 @@ impl Agent {
                                                     ),
                                                     kind: BackgroundResultKind::Notification,
                                                     media: vec![],
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
                                                 })
                                                 .await;
                                             }
@@ -477,6 +488,7 @@ impl Agent {
                                             content,
                                             kind: BackgroundResultKind::Notification,
                                             media: vec![],
+                                            originating_thread_id: bg_originating_thread_id.clone(),
                                         })
                                         .await;
                                     }
@@ -499,6 +511,8 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
                                             })
                                             .await;
                                         }
@@ -534,6 +548,8 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
                                             })
                                             .await;
                                         }
@@ -633,6 +649,8 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                originating_thread_id: bg_originating_thread_id
+                                                    .clone(),
                                             })
                                             .await;
                                         }
@@ -659,6 +677,8 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        originating_thread_id:
+                                                            bg_originating_thread_id.clone(),
                                                     })
                                                     .await;
                                                 }
@@ -679,6 +699,8 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        originating_thread_id:
+                                                            bg_originating_thread_id.clone(),
                                                     })
                                                     .await;
                                                 }
@@ -702,6 +724,7 @@ impl Agent {
                                     content: format!("✗ {} failed: {}", bg_name, r.output),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    originating_thread_id: bg_originating_thread_id.clone(),
                                 })
                                 .await;
                             }
@@ -719,6 +742,7 @@ impl Agent {
                                     content: format!("✗ {} error: {}", bg_name, e),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    originating_thread_id: bg_originating_thread_id.clone(),
                                 })
                                 .await;
                             }

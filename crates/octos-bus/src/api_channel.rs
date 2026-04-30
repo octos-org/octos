@@ -963,8 +963,15 @@ impl Channel for ApiChannel {
                 let sess = self.sessions.lock().await;
                 sess.data_dir()
             };
-            if let Some(event) = build_session_result_event(result, &data_dir, None, topic) {
+            if let Some(mut event) = build_session_result_event(result, &data_dir, None, topic) {
                 record_result_delivery("session_result_event", "metadata", "session_result");
+                // M8.10 follow-up (#649): tag the wire-side session_result
+                // with the resolved thread_id so the web client routes it
+                // under the originating bubble. Without this, late-arriving
+                // background results (deep_research, spawn_only completions)
+                // appear under whichever turn happens to hold the sticky
+                // thread_id, NOT the turn that actually launched them.
+                inject_thread_id(&mut event, thread_id.as_deref());
                 self.broadcast_session_event(&msg.chat_id, topic, event)
                     .await;
             }
@@ -3502,6 +3509,137 @@ mod tests {
         assert_eq!(media.len(), 1);
         assert!(media[0].as_str().unwrap().starts_with("pf/"));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// M8.10 follow-up (#649) regression: when the api_channel sticky map
+    /// has rotated through three turns (A → B → C) and a long-running
+    /// background task originating in turn A finally finalises, the wire
+    /// event MUST carry turn A's thread_id (sourced from explicit
+    /// metadata) and NOT the most-recent sticky value (turn C).
+    ///
+    /// Reproduces the live mini3 trace (2026-04-29, session
+    /// `web-1777402538752-zn7jfr`) where the deep_research turn's late
+    /// output landed under the voices turn's bubble — the bug this PR
+    /// fixes.
+    #[tokio::test]
+    async fn late_tool_result_for_overflow_turn_keeps_originating_thread_id_under_3_user_race() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-race-chat".into(), tx);
+        }
+
+        // Simulate the production scenario: 3 user turns rotate the
+        // sticky map A → B → C as their first SSE events go out. We
+        // drive the rotation directly by calling `remember_thread_id`
+        // (the same hook every `send`/`send_with_id` uses).
+        ch.remember_thread_id("test-race-chat", Some("cmid-A-deep-research"))
+            .await;
+        ch.remember_thread_id("test-race-chat", Some("cmid-B-stocks"))
+            .await;
+        ch.remember_thread_id("test-race-chat", Some("cmid-C-voices"))
+            .await;
+        // After this, the sticky map points at C — the WRONG thread for
+        // a late-arriving turn-A result.
+
+        // Now turn A's background task finally finalises. It carries
+        // `thread_id=cmid-A-deep-research` in OutboundMessage metadata
+        // (the fix). The api_channel must honour this explicit metadata
+        // INSTEAD of falling through to the sticky map.
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-race-chat".into(),
+            content: "Deep research report on space exploration".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({
+                "_history_persisted": true,
+                "thread_id": "cmid-A-deep-research",
+                "_session_result": {
+                    "seq": 9,
+                    "role": "assistant",
+                    "content": "Deep research report on space exploration",
+                    "timestamp": "2026-04-29T05:56:03Z",
+                    "media": [],
+                    "thread_id": "cmid-A-deep-research",
+                }
+            }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "session_result");
+        assert_eq!(
+            parsed.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-A-deep-research"),
+            "wire-side session_result MUST be tagged with the turn A cmid \
+             carried explicitly in OutboundMessage metadata; the sticky \
+             map (which now points at turn C) must NOT win. Got: {parsed}"
+        );
+        assert_eq!(
+            parsed["message"].get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-A-deep-research"),
+            "the embedded message body must also carry the originating \
+             thread_id so the web client renders it under the right bubble \
+             (the v2 thread-store keys off `message.thread_id`)"
+        );
+    }
+
+    /// M8.10 follow-up (#649) regression: explicit `thread_id` in
+    /// OutboundMessage metadata MUST win over the sticky map for the
+    /// `replace`/wire-side text path too. This pins the contract that
+    /// `outbound_thread_id(metadata)` is consulted BEFORE
+    /// `sticky_thread_id(chat_id)` in `send()`.
+    #[tokio::test]
+    async fn explicit_metadata_thread_id_wins_over_sticky_for_replace_event() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = test_sessions_in(data_dir.path());
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            sessions,
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("test-explicit-chat".into(), tx);
+        }
+
+        // Sticky map says C.
+        ch.remember_thread_id("test-explicit-chat", Some("cmid-sticky-C"))
+            .await;
+
+        // Outbound carries A explicitly.
+        let msg = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "test-explicit-chat".into(),
+            content: "originating turn A reply".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({ "thread_id": "cmid-explicit-A" }),
+        };
+        ch.send(&msg).await.unwrap();
+
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(parsed["type"], "replace");
+        assert_eq!(
+            parsed.get("thread_id").and_then(|v| v.as_str()),
+            Some("cmid-explicit-A"),
+            "explicit metadata.thread_id must outrank the sticky map; got {parsed}"
+        );
     }
 
     #[tokio::test]

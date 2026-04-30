@@ -74,6 +74,13 @@ pub struct BackgroundResultPayload {
     pub content: String,
     pub kind: BackgroundResultKind,
     pub media: Vec<String>,
+    /// M8.10 follow-up (#649): the user message's `client_message_id` that
+    /// originated this background task. Carries through to the late-arriving
+    /// outbound's `metadata.thread_id` so the API channel can stamp SSE
+    /// events with the originating turn — NOT whatever the per-chat sticky
+    /// map happens to hold when the background task finally finalises.
+    /// `None` for legacy callers and tests that don't track origination.
+    pub originating_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2249,6 +2256,15 @@ impl Tool for SpawnTool {
             // background child task so the detached child inherits the same
             // compaction + validator contracts the sync spawn path honours.
             let child_workspace_policy = parent_workspace_policy.clone();
+            // M8.10 follow-up (#649): snapshot the originating turn's
+            // thread_id (= user message's client_message_id) at spawn
+            // time so the late-arriving terminal payload can stamp it
+            // onto the OutboundMessage metadata. Without this snapshot
+            // the payload would inherit whatever the per-chat sticky
+            // map happens to hold when the background task finalises,
+            // which after fast-follow-up turns is the WRONG turn's
+            // thread_id (cf. live mini3 trace, 2026-04-29).
+            let originating_thread_id = ctx.reporter.thread_id().map(str::to_string);
             // M8 Runtime Parity W2.B1: capture parent caches into the
             // detached background closure so the bg child Agent gets the
             // same FileStateCache + Router + SummaryGenerator as the sync
@@ -2869,6 +2885,7 @@ impl Tool for SpawnTool {
                         content: content.clone(),
                         kind: result_kind,
                         media: result_media.clone(),
+                        originating_thread_id: originating_thread_id.clone(),
                     },
                 )
                 .await
@@ -3798,6 +3815,7 @@ PY
             content: "done".to_string(),
             kind: BackgroundResultKind::Notification,
             media: vec!["/tmp/output.mp3".to_string()],
+            originating_thread_id: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);

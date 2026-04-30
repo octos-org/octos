@@ -83,6 +83,10 @@ fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
 }
 
 impl ProgressReporter for ChannelStreamReporter {
+    fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
+    }
+
     fn report(&self, event: ProgressEvent) {
         let thread_id = self.thread_id.as_deref();
         let mapped = match event {
