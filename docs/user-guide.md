@@ -1297,8 +1297,8 @@ Recursively crawls a website using headless Chrome via CDP (Chrome DevTools Prot
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `url` | string | *(required)* | Starting URL |
-| `max_depth` | 1-10 | 3 | Maximum link-following depth |
-| `max_pages` | 1-200 | 50 | Maximum pages to crawl |
+| `max_depth` | integer 1-10 | *(required)* | Maximum link-following depth — the tool prompts the LLM to ask the user before calling |
+| `max_pages` | integer 1-100 | *(required)* | Maximum pages to crawl — the tool prompts the LLM to ask the user before calling |
 | `path_prefix` | string | none | Only follow links with this path prefix |
 
 #### Output
@@ -1329,7 +1329,7 @@ Bot: [uses deep_crawl with url="https://docs.rs/tokio/latest/tokio/",
 ```
 User: Crawl my company's documentation site
 
-Bot: [uses deep_crawl with url="https://docs.example.com", max_pages=100]
+Bot: [uses deep_crawl with url="https://docs.example.com", max_depth=4, max_pages=100]
      Crawled 87 pages. Content saved to crawl-docs.example.com/
 ```
 

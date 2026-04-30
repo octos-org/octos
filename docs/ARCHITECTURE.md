@@ -678,9 +678,9 @@ pub struct ToolResult {
 | **check_background_tasks** | — | Inspect outstanding background / `spawn_only` tasks held by `task_supervisor` |
 | **activate_tools** | groups | Pull deferred LRU-evicted tools back into the active registry |
 | **check_workspace_contract** | — | Verify the worktree against `workspace_contract.rs` invariants |
-| **workspace_log** | path? | Worktree event-log query (source: `tools/workspace_history.rs:101`) |
-| **workspace_show** | path | Show a single worktree event entry (`workspace_history.rs:199`) |
-| **workspace_diff** | path? | Diff worktree state against the last logged baseline (`workspace_history.rs:322`) |
+| **workspace_log** | project, limit? | Git `log --oneline --all -n <limit>` for a workspace project (e.g. `slides/my-deck`, `sites/blog`). Default `limit=20`, capped at 100. Source: `tools/workspace_history.rs:101`. |
+| **workspace_show** | project, commit, file | Read a file at a specific commit (`git show <commit>:<file>`). All three fields required. Source: `tools/workspace_history.rs:199`. |
+| **workspace_diff** | project, from_commit, to_commit?, file? | Diff two commits (`from_commit..to_commit`); `to_commit` defaults to `HEAD`; `file` optionally scopes the diff. Source: `tools/workspace_history.rs:322`. |
 
 **Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, send_file, and cron are registered only in gateway mode (`gateway.rs`).
 
