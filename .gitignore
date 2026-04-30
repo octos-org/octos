@@ -86,6 +86,8 @@ scripts/deploy.sh
 !docs/m8-runtime-parity-prd.md
 !docs/m8-runtime-contract.md
 !docs/m8-runtime-migration-runbook.md
+!docs/OCTOS_HARNESS_ENGINEERING_REQUIREMENTS_M6_M9.md
+!docs/OCTOS_HARNESS_AUDIT_M6_M9_2026-04-30.md
 # UI Protocol change requests (UPCR) — required by check-ui-protocol-upcr.sh
 # whenever protocol-visible code changes; listed in
 # api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md.
