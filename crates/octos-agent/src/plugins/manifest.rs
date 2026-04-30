@@ -116,6 +116,9 @@ pub struct PluginToolDef {
     /// runtime env vars are still forwarded by default.
     #[serde(default, alias = "env_allowlist")]
     pub env: Vec<String>,
+    /// Manifest-declared approval risk for this tool.
+    #[serde(default)]
+    pub risk: Option<String>,
     /// Message returned to the LLM when a spawn_only tool is auto-backgrounded.
     /// Default: "SUCCESS: Task is now running in background..."
     #[serde(default)]
@@ -185,6 +188,7 @@ mod tests {
                 {
                     "name": "hello",
                     "description": "Say hello",
+                    "risk": "medium",
                     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}}
                 }
             ]
@@ -193,6 +197,7 @@ mod tests {
         assert_eq!(manifest.name, "test-plugin");
         assert_eq!(manifest.tools.len(), 1);
         assert_eq!(manifest.tools[0].name, "hello");
+        assert_eq!(manifest.tools[0].risk.as_deref(), Some("medium"));
     }
 
     #[test]
@@ -208,6 +213,18 @@ mod tests {
             serde_json::json!({"type": "object"})
         );
         assert!(manifest.tools[0].env.is_empty());
+        assert_eq!(manifest.tools[0].risk, None);
+    }
+
+    #[test]
+    fn test_tool_risk_preserves_blank_manifest_value() {
+        let json = r#"{
+            "name": "risk-plugin",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d", "risk": "   "}]
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.tools[0].risk.as_deref(), Some("   "));
     }
 
     #[test]

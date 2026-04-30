@@ -43,6 +43,11 @@ pub struct PluginLoadResult {
     pub prompt_fragments: Vec<String>,
 }
 
+struct LoadedPluginTool {
+    tool: PluginTool,
+    risk: Option<String>,
+}
+
 /// Optional knobs for plugin loading beyond `extra_env` and `work_dir`.
 ///
 /// Add new fields here when introducing host→plugin config injection so the
@@ -138,12 +143,19 @@ impl PluginLoader {
                     continue;
                 }
 
-                match Self::load_plugin_with_options(&path, extra_env, options.clone()) {
+                match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
                     Ok((tools, extras)) => {
                         let n = tools.len();
                         let spawn_only = extras.spawn_only_tools.clone();
-                        for tool in tools {
+                        for loaded in tools {
+                            let tool = loaded.tool;
                             let name = tool.name().to_string();
+                            let risk =
+                                octos_core::ui_protocol::manifest_tool_risk(loaded.risk.as_deref());
+                            octos_core::ui_protocol::register_tool_approval_risk(
+                                name.clone(),
+                                risk,
+                            );
                             result.tool_names.push(name.clone());
                             registry.mark_as_plugin(&name);
                             registry.register(tool);
@@ -226,6 +238,19 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         options: PluginLoadOptions<'_>,
     ) -> Result<(Vec<PluginTool>, SkillExtras)> {
+        let (tools, extras) =
+            Self::load_plugin_with_options_and_risks(plugin_dir, extra_env, options)?;
+        Ok((
+            tools.into_iter().map(|loaded| loaded.tool).collect(),
+            extras,
+        ))
+    }
+
+    fn load_plugin_with_options_and_risks(
+        plugin_dir: &Path,
+        extra_env: &[(String, String)],
+        options: PluginLoadOptions<'_>,
+    ) -> Result<(Vec<LoadedPluginTool>, SkillExtras)> {
         let work_dir = options.work_dir;
         let synthesis_config = options.synthesis_config;
         let manifest_path = plugin_dir.join("manifest.json");
@@ -354,10 +379,11 @@ impl PluginLoader {
             .collect();
 
         let plugin_name = manifest.name.clone();
-        let tools: Vec<PluginTool> = manifest
+        let tools: Vec<LoadedPluginTool> = manifest
             .tools
             .into_iter()
             .map(|def| {
+                let manifest_risk = def.risk.clone();
                 let def = apply_builtin_env_allowlist(&plugin_name, def);
                 let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
@@ -374,7 +400,10 @@ impl PluginLoader {
                 if let Some(cfg) = synthesis_config.clone() {
                     tool = tool.with_synthesis_config(cfg);
                 }
-                tool
+                LoadedPluginTool {
+                    tool,
+                    risk: manifest_risk,
+                }
             })
             .collect();
 
@@ -917,6 +946,93 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_loader_registers_manifest_approval_risk_and_overwrites_unspecified() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_plugin(root: &Path, plugin_name: &str, manifest: String) {
+            let plugin_dir = root.join(plugin_name);
+            std::fs::create_dir(&plugin_dir).unwrap();
+            std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+            let exec_path = plugin_dir.join(plugin_name);
+            std::fs::write(
+                &exec_path,
+                "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+            )
+            .unwrap();
+            std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let declared_tool = "risk_declared_tool";
+        let missing_tool = "risk_overwrite_missing_tool";
+        let blank_tool = "risk_overwrite_blank_tool";
+
+        let first_root = tempfile::tempdir().unwrap();
+        write_plugin(
+            first_root.path(),
+            "risk-plugin-first",
+            format!(
+                r#"{{
+                    "name": "risk-plugin-first",
+                    "version": "1.0",
+                    "tools": [
+                        {{"name": "{declared_tool}", "description": "declared", "risk": "medium"}},
+                        {{"name": "{missing_tool}", "description": "missing first", "risk": "high"}},
+                        {{"name": "{blank_tool}", "description": "blank first", "risk": "high"}}
+                    ]
+                }}"#
+            ),
+        );
+
+        let mut registry = ToolRegistry::new();
+        let first = PluginLoader::load_into(&mut registry, &[first_root.path().to_path_buf()], &[])
+            .unwrap();
+        assert_eq!(first.tool_count, 3);
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(declared_tool),
+            "medium"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(missing_tool),
+            "high"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(blank_tool),
+            "high"
+        );
+
+        let second_root = tempfile::tempdir().unwrap();
+        write_plugin(
+            second_root.path(),
+            "risk-plugin-second",
+            format!(
+                r#"{{
+                    "name": "risk-plugin-second",
+                    "version": "1.0",
+                    "tools": [
+                        {{"name": "{missing_tool}", "description": "missing second"}},
+                        {{"name": "{blank_tool}", "description": "blank second", "risk": "   "}}
+                    ]
+                }}"#
+            ),
+        );
+
+        let second =
+            PluginLoader::load_into(&mut registry, &[second_root.path().to_path_buf()], &[])
+                .unwrap();
+        assert_eq!(second.tool_count, 2);
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(missing_tool),
+            "unspecified"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(blank_tool),
+            "unspecified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_loader_bootstraps_script_skill_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
@@ -952,6 +1068,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             spawn_only: false,
             env: vec!["EXISTING_ENV".to_string(), "GEMINI_API_KEY".to_string()],
+            risk: None,
             spawn_only_message: None,
             concurrency_class: None,
         };
@@ -975,6 +1092,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             spawn_only: false,
             env: vec![],
+            risk: None,
             spawn_only_message: None,
             concurrency_class: None,
         };

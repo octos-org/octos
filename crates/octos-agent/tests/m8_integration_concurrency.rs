@@ -79,6 +79,7 @@ fn plugin_wrapper_can_declare_exclusive_and_serializes_batch() {
         input_schema: serde_json::json!({"type": "object"}),
         spawn_only: false,
         env: vec![],
+        risk: None,
         spawn_only_message: None,
         concurrency_class: Some("exclusive".into()),
     };
@@ -100,6 +101,7 @@ fn plugin_wrapper_can_declare_exclusive_and_serializes_batch() {
         input_schema: serde_json::json!({"type": "object"}),
         spawn_only: false,
         env: vec![],
+        risk: None,
         spawn_only_message: None,
         concurrency_class: None,
     };

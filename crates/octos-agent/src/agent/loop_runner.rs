@@ -2279,6 +2279,7 @@ printf '{"output":"voice saved","success":true}\n'
             }),
             spawn_only: false,
             env: vec![],
+            risk: None,
             spawn_only_message: None,
             concurrency_class: None,
         };
