@@ -130,12 +130,16 @@ test.describe('Live thread interleave (M8.10 PR #4)', () => {
     await getSendButton(page).click();
     await expect.poll(() => countUserBubbles(page)).toBe(userBubblesBefore + 1);
 
-    // 2. Wait briefly so the slow request enters streaming state, then
-    //    send the fast question while slow is still in flight.
+    // 2. Wait briefly, then send the fast question. The slow Q may be
+    //    in active foreground streaming OR may have already spawned to
+    //    background — `deep_search` / `run_pipeline` are spawn_only, so
+    //    the foreground SSE turn ends with a "background started" ack
+    //    within ~2-3s and the cancel button disappears even though the
+    //    real research is still running. The threading invariant we
+    //    test below holds either way: each user message's responses
+    //    (including any later background-completion bubble) bind to
+    //    its own thread by clientMessageId.
     await page.waitForTimeout(SEND_GAP_MS);
-    await expect
-      .poll(() => page.locator(SEL.cancelButton).isVisible().catch(() => false))
-      .toBeTruthy();
 
     await getInput(page).fill(FAST_PROMPT);
     await getSendButton(page).click();
