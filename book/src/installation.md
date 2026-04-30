@@ -27,17 +27,27 @@ You also need an API key from at least one supported LLM provider.
 git clone https://github.com/octos-org/octos
 cd octos
 
-# Basic (CLI, chat, run, gateway with CLI channel)
+# Recommended: canonical feature set (matches scripts/milestone-ci.sh).
+# Includes the REST API + dashboard (`octos serve`) and every messaging
+# channel adapter. Build this first if you don't know which features
+# you need — it's what release artifacts ship.
+cargo install --path crates/octos-cli \
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+
+# Minimal: CLI + chat + gateway with CLI channel only.
+# This produces a binary that does NOT have `octos serve` (the api
+# feature is what registers that subcommand) and that has no
+# messaging channel adapters compiled in.
 cargo install --path crates/octos-cli
 
-# With messaging channels
-cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
-
-# With browser automation (requires Chrome/Chromium)
-cargo install --path crates/octos-cli --features browser
-
-# With web UI and REST API
-cargo install --path crates/octos-cli --features api
+# Trim the feature list to your needs. Available channel features:
+#   telegram, discord, slack, whatsapp, feishu, email, wecom, wecom-bot,
+#   matrix, qq-bot, twilio, wechat
+# Required for `octos serve`: api
+# Other features: git (gitoxide), ast (tree-sitter)
+# Note: the browser tool (headless Chrome via CDP) is always compiled
+# in — there is no `browser` feature.
+cargo install --path crates/octos-cli --features "api,telegram,slack"
 
 # Verify
 octos --version
@@ -172,10 +182,13 @@ Octos builds and runs natively on Windows. Shell commands are executed via `cmd 
 # 1. Install Rust (download rustup-init.exe from https://rustup.rs)
 rustup-init.exe
 
-# 2. Clone and build
+# 2. Clone and build with the canonical feature set
+#    (omit features only if you just want `octos chat`; `octos serve`
+#    requires the `api` feature).
 git clone https://github.com/octos-org/octos.git
 cd octos
-cargo install --path crates/octos-cli
+cargo install --path crates/octos-cli `
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
 
 # 3. Set API key and run
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
