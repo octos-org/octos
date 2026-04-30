@@ -108,9 +108,9 @@ jobs:
       # the same runner (run 25137059453, job 73677952504 — runner lost
       # communication with the server during `Test octos-agent (lib)`,
       # 54min in). The structural fix is sharding: see test-octos-agent
-      # and test-octos-cli below, which each get their own fresh 16GB
-      # runner. This `check` job now only handles the light crates and
-      # workspace-level checks (fmt, clippy, doc tests).
+      # (matrix: lib + integration) and test-octos-cli below, which each
+      # get their own fresh 16GB runner. This `check` job now only handles
+      # the light crates and workspace-level checks (fmt, clippy, doc tests).
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -192,10 +192,26 @@ jobs:
   # 25137059453 — "hosted runner lost communication with the server" 54min
   # in). Each crate now runs on its own fresh runner with its own cache.
   #
-  # Cache keys are distinct (shared-key: octos-agent-tests / octos-cli-tests)
-  # so they don't fight the lean `check` job's default-keyed cache.
+  # octos-agent goes one step further: its lib + integration test compile
+  # phases EACH peak around the 16GB ceiling (run on PR #672 — integration
+  # step was cancelled after lib step's compile already used a chunk of
+  # RAM in the same runner). So lib and integration are split into two
+  # SEPARATE jobs (each fresh 16GB runner), via a matrix on `test-mode`.
+  #
+  # Cache keys are distinct (shared-key: octos-agent-tests-{lib,integration}
+  # / octos-cli-tests) so they don't fight the lean `check` job's
+  # default-keyed cache and don't fight each other.
 
   test-octos-agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        # `lib` runs `--lib` only. `integration` runs `--tests` (every
+        # integration test binary, including activate_tools_regression).
+        # Splitting these onto separate runners means each gets a fresh
+        # 16GB allocation and neither inherits residual RAM from the
+        # other's compile phase.
+        test-mode: [lib, integration]
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -210,19 +226,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: octos-agent-tests
+          shared-key: octos-agent-tests-${{ matrix.test-mode }}
 
-      # Library and integration test binaries are split so neither step
-      # pulls all 27 octos-agent test binaries into memory at link time.
       - name: Test octos-agent (lib)
+        if: matrix.test-mode == 'lib'
         run: cargo test -p octos-agent --lib
 
       - name: Test octos-agent (integration)
+        if: matrix.test-mode == 'integration'
         run: cargo test -p octos-agent --tests
 
-      # Co-located here so it reuses this job's warm octos-agent build cache
-      # rather than triggering a cold rebuild in the lean `check` job.
+      # Co-located in the integration job so it reuses the warm octos-agent
+      # integration test build cache (activate_tools_regression is itself an
+      # integration test binary). Skipped in the lib job.
       - name: activate_tools regression tests
+        if: matrix.test-mode == 'integration'
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
   test-octos-cli:
