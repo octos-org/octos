@@ -25,6 +25,10 @@
     - [账户管理器](#125-账户管理器)
     - [时钟](#126-时钟)
     - [天气](#127-天气)
+    - [微信桥接](#128-微信桥接wechat-bridge)
+    - [Pipeline Guard](#129-pipeline-guard)
+    - [Skill Evolve](#1210-skill-evolve)
+    - [Harness Starter](#1211-harness-starter启动模板)
 13. [平台技能 (ASR/TTS)](#13-平台技能-asrtts)
 14. [自定义技能安装](#14-自定义技能安装)
 15. [配置参考](#15-配置参考)
@@ -34,25 +38,32 @@
 
 ## 1. 概览
 
-Octos 是一个 Rust 原生的 AI 智能体平台，支持以下运行模式：
+Octos 是一个 Rust 原生的 AI 智能体平台，支持三种运行模式：
 
-- **`octos serve`** — 控制面板 + 管理仪表盘。管理多个 **配置文件**（机器人实例），每个实例作为独立的 gateway 子进程运行，拥有独立的配置、记忆、会话和消息通道。
-- **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、飞书、邮件、企业微信、Matrix）。
+- **`octos serve`** — 控制面板 + 管理仪表盘 + 约 140 个 REST 端点。管理多个 **配置文件**（机器人实例），每个实例作为独立的 gateway 子进程运行，拥有独立的配置、记忆、会话和消息通道。首次启动且无管理员配置时，嵌入式仪表盘会运行**首次设置向导**。
+- **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、Matrix、飞书、邮件、微信、企业微信、企业微信群机器人、QQ 机器人、Twilio）。
 - **`octos chat`** — 交互式 CLI 聊天，用于开发和测试。
 
 ### 架构
 
 ```
-octos serve（控制面板 + 仪表盘）
+octos serve（控制面板 + 仪表盘，约 140 个 REST 端点）
+  ├── 首次设置向导 /api/admin/setup/{state,step,complete,skip}
   ├── 配置 A → gateway 进程（Telegram、WhatsApp）
-  ├── 配置 B → gateway 进程（飞书、Slack）
+  ├── 配置 B → gateway 进程（飞书、Slack、Matrix）
   └── 配置 C → gateway 进程（CLI）
        │
-       ├── LLM 提供商（kimi-2.5、deepseek-chat、gpt-4o 等）
-       ├── 工具注册表（shell、文件、搜索、网页、技能...）
-       ├── 会话存储（每通道对话历史）
-       ├── 记忆系统（MEMORY.md、每日笔记、回忆录）
-       └── 技能（内置 + 自定义）
+       ├── LLM 提供商（15 家，AdaptiveRouter → ProviderChain → RetryProvider）
+       ├── 工具注册表（约 50 个内置 + 插件 + 9 个用户级 app-skill）
+       │      LRU 延迟加载保留约 15 个活跃；spawn_only 自动转后台
+       ├── 沙箱（bwrap / sandbox-exec / Docker / Windows AppContainer）
+       ├── Pipeline 引擎（DOT 图，逐节点模型，限流扇出）
+       ├── Swarm 调度器（/api/swarm/dispatch — 扇出到 N 个子 Agent）
+       ├── 子 Agent 输出路由器（M8.7 — 摘要 + 持久化全文）
+       ├── 任务监督者（限流扇出、孤立任务清理、运行时恢复）
+       ├── 会话存储（JSONL，sticky thread_id，committed_seq，三层压缩）
+       ├── 记忆（MEMORY.md + 实体库 + episodes.redb + HNSW）
+       └── 技能（内置 + 自定义；voice_profiles 注册克隆音色）
 ```
 
 每个配置文件完全隔离 — 拥有独立的数据目录、记忆、会话、技能和 API 密钥。可以在配置文件下创建子账户，子账户继承父配置的 LLM 设置。
@@ -140,14 +151,34 @@ export SMTP_PASSWORD="your-app-password"
 - **日志查看** — 每个 gateway 进程的实时 SSE 日志流
 - **提供商测试** — 在部署前测试 LLM 提供商/模型/API 密钥组合
 - **WhatsApp 二维码** — 扫描二维码绑定 WhatsApp 号码
-- **平台技能** — 监控和管理 OminiX ASR/TTS 服务
+- **平台技能** — 监控并管理 ASR/TTS 服务以及 voice_profiles 音色克隆注册
+- **Swarm 调度** — 查看进行中的扇出调度、产物以及单次调度账本
+- **Pipeline 运行** — 节点树、单节点成本、对进行中的运行进行取消/重启
 - **指标** — 每个配置文件的 LLM 提供商 QoS 指标（延迟、错误率）
+
+### 2.4 首次设置向导
+
+当 `octos serve` 首次启动且没有管理员配置时，嵌入式仪表盘会启动**设置向导**，引导操作员依次完成：
+
+1. **部署模式** — 在本地、自托管云 + 租户、Octos Cloud 注册之间选择，每种模式有相应指引文本。
+2. **SMTP 配置** — OTP 邮件登录所需（本地部署可跳过）。
+3. **LLM 提供商** — 选择提供商、填入 API 密钥并在保存前进行联通测试。
+4. **管理员配置** — 名称、通道、可选的 Family Plan 子账户。
+
+进度由后端跟踪：
+
+- `GET /api/admin/setup/state` — 当前向导步骤 + 完成标志
+- `POST /api/admin/setup/step` — 提交/保存某个步骤
+- `POST /api/admin/setup/complete` — 完成并创建管理员配置
+- `POST /api/admin/setup/skip` — 操作员逃生口（跳过剩余可选步骤）
+
+源码：`crates/octos-cli/src/api/admin_setup.rs`、`dashboard/src/pages/wizard/`。
 
 ---
 
 ## 3. 配置 LLM 提供商
 
-Octos 开箱即用支持 14 个 LLM 提供商。每个提供商需要设置对应的环境变量 API 密钥。
+Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对应的环境变量 API 密钥。
 
 ### 3.1 支持的提供商
 
@@ -157,6 +188,7 @@ Octos 开箱即用支持 14 个 LLM 提供商。每个提供商需要设置对�
 | `openai` | `OPENAI_API_KEY` | gpt-4o | 原生 OpenAI | — |
 | `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | 原生 Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | 原生 OpenRouter | — |
+| `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI 自动判定 | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI 兼容 | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI 兼容 | — |
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI 兼容 | `kimi` |
@@ -419,6 +451,8 @@ octos auth logout --provider openai
 
 提供商按顺序尝试：**DuckDuckGo → Brave → You.com → Perplexity**。第一个返回非空结果的提供商获胜。如果全部失败，返回 DuckDuckGo 结果作为兜底。
 
+**配额/限流时自动轮换（M8.10b，#578）**：当前提供商若返回配额耗尽或限流错误（HTTP 402、429 或服务自定义错误串），`web_search` 在调用过程中即切换到下一个已配置的提供商，而不是把错误抛给 Agent。这让该工具在配额波动下仍然稳定，无需 Agent 端重试逻辑。
+
 设置对应的 API 密钥即可使用特定提供商：
 
 ```bash
@@ -514,6 +548,13 @@ export PERPLEXITY_API_KEY="pplx-your-key"
 | `group:web` | `web_search`、`web_fetch`、`browser` |
 | `group:search` | `glob`、`grep`、`list_dir` |
 | `group:sessions` | `spawn` |
+| `group:memory` | `save_memory`、`recall_memory` |
+| `group:research` | `deep_search`、`site_crawl`、`synthesize_research` |
+| `group:admin` | 全部 `admin_*` 工具（配置/技能/音色克隆等管理类） |
+| `group:media` | `send_file`、`take_photo`、语音合成相关工具 |
+| `group:delegated` | 在被委派的子 Agent 中必须禁用的工具集（写入子 Agent 策略后递归 deny-wins） |
+
+权威定义：`crates/octos-agent/src/tools/policy.rs:128-213`。
 
 ### 7.3 通配符匹配
 
@@ -852,7 +893,9 @@ curl -X POST http://localhost:3000/api/admin/test-provider \
 - **会话持久化：** `.octos/sessions/` 中的 JSONL 文件
 - **最大历史记录：** 通过 `gateway.max_history` 配置（默认：50 条消息）
 - **会话分叉：** `/new` 创建带有 parent_key 追踪的分支对话
-- **上下文压缩：** 当对话超过 LLM 的上下文窗口时，较旧的消息会自动压缩（工具参数被剥离，早期消息被摘要）
+- **三层上下文压缩（M8.5）：** 工作层 / 冷层 / 归档层。当对话超过 LLM 的上下文窗口时，较旧的消息按首行摘要（工具参数被剥离），最早的消息被推入实体库作为长期记忆。
+- **Sticky `thread_id` 与 `committed_seq`（M8.10）：** 每个会话拥有稳定的 `thread_id`，在首次 SSE 发送之前完成绑定，并在后续每个事件（`token`、`tool_progress`、`task_status`、`session_result`）上携带。`done` 事件还携带 `committed_seq`（终态写入的持久序号），客户端因此能够通过 `GET /sessions/:id/events/stream` 在断线重连后做确定性回放。详情见 [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md)。
+- **结构化恢复（M8.6）：** 当工作树缺失或子 Agent 失败时，监督者拒绝静默丢弃当前轮次，而是用一个描述失败原因的结构化恢复负载重新驱动 LLM。
 
 ### 11.3 记忆系统
 
@@ -951,7 +994,16 @@ octos cron enable <job-id> --disable
        以下是 example.com 的截图...
 ```
 
-### 11.9 子智能体
+### 11.9 子 Agent 与 Swarm
+
+子 Agent 入口共有三种：
+
+| 工具 / API | 形态 | 输出处理 |
+|---|---|---|
+| `spawn` (`mode: "sync"`) | 单子 Agent，父级阻塞 | 同轮次内联返回 |
+| `spawn` (`mode: "background"`) | 单子 Agent，父级继续 | 通过 gateway 以新入站消息回送 |
+| `delegate` | 单个限定子 Agent，父级阻塞 | 内联摘要 + 全文落盘（M8.7 子 Agent 输出路由器） |
+| `/api/swarm/dispatch` | N 个并行子 Agent | 聚合产物、校验器审核、单次调度账本 |
 
 ```
 用户：深入研究这个主题，使用子智能体
@@ -975,12 +1027,21 @@ octos cron enable <job-id> --disable
 }
 ```
 
+**子 Agent 输出路由器（M8.7）**：长子 Agent 文稿由 `AgentSummaryGenerator` 生成精简摘要进入父上下文；完整文稿落盘以便事后查看。即使委派大型研究任务也能保持父上下文紧凑。
+
+**Swarm 调度**：扇出工作请使用 swarm API 而非多次 spawn。单次 swarm 调度将契约扇出到 N 个子 Agent，聚合产物，通过校验器审核，并把成本汇总回父级。状态持久化在 `crates/octos-swarm/src/persistence.rs`，账本在 `crates/octos-swarm/src/ledger.rs`。
+
+**`spawn_only` 技能工具自动转后台**：清单里 `spawn_only: true` 的插件工具会在执行层（`crates/octos-agent/src/agent/execution.rs`）被拦截，无论调用方意图如何都强制后台执行。Agent 立即收到「任务已启动」回执，结果稍后以新入站消息送达。子 Agent 不能再生成更深层子 Agent（`group:delegated` 递归 deny-wins）。
+
 ### 11.10 消息队列模式
 
 当用户在智能体处理中发送消息时：
 
-- **`followup`**（默认）：排队的消息按 FIFO 逐条处理
-- **`collect`**：同一会话的消息被拼接后一次性处理
+- **`followup`**：排队的消息按 FIFO 逐条处理
+- **`collect`**（默认）：同一会话的消息被拼接后一次性处理
+- **`steer`**：将排队消息作为对进行中轮次的转向/重定向应用
+- **`interrupt`**：取消进行中轮次并启动新轮次
+- **`speculative`**：在进行中轮次执行期间并行运行投机轮次，先完成的胜出
 
 ```json
 {
@@ -998,6 +1059,18 @@ octos cron enable <job-id> --disable
 <!-- .octos/HEARTBEAT.md -->
 检查 GitHub 仓库中的新 issue，汇总所有紧急问题。
 ```
+
+### 11.12 后台任务
+
+`spawn_only` 技能工具（长时间研究、深度爬取、音色训练等）作为后台任务在每个配置文件的 `task_supervisor` 下运行。用户可以：
+
+- 通过插件协议 v2 事件（以 `tool_progress` SSE 形式）接收周期性进度
+- 使用 `check_background_tasks` 工具查看待处理后台任务
+- 通过专用会话事件流接收终态：监督者在持久化完成后提交带 `committed_seq` 的 `session_result` 事件（#629），仪表盘据此确定性更新
+
+**Fleet 稳定性（#610）**：`spawn`、Pipeline 扇出与 swarm 调度共用全局并发上限，避免单个失控 Agent 耗尽运行资源。归属会话已结束的孤立任务由 `task_supervisor` 清理。
+
+**运行时失败恢复（M8.9）**：`spawn_only` 任务失败时，监督者用结构化恢复负载重新驱动 LLM —— 当前轮次不会被静默丢弃。
 
 ---
 
@@ -1370,6 +1443,38 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
        看起来周六可能有些小雨，但周日应该是晴天！
 ```
 
+### 12.8 微信桥接（WeChat Bridge）
+
+**二进制：** `wechat-bridge`
+
+为微信个人号提供 WebSocket 桥接 —— 通过 WebSocket 与微信客户端通信并把消息转发给 gateway。
+
+### 12.9 Pipeline Guard
+
+**类型：** Hook（不是工具）
+**事件：** `before_tool_call`（过滤：`run_pipeline`）
+
+在 `run_pipeline` 执行前校验 DOT 图并注入最佳模型分配。作为 before-hook 运行（10s 超时），可以拒绝畸形的 pipeline 提交。
+
+### 12.10 Skill Evolve
+
+**二进制：** `skill-evolve`
+
+`spawn_only` 技能：观察 Agent 对其他技能的使用情况，识别摩擦点（频繁失败、冗余调用、缺参数），并对某个技能的 `manifest.json` 或 `SKILL.md` 提出有针对性的修改建议。把启动模板适配到具体部署时尤其有用。
+
+输出是结构化 JSON 提案，由操作员审阅后手动合并 —— 该技能不会自我改写。
+
+### 12.11 Harness Starter（启动模板）
+
+`crates/app-skills/harness-starter-{audio, coding, generic, report}/` 下的四个启动模板，每个都是一个可工作的 harnessed 技能示例（含合同测试、清单和 SKILL.md），可作为自定义领域技能的起点：
+
+- `harness-starter-generic` —— 适合任意文本任务的最小回声式 harness
+- `harness-starter-coding` —— 与 worktree 集成的代码任务 harness
+- `harness-starter-report` —— 带产物输出的报告生成 harness
+- `harness-starter-audio` —— 带附件校验的音频任务 harness
+
+它们仅为模板 —— 每个 `SKILL.md` 都注明「适配该模板时请替换为真实的 ……」。完整的技能开发指南见 [docs/app-skill-dev-guide-zh.md](./app-skill-dev-guide-zh.md)。
+
 ---
 
 ## 13. 平台技能 (ASR/TTS)
@@ -1469,6 +1574,16 @@ curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
         text="早上好，团队"，language="chinese"]
        已用你的声音生成语音。[发送音频]
 ```
+
+#### 13.5.1 部署时注册音色（#653）
+
+多租户部署中，可一次性为每个配置注册可复用的音色，无需每次调用都传 `reference_audio`：
+
+1. 把参考样本放入 `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`
+2. 运行 `scripts/register-fleet-voices.sh`（也由 `cloud-host-deploy.sh` 与租户部署脚本自动调用）
+3. 平台技能 voice 运行时会把每个 `<name>.wav` 注册为该配置下的具名音色
+
+注册完成后，Agent 调用 `voice_clone_synthesize` 时只需传具名音色（如 `voice: "alice"`）而无需参考音频路径。再次执行注册脚本会重新读取目录并更新已变化的音色。
 
 ### 13.6 播客生成 (`generate_podcast`)
 
@@ -1866,11 +1981,14 @@ chmod +x .octos/skills/translator/main
   // MCP 服务器
   "mcp_servers": [],
 
-  // 沙箱
+  // 沙箱 — 完整说明见 docs/SANDBOX.md。
+  // 后端：bwrap（Linux）、sandbox-exec（macOS）、AppContainer（Windows，
+  // 由 octos-sandbox 辅助 crate 提供）、docker（任意 OS）。auto 按 OS 选择。
   "sandbox": {
     "enabled": true,
     "mode": "auto",
-    "allow_network": false
+    "allow_network": false,
+    "read_allow_paths": []        // 仅 macOS：收紧读取范围
   },
 
   // 邮件（用于邮件通道）
@@ -1936,9 +2054,13 @@ chmod +x .octos/skills/translator/main
 ```
 ~/.octos/                        # 全局配置目录
 ├── auth.json                   # 存储的 API 凭据（权限 0600）
-├── profiles/                   # 配置文件（serve 模式）
-│   ├── my-bot.json
-│   └── work-bot.json
+├── profiles/                   # 每个配置的数据根（serve 模式）
+│   └── <profile-id>/
+│       ├── config.json
+│       └── data/
+│           ├── voice_profiles/  # 用于音色克隆注册的参考 WAV
+│           ├── media/           # 持久化的音频/图片附件
+│           └── skills/          # 配置专属技能覆盖
 ├── skills/                     # 全局自定义技能
 └── serve.log                   # Serve 模式日志文件
 
@@ -1951,20 +2073,24 @@ chmod +x .octos/skills/translator/main
 ├── TOOLS.md                    # 工具特定指南
 ├── IDENTITY.md                 # 自定义身份
 ├── HEARTBEAT.md                # 后台任务指令
-├── sessions/                   # 对话历史（JSONL）
+├── sessions/                   # 对话历史（JSONL，meta 中含 sticky thread_id）
 ├── memory/                     # 记忆文件
 │   ├── MEMORY.md               # 长期持久化记忆
-│   └── 2026-03-06.md           # 每日笔记
-├── skills/                     # 自定义技能
+│   └── 2026-04-30.md           # 每日笔记
+├── skills/                     # 自定义技能（优先级：项目 > 配置 > 全局）
 │   ├── news/                   # 内置：新闻获取
-│   ├── deep-search/            # 内置：深度搜索
-│   ├── deep-crawl/             # 内置：深度爬取
+│   ├── deep-search/            # 内置：深度搜索（插件协议 v2）
+│   ├── deep-crawl/             # 内置：深度爬取（插件协议 v2）
 │   ├── send-email/             # 内置：邮件发送
 │   ├── account-manager/        # 内置：子账户管理
-│   ├── clock/                  # 内置：时间查询
+│   ├── time/                   # 内置：时间查询
 │   ├── weather/                # 内置：天气信息
+│   ├── pipeline-guard/         # 内置：pipeline 前置 hook 校验
+│   ├── skill-evolve/           # 内置：技能自我改进（spawn_only）
+│   ├── wechat-bridge/          # 内置：微信 WebSocket 桥接
+│   ├── harness-starter-{audio,coding,generic,report}/  # 启动模板
 │   └── my-custom-skill/        # 用户安装的技能
-├── platform-skills/            # 平台技能（ASR/TTS）
+├── platform-skills/            # 平台技能（ASR/TTS、音色克隆）
 ├── episodes.redb               # 回忆录数据库
 ├── tool_config.json            # 工具配置覆盖
 └── history/
@@ -2231,4 +2357,4 @@ Palpo 在启动时读取 `appservices/octos-registration.yaml`。当 Matrix 用�
 
 ---
 
-*本指南涵盖截至 2026 年 3 月的 Octos 版本。最新更新请参阅仓库 [github.com/octos-org/octos](https://github.com/octos-org/octos)。*
+*本指南反映 M8.10 之后的状态（2026 年 4 月）。最新更新请参阅仓库 [github.com/octos-org/octos](https://github.com/octos-org/octos)。*

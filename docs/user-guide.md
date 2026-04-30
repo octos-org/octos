@@ -27,6 +27,8 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
     - [Weather](#127-weather)
     - [WeChat Bridge](#128-wechat-bridge)
     - [Pipeline Guard](#129-pipeline-guard)
+    - [Skill Evolve](#1210-skill-evolve)
+    - [Harness Starters](#1211-harness-starters)
 13. [Platform Skills (ASR/TTS)](#13-platform-skills-asrtts)
 14. [Custom Skill Installation](#14-custom-skill-installation)
 15. [Configuration Reference](#15-configuration-reference)
@@ -36,25 +38,32 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
 
 ## 1. Overview
 
-Octos is a Rust-native AI agent platform that runs in two modes:
+Octos is a Rust-native AI agent platform that runs in three modes:
 
-- **`octos serve`** — Control plane with admin dashboard. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels.
-- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom, Matrix).
+- **`octos serve`** — Control plane with admin dashboard + ~140 REST endpoints. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels. On first launch with no admin profile, the embedded dashboard runs the **setup wizard**.
+- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
 ### Architecture
 
 ```
-octos serve (control plane + dashboard)
+octos serve (control plane + dashboard, ~140 REST endpoints)
+  ├── First-run wizard /api/admin/setup/{state,step,complete,skip}
   ├── Profile A → gateway process (Telegram, WhatsApp)
-  ├── Profile B → gateway process (Feishu, Slack)
+  ├── Profile B → gateway process (Feishu, Slack, Matrix)
   └── Profile C → gateway process (CLI)
        │
-       ├── LLM Provider (kimi-2.5, deepseek-chat, gpt-4o, etc.)
-       ├── Tool Registry (shell, files, search, web, skills...)
-       ├── Session Store (per-channel conversation history)
-       ├── Memory (MEMORY.md, daily notes, episodes)
-       └── Skills (bundled + custom)
+       ├── LLM Provider (15 providers via AdaptiveRouter → ProviderChain → RetryProvider)
+       ├── Tool Registry (~50 built-ins + plugins + 9 user-facing app-skills)
+       │     LRU deferral keeps ~15 active; spawn_only auto-routes to background
+       ├── Sandbox (bwrap / sandbox-exec / Docker / Windows AppContainer)
+       ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
+       ├── Swarm Dispatcher (/api/swarm/dispatch — fan-out to N sub-agents)
+       ├── Sub-agent Output Router (M8.7 — summarize + persist transcript)
+       ├── Task Supervisor (bounded fan-out, orphan-task reaper, runtime recovery)
+       ├── Session Store (JSONL, sticky thread_id, committed_seq, three-tier compaction)
+       ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
+       └── Skills (bundled + custom; voice clones registered from voice_profiles)
 ```
 
 Each profile is fully isolated — its own data directory, memory, sessions, skills, and API keys. Sub-accounts can be created under a profile and inherit the parent's LLM configuration.
@@ -204,14 +213,34 @@ Once logged in, the dashboard provides:
 - **Log Viewer** — Real-time SSE log streaming for each gateway process
 - **Provider Testing** — Test LLM provider/model/API key combinations before deploying
 - **WhatsApp QR** — Scan QR code to link a WhatsApp number
-- **Platform Skills** — Monitor and manage OminiX ASR/TTS services
+- **Platform Skills** — Monitor and manage ASR/TTS services and voice-clone registration
+- **Swarm Dispatch** — Inspect running fan-out dispatches, artifacts, and per-dispatch ledger
+- **Pipeline Runs** — Node tree, per-node cost, cancel/restart for in-flight runs
 - **Metrics** — Per-profile LLM provider QoS metrics (latency, error rates)
+
+### 2.4 First-Run Setup Wizard
+
+When `octos serve` boots for the first time without an admin profile, the embedded dashboard launches a **setup wizard** that walks the operator through:
+
+1. **Deployment mode** — choose between local-only, self-hosted cloud + tenant, or Octos Cloud signup. Guidance text differs per mode.
+2. **SMTP configuration** — needed for OTP email login (skippable for local-only deployments).
+3. **LLM provider** — pick a provider, enter the API key, and run a live test before saving.
+4. **Admin profile** — name, channels, and optional Family Plan setup.
+
+Progress is tracked server-side via:
+
+- `GET /api/admin/setup/state` — current wizard step + completed flags
+- `POST /api/admin/setup/step` — advance/save a step
+- `POST /api/admin/setup/complete` — finalize and create the admin profile
+- `POST /api/admin/setup/skip` — operator escape hatch (skips remaining optional steps)
+
+Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`.
 
 ---
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 14 LLM providers out of the box. Each provider requires an API key set as an environment variable.
+Octos supports 15 LLM providers out of the box. Each provider requires an API key set as an environment variable.
 
 ### 3.1 Supported Providers
 
@@ -221,6 +250,7 @@ Octos supports 14 LLM providers out of the box. Each provider requires an API ke
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | — |
 | `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | Native Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | — |
+| `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI auto-detected | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | — |
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
@@ -491,6 +521,8 @@ The `web_search` tool uses multiple search providers with automatic fallback.
 
 Providers are tried in order: **DuckDuckGo → Brave → You.com → Perplexity**. The first provider returning non-empty results wins. If all fail, DuckDuckGo results are returned as fallback.
 
+**Auto-rotate on quota / rate-limit errors** (M8.10b, #578): if the active provider returns a quota-exhaustion or rate-limit error (HTTP 402, 429, or provider-specific error strings), `web_search` rotates to the next configured provider mid-call rather than surfacing the error. This makes the tool robust against quota churn without requiring agent-side retry logic.
+
 To use a specific provider, set its API key:
 
 ```bash
@@ -586,6 +618,13 @@ Tool policies control which tools the agent can use. They can be set globally, p
 | `group:web` | `web_search`, `web_fetch`, `browser` |
 | `group:search` | `glob`, `grep`, `list_dir` |
 | `group:sessions` | `spawn` |
+| `group:memory` | `save_memory`, `recall_memory` |
+| `group:research` | `deep_search`, `site_crawl`, `synthesize_research` |
+| `group:admin` | All `admin_*` tools (profile/skill/voice-clone provisioning) |
+| `group:media` | `send_file`, `take_photo`, voice synthesis tools |
+| `group:delegated` | Tools that must be denied under a delegated child agent — added to a child policy makes the deny-wins recursion close that surface for sub-agents |
+
+Source of truth: `crates/octos-agent/src/tools/policy.rs:128-213`.
 
 ### 7.3 Wildcard Matching
 
@@ -925,7 +964,9 @@ Each channel:chat_id pair maintains its own session (conversation history).
 - **Session persistence:** JSONL files in `.octos/sessions/`
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
 - **Session forking:** `/new` creates a branched conversation with parent_key tracking
-- **Context compaction:** When conversation exceeds the LLM's context window, older messages are automatically compacted (tool arguments stripped, early messages summarized)
+- **Context compaction:** Three-tier (M8.5) — working / cold / archived. When the conversation exceeds the LLM's context window, older messages are summarized to first lines (tool arguments stripped) and the oldest are pushed into the entity bank as long-term memory.
+- **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first SSE emission and carried on every subsequent event (`token`, `tool_progress`, `task_status`, `session_result`). The `done` event additionally carries `committed_seq` — the durable history sequence number of the terminal write — so a web client can replay deterministically after reconnect via `GET /sessions/:id/events/stream`. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
+- **Structured resume (M8.6)** — when a worktree is missing or a sub-agent fails, the supervisor refuses to silently drop the turn and re-engages the LLM with a structured-resume payload describing the failure.
 
 ### 11.3 Memory System
 
@@ -1024,7 +1065,16 @@ Bot: [uses browser tool to navigate and screenshot]
      Here's the screenshot of example.com...
 ```
 
-### 11.9 Spawning Sub-Agents
+### 11.9 Spawning Sub-Agents and Swarms
+
+There are three sub-agent surfaces:
+
+| Tool / API | Shape | Output handling |
+|---|---|---|
+| `spawn` (`mode: "sync"`) | One child, parent blocks | Inline in same turn |
+| `spawn` (`mode: "background"`) | One child, parent continues | New inbound message via gateway |
+| `delegate` | One scoped child, parent blocks | Summary inline + transcript file (M8.7 sub-agent output router) |
+| `/api/swarm/dispatch` | N parallel sub-agents | Aggregated artifacts, validator-gated, per-dispatch ledger |
 
 ```
 User: Research this topic in depth using a sub-agent
@@ -1048,12 +1098,21 @@ Sub-agents can use different LLM models via `sub_providers`:
 }
 ```
 
+**Sub-agent output router (M8.7)**: long sub-agent transcripts are summarized by `AgentSummaryGenerator` and the compact summary is surfaced in parent context, while the full transcript is persisted to disk for later inspection. This keeps parent context small even when delegating large research tasks.
+
+**Swarm dispatch**: for fan-out workloads use the swarm API instead of multiple spawns. A swarm dispatch fans a contract to N sub-agents, aggregates artifacts, runs them through a validator, and rolls cost up to the parent. State persisted at `crates/octos-swarm/src/persistence.rs`; ledger at `crates/octos-swarm/src/ledger.rs`.
+
+**`spawn_only` skill tools auto-route to background**: any plugin tool whose manifest declares `spawn_only: true` is intercepted at the execution layer (`crates/octos-agent/src/agent/execution.rs`) and forced into background mode regardless of caller intent. The agent gets an immediate "task started" acknowledgement, and the result is delivered later as a new inbound message. Sub-agents cannot spawn further sub-agents (deny-wins via `group:delegated`).
+
 ### 11.10 Message Queue Modes
 
 When a user sends messages while the agent is processing:
 
-- **`followup`** (default): Queued messages are processed one at a time (FIFO)
-- **`collect`**: Messages from the same session are concatenated and processed as one
+- **`followup`**: Queued messages are processed one at a time (FIFO)
+- **`collect`** (default): Messages from the same session are concatenated and processed as one
+- **`steer`**: Apply queued messages as a steer/redirect to the in-flight turn
+- **`interrupt`**: Cancel the in-flight turn and start a new one
+- **`speculative`**: Run a parallel speculative turn while the in-flight one finishes; return whichever completes first
 
 ```json
 {
@@ -1062,6 +1121,18 @@ When a user sends messages while the agent is processing:
   }
 }
 ```
+
+### 11.10a Background Tasks
+
+`spawn_only` skill tools (long-running research, deep crawls, voice-clone training, etc.) run as background tasks under the per-profile `task_supervisor`. Users can:
+
+- Receive progress as periodic plugin protocol v2 events surfaced as `tool_progress` SSE events
+- Inspect outstanding background work with the `check_background_tasks` tool
+- Get terminal status via the dedicated session events stream — the supervisor commits a `session_result` event with `committed_seq` (#629) so the dashboard updates deterministically once the work is durable
+
+**Fleet stability** (#610): `spawn`, pipeline fan-out, and swarm dispatch share a global concurrency cap so a runaway agent cannot exhaust runner CPU/memory. Orphan tasks (whose owning session has terminated) are reaped by `task_supervisor`.
+
+**Runtime failure recovery** (M8.9): if a `spawn_only` task fails, the supervisor re-engages the LLM with a structured-resume payload describing the failure — the turn is not silently dropped.
 
 ### 11.11 Heartbeat
 
@@ -1464,6 +1535,25 @@ WebSocket bridge for WeChat personal accounts. Connects to the WeChat client via
 
 Validates DOT graphs and injects optimal model assignments before `run_pipeline` executes. Runs as a before-hook with 10s timeout — can deny malformed pipeline submissions.
 
+### 12.10 Skill Evolve
+
+**Binary:** `skill-evolve`
+
+`spawn_only` skill that observes how the agent uses other skills, identifies friction points (frequent failures, redundant calls, missing arguments), and proposes targeted edits to a skill's `manifest.json` or `SKILL.md`. Useful when adapting a starter template to a specific deployment.
+
+Output is a structured JSON proposal — operators review and merge changes manually rather than the skill self-modifying.
+
+### 12.11 Harness Starters
+
+Four starter-template skills under `crates/app-skills/harness-starter-{audio, coding, generic, report}/`. Each is a working example of a harnessed skill (with the contract tests, manifest, and SKILL.md) that you can copy and adapt for a custom domain skill:
+
+- `harness-starter-generic` — minimal echo-style harness for any text task
+- `harness-starter-coding` — code-task harness with worktree integration
+- `harness-starter-report` — report-generation harness with artifact production
+- `harness-starter-audio` — audio-task harness with attachment validation
+
+These are intended as templates — the `SKILL.md` for each says "Replace with a real ... when adapting the starter." See [docs/app-skill-dev-guide.md](./app-skill-dev-guide.md) for the full skill development guide.
+
 ---
 
 ## 13. Platform Skills (ASR/TTS)
@@ -1563,6 +1653,16 @@ Bot: [uses voice_clone_synthesize with reference_audio="/tmp/my-voice-sample.wav
       text="Good morning team", language="english"]
      Generated speech in your voice. [sends audio]
 ```
+
+#### 13.5.1 Voice Profile Registration on Deploy (#653)
+
+For multi-tenant deployments, declare reusable voice clones once per profile rather than passing `reference_audio` on every call:
+
+1. Drop reference samples into `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`
+2. Run `scripts/register-fleet-voices.sh` (also called automatically as part of `cloud-host-deploy.sh` and tenant deploy scripts)
+3. The platform-skill voice runtime registers each `<name>.wav` as a named voice clone for that profile
+
+After registration, agents can call `voice_clone_synthesize` with a registered name (e.g. `voice: "alice"`) instead of passing a reference audio path. Re-running the registration script picks up new files and re-registers any updates.
 
 ### 13.6 Podcast Generation (`generate_podcast`)
 
@@ -1960,11 +2060,14 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // MCP servers
   "mcp_servers": [],
 
-  // Sandbox
+  // Sandbox — see docs/SANDBOX.md for full reference.
+  // Backends: bwrap (Linux), sandbox-exec (macOS), AppContainer (Windows,
+  // via the octos-sandbox helper crate), docker (any OS). Auto picks per-OS.
   "sandbox": {
     "enabled": true,
     "mode": "auto",
-    "allow_network": false
+    "allow_network": false,
+    "read_allow_paths": []        // macOS only: tighten read access
   },
 
   // Email (for email channel)
@@ -2038,9 +2141,13 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 ```
 ~/.octos/                        # Global config directory
 ├── auth.json                   # Stored API credentials (mode 0600)
-├── profiles/                   # Profile configs (serve mode)
-│   ├── my-bot.json
-│   └── work-bot.json
+├── profiles/                   # Per-profile data root (serve mode)
+│   └── <profile-id>/
+│       ├── config.json
+│       └── data/
+│           ├── voice_profiles/  # Reference WAVs for voice-clone registration
+│           ├── media/           # Persisted audio/image attachments
+│           └── skills/          # Per-profile skill overrides
 ├── skills/                     # Global custom skills
 └── serve.log                   # Serve mode log file
 
@@ -2053,20 +2160,24 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 ├── TOOLS.md                    # Tool-specific guidance
 ├── IDENTITY.md                 # Custom identity
 ├── HEARTBEAT.md                # Background task instructions
-├── sessions/                   # Conversation history (JSONL)
+├── sessions/                   # Conversation history (JSONL, sticky thread_id in meta)
 ├── memory/                     # Memory files
 │   ├── MEMORY.md               # Long-term persistent memory
-│   └── 2026-03-06.md           # Daily notes
-├── skills/                     # Custom skills
+│   └── 2026-04-30.md           # Daily notes
+├── skills/                     # Custom skills (precedence: project > profile > global)
 │   ├── news/                   # Bundled: news fetch
-│   ├── deep-search/            # Bundled: deep web search
-│   ├── deep-crawl/             # Bundled: deep crawl
+│   ├── deep-search/            # Bundled: deep web search (plugin protocol v2)
+│   ├── deep-crawl/             # Bundled: deep crawl (plugin protocol v2)
 │   ├── send-email/             # Bundled: email sending
 │   ├── account-manager/        # Bundled: sub-account management
-│   ├── clock/                  # Bundled: time queries
+│   ├── time/                   # Bundled: time queries
 │   ├── weather/                # Bundled: weather info
+│   ├── pipeline-guard/         # Bundled: pipeline before-hook validator
+│   ├── skill-evolve/           # Bundled: skill self-improvement (spawn_only)
+│   ├── wechat-bridge/          # Bundled: WeChat WebSocket bridge
+│   ├── harness-starter-{audio,coding,generic,report}/  # Starter templates
 │   └── my-custom-skill/        # User-installed skill
-├── platform-skills/            # Platform skills (ASR/TTS)
+├── platform-skills/            # Platform skills (ASR/TTS, voice clones)
 ├── episodes.redb               # Episodic memory database
 ├── tool_config.json            # Tool configuration overrides
 └── history/
@@ -2333,4 +2444,4 @@ The most common misconfiguration is a token mismatch. All three of these must ag
 
 ---
 
-*This guide covers Octos version as of March 2026. For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*
+*This guide reflects the post-M8.10 state (April 2026). For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*
