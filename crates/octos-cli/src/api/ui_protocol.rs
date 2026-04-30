@@ -44,7 +44,7 @@ use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::ui_protocol_approvals::PendingApprovalStore;
 use super::ui_protocol_audit::{ApprovalsAuditConfig, ApprovalsAuditLog, log_decision_tracing};
-use super::ui_protocol_diff::PendingDiffPreviewStore;
+use super::ui_protocol_diff::{DiffPreviewConfig, PendingDiffPreviewStore};
 use super::ui_protocol_ledger::{
     LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
     spawn_eviction_task,
@@ -294,7 +294,13 @@ impl WsConnection {
 #[derive(Default)]
 struct UiProtocolContractStores {
     approvals: PendingApprovalStore,
-    diff_previews: PendingDiffPreviewStore,
+    /// Lazily-initialized pending diff-preview store. With a `data_dir`
+    /// the first call hydrates from disk and subsequent inserts
+    /// write-ahead before returning, so `diff/preview/get` survives
+    /// daemon restart (mirrors the M9.6 ledger durability pattern).
+    /// Without a `data_dir` (unit tests, headless smoke) we fall back
+    /// to an ephemeral RAM-only store via `Default`.
+    diff_previews: OnceLock<Arc<PendingDiffPreviewStore>>,
     /// Per-session approval-scope policy table — stores future-call gating
     /// rules registered by `respond` when the user picks a scope stronger
     /// than `approve_once`. See `ui_protocol_scope.rs`.
@@ -314,6 +320,33 @@ impl UiProtocolContractStores {
                     data_dir,
                     ApprovalsAuditConfig::from_env(),
                 ))
+            })
+            .clone()
+    }
+
+    /// Lazily build the durable diff-preview store. The first caller
+    /// with a `data_dir` wins and runs disk recovery; without a
+    /// `data_dir` we install an ephemeral store. Subsequent calls
+    /// always return the same `Arc`.
+    fn diff_previews(&self, data_dir: Option<&Path>) -> Arc<PendingDiffPreviewStore> {
+        self.diff_previews
+            .get_or_init(|| {
+                let config = match data_dir {
+                    Some(dir) => DiffPreviewConfig::durable(dir.to_path_buf()),
+                    None => DiffPreviewConfig::ephemeral(),
+                };
+                if config.data_dir.is_some() {
+                    let outcome = PendingDiffPreviewStore::recover(config);
+                    info!(
+                        target = "octos::diff_preview",
+                        sessions_recovered = outcome.sessions_recovered,
+                        entries_recovered = outcome.entries_recovered,
+                        "ui protocol diff-preview store initialized with durable backing"
+                    );
+                    Arc::new(outcome.store)
+                } else {
+                    Arc::new(PendingDiffPreviewStore::with_config(config))
+                }
             })
             .clone()
     }
@@ -574,6 +607,23 @@ async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
         let _handle = spawn_eviction_task(installed.clone());
     }
     installed
+}
+
+/// Process-global pending diff-preview store. Mirrors
+/// [`event_ledger`]'s lazy initialization: with a `data_dir` from the
+/// sessions manager, the first call hydrates from disk and installs a
+/// durable store; without one we install an ephemeral fallback.
+/// Subsequent calls return the same `Arc` regardless of the
+/// `state` they're given — by design, the store is process-singleton.
+async fn diff_preview_store(
+    state: &AppState,
+    contracts: &UiProtocolContractStores,
+) -> Arc<PendingDiffPreviewStore> {
+    let data_dir = match &state.sessions {
+        Some(sessions) => Some(sessions.lock().await.data_dir()),
+        None => None,
+    };
+    contracts.diff_previews(data_dir.as_deref())
 }
 
 struct AbortOnDrop {
@@ -982,6 +1032,12 @@ async fn ui_protocol_connection(
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
     let ledger = event_ledger(&state).await;
+    // Force lazy init of the diff-preview store on this connection so
+    // its disk recovery + write-ahead path is wired up before any
+    // approval flow can `upsert_file_mutation`. Subsequent calls reuse
+    // the same `Arc`. Without `state.sessions` (headless smoke) this
+    // installs the ephemeral RAM-only fallback.
+    let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let connection_profile_id = connection_profile_id.as_deref();
 
     while let Some(Ok(msg)) = ws_rx.next().await {
@@ -1069,14 +1125,9 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::DiffPreviewGet(params) => {
-                handle_diff_preview_get(
-                    &ws,
-                    &contracts.diff_previews,
-                    connection_profile_id,
-                    id,
-                    params,
-                )
-                .await;
+                let store = diff_preview_store(&state, contracts.as_ref()).await;
+                handle_diff_preview_get(&ws, store.as_ref(), connection_profile_id, id, params)
+                    .await;
             }
             UiCommand::TaskOutputRead(params) => {
                 handle_task_output_read(&ws, &state, connection_profile_id, id, params).await;
@@ -3210,7 +3261,11 @@ fn apply_progress_contract_side_effects(
         None
     };
     let diff = explicit_diff.or(materialized_diff.as_deref());
-    contracts.diff_previews.upsert_file_mutation(
+    // `diff_previews(None)` returns the singleton installed during
+    // connection-open (durable when `state.sessions` is wired,
+    // ephemeral otherwise). The store does its own write-ahead before
+    // the in-memory map update.
+    contracts.diff_previews(None).upsert_file_mutation(
         context.session_id.clone(),
         &context.turn_id,
         notice,
@@ -4261,7 +4316,7 @@ mod tests {
         let contracts = UiProtocolContractStores::default();
         let session_id = SessionKey("local:test".into());
         let preview_id = PreviewId::new();
-        contracts.diff_previews.insert(DiffPreview {
+        contracts.diff_previews(None).insert(DiffPreview {
             session_id: session_id.clone(),
             preview_id: preview_id.clone(),
             title: Some("planned edit".into()),
@@ -4282,7 +4337,7 @@ mod tests {
         });
 
         let result = contracts
-            .diff_previews
+            .diff_previews(None)
             .get(DiffPreviewGetParams {
                 session_id,
                 preview_id: preview_id.clone(),
@@ -4327,7 +4382,7 @@ mod tests {
             .and_then(|notice| notice.preview_id.clone())
             .expect("file mutation should expose a preview id");
         let result = contracts
-            .diff_previews
+            .diff_previews(None)
             .get(DiffPreviewGetParams {
                 session_id,
                 preview_id: preview_id.clone(),
@@ -4415,7 +4470,7 @@ mod tests {
             .and_then(|notice| notice.preview_id.clone())
             .expect("file mutation should expose a preview id");
         let result = contracts
-            .diff_previews
+            .diff_previews(None)
             .get(DiffPreviewGetParams {
                 session_id,
                 preview_id,
@@ -4506,7 +4561,7 @@ mod tests {
             .and_then(|notice| notice.preview_id.clone())
             .expect("file mutation should expose a preview id");
         let result = contracts
-            .diff_previews
+            .diff_previews(None)
             .get(DiffPreviewGetParams {
                 session_id,
                 preview_id,
@@ -4587,7 +4642,7 @@ mod tests {
         // t3 — fetch the cached preview. It must still reflect v1 (the
         // proposal-time snapshot), not v2 (the current FS).
         let result = contracts
-            .diff_previews
+            .diff_previews(None)
             .get(DiffPreviewGetParams {
                 session_id: session_id.clone(),
                 preview_id: preview_id.clone(),
@@ -4606,7 +4661,7 @@ mod tests {
         // The raw diff bytes captured at proposal time are also preserved
         // for downstream apply-time consistency checks.
         let snapshot = contracts
-            .diff_previews
+            .diff_previews(None)
             .snapshot_for(&preview_id)
             .expect("snapshot should be retained for the entry");
         assert!(snapshot.contains("\"v1\""));
@@ -4617,7 +4672,7 @@ mod tests {
     fn missing_diff_preview_returns_typed_json_rpc_error() {
         let contracts = UiProtocolContractStores::default();
         let missing = contracts
-            .diff_previews
+            .diff_previews(None)
             .get(DiffPreviewGetParams {
                 session_id: SessionKey("local:test".into()),
                 preview_id: PreviewId::new(),
