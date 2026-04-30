@@ -42,6 +42,90 @@ umbrella still runs `coding-hardcases.spec.ts` against `OCTOS_CREW_URL`,
 because those coding acceptance checks target the general chat/coding surface
 rather than the ocean deliverables host.
 
+### M9 App UI Integration Gate
+
+Use this gate for the `integrate/m9-appui-on-main` merge path. Run the commands
+from the repository root unless a command sets `--prefix e2e` or changes into
+`e2e`.
+
+```bash
+# 0. Confirm protocol-visible edits have an explicit review override or UPCR.
+./scripts/check-ui-protocol-upcr.sh
+
+# 1. Static Rust gates.
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# 2. Full workspace test gate. Prefer the GitHub Actions shards on constrained
+# machines; the monolithic command remains useful on a large local runner.
+cargo test --workspace
+
+# CI-equivalent sharded fallback:
+cargo test -p octos-core
+cargo test -p octos-memory
+cargo test -p octos-llm --lib
+cargo test -p octos-llm --tests
+cargo test -p octos-bus
+cargo test -p octos-pipeline
+cargo test -p octos-plugin
+cargo test -p octos-swarm
+cargo test -p octos-agent --lib
+cargo test -p octos-agent --tests
+cargo test -p octos-cli --lib
+cargo test -p octos-cli --tests
+cargo test -p harness-starter-generic
+cargo test -p harness-starter-report
+cargo test -p harness-starter-audio
+cargo test -p harness-starter-coding
+cargo test --workspace --doc
+cargo test -p octos-cli --features api api::auth_handlers
+cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
+cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
+cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
+cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+
+# 3. Focused M9 Rust tests.
+cargo test -p octos-core ui_protocol -- --nocapture
+cargo test -p octos-core app_ui -- --nocapture
+cargo test -p octos-cli ui_protocol --features api -- --nocapture
+
+# 4. Build and boot a local API server for live browser/protocol checks.
+cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
+OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000
+curl -sf http://localhost:3000/api/status \
+  -H "Authorization: Bearer ci-test-token"
+
+# 5. M9 wire protocol Playwright gate against the local server.
+npm --prefix e2e install
+(
+  cd e2e
+  OCTOS_LIVE_URL=http://localhost:3000 \
+  OCTOS_LIVE_TOKEN=ci-test-token \
+  OCTOS_M9_APPROVAL_FIXTURE=1 \
+  OCTOS_M9_REPLAY_LOSSY_FIXTURE=1 \
+    npx playwright test --workers=1 tests/m9-protocol-*.spec.ts --reporter=line
+)
+
+# Equivalent tmux lane: boots its own fixture server on 127.0.0.1:50191.
+./e2e/tmux/run.sh m9-protocol
+
+# 6. TUI/protocol smoke lanes. The live lane boots its own server only when
+# OCTOS_TMUX_LIVE=1 is set.
+./e2e/tmux/run.sh default
+OCTOS_TMUX_LIVE=1 ./e2e/tmux/run.sh live
+
+# 7. Long-running real-LLM coding UX checks, only when provider keys are set.
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh queue
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh adaptive
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh session
+```
+
+The M9 Playwright harness reads `OCTOS_LIVE_URL`, `OCTOS_LIVE_TOKEN` (or
+`OCTOS_AUTH_TOKEN`), and optional `OCTOS_LIVE_PROFILE`. The fixture flags keep
+approval/replay cases deterministic for the protocol gate.
+
 ---
 
 ## CI Pipeline

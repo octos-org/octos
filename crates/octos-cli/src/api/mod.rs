@@ -14,6 +14,15 @@ mod router;
 mod sse;
 mod static_files;
 pub mod swarm;
+mod ui_protocol;
+mod ui_protocol_approvals;
+mod ui_protocol_audit;
+mod ui_protocol_diff;
+mod ui_protocol_ledger;
+pub(crate) mod ui_protocol_progress;
+mod ui_protocol_sanitize;
+mod ui_protocol_scope;
+mod ui_protocol_task_output;
 pub mod user_admin;
 pub mod webhook_proxy;
 
