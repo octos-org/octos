@@ -336,8 +336,34 @@ impl ToolRegistry {
     }
 
     /// Retain only tools whose names satisfy the predicate.
+    ///
+    /// Also prunes parallel side state (`spawn_only`,
+    /// `spawn_only_messages`, `deferred`) for any names that were
+    /// dropped. Without this, stale entries survive an `apply_policy`
+    /// deny and produce confusing downstream behaviour:
+    ///
+    /// - A stale `spawn_only` marker fools the agent's spawn_only
+    ///   intercept in `execution.rs` into treating an evicted tool as
+    ///   background-eligible. The intercept falls through to
+    ///   `bg_tools.execute_with_context` which fails async because the
+    ///   tool itself is gone from the registry — so the foreground turn
+    ///   observes a fake "started successfully". See PR #688 follow-up
+    ///   MEDIUM #3.
+    /// - A stale `deferred` entry would let `activate_tools` /
+    ///   `has_deferred()` advertise a name that was already evicted by
+    ///   policy. See PR #688 follow-up codex review (round 2).
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
+        self.spawn_only.retain(|name| self.tools.contains_key(name));
+        self.spawn_only_messages
+            .retain(|name, _| self.tools.contains_key(name));
+        // Stale `deferred` entries are interior-mutable; lock and prune
+        // here so a subsequent `activate(...)` cannot resurrect a tool
+        // that policy has already removed.
+        {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            deferred.retain(|name| self.tools.contains_key(name));
+        }
         self.invalidate_cache();
     }
 
