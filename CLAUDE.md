@@ -12,7 +12,12 @@ cargo test -p octos-agent test_name  # Run single test
 cargo clippy --workspace         # Lint
 cargo fmt --all                  # Format
 cargo fmt --all -- --check       # Check formatting
-cargo install --path crates/octos-cli  # Install CLI locally
+cargo install --path crates/octos-cli \
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+                                          # Install CLI locally with the
+                                          # canonical feature default
+                                          # (matches scripts/milestone-ci.sh).
+                                          # `api` is required for `octos serve`.
 ```
 
 ## Architecture
