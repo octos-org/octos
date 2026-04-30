@@ -147,6 +147,11 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-003](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_003_SESSION_WORKSPACE_CWD.md).
   That UPCR authorizes launch/open-time workspace binding only; in-session cwd
   mutation UX or persistent cwd approval policy requires a future accepted UPCR.
+- The additive `cancelled` variant on `TaskRuntimeState` (used by the
+  `task/updated` notification) is governed by accepted
+  [UPCR-2026-004](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_004_TASK_RUNTIME_CANCELLED.md).
+  That UPCR carries the `task_supervisor` cancellation lifecycle through to
+  the wire so cancelled tasks no longer fall back to `Running` in the UI.
 
 ## 5. Identity Model
 

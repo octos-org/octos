@@ -1398,7 +1398,18 @@ fn session_tool_registry(
 
     session_filesystem_profile_for_workspace(base_tools.as_ref(), &workspace_root)
         .map_err(|error| error.message)?;
-    let sandbox = octos_agent::sandbox::create_sandbox(&octos_agent::SandboxConfig::default());
+    // M9 review fix (HIGH #1): inherit the effective sandbox config from
+    // `base_agent` so per-session shell tools keep the running server's
+    // sandbox policy (mode, network, read-allow paths, profile) instead of
+    // silently falling back to `SandboxConfig::default()` which disables
+    // network and overrides read paths — that fallback was the root cause
+    // of "backend cannot install npm" reports on AppUi sessions.
+    // Falls back to `SandboxConfig::default()` only when the agent was built
+    // without recording its sandbox config (legacy/test paths).
+    let sandbox_config = base_agent
+        .sandbox_config()
+        .unwrap_or_else(octos_agent::SandboxConfig::default);
+    let sandbox = octos_agent::sandbox::create_sandbox(&sandbox_config);
     let rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
 
     Ok((Arc::new(rebound), Some(workspace_root)))

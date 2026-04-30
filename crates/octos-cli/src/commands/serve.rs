@@ -958,7 +958,14 @@ impl ServeCommand {
             .with_reporter(reporter)
             .with_file_state_cache(file_state_cache)
             .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator);
+            .with_subagent_summary_generator(subagent_summary_generator)
+            // M9 review fix (HIGH #1): record the effective sandbox config so
+            // the AppUi `session_tool_registry` rebind path inherits the
+            // running server's sandbox policy when re-creating the per-session
+            // ShellTool sandbox, instead of silently dropping back to
+            // `SandboxConfig::default()` (which disables network and overrides
+            // read paths).
+            .with_sandbox_config(config.sandbox.clone());
 
         // Inject skill prompt fragments
         for fragment in &plugin_result.prompt_fragments {
