@@ -5144,6 +5144,119 @@ mod tests {
         );
     }
 
+    /// Minimal stub LLM provider for tests that build an `Agent` but never
+    /// actually call out to a model. `session_tool_registry` only inspects
+    /// the agent's tool registry and sandbox config — it never drives the
+    /// LLM — so a `chat` panic guard is enough.
+    struct StubLlm;
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for StubLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("StubLlm should not be invoked by session_tool_registry tests")
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    /// Tier-2 of the AppUi `session_tool_registry` fallback chain: when a
+    /// session has no entry in `session_workspaces()` and the operator
+    /// configured `appui.default_session_cwd`, the API agent's recorded
+    /// `workspace_root` is used. This locks down the behavior added by
+    /// `Agent::with_workspace_root` + `serve.rs` wire-up.
+    #[tokio::test]
+    async fn session_tool_registry_uses_agent_workspace_root_as_tier2_fallback() {
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let memory_dir = tempfile::tempdir().expect("memory dir");
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(memory_dir.path())
+                .await
+                .expect("open memory"),
+        );
+        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(StubLlm);
+        let tools = octos_agent::ToolRegistry::with_builtins(workspace.path());
+
+        let agent = octos_agent::Agent::new(AgentId::new("api-test"), llm, tools, memory)
+            .with_workspace_root(workspace.path().to_path_buf());
+
+        // Use a unique session_id so we don't collide with other tests on
+        // the process-global `session_workspaces()` store.
+        let session_id = SessionKey("local:tier2-fallback-test".into());
+
+        let (registry, root) =
+            session_tool_registry(&agent, &session_id).expect("session_tool_registry");
+
+        let root = root.expect("Tier-2 must populate workspace_root");
+        assert_eq!(
+            std::fs::canonicalize(&root).expect("canonicalize"),
+            std::fs::canonicalize(workspace.path()).expect("canonicalize"),
+            "Tier-2 fallback should pick up the agent's recorded workspace_root"
+        );
+        assert!(
+            registry.workspace_root().is_some(),
+            "rebound registry must record the workspace_root"
+        );
+    }
+
+    /// Tier-1 (capability-gated client-sent cwd via `session_workspaces`)
+    /// MUST take precedence over Tier-2 (operator default). This prevents
+    /// the operator default from clobbering octos-tui's per-session picker.
+    ///
+    /// `session_filesystem_profile_for_workspace` requires the requested
+    /// cwd to live under `tools.workspace_root()`. Since
+    /// `with_workspace_root` overwrites the registry's recorded root, we
+    /// anchor the agent at the operator-default folder (Tier-2) and put
+    /// the client-sent cwd as a subdir of it. If Tier-1 wins, the
+    /// resulting workspace_root is the subdir, not the parent.
+    #[tokio::test]
+    async fn session_tool_registry_tier1_wins_over_tier2_default() {
+        let tier2_default = tempfile::tempdir().expect("tier2 default dir");
+        let tier1_subdir = tier2_default.path().join("tier1-client-cwd");
+        std::fs::create_dir_all(&tier1_subdir).expect("tier1 subdir");
+
+        let memory_dir = tempfile::tempdir().expect("memory dir");
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(memory_dir.path())
+                .await
+                .expect("open memory"),
+        );
+        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(StubLlm);
+        let tools = octos_agent::ToolRegistry::with_builtins(tier2_default.path());
+
+        let agent = octos_agent::Agent::new(AgentId::new("api-test"), llm, tools, memory)
+            // Tier-2: operator-configured default cwd.
+            .with_workspace_root(tier2_default.path().to_path_buf());
+
+        // Tier-1: client-sent cwd recorded in `session_workspaces`.
+        let session_id = SessionKey("local:tier1-wins-test".into());
+        session_workspaces().set(session_id.clone(), tier1_subdir.clone());
+
+        let (_registry, root) =
+            session_tool_registry(&agent, &session_id).expect("session_tool_registry");
+
+        let root = root.expect("workspace_root must be set");
+        assert_eq!(
+            std::fs::canonicalize(&root).expect("canonicalize"),
+            std::fs::canonicalize(&tier1_subdir).expect("canonicalize"),
+            "Tier-1 (client-sent cwd) must win over Tier-2 (operator default)"
+        );
+    }
+
     #[test]
     fn pane_snapshot_prefers_approved_session_workspace_root() {
         let data_dir = tempfile::tempdir().expect("data dir");
