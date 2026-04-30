@@ -118,11 +118,12 @@ fn resolve_mcp_server(srv: &SkillMcpServer, skill_dir: &Path) -> McpServerConfig
         env,
         url: srv.url.clone(),
         headers: srv.headers.clone(),
-        // Skill-bundled MCP servers fall through to the conservative
-        // server default (`Exclusive`). A future skill manifest
-        // extension could plumb a per-server hint through `srv` if
-        // bundled servers prove to be mostly read-only — until then,
-        // leaving this `None` keeps the safer behaviour.
+        // Skill-bundled MCP servers fall through to the wrapper's
+        // server default (`Safe` — read-only common case). A skill
+        // that bundles a mutating MCP server should plumb a per-server
+        // hint through `SkillMcpServer` (a future extension) and have
+        // it copied into this field; until then, the bundled servers
+        // run in the parallel-friendly path.
         concurrency_class: None,
     }
 }
