@@ -51,6 +51,41 @@ case "$ARCH" in
 esac
 echo "==> Target: $TRIPLE"
 
+# ── Ensure cargo is on PATH ───────────────────────────────────────────
+# Source-build hosts need the Rust toolchain. install.sh's --install-deps
+# only covers runtime deps for release-binary installs; for the
+# build-from-source path we install rustup here when the operator opted
+# in via --install-deps. Otherwise, fail fast with a clear hint instead
+# of letting milestone-ci.sh die on `cargo: command not found`.
+ensure_cargo() {
+    # rustup installs to ~/.cargo/bin which may not be on PATH yet for
+    # this shell (e.g. fresh install). Try to source the env script too.
+    if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1091
+        . "$HOME/.cargo/env"
+    fi
+    if command -v cargo >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$INSTALL_DEPS" != true ]; then
+        echo "ERROR: cargo (Rust toolchain) is required to build from source." >&2
+        echo "       Install rustup: https://rustup.rs" >&2
+        echo "       Or rerun with --install-deps to auto-install." >&2
+        return 1
+    fi
+    echo "==> Installing rustup (Rust toolchain)"
+    # Official rustup installer; -y skips confirmation, --default-toolchain
+    # stable picks the right channel without forcing a specific version.
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+    if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1091
+        . "$HOME/.cargo/env"
+    fi
+    command -v cargo >/dev/null 2>&1
+}
+ensure_cargo || exit 1
+
 # ── Dashboard (embedded SPA — must be built before cargo, since ─────
 #    rust_embed bakes crates/octos-cli/static/admin/ into the binary) ─
 if [ "$SKIP_DASHBOARD" = true ]; then
