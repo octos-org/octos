@@ -1,0 +1,24 @@
+{
+  "id": "legacy",
+  "name": "legacy",
+  "enabled": true,
+  "data_dir": null,
+  "config": {
+    "search": {
+      "providers": {}
+    },
+    "channels": [],
+    "gateway": {
+      "max_history": 500,
+      "max_iterations": 80,
+      "system_prompt": null,
+      "max_concurrent_sessions": 100,
+      "browser_timeout_secs": null,
+      "max_output_tokens": null
+    },
+    "env_vars": {},
+    "hooks": [],
+    "admin_mode": false,
+    "adaptive_routing": null
+  }
+}

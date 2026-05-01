@@ -92,6 +92,23 @@ impl ModelPicks {
 }
 
 // ── Profile config (to know which models are configured) ─────
+//
+// Schema mirrors the live `~/.octos/profiles/<id>.json` files:
+//
+//   {
+//     "config": {
+//       "llm": {
+//         "primary":   { "family_id": "...", "model_id": "...", "route": {...} },
+//         "fallbacks": [
+//           { "family_id": "...", "model_id": "...", "route": {...} },
+//           ...
+//         ]
+//       },
+//       ...
+//     }
+//   }
+//
+// All fields outside `family_id`/`model_id` are tolerated and ignored.
 
 #[derive(Deserialize)]
 struct ProfileConfig {
@@ -101,27 +118,39 @@ struct ProfileConfig {
 #[derive(Deserialize)]
 struct ProfileInner {
     #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    fallback_models: Vec<FallbackModel>,
+    llm: Option<LlmConfig>,
 }
 
 #[derive(Deserialize)]
-struct FallbackModel {
+struct LlmConfig {
     #[serde(default)]
-    provider: String,
-    model: String,
+    primary: Option<ModelEntry>,
+    #[serde(default)]
+    fallbacks: Vec<ModelEntry>,
 }
 
-/// Load the profile's configured models from the profile JSON.
-/// Returns provider/model keys like "dashscope/qwen3.5-plus", "nvidia/minimaxai/minimax-m2.5".
-fn load_profile_models() -> HashSet<String> {
-    let mut models = HashSet::new();
+#[derive(Deserialize)]
+struct ModelEntry {
+    // Both fields are Option<> to mirror the canonical
+    // `LlmModelSelectionConfig` in `octos-cli/src/profiles.rs` — a primary or
+    // fallback entry may legitimately omit family_id while keeping model_id
+    // (or vice versa) without rejecting the whole profile.
+    #[serde(default)]
+    family_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    // Other fields like `route`, `strong`, `label`, `cost_per_m`, `model_hints`
+    // are tolerated by serde unless `#[serde(deny_unknown_fields)]` is added —
+    // keep it permissive so future schema additions don't break the guard.
+}
 
-    // Try OCTOS_PROFILE env (set by managed gateway — full path to profile JSON)
-    // Also try standard profile dirs
+/// Discover candidate profile JSON paths.
+///
+/// Order:
+///   1. `$OCTOS_PROFILE` (full path to a profile JSON, set by the managed gateway)
+///   2. `*.json` under `~/.octos/profiles/`
+///   3. `*.json` under `~/.crew/profiles/`
+fn discover_profile_paths() -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut paths = Vec::new();
 
@@ -129,7 +158,6 @@ fn load_profile_models() -> HashSet<String> {
         paths.push(profile_path);
     }
 
-    // Scan profile dirs for .json files
     for base in &[
         format!("{home}/.octos/profiles"),
         format!("{home}/.crew/profiles"),
@@ -144,32 +172,69 @@ fn load_profile_models() -> HashSet<String> {
         }
     }
 
-    for path in &paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(profile) = serde_json::from_str::<ProfileConfig>(&content) {
-                // Add primary model
-                if let (Some(provider), Some(model)) =
-                    (&profile.config.provider, &profile.config.model)
-                {
-                    models.insert(format!("{provider}/{model}"));
-                    models.insert(model.clone());
-                }
-                // Add all fallback models
-                for fb in &profile.config.fallback_models {
-                    models.insert(format!("{}/{}", fb.provider, fb.model));
-                    models.insert(fb.model.clone());
-                }
-                if !models.is_empty() {
-                    eprintln!(
-                        "[pipeline-guard] loaded {} models from profile {path}",
-                        models.len()
-                    );
-                    return models;
-                }
+    paths
+}
+
+/// Resolve `family_id`/`model_id` pairs from a parsed profile into a flat
+/// HashSet that includes BOTH:
+///   - `format!("{family_id}/{model_id}")` — fully-qualified key
+///   - `model_id`                          — bare model name
+///
+/// Both forms are inserted because pipeline-guard's STRONG/FAST advertisement
+/// uses bare ids while the ProviderRouter sometimes registers under the
+/// qualified key. Inserting both ensures whatever pipeline-guard injects
+/// matches what the ProviderRouter has registered.
+fn collect_models_from_profile(profile: &ProfileConfig, out: &mut HashSet<String>) {
+    let Some(llm) = profile.config.llm.as_ref() else {
+        return;
+    };
+    let mut insert_entry = |entry: &ModelEntry| {
+        // Only meaningful when there's a model_id — bare family_id is not a
+        // routing key the ProviderRouter understands.
+        if let Some(model_id) = entry.model_id.as_deref() {
+            if let Some(family_id) = entry.family_id.as_deref() {
+                out.insert(format!("{family_id}/{model_id}"));
             }
+            out.insert(model_id.to_string());
+        }
+    };
+    if let Some(primary) = llm.primary.as_ref() {
+        insert_entry(primary);
+    }
+    for fb in &llm.fallbacks {
+        insert_entry(fb);
+    }
+}
+
+/// Read the given profile JSON paths, parse, and collect every configured
+/// model into a flat HashSet. Returns the first non-empty set found.
+fn load_profile_models_from_paths(paths: &[String]) -> HashSet<String> {
+    let mut models = HashSet::new();
+
+    for path in paths {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(profile) = serde_json::from_str::<ProfileConfig>(&content) else {
+            continue;
+        };
+        collect_models_from_profile(&profile, &mut models);
+        if !models.is_empty() {
+            eprintln!(
+                "[pipeline-guard] loaded {} models from profile {path}",
+                models.len()
+            );
+            return models;
         }
     }
     models
+}
+
+/// Load the profile's configured models from disk.
+/// Returns family/model keys like "moonshot/kimi-k2.5", plus bare ids
+/// like "kimi-k2.5".
+fn load_profile_models() -> HashSet<String> {
+    load_profile_models_from_paths(&discover_profile_paths())
 }
 
 /// Load the system-wide model_catalog.json, filter to profile's available models,
@@ -195,11 +260,25 @@ fn load_catalog() -> Option<ModelCatalog> {
     // 2. Load system-wide catalog
     let system_catalog = load_system_catalog(&home)?;
 
-    // 3. Filter by profile's available models
+    // 3. Filter by profile's available models.
+    //
+    // FAIL CLOSED: when no profile models are discoverable, or when no
+    // catalog entries match the profile, we must NOT fall back to the
+    // full catalog. The full-catalog fallback was the root cause of the
+    // pipeline-guard injection bug (live-thread-interleave:207): it
+    // advertised models like `qwen3.5-plus` that the profile-scoped
+    // ProviderRouter never registered, causing pipelines to die in 0 ms
+    // with `no provider registered for key '…'`. Returning None here
+    // makes main() pass through (exit 0) — the LLM's original DOT runs
+    // unmodified, which is the safest behavior when guard cannot reason
+    // about the profile.
     let profile_models = load_profile_models();
     if profile_models.is_empty() {
-        eprintln!("[pipeline-guard] no profile models found, using full catalog");
-        return Some(system_catalog);
+        eprintln!(
+            "[pipeline-guard] no profile models found — passing through \
+             (full-catalog fallback removed; see fix/pipeline-guard-profile-schema)"
+        );
+        return None;
     }
 
     let filtered_models: Vec<CatalogEntry> = system_catalog
@@ -225,10 +304,14 @@ fn load_catalog() -> Option<ModelCatalog> {
     );
 
     if filtered_models.is_empty() {
-        eprintln!("[pipeline-guard] no catalog models match profile, using full catalog");
-        return Some(ModelCatalog {
-            models: load_system_catalog(&home)?.models,
-        });
+        // Same fail-closed reasoning as above: profile is known but no
+        // catalog entry matches → don't risk advertising unregistered
+        // models. Pass through.
+        eprintln!(
+            "[pipeline-guard] no catalog models match profile — passing through \
+             (full-catalog fallback removed)"
+        );
+        return None;
     }
 
     let filtered_catalog = ModelCatalog {
@@ -611,10 +694,20 @@ fn main() {
     }
 
     // ── Step 2: Load model catalog and pick models ──────────────
+    // load_catalog() returns None for any of:
+    //   - no system-wide model_catalog.json on disk
+    //   - no profile models discoverable (would have caused the
+    //     historical "no profile models found, using full catalog" bug)
+    //   - profile models discoverable but no catalog entries match
+    // In every "None" case we pass through unchanged — the LLM's DOT
+    // runs as-written, which is safer than injecting models the
+    // ProviderRouter cannot resolve.
     let catalog = match load_catalog() {
         Some(c) => c,
         None => {
-            eprintln!("[pipeline-guard] no model_catalog.json found, passing through");
+            eprintln!(
+                "[pipeline-guard] catalog/profile not resolvable — passing through unchanged"
+            );
             std::process::exit(0);
         }
     };
@@ -748,4 +841,144 @@ fn main() {
     eprintln!("[pipeline-guard] DOT modified with resolved models");
     println!("{}", serde_json::to_string(&new_args).unwrap());
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+    fn load_fixture(name: &str) -> HashSet<String> {
+        let path = format!("{FIXTURE_DIR}/{name}");
+        load_profile_models_from_paths(&[path])
+    }
+
+    /// Real-shape `dspfac.json` profile (sanitized). Verifies pipeline-guard
+    /// reads `config.llm.primary` + `config.llm.fallbacks` correctly and
+    /// returns BOTH fully-qualified keys (family_id/model_id) AND bare
+    /// model_ids — both forms are needed so whatever pipeline-guard injects
+    /// matches whatever the ProviderRouter has registered.
+    #[test]
+    fn pipeline_guard_loads_models_from_real_profile_schema() {
+        let models = load_fixture("dspfac.json");
+
+        // Bare model_ids — what pipeline-guard's STRONG/FAST advertisement uses
+        assert!(
+            models.contains("kimi-k2.5"),
+            "expected bare primary model_id in {models:?}"
+        );
+        assert!(
+            models.contains("MiniMax-M2.5-highspeed"),
+            "expected bare fallback model_id in {models:?}"
+        );
+        assert!(
+            models.contains("DeepSeek-V3.2"),
+            "expected bare fallback model_id in {models:?}"
+        );
+
+        // Fully-qualified family_id/model_id — what the ProviderRouter
+        // registers in some configurations.
+        assert!(
+            models.contains("moonshot/kimi-k2.5"),
+            "expected qualified primary key in {models:?}"
+        );
+        assert!(
+            models.contains("minimax/MiniMax-M2.5-highspeed"),
+            "expected qualified fallback key in {models:?}"
+        );
+        assert!(
+            models.contains("deepseek/DeepSeek-V3.2"),
+            "expected qualified fallback key in {models:?}"
+        );
+
+        // Exactly 6 entries: 3 bare + 3 qualified
+        assert_eq!(models.len(), 6, "unexpected model set: {models:?}");
+    }
+
+    /// Old-style profile without an `llm` section returns empty set.
+    /// Ensures pipeline-guard degrades to "no profile models found" rather
+    /// than panicking on legacy/incomplete profile JSON.
+    #[test]
+    fn pipeline_guard_handles_missing_llm_section_gracefully() {
+        let models = load_fixture("legacy_no_llm.json");
+        assert!(
+            models.is_empty(),
+            "expected empty set for profile without llm section, got {models:?}"
+        );
+    }
+
+    /// Profile with `llm.primary` but no `llm.fallbacks` returns just the
+    /// primary's family/bare pair.
+    #[test]
+    fn pipeline_guard_handles_missing_fallbacks_array() {
+        let models = load_fixture("primary_only.json");
+        assert!(models.contains("kimi-k2.5"));
+        assert!(models.contains("moonshot/kimi-k2.5"));
+        assert_eq!(models.len(), 2, "expected only primary entries: {models:?}");
+    }
+
+    /// Sanity check that an unknown route field on a fallback (e.g. `strong: true`)
+    /// does not break parsing — serde tolerance is intentional.
+    #[test]
+    fn pipeline_guard_tolerates_unknown_fields_on_model_entries() {
+        let models = load_fixture("dspfac.json");
+        // The DeepSeek fallback in the fixture carries a `strong: true` field;
+        // if we accidentally added `deny_unknown_fields`, parsing would fail
+        // and DeepSeek would be missing from the set.
+        assert!(
+            models.contains("DeepSeek-V3.2"),
+            "deny_unknown_fields likely re-introduced — fixture has unknown 'strong' field"
+        );
+    }
+
+    /// Mirrors the canonical `LlmModelSelectionConfig` schema where
+    /// `family_id` and `model_id` are both `Option<String>`. A profile with
+    /// only `model_id` should still yield a usable bare key — the qualified
+    /// key is simply omitted.
+    #[test]
+    fn pipeline_guard_handles_optional_family_id() {
+        let models = load_fixture("missing_family_id.json");
+        assert!(
+            models.contains("kimi-k2.5"),
+            "expected bare model_id even without family_id in {models:?}"
+        );
+        // Without family_id, the qualified key should not appear.
+        assert!(
+            !models.iter().any(|m| m.ends_with("/kimi-k2.5")),
+            "qualified key should be skipped when family_id absent: {models:?}"
+        );
+        assert_eq!(models.len(), 1);
+    }
+
+    /// A profile written in the OLD pre-fix struct shape (flat
+    /// `config.provider`/`config.model`/`config.fallback_models`) must
+    /// return EMPTY under the new schema-aware reader. Combined with the
+    /// fail-closed `load_catalog()` change (which now returns None when
+    /// `load_profile_models()` is empty), this guarantees pipeline-guard
+    /// passes through unchanged for legacy profiles rather than silently
+    /// advertising the full system catalog — the bug that broke
+    /// live-thread-interleave:207.
+    #[test]
+    fn pipeline_guard_returns_empty_for_legacy_pre_fix_shape() {
+        let models = load_fixture("legacy_pre_fix_shape.json");
+        assert!(
+            models.is_empty(),
+            "legacy pre-fix shape must not be silently parsed; got {models:?}"
+        );
+    }
+
+    /// Multiple paths: first non-empty wins. Confirms the iteration order
+    /// in `load_profile_models_from_paths` keeps a parsed dspfac profile
+    /// even if a legacy/empty profile precedes it.
+    #[test]
+    fn pipeline_guard_skips_empty_profile_and_keeps_searching() {
+        let legacy = format!("{FIXTURE_DIR}/legacy_no_llm.json");
+        let real = format!("{FIXTURE_DIR}/dspfac.json");
+        let models = load_profile_models_from_paths(&[legacy, real]);
+        assert!(
+            models.contains("kimi-k2.5"),
+            "expected to fall through legacy profile to dspfac fixture: {models:?}"
+        );
+    }
 }

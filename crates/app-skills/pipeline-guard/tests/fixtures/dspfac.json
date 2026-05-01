@@ -1,0 +1,122 @@
+{
+  "id": "dspfac",
+  "name": "dspfac",
+  "enabled": true,
+  "data_dir": null,
+  "config": {
+    "llm": {
+      "primary": {
+        "family_id": "moonshot",
+        "model_id": "kimi-k2.5",
+        "route": {
+          "base_url": "https://example.invalid/api/v1",
+          "api_key_env": "AUTODL_API_KEY"
+        }
+      },
+      "fallbacks": [
+        {
+          "family_id": "minimax",
+          "model_id": "MiniMax-M2.5-highspeed",
+          "route": {
+            "route_id": "wisemodel",
+            "label": "WiseModel",
+            "base_url": "https://example.invalid/v1",
+            "api_key_env": "WISEMODEL_API_KEY"
+          }
+        },
+        {
+          "family_id": "deepseek",
+          "model_id": "DeepSeek-V3.2",
+          "route": {
+            "base_url": "https://example.invalid/api/v1",
+            "api_key_env": "AUTODL_API_KEY"
+          },
+          "strong": true
+        }
+      ]
+    },
+    "search": {
+      "providers": {
+        "perplexity": {
+          "api_key_env": "PERPLEXITY_API_KEY"
+        },
+        "tavily": {
+          "api_key_env": "TAVILY_API_KEY"
+        }
+      }
+    },
+    "channels": [
+      {
+        "type": "telegram",
+        "token_env": "TELEGRAM_BOT_TOKEN",
+        "allowed_senders": "0000000000"
+      }
+    ],
+    "gateway": {
+      "max_history": 500,
+      "max_iterations": 80,
+      "system_prompt": null,
+      "max_concurrent_sessions": 100,
+      "browser_timeout_secs": null,
+      "max_output_tokens": null
+    },
+    "email": {
+      "provider": "smtp",
+      "smtp_host": "smtp.example.invalid",
+      "smtp_port": 587,
+      "username": "dspfac@example.invalid",
+      "password_env": "SMTP_PASSWORD",
+      "password": "REDACTED",
+      "from_address": "dspfac@example.invalid",
+      "feishu_app_id": null,
+      "feishu_app_secret_env": null,
+      "feishu_app_secret": null,
+      "feishu_from_address": null,
+      "feishu_region": null
+    },
+    "api_type": null,
+    "env_vars": {
+      "MINIMAX_API_KEY": "REDACTED",
+      "DEEPSEEK_API_KEY": "REDACTED",
+      "PERPLEXITY_API_KEY": "REDACTED",
+      "SERPER_API_KEY": "REDACTED",
+      "TAVILY_API_KEY": "REDACTED",
+      "TELEGRAM_BOT_TOKEN": "REDACTED",
+      "SMTP_PORT": "587",
+      "SMTP_HOST": "smtp.example.invalid",
+      "ZAI_API_KEY": "REDACTED",
+      "SMTP_USERNAME": "dspfac@example.invalid",
+      "MOONSHOT_API_KEY": "REDACTED",
+      "SMTP_FROM": "dspfac@example.invalid",
+      "KIMI_API_KEY": "REDACTED",
+      "GEMINI_API_KEY": "REDACTED",
+      "WISEMODEL_API_KEY": "REDACTED",
+      "NVIDIA_API_KEY": "REDACTED",
+      "SMTP_PASSWORD": "REDACTED",
+      "DASHSCOPE_API_KEY": "REDACTED",
+      "AUTODL_API_KEY": "REDACTED",
+      "OMINIX_API_URL": "http://127.0.0.1:8080",
+      "OPENAI_API_KEY": "REDACTED"
+    },
+    "hooks": [],
+    "admin_mode": false,
+    "sandbox": {
+      "enabled": true,
+      "mode": "auto",
+      "allow_network": true,
+      "docker": {
+        "image": "ubuntu:24.04",
+        "cpu_limit": null,
+        "memory_limit": null,
+        "pids_limit": null,
+        "mount_mode": "rw",
+        "extra_binds": []
+      },
+      "read_allow_paths": [],
+      "profile_name": null
+    },
+    "adaptive_routing": null
+  },
+  "created_at": "2026-03-23T21:26:05.549973Z",
+  "updated_at": "2026-04-21T06:33:23.393986Z"
+}

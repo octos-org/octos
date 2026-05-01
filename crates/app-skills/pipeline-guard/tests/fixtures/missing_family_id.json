@@ -1,0 +1,30 @@
+{
+  "id": "missing_family",
+  "name": "missing_family",
+  "enabled": true,
+  "config": {
+    "llm": {
+      "primary": {
+        "model_id": "kimi-k2.5",
+        "route": {
+          "base_url": "https://example.invalid/api/v1",
+          "api_key_env": "AUTODL_API_KEY"
+        }
+      },
+      "fallbacks": []
+    },
+    "channels": [],
+    "gateway": {
+      "max_history": 500,
+      "max_iterations": 80,
+      "system_prompt": null,
+      "max_concurrent_sessions": 100,
+      "browser_timeout_secs": null,
+      "max_output_tokens": null
+    },
+    "env_vars": {},
+    "hooks": [],
+    "admin_mode": false,
+    "adaptive_routing": null
+  }
+}
