@@ -284,9 +284,22 @@ impl ToolRegistry {
     ///
     /// Unknown tools report [`super::ConcurrencyClass::Safe`] — the executor
     /// defers error handling to `execute()` which bails with `unknown tool`
-    /// rather than letting the admission phase fail silently. Plugin/MCP
-    /// tools report `Safe` today because their wrapper inherits the trait
-    /// default; they will be wired through a declared class in a follow-up.
+    /// rather than letting the admission phase fail silently.
+    ///
+    /// Plugin and MCP wrappers override `Tool::concurrency_class()` and
+    /// surface their declared class:
+    /// - Plugin wrapper: reads `concurrency_class` from the manifest tool
+    ///   def. Defaults to `Safe` so the bundled read-only skills (weather,
+    ///   news, time, deep-search, …) keep their parallel-friendly path. A
+    ///   plugin tool that writes files or mutates remote state must declare
+    ///   `"exclusive"` in its manifest.
+    /// - MCP wrapper: reads `concurrency_class` from
+    ///   `McpServerConfig`. Defaults to `Safe` because most MCP servers
+    ///   in practice are read-only (search, wiki, time, weather);
+    ///   operators must declare `"exclusive"` per server when the MCP
+    ///   server mutates files / remote state and could race with the
+    ///   native `edit_file` / `write_file` tools. Unknown values fail
+    ///   safe to `Exclusive`.
     pub fn concurrency_class(&self, name: &str) -> super::ConcurrencyClass {
         self.tools
             .get(name)
