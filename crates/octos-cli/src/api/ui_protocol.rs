@@ -7818,6 +7818,7 @@ mod tests {
             error: None,
             session_key: Some("local:test".into()),
             tool_input: None,
+            originating_client_message_id: None,
         }
     }
 
