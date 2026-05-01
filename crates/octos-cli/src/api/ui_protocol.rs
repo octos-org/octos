@@ -28,12 +28,13 @@ use octos_core::ui_protocol::{
     TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
     ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
     TurnId, TurnInterruptParams, TurnInterruptResult, TurnStartParams,
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot, approval_cancelled_reasons,
-    approval_kinds, progress_kinds,
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiCursor, UiFileMutationNotice,
+    UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot,
+    UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities,
+    UiWorkspacePaneEntry, UiWorkspacePaneSnapshot, approval_cancelled_reasons, approval_kinds,
+    progress_kinds,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
 use serde::Serialize;
@@ -475,6 +476,14 @@ struct ConnectionUiFeatures {
     typed_approvals: bool,
     pane_snapshots: bool,
     session_workspace_cwd: bool,
+    harness_task_control: bool,
+    /// `true` when the client sent at least one feature token via the
+    /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
+    /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
+    /// (where the server falls back to advertising the full first-slice in
+    /// `SessionOpened.capabilities`) from "header sent with all-unknown
+    /// tokens" (where the negotiated `supported_features` is empty).
+    header_present: bool,
 }
 
 impl ConnectionUiFeatures {
@@ -487,8 +496,68 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             ),
+            harness_task_control: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            ),
+            header_present: has_any_ui_feature_token(headers, query),
         }
     }
+
+    /// Build the `UiProtocolCapabilities` payload to advertise on
+    /// `SessionOpened` per UPCR-2026-007 § 4 capability negotiation. When
+    /// the client sent no feature header at all, the server returns the
+    /// `first_server_slice` default so clients can still discover the
+    /// surface in-band. When the client sent at least one feature token,
+    /// the server returns the intersection of requested features with the
+    /// known feature registry — clients see exactly which of their
+    /// requests were honoured and never receive a flag they did not ask
+    /// for.
+    fn negotiated_capabilities(self) -> UiProtocolCapabilities {
+        if !self.header_present {
+            return UiProtocolCapabilities::first_server_slice();
+        }
+        let mut requested: Vec<&str> = Vec::with_capacity(4);
+        if self.typed_approvals {
+            requested.push(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1);
+        }
+        if self.pane_snapshots {
+            requested.push(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1);
+        }
+        if self.session_workspace_cwd {
+            requested.push(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1);
+        }
+        if self.harness_task_control {
+            requested.push(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1);
+        }
+        UiProtocolCapabilities::for_negotiated_features(requested)
+    }
+}
+
+/// True when the client sent any non-empty `X-Octos-Ui-Features` token
+/// through the header or the URL query. Used by UPCR-2026-007 to
+/// distinguish "no negotiation attempted" from "negotiation attempted with
+/// no honoured tokens".
+fn has_any_ui_feature_token(headers: &HeaderMap, query: Option<&str>) -> bool {
+    let header_has_token = headers
+        .get(UI_FEATURES_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split([',', ' '])
+                .any(|candidate| !candidate.trim().is_empty())
+        });
+    if header_has_token {
+        return true;
+    }
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, _)| matches!(*key, "ui_feature" | "ui_features" | "x-octos-ui-features"))
+        .flat_map(|(_, value)| value.split([',', ' ']))
+        .any(|candidate| !candidate.trim().is_empty())
 }
 
 fn has_ui_feature(headers: &HeaderMap, query: Option<&str>, feature: &str) -> bool {
@@ -1388,12 +1457,17 @@ async fn open_session_result(
     let panes = features
         .pane_snapshots
         .then(|| build_pane_snapshot(&data_dir, &params.session_id, workspace_root.as_deref()));
+    // UPCR-2026-007: advertise the negotiated capability set in-band so
+    // clients don't have to rely on out-of-band knowledge of which feature
+    // tokens the server honours.
+    let capabilities = features.negotiated_capabilities();
     let opened_event = ledger.append_notification(UiNotification::SessionOpened(SessionOpened {
         session_id: params.session_id,
         active_profile_id,
         workspace_root: workspace_root.map(|path| path.to_string_lossy().to_string()),
         cursor: None,
         panes,
+        capabilities,
     }));
     let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
         opened_event.event.clone()
@@ -4238,6 +4312,8 @@ mod tests {
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                harness_task_control: false,
+                header_present: true,
             },
         );
         assert_eq!(
@@ -4281,6 +4357,8 @@ mod tests {
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                harness_task_control: false,
+                header_present: true,
             },
         );
 
@@ -4527,6 +4605,8 @@ mod tests {
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
+                harness_task_control: false,
+                header_present: true,
             },
         );
         let cwd = typed
@@ -5803,6 +5883,8 @@ mod tests {
                 typed_approvals: false,
                 pane_snapshots: true,
                 session_workspace_cwd: false,
+                harness_task_control: false,
+                header_present: true,
             },
             SessionOpenParams {
                 session_id: session_id.clone(),
@@ -5865,6 +5947,124 @@ mod tests {
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("feature_required"))
+        );
+    }
+
+    // ----- UPCR-2026-007: capability advertisement on `SessionOpened` -----
+
+    #[tokio::test]
+    async fn session_open_result_advertises_full_protocol_when_no_header() {
+        // Client sent no `X-Octos-Ui-Features` request — server returns
+        // the `first_server_slice` baseline so a discovery-aware client
+        // can learn the surface in-band per UPCR-2026-007.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let session_id = SessionKey("local:caps-default".into());
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            None,
+            ConnectionUiFeatures::default(),
+            SessionOpenParams {
+                session_id,
+                profile_id: None,
+                cwd: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("open session without feature header");
+
+        let capabilities = &outcome.result.opened.capabilities;
+        assert_eq!(
+            capabilities,
+            &UiProtocolCapabilities::first_server_slice(),
+            "no header => server falls back to first_server_slice"
+        );
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+    }
+
+    #[tokio::test]
+    async fn session_open_result_advertises_intersection_when_header_subset() {
+        // Client requested only `pane.snapshots.v1` — server returns
+        // capabilities with that single feature and never leaks flags the
+        // client did not negotiate (UPCR-2026-007 § 4 capability
+        // negotiation).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let session_id = SessionKey("local:caps-subset".into());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.header_present);
+        assert!(features.pane_snapshots);
+        assert!(!features.typed_approvals);
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            None,
+            features,
+            SessionOpenParams {
+                session_id,
+                profile_id: None,
+                cwd: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("open session with feature header subset");
+
+        let capabilities = &outcome.result.opened.capabilities;
+        assert_eq!(
+            capabilities.supported_features,
+            vec![UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1.to_owned()],
+            "intersection must be exactly the features the client asked for"
+        );
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        // Unconditional methods stay advertised so the client can still
+        // see what the server offers in-band.
+        assert!(
+            capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::SESSION_OPEN)
+        );
+        // Capability-gated methods (task-control RPCs behind
+        // harness.task_control.v1) must not leak when the gating feature
+        // is not in the negotiated set — otherwise the client would call
+        // them and the server would reject with method_not_supported.
+        assert!(
+            !capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::TASK_LIST),
+            "task/list must be gated by harness.task_control.v1"
+        );
+        assert!(
+            !capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::TASK_CANCEL),
+            "task/cancel must be gated by harness.task_control.v1"
         );
     }
 
