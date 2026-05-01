@@ -64,13 +64,22 @@ export async function ensureAdminTokenRotated(
 
   cached = (async () => {
     // `/api/auth/me` is the authoritative gate the SPA uses. A token that
-    // returns 200 here will satisfy AuthGuard and let `/chat` render.
+    // returns 200 here will satisfy AuthGuard and let `/chat` render. The
+    // server accepts both admin tokens and email-OTP user sessions on
+    // this endpoint, but we want admin specifically — non-admin sessions
+    // fail downstream when specs hit `/admin/*` SPA routes (e.g.
+    // live-mofa-skills, live-realtime-status). Require `role === 'admin'`
+    // so we don't silently degrade.
     const meProbe = async (token: string): Promise<boolean> => {
       try {
         const resp = await fetch(`${host}/api/auth/me`, {
           headers: { Authorization: `Bearer ${token}` },
         });
-        return resp.ok;
+        if (!resp.ok) return false;
+        const body = (await resp.json().catch(() => null)) as
+          | { user?: { role?: string } }
+          | null;
+        return body?.user?.role === 'admin';
       } catch {
         return false;
       }
@@ -178,9 +187,14 @@ function pageBaseUrl(page: Page): string {
  * `octos_session_token` / `octos_auth_token` localStorage entries. Resolves
  * to the rotated strong token when the helper had to bootstrap the daemon,
  * otherwise to whatever `OCTOS_AUTH_TOKEN` was passed in.
+ *
+ * Pass `baseUrl` when the caller targets a host that doesn't match
+ * `OCTOS_TEST_URL` (e.g. when a spec uses its own `BASE` constant or
+ * threads the page baseURL through). Defaults preserve the previous
+ * env-only behaviour so this call is backward compatible.
  */
-export async function getEffectiveAdminToken(): Promise<string> {
-  return ensureAdminTokenRotated();
+export async function getEffectiveAdminToken(baseUrl?: string): Promise<string> {
+  return ensureAdminTokenRotated(baseUrl);
 }
 
 export const SEL = {
