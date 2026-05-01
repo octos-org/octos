@@ -210,6 +210,10 @@ pub struct SmtpSettings {
     /// Whether `smtp_secret.json` currently holds a password. The password
     /// itself is never returned by the API.
     pub password_configured: bool,
+    /// Sibling of `dashboard_auth.smtp` in `config.json`. Surfaced here so
+    /// the wizard's SMTP step can present the toggle alongside the SMTP
+    /// fields (matches the cloud-host-deploy.sh interactive prompts).
+    pub allow_self_registration: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +225,11 @@ pub struct SmtpSettingsBody {
     /// Optional — when `Some` and non-empty, overwrites `smtp_secret.json`.
     #[serde(default)]
     pub password: Option<String>,
+    /// Optional — when present, also writes `dashboard_auth.allow_self_registration`
+    /// in `config.json` and hot-reloads the in-memory `AuthManager` flag.
+    /// Omitted callers leave the existing value alone.
+    #[serde(default)]
+    pub allow_self_registration: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +277,7 @@ struct SmtpFromConfig {
     port: u16,
     username: String,
     from_address: String,
+    allow_self_registration: bool,
 }
 
 fn read_smtp_from_config(
@@ -282,6 +292,7 @@ fn read_smtp_from_config(
                 port: 465,
                 username: String::new(),
                 from_address: String::new(),
+                allow_self_registration: false,
             });
         }
         Err(e) => {
@@ -303,9 +314,12 @@ fn read_smtp_from_config(
             }),
         )
     })?;
-    let smtp = value
+    let dashboard_auth = value
         .get("dashboard_auth")
-        .and_then(|v| v.get("smtp"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let smtp = dashboard_auth
+        .get("smtp")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let host = smtp
@@ -324,11 +338,16 @@ fn read_smtp_from_config(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let allow_self_registration = dashboard_auth
+        .get("allow_self_registration")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Ok(SmtpFromConfig {
         host,
         port,
         username,
         from_address,
+        allow_self_registration,
     })
 }
 
@@ -347,6 +366,7 @@ pub async fn get_smtp(
         username: cfg.username,
         from_address: cfg.from_address,
         password_configured,
+        allow_self_registration: cfg.allow_self_registration,
     }))
 }
 
@@ -436,6 +456,15 @@ pub async fn post_smtp(
         smtp_obj
             .entry("password_env".to_string())
             .or_insert_with(|| serde_json::json!("SMTP_PASSWORD"));
+        // Optionally update the sibling allow_self_registration field. Only
+        // written when the caller explicitly supplied a value, so legacy
+        // callers that omit the field keep the existing setting.
+        if let Some(allow) = body.allow_self_registration {
+            auth_obj.insert(
+                "allow_self_registration".into(),
+                serde_json::json!(allow),
+            );
+        }
         Ok(())
     })
     .map_err(|e| {
@@ -460,6 +489,9 @@ pub async fn post_smtp(
                 from_address: body.from_address.clone(),
             }))
             .await;
+        if let Some(allow) = body.allow_self_registration {
+            auth_mgr.set_allow_self_registration(allow);
+        }
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -931,6 +963,7 @@ mod tests {
             username: "octos".into(),
             from_address: "noreply@example.com".into(),
             password: Some("hunter2".into()),
+            allow_self_registration: None,
         };
         let status = post_smtp(State(state.clone()), Json(body)).await.unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -969,6 +1002,7 @@ mod tests {
             username: "octos".into(),
             from_address: "noreply@example.com".into(),
             password: None,
+            allow_self_registration: None,
         };
         post_smtp(State(state.clone()), Json(body)).await.unwrap();
 
@@ -981,6 +1015,7 @@ mod tests {
             username: "octos".into(),
             from_address: "noreply@example.com".into(),
             password: Some(String::new()),
+            allow_self_registration: None,
         };
         post_smtp(State(state), Json(body2)).await.unwrap();
         let pw = SmtpSecretStore::new(dir.path()).load().unwrap().unwrap();
@@ -997,6 +1032,7 @@ mod tests {
             username: "u".into(),
             from_address: "a@b".into(),
             password: None,
+            allow_self_registration: None,
         };
         let err = post_smtp(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -1013,6 +1049,7 @@ mod tests {
             username: "u".into(),
             from_address: "a@b".into(),
             password: None,
+            allow_self_registration: None,
         };
         let err = post_smtp(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -1029,6 +1066,7 @@ mod tests {
             username: "u".into(),
             from_address: "not-an-email".into(),
             password: None,
+            allow_self_registration: None,
         };
         let err = post_smtp(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -1058,6 +1096,7 @@ mod tests {
             username: "u".into(),
             from_address: "a@b.com".into(),
             password: None,
+            allow_self_registration: None,
         };
         post_smtp(State(state), Json(body)).await.unwrap();
 
@@ -1071,6 +1110,68 @@ mod tests {
         assert_eq!(
             parsed["dashboard_auth"]["smtp"]["password_env"],
             "CUSTOM_PW_ENV"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_smtp_persists_allow_self_registration_when_provided() {
+        // The wizard SMTP step now offers an allow_self_registration toggle
+        // alongside the SMTP fields so completing the wizard is equivalent
+        // to picking that option in cloud-host-deploy.sh's interactive
+        // prompts. The field is optional in the request body; present-with-
+        // value writes config.json + hot-reloads the in-memory flag.
+        let dir = tempfile::tempdir().unwrap();
+        let state = smtp_state(dir.path());
+
+        let body = SmtpSettingsBody {
+            host: "smtp.example.com".into(),
+            port: 587,
+            username: "u".into(),
+            from_address: "a@b.com".into(),
+            password: Some("pw".into()),
+            allow_self_registration: Some(true),
+        };
+        post_smtp(State(state.clone()), Json(body)).await.unwrap();
+
+        // GET round-trips it.
+        let Json(settings) = get_smtp(State(state.clone())).await.unwrap();
+        assert!(settings.allow_self_registration);
+
+        // config.json received it as a sibling of `smtp`.
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["dashboard_auth"]["allow_self_registration"], true);
+    }
+
+    #[tokio::test]
+    async fn post_smtp_leaves_allow_self_registration_alone_when_omitted() {
+        // Legacy callers that don't supply the field must not have their
+        // existing value clobbered to false.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "dashboard_auth":{"smtp":{"host":"old"},"allow_self_registration":true}
+            }"#,
+        )
+        .unwrap();
+        let state = smtp_state(dir.path());
+
+        let body = SmtpSettingsBody {
+            host: "smtp.new".into(),
+            port: 587,
+            username: "u".into(),
+            from_address: "a@b.com".into(),
+            password: None,
+            allow_self_registration: None,
+        };
+        post_smtp(State(state), Json(body)).await.unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed["dashboard_auth"]["allow_self_registration"], true,
+            "omitted field must not overwrite an existing true"
         );
     }
 

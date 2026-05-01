@@ -300,6 +300,7 @@ export type SmtpSettings = {
   username: string
   from_address: string
   password_configured: boolean
+  allow_self_registration: boolean
 }
 
 export type SmtpSettingsBody = {
@@ -309,6 +310,10 @@ export type SmtpSettingsBody = {
   from_address: string
   /** Leave undefined / empty to keep the existing password. */
   password?: string
+  /** Omit to leave the current setting alone; pass true/false to write
+   *  dashboard_auth.allow_self_registration in config.json and hot-reload
+   *  the in-memory AuthManager flag. */
+  allow_self_registration?: boolean
 }
 
 export type SmtpTestResult = {
