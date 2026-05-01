@@ -938,6 +938,7 @@ mod tests {
             error: None,
             session_key: Some("local:demo".into()),
             tool_input: None,
+            originating_client_message_id: None,
         };
 
         let event = background_task_to_progress_json(&task);
