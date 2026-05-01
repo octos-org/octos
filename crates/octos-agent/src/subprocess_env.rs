@@ -30,8 +30,110 @@ impl EnvAllowlist {
         Self::from_names(names.iter().map(String::as_str))
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
     fn contains(&self, name: &str) -> bool {
         self.names.contains(&normalize_env_name(name))
+    }
+}
+
+/// Names that are always retained even when a strict manifest env
+/// allowlist is in effect. These are runtime-essential vars that the
+/// subprocess needs to function (PATH for binary lookup, locale, etc).
+/// Adding to this list is a deliberate decision — every entry here is a
+/// var the manifest can NOT exclude.
+const ALWAYS_RETAIN_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "PWD",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "TZ",
+    "TERM",
+];
+
+fn is_always_retain_env_name(name: &str) -> bool {
+    let upper = normalize_env_name(name);
+    if ALWAYS_RETAIN_ENV_NAMES.iter().any(|&n| upper == n) {
+        return true;
+    }
+    // Any LC_* locale variant.
+    upper.starts_with("LC_")
+}
+
+/// Names the harness itself injects into plugin processes; the strict
+/// allowlist gate must not strip these because the wrapper later sets
+/// them to plumb harness identity (session id, work dir, event sink).
+fn is_harness_env_name(name: &str) -> bool {
+    let upper = normalize_env_name(name);
+    upper.starts_with("OCTOS_")
+}
+
+/// Strict variant of [`should_forward_env_name`] for plugin tools that
+/// declare a non-empty manifest env allowlist.
+///
+/// Default semantics ([`should_forward_env_name`]) gate **only** secret-like
+/// vars: a manifest declaring `env: ["FOO"]` adds `FOO` to the allowlist
+/// but does NOT restrict non-secret vars. That mismatches the plain reading
+/// of the manifest field name.
+///
+/// This strict variant is used when the manifest's `env` list is non-empty.
+/// It forwards a name iff:
+/// - it is not a known process-hijack var (`LD_PRELOAD`, `DYLD_*`, ...),
+/// - AND either:
+///   - it is in the manifest allowlist, OR
+///   - it is in [`ALWAYS_RETAIN_ENV_NAMES`] (runtime essentials), OR
+///   - it is a harness-injected `OCTOS_*` var.
+///
+/// Any other env var — secret OR non-secret — is dropped.
+pub(crate) fn should_forward_env_name_strict(name: &str, allowlist: &EnvAllowlist) -> bool {
+    if is_injection_env_name(name) {
+        return false;
+    }
+    if allowlist.contains(name) {
+        return true;
+    }
+    if is_always_retain_env_name(name) {
+        return true;
+    }
+    if is_harness_env_name(name) {
+        return true;
+    }
+    false
+}
+
+/// Strict env sanitisation — see [`should_forward_env_name_strict`].
+///
+/// Use this when the plugin's manifest declares a non-empty `env`
+/// allowlist. Strips every env var that isn't in the manifest list,
+/// runtime essentials, or the `OCTOS_*` harness namespace.
+pub(crate) fn sanitize_command_env_strict(cmd: &mut Command, allowlist: &EnvAllowlist) {
+    for (key, _) in std::env::vars_os() {
+        let Some(name) = key.to_str() else {
+            continue;
+        };
+        if !should_forward_env_name_strict(name, allowlist) {
+            cmd.env_remove(&key);
+        }
+    }
+
+    for name in BLOCKED_ENV_VARS {
+        cmd.env_remove(name);
     }
 }
 
@@ -155,5 +257,66 @@ mod tests {
         assert!(!should_forward_env_name("TAVILY_API_KEY", &allowlist));
         assert!(!should_forward_env_name("LD_PRELOAD", &allowlist));
         assert!(should_forward_env_name("OPENAI_BASE_URL", &allowlist));
+    }
+
+    #[test]
+    fn strict_allowlist_permits_listed_names() {
+        let allowlist = EnvAllowlist::from_names(["MY_VAR", "OPENAI_API_KEY"]);
+        assert!(should_forward_env_name_strict("MY_VAR", &allowlist));
+        assert!(should_forward_env_name_strict("my_var", &allowlist)); // case-insensitive
+        assert!(should_forward_env_name_strict("OPENAI_API_KEY", &allowlist));
+    }
+
+    #[test]
+    fn strict_allowlist_drops_non_listed_secret_and_non_secret_names() {
+        let allowlist = EnvAllowlist::from_names(["MY_VAR"]);
+        // Secret not in the list: dropped.
+        assert!(!should_forward_env_name_strict(
+            "OPENAI_API_KEY",
+            &allowlist
+        ));
+        // Non-secret not in the list and not runtime-essential: dropped.
+        assert!(!should_forward_env_name_strict(
+            "PPT_TEMPLATE_DIR",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn strict_allowlist_retains_runtime_essentials() {
+        let allowlist = EnvAllowlist::from_names(["MY_VAR"]);
+        for name in ["PATH", "HOME", "PWD", "USER", "LANG", "TZ", "TERM"] {
+            assert!(
+                should_forward_env_name_strict(name, &allowlist),
+                "{name} should be retained"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_allowlist_retains_lc_locale_variants() {
+        let allowlist = EnvAllowlist::from_names(["MY_VAR"]);
+        for name in ["LC_CTYPE", "LC_ALL", "LC_MESSAGES", "LC_TIME"] {
+            assert!(
+                should_forward_env_name_strict(name, &allowlist),
+                "{name} should be retained"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_allowlist_retains_octos_namespace() {
+        let allowlist = EnvAllowlist::from_names(["MY_VAR"]);
+        assert!(should_forward_env_name_strict("OCTOS_TASK_ID", &allowlist));
+        assert!(should_forward_env_name_strict("OCTOS_WORK_DIR", &allowlist));
+    }
+
+    #[test]
+    fn strict_allowlist_drops_injection_names_even_if_listed() {
+        // Defense in depth — if a manifest somehow listed LD_PRELOAD,
+        // strict gate still strips it.
+        let allowlist = EnvAllowlist::from_names(["LD_PRELOAD", "MY_VAR"]);
+        assert!(!should_forward_env_name_strict("LD_PRELOAD", &allowlist));
+        assert!(should_forward_env_name_strict("MY_VAR", &allowlist));
     }
 }
