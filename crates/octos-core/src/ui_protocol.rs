@@ -1513,14 +1513,98 @@ impl TurnStartResult {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Typed result for `turn/interrupt`.
+///
+/// `interrupted` is the canonical boolean response. The three optional
+/// fields (`reason`, `terminal_state`, `ack_timeout`) carry diagnostic
+/// information the server has historically emitted via raw `json!` and are
+/// codified here under accepted `UPCR-2026-008`.
+///
+/// String registry for `reason` (when `interrupted` is `false`):
+/// - `turn_id_mismatch` — the turn_id sent does not match the active turn for
+///   the session.
+/// - `<terminal_state>` — set by `terminal_state` instead; `reason` stays
+///   `None` for the already-terminal case.
+///
+/// Future `reason` values must be added via a follow-up UPCR.
+///
+/// `terminal_state` is set when interrupt was sent against a turn that had
+/// already reached a terminal state. Values come from the server's terminal
+/// state enum and currently include `completed`, `errored`, and
+/// `interrupted`.
+///
+/// `ack_timeout` is set to `Some(true)` when the server captured the
+/// interrupt but could not confirm the wire-side terminal event was received
+/// within the ack window. It is omitted otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnInterruptResult {
     pub interrupted: bool,
+    /// Diagnostic reason when `interrupted` is `false` and the server has a
+    /// non-terminal explanation (e.g., `turn_id_mismatch`). String registry;
+    /// future values must be registered via UPCR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Set when interrupt was sent against a turn that had already reached a
+    /// terminal state. Carries the terminal state name (`completed`,
+    /// `errored`, `interrupted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+    /// `Some(true)` when the interrupt was captured but the wire-side ack of
+    /// the terminal event timed out. Indicates the server did finish the
+    /// interrupt but could not confirm client receipt within the ack window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_timeout: Option<bool>,
 }
 
 impl TurnInterruptResult {
+    /// Bare constructor preserved for back-compat: callers passing only the
+    /// boolean see no behavioural change.
     pub fn new(interrupted: bool) -> Self {
-        Self { interrupted }
+        Self {
+            interrupted,
+            reason: None,
+            terminal_state: None,
+            ack_timeout: None,
+        }
+    }
+
+    /// Successful interrupt of a running turn — the typical happy-path
+    /// response.
+    pub fn interrupted_ok() -> Self {
+        Self::new(true)
+    }
+
+    /// Interrupt declined with a diagnostic reason (e.g.,
+    /// `turn_id_mismatch`).
+    pub fn declined(reason: impl Into<String>) -> Self {
+        Self {
+            interrupted: false,
+            reason: Some(reason.into()),
+            terminal_state: None,
+            ack_timeout: None,
+        }
+    }
+
+    /// Interrupt against a turn that was already terminal. `interrupted` is
+    /// `true` only when the prior terminal was itself `interrupted`.
+    pub fn already_terminal(terminal_state: impl Into<String>, interrupted: bool) -> Self {
+        Self {
+            interrupted,
+            reason: None,
+            terminal_state: Some(terminal_state.into()),
+            ack_timeout: None,
+        }
+    }
+
+    /// Interrupt was captured but the wire-side ack timed out. Server still
+    /// emitted the terminal event; client just couldn't be confirmed.
+    pub fn ack_timed_out() -> Self {
+        Self {
+            interrupted: true,
+            reason: None,
+            terminal_state: None,
+            ack_timeout: Some(true),
+        }
     }
 }
 
@@ -3533,6 +3617,99 @@ mod tests {
             UiRpcResult::from_method_and_result(methods::TASK_OUTPUT_READ, value)
                 .expect("decode task/output/read result"),
             task_result
+        );
+    }
+
+    /// Golden: minimal `interrupted: true` round-trip omits the optional
+    /// diagnostic fields (`reason`, `terminal_state`, `ack_timeout`) so the
+    /// canonical happy-path wire shape is preserved.
+    #[test]
+    fn turn_interrupt_result_minimal_omits_optional_fields() {
+        let result = UiRpcResult::TurnInterrupt(TurnInterruptResult::interrupted_ok());
+        let value = result
+            .clone()
+            .into_result_value()
+            .expect("serialize turn/interrupt result");
+        assert_eq!(value, json!({ "interrupted": true }));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TURN_INTERRUPT, value)
+                .expect("decode turn/interrupt result"),
+            result
+        );
+    }
+
+    /// Golden: declined interrupt with a `reason` string round-trips through
+    /// serde without dropping the diagnostic field.
+    #[test]
+    fn turn_interrupt_result_round_trips_with_reason() {
+        let result = UiRpcResult::TurnInterrupt(TurnInterruptResult::declined("turn_id_mismatch"));
+        let value = result
+            .clone()
+            .into_result_value()
+            .expect("serialize turn/interrupt result");
+        assert_eq!(
+            value,
+            json!({ "interrupted": false, "reason": "turn_id_mismatch" })
+        );
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TURN_INTERRUPT, value)
+                .expect("decode turn/interrupt result"),
+            result
+        );
+    }
+
+    /// Golden: already-terminal interrupt round-trips with `terminal_state`
+    /// and an `interrupted` boolean derived from the prior terminal state.
+    #[test]
+    fn turn_interrupt_result_round_trips_with_terminal_state() {
+        let result =
+            UiRpcResult::TurnInterrupt(TurnInterruptResult::already_terminal("completed", false));
+        let value = result
+            .clone()
+            .into_result_value()
+            .expect("serialize turn/interrupt result");
+        assert_eq!(
+            value,
+            json!({ "interrupted": false, "terminal_state": "completed" })
+        );
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TURN_INTERRUPT, value)
+                .expect("decode turn/interrupt result"),
+            result
+        );
+    }
+
+    /// Golden: ack-timed-out interrupt round-trips with `ack_timeout: true`
+    /// and `interrupted: true` (server captured the interrupt; only client
+    /// receipt of the terminal event is uncertain).
+    #[test]
+    fn turn_interrupt_result_round_trips_with_ack_timeout() {
+        let result = UiRpcResult::TurnInterrupt(TurnInterruptResult::ack_timed_out());
+        let value = result
+            .clone()
+            .into_result_value()
+            .expect("serialize turn/interrupt result");
+        assert_eq!(value, json!({ "interrupted": true, "ack_timeout": true }));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TURN_INTERRUPT, value)
+                .expect("decode turn/interrupt result"),
+            result
+        );
+    }
+
+    /// Spec: unknown optional fields on a `turn/interrupt` result must not
+    /// break decode for clients on this version (forward-compat).
+    #[test]
+    fn turn_interrupt_result_decodes_with_unknown_fields_ignored() {
+        let value = json!({
+            "interrupted": true,
+            "future_extension": "x"
+        });
+        let decoded = UiRpcResult::from_method_and_result(methods::TURN_INTERRUPT, value)
+            .expect("decode turn/interrupt result with unknown field");
+        assert_eq!(
+            decoded,
+            UiRpcResult::TurnInterrupt(TurnInterruptResult::interrupted_ok())
         );
     }
 

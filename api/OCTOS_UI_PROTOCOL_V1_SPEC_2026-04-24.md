@@ -164,6 +164,13 @@ Current M9 sandbox-parity decision:
   That UPCR closes M9 harness audit gap #707 by giving clients a single
   wire-level boolean for snapshot vs. live-tail semantics, independent of the
   open `source` enum and the free-form `limitations[]` registry.
+- The additive `reason`, `terminal_state`, and `ack_timeout` optional fields
+  on `TurnInterruptResult` are governed by accepted
+  [UPCR-2026-008](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_008_TURN_INTERRUPT_TYPED_FIELDS.md).
+  That UPCR closes M9 protocol-as-contract audit issue #721 by codifying the
+  diagnostic fields the `turn/interrupt` handler has been emitting since the
+  protocol shipped. The typed contract is now equivalent to the wire shape;
+  the canonical minimal `{ "interrupted": <bool> }` response is preserved.
 
 ## 5. Identity Model
 
@@ -296,6 +303,32 @@ Behavior:
 
 - if the turn is still running, server stops it and emits terminal state
 - if already completed, behavior should be idempotent and explicit
+
+Minimum result fields:
+
+- `interrupted` (`bool`)
+  `true` iff the server stopped the turn (or the turn had already been
+  interrupted). `false` iff the interrupt was declined or the turn was
+  already in a non-`interrupted` terminal state.
+
+Optional result fields from accepted `UPCR-2026-008`:
+
+- `reason` (`string`)
+  Non-terminal diagnostic explanation when `interrupted` is `false`. String
+  registry; initial value: `turn_id_mismatch`. Future values must be
+  registered via UPCR.
+- `terminal_state` (`string`)
+  Set when interrupt was sent against a turn that had already reached a
+  terminal state. String registry; values: `completed`, `errored`,
+  `interrupted`. Future values must be registered via UPCR.
+- `ack_timeout` (`bool`)
+  Set to `true` only when the server captured the interrupt and emitted the
+  wire-side terminal event but could not confirm client receipt within the
+  ack window. The interrupt itself is captured (`interrupted` is `true`);
+  only client-side receipt is uncertain. Omitted otherwise.
+
+The canonical minimal wire shape is preserved: when no diagnostic fields
+apply, the result is `{ "interrupted": <bool> }`.
 
 ### `approval/respond`
 
