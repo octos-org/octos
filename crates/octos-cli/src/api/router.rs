@@ -717,7 +717,9 @@ async fn user_auth_middleware(
         }
 
         let uri_str = uri.path();
-        // Only allow proxy auth for chat-related endpoints, not admin
+        // Allow proxy auth for chat- and session-scoped endpoints, not admin.
+        // Task-control verbs (`/api/tasks/{id}/cancel`, `/restart-from-node`)
+        // are session-scoped — same trust posture as `/api/sessions`.
         if uri_str.starts_with("/api/chat")
             || uri_str.starts_with("/api/ws")
             || uri_str.starts_with("/api/ui-protocol")
@@ -725,6 +727,7 @@ async fn user_auth_middleware(
             || uri_str.starts_with("/api/sessions")
             || uri_str.starts_with("/api/files")
             || uri_str.starts_with("/api/status")
+            || uri_str.starts_with("/api/tasks")
         {
             req.extensions_mut().insert(AuthIdentity::User {
                 id: profile_id,
