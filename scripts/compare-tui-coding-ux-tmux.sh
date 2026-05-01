@@ -35,6 +35,9 @@ case "$PROVIDER" in
     API_KEY_ENV="${OCTOS_TUI_UX_API_KEY_ENV:-$(printf '%s_API_KEY' "$PROVIDER" | tr '[:lower:]' '[:upper:]')}"
     ;;
 esac
+SERVER_PROVIDER="${OCTOS_TUI_UX_SERVER_PROVIDER:-$PROVIDER}"
+SERVER_BASE_URL="${OCTOS_TUI_UX_SERVER_BASE_URL:-}"
+SERVER_API_TYPE="${OCTOS_TUI_UX_SERVER_API_TYPE:-openai}"
 PORT="${OCTOS_TUI_UX_PORT:-$((51000 + $$ % 10000))}"
 AUTH_TOKEN="${OCTOS_TUI_UX_AUTH_TOKEN:-octos-tui-ux-token-$RUN_ID}"
 SESSION_ID="${OCTOS_TUI_UX_SESSION_ID:-coding:local:prototype#tui-compare}"
@@ -1022,6 +1025,8 @@ drive_tui() {
   local server_runner
   local transcript
   local server_log
+  local server_config
+  local server_config_arg=""
   local raw_transcript
   local tui_command
   local frame_sampler_pid=""
@@ -1046,14 +1051,28 @@ drive_tui() {
   endpoint="ws://127.0.0.1:$PORT/api/ui-protocol/ws"
   server_fifo="$OUT_DIR/octos-tui-server-key.fifo"
   server_runner="$OUT_DIR/run-octos-tui-server.sh"
+  server_config="$OUT_DIR/octos-server-config.json"
   transcript="$OUT_DIR/octos-tui-transcript.log"
   raw_transcript="$OUT_DIR/octos-tui-raw-transcript.log"
   server_log="$OUT_DIR/octos-tui-server.log"
   : >"$transcript"
   : >"$raw_transcript"
 
+  if [ -n "$SERVER_BASE_URL" ]; then
+    cat >"$server_config" <<EOF
+{
+  "provider": "$SERVER_PROVIDER",
+  "model": "$MODEL",
+  "base_url": "$SERVER_BASE_URL",
+  "api_key_env": "$API_KEY_ENV",
+  "api_type": "$SERVER_API_TYPE"
+}
+EOF
+    server_config_arg=" --config '$server_config'"
+  fi
+
   write_secret_runner "$server_runner" "$server_fifo" \
-    "cd '$ROOT_DIR' && RUST_LOG=off exec '$octos_bin' serve --host 127.0.0.1 --port '$PORT' --cwd '$dir' --data-dir '$OUT_DIR/octos-data' --provider '$PROVIDER' --model '$MODEL' --auth-token '$AUTH_TOKEN' >'$server_log' 2>&1"
+    "cd '$ROOT_DIR' && RUST_LOG=off exec '$octos_bin' serve --host 127.0.0.1 --port '$PORT' --cwd '$dir' --data-dir '$OUT_DIR/octos-data'$server_config_arg --provider '$SERVER_PROVIDER' --model '$MODEL' --auth-token '$AUTH_TOKEN' >'$server_log' 2>&1"
   start_secret_session "$server_session" "$server_runner" "$server_fifo" "$API_KEY_ENV"
 
   local deadline=$((SECONDS + MAX_WAIT_SHORT))
@@ -1798,6 +1817,9 @@ main() {
     printf 'fixture_dir=%s\n' "$FIXTURE_DIR"
     printf 'provider=%s\n' "$PROVIDER"
     printf 'api_key_env=%s\n' "$API_KEY_ENV"
+    printf 'server_provider=%s\n' "$SERVER_PROVIDER"
+    printf 'server_base_url=%s\n' "${SERVER_BASE_URL:-}"
+    printf 'server_api_type=%s\n' "$SERVER_API_TYPE"
     printf 'long_mode=%s\n' "$LONG_MODE"
     printf 'frame_sample_enabled=%s\n' "$FRAME_SAMPLE_ENABLED"
     printf 'server_sandbox_mode=%s\n' "$RESOLVED_SERVER_SANDBOX_MODE"
