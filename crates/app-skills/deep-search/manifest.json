@@ -8,6 +8,7 @@
     {
       "name": "deep_search",
       "description": "Perform deep multi-round web research on a topic. Searches from multiple angles (follow-up queries, time-qualified, controversy), fetches all pages in parallel, chases most-referenced external sources, and produces a structured research report saved to disk. The report file path is printed at the end of the output.",
+      "concurrency_class": "exclusive",
       "entrypoint": "target/release/deep-search",
       "env": [
         "SERPER_API_KEY",
@@ -20,7 +21,8 @@
         "MOONSHOT_API_KEY",
         "DASHSCOPE_API_KEY",
         "OPENAI_API_KEY",
-        "DEEP_SEARCH_SYNTHESIS_MODEL"
+        "DEEP_SEARCH_SYNTHESIS_MODEL",
+        "DEEP_SEARCH_MAX_BROWSERS"
       ],
       "input_schema": {
         "type": "object",

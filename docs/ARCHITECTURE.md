@@ -2,30 +2,40 @@
 
 ## Overview
 
-octos is an 18-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
+octos is a 25-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 For the background-task delivery model used by web chat, see [SESSION_EVENT_ARCHITECTURE.md](SESSION_EVENT_ARCHITECTURE.md).
 For the next hardening/generalization round after the runtime refactor, see [OCTOS_RUNTIME_PHASE2.md](OCTOS_RUNTIME_PHASE2.md).
 
 **Workspace members**:
-- **8 core crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli, octos-pipeline, octos-plugin
-- **9 app-skill crates**: news, deep-search, deep-crawl, send-email, account-manager, time, weather, wechat-bridge, pipeline-guard
-- **1 platform-skill crate**: voice
+- **10 octos-* crates**: octos-core, octos-memory, octos-llm, octos-agent, octos-bus, octos-cli, octos-pipeline, octos-plugin, **octos-sandbox** (Windows AppContainer helper binary), **octos-swarm** (PM/swarm dispatcher, ledger, topology)
+- **14 app-skill workspace crates**, of which **9 are auto-bootstrapped at gateway startup** (the contents of `BUNDLED_APP_SKILLS` in `crates/octos-agent/src/bundled_app_skills.rs`):
+  - **Bundled (9)**: news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve
+  - **Not bundled (5) — workspace example/utility crates only**: `harness-starter-{audio, coding, generic, report}` (templates for new skill authors), `wechat-bridge` (transport helper, not a tool-providing skill)
+- **1 platform-skill crate**: voice (auto-bootstrapped)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        octos-cli                             │
-│           (CLI: chat, gateway, init, status)                │
+│  (CLI: chat, gateway, serve, init, status, wizard, auth,    │
+│   skills, channels, cron, completions)                      │
 ├──────────────────────────┬──────────────────────────────────┤
 │       octos-agent         │           octos-bus               │
-│  (Agent, Tools, Skills)  │  (Channels, Sessions, Cron)     │
-├──────────┬───────────────┼──────────────────────────────────┤
-│octos-memory│  octos-llm    │       octos-pipeline              │
-│(Episodes) │ (Providers)  │  (DOT-based orchestration)      │
-├──────────┴───────────────┴──────────────────────────────────┤
-│                       octos-core                             │
-│            (Types, Messages, Gateway Protocol)              │
-└─────────────────────────────────────────────────────────────┘
+│  (agent loop, tools,     │  (14 channels, sessions w/      │
+│   profile, sandbox, MCP, │   sticky thread_id, coalescing,  │
+│   hooks, sub-agent       │   cron, heartbeat)              │
+│   router, supervisor)    │                                  │
+├──────────┬───────────────┼──────────────┬──────────────────┤
+│octos-memory│  octos-llm    │ octos-pipeline│ octos-swarm      │
+│(MEMORY +  │  (15 providers│  (DOT graphs,│  (PM dispatcher,  │
+│ episodes  │   3-layer     │   bounded    │   ledger,         │
+│ + HNSW)   │   failover)  │   fan-out)   │   topology)       │
+├──────────┴──┬────────────┴────┬─────────┴──────────────────┤
+│ octos-plugin │  octos-sandbox  │       octos-core            │
+│ (manifest,  │ (Windows         │ (Task, Message, Error      │
+│  protocol   │  AppContainer    │  types — no internal deps) │
+│  v1 + v2)   │  helper binary)  │                            │
+└──────────────┴─────────────────┴────────────────────────────┘
 ```
 
 ---
@@ -252,7 +262,7 @@ pub struct CreateParams {
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
 | R9S | r9s.ai | api.r9s.ai/v1 | claude-sonnet-4-6 | R9S_API_KEY |
 
 ### ModelHints (OpenAI provider)
@@ -444,18 +454,12 @@ File-based persistent memory at `{data_dir}/memory/`:
 
 ### HybridIndex — BM25 + Vector Search
 
-```rust
-pub struct HybridIndex {
-    inverted: HashMap<String, Vec<(usize, f32)>>,  // term → [(doc_idx, tf)]
-    doc_lengths: Vec<usize>,
-    avg_dl: f64,
-    ids: Vec<String>,
-    texts: Vec<String>,
-    hnsw: Option<Hnsw<'static, f32, DistCosine>>,
-    has_embedding: Vec<bool>,
-    dimension: usize,                               // default: 1536
-}
-```
+`HybridIndex` (`crates/octos-memory/src/hybrid_search.rs`) combines a BM25 keyword index with an HNSW vector index. State it tracks:
+
+- **BM25 side**: an inverted index `HashMap<term, Vec<(doc_idx, u32 raw_count)>>`, per-doc token lengths, a running `total_len` (so `avg_dl` doesn't need an O(n) recomputation on every insert), and `avg_dl`.
+- **Vector side**: optional `Hnsw<'static, f32, DistCosine>` plus a `has_embedding: Vec<bool>` parallel to the doc list and a fixed `dimension`.
+- **Doc identity**: episode IDs in insertion order (`Vec<String>`). The full episode text is **not** stored in the index — callers fetch documents by ID from the episode store after ranking.
+- **Hybrid weights**: `vector_weight` and `bm25_weight` (defaults 0.7 / 0.3, configurable via `with_weights(..)`).
 
 **BM25 scoring** (constants: K1=1.2, B=0.75):
 - Tokenization: lowercase, split on non-alphanumeric, filter tokens < 2 chars
@@ -475,6 +479,44 @@ pub struct HybridIndex {
 ---
 
 ## octos-agent — Agent Runtime
+
+The runtime was refactored into smaller modules over the M8.1–M8.10 milestones. The agent loop now lives in `crates/octos-agent/src/agent/` (subdirectory):
+
+```
+crates/octos-agent/src/agent/
+├── mod.rs              # Agent struct, public API
+├── loop_runner.rs      # Outer loop driver
+├── loop_state.rs       # Per-iteration state machine
+├── loop_compaction.rs  # Compaction trigger inside the loop
+├── llm_call.rs         # LLM invocation + retry/streaming hand-off
+├── execution.rs        # Tool dispatch + spawn_only interception
+├── streaming.rs        # SSE chunk assembly
+├── realtime.rs         # Live-progress event surface
+├── memory.rs           # Memory injection at turn boundary
+├── turn_state.rs       # Per-turn token/cost accounting
+├── activity.rs         # Activity heartbeats for supervisor
+├── budget.rs           # Token + wall-clock budget enforcement
+├── compaction.rs       # Compaction primitives
+├── detection.rs        # Loop-detection (LOOP DETECTED dedup)
+└── message_repair.rs   # Fix malformed tool-call/tool-result pairs
+```
+
+Plus M8-era top-level modules in `crates/octos-agent/src/`:
+
+- `profile/` — M8.3 profile system (per-profile prompts, models, tool policies)
+- `agents/` — M8.2 agent definition manifest, agent assembly
+- `prompts/` — Layered system-prompt assembly
+- `compaction_tiered.rs` — M8.5 three-tier compaction (working / cold / archived)
+- `task_supervisor.rs` — Bounded supervisor with orphan-task reaper (#609)
+- `subagent_output.rs`, `subagent_summary.rs` — M8.7 sub-agent output router + summary generator
+- `file_state_cache.rs` — M8.4 file state cache
+- `harness_events.rs`, `harness_errors.rs` — Harness contract (M8 runtime parity)
+- `cost_ledger.rs` — Cost tracking shared with pipeline / swarm
+- `loop_detect.rs` — LOOP DETECTED warning dedup (single-fire per session burst)
+- `validators.rs`, `permissions.rs`, `progress.rs`, `summarizer.rs` — Helpers
+- `workspace_contract.rs`, `workspace_git.rs`, `workspace_policy.rs` — Worktree integrity
+- `prompt_guard.rs` — Prompt-injection detection (`ThreatKind`)
+- `event_bus.rs` — In-process pub/sub for live events
 
 ### Agent Core
 
@@ -499,19 +541,23 @@ pub struct AgentConfig {
 }
 ```
 
-### Execution Loop (`run_task` / `process_message`)
+### Execution Loop (`agent/loop_runner.rs`)
 
 ```
-1. Build messages: system prompt + history + memory context + input
+1. Build messages: system prompt + profile prompt + history + memory + input
 2. Loop (up to max_iterations):
-   a. Check shutdown flag and token budget
-   b. trim_to_context_window() — compact if needed
-   c. Call LLM via chat_stream()
-   d. Consume stream → accumulate text, tool_calls, tokens
+   a. Check shutdown flag and token budget; emit activity heartbeat
+   b. trim_to_context_window() — three-tier compaction if needed (M8.5)
+   c. Call LLM via chat_stream() (llm_call.rs)
+   d. Consume stream → accumulate text, tool_calls, tokens (streaming.rs)
+      → emit SSE events with sticky thread_id (M8.10)
    e. Match stop_reason:
-      - EndTurn/StopSequence → save episode, return result
-      - ToolUse → execute_tools() → append results → continue
-      - MaxTokens → return result
+      - EndTurn/StopSequence → emit done w/ committed_seq → save episode
+      - ToolUse → execute_tools() → if spawn_only, fork to background;
+                  else append results → continue
+      - MaxTokens → return result with overflow continuation
+   f. On supervised failure → re-engage LLM with structured-resume payload
+      (M8.6 structured resume + M8.9 runtime failure recovery)
 ```
 
 **ConversationResponse**: `content: String`, `token_usage: TokenUsage`, `files_modified: Vec<PathBuf>`, `streamed: bool`
@@ -520,22 +566,23 @@ pub struct AgentConfig {
 
 **Wall-clock timeout**: Agent aborts after `max_timeout` (default 600s) regardless of iteration count.
 
+**Sticky thread_id (M8.10)**: every SSE event (`token`, `tool_progress`, `done`) carries a `thread_id` bound before the first emission. The `done` event also carries `committed_seq` so clients can replay deterministically. The replay harness lives at `crates/octos-bus/tests/jsonl_replay_thread_binding.rs` (#656); end-to-end coverage is in `e2e/tests/live-overflow-thread-binding.spec.ts` and `e2e/tests/live-thread-interleave.spec.ts`.
+
 ### Tool Output Sanitization
 
 Before feeding tool results back to the LLM, `sanitize_tool_output()` (in `sanitize.rs`) strips noise:
 - **Base64 data URIs**: `data:...;base64,<payload>` → `[base64-data-redacted]`
 - **Long hex strings**: 64+ contiguous hex chars (SHA-256, raw keys) → `[hex-redacted]`
 
-### Context Compaction
+### Context Compaction (three-tier — M8.5)
+
+`compaction_tiered.rs` introduces three tiers of history retention:
+
+1. **Working** — most recent N messages kept verbatim (don't split tool pairs)
+2. **Cold** — older messages summarized to first line (200 chars), tool args stripped
+3. **Archived** — pushed to long-term memory (entity bank), referenced by digest
 
 Triggered when estimated tokens exceed 80% of context window / 1.2 safety margin.
-
-**Algorithm**:
-1. Keep MIN_RECENT_MESSAGES (6) most recent non-system messages
-2. Don't split inside tool call/result pairs
-3. Summarize old messages: first line (200 chars), strip tool arguments, drop media
-4. Budget: 40% of total for summary (BASE_CHUNK_RATIO = 0.4)
-5. Replace: `[System, CompactionSummary, Recent1, Recent2, ...]`
 
 **Format**:
 - User: `> User: first line [media omitted]`
@@ -544,11 +591,35 @@ Triggered when estimated tokens exceed 80% of context window / 1.2 safety margin
 
 ### Bundled App Skills (`bundled_app_skills.rs`)
 
-Compile-time embedded app-skill entries. Each app-skill crate (news, deep-search, deep-crawl, etc.) is registered as a bundled skill available at runtime.
+`BUNDLED_APP_SKILLS` is a `&[(dir_name, binary_name, SKILL.md, manifest.json)]` slice of nine entries — the only app-skills that ship inside the `octos` binary and get auto-installed at gateway startup:
+
+| dir | binary | purpose |
+|---|---|---|
+| `news` | `news_fetch` | News digest |
+| `deep-search` | `deep-search` | Multi-step research (plugin protocol v2) |
+| `deep-crawl` | `deep_crawl` | Site crawl + synthesis (plugin protocol v2) |
+| `send-email` | `send_email` | SMTP send |
+| `account-manager` | `account_manager` | Sub-account ops |
+| `time` | `clock` | Time/timezone |
+| `weather` | `weather` | Weather API |
+| `pipeline-guard` | `pipeline-guard` | DOT pipeline before-hook validator |
+| `skill-evolve` | `skill-evolve` | Patch-management for skill SKILL.md drift |
+
+`PLATFORM_SKILLS` adds one more entry — `voice` — bootstrapped once by `octos serve` at admin-bot startup, shared across all gateway profiles, only installed when its OminiX-API backend is reachable. Voice cloning is **not** part of the platform voice skill — it is handled by the separate `mofa-fm` skill (`fm_tts`).
+
+The other workspace `app-skills/*` crates (`harness-starter-{audio,coding,generic,report}`, `wechat-bridge`) are **not** in `BUNDLED_APP_SKILLS`. They build as part of `cargo build --workspace` but are not auto-installed by the gateway; harness-starters are templates new skill authors copy, and `wechat-bridge` is a WebSocket transport helper rather than a tool-providing skill.
 
 ### Bootstrap (`bootstrap.rs`)
 
-Bootstraps bundled skills at gateway startup. Ensures all bundled app-skills are registered and available.
+`bootstrap.rs` writes the contents of each `BUNDLED_APP_SKILLS` entry into `~/.octos/bundled-app-skills/<dir>/` (constant: `BUNDLED_APP_SKILLS_DIR = "bundled-app-skills"`) at gateway startup, then drops the matching binary alongside it. The runtime resolves these in addition to user-installed skills under `~/.octos/skills/` and per-profile `~/.octos/profiles/<id>/data/skills/`. Operators or sideloaded user skills go into `~/.octos/skills/` so they aren't overwritten on next bootstrap.
+
+### Sub-Agent Output Router (M8.7)
+
+`subagent_output.rs` and `subagent_summary.rs` route output from spawned sub-agents back to the parent session. Long sub-agent transcripts are summarized by `AgentSummaryGenerator` and surfaced as a compact summary in parent context, with the full transcript persisted for inspection.
+
+### Task Supervisor (`task_supervisor.rs`)
+
+Bounded supervisor that owns the lifecycle of agent tasks. Caps fan-out (#610 fleet-stability). Reaps orphan tasks (#609). Validates audio attachments (header + silence + duration). Coordinates cancel/restart with the swarm + pipeline hosts.
 
 ### Prompt Guard (`prompt_guard.rs`)
 
@@ -595,14 +666,21 @@ pub struct ToolResult {
 | **browser** | action, url?, selector?, text?, expression? | Headless Chrome via CDP (always compiled). Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
 | **send_file** | path, caption? | Delivers files to chat channels via OutboundMessage. Path validated against `data_dir`. **Gateway-only** |
 | **git** | subcommand, args | Git operations within workspace |
-| **diff_edit** | path, diff | Unified diff with fuzzy matching (+-3 lines), reverse hunk application |
-| **save_memory** | key, content | Persist memory entries |
-| **recall_memory** | query | Retrieve relevant memories via hybrid search |
-| **deep_search** | query | Multi-step research with web search + synthesis |
-| **site_crawl** | url, depth? | Crawl website pages for content extraction |
-| **take_photo** | — | Camera capture (platform-skill integration) |
+| **save_memory** | name, content | Save / update an entity page in the memory bank. `name` is slugified (lowercase, spaces → hyphens); `content` is full markdown. `Exclusive` concurrency to avoid mid-write reads. |
+| **recall_memory** | name | Load the full markdown content of a memory bank entity by name. Names are listed in the Memory Bank section of the system prompt. |
+| **deep_search** | query | Multi-step research (built-in entrypoint into the deep-search app-skill) |
+| **deep_crawl** | url, max_depth, max_pages, path_prefix? | Recursively crawl a website via headless Chrome (CDP), extract text, save to disk. **All three of `url`, `max_depth` (1-10), `max_pages` (1-100) are required** — the description prompts the LLM to ask the user before calling. Source: `tools/site_crawl.rs` — the file name is historical; `Tool::name()` returns `"deep_crawl"`. |
+| **synthesize_research** | … | Synthesis pass paired with `deep_search` / `deep_crawl` (plugin protocol v2 wiring). |
 | **code_structure** | path? | Extract code structure (AST-based) |
 | **manage_skills** | action, name? | List/install/remove skills programmatically |
+| **configure_tool** | tool, settings | Per-tool runtime config overrides (source: `tools/tool_config.rs`) |
+| **delegate_task** | … | Scoped child agent (M8.7 sub-agent output router) |
+| **check_background_tasks** | — | Inspect outstanding background / `spawn_only` tasks held by `task_supervisor` |
+| **activate_tools** | groups | Pull deferred LRU-evicted tools back into the active registry |
+| **check_workspace_contract** | — | Verify the worktree against `workspace_contract.rs` invariants |
+| **workspace_log** | project, limit? | Git `log --oneline --all -n <limit>` for a workspace project (e.g. `slides/my-deck`, `sites/blog`). Default `limit=20`, capped at 100. Source: `tools/workspace_history.rs:101`. |
+| **workspace_show** | project, commit, file | Read a file at a specific commit (`git show <commit>:<file>`). All three fields required. Source: `tools/workspace_history.rs:199`. |
+| **workspace_diff** | project, from_commit, to_commit?, file? | Diff two commits (`from_commit..to_commit`); `to_commit` defaults to `HEAD`; `file` optionally scopes the diff. Source: `tools/workspace_history.rs:322`. |
 
 **Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, send_file, and cron are registered only in gateway mode (`gateway.rs`).
 
@@ -615,7 +693,17 @@ pub struct ToolPolicy {
 }
 ```
 
-**Groups**: `group:fs` (read_file, write_file, edit_file, diff_edit), `group:runtime` (shell), `group:web` (web_search, web_fetch, browser), `group:search` (glob, grep, list_dir), `group:sessions` (spawn).
+**Groups** (`TOOL_GROUPS` in `tools/policy.rs:154-223`):
+- `group:fs` — read_file, write_file, edit_file, diff_edit
+- `group:runtime` — shell
+- `group:web` — web_search, web_fetch, browser
+- `group:search` — glob, grep, list_dir
+- `group:sessions` — spawn
+- `group:memory` — recall_memory, save_memory
+- `group:research` — deep_search, synthesize_research, deep_crawl
+- `group:admin` — manage_skills, configure_tool, model_check
+- `group:media` — mofa_comic, mofa_slides, mofa_infographic, mofa_cards, fm_tts, fm_voice_list
+- `group:delegated` — delegate_task, spawn, send_message, message, save_memory, execute_code (canonical deny list every DelegateTool child receives; deny-wins recursion gates re-delegation, background spawning, user messaging, memory writes, and arbitrary code execution)
 
 **Wildcards**: `exec*` matches prefix. Provider-specific policies via config `tools.byProvider`.
 
@@ -631,9 +719,13 @@ pub enum Decision { Allow, Deny, Ask }
 
 ### Sandbox
 
+Sandbox backends live in `crates/octos-agent/src/sandbox/` (directory) — `mod.rs`, `bwrap.rs`, `docker.rs`, `macos.rs`, `windows.rs`.
+
 ```rust
-pub enum SandboxMode { Auto, Bwrap, Macos, Docker, None }
+pub enum SandboxMode { Auto, Bwrap, Macos, Docker, AppContainer, None }
 ```
+
+`Auto` selects per-OS: Bwrap on Linux, Macos on macOS, AppContainer on Windows.
 
 **BLOCKED_ENV_VARS** (18 vars, shared across all backends + MCP):
 `LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH, DYLD_FRAMEWORK_PATH, DYLD_FALLBACK_LIBRARY_PATH, DYLD_VERSIONED_LIBRARY_PATH, NODE_OPTIONS, PYTHONSTARTUP, PYTHONPATH, PERL5OPT, RUBYOPT, RUBYLIB, JAVA_TOOL_OPTIONS, BASH_ENV, ENV, ZDOTDIR`
@@ -641,10 +733,13 @@ pub enum SandboxMode { Auto, Bwrap, Macos, Docker, None }
 | Backend | Isolation | Network | Path Validation |
 |---|---|---|---|
 | **Bwrap** (Linux) | RO bind /usr,/lib,/bin,/sbin,/etc; RW bind workdir; tmpfs /tmp; unshare-pid | `--unshare-net` if !allow_network | N/A |
-| **Macos** (sandbox-exec) | SBPL profile: process-exec/fork, file-read*, writes to workdir+/private/tmp | `(allow network*)` or `(deny network*)` | Rejects control chars, `(`, `)`, `\`, `"` |
+| **Macos** (sandbox-exec) | SBPL profile: process-exec/fork, file-read*, writes to workdir+/private/tmp; per-user workspace path substituted into SBPL `subpath` | `(allow network*)` or `(deny network*)` | Rejects control chars, `(`, `)`, `\`, `"` |
 | **Docker** | `--rm --security-opt no-new-privileges --cap-drop ALL` | `--network none` | Rejects `:`, `\0`, `\n`, `\r` |
+| **AppContainer** (Windows) | Wraps the helper binary in `crates/octos-sandbox/` (built on `rappct`); per-process AppContainer SID, restricted token, low-IL workdir | Per-capability network restriction | Rejects control chars, NUL, drive escape |
 
 **Docker resource limits**: `--cpus`, `--memory`, `--pids-limit`. Mount modes: None (/tmp workdir), ReadOnly, ReadWrite.
+
+**Read isolation**: SBPL on macOS supports `read_allow_paths` so the agent can be granted minimum-necessary read access (e.g. just the project directory + system libs) instead of full file-read.
 
 ### Hooks System
 
@@ -1012,9 +1107,12 @@ Detects repetitive agent behavior (e.g., calling the same tool with same args). 
 
 `create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessages; BusPublisher dispatches OutboundMessages.
 
-**Queue Modes** (configured via `gateway.queue_mode`):
-- `Followup` (default): FIFO — process queued messages one at a time
-- `Collect`: Merge queued messages by session, concatenating content before processing
+**Queue Modes** (configured via `gateway.queue_mode`, definition in `octos-cli/src/config.rs:649-663`):
+- `Followup`: FIFO — process queued messages one at a time
+- `Collect` (default): Merge queued messages by session, concatenating content before processing
+- `Steer`: Apply queued messages as a steer/redirect to the in-flight turn
+- `Interrupt`: Cancel the in-flight turn and start a new one
+- `Speculative`: Run a parallel speculative turn while the in-flight one finishes
 
 ### Channel Trait
 
@@ -1034,13 +1132,18 @@ pub trait Channel: Send + Sync {
 | Channel | Transport | Feature Flag | Auth | Dedup |
 |---|---|---|---|---|
 | **CLI** | stdin/stdout | (always) | N/A | N/A |
+| **API** | HTTP/SSE (axum) | (always) | Bearer token | seq number |
 | **Telegram** | teloxide long-poll | `telegram` | Bot token (env) | teloxide built-in |
 | **Discord** | serenity gateway | `discord` | Bot token (env) | serenity built-in |
 | **Slack** | Socket Mode (tokio-tungstenite) | `slack` | Bot token + App token | message_ts |
 | **WhatsApp** | WebSocket bridge (ws://localhost:3001) | `whatsapp` | Baileys bridge | HashSet (10K cap, clear on overflow) |
+| **Matrix** | Matrix Application Service (MSC4357 finish_stream) | `matrix` | AS token + HS URL | event_id |
 | **Feishu** | WebSocket (tokio-tungstenite) | `feishu` | App ID + Secret → tenant token (TTL 6000s) | HashSet (10K cap, clear on overflow) |
 | **Email** | IMAP poll + SMTP send | `email` | Username/password, rustls TLS | IMAP UNSEEN flag |
-| **WeCom** | WeCom/WeChat Work API | `wecom` | Corp ID + Agent Secret | message_id |
+| **WeChat** | WeChat OA (via `wechat-bridge` skill) | `wechat` | Bridged credentials | message_id |
+| **WeCom** | WeCom/WeChat Work API (corp app) | `wecom` | Corp ID + Agent Secret | message_id |
+| **WeCom Bot** | WeCom group-bot webhook | `wecom_bot` | Webhook key | seq |
+| **QQ Bot** | QQ Open Platform bot | `qq_bot` | App ID + Token | message_id |
 | **Twilio** | Twilio SMS/MMS | `twilio` | Account SID + Auth Token | message SID |
 
 **Email specifics**: IMAP `async-imap` with rustls for inbound (poll unseen, mark \Seen). SMTP `lettre` for outbound (port 465=implicit TLS, other=STARTTLS). `mailparse` for RFC822 body extraction. Body truncated via `truncate_utf8(max_body_chars)`.
@@ -1113,7 +1216,7 @@ Periodic check of `HEARTBEAT.md` (default: 30 min interval). Sends content to ag
 | `clean` | Remove .redb files with dry-run support |
 | `completions` | Shell completion generation (bash/zsh/fish) |
 | `docs` | Generate tool + provider documentation |
-| `serve` | REST API server (feature: api) — axum on 127.0.0.1:8080 (`--host` to override) |
+| `serve` | REST API server (feature: api) — axum on 127.0.0.1:8080 (`--host` to override). On first launch with no admin profile, the embedded dashboard runs the **setup wizard** (deployment-mode → SMTP → LLM provider → admin profile). Setup endpoints under `/api/admin/setup/{state,step,complete,skip}`. |
 
 ### Configuration
 
@@ -1174,7 +1277,20 @@ Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summari
 
 ## octos-plugin — Plugin SDK
 
-Standalone crate for plugin manifest parsing, discovery, and gating. Used by `octos-agent/src/plugins/` for loading plugins at runtime.
+Standalone crate for plugin manifest parsing, discovery, gating, and lifecycle. Used by `octos-agent/src/plugins/` for loading plugins at runtime.
+
+Source layout:
+
+```
+crates/octos-plugin/src/
+├── lib.rs
+├── manifest.rs       # PluginManifest, Requirements, InstallSpec
+├── discovery.rs      # Directory scan + precedence
+├── gating.rs         # Binary / env / OS checks
+├── lifecycle.rs      # Spawn/stop/restart helpers
+├── protocol_v2.rs    # Structured stderr events (LogEvent, PhaseEvent, ProgressEvent, CostEvent, ArtifactEvent) + synthesis flow
+└── types.rs
+```
 
 **PluginType** enum: `Tool`, `Skill`, `Channel`, `Hook`. Inferred from manifest if not explicit (`tools` non-empty → Tool, else Skill).
 
@@ -1183,6 +1299,20 @@ Standalone crate for plugin manifest parsing, discovery, and gating. Used by `oc
 **InstallSpec**: Declarative install steps with `kind` (brew, apt, cargo, url), platform-specific formulas/packages, and provided binary names.
 
 **Discovery** (`discovery.rs`): Scans plugin directories with precedence (local `.octos/plugins/` before global `~/.octos/plugins/`).
+
+**Plugin Protocol v2** (`protocol_v2.rs`): Skills can opt in to a richer reporting protocol by setting `protocol_version: 2` in the manifest. In addition to the v1 stdin/stdout JSON contract, v2 plugins emit structured **events on stderr**, one JSON object per line:
+
+| Event | Purpose |
+|---|---|
+| `LogEvent` | Free-form text log line |
+| `PhaseEvent` | Phase transitions (`planning`, `searching`, `synthesizing`, …) |
+| `ProgressEvent` | Numeric progress (current/total + label) |
+| `CostEvent` | Per-step token + USD cost — rolls up via `cost_ledger.rs` |
+| `ArtifactEvent` | Pointer to a produced artifact (file path or URL) |
+
+Synthesis-style skills (`deep-search`, `deep-crawl`) declare `synthesis_config` so the host injects the correct LLM provider/model and forwards env keys via `x-octos-host-config-keys`.
+
+Contract tests live at `crates/octos-plugin/tests/lifecycle_sandbox.rs`.
 
 ---
 
@@ -1207,6 +1337,32 @@ DOT-based pipeline orchestration engine for defining and executing multi-step wo
 - `events.rs` — Pipeline event system for progress tracking
 - `run_dir.rs` — Per-run working directories with isolation
 - `stylesheet.rs` — Visual styling for pipeline graph rendering
+
+**Fleet stability** (#610): pipeline fan-out, swarm dispatcher, and `spawn` tool all share a bounded-supervisor cap so a single profile cannot exhaust runner resources. `node_costs` are plumbed through tool result + SSE done event for accurate per-pipeline cost rollup. Plugin loading is cached across nodes (#603).
+
+---
+
+## octos-swarm — Swarm / PM Dispatcher
+
+Fan-out / sequence / pipeline orchestrator over MCP-backed sub-agents.
+
+```
+crates/octos-swarm/src/
+├── lib.rs
+├── dispatcher.rs   # Fan-out a contract to N sub-agents, gather artifacts
+├── ledger.rs       # Per-dispatch ledger of inputs / outputs / cost
+├── topology.rs     # Sequence vs. fan-out vs. pipeline shapes
+├── persistence.rs  # Resume support
+└── result.rs       # SwarmResult — artifacts, cost, validator verdict
+```
+
+Wired into REST under `/api/swarm/dispatch` and `/api/swarm/dispatches/*`.
+
+---
+
+## octos-sandbox — Windows AppContainer Helper
+
+Standalone helper binary (`crates/octos-sandbox/src/main.rs`) that wraps a child process inside a Windows AppContainer using the `rappct` library. The agent invokes this binary on Windows when `SandboxMode::AppContainer` is selected (or via `Auto` on Windows). The bwrap / sandbox-exec / Docker code paths still live in `octos-agent/src/sandbox/` — `octos-sandbox` is specifically the Windows complement.
 
 ---
 
@@ -1283,47 +1439,87 @@ twilio   = ["octos-bus/twilio"]
 ```
 crates/
 ├── octos-core/src/
-│   ├── lib.rs, task.rs, types.rs, error.rs, gateway.rs, message.rs, utils.rs
+│   └── lib.rs, task.rs, types.rs, error.rs, gateway.rs, message.rs, utils.rs
 ├── octos-llm/src/
 │   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, failover.rs, sse.rs
 │   ├── embedding.rs, pricing.rs, context.rs, transcription.rs, vision.rs
-│   ├── adaptive.rs, swappable.rs, router.rs, ominix.rs
+│   ├── adaptive.rs, swappable.rs, router.rs, ominix.rs, catalog.rs
 │   ├── anthropic.rs, openai.rs, gemini.rs, openrouter.rs  (protocol impls)
-│   └── registry/ (mod.rs + 14 provider entries: anthropic, openai, gemini,
-│                   openrouter, deepseek, groq, moonshot, dashscope, minimax,
-│                   zhipu, zai, nvidia, ollama, vllm)
+│   └── registry/  (mod.rs + 15 provider entries)
 ├── octos-memory/src/
-│   ├── lib.rs, episode.rs, store.rs, memory_store.rs, hybrid_search.rs
+│   └── lib.rs, episode.rs, store.rs, memory_store.rs, hybrid_search.rs
 ├── octos-agent/src/
-│   ├── lib.rs, agent.rs, progress.rs, policy.rs, compaction.rs, sanitize.rs, hooks.rs
-│   ├── sandbox.rs, mcp.rs, skills.rs, builtin_skills.rs
-│   ├── bundled_app_skills.rs, bootstrap.rs, prompt_guard.rs
-│   ├── plugins/ (mod.rs, loader.rs, manifest.rs, tool.rs)
-│   ├── skills/ (cron, skill-store, skill-creator SKILL.md)
-│   └── tools/ (mod, policy, shell, read_file, write_file, edit_file, diff_edit,
-│               list_dir, glob_tool, grep_tool, web_search, web_fetch,
-│               message, spawn, browser, ssrf, tool_config,
-│               deep_search, site_crawl, recall_memory, save_memory,
-│               send_file, take_photo, code_structure, git,
-│               deep_research_pipeline, synthesize_research, research_utils,
-│               admin/ (profiles, skills, sub_accounts, system,
-│                       platform_skills, update))
+│   ├── lib.rs, behaviour.rs, bootstrap.rs, builtin_skills.rs,
+│   │  bundled_app_skills.rs, compaction.rs, compaction_tiered.rs,
+│   │  cost_ledger.rs, event_bus.rs, exec_env.rs, file_state_cache.rs,
+│   │  harness_errors.rs, harness_events.rs, hooks.rs, loop_detect.rs,
+│   │  mcp.rs, mcp_server.rs, permissions.rs, policy.rs, progress.rs,
+│   │  prompt_guard.rs, prompt_layer.rs, provider_tools.rs, sanitize.rs,
+│   │  session.rs, skills.rs, steering.rs, subagent_output.rs,
+│   │  subagent_summary.rs, subprocess_env.rs, summarizer.rs,
+│   │  task_supervisor.rs, turn.rs, validators.rs,
+│   │  workspace_contract.rs, workspace_git.rs, workspace_policy.rs
+│   ├── agent/ (mod, loop_runner, loop_state, loop_compaction, llm_call,
+│   │           execution, streaming, realtime, memory, turn_state,
+│   │           activity, budget, compaction, detection, message_repair)
+│   ├── agents/        (M8.2 agent definition manifest)
+│   ├── profile/       (M8.3 profile system)
+│   ├── prompts/       (layered system prompt assembly)
+│   ├── sandbox/       (mod, bwrap, macos, docker, windows)
+│   ├── plugins/       (mod, loader, manifest, tool, lifecycle)
+│   ├── skills/        (cron, skill-store, skill-creator SKILL.md)
+│   └── tools/         (mod, policy, registry, shell, read_file, write_file,
+│                        edit_file, diff_edit, list_dir, glob_tool,
+│                        grep_tool, web_search, web_fetch, message,
+│                        spawn, delegate, browser, ssrf,
+│                        check_background_tasks, tool_config,
+│                        activate_tools, check_workspace_contract,
+│                        deep_search, site_crawl  (registers as deep_crawl),
+│                        recall_memory, save_memory, send_file,
+│                        code_structure, git, synthesize_research,
+│                        research_utils, manage_skills, mcp_agent,
+│                        robot_groups, workspace_history,
+│                        admin/ (profiles, skills, sub_accounts, system,
+│                                platform_skills, voice_clones, update))
 ├── octos-bus/src/
 │   ├── lib.rs, bus.rs, channel.rs, session.rs, coalesce.rs, media.rs
-│   ├── cli_channel.rs, telegram_channel.rs, discord_channel.rs
-│   ├── slack_channel.rs, whatsapp_channel.rs, feishu_channel.rs, email_channel.rs
-│   ├── wecom_channel.rs, twilio_channel.rs, markdown_html.rs
-│   ├── cron_service.rs, cron_types.rs, heartbeat.rs
-└── octos-cli/src/
-    ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs
-    ├── auth/ (mod.rs, store.rs, oauth.rs, token.rs)
-    ├── api/ (mod.rs, router.rs, handlers.rs, sse.rs, metrics.rs, static_files.rs)
-    └── commands/ (mod, chat, init, status, gateway, clean,
-                   completions, cron, channels, auth, skills, docs, serve,
-                   office, account)
+│   ├── api_channel.rs, cli_channel.rs, telegram_channel.rs,
+│   │  discord_channel.rs, slack_channel.rs, whatsapp_channel.rs,
+│   │  matrix_channel.rs, feishu_channel.rs, email_channel.rs,
+│   │  wechat_channel.rs, wecom_channel.rs, wecom_bot_channel.rs,
+│   │  qq_bot_channel.rs, twilio_channel.rs, markdown_html.rs
+│   └── cron_service.rs, cron_types.rs, heartbeat.rs, resume_policy.rs
+├── octos-cli/src/
+│   ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs
+│   ├── auth/      (mod, store, oauth, token)
+│   ├── api/       (mod, router, handlers, sse, metrics, static_files,
+│   │               admin_setup [first-run wizard])
+│   └── commands/  (mod, chat, init, status, gateway, clean,
+│                    completions, cron, channels, auth, skills, docs,
+│                    serve, office, account)
 ├── octos-pipeline/src/
 │   ├── lib.rs, parser.rs, graph.rs, executor.rs, handler.rs
-│   ├── condition.rs, tool.rs, validate.rs
+│   ├── condition.rs, tool.rs, validate.rs, human_gate.rs, fidelity.rs
+│   ├── manager.rs, thread.rs, server.rs, artifact.rs, checkpoint.rs
+│   ├── events.rs, run_dir.rs, stylesheet.rs
+├── octos-plugin/src/
+│   ├── lib.rs, manifest.rs, discovery.rs, gating.rs, lifecycle.rs,
+│   │  protocol_v2.rs, types.rs
+├── octos-sandbox/src/
+│   └── main.rs    (Windows AppContainer helper binary)
+├── octos-swarm/src/
+│   └── lib.rs, dispatcher.rs, ledger.rs, topology.rs,
+│       persistence.rs, result.rs
+├── app-skills/    (14 workspace crates; only 9 are auto-bootstrapped via
+│                    BUNDLED_APP_SKILLS:
+│                      news, deep-search, deep-crawl, send-email,
+│                      account-manager, time, weather, pipeline-guard,
+│                      skill-evolve.
+│                    Workspace-only (not bundled):
+│                      harness-starter-{audio, coding, generic, report},
+│                      wechat-bridge)
+└── platform-skills/voice/   (preset-voice TTS + ASR via OminiX-API.
+                              Cloning lives in mofa-fm / fm_tts, not here.)
 ```
 
 ---
@@ -1340,10 +1536,11 @@ crates/
 - Constant-time byte comparison for API bearer tokens (timing attack prevention)
 
 ### Execution Sandbox
-- Three backends: bwrap (Linux), sandbox-exec (macOS), Docker — `SandboxMode::Auto` detection
-- 18 BLOCKED_ENV_VARS shared across all sandbox backends, MCP server spawning, and browser tool
+- Four backends: bwrap (Linux), sandbox-exec (macOS), Docker, Windows AppContainer (via `octos-sandbox` helper) — `SandboxMode::Auto` detection per OS
+- 18 BLOCKED_ENV_VARS shared across all sandbox backends, MCP server spawning, hooks, and browser tool
 - Path injection prevention per backend (Docker: `:`, `\0`, `\n`, `\r`; macOS: control chars, `(`, `)`, `\`, `"`)
 - Docker: `--cap-drop ALL`, `--security-opt no-new-privileges`, `--network none`
+- macOS SBPL: per-user workspace path substitution; `read_allow_paths` for read-isolation
 
 ### Tool Safety
 - ShellTool SafePolicy: deny `rm -rf /`, `dd`, `mkfs`, fork bombs; ask for `sudo`, `git push --force`. Whitespace-normalized before matching. Timeout clamped to [1, 600]s.
@@ -1425,23 +1622,34 @@ LLM response: [web_search, read_file, send_email]
                     Next LLM call
 ```
 
-### Sub-Agent Modes (spawn tool)
+### Sub-Agent Modes (spawn / delegate / swarm)
 
-| Aspect | Sync | Background |
-|--------|------|------------|
-| Parent blocks? | Yes | No (`tokio::spawn()`) |
-| Result delivery | Same conversation turn | New inbound message via gateway |
-| Token accounting | Counted toward parent budget | Independent |
-| Use case | Sequential pipelines | Fire-and-forget long tasks |
+| Aspect | Sync `spawn` | Background `spawn` | `delegate` | Swarm dispatch |
+|--------|------|------------|------------|------|
+| Parent blocks? | Yes | No (`tokio::spawn()`) | Yes (one child) | No (fan-out) |
+| Result delivery | Same turn | New inbound message via gateway | Same turn, summarized | `/api/swarm/dispatch` poll |
+| Token accounting | Parent budget | Independent | Parent budget | Per-dispatch ledger |
+| Output handling | Inline | Inline summary + transcript file | M8.7 sub-agent output router | Aggregated artifacts |
+| Use case | Sequential pipeline | Fire-and-forget | One scoped child | N parallel sub-agents |
 
-Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy).
+`spawn_only` skill tools are intercepted at the execution layer and forced into background mode regardless of caller intent (`agent/execution.rs`). Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy via `group:delegated`).
+
+### Task Supervisor & Fleet Stability
+
+`task_supervisor.rs` owns the full lifecycle of agent tasks per profile:
+
+- **Bounded fan-out** (#610): swarm + pipeline + spawn share a global concurrency cap so a single profile cannot exhaust runner resources.
+- **Orphan-task reaper** (#609): tasks whose owning session has terminated are reaped and their resources released.
+- **Runtime failure recovery** (M8.9): when a `spawn_only` task fails, the supervisor re-engages the LLM with a structured-resume payload describing the failure rather than dropping the turn.
+- **Audio attachment validation**: header + silence + duration checks before persisting voice media.
 
 ### Multi-Tenant Dashboard
 
 The dashboard (`octos serve`) runs each user profile as a **separate gateway OS process**:
 
 ```
-Dashboard (octos serve)
+Dashboard (octos serve, ~140 REST endpoints)
+  ├─ First-run wizard → /api/admin/setup/{state,step,complete,skip}
   ├─ Profile "alice" → octos gateway --config alice.json  (deepseek, own semaphore)
   ├─ Profile "bob"   → octos gateway --config bob.json    (kimi, own semaphore)
   └─ Profile "carol" → octos gateway --config carol.json  (openai, own semaphore)
@@ -1449,19 +1657,29 @@ Dashboard (octos serve)
 
 Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. Profiles are fully isolated — no shared state between gateway processes.
 
+**Auto-rotate admin token** (#650): on `octos serve` boot, if a stored admin token is older than the configured threshold or has been invalidated, it is rotated automatically and the new value is persisted to `~/.octos/auth.json`.
+
+**Voice clone registration** (#653): voice cloning is owned by the separate `mofa-fm` skill (`fm_tts`), not the platform `voice` skill (which only does preset-voice TTS). Per-profile clone reference WAVs live under `~/.octos/profiles/<profile>/data/voice_profiles/*.wav`. On deploy, `scripts/register-fleet-voices.sh` merges those filenames into OminiX-API's `~/.OminiX/models/voices.json` on each fleet host so that `fm_tts`'s pre-call validation against `/v1/voices` succeeds. Without that merge step `fm_tts` rejects calls with `"voice 'X' is not registered on ominix-api"`.
+
 ---
 
 ## Testing
 
-1300+ tests across all crates. See [TESTING.md](./TESTING.md) for the full inventory and CI guide.
+See [TESTING.md](./TESTING.md) for the full inventory, focused subsystem suites, and CI guide.
 
-- **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction, coalescing, BM25 scoring, L2 normalization, SSE parsing
-- **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing (19 tests)
-- **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries (8 tests)
-- **Queue modes**: Followup, Collect, Steer, Speculative overflow, auto-escalation/deescalation (9 tests)
-- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access (28 tests)
+Highlights of the current suite:
+
+- **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction (incl. three-tier), coalescing, BM25 scoring, L2 normalization, SSE parsing
+- **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing
+- **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries
+- **Queue modes**: Followup, Collect, Steer, Interrupt, Speculative — overflow + auto-escalation/deescalation
+- **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (`crates/octos-bus/tests/jsonl_replay_thread_binding.rs`, #656)
+- **M8 runtime invariants**: `e2e/tests/m8-runtime-invariants-live.spec.ts` — sub-agent output router, structured resume, orphan reaper, supervisor caps
+- **Live progress gate**: `e2e/tests/live-progress-gate.spec.ts` — background-task UX (#655)
+- **Plugin contract**: `crates/octos-plugin/tests/lifecycle_sandbox.rs` — protocol v2 events
+- **Swarm contract**: `crates/octos-swarm/tests/{subtask_contracts,swarm_dispatch}.rs`
 - **Integration**: CLI commands, file tools, cron jobs, session forking, plugin loading
-- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session file size limits, circuit breaker threshold edge cases, MCP schema validation
-- **Channel**: allowed_senders, message parsing, dedup logic, email address extraction
+- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session file size limits, circuit breaker threshold edge cases, MCP schema validation, prompt-injection corpus (67 cases)
+- **Channel**: allowed_senders, message parsing, dedup logic, email address extraction, Matrix MSC4357 finish_stream
 
 Local CI: `./scripts/ci.sh` (mirrors GitHub Actions + focused subsystem tests). See [TESTING.md](./TESTING.md).

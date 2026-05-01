@@ -891,20 +891,28 @@ impl SwarmEventSink for BroadcasterSwarmEventSink {
 /// The wired event sink forwards every `HarnessSwarmDispatchEvent`
 /// through [`BroadcasterSwarmEventSink`] so the dashboard's Live tab +
 /// the M7.8 live gate both see frames on `/api/events/harness`.
+///
+/// M7 req 7: callers MAY pass a [`octos_swarm::DispatchPolicy`] to wire
+/// the swarm-level approval / tool-policy / sandbox / env-allowlist
+/// gates. Pass `None` for the legacy unenforced behaviour (existing
+/// integration tests pre-fix) — production deployments should pass a
+/// real policy.
 pub async fn build_swarm_state(
     backend: Arc<dyn McpAgentBackend>,
     swarm_dir: impl Into<std::path::PathBuf>,
     cost_ledger: Arc<PersistentCostLedger>,
     broadcaster: Arc<super::SseBroadcaster>,
     sink_path: Option<String>,
+    dispatch_policy: Option<octos_swarm::DispatchPolicy>,
 ) -> eyre::Result<SwarmState> {
     let swarm_dir = swarm_dir.into();
     let sink: Arc<dyn SwarmEventSink> =
         Arc::new(BroadcasterSwarmEventSink::new(broadcaster, sink_path));
-    let swarm = Swarm::builder(backend, &swarm_dir)
-        .with_event_sink(sink)
-        .build()
-        .await?;
+    let mut builder = Swarm::builder(backend, &swarm_dir).with_event_sink(sink);
+    if let Some(policy) = dispatch_policy {
+        builder = builder.with_dispatch_policy(policy);
+    }
+    let swarm = builder.build().await?;
     Ok(SwarmState {
         swarm: Arc::new(swarm),
         cost_ledger,

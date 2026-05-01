@@ -13,7 +13,7 @@ use crate::sandbox::BLOCKED_ENV_VARS;
 use crate::tools::{Tool, ToolRegistry};
 
 use super::extras::{SkillExtras, resolve_extras};
-use super::manifest::{PluginManifest, PluginToolDef};
+use super::manifest::{ConcurrencyClassClassification, PluginManifest, PluginToolDef};
 use super::tool::{PluginTool, SynthesisConfig};
 
 const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
@@ -41,6 +41,11 @@ pub struct PluginLoadResult {
     pub hooks: Vec<HookConfig>,
     /// Prompt fragments read from skill directories.
     pub prompt_fragments: Vec<String>,
+}
+
+struct LoadedPluginTool {
+    tool: PluginTool,
+    risk: Option<String>,
 }
 
 /// Optional knobs for plugin loading beyond `extra_env` and `work_dir`.
@@ -138,12 +143,19 @@ impl PluginLoader {
                     continue;
                 }
 
-                match Self::load_plugin_with_options(&path, extra_env, options.clone()) {
+                match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
                     Ok((tools, extras)) => {
                         let n = tools.len();
                         let spawn_only = extras.spawn_only_tools.clone();
-                        for tool in tools {
+                        for loaded in tools {
+                            let tool = loaded.tool;
                             let name = tool.name().to_string();
+                            let risk =
+                                octos_core::ui_protocol::manifest_tool_risk(loaded.risk.as_deref());
+                            octos_core::ui_protocol::register_tool_approval_risk(
+                                name.clone(),
+                                risk,
+                            );
                             result.tool_names.push(name.clone());
                             registry.mark_as_plugin(&name);
                             registry.register(tool);
@@ -226,6 +238,19 @@ impl PluginLoader {
         extra_env: &[(String, String)],
         options: PluginLoadOptions<'_>,
     ) -> Result<(Vec<PluginTool>, SkillExtras)> {
+        let (tools, extras) =
+            Self::load_plugin_with_options_and_risks(plugin_dir, extra_env, options)?;
+        Ok((
+            tools.into_iter().map(|loaded| loaded.tool).collect(),
+            extras,
+        ))
+    }
+
+    fn load_plugin_with_options_and_risks(
+        plugin_dir: &Path,
+        extra_env: &[(String, String)],
+        options: PluginLoadOptions<'_>,
+    ) -> Result<(Vec<LoadedPluginTool>, SkillExtras)> {
         let work_dir = options.work_dir;
         let synthesis_config = options.synthesis_config;
         let manifest_path = plugin_dir.join("manifest.json");
@@ -334,17 +359,25 @@ impl PluginLoader {
             .map(Duration::from_secs)
             .unwrap_or(PluginTool::DEFAULT_TIMEOUT);
 
-        // Collect spawn_only tool names and messages before consuming manifest.tools
+        // Collect spawn_only tool names and messages before consuming
+        // manifest.tools. Tools that fail manifest validation below are
+        // skipped — drop them from the spawn_only metadata too so the
+        // execution loop doesn't try to auto-background a tool that was
+        // never registered.
         let spawn_only_names: Vec<String> = manifest
             .tools
             .iter()
-            .filter(|t| t.spawn_only)
+            .filter(|t| t.spawn_only && t.validate_for_registration().is_ok())
             .map(|t| t.name.clone())
             .collect();
         let spawn_only_msgs: std::collections::HashMap<String, String> = manifest
             .tools
             .iter()
-            .filter(|t| t.spawn_only && t.spawn_only_message.is_some())
+            .filter(|t| {
+                t.spawn_only
+                    && t.spawn_only_message.is_some()
+                    && t.validate_for_registration().is_ok()
+            })
             .map(|t| {
                 (
                     t.name.clone(),
@@ -354,10 +387,44 @@ impl PluginLoader {
             .collect();
 
         let plugin_name = manifest.name.clone();
-        let tools: Vec<PluginTool> = manifest
+        let tools: Vec<LoadedPluginTool> = manifest
             .tools
             .into_iter()
-            .map(|def| {
+            .filter_map(|def| {
+                // M6 req 4: registration-time gate for env allowlist hygiene.
+                // A malformed manifest entry (empty name, '=', whitespace,
+                // process-hijack vars like LD_PRELOAD) is rejected here so
+                // the runtime allowlist gate cannot be subverted by a
+                // crafted entry that the runtime check would later
+                // mis-handle.
+                if let Err(err) = def.validate_for_registration() {
+                    warn!(
+                        plugin = %plugin_name,
+                        tool = %def.name,
+                        error = %err,
+                        "skipping plugin tool with invalid manifest field"
+                    );
+                    return None;
+                }
+                // Codex review #1 + issue #718: warn (don't reject) on
+                // unknown concurrency_class so authors notice typos like
+                // `"exclusive "` (trailing space → silently Safe) or
+                // `"exclusve"`. The runtime resolver in tool.rs now
+                // fails-closed to Exclusive on Unknown — matches MCP's
+                // `resolved_concurrency_class`. This warn keeps the
+                // misconfiguration visible even though it is no longer
+                // a silent downgrade.
+                if let ConcurrencyClassClassification::Unknown(raw) =
+                    def.classify_concurrency_class()
+                {
+                    warn!(
+                        plugin = %plugin_name,
+                        tool = %def.name,
+                        concurrency_class = %raw,
+                        "manifest declares unknown concurrency_class; falling back to Exclusive (fail-closed)"
+                    );
+                }
+                let manifest_risk = def.risk.clone();
                 let def = apply_builtin_env_allowlist(&plugin_name, def);
                 let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
@@ -374,7 +441,10 @@ impl PluginLoader {
                 if let Some(cfg) = synthesis_config.clone() {
                     tool = tool.with_synthesis_config(cfg);
                 }
-                tool
+                Some(LoadedPluginTool {
+                    tool,
+                    risk: manifest_risk,
+                })
             })
             .collect();
 
@@ -917,6 +987,93 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_loader_registers_manifest_approval_risk_and_overwrites_unspecified() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_plugin(root: &Path, plugin_name: &str, manifest: String) {
+            let plugin_dir = root.join(plugin_name);
+            std::fs::create_dir(&plugin_dir).unwrap();
+            std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+            let exec_path = plugin_dir.join(plugin_name);
+            std::fs::write(
+                &exec_path,
+                "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+            )
+            .unwrap();
+            std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let declared_tool = "risk_declared_tool";
+        let missing_tool = "risk_overwrite_missing_tool";
+        let blank_tool = "risk_overwrite_blank_tool";
+
+        let first_root = tempfile::tempdir().unwrap();
+        write_plugin(
+            first_root.path(),
+            "risk-plugin-first",
+            format!(
+                r#"{{
+                    "name": "risk-plugin-first",
+                    "version": "1.0",
+                    "tools": [
+                        {{"name": "{declared_tool}", "description": "declared", "risk": "medium"}},
+                        {{"name": "{missing_tool}", "description": "missing first", "risk": "high"}},
+                        {{"name": "{blank_tool}", "description": "blank first", "risk": "high"}}
+                    ]
+                }}"#
+            ),
+        );
+
+        let mut registry = ToolRegistry::new();
+        let first = PluginLoader::load_into(&mut registry, &[first_root.path().to_path_buf()], &[])
+            .unwrap();
+        assert_eq!(first.tool_count, 3);
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(declared_tool),
+            "medium"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(missing_tool),
+            "high"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(blank_tool),
+            "high"
+        );
+
+        let second_root = tempfile::tempdir().unwrap();
+        write_plugin(
+            second_root.path(),
+            "risk-plugin-second",
+            format!(
+                r#"{{
+                    "name": "risk-plugin-second",
+                    "version": "1.0",
+                    "tools": [
+                        {{"name": "{missing_tool}", "description": "missing second"}},
+                        {{"name": "{blank_tool}", "description": "blank second", "risk": "   "}}
+                    ]
+                }}"#
+            ),
+        );
+
+        let second =
+            PluginLoader::load_into(&mut registry, &[second_root.path().to_path_buf()], &[])
+                .unwrap();
+        assert_eq!(second.tool_count, 2);
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(missing_tool),
+            "unspecified"
+        );
+        assert_eq!(
+            octos_core::ui_protocol::tool_approval_risk(blank_tool),
+            "unspecified"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_loader_bootstraps_script_skill_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let plugin_dir = dir.path().join("mofa-publish");
@@ -952,6 +1109,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             spawn_only: false,
             env: vec!["EXISTING_ENV".to_string(), "GEMINI_API_KEY".to_string()],
+            risk: None,
             spawn_only_message: None,
             concurrency_class: None,
         };
@@ -975,6 +1133,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             spawn_only: false,
             env: vec![],
+            risk: None,
             spawn_only_message: None,
             concurrency_class: None,
         };
@@ -1211,5 +1370,83 @@ edition = "2021"
             prepared.get("synthesis_config").is_none(),
             "non-opted-in plugin must not see synthesis_config: {prepared}"
         );
+    }
+
+    /// M6 req 4: a manifest that declares an env allowlist entry whose
+    /// name is a known process-hijack var (`LD_PRELOAD`) must be rejected
+    /// at registration time so the malicious entry never reaches the
+    /// runtime gate.
+    #[cfg(unix)]
+    #[test]
+    fn loader_skips_tool_with_invalid_env_allowlist_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("evil-env-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "evil-env-plugin",
+                "version": "1.0",
+                "tools": [
+                    {"name": "good_tool", "description": "ok", "env": ["MY_VAR"]},
+                    {"name": "bad_tool", "description": "bad", "env": ["LD_PRELOAD"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let exec_path = plugin_dir.join("evil-env-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        // good_tool registered, bad_tool skipped.
+        assert_eq!(result.tool_count, 1);
+        assert!(result.tool_names.contains(&"good_tool".to_string()));
+        assert!(!result.tool_names.contains(&"bad_tool".to_string()));
+    }
+
+    /// Pin that registration-time validation rejects manifests with
+    /// `env` entries containing `=` (a shell-injection vector).
+    #[cfg(unix)]
+    #[test]
+    fn loader_skips_tool_with_equals_in_env_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("eq-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "eq-plugin",
+                "version": "1.0",
+                "tools": [{"name": "bad", "description": "d", "env": ["FOO=bar"]}]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("eq-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"ok\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 0);
     }
 }

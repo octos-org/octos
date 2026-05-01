@@ -7,11 +7,13 @@
 //! - Context and result types
 
 pub mod abort;
+pub mod app_ui;
 mod error;
 pub mod gateway;
 mod message;
 mod task;
 mod types;
+pub mod ui_protocol;
 mod utils;
 
 pub use abort::{abort_response, is_abort_trigger};

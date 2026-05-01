@@ -1473,10 +1473,26 @@ impl TaskSupervisor {
     }
 
     /// Mark a task as running.
+    ///
+    /// **M8 DoD gate (Req #4)**: this is a no-op when the task is already in
+    /// a terminal state. Without the guard a worker that races with `cancel()`
+    /// — e.g. cancel fires before the worker observes its cancel token, and
+    /// the worker still calls `mark_running` — could resurrect a `Cancelled`
+    /// task back to `Running`, undoing the user's cancellation.
     pub fn mark_running(&self, task_id: &str) {
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
+                if task.status.is_terminal() {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        current_status = task.status.as_str(),
+                        current_runtime_state = ?task.runtime_state,
+                        attempted_status = TaskStatus::Running.as_str(),
+                        "ignoring late mark_running: task already in terminal state",
+                    );
+                    return;
+                }
                 task.status = TaskStatus::Running;
                 task.runtime_state = TaskRuntimeState::ExecutingTool;
                 task.runtime_detail = None;
@@ -1494,6 +1510,12 @@ impl TaskSupervisor {
     }
 
     /// Update the fine-grained runtime state while keeping the coarse status.
+    ///
+    /// **M8 DoD gate (Req #4)**: this is a no-op when the task is already in
+    /// a terminal state (`Completed`/`Failed`/`Cancelled`). A late harness
+    /// event from a worker that already cancelled cannot otherwise flip the
+    /// stored `runtime_state` away from `Cancelled`, leaking incorrect
+    /// progress emissions and ledger snapshots.
     pub fn mark_runtime_state(
         &self,
         task_id: &str,
@@ -1503,6 +1525,16 @@ impl TaskSupervisor {
         let (snapshot, previous_detail) = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
+                if task.status.is_terminal() {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        current_status = task.status.as_str(),
+                        current_runtime_state = ?task.runtime_state,
+                        attempted_runtime_state = ?runtime_state,
+                        "ignoring late mark_runtime_state: task already in terminal state",
+                    );
+                    return;
+                }
                 let previous_detail = task.runtime_detail.clone();
                 task.runtime_state = runtime_state;
                 task.runtime_detail = runtime_detail;
@@ -1534,10 +1566,28 @@ impl TaskSupervisor {
     }
 
     /// Mark a task as completed with output files.
+    ///
+    /// **M8 DoD gate (Req #4)**: this is a no-op when the task is already in a
+    /// terminal state (`Completed`/`Failed`/`Cancelled`). The check + write
+    /// happen under the same lock as the rest of the supervisor so the guard
+    /// is a CAS-style atomic transition. A late-arriving worker that finishes
+    /// after the user has cancelled the task therefore *cannot* resurrect it
+    /// to `Completed`. The race is logged at `warn` so operators can observe
+    /// it.
     pub fn mark_completed(&self, task_id: &str, output_files: Vec<String>) {
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
+                if task.status.is_terminal() {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        current_status = task.status.as_str(),
+                        current_runtime_state = ?task.runtime_state,
+                        attempted_status = TaskStatus::Completed.as_str(),
+                        "ignoring late mark_completed: task already in terminal state",
+                    );
+                    return;
+                }
                 task.status = TaskStatus::Completed;
                 task.runtime_state = TaskRuntimeState::Completed;
                 task.updated_at = Utc::now();
@@ -1591,10 +1641,27 @@ impl TaskSupervisor {
     /// actor) can schedule a recovery turn. Re-marking an already-failed
     /// task is a no-op for the failure signal — this guarantees at most one
     /// recovery attempt per task even if multiple paths report the failure.
+    ///
+    /// **M8 DoD gate (Req #4)**: this is a no-op when the task is already
+    /// `Cancelled` or `Completed`. The check + write happen under the same
+    /// lock so a late worker that races with `cancel()` cannot overwrite a
+    /// `Cancelled` task to `Failed` (or a `Completed` task either). Re-marking
+    /// an already-`Failed` task is still allowed (idempotent) so existing
+    /// `was_already_failed` semantics are preserved.
     pub fn mark_failed(&self, task_id: &str, error: String) {
         let (snapshot, was_already_failed) = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
+                if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Completed) {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        current_status = task.status.as_str(),
+                        current_runtime_state = ?task.runtime_state,
+                        attempted_status = TaskStatus::Failed.as_str(),
+                        "ignoring late mark_failed: task already in terminal state",
+                    );
+                    return;
+                }
                 let already_failed = task.status == TaskStatus::Failed;
                 task.status = TaskStatus::Failed;
                 task.runtime_state = TaskRuntimeState::Failed;
@@ -3166,6 +3233,258 @@ mod tests {
         assert!(
             !cancels.is_empty(),
             "expected at least one cancelled ToolProgress, got: {tool_progress:?}"
+        );
+    }
+
+    // ────────── M8 Req #4 DoD: cancel cannot be overwritten by late workers ──────────
+
+    /// Race regression: a worker that finishes AFTER the user has cancelled
+    /// the task must NOT resurrect it to `Completed`. The supervisor's
+    /// `mark_completed` guard short-circuits when the task is already in a
+    /// terminal state. Asserts state stays `Cancelled`, the on_change callback
+    /// fires exactly twice (once for `mark_running`, once for `cancel`), and
+    /// the ProgressReporter does NOT emit a spurious "completed" event after
+    /// cancellation.
+    #[test]
+    fn mark_completed_after_cancel_does_not_overwrite_cancelled_state() {
+        use std::sync::Mutex;
+        let supervisor = TaskSupervisor::new();
+        let progress_events = collect_progress_events(&supervisor);
+        let on_change_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        {
+            let on_change_count = on_change_count.clone();
+            supervisor.set_on_change(move |_task| {
+                *on_change_count.lock().unwrap() += 1;
+            });
+        }
+
+        let task_id = supervisor.register("run_pipeline", "call-race-1", Some("session-X"));
+        supervisor.mark_running(&task_id); // notify #1
+        supervisor.cancel(&task_id).expect("cancel should succeed"); // notify #2
+
+        // Late-arriving worker tries to mark completed — this is the race.
+        supervisor.mark_completed(&task_id, vec!["late/output.bin".into()]); // must noop
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(
+            task.status,
+            TaskStatus::Cancelled,
+            "late mark_completed must NOT overwrite Cancelled state"
+        );
+        assert_eq!(task.runtime_state, TaskRuntimeState::Cancelled);
+        assert_eq!(task.lifecycle_state(), TaskLifecycleState::Cancelled);
+        assert!(
+            task.output_files.is_empty(),
+            "late completion's output_files must not leak onto a Cancelled task, got: {:?}",
+            task.output_files
+        );
+
+        // on_change must have fired exactly twice — guard noop must not
+        // double-fire the change callback.
+        assert_eq!(
+            *on_change_count.lock().unwrap(),
+            2,
+            "on_change should fire exactly twice (mark_running + cancel), not for the noop mark_completed"
+        );
+
+        // ProgressReporter must not have emitted any "completed" message
+        // after cancellation. We saw running + cancelled, but never completed.
+        let captured = progress_events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        let post_cancel_completed: Vec<_> = tool_progress
+            .iter()
+            .filter(|(_, _, message)| message.contains("completed"))
+            .collect();
+        assert!(
+            post_cancel_completed.is_empty(),
+            "guard must not emit 'completed' progress for a cancelled task, got: {tool_progress:?}"
+        );
+    }
+
+    /// Race regression mirror: a worker that fails AFTER the user has
+    /// cancelled the task must NOT overwrite the cancellation with a
+    /// `Failed` status. Without the guard this would corrupt the
+    /// dashboard ("user cancelled" silently flips to "the task crashed").
+    #[test]
+    fn mark_failed_after_cancel_does_not_overwrite_cancelled_state() {
+        use std::sync::Mutex;
+        let supervisor = TaskSupervisor::new();
+        let on_change_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        {
+            let on_change_count = on_change_count.clone();
+            supervisor.set_on_change(move |_task| {
+                *on_change_count.lock().unwrap() += 1;
+            });
+        }
+        let failure_signals: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        {
+            let failure_signals = failure_signals.clone();
+            supervisor.set_on_failure_signal(move |_signal| {
+                *failure_signals.lock().unwrap() += 1;
+            });
+        }
+
+        let task_id = supervisor.register("run_pipeline", "call-race-2", Some("session-Y"));
+        supervisor.mark_running(&task_id); // notify #1
+        supervisor.cancel(&task_id).expect("cancel should succeed"); // notify #2
+
+        // Late-arriving worker reports failure — guard must reject.
+        supervisor.mark_failed(&task_id, "late worker error".to_string());
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(
+            task.status,
+            TaskStatus::Cancelled,
+            "late mark_failed must NOT overwrite Cancelled state"
+        );
+        assert_eq!(task.runtime_state, TaskRuntimeState::Cancelled);
+        assert_eq!(
+            task.error.as_deref(),
+            Some("cancelled by supervisor"),
+            "cancel reason must survive the late mark_failed call"
+        );
+
+        assert_eq!(
+            *on_change_count.lock().unwrap(),
+            2,
+            "on_change should fire exactly twice (mark_running + cancel), not for the noop mark_failed"
+        );
+        assert_eq!(
+            *failure_signals.lock().unwrap(),
+            0,
+            "spawn-only failure signal must NOT fire for a cancelled task that hits the guard"
+        );
+    }
+
+    /// Idempotency: calling `mark_completed` twice on the same task should
+    /// be a no-op on the second call. The first call sets the terminal
+    /// state; the second hits the guard and warns. Output files do NOT
+    /// regress (the second call's payload is ignored), and the on_change /
+    /// progress reporter both fire exactly once for the real transition.
+    #[test]
+    fn mark_completed_after_completed_is_idempotent_and_warns() {
+        use std::sync::Mutex;
+        let supervisor = TaskSupervisor::new();
+        let progress_events = collect_progress_events(&supervisor);
+        let on_change_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        {
+            let on_change_count = on_change_count.clone();
+            supervisor.set_on_change(move |_task| {
+                *on_change_count.lock().unwrap() += 1;
+            });
+        }
+
+        let task_id = supervisor.register("podcast_generate", "call-race-3", None);
+        supervisor.mark_running(&task_id); // notify #1
+        supervisor.mark_completed(&task_id, vec!["output/first.mp3".into()]); // notify #2
+
+        // Second call must be a noop — no panic, no state regression.
+        supervisor.mark_completed(&task_id, vec!["output/second.mp3".into()]);
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(
+            task.output_files,
+            vec!["output/first.mp3".to_string()],
+            "second mark_completed must NOT replace the first call's output_files"
+        );
+
+        assert_eq!(
+            *on_change_count.lock().unwrap(),
+            2,
+            "on_change should fire exactly twice (mark_running + first mark_completed), not for the noop second call"
+        );
+
+        // Progress reporter should see at most one "completed" emission.
+        let captured = progress_events.lock().unwrap().clone();
+        let tool_progress = extract_tool_progress(&captured);
+        let completed_emissions: Vec<_> = tool_progress
+            .iter()
+            .filter(|(_, _, message)| message.contains("completed"))
+            .collect();
+        assert_eq!(
+            completed_emissions.len(),
+            1,
+            "expected exactly one 'completed' progress emission, got: {tool_progress:?}"
+        );
+    }
+
+    /// Race regression: a worker that calls `mark_running` AFTER the user has
+    /// cancelled the task must NOT resurrect it to `Running`. This is the
+    /// subtle case that hides under register → cancel-before-running →
+    /// worker still observes the spawn and tries to flip Running before
+    /// noticing the cancel token.
+    #[test]
+    fn mark_running_after_cancel_does_not_overwrite_cancelled_state() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("run_pipeline", "call-race-4", Some("session-Z"));
+        // Cancel BEFORE mark_running — exercises the "cancelled while still
+        // Spawned" branch of the race window.
+        supervisor.cancel(&task_id).expect("cancel should succeed");
+
+        // Late worker tries to mark running — must noop.
+        supervisor.mark_running(&task_id);
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(
+            task.status,
+            TaskStatus::Cancelled,
+            "late mark_running must NOT overwrite Cancelled state"
+        );
+        assert_eq!(task.runtime_state, TaskRuntimeState::Cancelled);
+    }
+
+    /// Race regression: a worker that emits a harness progress event AFTER
+    /// the user has cancelled the task must NOT corrupt the stored
+    /// `runtime_state` away from `Cancelled`. Without the guard, ledger
+    /// snapshots and progress emissions would flip to e.g. `executing_tool`
+    /// even though the public `status` is still `Cancelled`.
+    #[test]
+    fn mark_runtime_state_after_cancel_does_not_overwrite_cancelled_runtime_state() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("run_pipeline", "call-race-5", Some("session-W"));
+        supervisor.mark_running(&task_id);
+        supervisor.cancel(&task_id).expect("cancel should succeed");
+
+        // Late worker reports a phase update — must noop.
+        supervisor.mark_runtime_state(
+            &task_id,
+            TaskRuntimeState::DeliveringOutputs,
+            Some(r#"{"workflow_kind":"podcast","current_phase":"render"}"#.into()),
+        );
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(
+            task.runtime_state,
+            TaskRuntimeState::Cancelled,
+            "late mark_runtime_state must NOT overwrite Cancelled runtime_state"
+        );
+    }
+
+    /// Race regression: late `mark_failed` after the task completed normally
+    /// must not flip a `Completed` task back to `Failed`. This exercises the
+    /// non-cancel branch of the new mark_failed guard.
+    #[test]
+    fn mark_failed_after_completed_does_not_overwrite_completed_state() {
+        let supervisor = TaskSupervisor::new();
+        let task_id = supervisor.register("podcast_generate", "call-race-6", None);
+        supervisor.mark_running(&task_id);
+        supervisor.mark_completed(&task_id, vec!["output/podcast.mp3".into()]);
+
+        // Late worker reports a failure — must noop.
+        supervisor.mark_failed(&task_id, "stale failure".to_string());
+
+        let task = supervisor.get_task(&task_id).expect("task still tracked");
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "late mark_failed must NOT overwrite Completed state"
+        );
+        assert!(
+            task.error.is_none(),
+            "Completed task must not gain an error from a late mark_failed, got: {:?}",
+            task.error
         );
     }
 

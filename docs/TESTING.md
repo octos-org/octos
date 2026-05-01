@@ -42,6 +42,90 @@ umbrella still runs `coding-hardcases.spec.ts` against `OCTOS_CREW_URL`,
 because those coding acceptance checks target the general chat/coding surface
 rather than the ocean deliverables host.
 
+### M9 App UI Integration Gate
+
+Use this gate for the `integrate/m9-appui-on-main` merge path. Run the commands
+from the repository root unless a command sets `--prefix e2e` or changes into
+`e2e`.
+
+```bash
+# 0. Confirm protocol-visible edits have an explicit review override or UPCR.
+./scripts/check-ui-protocol-upcr.sh
+
+# 1. Static Rust gates.
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+
+# 2. Full workspace test gate. Prefer the GitHub Actions shards on constrained
+# machines; the monolithic command remains useful on a large local runner.
+cargo test --workspace
+
+# CI-equivalent sharded fallback:
+cargo test -p octos-core
+cargo test -p octos-memory
+cargo test -p octos-llm --lib
+cargo test -p octos-llm --tests
+cargo test -p octos-bus
+cargo test -p octos-pipeline
+cargo test -p octos-plugin
+cargo test -p octos-swarm
+cargo test -p octos-agent --lib
+cargo test -p octos-agent --tests
+cargo test -p octos-cli --lib
+cargo test -p octos-cli --tests
+cargo test -p harness-starter-generic
+cargo test -p harness-starter-report
+cargo test -p harness-starter-audio
+cargo test -p harness-starter-coding
+cargo test --workspace --doc
+cargo test -p octos-cli --features api api::auth_handlers
+cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
+cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
+cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
+cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+cargo test -p octos-agent --test activate_tools_regression -- --nocapture
+
+# 3. Focused M9 Rust tests.
+cargo test -p octos-core ui_protocol -- --nocapture
+cargo test -p octos-core app_ui -- --nocapture
+cargo test -p octos-cli ui_protocol --features api -- --nocapture
+
+# 4. Build and boot a local API server for live browser/protocol checks.
+cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
+OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000
+curl -sf http://localhost:3000/api/status \
+  -H "Authorization: Bearer ci-test-token"
+
+# 5. M9 wire protocol Playwright gate against the local server.
+npm --prefix e2e install
+(
+  cd e2e
+  OCTOS_LIVE_URL=http://localhost:3000 \
+  OCTOS_LIVE_TOKEN=ci-test-token \
+  OCTOS_M9_APPROVAL_FIXTURE=1 \
+  OCTOS_M9_REPLAY_LOSSY_FIXTURE=1 \
+    npx playwright test --workers=1 tests/m9-protocol-*.spec.ts --reporter=line
+)
+
+# Equivalent tmux lane: boots its own fixture server on 127.0.0.1:50191.
+./e2e/tmux/run.sh m9-protocol
+
+# 6. TUI/protocol smoke lanes. The live lane boots its own server only when
+# OCTOS_TMUX_LIVE=1 is set.
+./e2e/tmux/run.sh default
+OCTOS_TMUX_LIVE=1 ./e2e/tmux/run.sh live
+
+# 7. Long-running real-LLM coding UX checks, only when provider keys are set.
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh queue
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh adaptive
+KIMI_API_KEY=... DEEPSEEK_API_KEY=... ./scripts/ux-test.sh session
+```
+
+The M9 Playwright harness reads `OCTOS_LIVE_URL`, `OCTOS_LIVE_TOKEN` (or
+`OCTOS_AUTH_TOKEN`), and optional `OCTOS_LIVE_PROFILE`. The fixture flags keep
+approval/replay cases deterministic for the protocol gate.
+
 ---
 
 ## CI Pipeline
@@ -61,14 +145,35 @@ rather than the ocean deliverables host.
 
 After the full workspace run, the CI script re-runs critical subsystems individually to surface failures clearly:
 
-| Group | Crate | Test Filter | Count | What It Covers |
-|-------|-------|-------------|-------|----------------|
-| Adaptive routing | `octos-llm` | `adaptive::tests` | 19 | Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, racing |
-| Responsiveness | `octos-llm` | `responsiveness::tests` | 8 | Baseline learning, degradation detection, recovery, threshold boundaries |
-| Session actor | `octos-cli` | `session_actor::tests` | 9 | Queue modes, speculative overflow, auto-escalation/deescalation |
-| Session persistence | `octos-bus` | `session::tests` | 28 | JSONL storage, LRU eviction, fork, rewrite, timestamp sort |
+| Group | Crate | Test Filter | What It Covers |
+|-------|-------|-------------|----------------|
+| Adaptive routing | `octos-llm` | `adaptive::tests` | Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, racing |
+| Responsiveness | `octos-llm` | `responsiveness::tests` | Baseline learning, degradation detection, recovery, threshold boundaries |
+| Session actor | `octos-cli` | `session_actor::tests` | Queue modes (Followup/Collect/Steer/Interrupt/Speculative), overflow, auto-escalation/deescalation |
+| Session persistence | `octos-bus` | `session::tests` | JSONL storage, LRU eviction, fork, rewrite, timestamp sort, sticky thread_id |
+| Replay harness | `octos-bus` | `tests/jsonl_replay_thread_binding.rs` | thread_id binding correctness on JSONL fixtures (#656) |
+| Plugin lifecycle | `octos-plugin` | `tests/lifecycle_sandbox` | Plugin protocol v2 contract — log/phase/progress/cost/artifact events |
+| Swarm contract | `octos-swarm` | `tests/{subtask_contracts,swarm_dispatch}` | Swarm fan-out, ledger, validator gate |
+| Harness starters | `harness-starter-*` | `cargo test -p harness-starter-{audio,coding,generic,report}` | Starter-template skill binaries |
 
 Session actor tests always run single-threaded (`--test-threads=1`) because they spawn full actors with mock providers and can OOM under parallel execution.
+
+### Live-runtime E2E suites (Playwright, `e2e/tests/`)
+
+| Spec | What It Covers |
+|------|----------------|
+| `m8-runtime-invariants-live.spec.ts` | M8 runtime invariants: sub-agent output router, structured resume, supervisor caps, orphan reaper |
+| `live-progress-gate.spec.ts` | Background-task UX (#655) — progress gate, tool-retry collapse |
+| `live-thread-interleave.spec.ts` | Thread interleave + sticky thread_id behaviour (#630) |
+| `live-tool-retry-collapse.spec.ts` | Tool retry collapse on fast retry paths |
+| `session-recovery.spec.ts` | Session recovery after gateway restart |
+| `skill-compat-gate.spec.ts` | Skill ABI/manifest compatibility gate |
+| `harness-dashboard.spec.ts`, `coding-loop-dashboard.spec.ts` | Dashboard surfaces for harness + coding loop |
+| `live-pipeline-end-to-end.spec.ts`, `live-spawn-end-to-end.spec.ts` | Full pipeline + spawn end-to-end |
+| `live-cost-tracking.spec.ts`, `live-restart.spec.ts` | Cost rollup; restart preserves committed state |
+| `live-mofa-skills.spec.ts`, `live-slides-site.spec.ts` | Live skill flows for MOFA and slides |
+| `session-list-regression.spec.ts`, `tool-use-regression.spec.ts` | Regression suites |
+| `coding-hardcases.spec.ts` | Coding-acceptance hardcases (still targeted at `OCTOS_CREW_URL`) |
 
 ---
 
@@ -279,12 +384,10 @@ Tests JSONL-backed session storage with LRU caching.
 |------|---------------|
 | **Interrupt queue mode** | Same codepath as Steer — covered by `test_queue_mode_steer_keeps_newest` |
 | **Probe/canary requests** | Disabled in all tests via `probe_probability: 0.0` for determinism |
-| **Streaming (`chat_stream`)** | No mock streaming infrastructure; streaming tested manually |
-| **Session compaction** | Called in actor tests but output not verified (would need LLM mock for summarization) |
-| **Live provider integration** | Requires API keys; 1 test exists but marked `#[ignore]` |
+| **Streaming (`chat_stream`)** | Replay harness covers committed-seq replay; lower-level chunk assembly still tested manually |
+| **Live provider integration** | Requires API keys; live specs gated behind `--ignored` or env-key presence |
 | **Channel-specific routing** | Covered by channel crate tests, not part of this subsystem |
-| **⬆️ Earlier task marker** | Primary response gets "⬆️ Earlier task completed:" prefix when overflow was served; not directly asserted in tests (would need to inspect outbound content after a slow primary + fast overflow race) |
-| **Overflow agent tool execution** | `serve_overflow` spawns a full `agent.process_message_tracked()` with tool access; current tests use `DelayedMockProvider` which returns canned responses without tool calls |
+| **Overflow agent tool execution** | `serve_overflow` spawns a full agent task; tool-call coverage relies on the `live-spawn-end-to-end` Playwright suite rather than the unit harness |
 
 ---
 
@@ -324,8 +427,14 @@ The local `scripts/ci.sh` is a superset — it runs the same three steps plus fo
 |------|------|
 | `scripts/ci.sh` | Local CI script (this document) |
 | `scripts/pre-release.sh` | Full release smoke tests (build, E2E, skill binaries) |
-| `.github/workflows/ci.yml` | GitHub Actions CI |
-| `crates/octos-llm/src/adaptive.rs` | Adaptive router + 19 tests |
-| `crates/octos-llm/src/responsiveness.rs` | Responsiveness observer + 8 tests |
-| `crates/octos-cli/src/session_actor.rs` | Session actor + 9 tests |
-| `crates/octos-bus/src/session.rs` | Session persistence + 28 tests |
+| `scripts/milestone-ci.sh` | Canonical milestone CI suites (hosted-fast, workspace-all-features, dashboard, release-bundle) |
+| `.github/workflows/ci.yml` | GitHub Actions CI (sharded per-crate to fit runner memory) |
+| `crates/octos-llm/src/adaptive.rs` | Adaptive router tests |
+| `crates/octos-llm/src/responsiveness.rs` | Responsiveness observer tests |
+| `crates/octos-cli/src/session_actor.rs` | Session actor tests |
+| `crates/octos-bus/src/session.rs` | Session persistence tests |
+| `crates/octos-bus/tests/jsonl_replay_thread_binding.rs` | Replay harness for thread_id binding correctness on JSONL fixtures |
+| `crates/octos-agent/tests/` | Agent integration tests (compaction, m8 end-to-end gate, plugin v2 contract, validator runner, abi compat) |
+| `crates/octos-plugin/tests/lifecycle_sandbox.rs` | Plugin protocol v2 contract tests |
+| `crates/octos-swarm/tests/{subtask_contracts,swarm_dispatch}.rs` | Swarm dispatcher + ledger tests |
+| `e2e/tests/` | Playwright live-runtime suites (M8 invariants, progress gate, thread interleave, etc.) |
