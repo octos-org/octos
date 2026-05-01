@@ -1,0 +1,8 @@
+# Captured live-soak fixtures are auto-generated and should not be
+# committed. Promote interesting ones via
+# `e2e/scripts/promote-captured-fixture.sh` to the Layer 1 fixture corpus
+# under `crates/octos-web/src/state/__tests__/fixtures/captured/` and
+# commit THAT copy instead. See README.md in this directory for the
+# triage workflow.
+*.json
+!.gitignore
