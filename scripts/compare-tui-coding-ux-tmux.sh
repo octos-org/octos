@@ -479,7 +479,7 @@ tui_capture_has_ready_state() {
 tui_capture_has_active_state() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Progress:)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
+    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
 }
 
 tui_capture_has_blocking_approval() {
