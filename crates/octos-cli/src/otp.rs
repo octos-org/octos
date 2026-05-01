@@ -274,6 +274,18 @@ impl AuthManager {
         *self.smtp_config.write().await = cfg;
     }
 
+    /// Whether SMTP delivery is currently usable. Returns true only when a
+    /// host is set; password presence is checked at send time. Used by
+    /// auth/status to drive `email_login_enabled` honestly and by send_code
+    /// to short-circuit with a server-state error when SMTP isn't configured
+    /// (vs. silently logging the OTP to the server console).
+    pub async fn smtp_configured(&self) -> bool {
+        match &*self.smtp_config.read().await {
+            Some(cfg) => !cfg.host.trim().is_empty(),
+            None => false,
+        }
+    }
+
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
     pub async fn send_otp(&self, email: &str) -> Result<bool> {
         self.send_otp_with_registration(email, self.allow_self_registration)
