@@ -1,0 +1,58 @@
+name: Web reducer fixtures (Layer 1)
+
+# Layer 1 SPA reducer fixture tests. Runs deterministic UI Protocol v1
+# event fixtures against the octos-web reducer in milliseconds, no LLM,
+# no fleet, no Playwright. See crates/octos-web/src/state/__tests__/README.md
+# for the contract.
+#
+# Triggers on every PR touching octos-web or the UI protocol surface
+# (octos-core/src/ui_protocol.rs). Total runtime target: <1s.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/octos-web/**'
+      - 'crates/octos-core/src/ui_protocol.rs'
+      # Server-side surfaces that emit the events the reducer consumes.
+      # If any of these change, replay this layer to catch event-shape
+      # regressions before they reach the SPA.
+      - 'crates/octos-bus/src/api_channel.rs'
+      - 'crates/octos-cli/src/api/ui_protocol.rs'
+      - 'crates/octos-cli/src/stream_reporter.rs'
+      - '.github/workflows/web-reducer-fixtures.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/octos-web/**'
+      - 'crates/octos-core/src/ui_protocol.rs'
+      - 'crates/octos-bus/src/api_channel.rs'
+      - 'crates/octos-cli/src/api/ui_protocol.rs'
+      - 'crates/octos-cli/src/stream_reporter.rs'
+      - '.github/workflows/web-reducer-fixtures.yml'
+  workflow_dispatch:
+
+jobs:
+  reducer-fixtures:
+    name: SPA reducer fixture replay
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: crates/octos-web
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/octos-web/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run reducer fixtures (Vitest)
+        run: npm test
