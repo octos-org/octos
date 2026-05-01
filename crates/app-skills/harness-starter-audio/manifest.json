@@ -9,6 +9,7 @@
       "name": "synthesize_clip",
       "description": "Synthesize a short WAV clip for a label. Writes to audio/<slug>.wav. Replace with a real TTS/render engine when adapting the starter.",
       "spawn_only": true,
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {

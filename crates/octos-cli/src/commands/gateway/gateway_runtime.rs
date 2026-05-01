@@ -1049,6 +1049,21 @@ impl GatewayRuntime {
             tools.register(octos_agent::ActivateToolsTool::new());
         }
 
+        // PR #688 follow-up — codex finding (post-MEDIUM #4):
+        // re-apply tool_policy AFTER all base-registry tools have been
+        // registered. The first pass at line ~684 above ran before
+        // `ManageSkillsTool`, `SynthesizeResearchTool`,
+        // `RecallMemoryTool`, `SaveMemoryTool`, `SwitchModelTool`, and
+        // `ActivateToolsTool` were registered, so a `tool_policy.deny`
+        // entry targeting any of those names was silently bypassed at
+        // the base level. The per-session re-apply in
+        // `ActorFactory::spawn` is still required for `run_pipeline`
+        // (which is registered later still); this second pass plugs the
+        // base-registry leak so the snapshot itself is consistent.
+        if let Some(ref policy) = config.tool_policy {
+            tools.apply_policy(policy);
+        }
+
         // Create the base tool registry snapshot (excludes session-specific tools)
         let tool_registry_factory = Arc::new(SnapshotToolRegistryFactory::new(tools));
 
@@ -1102,6 +1117,13 @@ impl GatewayRuntime {
             cwd: cwd.clone(),
             sandbox_config: sandbox_config.clone(),
             provider_policy: provider_policy_for_factory,
+            // PR #688 follow-up — MEDIUM #4: pass the global tool_policy
+            // through so `ActorFactory::spawn` can re-apply it AFTER the
+            // per-session `run_pipeline` registration. Without this, a
+            // policy deny of `run_pipeline` configured via `tool_policy`
+            // is silently bypassed because the base registry's
+            // `apply_policy` ran before `run_pipeline` was registered.
+            tool_policy: config.tool_policy.clone(),
             worker_prompt: worker_prompt_for_factory,
             provider_router: provider_router_for_factory,
             embedder: create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>),

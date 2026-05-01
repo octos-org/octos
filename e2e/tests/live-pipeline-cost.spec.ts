@@ -118,7 +118,13 @@ function findToken(events: SseEvent[], key: 'input_tokens' | 'output_tokens'): n
   return total;
 }
 
-test.describe('W1.G4 — pipeline cost breakdown SSE invariants', () => {
+// SKIP: as of run_pipeline → spawn_only conversion (PR #688), pipeline
+// execution happens asynchronously after the foreground turn returns the
+// spawn-ack. Per-node cost is attributed in the background path and is no
+// longer flattened into the foreground `done` SSE event. Replace with a
+// spawn_only-aware spec that awaits the BackgroundResultPayload and asserts
+// on the cost ledger or the supervisor's task record.
+test.describe.skip('W1.G4 — pipeline cost breakdown SSE invariants', () => {
   test('run_pipeline reports non-zero token totals across nodes', async () => {
     const sessionId = `e2e-w1-cost-${Date.now()}`;
     const prompt =

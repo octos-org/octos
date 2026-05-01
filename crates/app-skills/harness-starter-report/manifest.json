@@ -9,6 +9,7 @@
       "name": "generate_report",
       "description": "Generate a markdown report for a topic. Writes to reports/<slug>.md. The workspace policy primary = \"reports/*.md\" resolves the delivered file.",
       "spawn_only": true,
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {

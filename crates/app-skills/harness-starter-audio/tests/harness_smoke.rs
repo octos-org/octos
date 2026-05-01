@@ -20,6 +20,29 @@ fn manifest_parses_and_declares_synthesize_clip_tool() {
 }
 
 #[test]
+fn harness_starter_audio_manifest_declares_exclusive_concurrency() {
+    // Issue #718: `synthesize_clip` writes `audio/<slug>.wav`, so it
+    // must declare `concurrency_class = "exclusive"` to serialise
+    // against sibling mutating tools in the same batch. Without this
+    // field the M8.8 scheduler defaults to `Safe` and silently permits
+    // parallel writes — same gap PR #711 closed for the other bundled
+    // mutating skills (harness-starter-coding, harness-starter-report,
+    // account-manager, skill-evolve).
+    let manifest = PluginManifest::from_file(&crate_root().join("manifest.json"))
+        .expect("manifest.json must parse");
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "synthesize_clip")
+        .expect("synthesize_clip tool present");
+    assert_eq!(
+        tool.concurrency_class.as_deref(),
+        Some("exclusive"),
+        "synthesize_clip writes audio/<slug>.wav and must declare concurrency_class=exclusive",
+    );
+}
+
+#[test]
 fn workspace_policy_declares_primary_audio_with_size_validator() {
     let raw = std::fs::read_to_string(crate_root().join("workspace-policy.toml"))
         .expect("policy readable");

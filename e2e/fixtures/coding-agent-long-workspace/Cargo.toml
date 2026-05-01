@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/worklog-core",
+    "crates/worklog-report",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

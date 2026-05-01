@@ -39,9 +39,55 @@ pub struct McpServerConfig {
     /// HTTP transport: additional headers (e.g. Authorization).
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Optional override for the M8.8 concurrency class assigned to every
+    /// tool exposed by this server.
+    ///
+    /// Defaults to [`crate::tools::ConcurrencyClass::Safe`] — most MCP
+    /// servers in practice expose read-only / query tools (search, wiki
+    /// lookup, time, weather), and forcing `Exclusive` on all of them
+    /// would serialise the fast common path. Operators who run an MCP
+    /// server that mutates files, posts to remote services, or otherwise
+    /// races with the native `edit_file` / `write_file` tools must
+    /// declare `"exclusive"` here so the M8.8 scheduler serialises the
+    /// batch.
+    ///
+    /// Accepted values: `"safe"`, `"exclusive"` (case-insensitive).
+    /// Unknown values resolve to the conservative `Exclusive` side
+    /// (fail-safe: a typo must not silently downgrade enforcement).
+    ///
+    /// Per-tool granularity is intentionally not supported — MCP's
+    /// `tools/list` carries no concurrency hint, and exposing a per-tool
+    /// override field would invite drift between operator config and the
+    /// remote tool surface.
+    #[serde(default)]
+    pub concurrency_class: Option<String>,
 }
 
 impl McpServerConfig {
+    /// Resolve the configured concurrency class for tools spawned by this
+    /// server.
+    ///
+    /// - Field absent → `Safe` (read-only common case).
+    /// - Field `"safe"` (any case) → `Safe`.
+    /// - Field `"exclusive"` (any case) → `Exclusive` (operator opt-in
+    ///   for mutating servers).
+    /// - Unknown value → `Exclusive` (fail-safe — a typo must not
+    ///   silently downgrade enforcement).
+    pub fn resolved_concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+        match self
+            .concurrency_class
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("safe") => crate::tools::ConcurrencyClass::Safe,
+            Some("exclusive") => crate::tools::ConcurrencyClass::Exclusive,
+            // Unknown values fail safe to Exclusive so a typo doesn't
+            // silently downgrade serialisation.
+            Some(_) => crate::tools::ConcurrencyClass::Exclusive,
+        }
+    }
+
     fn display_name(&self) -> &str {
         if let Some(cmd) = &self.command {
             cmd
@@ -269,6 +315,10 @@ struct McpToolSpec {
     description: String,
     input_schema: serde_json::Value,
     connection: Arc<Mutex<McpConnection>>,
+    /// Concurrency class for the M8.8 scheduler. Carried per-spec so each
+    /// server's `McpServerConfig.concurrency_class` propagates to every
+    /// tool the server exposes when `register_tools` runs.
+    concurrency_class: crate::tools::ConcurrencyClass,
 }
 
 /// Maximum nesting depth for MCP tool input schemas.
@@ -323,9 +373,11 @@ impl McpClient {
                 Ok((conn, server_tools)) => {
                     let server_name = config.display_name().to_string();
                     let conn = Arc::new(Mutex::new(conn));
+                    let concurrency_class = config.resolved_concurrency_class();
                     info!(
                         server = server_name,
                         tools = server_tools.len(),
+                        concurrency_class = ?concurrency_class,
                         "MCP server started"
                     );
                     for tool in server_tools {
@@ -345,6 +397,7 @@ impl McpClient {
                             description: tool.description.unwrap_or_default(),
                             input_schema: schema,
                             connection: conn.clone(),
+                            concurrency_class,
                         });
                     }
                     connections.push((server_name, conn));
@@ -503,13 +556,13 @@ impl McpClient {
                 description: spec.description,
                 input_schema: spec.input_schema,
                 connection: spec.connection,
-                // Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
-                // MCP servers are conservative-by-default treated as
-                // Exclusive because the JSON-RPC transport serialises
-                // internally and most servers mutate remote state.
-                // A future milestone will let manifests/configs override
-                // this with per-server concurrency hints.
-                concurrency_class: crate::tools::ConcurrencyClass::Exclusive,
+                // Per-server class resolved at `start()` from
+                // `McpServerConfig.concurrency_class`. Defaults to
+                // `Safe` (read-only common case — search, wiki, time);
+                // operators declare `"exclusive"` for MCP servers that
+                // mutate files / remote state and could race with the
+                // native `edit_file` / `write_file` tools.
+                concurrency_class: spec.concurrency_class,
             });
         }
     }
@@ -547,12 +600,14 @@ struct McpTool {
     description: String,
     input_schema: serde_json::Value,
     connection: Arc<Mutex<McpConnection>>,
-    /// Item 6 of OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24:
-    /// concurrency class declared by the wrapper. Each MCP server is
-    /// configured with a single concurrency class — the wrapper does
-    /// not inspect MCP's `tools/list` for a per-tool hint. Server-level
-    /// declaration is appropriate because most MCP servers serialise
-    /// internally on the JSON-RPC stream anyway.
+    /// Concurrency class for the M8.8 scheduler. Resolved at
+    /// `McpClient::start` from the per-server `McpServerConfig`:
+    /// defaults to `Safe` (read-only common case — search, wiki, time
+    /// servers); operators must declare `"exclusive"` per server when
+    /// the MCP server mutates files or remote state and could race
+    /// with the native `edit_file` / `write_file` tools. Per-tool
+    /// granularity is intentionally not wired — MCP's `tools/list`
+    /// carries no concurrency hint.
     concurrency_class: crate::tools::ConcurrencyClass,
 }
 
@@ -722,6 +777,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             headers: HashMap::new(),
+            concurrency_class: None,
         };
         assert_eq!(config.display_name(), "unknown");
     }
@@ -735,6 +791,103 @@ mod tests {
         assert!(config.env.is_empty());
         assert!(config.url.is_none());
         assert!(config.headers.is_empty());
+        // Backward-compat: existing configs that omit `concurrency_class`
+        // continue to parse. The resolved class falls through to `Safe`
+        // (read-only common case for MCP — search, wiki, time, weather).
+        // Mutating servers must declare `"exclusive"` explicitly.
+        assert!(config.concurrency_class.is_none());
+        assert_eq!(
+            config.resolved_concurrency_class(),
+            crate::tools::ConcurrencyClass::Safe,
+        );
+    }
+
+    #[test]
+    fn test_config_concurrency_class_explicit_safe() {
+        // Explicit declaration round-trips through serde and resolves
+        // identically to the default — pinned so a future schema change
+        // doesn't silently break operator configs that opt in.
+        let json = r#"{"concurrency_class": "safe"}"#;
+        let config: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.concurrency_class.as_deref(), Some("safe"));
+        assert_eq!(
+            config.resolved_concurrency_class(),
+            crate::tools::ConcurrencyClass::Safe,
+        );
+    }
+
+    #[test]
+    fn test_config_concurrency_class_explicit_exclusive() {
+        // Operators who run a mutating MCP server (e.g. one that
+        // writes files into the workspace) declare `"exclusive"` so
+        // the M8.8 scheduler serialises the batch.
+        let json = r#"{"concurrency_class": "exclusive"}"#;
+        let config: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.resolved_concurrency_class(),
+            crate::tools::ConcurrencyClass::Exclusive,
+        );
+    }
+
+    #[test]
+    fn test_config_concurrency_class_case_insensitive_and_unknown_falls_back() {
+        // Mixed case still resolves correctly.
+        let mixed_json = r#"{"concurrency_class": "ExClUsIvE"}"#;
+        let mixed: McpServerConfig = serde_json::from_str(mixed_json).unwrap();
+        assert_eq!(
+            mixed.resolved_concurrency_class(),
+            crate::tools::ConcurrencyClass::Exclusive,
+        );
+
+        // Unknown values fall back to `Exclusive` (fail-safe — typo in
+        // operator config must not silently downgrade enforcement).
+        let typo_json = r#"{"concurrency_class": "exlusive"}"#;
+        let typo: McpServerConfig = serde_json::from_str(typo_json).unwrap();
+        assert_eq!(
+            typo.resolved_concurrency_class(),
+            crate::tools::ConcurrencyClass::Exclusive,
+        );
+    }
+
+    #[test]
+    fn test_mcp_tool_surfaces_per_server_concurrency_class() {
+        // Construct an `McpTool` directly with a stub HTTP connection
+        // so we can verify the wrapper surfaces the per-spec class
+        // through `Tool::concurrency_class()`. This pins the contract
+        // that `register_tools` plumbs the per-server class to every
+        // tool — a regression that swapped the field back to
+        // hardcoded `Exclusive` would turn this test red for the
+        // safe-server case.
+        use crate::tools::ConcurrencyClass;
+
+        let conn = Arc::new(Mutex::new(McpConnection::Http(HttpMcpConnection {
+            client: reqwest::Client::new(),
+            url: "http://stub.invalid/".into(),
+            headers: HashMap::new(),
+            next_id: 1,
+            session_id: None,
+        })));
+
+        let safe_tool = McpTool {
+            name: "search".into(),
+            description: "test".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            connection: conn.clone(),
+            concurrency_class: ConcurrencyClass::Safe,
+        };
+        assert_eq!(safe_tool.concurrency_class(), ConcurrencyClass::Safe);
+
+        let exclusive_tool = McpTool {
+            name: "write_remote".into(),
+            description: "test".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            connection: conn,
+            concurrency_class: ConcurrencyClass::Exclusive,
+        };
+        assert_eq!(
+            exclusive_tool.concurrency_class(),
+            ConcurrencyClass::Exclusive,
+        );
     }
 
     // --- Schema validation ---

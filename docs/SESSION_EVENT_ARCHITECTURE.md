@@ -44,6 +44,16 @@ This repository now implements a first event-ledger step:
   - `session_result`
 - `octos-web` `task-watcher` opens a dedicated background session stream for watched sessions and applies committed `session_result` events through `MessageStore.appendHistoryMessages()`
 
+## Phase 2 — Sticky thread_id and committed_seq (M8.10)
+
+Subsequent work hardened the contract so that the browser can replay deterministically:
+
+- **Persistent thread_id** (#628) — every session has a stable `thread_id` carried alongside its `key` and persisted in JSONL meta.
+- **thread_id on every SSE event** (#629) — `token`, `tool_progress`, `task_status`, and `session_result` events all carry the thread_id; the `done` event additionally carries `committed_seq` so a client knows the exact sequence number of the durable terminal write.
+- **Sticky on api_channel** (#635) — once an api_channel SSE connection has emitted any event for a thread, that thread_id stays bound to the connection. The thread_id is bound **before** the first emission (#637) so very fast first-token paths still see it.
+- **Replay-harness fixtures** (#656) — `crates/octos-agent/tests/` holds JSONL fixtures that exercise thread_id binding correctness; the harness replays the fixture and asserts every event in the stream carries the expected thread_id and committed_seq.
+- **e2e progress-gate** (#655) — `e2e/tests/live-progress-gate.spec.ts` exercises the background-task UX end-to-end, including tool-retry collapse and thread interleave (#630).
+
 ## Why This Is Better
 
 This change moves completion truth from:
