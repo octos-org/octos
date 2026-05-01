@@ -938,38 +938,45 @@ fn approval_event_from_tool_request(
         request.body,
     );
 
-    if features.typed_approvals && event.tool_name == "shell" {
-        let command = request.command;
-        if command.is_some() || request.cwd.is_some() {
-            event.approval_kind = Some(approval_kinds::COMMAND.to_owned());
-            // Risk is derived from the tool manifest, not from the tool's
-            // own payload — a malicious tool cannot self-attest as `low`.
-            // Default `unspecified` makes "manifest didn't say" visible in
-            // the UI badge instead of silently advertising `medium`.
-            event.risk = Some(server_risk_for(&event.tool_name));
-            // `cwd` is path-shaped: sanitise before it lands in display
-            // strings (typed_details, render hints).
-            let safe_cwd = request.cwd.as_deref().map(sanitize_display_path);
-            event.typed_details = Some(ApprovalTypedDetails::command(
-                ApprovalCommandDetails {
-                    argv: Vec::new(),
-                    command_line: command,
-                    cwd: safe_cwd,
-                    env_keys: Vec::new(),
-                    tool_call_id: Some(request.tool_id),
-                },
-                None,
-            ));
-            event.render_hints = Some(ApprovalRenderHints {
-                default_decision: Some("deny".to_owned()),
-                primary_label: Some("Approve".to_owned()),
-                secondary_label: Some("Deny".to_owned()),
-                danger: Some(false),
-                monospace_fields: vec![
-                    "typed_details.command.command_line".to_owned(),
-                    "typed_details.command.cwd".to_owned(),
-                ],
-            });
+    if features.typed_approvals {
+        // Risk is derived from the tool manifest, not from the tool's own
+        // payload — a malicious tool cannot self-attest as `low`. Default
+        // `unspecified` makes "manifest didn't say" visible in the UI badge
+        // instead of silently advertising `medium`. This applies to every
+        // tool surface (shell, plugin, future MCP) — audit #715: previously
+        // gated on `tool_name == "shell"`, leaving plugin approvals with no
+        // risk classification on the wire even though manifest-driven gating
+        // engaged server-side (PR #712).
+        event.risk = Some(server_risk_for(&event.tool_name));
+
+        if event.tool_name == "shell" {
+            let command = request.command;
+            if command.is_some() || request.cwd.is_some() {
+                event.approval_kind = Some(approval_kinds::COMMAND.to_owned());
+                // `cwd` is path-shaped: sanitise before it lands in display
+                // strings (typed_details, render hints).
+                let safe_cwd = request.cwd.as_deref().map(sanitize_display_path);
+                event.typed_details = Some(ApprovalTypedDetails::command(
+                    ApprovalCommandDetails {
+                        argv: Vec::new(),
+                        command_line: command,
+                        cwd: safe_cwd,
+                        env_keys: Vec::new(),
+                        tool_call_id: Some(request.tool_id),
+                    },
+                    None,
+                ));
+                event.render_hints = Some(ApprovalRenderHints {
+                    default_decision: Some("deny".to_owned()),
+                    primary_label: Some("Approve".to_owned()),
+                    secondary_label: Some("Deny".to_owned()),
+                    danger: Some(false),
+                    monospace_fields: vec![
+                        "typed_details.command.command_line".to_owned(),
+                        "typed_details.command.cwd".to_owned(),
+                    ],
+                });
+            }
         }
     }
 
@@ -4306,6 +4313,172 @@ mod tests {
             silent.risk.as_deref(),
             Some(octos_core::ui_protocol::RISK_UNSPECIFIED)
         );
+        clear_tool_risk_registry_for_test();
+    }
+
+    /// Audit #715 regression: a plugin manifest declared `risk: "high"` must
+    /// surface on the wire `approval_requested` event so approval cards and
+    /// the audit trail can render the badge. Previously, only `tool_name ==
+    /// "shell"` populated `event.risk`, so plugin tools went out unclassified
+    /// even when manifest gating engaged (PR #712).
+    #[test]
+    fn plugin_high_risk_approval_emits_risk_field_on_wire() {
+        let _guard = tool_risk_registry_test_lock().lock().unwrap_or_else(|e| {
+            tool_risk_registry_test_lock().clear_poison();
+            e.into_inner()
+        });
+        clear_tool_risk_registry_for_test();
+        register_tool_risk_for_test("weather_lookup", "high");
+
+        // Plugin tools route approvals via `command: None`; only `cwd`
+        // (the plugin work_dir) flows through the request.
+        let request = ToolApprovalRequest {
+            tool_id: "tool-plugin-1".into(),
+            tool_name: "weather_lookup".into(),
+            title: "Approve plugin tool".into(),
+            body: "Plugin 'weather' tool 'weather_lookup' is declared high risk.".into(),
+            command: None,
+            cwd: Some("/tmp/weather-plugin".into()),
+        };
+        let event = approval_event_from_tool_request(
+            request,
+            SessionKey("local:test".into()),
+            ApprovalId::new(),
+            TurnId::new(),
+            ConnectionUiFeatures {
+                typed_approvals: true,
+                pane_snapshots: false,
+                session_workspace_cwd: false,
+            },
+        );
+
+        assert_eq!(
+            event.risk.as_deref(),
+            Some("high"),
+            "plugin tool's manifest-declared risk must reach the wire"
+        );
+        // Plugin path doesn't produce shell-style typed_details/render_hints.
+        assert!(event.approval_kind.is_none());
+        assert!(event.typed_details.is_none());
+        assert!(event.render_hints.is_none());
+        clear_tool_risk_registry_for_test();
+    }
+
+    /// Audit #715 regression: `critical` risk plugins must reach the wire so
+    /// the UI can render the highest-severity badge.
+    #[test]
+    fn plugin_critical_risk_approval_emits_risk_critical() {
+        let _guard = tool_risk_registry_test_lock().lock().unwrap_or_else(|e| {
+            tool_risk_registry_test_lock().clear_poison();
+            e.into_inner()
+        });
+        clear_tool_risk_registry_for_test();
+        register_tool_risk_for_test("destroy_world", "critical");
+
+        let request = ToolApprovalRequest {
+            tool_id: "tool-plugin-2".into(),
+            tool_name: "destroy_world".into(),
+            title: "Approve plugin tool".into(),
+            body: "Plugin 'apocalypse' tool 'destroy_world' is declared critical risk.".into(),
+            command: None,
+            cwd: None,
+        };
+        let event = approval_event_from_tool_request(
+            request,
+            SessionKey("local:test".into()),
+            ApprovalId::new(),
+            TurnId::new(),
+            ConnectionUiFeatures {
+                typed_approvals: true,
+                pane_snapshots: false,
+                session_workspace_cwd: false,
+            },
+        );
+
+        assert_eq!(event.risk.as_deref(), Some("critical"));
+        clear_tool_risk_registry_for_test();
+    }
+
+    /// Regression for the existing shell typed-approvals path: lifting the
+    /// risk assignment out of the `tool_name == "shell"` guard must not
+    /// break shell event population (typed_details, render_hints, risk).
+    #[test]
+    fn shell_approval_still_emits_risk_field() {
+        let _guard = tool_risk_registry_test_lock().lock().unwrap_or_else(|e| {
+            tool_risk_registry_test_lock().clear_poison();
+            e.into_inner()
+        });
+        clear_tool_risk_registry_for_test();
+        register_tool_risk_for_test("shell", "medium");
+
+        let request = ToolApprovalRequest {
+            tool_id: "tool-shell-1".into(),
+            tool_name: "shell".into(),
+            title: "Approve shell command".into(),
+            body: "Command:\ncargo test".into(),
+            command: Some("cargo test".into()),
+            cwd: Some("/tmp/work".into()),
+        };
+        let event = approval_event_from_tool_request(
+            request,
+            SessionKey("local:test".into()),
+            ApprovalId::new(),
+            TurnId::new(),
+            ConnectionUiFeatures {
+                typed_approvals: true,
+                pane_snapshots: false,
+                session_workspace_cwd: false,
+            },
+        );
+
+        assert_eq!(event.risk.as_deref(), Some("medium"));
+        assert_eq!(
+            event.approval_kind.as_deref(),
+            Some(approval_kinds::COMMAND)
+        );
+        assert!(event.typed_details.is_some());
+        assert!(event.render_hints.is_some());
+        clear_tool_risk_registry_for_test();
+    }
+
+    /// When `typed_approvals` is not negotiated, the wire event must remain
+    /// fully generic — no `risk` field, no typed details. Audit #715 fix
+    /// must not start advertising risk on the legacy untyped path, which
+    /// older clients are not prepared to parse.
+    #[test]
+    fn tool_with_no_risk_classification_does_not_emit_risk_field() {
+        let _guard = tool_risk_registry_test_lock().lock().unwrap_or_else(|e| {
+            tool_risk_registry_test_lock().clear_poison();
+            e.into_inner()
+        });
+        clear_tool_risk_registry_for_test();
+        register_tool_risk_for_test("weather_lookup", "high");
+
+        let request = ToolApprovalRequest {
+            tool_id: "tool-plugin-3".into(),
+            tool_name: "weather_lookup".into(),
+            title: "Approve plugin tool".into(),
+            body: "Plugin tool approval".into(),
+            command: None,
+            cwd: Some("/tmp/weather-plugin".into()),
+        };
+        // `typed_approvals: false` — legacy client.
+        let event = approval_event_from_tool_request(
+            request,
+            SessionKey("local:test".into()),
+            ApprovalId::new(),
+            TurnId::new(),
+            ConnectionUiFeatures::default(),
+        );
+
+        assert!(
+            event.risk.is_none(),
+            "legacy untyped path must not advertise risk; got {:?}",
+            event.risk
+        );
+        assert!(event.approval_kind.is_none());
+        assert!(event.typed_details.is_none());
+        assert!(event.render_hints.is_none());
         clear_tool_risk_registry_for_test();
     }
 
