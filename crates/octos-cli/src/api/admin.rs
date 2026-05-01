@@ -4094,13 +4094,13 @@ mod register_tenant_email_tests {
         let auth_manager = Arc::new(
             AuthManager::new(
                 Some(DashboardAuthConfig {
-                    smtp: SmtpConfig {
+                    smtp: Some(SmtpConfig {
                         host: "smtp.example.com".into(),
                         port: 465,
                         username: "octos".into(),
                         password_env: "SMTP_PASSWORD".into(),
                         from_address: "noreply@example.com".into(),
-                    },
+                    }),
                     session_expiry_hours: 24,
                     allow_self_registration: true,
                     static_tokens: Vec::new(),

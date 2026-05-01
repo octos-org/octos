@@ -405,12 +405,16 @@ if enable_smtp:
     dashboard_auth["session_expiry_hours"] = dashboard_auth.get("session_expiry_hours", 24)
     dashboard_auth["allow_self_registration"] = allow_self_registration
     data["dashboard_auth"] = dashboard_auth
-elif isinstance(dashboard_auth, dict) and "smtp" in dashboard_auth:
-    dashboard_auth.pop("smtp", None)
-    if dashboard_auth:
-        data["dashboard_auth"] = dashboard_auth
-    else:
-        data.pop("dashboard_auth", None)
+elif isinstance(dashboard_auth, dict):
+    # SMTP is disabled. Drop the entire dashboard_auth block — the
+    # remaining fields (allow_self_registration, session_expiry_hours)
+    # are functionally meaningless without SMTP, and leaving a
+    # dashboard_auth block without a `smtp` field used to crash
+    # `octos serve` on startup (DashboardAuthConfig.smtp is now
+    # Option<SmtpConfig> upstream of this fix, so the config parses,
+    # but a partial block with allow_self_registration=true is still
+    # misleading — registration via OTP can't actually succeed).
+    data.pop("dashboard_auth", None)
 
 config_path.write_text(json.dumps(data, indent=2) + "\n")
 PYEOF

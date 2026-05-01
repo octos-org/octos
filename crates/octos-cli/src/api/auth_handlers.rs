@@ -2211,13 +2211,13 @@ mod tests {
         // set_smtp_config(None).
         let auth_manager = Arc::new(AuthManager::new(
             Some(crate::otp::DashboardAuthConfig {
-                smtp: crate::otp::SmtpConfig {
+                smtp: Some(crate::otp::SmtpConfig {
                     host: "smtp.test.invalid".into(),
                     port: 465,
                     username: "test@test.invalid".into(),
                     password_env: "SMTP_PASSWORD".into(),
                     from_address: "test@test.invalid".into(),
-                },
+                }),
                 session_expiry_hours: 24,
                 allow_self_registration: false,
                 static_tokens: Vec::new(),

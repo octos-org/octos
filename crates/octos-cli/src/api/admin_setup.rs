@@ -727,10 +727,27 @@ pub async fn post_deployment_mode(
 }
 
 /// GET `/api/admin/deployment-mode/detect` — heuristic detection.
+///
+/// Source-of-truth precedence (highest first):
+///   1. AppState.tunnel_domain — populated from config.json's tunnel_domain
+///      field at startup. Set by cloud-host-deploy.sh when the host is
+///      provisioned as a relay. Authoritative when present.
+///   2. TUNNEL_DOMAIN env var — legacy signal kept for compatibility with
+///      older installs that exported it instead of writing to config.json.
+///   3. <data_dir>/frpc.toml — present means this host is a tenant
+///      tunneling out to a relay.
+///   4. Fallback: local.
 pub async fn get_deployment_mode_detect(
     State(state): State<Arc<AppState>>,
 ) -> Json<DeploymentModeDetection> {
-    let detected = if std::env::var("TUNNEL_DOMAIN").is_ok() {
+    let detected = if state
+        .tunnel_domain
+        .as_deref()
+        .map(|d| !d.is_empty())
+        .unwrap_or(false)
+    {
+        "cloud"
+    } else if std::env::var("TUNNEL_DOMAIN").is_ok() {
         "cloud"
     } else {
         let frpc_exists = data_dir_from_state(&state)
