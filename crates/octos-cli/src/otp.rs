@@ -44,8 +44,16 @@ fn default_smtp_port() -> u16 {
 /// Dashboard authentication configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardAuthConfig {
-    /// SMTP configuration for sending OTP emails.
-    pub smtp: SmtpConfig,
+    /// SMTP configuration for sending OTP emails. Optional so a partial
+    /// `dashboard_auth` block (e.g. `{"allow_self_registration": true}`
+    /// with no SMTP yet — the wizard's mid-setup state, or
+    /// cloud-host-deploy.sh's "SMTP disabled" leftover) parses cleanly
+    /// instead of crashing on startup. `None` here is functionally the
+    /// same as no `dashboard_auth.smtp` at all: OTP delivery falls
+    /// through to the console-log path, and the wizard surfaces the
+    /// "SMTP not configured" warning.
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
     /// Session expiry in hours.
     #[serde(default = "default_session_hours")]
     pub session_expiry_hours: u64,
@@ -117,7 +125,7 @@ impl AuthManager {
         let (smtp_config, session_expiry_hours, allow_self_registration, static_tokens) =
             match config {
                 Some(c) => (
-                    Some(c.smtp),
+                    c.smtp,
                     c.session_expiry_hours,
                     c.allow_self_registration,
                     c.static_tokens,
@@ -859,7 +867,7 @@ mod tests {
         };
         let mgr = AuthManager::new(
             Some(DashboardAuthConfig {
-                smtp: smtp.clone(),
+                smtp: Some(smtp.clone()),
                 session_expiry_hours: 24,
                 allow_self_registration: false,
                 static_tokens: Vec::new(),
