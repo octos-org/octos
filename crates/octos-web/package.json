@@ -1,0 +1,17 @@
+{
+  "name": "octos-web",
+  "private": true,
+  "version": "0.0.0-pre",
+  "description": "octos-web SPA — Layer 1 reducer fixture testing infrastructure. The production reducer ships in PR J; this package currently contains only the fixture replay engine + 5 seed fixtures + reference implementation that PR J must match.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -b"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.9"
+  }
+}
