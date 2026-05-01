@@ -16,8 +16,10 @@ Usage: $(basename "$0") [--install-deps]
 Builds the dashboard SPA into $OUT_DIR.
 
   --install-deps   Install Node.js (which provides npm) automatically when
-                   missing, using the platform's package manager. Mirrors
-                   install.sh's --install-deps for source-checkout builds.
+                   missing. Uses the platform's package manager when one is
+                   available (brew on macOS, apt/dnf/yum/pacman/apk on Linux),
+                   and falls back to the official Node.js .pkg installer
+                   (sudo) on macOS without Homebrew.
 EOF
             exit 0
             ;;
@@ -56,6 +58,37 @@ node_install_hint() {
     esac
 }
 
+# Direct-from-nodejs.org fallback for macOS without Homebrew. Downloads
+# the official LTS .pkg installer and installs system-wide via
+# `sudo installer`. Pinning a known-good LTS keeps this deterministic;
+# bump as needed when the version is EOL'd.
+install_node_macos_pkg() {
+    local node_version="v22.12.0"
+    local arch_name
+    case "$(uname -m)" in
+        arm64)         arch_name="arm64" ;;
+        x86_64|amd64)  arch_name="x64" ;;
+        *) echo "ERROR: unsupported macOS arch $(uname -m) for Node.js .pkg" >&2; return 1 ;;
+    esac
+    local url="https://nodejs.org/dist/${node_version}/node-${node_version}-darwin-${arch_name}.pkg"
+    local pkg
+    pkg=$(mktemp /tmp/node.XXXXXX.pkg)
+    echo "==> Downloading Node.js ${node_version} (${arch_name}) from nodejs.org"
+    if ! curl -fsSL --max-time 180 "$url" -o "$pkg"; then
+        rm -f "$pkg"
+        return 1
+    fi
+    echo "==> Installing Node.js (sudo will prompt)"
+    if ! sudo installer -pkg "$pkg" -target /; then
+        rm -f "$pkg"
+        return 1
+    fi
+    rm -f "$pkg"
+    # The .pkg lays down /usr/local/bin/node + /usr/local/bin/npm; both
+    # should be on PATH already on a default macOS shell.
+    command -v npm >/dev/null 2>&1
+}
+
 # Try to auto-install Node.js. Returns 0 only when npm is on PATH afterwards.
 # Mirrors install.sh's pkg_hint approach so the prereqs stay consistent
 # across the install scripts.
@@ -63,7 +96,15 @@ auto_install_node() {
     local cmd
     cmd="$(node_install_hint)"
     case "$cmd" in
-        Install*) return 1 ;;  # The hint started with "Install ..." → no auto path.
+        Install*)
+            # No package manager hint available. On macOS without Homebrew
+            # we can still install directly from the official .pkg — that
+            # path needs sudo but doesn't require any prior tooling.
+            if [ "$(uname -s)" = "Darwin" ]; then
+                install_node_macos_pkg && return 0
+            fi
+            return 1
+            ;;
     esac
     echo "==> Installing Node.js"
     echo "    $cmd"
