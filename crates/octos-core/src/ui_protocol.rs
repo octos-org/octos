@@ -52,6 +52,25 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
 ];
 
+/// Returns the feature flag that gates `method` per spec § 7 capability
+/// negotiation, or `None` if the method is unconditionally available.
+///
+/// Used by [`UiProtocolCapabilities::for_negotiated_features`] so the
+/// negotiated `supported_methods` only advertises capability-gated methods
+/// when their gating feature is also in the negotiated `supported_features`
+/// set. Without this gate a client that did not request
+/// `harness.task_control.v1` would see `task/list` / `task/cancel` /
+/// `task/restart_from_node` in the response and then receive
+/// `method_not_supported` errors when it tried to call them.
+fn method_capability_gate(method: &str) -> Option<&'static str> {
+    match method {
+        methods::TASK_LIST | methods::TASK_CANCEL | methods::TASK_RESTART_FROM_NODE => {
+            Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1)
+        }
+        _ => None,
+    }
+}
+
 pub mod approval_kinds {
     pub const COMMAND: &str = "command";
     pub const DIFF: &str = "diff";
@@ -745,13 +764,22 @@ impl UiProtocolCapabilities {
     }
 
     /// Build a server-side capabilities payload reflecting the negotiated
-    /// feature set per spec § 4 (UPCR-2026-007). The advertised method and
-    /// notification surfaces are always the first-server-slice baseline so
-    /// clients can discover them in-band; `supported_features` is the
+    /// feature set per spec § 4 (UPCR-2026-007). `supported_features` is the
     /// intersection of `requested` (typically from `X-Octos-Ui-Features`)
-    /// with the server's known feature registry, preserving the order of the
-    /// registry. Unknown feature names in `requested` are dropped — the
+    /// with the server's known feature registry, preserving the order of
+    /// the registry. Unknown feature names in `requested` are dropped — the
     /// server does not advertise capabilities it cannot honour.
+    ///
+    /// Method-level capability gates honour the same intersection: methods
+    /// that spec § 7 marks as capability-gated (e.g. `task/list`,
+    /// `task/cancel`, `task/restart_from_node` behind
+    /// `harness.task_control.v1`) appear in `supported_methods` only when
+    /// the gating feature is in the negotiated set. The spec contract is
+    /// "servers expose it only when the feature flag is advertised", so
+    /// the advertised method set must agree with the advertised feature
+    /// set — otherwise a client that did not negotiate `harness.task_control.v1`
+    /// would still see the methods in the response and make calls the
+    /// server would then reject with `method_not_supported`.
     pub fn for_negotiated_features<I, S>(requested: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -761,15 +789,30 @@ impl UiProtocolCapabilities {
             .into_iter()
             .map(|feature| feature.as_ref().to_owned())
             .collect();
-        let mut capabilities = Self::new(
-            UI_PROTOCOL_FIRST_SERVER_METHODS,
-            UI_PROTOCOL_NOTIFICATION_METHODS,
-        );
-        capabilities.supported_features = UI_PROTOCOL_KNOWN_FEATURES
+        let supported_features: Vec<String> = UI_PROTOCOL_KNOWN_FEATURES
             .iter()
             .filter(|feature| requested.iter().any(|requested| requested == **feature))
             .map(|feature| (*feature).to_owned())
             .collect();
+        let supported_methods: Vec<String> = UI_PROTOCOL_FIRST_SERVER_METHODS
+            .iter()
+            .filter(|method| {
+                method_capability_gate(method).is_none_or(|gating_feature| {
+                    supported_features
+                        .iter()
+                        .any(|advertised| advertised == gating_feature)
+                })
+            })
+            .map(|method| (*method).to_owned())
+            .collect();
+        let mut capabilities = Self {
+            version: UiProtocolVersion::current(),
+            capabilities_schema_version: UI_PROTOCOL_CAPABILITIES_SCHEMA_VERSION,
+            supported_methods,
+            supported_notifications: string_list(UI_PROTOCOL_NOTIFICATION_METHODS),
+            supported_features,
+            unsupported: Vec::new(),
+        };
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
             .map(|method| {
@@ -2802,6 +2845,12 @@ mod tests {
         assert!(capabilities.supported_features.is_empty());
         assert!(capabilities.supports_method(methods::SESSION_OPEN));
         assert!(capabilities.supports_method(methods::TURN_START));
+        // Capability-gated methods MUST NOT leak when their gating feature
+        // is not in the negotiated set — otherwise a client would call
+        // them and receive `method_not_supported`.
+        assert!(!capabilities.supports_method(methods::TASK_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
     }
 
     #[test]
@@ -2820,6 +2869,32 @@ mod tests {
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        // Task-control methods are gated by harness.task_control.v1 — they
+        // must not appear in the advertised method set when the gating
+        // feature is not negotiated.
+        assert!(!capabilities.supports_method(methods::TASK_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        // Unconditional methods stay present.
+        assert!(capabilities.supports_method(methods::SESSION_OPEN));
+        assert!(capabilities.supports_method(methods::TURN_START));
+        assert!(capabilities.supports_method(methods::TASK_OUTPUT_READ));
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_task_control_methods_when_feature_requested() {
+        // Pre-condition for the gating change: when the client *did*
+        // request `harness.task_control.v1`, the server's negotiated
+        // method set includes the task-control RPCs so the spec § 7
+        // "expose only when feature flag is advertised" rule is honoured
+        // bidirectionally.
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+        ]);
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::TASK_LIST));
+        assert!(capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
     }
 
     #[test]
