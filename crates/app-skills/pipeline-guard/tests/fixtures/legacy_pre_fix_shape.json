@@ -1,0 +1,25 @@
+{
+  "id": "legacy_pre_fix",
+  "name": "legacy_pre_fix",
+  "enabled": true,
+  "config": {
+    "provider": "moonshot",
+    "model": "kimi-k2.5",
+    "fallback_models": [
+      { "provider": "minimax", "model": "MiniMax-M2.5-highspeed" }
+    ],
+    "channels": [],
+    "gateway": {
+      "max_history": 500,
+      "max_iterations": 80,
+      "system_prompt": null,
+      "max_concurrent_sessions": 100,
+      "browser_timeout_secs": null,
+      "max_output_tokens": null
+    },
+    "env_vars": {},
+    "hooks": [],
+    "admin_mode": false,
+    "adaptive_routing": null
+  }
+}
