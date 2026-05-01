@@ -59,22 +59,44 @@ node_install_hint() {
 }
 
 # Direct-from-nodejs.org fallback for macOS without Homebrew. Downloads
-# the official LTS .pkg installer and installs system-wide via
-# `sudo installer`. Pinning a known-good LTS keeps this deterministic;
-# bump as needed when the version is EOL'd.
+# the official universal .pkg installer and installs system-wide via
+# `sudo installer`.
+#
+# nodejs.org ships a single universal .pkg per release at
+# `node-v${version}.pkg` (no arch suffix). The arch-suffixed variants
+# listed in `index.json::files` (e.g. `osx-x64-pkg`) are not always
+# present at the URL pattern that name implies, and there is no
+# `-darwin-arm64.pkg` at all — Apple Silicon-only is shipped as a
+# tarball. The unprefixed .pkg is universal (Intel + Apple Silicon)
+# and installs cleanly on both, so we use that.
+#
+# Version is fetched from index.json so the latest LTS is always used.
+# A hardcoded fallback is kept for offline/restricted hosts where the
+# index lookup fails.
 install_node_macos_pkg() {
-    local node_version="v22.12.0"
-    local arch_name
-    case "$(uname -m)" in
-        arm64)         arch_name="arm64" ;;
-        x86_64|amd64)  arch_name="x64" ;;
-        *) echo "ERROR: unsupported macOS arch $(uname -m) for Node.js .pkg" >&2; return 1 ;;
-    esac
-    local url="https://nodejs.org/dist/${node_version}/node-${node_version}-darwin-${arch_name}.pkg"
+    local fallback_version="v24.15.0"
+    local node_version
+    # Discover the latest LTS via index.json. Pure bash (no jq/python
+    # dependency): split the array entries by `},{`, take the first
+    # record whose `"lts"` field is a non-false string, extract its
+    # version.
+    node_version=$(curl -fsSL --max-time 30 https://nodejs.org/dist/index.json 2>/dev/null \
+        | sed 's/},{/},\
+{/g' \
+        | grep -m1 '"lts":"[A-Z]' \
+        | grep -oE '"v[0-9]+\.[0-9]+\.[0-9]+"' \
+        | head -1 \
+        | tr -d '"')
+    if [ -z "$node_version" ]; then
+        echo "    Could not query nodejs.org for the latest LTS; falling back to ${fallback_version}"
+        node_version="$fallback_version"
+    fi
+    local url="https://nodejs.org/dist/${node_version}/node-${node_version}.pkg"
     local pkg
     pkg=$(mktemp /tmp/node.XXXXXX.pkg)
-    echo "==> Downloading Node.js ${node_version} (${arch_name}) from nodejs.org"
+    echo "==> Downloading Node.js ${node_version} (universal .pkg) from nodejs.org"
     if ! curl -fsSL --max-time 180 "$url" -o "$pkg"; then
+        echo "ERROR: Node.js .pkg download failed (${url})" >&2
         rm -f "$pkg"
         return 1
     fi
