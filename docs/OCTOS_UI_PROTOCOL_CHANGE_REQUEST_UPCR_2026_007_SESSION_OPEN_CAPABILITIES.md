@@ -127,10 +127,13 @@ shape:
 
 ### Negotiation Semantics
 
-`capabilities.supported_methods` and
-`capabilities.supported_notifications` are the server's first-slice
-baseline so a discovery-aware client can learn the surface in-band even
-when it never sent `X-Octos-Ui-Features`.
+`capabilities.supported_notifications` is always the first-slice
+baseline so a discovery-aware client can learn the event surface
+in-band even when it never sent `X-Octos-Ui-Features`. Notifications
+are not capability-gated at the wire level (the server may simply not
+emit a given notification if the underlying feature is off; a client
+that doesn't request a feature won't react to notifications it doesn't
+know about).
 
 `capabilities.supported_features` is computed from the client's
 `X-Octos-Ui-Features` header (or `ui_feature` / `ui_features` query
@@ -142,11 +145,28 @@ param):
    what the server can do.
 2. **Header sent with feature tokens** → server returns the
    intersection of requested features with the server-known feature
-   registry (`UI_PROTOCOL_KNOWN_FEATURES`). The server **never** leaks a
-   feature flag the client did not ask for; clients see exactly which
+   registry (`UI_PROTOCOL_KNOWN_FEATURES`). The server **never** leaks
+   a feature flag the client did not ask for; clients see exactly which
    of their requests were honoured.
 3. **Unknown tokens in the header** → silently dropped from the
    response (server does not advertise capabilities it cannot honour).
+
+`capabilities.supported_methods` follows the same intersection so the
+advertised method set agrees with the advertised feature set. Methods
+that spec § 7 marks as capability-gated (`task/list`, `task/cancel`,
+`task/restart_from_node` behind `harness.task_control.v1`) appear in
+`supported_methods` only when the gating feature is present in the
+negotiated `supported_features`. Without this, a client that did not
+negotiate `harness.task_control.v1` would see the methods in the
+response, call them, and receive `method_not_supported` from the same
+server it just learnt the methods from. With the gate, advertised
+surface ⇔ callable surface.
+
+Methods without a capability gate (`session/open`, `turn/start`,
+`turn/interrupt`, `approval/respond`, `approval/scopes/list`,
+`diff/preview/get`, `task/output/read`) are unconditionally advertised
+so discovery still works for clients that never send any feature
+header.
 
 The intersection logic lives behind the new
 `UiProtocolCapabilities::for_negotiated_features` builder in
@@ -156,9 +176,12 @@ helper in `octos-cli` so it stays in one place across handlers.
 ## Compatibility
 
 - Old clients that ignore unknown fields per spec § 4 continue to work
-  unchanged. The TS interface in `e2e/lib/m9-ws-client.ts` already uses
-  `unknown` for the pane field and will treat `capabilities` the same
-  way.
+  unchanged. The TS interface in `e2e/lib/m9-ws-client.ts` does not
+  declare a `capabilities` member yet; structural-typing TypeScript
+  consumers will simply see the extra field as untyped and ignore it.
+  Future client updates can add an explicit `capabilities?: unknown` (or
+  a typed `UiProtocolCapabilities` shape) when they are ready to consume
+  the negotiated set.
 - Old serialized payloads (ledger replays from before the field
   existed) decode successfully because the field carries
   `serde(default = "UiProtocolCapabilities::first_server_slice")`. A
@@ -207,7 +230,15 @@ UPCRs (`UPCR-2026-001`, `UPCR-2026-002`, `UPCR-2026-003`,
     `supported_features`.
   - `negotiated_capabilities_intersect_requested_with_known_features` —
     a request containing a known feature plus an unknown token returns
-    only the known feature; never leaks unrequested flags.
+    only the known feature; never leaks unrequested flags. Also pins
+    that capability-gated methods (`task/list`, `task/cancel`,
+    `task/restart_from_node`) are excluded from `supported_methods`
+    when their gating feature is not requested.
+  - `negotiated_capabilities_advertise_task_control_methods_when_feature_requested`
+    — when the client *does* request `harness.task_control.v1`, the
+    advertised method set includes the task-control RPCs so the spec
+    § 7 "expose only when feature flag is advertised" rule is honoured
+    bidirectionally.
 - `crates/octos-cli/src/api/ui_protocol.rs`:
   - `session_open_result_advertises_full_protocol_when_no_header` —
     `open_session_result()` with `ConnectionUiFeatures::default()`

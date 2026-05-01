@@ -6040,13 +6040,31 @@ mod tests {
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
-        // Method/notification surface stays intact so the client can still
-        // see what the server advertises in-band.
+        // Unconditional methods stay advertised so the client can still
+        // see what the server offers in-band.
         assert!(
             capabilities
                 .supported_methods
                 .iter()
                 .any(|method| method == octos_core::ui_protocol::methods::SESSION_OPEN)
+        );
+        // Capability-gated methods (task-control RPCs behind
+        // harness.task_control.v1) must not leak when the gating feature
+        // is not in the negotiated set — otherwise the client would call
+        // them and the server would reject with method_not_supported.
+        assert!(
+            !capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::TASK_LIST),
+            "task/list must be gated by harness.task_control.v1"
+        );
+        assert!(
+            !capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == octos_core::ui_protocol::methods::TASK_CANCEL),
+            "task/cancel must be gated by harness.task_control.v1"
         );
     }
 

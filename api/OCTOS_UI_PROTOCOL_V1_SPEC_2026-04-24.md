@@ -292,7 +292,11 @@ Required result fields from accepted `UPCR-2026-007`:
   can still learn the surface in-band. When the client sent feature tokens,
   `supported_features` is the intersection of the request with the server's
   known feature registry — the server never advertises a flag the client did
-  not request.
+  not request. Capability-gated methods (`task/list`, `task/cancel`,
+  `task/restart_from_node` behind `harness.task_control.v1`) appear in
+  `supported_methods` only when their gating feature is in the negotiated
+  `supported_features`, so the advertised method set always agrees with the
+  callable surface.
 
 ### `turn/start`
 
