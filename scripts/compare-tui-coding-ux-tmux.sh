@@ -44,6 +44,7 @@ if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_WAIT_TURN+x}" ]; then
 else
   MAX_WAIT_TURN="${OCTOS_TUI_UX_WAIT_TURN:-900}"
 fi
+MAX_WAIT_APPROVAL="${OCTOS_TUI_UX_WAIT_APPROVAL:-90}"
 if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_TUI_CODING_ROUNDS+x}" ]; then
   MAX_TUI_CODING_ROUNDS=8
 else
@@ -683,7 +684,7 @@ wait_for_tui_approval_prompt() {
   while [ "$SECONDS" -le "$deadline" ]; do
     capture="$(capture_visible_clean "$session" || true)"
     without_prompt="$(printf '%s\n' "$capture" | sed '/^│user/,/^│assistant/d')"
-    if printf '%s\n' "$without_prompt" | grep -E -q -- 'Approval Requested|kind command|command sudo true|command[[:space:]]+sudo'; then
+    if printf '%s\n' "$without_prompt" | grep -E -q -- 'Approval Requested|approve this command once|approve session|deny it|y[[:space:]]*=[[:space:]]*approve|s[[:space:]]*=[[:space:]]*approve|n[[:space:]]*=[[:space:]]*deny'; then
       return 0
     fi
     sleep 0.5
@@ -1065,7 +1066,7 @@ drive_tui() {
   if ! send_tui_prompt "$tui_session" "$PROMPT_APPROVAL" "approval probe turn"; then
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval submit failure"
   fi
-  if wait_for_tui_approval_prompt "$tui_session" "$MAX_WAIT_TURN"; then
+  if wait_for_tui_approval_prompt "$tui_session" "$MAX_WAIT_APPROVAL"; then
     approval_seen=1
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval prompt"
     tmux_key "$tui_session" "$TUI_DENY_KEY"
@@ -1742,6 +1743,7 @@ main() {
     printf 'server_sandbox_mode=%s\n' "$RESOLVED_SERVER_SANDBOX_MODE"
     printf 'server_sandbox_policy=%s\n' "$SERVER_SANDBOX_POLICY"
     printf 'max_wait_turn=%s\n' "$MAX_WAIT_TURN"
+    printf 'max_wait_approval=%s\n' "$MAX_WAIT_APPROVAL"
     printf 'max_tui_coding_rounds=%s\n' "$MAX_TUI_CODING_ROUNDS"
     printf 'model=%s\n' "$MODEL"
     printf 'port=%s\n' "$PORT"
