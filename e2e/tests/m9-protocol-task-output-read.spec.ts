@@ -132,6 +132,11 @@ test.describe("M9 protocol — task/output/read", () => {
       expect(first.session_id).toBe(sid);
       expect(first.task_id).toBe(taskId);
       expect(first.source).toBe("runtime_projection");
+      // Audit issue #707 / accepted UPCR-2026-006: clients must be able to
+      // distinguish snapshot projection from a (future) live-tail read on the
+      // wire without parsing limitations[] strings.
+      expect(first.is_snapshot_projection).toBe(true);
+      expect(first.live_tail_supported).toBe(false);
       expect(first.cursor.offset).toBe(0);
       expect(first.next_cursor.offset).toBeGreaterThan(first.cursor.offset);
       expect(Buffer.byteLength(first.text, "utf8")).toBe(first.bytes_read);

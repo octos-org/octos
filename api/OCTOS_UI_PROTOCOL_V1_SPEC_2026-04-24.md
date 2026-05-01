@@ -158,6 +158,12 @@ Current M9 sandbox-parity decision:
   That UPCR closes M9 harness audit gap #704 by giving clients first-class
   AppUi RPCs for the supervisor's `cancel` / `relaunch` / task-snapshot
   primitives, gated behind the `harness.task_control.v1` feature flag.
+- The additive `is_snapshot_projection: bool` field on the
+  `task/output/read` result is governed by accepted
+  [UPCR-2026-006](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_006_TASK_OUTPUT_SNAPSHOT_PROJECTION.md).
+  That UPCR closes M9 harness audit gap #707 by giving clients a single
+  wire-level boolean for snapshot vs. live-tail semantics, independent of the
+  open `source` enum and the free-form `limitations[]` registry.
 
 ## 5. Identity Model
 
@@ -335,6 +341,38 @@ Minimum params:
 - `task_id`
 - optional `cursor`
 - optional `limit_bytes`
+
+Result fields (subset relevant to this spec; see `TaskOutputReadResult` for
+the full struct):
+
+- `source` — open snake_case enum identifying the read source. Today's
+  runtime always emits `runtime_projection`; future sources (e.g. a
+  disk-routed stdout/stderr stream) will introduce additional variants.
+  Clients MUST NOT switch on this enum to decide whether the cursor is a
+  stable byte-stream offset or an advisory snapshot offset; use
+  `is_snapshot_projection` for that.
+- `cursor` / `next_cursor` — byte offsets into the returned text window.
+  When `is_snapshot_projection` is `true` the offsets are interpreted within
+  the snapshot served by this response; when it is `false` the offsets are
+  stable positions in the live byte stream the source exposes (see
+  `is_snapshot_projection` below).
+- `live_tail_supported: bool` — whether the read *source* has a live-tail
+  mode (i.e. whether `task/output/delta` notifications can be expected for
+  the same task). Today's `runtime_projection` source always reports
+  `false`.
+- `is_snapshot_projection: bool` — required, governed by accepted
+  [UPCR-2026-006](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_006_TASK_OUTPUT_SNAPSHOT_PROJECTION.md).
+  When `true`, the response was projected from a point-in-time snapshot of
+  the task ledger; `cursor` / `next_cursor` are advisory across reads
+  because a fresh `task/output/read` may project a different snapshot.
+  When `false`, the response was sourced from a live byte-monotonic stream
+  and `next_cursor` is a stable resume offset. Today's runtime always emits
+  `is_snapshot_projection: true`.
+- `limitations` — free-form list of `{ code, message }` entries describing
+  source-specific caveats (e.g. `live_tail_unavailable`,
+  `disk_output_unavailable`). Clients MUST NOT rely on specific `code`
+  values as a contract for snapshot vs. live-tail semantics; that contract
+  is carried by `is_snapshot_projection`.
 
 ### `task/list`
 

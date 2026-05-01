@@ -94,6 +94,11 @@ export interface TaskOutputReadResult {
   truncated: boolean;
   complete: boolean;
   live_tail_supported: boolean;
+  // Audit issue #707 / accepted UPCR-2026-006: true when the result was
+  // projected from the task ledger snapshot rather than a live disk-routed
+  // output stream. Cursors returned alongside `is_snapshot_projection: true`
+  // are advisory; a fresh read may produce a different snapshot.
+  is_snapshot_projection: boolean;
   task_status: string;
   runtime_state: string;
   lifecycle_state: string;
