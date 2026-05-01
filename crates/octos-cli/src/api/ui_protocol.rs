@@ -27,12 +27,13 @@ use octos_core::ui_protocol::{
     TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
     TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
     ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
-    TurnId, TurnInterruptParams, TurnStartParams, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiCursor, UiFileMutationNotice,
-    UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot,
-    UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, approval_cancelled_reasons, approval_kinds, progress_kinds,
+    TurnId, TurnInterruptParams, TurnInterruptResult, TurnStartParams,
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot,
+    UiCommand, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
+    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
+    UiProgressMetadata, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot, approval_cancelled_reasons,
+    approval_kinds, progress_kinds,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
 use serde::Serialize;
@@ -2103,21 +2104,22 @@ async fn handle_turn_interrupt(
             let _ = send_rpc_error(ws, Some(id), unknown_turn_error(&params.turn_id));
         }
         InterruptOutcome::Mismatch => {
-            let _ = send_rpc_result(
+            // Codified by accepted UPCR-2026-008: typed `reason` field on
+            // `TurnInterruptResult`. String registry value `turn_id_mismatch`.
+            let _ = send_typed_interrupt_result(
                 ws,
                 id,
-                json!({ "interrupted": false, "reason": "turn_id_mismatch" }),
+                TurnInterruptResult::declined("turn_id_mismatch"),
             );
         }
         InterruptOutcome::AlreadyTerminal(reason) => {
             let interrupted = matches!(reason, TerminalReason::Interrupted);
-            let _ = send_rpc_result(
+            // Codified by accepted UPCR-2026-008: typed `terminal_state` field
+            // on `TurnInterruptResult`. Values come from `TerminalReason`.
+            let _ = send_typed_interrupt_result(
                 ws,
                 id,
-                json!({
-                    "interrupted": interrupted,
-                    "terminal_state": reason.as_str(),
-                }),
+                TurnInterruptResult::already_terminal(reason.as_str(), interrupted),
             );
         }
         InterruptOutcome::AlreadyInterrupting => {
@@ -2125,7 +2127,7 @@ async fn handle_turn_interrupt(
             // awaiting ack. The terminal event is already guaranteed to be
             // emitted exactly once. Idempotent: report the same response shape
             // as the original caller will.
-            let _ = send_rpc_result(ws, id, json!({ "interrupted": true }));
+            let _ = send_typed_interrupt_result(ws, id, TurnInterruptResult::interrupted_ok());
         }
         InterruptOutcome::Captured { ack_rx } => {
             // State is now `Interrupting { ack }`; the turn task is wired to
@@ -2135,19 +2137,37 @@ async fn handle_turn_interrupt(
             // emission and could lose the wire-side event.
             let result = tokio::time::timeout(INTERRUPT_ACK_TIMEOUT, ack_rx).await;
             let payload = match result {
-                Ok(Ok(())) => json!({ "interrupted": true }),
+                Ok(Ok(())) => TurnInterruptResult::interrupted_ok(),
                 Ok(Err(_)) => {
                     // Sender dropped without ack — the task panicked or was
                     // cancelled before reaching the terminal arm. The state
                     // remains `Interrupting`; report timeout-style result so
                     // the caller knows the wire-side terminal is uncertain.
-                    json!({ "interrupted": true, "ack_timeout": true })
+                    // Codified by accepted UPCR-2026-008.
+                    TurnInterruptResult::ack_timed_out()
                 }
-                Err(_) => json!({ "interrupted": true, "ack_timeout": true }),
+                Err(_) => TurnInterruptResult::ack_timed_out(),
             };
-            let _ = send_rpc_result(ws, id, payload);
+            let _ = send_typed_interrupt_result(ws, id, payload);
         }
     }
+}
+
+/// Serialize a typed `TurnInterruptResult` and dispatch via `send_rpc_result`.
+///
+/// Falls back to a hand-built minimal result if serialization fails. The
+/// fallback path should be unreachable in practice — `TurnInterruptResult`
+/// has no field that can fail to serialize — but keeping the call infallible
+/// on the wire avoids leaving the caller without a response on a defensive
+/// path.
+fn send_typed_interrupt_result(
+    ws: &WsConnection,
+    id: String,
+    result: TurnInterruptResult,
+) -> Result<(), SendError> {
+    let value = serde_json::to_value(&result)
+        .unwrap_or_else(|_| json!({ "interrupted": result.interrupted }));
+    send_rpc_result(ws, id, value)
 }
 
 #[derive(Debug)]
