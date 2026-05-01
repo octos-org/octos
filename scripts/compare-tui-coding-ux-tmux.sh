@@ -692,6 +692,32 @@ wait_for_tui_approval_prompt() {
   return 1
 }
 
+wait_for_tui_approval_outcome() {
+  local session="$1"
+  local timeout="$2"
+  local deadline=$((SECONDS + timeout))
+  local capture
+  local without_prompt
+
+  while [ "$SECONDS" -le "$deadline" ]; do
+    capture="$(capture_visible_clean "$session" || true)"
+    without_prompt="$(printf '%s\n' "$capture" | sed '/^│user/,/^│assistant/d')"
+    if printf '%s\n' "$without_prompt" | grep -E -q -- 'Approval Requested|approve this command once|approve session|deny it|y[[:space:]]*=[[:space:]]*approve|s[[:space:]]*=[[:space:]]*approve|n[[:space:]]*=[[:space:]]*deny'; then
+      return 0
+    fi
+    if printf '%s\n' "$without_prompt" | grep -E -q -- 'blocked.*interactive approval|pending interactive approval|requires interactive approval|approve .* from your end|approval on your end|safety filter'; then
+      return 2
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+record_tui_missing_approval_prompt() {
+  local session="$1"
+  append_capture_clean_to_file "$session" "$transcript" "octos-tui approval prompt missing"
+}
+
 candidate_has_diff() {
   local dir="$1"
   (
@@ -1075,12 +1101,19 @@ drive_tui() {
   if ! send_tui_prompt "$tui_session" "$PROMPT_APPROVAL" "approval probe turn"; then
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval submit failure"
   fi
-  if wait_for_tui_approval_prompt "$tui_session" "$MAX_WAIT_APPROVAL"; then
+  local approval_outcome=1
+  set +e
+  wait_for_tui_approval_outcome "$tui_session" "$MAX_WAIT_APPROVAL"
+  approval_outcome=$?
+  set -e
+  if [ "$approval_outcome" -eq 0 ]; then
     approval_seen=1
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval prompt"
     tmux_key "$tui_session" "$TUI_DENY_KEY"
+  elif [ "$approval_outcome" -eq 2 ]; then
+    record_tui_missing_approval_prompt "$tui_session"
   fi
-  if wait_for_tui_denial_ack "$tui_session" 180; then
+  if [ "$approval_outcome" -eq 0 ] && wait_for_tui_denial_ack "$tui_session" 180; then
     denial_seen=1
   fi
   wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
