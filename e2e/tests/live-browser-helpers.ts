@@ -362,6 +362,103 @@ export async function countAssistantBubbles(page: Page) {
   return page.locator(SEL.assistantMessage).count();
 }
 
+/**
+ * Trailing wall-clock timestamp the SPA renders as the LAST line of every
+ * assistant bubble (`YYYY-MM-DD HH:MM:SS`). Anchored to trailing position
+ * (optionally with whitespace) so it doesn't strip a date the LLM
+ * actually emitted INSIDE its answer (e.g. "Today is 2026-05-01") —
+ * which the previous global regex would have eaten and falsely
+ * classified as placeholder-only.
+ */
+const TRAILING_TIMESTAMP_RE = /\s*\d{4}-\d{2}-\d{2}[T\s]+\d{2}:\d{2}:\d{2}\s*$/;
+
+/**
+ * "Thinking" placeholder the SPA renders WHILE the assistant is iterating
+ * but before any tokens have streamed. The legacy renderer emits it as
+ * `.\n.\n.\nThinking (iteration N)` (parens), the newer renderer as
+ * `Thinking... (iteration N)` (ellipsis-then-parens). Match both shapes
+ * with optional dots/ellipsis between "Thinking" and the iteration.
+ * Counted as "filled" by naive `text.length > 1` waits — which made
+ * tests like `live-overflow-stress` exit before real responses arrived.
+ */
+const THINKING_PLACEHOLDER_RE = /Thinking[\s.…]*\(iteration\s+\d+\)/i;
+
+/**
+ * Spawn-only ack messages emitted by `run_pipeline` / `deep_research`
+ * spawn_only flows. PR #688 made these flows return TWO bubbles per turn:
+ * one ack within ~1-3s ("X started in background…"), one result minutes
+ * later (often a `.md` attachment). Harness predicates need to treat
+ * bubbles whose entire body is the ack as "still pending result".
+ *
+ * Detected by a small set of locale-aware ack phrases the daemon emits in
+ * `crates/octos-cli/src/workflows/*.rs`. Anchored phrases are preferred
+ * over unbounded substrings to avoid false-classifying legitimate
+ * results that mention "background" or "在后台" in prose as ack-only.
+ * The `<200` chars guard in `isSpawnAckOnly` provides a defense-in-
+ * depth backstop — if a real result happens to contain an ack-shaped
+ * phrase, the body length almost certainly exceeds the bare ack.
+ *
+ * NB: long-term the cleaner contract is server/SSE metadata
+ * (`message_kind: "spawn_ack" | "assistant_result"` or
+ * `metadata.is_spawn_ack`) surfaced as a DOM data attr; per codex
+ * review on 2026-05-01 these regexes are explicitly the compatibility
+ * fallback, not the final ABI.
+ */
+const SPAWN_ACK_PATTERNS: RegExp[] = [
+  /^.{0,30}已在后台启动/,
+  /^.{0,30}已在後台啟動/,
+  /^.{0,30}已在后台运行/,
+  /^.{0,30}已在後台運行/,
+  /^.{0,80}\b(?:has\s+)?started\s+in\s+(?:the\s+)?background\b/i,
+  /^.{0,80}\b(?:is\s+now\s+)?running\s+in\s+(?:the\s+)?background\b/i,
+];
+
+/**
+ * Strip timestamp + placeholder noise so callers can compare against
+ * "did real content arrive yet" predicates without hand-rolling the
+ * cleanup at every call-site.
+ */
+export function normalizeBubbleText(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(TRAILING_TIMESTAMP_RE, '')
+    .replace(THINKING_PLACEHOLDER_RE, '')
+    .replace(/[.\s]+/g, ' ') // collapse the `.\n.\n.` Thinking pre-pad
+    .trim();
+}
+
+/**
+ * True iff the bubble has nothing but SPA chrome (timestamp, "Thinking
+ * (iteration N)" placeholder, dot-pre-pad). Used by stress harnesses
+ * that need to wait for REAL content rather than the chrome that ships
+ * with every assistant slot.
+ */
+export function isPlaceholderOnly(raw: string): boolean {
+  return normalizeBubbleText(raw).length === 0;
+}
+
+/**
+ * True iff the bubble's only meaningful text is a spawn-only ack. Such a
+ * bubble means the result is still in flight — callers waiting on the
+ * RESULT (not the ack) should treat it as pending.
+ *
+ * `expected_in_response` markers in some specs (e.g. `'research'` for a
+ * deep-research prompt) can incidentally match the Chinese ack
+ * "深度研究已在后台启动" because both share the substring 研究. The fix is
+ * to detect the ack shape independently and require a non-ack signal
+ * (text marker after stripping ack OR `.md` attachment href) before
+ * declaring the spawn_only turn satisfied.
+ */
+export function isSpawnAckOnly(raw: string): boolean {
+  const normalized = normalizeBubbleText(raw);
+  if (normalized.length === 0) return false;
+  if (!SPAWN_ACK_PATTERNS.some((re) => re.test(normalized))) return false;
+  // Ack body is short — a few sentences. If the bubble is much longer
+  // than the ack itself, the result has streamed in alongside it (rare
+  // for spawn_only, but defensive).
+  return normalized.length < 200;
+}
+
 export async function sendAndWait(
   page: Page,
   message: string,
