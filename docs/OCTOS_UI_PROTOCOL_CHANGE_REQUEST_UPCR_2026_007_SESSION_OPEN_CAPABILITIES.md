@@ -78,7 +78,10 @@ Affected existing wire surface:
   - new field: `capabilities` (required, always emitted)
 
 The added field is a `UiProtocolCapabilities` object with the existing
-shape:
+shape. Example: a client that requested only `pane.snapshots.v1` via
+`X-Octos-Ui-Features` receives the negotiated payload below — the
+task-control RPCs are excluded from `supported_methods` because their
+gating feature `harness.task_control.v1` was not in the request:
 
 ```json
 {
@@ -95,9 +98,6 @@ shape:
     "approval/respond",
     "approval/scopes/list",
     "diff/preview/get",
-    "task/list",
-    "task/cancel",
-    "task/restart_from_node",
     "task/output/read"
   ],
   "supported_notifications": [
@@ -124,6 +124,12 @@ shape:
   ]
 }
 ```
+
+A client that sends no `X-Octos-Ui-Features` header receives the full
+`first_server_slice` payload instead — `supported_methods` includes
+the task-control RPCs and `supported_features` includes every name in
+`UI_PROTOCOL_KNOWN_FEATURES` — so it can still discover the surface in
+one round-trip.
 
 ### Negotiation Semantics
 
@@ -279,3 +285,19 @@ negotiation channel, and never leaks a feature the client did not
 request. The required-field-with-`serde(default)` choice keeps wire
 compatibility with older binaries and ledger replays while pinning the
 field as a stable surface new clients can rely on.
+
+### Out of Scope
+
+- **Runtime-side enforcement of `harness.task_control.v1`.** This UPCR
+  gates *advertisement*: a client that did not request the feature does
+  not see the methods in `supported_methods`. The
+  `handle_task_list` / `handle_task_cancel` /
+  `handle_task_restart_from_node` handlers in
+  `crates/octos-cli/src/api/ui_protocol.rs` still accept the calls
+  regardless of `ConnectionUiFeatures.harness_task_control`. A
+  well-behaved client that consults `supported_methods` will not call
+  them, but a malformed client could still hit the handler. Wiring
+  runtime rejection (returning `method_not_supported` when the feature
+  is not negotiated) is a follow-up tracked separately — it requires
+  threading the negotiated set through every command dispatcher and is
+  larger than the scope this UPCR closes.
