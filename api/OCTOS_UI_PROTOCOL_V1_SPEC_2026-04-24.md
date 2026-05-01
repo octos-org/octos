@@ -362,18 +362,23 @@ Result fields:
 
 Errors follow the v1 taxonomy (see § 10):
 
-- `unknown_session` when the requested session is not active and has no
-  tracked tasks
 - `runtime_unavailable` with `data.kind = "runtime_unavailable"` when the
   server has no task supervisor wired
+
+A `task/list` request for an inactive or unknown session returns an empty
+`tasks` array rather than `unknown_session`, matching how the
+`SessionTaskQueryStore` snapshot already handles missing supervisors.
 
 ### `task/cancel`
 
 Capability-gated by accepted `UPCR-2026-005`. Maps to
-`TaskSupervisor::cancel(task_id)` and preserves the cancel-race guard from
-PR #709 — once a task transitions to `cancelled`, later runtime state
-transitions cannot overwrite it, so a re-entrant cancel is observably
-idempotent.
+`TaskSupervisor::cancel(task_id)` (via `SessionTaskQueryStore::cancel_task`,
+which dispatches to the owning supervisor) and preserves the cancel-race
+guard from PR #709: once a task transitions to `cancelled`, later runtime
+state transitions cannot overwrite it. Re-entrant cancel of an
+already-terminal task surfaces as the `task_already_terminal` error rather
+than a second success — the supervisor *state* is the idempotent invariant,
+not the wire response.
 
 Purpose:
 
@@ -382,8 +387,9 @@ Purpose:
 Minimum params:
 
 - `task_id`
-- `session_id` — required for session-scope validation; omitting it returns
-  `invalid_params` so clients cannot cross-cancel tasks across sessions
+- `session_id` — wire-optional but validated as required at handler time;
+  omitting it returns `invalid_params` so clients cannot cross-cancel tasks
+  across sessions
 - optional `profile_id` — forwarded to the connection-profile validator
 
 Result fields:
@@ -397,9 +403,13 @@ Errors follow the v1 taxonomy (see § 10):
 - `unknown_task` when the supervisor has no task with that id, or the task is
   scoped to a different session than the request
 - `invalid_params` with `data.kind = "task_already_terminal"` when applied to
-  a task already in a terminal state
-- `permission_denied` when the connection profile does not match the
-  requested session/profile
+  a task already in a terminal state (including a task that was already
+  cancelled)
+- `invalid_params` (with the existing `expected_profile_id` /
+  `actual_profile_id` data fields) when the connection profile does not match
+  the requested `session_id` or `profile_id`. The taxonomy reuses
+  `validate_session_scope`, which the rest of the AppUi command surface
+  already returns as `invalid_params` for profile mismatches
 
 ### `task/restart_from_node`
 
@@ -418,8 +428,8 @@ Minimum params:
 - `task_id`
 - optional `node_id` — pipeline node id to resume from; forwarded to
   `RelaunchOpts.from_node`
-- `session_id` — required for session-scope validation, same rule as
-  `task/cancel`
+- `session_id` — wire-optional but validated as required at handler time,
+  same rule as `task/cancel`
 - optional `profile_id` — forwarded to the connection-profile validator
 
 Result fields:
@@ -435,6 +445,9 @@ Errors follow the v1 taxonomy (see § 10):
   scoped to a different session than the request
 - `invalid_params` with `data.kind = "task_still_active"` when applied to a
   non-terminal task
+- `invalid_params` (with the same `expected_profile_id` / `actual_profile_id`
+  data fields documented for `task/cancel`) when the connection profile does
+  not match the requested `session_id` or `profile_id`
 
 ## 8. Event Semantics
 

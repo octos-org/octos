@@ -48,12 +48,13 @@ them piecemeal would require three UPCRs for one logical contract addition.
 
 ## Change Type
 
-Additive method/notification.
+Additive method.
 
-Three new JSON-RPC command methods on the existing AppUi v1alpha1 protocol. No
-existing method, notification, required field, enum variant, or capability flag
-is modified. One additive feature flag (`harness.task_control.v1`) is added so
-clients can negotiate availability.
+Three new JSON-RPC command methods on the existing AppUi v1alpha1 protocol.
+No new notifications are added. No existing method, notification, required
+field, enum variant, or capability flag is modified. One additive feature
+flag (`harness.task_control.v1`) is added so clients can negotiate
+availability.
 
 ## Wire Contract
 
@@ -142,10 +143,13 @@ Params:
 ```
 
 - `task_id` (required): the task to cancel.
-- `session_id` (required for v1alpha1): scopes the cancel to one session and
-  enables the same `validate_session_scope` check used by other AppUi commands.
-  An absent `session_id` is rejected with `invalid_params` so clients cannot
-  cross-cancel tasks across sessions.
+- `session_id` (wire-optional, validated as required at handler time): scopes
+  the cancel to one session and enables the same `validate_session_scope`
+  check used by other AppUi commands. The wire schema keeps the field
+  optional to match the existing v1 pattern of using `serde(default,
+  skip_serializing_if = "Option::is_none")` for cross-session-shaped
+  identifiers; the handler rejects an absent `session_id` with
+  `invalid_params` so clients cannot cross-cancel tasks across sessions.
 - `profile_id` (optional): forwarded to the connection-profile validator.
 
 Result:
@@ -160,7 +164,10 @@ Result:
 - `status` is the canonical `TaskRuntimeState` value `cancelled` (governed by
   accepted `UPCR-2026-004`). The server preserves the cancel-race guard from
   PR #709: once a task is `Cancelled`, later runtime state transitions cannot
-  overwrite it, so a re-entrant cancel is observably idempotent.
+  overwrite the supervisor's stored state. A re-cancel of an already-terminal
+  task surfaces as `invalid_params` with `data.kind = "task_already_terminal"`
+  rather than a second `cancelled` success — the supervisor *state* is the
+  idempotent invariant, not the wire response.
 
 ### `task/restart_from_node`
 
@@ -184,7 +191,8 @@ Params:
 - `task_id` (required): the task to relaunch.
 - `node_id` (optional): pipeline node id to resume from. Forwarded to
   `RelaunchOpts.from_node`.
-- `session_id` (required for v1alpha1): same scoping rule as `task/cancel`.
+- `session_id` (wire-optional, validated as required at handler time): same
+  scoping rule as `task/cancel`.
 - `profile_id` (optional): forwarded to the connection-profile validator.
 
 Result:
@@ -211,16 +219,25 @@ The new commands return errors from the existing v1 taxonomy
 - `invalid_params` — params failed structural validation. Includes:
   - missing `session_id` on `task/cancel` / `task/restart_from_node`,
   - `task_already_terminal` (cancel applied to a task already in a terminal
-    state) — returned with `data.kind = "task_already_terminal"`,
+    state, including a task that was already cancelled) — returned with
+    `data.kind = "task_already_terminal"`,
   - `task_still_active` (relaunch applied to a non-terminal task) — returned
-    with `data.kind = "task_still_active"`.
-- `permission_denied` — connection profile does not match the requested
-  session/profile (existing `validate_session_scope` rule).
+    with `data.kind = "task_still_active"`,
+  - profile-scope mismatches surfaced through the existing
+    `validate_session_scope` helper. Carries the same
+    `expected_profile_id` / `actual_profile_id` data fields the rest of the
+    AppUi command surface already returns; this UPCR keeps the existing
+    convention rather than introducing a new `permission_denied` channel for
+    the same case.
 - `runtime_unavailable` — server has no `task_query_store` wired for this
   deployment (e.g. lite/embedded build). Returned with
   `data.kind = "runtime_unavailable"`.
 - `internal_error` — supervisor produced a non-array snapshot or returned an
   unparseable task id (defensive; should not occur in practice).
+
+A `task/list` request for an inactive or unknown session returns an empty
+`tasks` array rather than `unknown_session`, matching how the existing
+`SessionTaskQueryStore` snapshot already handles missing supervisors.
 
 No new error categories are introduced.
 
