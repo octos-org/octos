@@ -44,6 +44,7 @@ use tracing::{debug, warn};
 
 use octos_agent::cost_ledger::{CostAccountant, CostAttributionEvent, project_cost_usd};
 
+use crate::gate::{DispatchPolicy, enforce_or_outcome};
 use crate::ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
 use crate::persistence::{DispatchRecord, DispatchStore};
 use crate::result::{
@@ -173,6 +174,15 @@ pub struct Swarm {
     /// keeps the legacy pre-fix behaviour so integration tests and
     /// existing callers are unchanged.
     cost_budget: Option<SwarmCostBudget>,
+    /// M7 req 7: pre-dispatch policy gate. Closes the parity gap so
+    /// MCP/CLI/native backends honour the same approval, tool policy,
+    /// sandbox, and env-allowlist enforcement the native
+    /// [`octos_agent::tools::ToolRegistry::execute_with_context`] path
+    /// applies. Stored as an `Arc` so it can be cheaply cloned into the
+    /// per-subtask `JoinSet` without forcing the policy itself to be
+    /// `Clone`-cheap. A default policy (`is_noop()`) short-circuits the
+    /// gate so existing callers see no behavioural change.
+    dispatch_policy: Arc<DispatchPolicy>,
 }
 
 impl Swarm {
@@ -403,6 +413,7 @@ impl Swarm {
                 contract,
                 attempts,
                 self.cost_budget.as_ref(),
+                self.dispatch_policy.as_ref(),
             )
             .await;
             // Review A F-004: run per-subtask completion validators.
@@ -452,6 +463,7 @@ impl Swarm {
                 &contract,
                 attempts,
                 self.cost_budget.as_ref(),
+                self.dispatch_policy.as_ref(),
             )
             .await;
             // Review A F-004: run per-subtask completion validators. Pipeline
@@ -532,9 +544,16 @@ impl Swarm {
         let backend = Arc::clone(&self.backend);
         let contract = contracts[idx].clone();
         let budget = self.cost_budget.clone();
+        let policy = Arc::clone(&self.dispatch_policy);
         set.spawn(async move {
-            let outcome =
-                dispatch_with_budget(backend.as_ref(), &contract, attempts, budget.as_ref()).await;
+            let outcome = dispatch_with_budget(
+                backend.as_ref(),
+                &contract,
+                attempts,
+                budget.as_ref(),
+                policy.as_ref(),
+            )
+            .await;
             (idx, outcome)
         });
     }
@@ -615,6 +634,7 @@ pub struct SwarmBuilder {
     validator: Option<AggregateValidator>,
     event_sink: Arc<dyn SwarmEventSink>,
     cost_budget: Option<SwarmCostBudget>,
+    dispatch_policy: Arc<DispatchPolicy>,
 }
 
 impl SwarmBuilder {
@@ -626,6 +646,7 @@ impl SwarmBuilder {
             validator: None,
             event_sink: Arc::new(NoopSwarmEventSink),
             cost_budget: None,
+            dispatch_policy: Arc::new(DispatchPolicy::default()),
         }
     }
 
@@ -663,6 +684,18 @@ impl SwarmBuilder {
         self
     }
 
+    /// M7 req 7: wire a [`DispatchPolicy`] gate that runs before every
+    /// `McpAgentBackend::dispatch` call. Mirrors the gate sequence the
+    /// native [`octos_agent::tools::ToolRegistry::execute_with_context`]
+    /// path applies (tool policy, approval, sandbox, env allowlist) so
+    /// MCP/CLI/native backends are gated uniformly. Without this call
+    /// the swarm runs with the default no-op policy, preserving
+    /// pre-fix behaviour for existing callers.
+    pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.dispatch_policy = Arc::new(policy);
+        self
+    }
+
     /// Open the redb ledger and return the usable [`Swarm`].
     pub async fn build(self) -> Result<Swarm> {
         let store = DispatchStore::open(&self.persistence_dir).await?;
@@ -673,6 +706,7 @@ impl SwarmBuilder {
             validator: self.validator,
             event_sink: self.event_sink,
             cost_budget: self.cost_budget,
+            dispatch_policy: self.dispatch_policy,
         })
     }
 }
@@ -686,12 +720,27 @@ impl SwarmBuilder {
 /// refunding the projected spend without a ledger write. Commit only
 /// fires when the subtask reached a `Completed` terminal status so
 /// retryable / terminal failures never inflate the ledger.
+///
+/// M7 req 7: the [`DispatchPolicy`] gate runs **first**, before any
+/// budget reservation or backend dispatch. A gate denial short-circuits
+/// the whole pipeline (no reservation taken, no backend touched, no
+/// ledger row written) and the synthesised [`SubtaskOutcome`] flows
+/// through the existing event/metrics path so the harness sees a
+/// `policy_denied` / `approval_denied` / `env_forbidden` /
+/// `sandbox_required` / `approval_unavailable` outcome label uniformly
+/// across stdio, HTTP, and any future CLI-style MCP backends.
 async fn dispatch_with_budget(
     backend: &dyn McpAgentBackend,
     contract: &ContractSpec,
     prior_attempts: u32,
     budget: Option<&SwarmCostBudget>,
+    policy: &DispatchPolicy,
 ) -> SubtaskOutcome {
+    if let Err(outcome) = enforce_or_outcome(policy, backend, contract, prior_attempts).await {
+        record_dispatch_gate_metric(backend.backend_label(), &outcome.last_dispatch_outcome);
+        return outcome;
+    }
+
     let Some(budget) = budget else {
         return dispatch_once(backend, contract, prior_attempts).await;
     };
@@ -839,6 +888,20 @@ fn record_swarm_metric(topology: &str, outcome: SwarmOutcomeKind) {
         "octos_swarm_dispatch_total",
         "topology" => topology.to_string(),
         "outcome" => outcome.as_str().to_string()
+    )
+    .increment(1);
+}
+
+/// M7 req 7: per-gate-denial counter. Surfaces approval/policy/sandbox/
+/// env-allowlist denials in the same metrics surface the dispatcher
+/// already feeds. Stable label set: `backend` (`"local"` / `"remote"`)
+/// and `outcome` (one of `policy_denied`, `approval_denied`,
+/// `approval_unavailable`, `env_forbidden`, `sandbox_required`).
+fn record_dispatch_gate_metric(backend: &str, outcome: &str) {
+    counter!(
+        "octos_swarm_dispatch_gate_denial_total",
+        "backend" => backend.to_string(),
+        "outcome" => outcome.to_string()
     )
     .increment(1);
 }
