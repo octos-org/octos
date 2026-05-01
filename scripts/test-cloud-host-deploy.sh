@@ -140,6 +140,60 @@ EOF
         fail "standalone purge should not remove frps service"
     fi
 
+    # ── Test: re-running cloud-host-deploy.sh preserves auth_token from
+    # an existing config.json when --auth-token is not provided. Avoids
+    # silently invalidating live dashboard sessions on subsequent runs
+    # (e.g. operator re-runs to flip HTTPS on, no expectation that
+    # tokens get regenerated).
+    local preserve_data_dir="$test_root/home-preserve/.octos"
+    local preserve_state="$test_root/preserve-bootstrap.env"
+    mkdir -p "$preserve_data_dir"
+    cat >"$preserve_data_dir/config.json" <<'EOF'
+{
+  "auth_token": "ORIGINAL_TOKEN_DO_NOT_OVERWRITE",
+  "mode": "cloud",
+  "tunnel_domain": "octos.example.com",
+  "frps_server": "relay.octos.example.com",
+  "provider": "openai",
+  "model": "gpt-4.1-mini",
+  "api_key_env": "OPENAI_API_KEY"
+}
+EOF
+    local preserve_config="$test_root/preserve.env"
+    cat >"$preserve_config" <<'EOF'
+TUNNEL_DOMAIN=octos.example.com
+FRPS_SERVER=relay.octos.example.com
+ENABLE_HTTPS=false
+ENABLE_SMTP=false
+FRPS_TOKEN=test-shared-frps-token
+EOF
+    local preserve_out="$test_root/preserve.out"
+    bash "$CLOUD_DEPLOY" \
+        --config "$preserve_config" \
+        --non-interactive \
+        --dry-run \
+        --data-dir "$preserve_data_dir" \
+        --prefix "$test_root/home-preserve/.octos/bin" \
+        --state-file "$preserve_state" \
+        >"$preserve_out" 2>&1 \
+        || fail "preserve-auth-token run should succeed"
+    grep -q '"auth_token": "ORIGINAL_TOKEN_DO_NOT_OVERWRITE"' "$preserve_data_dir/config.json" \
+        || fail "auth_token must be preserved across re-runs when --auth-token is not provided (saw: $(grep auth_token "$preserve_data_dir/config.json"))"
+
+    # ── Test: explicit --auth-token still overwrites (operator intent).
+    local rotate_out="$test_root/rotate.out"
+    AUTH_TOKEN="EXPLICIT_NEW_TOKEN" bash "$CLOUD_DEPLOY" \
+        --config "$preserve_config" \
+        --non-interactive \
+        --dry-run \
+        --data-dir "$preserve_data_dir" \
+        --prefix "$test_root/home-preserve/.octos/bin" \
+        --state-file "$preserve_state" \
+        >"$rotate_out" 2>&1 \
+        || fail "explicit-auth-token rotate should succeed"
+    grep -q '"auth_token": "EXPLICIT_NEW_TOKEN"' "$preserve_data_dir/config.json" \
+        || fail "explicit AUTH_TOKEN env should overwrite the existing config.json value"
+
     # ── Test: ENABLE_SMTP=false with no ALLOW_SELF_REGISTRATION succeeds.
     # Regression test for the validator failure where the
     # `ALLOW_SELF_REGISTRATION must be true or false` error fired when the
