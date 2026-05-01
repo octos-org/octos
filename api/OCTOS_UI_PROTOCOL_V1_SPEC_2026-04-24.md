@@ -152,6 +152,12 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-004](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_004_TASK_RUNTIME_CANCELLED.md).
   That UPCR carries the `task_supervisor` cancellation lifecycle through to
   the wire so cancelled tasks no longer fall back to `Running` in the UI.
+- The additive `task/list`, `task/cancel`, and `task/restart_from_node`
+  command methods are governed by accepted
+  [UPCR-2026-005](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_005_TASK_CONTROL_RPCS.md).
+  That UPCR closes M9 harness audit gap #704 by giving clients first-class
+  AppUi RPCs for the supervisor's `cancel` / `relaunch` / task-snapshot
+  primitives, gated behind the `harness.task_control.v1` feature flag.
 
 ## 5. Identity Model
 
@@ -192,6 +198,9 @@ Commands:
 - `approval/respond`
 - `diff/preview/get`
 - `task/output/read`
+- `task/list` (capability-gated, accepted `UPCR-2026-005`)
+- `task/cancel` (capability-gated, accepted `UPCR-2026-005`)
+- `task/restart_from_node` (capability-gated, accepted `UPCR-2026-005`)
 
 Notifications:
 
@@ -326,6 +335,119 @@ Minimum params:
 - `task_id`
 - optional `cursor`
 - optional `limit_bytes`
+
+### `task/list`
+
+Capability-gated by accepted `UPCR-2026-005`. Servers expose it only when
+`harness.task_control.v1` is advertised in `UiProtocolCapabilities`.
+
+Purpose:
+
+- enumerate tasks the runtime tracks for one session, with one entry per task
+  including lifecycle/runtime state, optional child-session linkage, and output
+  cursors. Primary consumer is the `/ps`-style task panel.
+
+Minimum params:
+
+- `session_id`
+- optional `topic` — sub-topic suffix appended as `<session>#<topic>` for
+  grouping; the server falls back to the bare session if omitted or empty
+
+Result fields:
+
+- `session_id` and optional `topic` echoed from the request
+- `tasks` — array of task snapshots; each entry's `state` is the canonical
+  `TaskRuntimeState` (the same enum as `task/updated`), so cancelled tasks
+  surface as `cancelled` per accepted `UPCR-2026-004`
+
+Errors follow the v1 taxonomy (see § 10):
+
+- `runtime_unavailable` with `data.kind = "runtime_unavailable"` when the
+  server has no task supervisor wired
+
+A `task/list` request for an inactive or unknown session returns an empty
+`tasks` array rather than `unknown_session`, matching how the
+`SessionTaskQueryStore` snapshot already handles missing supervisors.
+
+### `task/cancel`
+
+Capability-gated by accepted `UPCR-2026-005`. Maps to
+`TaskSupervisor::cancel(task_id)` (via `SessionTaskQueryStore::cancel_task`,
+which dispatches to the owning supervisor) and preserves the cancel-race
+guard from PR #709: once a task transitions to `cancelled`, later runtime
+state transitions cannot overwrite it. Re-entrant cancel of an
+already-terminal task surfaces as the `task_already_terminal` error rather
+than a second success — the supervisor *state* is the idempotent invariant,
+not the wire response.
+
+Purpose:
+
+- cancel a single tracked task and return its final wire state
+
+Minimum params:
+
+- `task_id`
+- `session_id` — wire-optional but validated as required at handler time;
+  omitting it returns `invalid_params` so clients cannot cross-cancel tasks
+  across sessions
+- optional `profile_id` — forwarded to the connection-profile validator
+
+Result fields:
+
+- `task_id` echoed from the request
+- `status` — canonical `TaskRuntimeState` value; cancelled tasks surface as
+  `cancelled` per accepted `UPCR-2026-004`
+
+Errors follow the v1 taxonomy (see § 10):
+
+- `unknown_task` when the supervisor has no task with that id, or the task is
+  scoped to a different session than the request
+- `invalid_params` with `data.kind = "task_already_terminal"` when applied to
+  a task already in a terminal state (including a task that was already
+  cancelled)
+- `invalid_params` (with the existing `expected_profile_id` /
+  `actual_profile_id` data fields) when the connection profile does not match
+  the requested `session_id` or `profile_id`. The taxonomy reuses
+  `validate_session_scope`, which the rest of the AppUi command surface
+  already returns as `invalid_params` for profile mismatches
+
+### `task/restart_from_node`
+
+Capability-gated by accepted `UPCR-2026-005`. Maps to
+`TaskSupervisor::relaunch(task_id, opts)` for operator-triggered relaunch of a
+previously failed or terminal task, optionally beginning from a specific
+pipeline node.
+
+Purpose:
+
+- relaunch a tracked task from a chosen node and return the supervisor-assigned
+  successor task id
+
+Minimum params:
+
+- `task_id`
+- optional `node_id` — pipeline node id to resume from; forwarded to
+  `RelaunchOpts.from_node`
+- `session_id` — wire-optional but validated as required at handler time,
+  same rule as `task/cancel`
+- optional `profile_id` — forwarded to the connection-profile validator
+
+Result fields:
+
+- `original_task_id` echoed from the request
+- `new_task_id` — supervisor-assigned id of the relaunched successor
+- optional `from_node` — echoed when the supervisor accepted the requested
+  node
+
+Errors follow the v1 taxonomy (see § 10):
+
+- `unknown_task` when the supervisor has no task with that id, or the task is
+  scoped to a different session than the request
+- `invalid_params` with `data.kind = "task_still_active"` when applied to a
+  non-terminal task
+- `invalid_params` (with the same `expected_profile_id` / `actual_profile_id`
+  data fields documented for `task/cancel`) when the connection profile does
+  not match the requested `session_id` or `profile_id`
 
 ## 8. Event Semantics
 
