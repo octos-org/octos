@@ -79,6 +79,7 @@
 #![doc(html_root_url = "https://docs.rs/octos-swarm/0.1.0")]
 
 mod dispatcher;
+mod gate;
 mod ledger;
 mod persistence;
 mod result;
@@ -88,6 +89,7 @@ pub use dispatcher::{
     AggregateValidator, MAX_RETRY_ROUNDS, NoopSwarmEventSink, Swarm, SwarmBudget, SwarmBuilder,
     SwarmContext, SwarmCostBudget, SwarmEventSink, flatten_aggregate,
 };
+pub use gate::DispatchPolicy;
 pub use ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
 pub use persistence::{DISPATCH_RECORD_SCHEMA_VERSION, DispatchRecord, DispatchStore};
 pub use result::{AggregateArtifact, SubtaskOutcome, SubtaskStatus, SwarmOutcomeKind, SwarmResult};
