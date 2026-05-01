@@ -877,21 +877,22 @@ impl Channel for ApiChannel {
 
             // File message — persist to session history AND send SSE event.
             let committed_message = if !history_already_persisted {
-                let session_msg = Message {
-                    role: MessageRole::Assistant,
-                    // Preserve only the human-facing caption. The API/web path
-                    // already has structured media handles, so persisting
-                    // synthetic legacy `[file:...]` lines here creates
-                    // duplicate terminal file deliveries for the same artifact.
-                    content: msg.content.clone(),
-                    media: persisted_media.clone(),
-                    tool_calls: None,
-                    tool_call_id: tool_call_id.clone(),
-                    reasoning_content: None,
-                    client_message_id: None,
-                    thread_id: None,
-                    timestamp: chrono::Utc::now(),
+                // PR A: route through the typed assistant constructor when
+                // the outbound carries a thread_id (metadata or sticky fallback)
+                // so the persisted JSONL row is pinned to the correct thread.
+                // Preserve only the human-facing caption. The API/web path
+                // already has structured media handles, so persisting
+                // synthetic legacy `[file:...]` lines here creates duplicate
+                // terminal file deliveries for the same artifact.
+                let mut session_msg = match thread_id.as_deref() {
+                    Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                        msg.content.clone(),
+                        octos_core::ThreadId::new(tid),
+                    ),
+                    _ => Message::assistant(msg.content.clone()),
                 };
+                session_msg.media = persisted_media.clone();
+                session_msg.tool_call_id = tool_call_id.clone();
                 self.persist_to_session(&msg.chat_id, topic, session_msg)
                     .await
             } else {
@@ -1007,17 +1008,18 @@ impl Channel for ApiChannel {
         if is_bg_notification {
             // Background task notification — persist to session history.
             // Client polling will pick this up as the stop signal.
+            // PR A: when the outbound carries a thread_id (the originating
+            // turn's identity), use the typed assistant constructor so the
+            // persisted background-completion row is pinned to the correct
+            // thread instead of relying on the late-arrival derivation
+            // fallback (the same bug class that drove #649 → #740).
             if !history_already_persisted {
-                let session_msg = Message {
-                    role: MessageRole::Assistant,
-                    content: msg.content.clone(),
-                    media: vec![],
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    client_message_id: None,
-                    thread_id: None,
-                    timestamp: chrono::Utc::now(),
+                let session_msg = match thread_id.as_deref() {
+                    Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                        msg.content.clone(),
+                        octos_core::ThreadId::new(tid),
+                    ),
+                    _ => Message::assistant(msg.content.clone()),
                 };
                 let _ = self
                     .persist_to_session(&msg.chat_id, topic, session_msg)
