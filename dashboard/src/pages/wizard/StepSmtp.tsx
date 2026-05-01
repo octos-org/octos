@@ -49,12 +49,16 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         setUsername(s.username)
         setFromAddress(s.from_address)
         setPasswordConfigured(s.password_configured)
-        // If the field has never been written, the default-on UX still
-        // applies. If it has been written (true or false), respect it so
-        // re-entering the wizard reflects the saved state.
-        if (s.host.trim().length > 0) {
-          setAllowSelfRegistration(s.allow_self_registration)
-        }
+        // Always default the checkbox to on when the wizard opens. The
+        // install-time coercion (cloud-host-deploy.sh forcing
+        // ALLOW_SELF_REGISTRATION=false when SMTP is declined) leaves the
+        // saved value at false, but the wizard's intent is to surface this
+        // as the operator's first chance to flip it on. Reflecting saved
+        // state would defeat that. Operators who deliberately want
+        // allowlist-only login uncheck and save here — the next wizard
+        // visit will show on again, which is a small wart vs. the install-
+        // time-coercion silent-disable problem this is closing.
+        setAllowSelfRegistration(true)
         setLoaded(true)
       })
       .catch((e) => {
