@@ -7,6 +7,9 @@
 #   ./scripts/build-local-bundle.sh                    # build + bundle only
 #   ./scripts/build-local-bundle.sh --install          # + run installer
 #   ./scripts/build-local-bundle.sh --skip-dashboard   # skip npm/vite build
+#   ./scripts/build-local-bundle.sh --install-deps     # auto-install Node.js
+#                                                       # for the dashboard build
+#                                                       # (forwarded to install.sh too)
 #   ./scripts/build-local-bundle.sh --install --tunnel --tenant-name alice ...
 #
 # Environment (defaults mirror .github/workflows/ci.yml):
@@ -18,10 +21,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 SKIP_DASHBOARD=false
+INSTALL_DEPS=false
 PASSTHRU=()
 for arg in "$@"; do
     case "$arg" in
         --skip-dashboard) SKIP_DASHBOARD=true ;;
+        --install-deps)   INSTALL_DEPS=true; PASSTHRU+=("$arg") ;;
         *)                PASSTHRU+=("$arg") ;;
     esac
 done
@@ -51,7 +56,9 @@ echo "==> Target: $TRIPLE"
 if [ "$SKIP_DASHBOARD" = true ]; then
     echo "==> Skipping dashboard build (--skip-dashboard)"
 else
-    ./scripts/build-dashboard.sh
+    DASHBOARD_ARGS=()
+    [ "$INSTALL_DEPS" = true ] && DASHBOARD_ARGS+=(--install-deps)
+    ./scripts/build-dashboard.sh "${DASHBOARD_ARGS[@]}"
 fi
 
 # ── Build (delegates to milestone-ci.sh release-bundle) ──────────────
