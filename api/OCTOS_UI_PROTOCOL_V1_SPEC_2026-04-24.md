@@ -171,6 +171,17 @@ Current M9 sandbox-parity decision:
   diagnostic fields the `turn/interrupt` handler has been emitting since the
   protocol shipped. The typed contract is now equivalent to the wire shape;
   the canonical minimal `{ "interrupted": <bool> }` response is preserved.
+- The additive `capabilities` field on `SessionOpened` (carrying the
+  negotiated `UiProtocolCapabilities` payload) is governed by accepted
+  [UPCR-2026-007](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_007_SESSION_OPEN_CAPABILITIES.md).
+  That UPCR closes M9 harness audit gap #720 by emitting the negotiated
+  method/notification/feature surface in-band so clients no longer have
+  to read the spec doc to know which `X-Octos-Ui-Features` tokens the
+  server honours. The field is the in-band counterpart to the
+  capability-negotiation rules in this section: `supported_features` is
+  the intersection of the client's `X-Octos-Ui-Features` request with
+  the server's known feature registry; absent header falls back to the
+  first-server-slice default.
 
 ## 5. Identity Model
 
@@ -269,6 +280,19 @@ Optional result fields from accepted `UPCR-2026-003`:
   Canonical server-approved workspace root for the session. Clients should use
   it for display/status and must not infer approval from the requested `cwd`
   alone.
+
+Required result fields from accepted `UPCR-2026-007`:
+
+- `capabilities`
+  Negotiated `UiProtocolCapabilities` payload. Always present. Carries the
+  protocol version, capability schema version, server-advertised method and
+  notification sets, and the `supported_features` subset honoured for this
+  session. When the client did not send `X-Octos-Ui-Features`, the field
+  echoes the server's first-server-slice default so a discovery-aware client
+  can still learn the surface in-band. When the client sent feature tokens,
+  `supported_features` is the intersection of the request with the server's
+  known feature registry — the server never advertises a flag the client did
+  not request.
 
 ### `turn/start`
 
@@ -530,7 +554,8 @@ Marks the start of one client-visible turn. This creates the turn lifecycle boun
 
 Carries the opened-session notification and optional cursor baseline. The
 notification payload shares the `SessionOpened` shape used by
-`SessionOpenResult.opened`.
+`SessionOpenResult.opened`, including the required `capabilities` field
+from accepted `UPCR-2026-007` (see § 7).
 
 Optional pane fields from accepted `UPCR-2026-002`:
 
