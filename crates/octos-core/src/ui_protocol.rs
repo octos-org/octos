@@ -1270,6 +1270,13 @@ pub struct TaskOutputReadResult {
     pub truncated: bool,
     pub complete: bool,
     pub live_tail_supported: bool,
+    /// True when this read came from snapshot projection rather than a live
+    /// disk-routed output stream. Clients should treat the cursor returned
+    /// alongside `is_snapshot_projection: true` as advisory: a fresh read may
+    /// produce a different snapshot, since the underlying data is the latest
+    /// task ledger entry rather than a position in a monotonic byte stream.
+    /// Governed by accepted `UPCR-2026-006` (audit issue #707, M9 req 7).
+    pub is_snapshot_projection: bool,
     pub task_status: String,
     pub runtime_state: String,
     pub lifecycle_state: String,
@@ -2841,6 +2848,7 @@ mod tests {
             truncated: false,
             complete: true,
             live_tail_supported: false,
+            is_snapshot_projection: true,
             task_status: "completed".into(),
             runtime_state: "completed".into(),
             lifecycle_state: "completed".into(),
@@ -2870,6 +2878,7 @@ mod tests {
                     "truncated": false,
                     "complete": true,
                     "live_tail_supported": false,
+                    "is_snapshot_projection": true,
                     "task_status": "completed",
                     "runtime_state": "completed",
                     "lifecycle_state": "completed",
@@ -3498,6 +3507,7 @@ mod tests {
             truncated: false,
             complete: true,
             live_tail_supported: false,
+            is_snapshot_projection: true,
             task_status: "failed".into(),
             runtime_state: "delivering_outputs".into(),
             lifecycle_state: "completed".into(),
@@ -3514,6 +3524,11 @@ mod tests {
             .expect("serialize task/output/read result");
         assert_eq!(value["source"], json!("runtime_projection"));
         assert_eq!(value["next_cursor"]["offset"], json!(4));
+        // Audit issue #707 / accepted UPCR-2026-006: clients must be able to
+        // distinguish a snapshot projection read from a (future) live-tail
+        // read on the wire, not just by inferring it from `live_tail_supported
+        // == false` or the `runtime_projection` source label.
+        assert_eq!(value["is_snapshot_projection"], json!(true));
         assert_eq!(
             UiRpcResult::from_method_and_result(methods::TASK_OUTPUT_READ, value)
                 .expect("decode task/output/read result"),
