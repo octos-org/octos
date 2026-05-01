@@ -286,6 +286,13 @@ impl ChatCommand {
         .with_provider_policy(tools.provider_policy().cloned())
         .with_plugin_dirs(plugin_dirs);
         tools.register(pipeline_tool);
+        tools.mark_spawn_only(
+            "run_pipeline",
+            Some(
+                "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
+                    .to_string(),
+            ),
+        );
 
         // Apply tool policy from config
         if let Some(ref policy) = config.tool_policy {

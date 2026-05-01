@@ -9,6 +9,7 @@
     {
       "name": "summarize_text",
       "description": "Read a text file and write a compact summary. Returns the summary file as a deliverable artifact.",
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {

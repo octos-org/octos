@@ -221,6 +221,49 @@ impl Agent {
             // tokio task and return immediately. The tool's files_to_send
             // auto-delivers the result to the user. No subagent LLM needed.
             if tools.is_spawn_only(&tc_name) {
+                // PR #688 follow-up — MEDIUM #3: enforce the registry's
+                // provider policy at the spawn_only intercept site, BEFORE
+                // `tokio::spawn`. Without this, a denied stale tool call is
+                // silently spawned and only fails async inside the
+                // background task — the foreground turn observes a fake
+                // "started successfully" and the deny is invisible to the
+                // LLM. Mirror the deny behaviour of the foreground path
+                // (registry.rs `execute_with_context`) so the LLM sees one
+                // synthetic Tool message and stops retrying.
+                if let Some(policy) = tools.provider_policy() {
+                    if let crate::tools::policy::PolicyDecision::Deny { reason } =
+                        policy.evaluate(&tc_name)
+                    {
+                        tracing::warn!(
+                            tool = %tc_name,
+                            reason = %reason,
+                            "provider policy denied spawn_only tool at intercept"
+                        );
+                        let deny_msg = format!(
+                            "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
+                            tc_name, reason
+                        );
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: deny_msg,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                client_message_id: None,
+                                thread_id: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            false, // policy denial is a failure — cascade in serial mode
+                            None,
+                        );
+                    }
+                }
+
                 tracing::info!(
                     tool = %tc_name,
                     "running spawn_only tool in background"

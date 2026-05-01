@@ -1,6 +1,6 @@
 # Security Architecture
 
-octos multi-tenant AI agent gateway security reference. Last updated: 2026-03-30.
+octos multi-tenant AI agent gateway security reference. Last updated: 2026-04-30.
 
 ---
 
@@ -31,7 +31,7 @@ Not all defensive layers provide equal guarantees. This table classifies each la
 
 | Layer | Type | Enforcement | Bypass Resistance |
 |-------|------|-------------|-------------------|
-| **Sandbox** (bwrap, sandbox-exec, Docker) | Hard | Kernel namespaces / SBPL / container | Requires kernel exploit |
+| **Sandbox** (bwrap, sandbox-exec, Docker, Windows AppContainer) | Hard | Kernel namespaces / SBPL / container / AppContainer | Requires kernel exploit |
 | **SSRF filter** (`ssrf.rs`) | Hard | DNS resolution + IP validation, fail-closed | Requires DNS rebinding race or redirect bypass (see known gaps) |
 | **`O_NOFOLLOW` file I/O** | Hard | Kernel (atomic open flag) | No known bypass |
 | **`BLOCKED_ENV_VARS`** | Hard | Process environment (set before exec) | Requires parent process compromise |
@@ -143,7 +143,10 @@ On non-Unix platforms, a fallback `symlink_metadata()` check is used (TOCTOU win
 
 ### 3.3 Sandbox Backends
 
-Three sandbox backends in `octos-agent/src/sandbox.rs`, selectable via `SandboxConfig`:
+Four sandbox backends, selectable via `SandboxConfig`:
+
+- `octos-agent/src/sandbox/{bwrap,macos,docker,windows}.rs` — agent-side launcher logic
+- `crates/octos-sandbox/src/main.rs` — Windows AppContainer helper binary (built on `rappct`)
 
 **Bubblewrap (Linux)**:
 - Read-only bind mounts for `/usr`, `/lib`, `/bin`, `/sbin`, `/etc`.
@@ -157,6 +160,13 @@ Three sandbox backends in `octos-agent/src/sandbox.rs`, selectable via `SandboxC
 - `(allow file-write*)` scoped to `(subpath "{cwd}")`, `/private/tmp`, `/private/var/folders`. With per-user workspace isolation, `{cwd}` is the user's own workspace directory (`{data_dir}/users/{base_key}/workspace/`), so write access is kernel-restricted to that user's files.
 - `(allow file-read*)` globally (read-only access to system). See §3.1 limitation #1 for discussion.
 - Path injection prevention: rejects paths containing control chars (`< 0x20`, `0x7F`), parentheses, backslash, and double-quote -- all SBPL metacharacters. Fails closed (error, not unsandboxed execution).
+
+**Windows AppContainer**:
+- Wraps the child in a per-process AppContainer via the `octos-sandbox` helper binary (`rappct`).
+- Restricted token + low integrity level + per-AppContainer SID for the working directory.
+- Network capabilities denied by default; granted only when `allow_network` is true.
+- No standard Windows capabilities (`lpacAppExperience`, etc.) granted.
+- Path validation rejects control characters, NUL, and drive-escape sequences.
 
 **Docker**:
 - Default image: `ubuntu:24.04` (configurable via `docker.image` in sandbox config).
@@ -222,7 +232,7 @@ All backends remove these from the child process environment before execution.
 
 - **Deny list checked first**. If a tool matches any deny entry, it is blocked regardless of allow list.
 - **Empty allow list** = allow everything not denied.
-- **Named groups**: `group:fs` (read/write/edit/diff_edit), `group:runtime` (shell), `group:web` (web_search/web_fetch/browser), `group:search` (glob/grep/list_dir), `group:sessions` (spawn).
+- **Named groups** (`TOOL_GROUPS` in `tools/policy.rs:154-223`, 10 entries): `group:fs` (read/write/edit/diff_edit), `group:runtime` (shell), `group:web` (web_search/web_fetch/browser), `group:search` (glob/grep/list_dir), `group:sessions` (spawn), `group:memory` (recall_memory/save_memory), `group:research` (deep_search/synthesize_research/deep_crawl), `group:admin` (manage_skills/configure_tool/model_check), `group:media` (mofa_comic/mofa_slides/mofa_infographic/mofa_cards/fm_tts/fm_voice_list), `group:delegated` (delegate_task/spawn/send_message/message/save_memory/execute_code — the canonical deny list every DelegateTool child receives, gating re-delegation, background spawning, user messaging, memory writes, and arbitrary code execution).
 - **Wildcard matching**: `web_*` matches `web_search`, `web_fetch`.
 - **Tag-based filtering**: `require_tags` restricts tool visibility by semantic tags (e.g., `code`, `web`, `gateway`). Tools with no tags are universal (pass any filter).
 - **Provider-specific policies**: `set_provider_policy()` filters both `specs()` and `execute()` -- an LLM cannot call a tool it cannot see.
@@ -403,9 +413,41 @@ Shared resources -- installed skills (`~/.octos/skills/`), global config (`~/.oc
 
 ### 4.7 Sandbox Enabled by Default
 
-`SandboxConfig::default()` has `enabled: true` with `SandboxMode::Auto`. Auto-detection selects the best available backend (bwrap on Linux, sandbox-exec on macOS, Docker as fallback). If no backend is found, a prominent warning is logged and commands run unsandboxed.
+`SandboxConfig::default()` has `enabled: true` with `SandboxMode::Auto`. Auto-detection selects the best available backend (bwrap on Linux, sandbox-exec on macOS, Windows AppContainer on Windows, Docker as fallback). If no backend is found, a prominent warning is logged and commands run unsandboxed.
 
 Users can explicitly opt out with `"sandbox": {"enabled": false}` in config.
+
+---
+
+## 4a. M8 Runtime Hardening (2026-04)
+
+The M8.1–M8.10 milestones added runtime-level hardening that is security-relevant even though the bulk of the work was correctness/UX:
+
+### 4a.1 Bounded Supervisor and Orphan-Task Reaper (#609, #610)
+
+`crates/octos-agent/src/task_supervisor.rs` owns the lifecycle of agent tasks per profile and bounds total fan-out across `spawn`, pipeline, and swarm. This blocks a runaway agent (or a malicious prompt) from creating an unbounded number of background tasks and exhausting runner CPU/memory.
+
+The orphan-task reaper sweeps tasks whose owning session has terminated and frees their resources. Without it, a profile crash mid-spawn could leak memory and tokio handles.
+
+### 4a.2 Runtime Failure Recovery (M8.9)
+
+When a `spawn_only` task fails, the supervisor re-engages the LLM with a structured-resume payload that names the failed task and surfaces its error. Earlier behaviour silently dropped the turn, which could leave a session in a state where work appeared to be in progress but had actually died. From a security perspective, this matters because dropped failure paths previously made it harder to audit what an agent had attempted.
+
+### 4a.3 Sticky thread_id and committed_seq (M8.10)
+
+Every SSE event now carries a `thread_id` bound before the first emission, and the `done` event additionally carries `committed_seq`. This eliminates a class of cross-thread leakage bugs where, in flight, an event could be misattributed to the wrong UI thread. Replay-harness fixtures (`crates/octos-agent/tests/`) assert binding correctness.
+
+### 4a.4 Auto-Rotate Admin Token (#650)
+
+On `octos serve` boot, the stored admin bearer token is rotated if it's stale or marked invalid. Rotated value is persisted to `~/.octos/auth.json` (mode 0600). This shortens the window in which a leaked admin token is valid and gives operators a non-disruptive recovery path after suspected compromise.
+
+### 4a.5 Plugin Protocol v2 Contract Tests
+
+Plugins that opt into protocol v2 emit structured events on stderr (`LogEvent`, `PhaseEvent`, `ProgressEvent`, `CostEvent`, `ArtifactEvent`). Contract tests at `crates/octos-plugin/tests/lifecycle_sandbox.rs` execute plugins under sandbox to verify the event stream — this is also the test point where we can assert that v2 plugins do not bypass the BLOCKED_ENV_VARS list.
+
+### 4a.6 Audio Attachment Validation
+
+`task_supervisor.rs` validates audio attachments (header + silence + duration) before persisting voice media. Prevents arbitrary-bytes-as-audio media files from being stored under `~/.octos/profiles/<id>/data/media/`.
 
 ---
 
@@ -516,7 +558,7 @@ ruleset.restrict_self()?;
 **Risk**: Overly restrictive read lists break commands that need unexpected system paths. Needs a configurable allowlist with sensible defaults and an escape hatch (`sandbox.read_allow_paths` in config).
 
 **Files to modify**:
-- `crates/octos-agent/src/sandbox.rs` — Add `read_paths: Vec<PathBuf>` to `SandboxConfig`, update SBPL generation and bwrap bind mounts
+- `crates/octos-agent/src/sandbox/mod.rs` — Add `read_paths: Vec<PathBuf>` to `SandboxConfig`, update SBPL generation and bwrap bind mounts
 - New: Landlock backend in `sandbox.rs` (Linux 5.13+ detection via `prctl(PR_GET_NO_NEW_PRIVS)`)
 
 ### 5.4 Disk quotas (medium-term)
@@ -592,7 +634,7 @@ fn validate_bind_mount(source: &str) -> Result<()> {
 ```
 
 **Files to modify**:
-- `crates/octos-agent/src/sandbox.rs` — Add validation in `DockerSandbox::wrap_command()`
+- `crates/octos-agent/src/sandbox/mod.rs` — Add validation in `DockerSandbox::wrap_command()`
 
 ### 5.6 Persistent Docker containers (medium-term)
 
@@ -626,7 +668,7 @@ async fn prune_idle_containers(max_idle: Duration, max_age: Duration) { ... }
 **Performance**: First command ~300ms (container creation), subsequent ~5ms (`docker exec`). Filesystem state (installed packages, build artifacts) persists across commands within a session.
 
 **Files to modify**:
-- `crates/octos-agent/src/sandbox.rs` — Add `DockerSessionSandbox` alongside existing `DockerSandbox`
+- `crates/octos-agent/src/sandbox/mod.rs` — Add `DockerSessionSandbox` alongside existing `DockerSandbox`
 - `crates/octos-cli/src/session_actor.rs` — Tie container lifecycle to `SessionActor` lifetime
 
 ### 5.7 Profile containers with network isolation (long-term)

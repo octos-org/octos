@@ -9,6 +9,7 @@
       "name": "produce_artifact",
       "description": "Produce a single text artifact under output/. The workspace policy primary = \"output/artifact-*.txt\" resolves the delivered file.",
       "spawn_only": true,
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {

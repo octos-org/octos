@@ -2,7 +2,6 @@
 
 use octos_agent::{ProgressEvent, ProgressReporter};
 use tokio::sync::broadcast;
-use tracing::debug;
 
 /// Broadcasts progress events to SSE subscribers.
 pub struct SseBroadcaster {
@@ -92,6 +91,12 @@ impl ProgressReporter for ChannelReporter {
 /// omitted from the payload entirely.
 pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> serde_json::Value {
     let mut value = match event {
+        ProgressEvent::TaskStarted { task_id } => {
+            serde_json::json!({
+                "type": "task_started",
+                "task_id": task_id,
+            })
+        }
         ProgressEvent::ToolStarted { name, tool_id } => {
             serde_json::json!({
                 "type": "tool_start",
@@ -149,9 +154,70 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
         ProgressEvent::Response { iteration, .. } => {
             serde_json::json!({"type": "response", "iteration": iteration})
         }
-        other => {
-            debug!("unmapped SSE progress event: {other:?}");
-            serde_json::json!({"type": "other"})
+        ProgressEvent::FileModified { path } => {
+            serde_json::json!({"type": "file_modified", "path": path})
+        }
+        ProgressEvent::TokenUsage {
+            input_tokens,
+            output_tokens,
+        } => {
+            serde_json::json!({
+                "type": "cost_update",
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            })
+        }
+        ProgressEvent::TaskCompleted {
+            success,
+            iterations,
+            duration,
+        } => {
+            serde_json::json!({
+                "type": "task_completed",
+                "success": success,
+                "iterations": iterations,
+                "duration_ms": duration.as_millis() as u64,
+            })
+        }
+        ProgressEvent::TaskInterrupted { iterations } => {
+            serde_json::json!({
+                "type": "task_interrupted",
+                "iterations": iterations,
+            })
+        }
+        ProgressEvent::MaxIterationsReached { limit } => {
+            serde_json::json!({
+                "type": "max_iterations_reached",
+                "limit": limit,
+            })
+        }
+        ProgressEvent::TokenBudgetExceeded { used, limit } => {
+            serde_json::json!({
+                "type": "token_budget_exceeded",
+                "used": used,
+                "limit": limit,
+            })
+        }
+        ProgressEvent::ActivityTimeoutReached { elapsed, limit } => {
+            serde_json::json!({
+                "type": "activity_timeout_reached",
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "limit_ms": limit.as_millis() as u64,
+            })
+        }
+        ProgressEvent::LlmStatus { message, iteration } => {
+            serde_json::json!({
+                "type": "llm_status",
+                "message": message,
+                "iteration": iteration,
+            })
+        }
+        ProgressEvent::StreamRetry { iteration } => {
+            serde_json::json!({
+                "type": "stream_retry",
+                "message": "stream retry",
+                "iteration": iteration,
+            })
         }
     };
     if let (Some(tid), Some(obj)) = (thread_id, value.as_object_mut()) {
@@ -292,12 +358,13 @@ mod tests {
     }
 
     #[test]
-    fn event_to_json_unmapped_returns_other() {
+    fn event_to_json_task_started_preserves_task_id() {
         let event = ProgressEvent::TaskStarted {
             task_id: "abc".into(),
         };
         let json = event_to_json(&event, None);
-        assert_eq!(json["type"], "other");
+        assert_eq!(json["type"], "task_started");
+        assert_eq!(json["task_id"], "abc");
     }
 
     /// M8.10 PR #2: every SSE payload tagged with the bound thread_id so
@@ -388,6 +455,81 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["type"], "thinking");
         assert_eq!(parsed["thread_id"], "cmid-route-XYZ");
+    }
+
+    #[test]
+    fn event_to_json_maps_terminal_and_budget_events() {
+        let completed = event_to_json(
+            &ProgressEvent::TaskCompleted {
+                success: true,
+                iterations: 4,
+                duration: Duration::from_millis(250),
+            },
+            None,
+        );
+        assert_eq!(completed["type"], "task_completed");
+        assert_eq!(completed["success"], true);
+        assert_eq!(completed["iterations"], 4);
+        assert_eq!(completed["duration_ms"], 250);
+
+        let interrupted = event_to_json(&ProgressEvent::TaskInterrupted { iterations: 2 }, None);
+        assert_eq!(interrupted["type"], "task_interrupted");
+        assert_eq!(interrupted["iterations"], 2);
+
+        let max_iterations =
+            event_to_json(&ProgressEvent::MaxIterationsReached { limit: 10 }, None);
+        assert_eq!(max_iterations["type"], "max_iterations_reached");
+        assert_eq!(max_iterations["limit"], 10);
+
+        let token_budget = event_to_json(
+            &ProgressEvent::TokenBudgetExceeded {
+                used: 1200,
+                limit: 1000,
+            },
+            None,
+        );
+        assert_eq!(token_budget["type"], "token_budget_exceeded");
+        assert_eq!(token_budget["used"], 1200);
+        assert_eq!(token_budget["limit"], 1000);
+    }
+
+    #[test]
+    fn event_to_json_maps_status_and_usage_events() {
+        let usage = event_to_json(
+            &ProgressEvent::TokenUsage {
+                input_tokens: 11,
+                output_tokens: 7,
+            },
+            None,
+        );
+        assert_eq!(usage["type"], "cost_update");
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 7);
+
+        let timeout = event_to_json(
+            &ProgressEvent::ActivityTimeoutReached {
+                elapsed: Duration::from_secs(30),
+                limit: Duration::from_secs(60),
+            },
+            None,
+        );
+        assert_eq!(timeout["type"], "activity_timeout_reached");
+        assert_eq!(timeout["elapsed_ms"], 30_000);
+        assert_eq!(timeout["limit_ms"], 60_000);
+
+        let llm_status = event_to_json(
+            &ProgressEvent::LlmStatus {
+                message: "retrying".into(),
+                iteration: 3,
+            },
+            None,
+        );
+        assert_eq!(llm_status["type"], "llm_status");
+        assert_eq!(llm_status["message"], "retrying");
+
+        let retry = event_to_json(&ProgressEvent::StreamRetry { iteration: 5 }, None);
+        assert_eq!(retry["type"], "stream_retry");
+        assert_eq!(retry["iteration"], 5);
     }
 
     #[test]

@@ -759,6 +759,17 @@ impl ProfileActorFactoryBuilder {
                 tools.register(octos_agent::ActivateToolsTool::new());
             }
 
+            // PR #688 follow-up — codex finding: re-apply tool_policy
+            // AFTER all base-registry tools have been registered. The
+            // first pass at line ~648 ran before `ActivateToolsTool`
+            // (and any other late-registered base tools) existed, so a
+            // `tool_policy.deny` entry targeting them was bypassed at
+            // the base level. Per-session re-apply in
+            // `ActorFactory::spawn` still covers `run_pipeline`.
+            if let Some(ref policy) = profile_config.tool_policy {
+                tools.apply_policy(policy);
+            }
+
             struct ChildPipelineToolFactory {
                 llm: Arc<dyn LlmProvider>,
                 memory: Arc<octos_memory::EpisodeStore>,
@@ -841,6 +852,13 @@ impl ProfileActorFactoryBuilder {
             cwd: self.cwd.clone(),
             sandbox_config: effective_profile.config.sandbox.clone(),
             provider_policy,
+            // PR #688 follow-up — MEDIUM #4: thread the profile's
+            // `tool_policy` so `ActorFactory::spawn` re-applies it AFTER
+            // per-session `run_pipeline` registration. The non-admin
+            // branch above already applied it to the base registry, but
+            // per-session tools registered later (notably the spawn_only
+            // pipeline tool) bypass that initial pass.
+            tool_policy: profile_config.tool_policy.clone(),
             worker_prompt,
             provider_router,
             embedder: create_embedder(&profile_config)

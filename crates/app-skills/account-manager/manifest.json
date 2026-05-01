@@ -7,6 +7,7 @@
     {
       "name": "manage_account",
       "description": "Manage sub-accounts under the current profile. Sub-accounts share the parent's LLM provider and API keys but have their own data directory, memory, skills, and messaging channels. Supports creating, updating, listing, deleting, starting, stopping, and restarting sub-accounts.",
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {

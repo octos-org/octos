@@ -120,7 +120,10 @@ requires_env: API_KEY
 | `name` | 是 | — | 技能标识符 |
 | `version` | 是 | — | 语义化版本 |
 | `timeout_secs` | 否 | 30 | 每次工具调用的最大执行时间（1-600） |
-| `tools` | 否 | `[]` | 工具定义数组 |
+| `protocol_version` | 否 | 1 | `1` = 仅 stdin/stdout（默认）。`2` = 同时通过 stderr 输出结构化事件，详见下文「工具 I/O 协议」。 |
+| `synthesis_config` | 否 | — | 仅 v2：声明合成 LLM 调用，由宿主注入 provider/model 与所需环境变量 |
+| `x-octos-host-config-keys` | 否 | `[]` | 仅 v2：宿主需向技能传递的环境变量名（如合成所需的 provider API key） |
+| `tools` | 否 | `[]` | 工具定义数组。每个工具可设置 `spawn_only: true`，由 `agent/execution.rs` 自动转后台执行 |
 | `binaries` | 否 | `{}` | 预编译二进制，按 `{os}-{arch}` 分类 |
 | `mcp_servers` | 否 | `[]` | MCP 服务器声明 |
 | `hooks` | 否 | `[]` | 生命周期钩子 |
@@ -183,13 +186,38 @@ console.log(JSON.stringify({ output: result, success: true }));
 
 ### 工具 I/O 协议
 
+**协议 v1（默认）：**
+
 | 规则 | 说明 |
 |------|------|
 | **argv[1]** | 工具名（如 `get_weather`） |
 | **stdin** | 匹配工具 `input_schema` 的 JSON 对象 |
 | **stdout** | `{"output": "结果文本", "success": true/false}` |
 | **退出码** | 0 = 成功，非零 = 失败 |
-| **stderr** | 网关忽略（用于调试日志） |
+| **stderr** | 自由格式调试日志 |
+
+**协议 v2（可选启用）：** 在 `manifest.json` 中设置 `"protocol_version": 2`。stdout 仍承载最终结果（与 v1 相同），stderr 升级为结构化事件通道，每行一个 JSON 对象：
+
+| 事件 | 字段 | 用途 |
+|---|---|---|
+| `LogEvent` | `{level, message}` | 自由格式日志（debug/info/warn/error） |
+| `PhaseEvent` | `{phase, summary}` | 阶段切换（`planning`、`searching`、`synthesizing` 等） |
+| `ProgressEvent` | `{current, total, label}` | 数值进度 |
+| `CostEvent` | `{step, provider, model, input_tokens, output_tokens, usd}` | 单步 LLM 成本，由 `cost_ledger.rs` 汇总 |
+| `ArtifactEvent` | `{name, path, mime}` | 产出物指针（文件路径或 URL） |
+
+宿主把 phase/progress 事件以 `tool_progress` SSE 形式转发给仪表盘/客户端，把 `CostEvent` 累加到父级单轮成本汇总；解析失败的行视为普通日志（按 `info` 级别记入 `LogEvent`）。
+
+合成式技能（`deep-search`、`deep-crawl`）在 `manifest.json` 声明 `synthesis_config` 与 `x-octos-host-config-keys`，宿主据此为合成调用注入正确的 LLM provider/model 并转发 API key 等环境变量。合同测试位于 `crates/octos-plugin/tests/lifecycle_sandbox.rs`。
+
+**spawn_only 拦截机制**：当某工具的清单声明 `spawn_only: true`，Agent 执行循环（`crates/octos-agent/src/agent/execution.rs`）会在 LLM 往返**之前**拦截：
+
+1. 工具调用包入 `tokio::spawn`，立即向 LLM 返回回执；
+2. `task_supervisor.rs` 注册任务，应用每配置扇出上限（#610），并设置孤立任务清理；
+3. 技能二进制在后台运行至完成，期间发送协议 v2 事件；
+4. 完成（或失败）时，监督者提交带 `committed_seq` 的 `session_result` 事件，必要时按 M8.9 运行时失败恢复重新驱动 LLM。
+
+`spawn_only` 工具不会被 LRU 工具寄存器淘汰；其 `SKILL.md` 自动注入到系统提示，让 LLM 知道如何调用。
 
 ---
 
@@ -252,7 +280,7 @@ manage_skills(action="search", query="comic")
 
 1. `<profile-data>/skills/` — 配置文件级（最高优先级）
 2. `<project-dir>/skills/` — 项目本地
-3. `<project-dir>/bundled-skills/` — 内置应用技能
+3. `<project-dir>/bundled-app-skills/` — 内置应用技能（常量 `BUNDLED_APP_SKILLS_DIR`，位于 `octos-agent/src/bootstrap.rs`，由 `Config::plugin_dirs_from_project` 扫描）
 4. `~/.octos/skills/` — 全局（最低优先级）
 
 ### 发布到注册中心

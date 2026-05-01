@@ -191,6 +191,17 @@ impl ToolRegistry {
         self.workspace_root.as_deref()
     }
 
+    /// Record a workspace cwd on this registry without re-creating the
+    /// cwd-bound tools. Used by the AppUi `session_tool_registry` Tier-2
+    /// fallback so an operator-configured default folder shows up in
+    /// `workspace_root()` and the per-session `rebind_cwd` path can pick
+    /// it up. The existing `rebind_cwd` API mints a fresh registry, which
+    /// is wasteful when we only want to update the recorded path on a
+    /// freshly-built registry; this setter mutates in place.
+    pub fn set_workspace_root(&mut self, cwd: PathBuf) {
+        self.workspace_root = Some(cwd);
+    }
+
     /// Register a background task and return its ID.
     pub fn register_task(&self, tool_name: &str, tool_call_id: &str) -> String {
         self.supervisor
@@ -273,9 +284,22 @@ impl ToolRegistry {
     ///
     /// Unknown tools report [`super::ConcurrencyClass::Safe`] — the executor
     /// defers error handling to `execute()` which bails with `unknown tool`
-    /// rather than letting the admission phase fail silently. Plugin/MCP
-    /// tools report `Safe` today because their wrapper inherits the trait
-    /// default; they will be wired through a declared class in a follow-up.
+    /// rather than letting the admission phase fail silently.
+    ///
+    /// Plugin and MCP wrappers override `Tool::concurrency_class()` and
+    /// surface their declared class:
+    /// - Plugin wrapper: reads `concurrency_class` from the manifest tool
+    ///   def. Defaults to `Safe` so the bundled read-only skills (weather,
+    ///   news, time, deep-search, …) keep their parallel-friendly path. A
+    ///   plugin tool that writes files or mutates remote state must declare
+    ///   `"exclusive"` in its manifest.
+    /// - MCP wrapper: reads `concurrency_class` from
+    ///   `McpServerConfig`. Defaults to `Safe` because most MCP servers
+    ///   in practice are read-only (search, wiki, time, weather);
+    ///   operators must declare `"exclusive"` per server when the MCP
+    ///   server mutates files / remote state and could race with the
+    ///   native `edit_file` / `write_file` tools. Unknown values fail
+    ///   safe to `Exclusive`.
     pub fn concurrency_class(&self, name: &str) -> super::ConcurrencyClass {
         self.tools
             .get(name)
@@ -336,8 +360,34 @@ impl ToolRegistry {
     }
 
     /// Retain only tools whose names satisfy the predicate.
+    ///
+    /// Also prunes parallel side state (`spawn_only`,
+    /// `spawn_only_messages`, `deferred`) for any names that were
+    /// dropped. Without this, stale entries survive an `apply_policy`
+    /// deny and produce confusing downstream behaviour:
+    ///
+    /// - A stale `spawn_only` marker fools the agent's spawn_only
+    ///   intercept in `execution.rs` into treating an evicted tool as
+    ///   background-eligible. The intercept falls through to
+    ///   `bg_tools.execute_with_context` which fails async because the
+    ///   tool itself is gone from the registry — so the foreground turn
+    ///   observes a fake "started successfully". See PR #688 follow-up
+    ///   MEDIUM #3.
+    /// - A stale `deferred` entry would let `activate_tools` /
+    ///   `has_deferred()` advertise a name that was already evicted by
+    ///   policy. See PR #688 follow-up codex review (round 2).
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
+        self.spawn_only.retain(|name| self.tools.contains_key(name));
+        self.spawn_only_messages
+            .retain(|name, _| self.tools.contains_key(name));
+        // Stale `deferred` entries are interior-mutable; lock and prune
+        // here so a subsequent `activate(...)` cannot resurrect a tool
+        // that policy has already removed.
+        {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            deferred.retain(|name| self.tools.contains_key(name));
+        }
         self.invalidate_cache();
     }
 
@@ -1080,6 +1130,18 @@ mod cwd_isolation_tests {
             rebound_task.session_key.is_none(),
             "session key must be supplied by the new session actor, not inherited"
         );
+    }
+
+    #[test]
+    fn set_workspace_root_records_path_for_session_tool_registry_fallback() {
+        let mut reg = ToolRegistry::new();
+        assert!(
+            reg.workspace_root().is_none(),
+            "fresh registry must not advertise a workspace_root"
+        );
+        let cwd = std::path::PathBuf::from("/tmp/test-default-cwd");
+        reg.set_workspace_root(cwd.clone());
+        assert_eq!(reg.workspace_root(), Some(cwd.as_path()));
     }
 }
 

@@ -307,6 +307,35 @@ tokio::task_local! {
     pub static TOOL_CTX: ToolContext;
 }
 
+/// Request emitted by a tool when runtime policy requires user approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApprovalRequest {
+    pub tool_id: String,
+    pub tool_name: String,
+    pub title: String,
+    pub body: String,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// Decision returned to a blocked tool after client approval handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// Async approval bridge provided by clients that support interactive approval.
+#[async_trait]
+pub trait ToolApprovalRequester: Send + Sync {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision;
+}
+
+tokio::task_local! {
+    /// Optional task-local approval bridge scoped around a turn by interactive clients.
+    pub static TOOL_APPROVAL_CTX: Arc<dyn ToolApprovalRequester>;
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnAttachmentContext {
     pub attachment_paths: Vec<String>,

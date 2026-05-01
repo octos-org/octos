@@ -8,6 +8,7 @@
     {
       "name": "deep_crawl",
       "description": "Recursively crawl a website using a headless browser (CDP). Renders JavaScript, follows same-origin links via BFS, extracts text from each page, and saves results to disk. Ideal for JS-rendered SPAs and documentation sites.",
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {

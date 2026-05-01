@@ -27,6 +27,8 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
     - [Weather](#127-weather)
     - [WeChat Bridge](#128-wechat-bridge)
     - [Pipeline Guard](#129-pipeline-guard)
+    - [Skill Evolve](#1210-skill-evolve)
+    - [Harness Starters](#1211-harness-starters)
 13. [Platform Skills (ASR/TTS)](#13-platform-skills-asrtts)
 14. [Custom Skill Installation](#14-custom-skill-installation)
 15. [Configuration Reference](#15-configuration-reference)
@@ -36,25 +38,32 @@ A comprehensive guide for deploying, configuring, and using the Octos AI agent p
 
 ## 1. Overview
 
-Octos is a Rust-native AI agent platform that runs in two modes:
+Octos is a Rust-native AI agent platform that runs in three modes:
 
-- **`octos serve`** — Control plane with admin dashboard. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels.
-- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Feishu, Email, WeCom, Matrix).
+- **`octos serve`** — Control plane with admin dashboard + ~140 REST endpoints. Manages multiple **profiles** (bot instances), each running as an isolated gateway child process with its own config, memory, sessions, and messaging channels. On first launch with no admin profile, the embedded dashboard runs the **setup wizard**.
+- **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
 ### Architecture
 
 ```
-octos serve (control plane + dashboard)
+octos serve (control plane + dashboard, ~140 REST endpoints)
+  ├── First-run wizard /api/admin/setup/{state,step,complete,skip}
   ├── Profile A → gateway process (Telegram, WhatsApp)
-  ├── Profile B → gateway process (Feishu, Slack)
+  ├── Profile B → gateway process (Feishu, Slack, Matrix)
   └── Profile C → gateway process (CLI)
        │
-       ├── LLM Provider (kimi-2.5, deepseek-chat, gpt-4o, etc.)
-       ├── Tool Registry (shell, files, search, web, skills...)
-       ├── Session Store (per-channel conversation history)
-       ├── Memory (MEMORY.md, daily notes, episodes)
-       └── Skills (bundled + custom)
+       ├── LLM Provider (15 providers via AdaptiveRouter → ProviderChain → RetryProvider)
+       ├── Tool Registry (~50 built-ins + plugins + 9 user-facing app-skills)
+       │     LRU deferral keeps ~15 active; spawn_only auto-routes to background
+       ├── Sandbox (bwrap / sandbox-exec / Docker / Windows AppContainer)
+       ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
+       ├── Swarm Dispatcher (/api/swarm/dispatch — fan-out to N sub-agents)
+       ├── Sub-agent Output Router (M8.7 — summarize + persist transcript)
+       ├── Task Supervisor (bounded fan-out, orphan-task reaper, runtime recovery)
+       ├── Session Store (JSONL, sticky thread_id, committed_seq, three-tier compaction)
+       ├── Memory (MEMORY.md + entity bank + episodes.redb + HNSW)
+       └── Skills (bundled + custom; mofa-fm voice clones registered via voice_profiles)
 ```
 
 Each profile is fully isolated — its own data directory, memory, sessions, skills, and API keys. Sub-accounts can be created under a profile and inherit the parent's LLM configuration.
@@ -204,14 +213,34 @@ Once logged in, the dashboard provides:
 - **Log Viewer** — Real-time SSE log streaming for each gateway process
 - **Provider Testing** — Test LLM provider/model/API key combinations before deploying
 - **WhatsApp QR** — Scan QR code to link a WhatsApp number
-- **Platform Skills** — Monitor and manage OminiX ASR/TTS services
+- **Platform Skills** — Monitor and manage ASR/TTS services; mofa-fm voice-clone registration via the voice_profiles deploy script
+- **Swarm Dispatch** — Inspect running fan-out dispatches, artifacts, and per-dispatch ledger
+- **Pipeline Runs** — Node tree, per-node cost, cancel/restart for in-flight runs
 - **Metrics** — Per-profile LLM provider QoS metrics (latency, error rates)
+
+### 2.4 First-Run Setup Wizard
+
+When `octos serve` boots for the first time without an admin profile, the embedded dashboard launches a **setup wizard** that walks the operator through:
+
+1. **Deployment mode** — choose between local-only, self-hosted cloud + tenant, or Octos Cloud signup. Guidance text differs per mode.
+2. **SMTP configuration** — needed for OTP email login (skippable for local-only deployments).
+3. **LLM provider** — pick a provider, enter the API key, and run a live test before saving.
+4. **Admin profile** — name, channels, and optional Family Plan setup.
+
+Progress is tracked server-side via:
+
+- `GET /api/admin/setup/state` — current wizard step + completed flags
+- `POST /api/admin/setup/step` — advance/save a step
+- `POST /api/admin/setup/complete` — finalize and create the admin profile
+- `POST /api/admin/setup/skip` — operator escape hatch (skips remaining optional steps)
+
+Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`.
 
 ---
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 14 LLM providers out of the box. Each provider requires an API key set as an environment variable.
+Octos supports 15 LLM providers out of the box. Each provider requires an API key set as an environment variable.
 
 ### 3.1 Supported Providers
 
@@ -219,15 +248,16 @@ Octos supports 14 LLM providers out of the box. Each provider requires an API ke
 |----------|-------------|---------------|------------|---------|
 | `anthropic` | `ANTHROPIC_API_KEY` | claude-sonnet-4-20250514 | Native Anthropic | — |
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | — |
-| `gemini` | `GEMINI_API_KEY` | gemini-2.0-flash | Native Gemini | — |
+| `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | — |
+| `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI auto-detected | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | — |
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5 | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
@@ -383,7 +413,7 @@ The `api_type` field forces a specific API wire format:
 ```json
 {
   "provider": "zai",
-  "model": "glm-5",
+  "model": "glm-5-turbo",
   "api_type": "anthropic"
 }
 ```
@@ -435,7 +465,7 @@ Configure a priority-ordered fallback chain. If the primary provider fails (401,
     },
     {
       "provider": "gemini",
-      "model": "gemini-2.0-flash",
+      "model": "gemini-2.5-flash",
       "api_key_env": "GEMINI_API_KEY"
     }
   ]
@@ -490,6 +520,8 @@ The `web_search` tool uses multiple search providers with automatic fallback.
 ### 5.2 Provider Selection
 
 Providers are tried in order: **DuckDuckGo → Brave → You.com → Perplexity**. The first provider returning non-empty results wins. If all fail, DuckDuckGo results are returned as fallback.
+
+**Auto-rotate on quota / rate-limit errors** (M8.10b, #578): if the active provider returns a quota-exhaustion or rate-limit error (HTTP 402, 429, or provider-specific error strings), `web_search` rotates to the next configured provider mid-call rather than surfacing the error. This makes the tool robust against quota churn without requiring agent-side retry logic.
 
 To use a specific provider, set its API key:
 
@@ -579,6 +611,8 @@ Tool policies control which tools the agent can use. They can be set globally, p
 
 ### 7.2 Named Groups
 
+Source of truth: `TOOL_GROUPS` in `crates/octos-agent/src/tools/policy.rs:154-223`. The exact tool list:
+
 | Group | Expands To |
 |-------|-----------|
 | `group:fs` | `read_file`, `write_file`, `edit_file`, `diff_edit` |
@@ -586,6 +620,13 @@ Tool policies control which tools the agent can use. They can be set globally, p
 | `group:web` | `web_search`, `web_fetch`, `browser` |
 | `group:search` | `glob`, `grep`, `list_dir` |
 | `group:sessions` | `spawn` |
+| `group:memory` | `recall_memory`, `save_memory` |
+| `group:research` | `deep_search`, `synthesize_research`, `deep_crawl` |
+| `group:admin` | `manage_skills`, `configure_tool`, `model_check` |
+| `group:media` | `mofa_comic`, `mofa_slides`, `mofa_infographic`, `mofa_cards`, `fm_tts`, `fm_voice_list` |
+| `group:delegated` | `delegate_task`, `spawn`, `send_message`, `message`, `save_memory`, `execute_code` — the canonical deny list every delegated child receives. Adding it to a child's deny list closes re-delegation, background-spawn, user-messaging, memory writes, and arbitrary code execution all at once. |
+
+Robot-tier groups under `group:robot:*` are documented in the robotics architecture (`docs/OCTOS_ROBOTICS_ARCHITECTURE.md`) and resolved by `robot_groups::group_covers_tool` rather than `TOOL_GROUPS`.
 
 ### 7.3 Wildcard Matching
 
@@ -857,7 +898,7 @@ Bot: [uses switch_model tool with action="list"]
        - anthropic (default: claude-sonnet-4-20250514) [ready]
        - openai (default: gpt-4o) [ready]
        - deepseek (default: deepseek-chat) [ready]
-       - gemini (default: gemini-2.0-flash) [ready]
+       - gemini (default: gemini-2.5-flash) [ready]
        - moonshot (default: kimi-k2.5) [ready] [aliases: kimi]
        - ollama (default: llama3.2) [no key needed]
        ...
@@ -925,7 +966,9 @@ Each channel:chat_id pair maintains its own session (conversation history).
 - **Session persistence:** JSONL files in `.octos/sessions/`
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
 - **Session forking:** `/new` creates a branched conversation with parent_key tracking
-- **Context compaction:** When conversation exceeds the LLM's context window, older messages are automatically compacted (tool arguments stripped, early messages summarized)
+- **Context compaction:** Three-tier (M8.5) — working / cold / archived. When the conversation exceeds the LLM's context window, older messages are summarized to first lines (tool arguments stripped) and the oldest are pushed into the entity bank as long-term memory.
+- **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first SSE emission and carried on every subsequent event (`token`, `tool_progress`, `task_status`, `session_result`). The `done` event additionally carries `committed_seq` — the durable history sequence number of the terminal write — so a web client can replay deterministically after reconnect via `GET /sessions/:id/events/stream`. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
+- **Structured resume (M8.6)** — when a worktree is missing or a sub-agent fails, the supervisor refuses to silently drop the turn and re-engages the LLM with a structured-resume payload describing the failure.
 
 ### 11.3 Memory System
 
@@ -1024,7 +1067,16 @@ Bot: [uses browser tool to navigate and screenshot]
      Here's the screenshot of example.com...
 ```
 
-### 11.9 Spawning Sub-Agents
+### 11.9 Spawning Sub-Agents and Swarms
+
+There are three sub-agent surfaces:
+
+| Tool / API | Shape | Output handling |
+|---|---|---|
+| `spawn` (`mode: "sync"`) | One child, parent blocks | Inline in same turn |
+| `spawn` (`mode: "background"`) | One child, parent continues | New inbound message via gateway |
+| `delegate` | One scoped child, parent blocks | Summary inline + transcript file (M8.7 sub-agent output router) |
+| `/api/swarm/dispatch` | N parallel sub-agents | Aggregated artifacts, validator-gated, per-dispatch ledger |
 
 ```
 User: Research this topic in depth using a sub-agent
@@ -1048,12 +1100,21 @@ Sub-agents can use different LLM models via `sub_providers`:
 }
 ```
 
+**Sub-agent output router (M8.7)**: long sub-agent transcripts are summarized by `AgentSummaryGenerator` and the compact summary is surfaced in parent context, while the full transcript is persisted to disk for later inspection. This keeps parent context small even when delegating large research tasks.
+
+**Swarm dispatch**: for fan-out workloads use the swarm API instead of multiple spawns. A swarm dispatch fans a contract to N sub-agents, aggregates artifacts, runs them through a validator, and rolls cost up to the parent. State persisted at `crates/octos-swarm/src/persistence.rs`; ledger at `crates/octos-swarm/src/ledger.rs`.
+
+**`spawn_only` skill tools auto-route to background**: any plugin tool whose manifest declares `spawn_only: true` is intercepted at the execution layer (`crates/octos-agent/src/agent/execution.rs`) and forced into background mode regardless of caller intent. The agent gets an immediate "task started" acknowledgement, and the result is delivered later as a new inbound message. Sub-agents cannot spawn further sub-agents (deny-wins via `group:delegated`).
+
 ### 11.10 Message Queue Modes
 
 When a user sends messages while the agent is processing:
 
-- **`followup`** (default): Queued messages are processed one at a time (FIFO)
-- **`collect`**: Messages from the same session are concatenated and processed as one
+- **`followup`**: Queued messages are processed one at a time (FIFO)
+- **`collect`** (default): Messages from the same session are concatenated and processed as one
+- **`steer`**: Apply queued messages as a steer/redirect to the in-flight turn
+- **`interrupt`**: Cancel the in-flight turn and start a new one
+- **`speculative`**: Run a parallel speculative turn while the in-flight one finishes; return whichever completes first
 
 ```json
 {
@@ -1062,6 +1123,18 @@ When a user sends messages while the agent is processing:
   }
 }
 ```
+
+### 11.10a Background Tasks
+
+`spawn_only` skill tools (long-running research, deep crawls, voice-clone training, etc.) run as background tasks under the per-profile `task_supervisor`. Users can:
+
+- Receive progress as periodic plugin protocol v2 events surfaced as `tool_progress` SSE events
+- Inspect outstanding background work with the `check_background_tasks` tool
+- Get terminal status via the dedicated session events stream — the supervisor commits a `session_result` event with `committed_seq` (#629) so the dashboard updates deterministically once the work is durable
+
+**Fleet stability** (#610): `spawn`, pipeline fan-out, and swarm dispatch share a global concurrency cap so a runaway agent cannot exhaust runner CPU/memory. Orphan tasks (whose owning session has terminated) are reaped by `task_supervisor`.
+
+**Runtime failure recovery** (M8.9): if a `spawn_only` task fails, the supervisor re-engages the LLM with a structured-resume payload describing the failure — the turn is not silently dropped.
 
 ### 11.11 Heartbeat
 
@@ -1076,7 +1149,11 @@ Check for new issues in the GitHub repo and summarize any urgent ones.
 
 ## 12. Bundled App Skills
 
-Bundled app skills ship as compiled binaries alongside the `octos` binary. They are automatically bootstrapped into `.octos/skills/` on gateway startup — no installation required.
+Bundled app skills ship as compiled binaries alongside the `octos` binary. On gateway startup they are written into `~/.octos/bundled-app-skills/<name>/` (a separate directory from user-installed skills under `~/.octos/skills/`, so a re-deploy never overwrites operator/user customizations). The full list lives in `BUNDLED_APP_SKILLS` (`crates/octos-agent/src/bundled_app_skills.rs`):
+
+> **Bundled (auto-installed):** news, deep-search, deep-crawl, send-email, account-manager, time (binary `clock`), weather, pipeline-guard, skill-evolve. Plus the platform-skill `voice`.
+
+Sections 12.8 (WeChat Bridge) and 12.11 (Harness Starters) below describe **workspace example crates** under `crates/app-skills/` that are *not* in `BUNDLED_APP_SKILLS` — they ship in the source tree as templates / transport helpers, not as auto-installed runtime skills.
 
 ### 12.1 News Fetch
 
@@ -1220,8 +1297,8 @@ Recursively crawls a website using headless Chrome via CDP (Chrome DevTools Prot
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `url` | string | *(required)* | Starting URL |
-| `max_depth` | 1-10 | 3 | Maximum link-following depth |
-| `max_pages` | 1-200 | 50 | Maximum pages to crawl |
+| `max_depth` | integer 1-10 | *(required)* | Maximum link-following depth — the tool prompts the LLM to ask the user before calling |
+| `max_pages` | integer 1-100 | *(required)* | Maximum pages to crawl — the tool prompts the LLM to ask the user before calling |
 | `path_prefix` | string | none | Only follow links with this path prefix |
 
 #### Output
@@ -1252,7 +1329,7 @@ Bot: [uses deep_crawl with url="https://docs.rs/tokio/latest/tokio/",
 ```
 User: Crawl my company's documentation site
 
-Bot: [uses deep_crawl with url="https://docs.example.com", max_pages=100]
+Bot: [uses deep_crawl with url="https://docs.example.com", max_depth=4, max_pages=100]
      Crawled 87 pages. Content saved to crawl-docs.example.com/
 ```
 
@@ -1464,6 +1541,35 @@ WebSocket bridge for WeChat personal accounts. Connects to the WeChat client via
 
 Validates DOT graphs and injects optimal model assignments before `run_pipeline` executes. Runs as a before-hook with 10s timeout — can deny malformed pipeline submissions.
 
+### 12.10 Skill Evolve
+
+**Binary:** `skill-evolve`
+**Tool:** `skill_evolve` (single tool, foreground — not `spawn_only`)
+
+Manages **skill-evolution patches** that the runtime auto-generates whenever a plugin tool fails. Patches are proposed edits to a skill's `SKILL.md` that would have prevented the failure (clarified argument descriptions, missing trigger keywords, etc.). The agent invokes `skill_evolve` to inspect and act on the queue.
+
+`action` field selects the operation:
+
+| action | Effect |
+|---|---|
+| `list` | Show pending patches across all skills |
+| `apply` | Apply a queued patch to its target `SKILL.md` |
+| `discard` | Drop a queued patch without applying |
+| `consolidate` | Fold multiple related patches into a single edit |
+
+Patches are reviewed/applied through this tool — the skill does not self-modify silently. Useful when adapting a starter template to a specific deployment, or when a long-running deep-search session generated repeated friction-pattern feedback.
+
+### 12.11 Harness Starters
+
+Four starter-template skills under `crates/app-skills/harness-starter-{audio, coding, generic, report}/`. Each is a working example of a harnessed skill (with the contract tests, manifest, and SKILL.md) that you can copy and adapt for a custom domain skill:
+
+- `harness-starter-generic` — minimal echo-style harness for any text task
+- `harness-starter-coding` — code-task harness with worktree integration
+- `harness-starter-report` — report-generation harness with artifact production
+- `harness-starter-audio` — audio-task harness with attachment validation
+
+These are intended as templates — the `SKILL.md` for each says "Replace with a real ... when adapting the starter." See [docs/app-skill-dev-guide.md](./app-skill-dev-guide.md) for the full skill development guide.
+
 ---
 
 ## 13. Platform Skills (ASR/TTS)
@@ -1544,25 +1650,27 @@ Bot: [uses voice_synthesize with text="Welcome to the daily briefing",
      [sends audio file to user]
 ```
 
-### 13.5 Voice Cloning (`voice_clone_synthesize`)
+### 13.5 Voice Cloning (handled by `mofa-fm`, not the platform voice skill)
 
-Synthesizes speech in a cloned voice from a reference audio sample.
+The platform `voice` skill (this section) only exposes preset-voice TTS via `voice_synthesize`. **Voice cloning and custom voice profiles are handled by the separate `mofa-fm` skill via its `fm_tts` tool** — see the `mofa-fm` skill repo for the cloning interface. The platform voice skill's manifest documents this routing:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `text` | string | *(required)* | Text to synthesize |
-| `reference_audio` | string | *(required)* | Path to reference audio (3-10 seconds) |
-| `output_path` | string | auto | Output file path |
-| `language` | string | `"chinese"` | Target language |
+> "NOTE: This tool only supports preset voices. For voice cloning or custom voice profiles, use mofa-fm (`fm_tts`)."
 
+If `voice_synthesize` is called with a name that isn't a preset, it returns an error directing the caller to use `fm_tts` instead.
+
+#### 13.5.1 Registering Cloned Voices on Deploy (#653)
+
+`fm_tts` produces clone reference WAVs under `~/.octos/profiles/<profile>/data/voice_profiles/<name>.wav`. The OminiX-API voice registry that `fm_tts` validates against is in-memory at startup and loads from `~/.OminiX/models/voices.json` — saved profile WAVs are **not** auto-discovered.
+
+`scripts/register-fleet-voices.sh` writes `voices.json` on the remote host so OminiX-API's `/v1/voices` enumerates every saved voice profile, then nudges the daemon to pick up the change. It is idempotent (operator hand-tunes to `ref_text` / aliases are preserved). Run it as part of `./scripts/deploy.sh` post-deploy, or directly to fix a single host:
+
+```bash
+./scripts/register-fleet-voices.sh           # all minis (skips mini5)
+./scripts/register-fleet-voices.sh 1         # mini1 only
+./scripts/register-fleet-voices.sh user@host --password <pw>
 ```
-User: Clone my voice from this sample and say "Good morning team"
-      Reference: /tmp/my-voice-sample.wav
 
-Bot: [uses voice_clone_synthesize with reference_audio="/tmp/my-voice-sample.wav",
-      text="Good morning team", language="english"]
-     Generated speech in your voice. [sends audio]
-```
+After registration, `fm_tts` calls referencing those voice names succeed; without it they fail with `"voice 'X' is not registered on ominix-api"`.
 
 ### 13.6 Podcast Generation (`generate_podcast`)
 
@@ -1960,11 +2068,14 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // MCP servers
   "mcp_servers": [],
 
-  // Sandbox
+  // Sandbox — see docs/SANDBOX.md for full reference.
+  // Backends: bwrap (Linux), sandbox-exec (macOS), AppContainer (Windows,
+  // via the octos-sandbox helper crate), docker (any OS). Auto picks per-OS.
   "sandbox": {
     "enabled": true,
     "mode": "auto",
-    "allow_network": false
+    "allow_network": false,
+    "read_allow_paths": []        // macOS only: tighten read access
   },
 
   // Email (for email channel)
@@ -2038,9 +2149,13 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 ```
 ~/.octos/                        # Global config directory
 ├── auth.json                   # Stored API credentials (mode 0600)
-├── profiles/                   # Profile configs (serve mode)
-│   ├── my-bot.json
-│   └── work-bot.json
+├── profiles/                   # Per-profile data root (serve mode)
+│   └── <profile-id>/
+│       ├── config.json
+│       └── data/
+│           ├── voice_profiles/  # mofa-fm clone-reference WAVs (registered with OminiX-API by scripts/register-fleet-voices.sh)
+│           ├── media/           # Persisted audio/image attachments
+│           └── skills/          # Per-profile skill overrides
 ├── skills/                     # Global custom skills
 └── serve.log                   # Serve mode log file
 
@@ -2053,25 +2168,39 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 ├── TOOLS.md                    # Tool-specific guidance
 ├── IDENTITY.md                 # Custom identity
 ├── HEARTBEAT.md                # Background task instructions
-├── sessions/                   # Conversation history (JSONL)
+├── sessions/                   # Conversation history (JSONL, sticky thread_id in meta)
 ├── memory/                     # Memory files
 │   ├── MEMORY.md               # Long-term persistent memory
-│   └── 2026-03-06.md           # Daily notes
-├── skills/                     # Custom skills
-│   ├── news/                   # Bundled: news fetch
-│   ├── deep-search/            # Bundled: deep web search
-│   ├── deep-crawl/             # Bundled: deep crawl
-│   ├── send-email/             # Bundled: email sending
-│   ├── account-manager/        # Bundled: sub-account management
-│   ├── clock/                  # Bundled: time queries
-│   ├── weather/                # Bundled: weather info
-│   └── my-custom-skill/        # User-installed skill
-├── platform-skills/            # Platform skills (ASR/TTS)
+│   └── 2026-04-30.md           # Daily notes
+├── bundled-app-skills/         # Auto-installed by gateway bootstrap
+│   │                           # (BUNDLED_APP_SKILLS_DIR = "bundled-app-skills";
+│   │                           #  contents come from
+│   │                           #  crates/octos-agent/src/bundled_app_skills.rs).
+│   │                           # Re-deploy refreshes this; user edits here are
+│   │                           # overwritten — put customizations under skills/.
+│   ├── news/                   # news_fetch
+│   ├── deep-search/            # multi-step research (plugin protocol v2)
+│   ├── deep-crawl/             # site crawl + synthesis (plugin protocol v2)
+│   ├── send-email/             # SMTP send
+│   ├── account-manager/        # sub-account ops
+│   ├── time/                   # time / timezone (binary "clock")
+│   ├── weather/                # Open-Meteo weather
+│   ├── pipeline-guard/         # DOT-pipeline before-hook validator
+│   └── skill-evolve/           # SKILL.md patch queue (foreground)
+├── skills/                     # User-installed custom skills (precedence:
+│   │                           #  project > profile > global; not overwritten
+│   │                           #  by re-deploy).
+│   └── my-custom-skill/
+├── platform-skills/            # Platform-skill data (voice ASR/TTS).
+│                               # Voice cloning is OminiX-API + mofa-fm/fm_tts;
+│                               # the platform voice skill itself is preset-only.
 ├── episodes.redb               # Episodic memory database
 ├── tool_config.json            # Tool configuration overrides
 └── history/
     └── chat_history            # Readline history (CLI)
 ```
+
+> **Not present in the runtime tree:** `harness-starter-{audio,coding,generic,report}` and `wechat-bridge` are workspace-only example/utility crates under `crates/app-skills/`. They build with `cargo build --workspace` but are not part of `BUNDLED_APP_SKILLS`, so the gateway never copies them into `~/.octos/bundled-app-skills/`. Don't expect to find them at runtime — open the source tree if you want the templates.
 
 ---
 
@@ -2333,4 +2462,4 @@ The most common misconfiguration is a token mismatch. All three of these must ag
 
 ---
 
-*This guide covers Octos version as of March 2026. For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*
+*This guide reflects the post-M8.10 state (April 2026). For the latest updates, see the repository at [github.com/octos-org/octos](https://github.com/octos-org/octos).*

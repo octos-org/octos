@@ -9,6 +9,7 @@
       "name": "propose_patch",
       "description": "Render a patch as a unified-diff file under patches/<slug>.diff plus a preview file list at patches/<slug>.files.txt.",
       "spawn_only": true,
+      "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
         "properties": {
