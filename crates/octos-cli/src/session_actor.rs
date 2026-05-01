@@ -1383,6 +1383,13 @@ pub enum ActorMessage {
         /// Best-effort prompt body. Already framed as `[system-internal]` so
         /// the LLM treats it as runtime guidance, not a user turn.
         prompt: String,
+        /// Issue #738 fix: the originating user turn's `client_message_id`,
+        /// captured when the spawn_only task was registered. Stamped onto
+        /// the synthetic recovery `InboundMessage`'s metadata so
+        /// `process_inbound` reuses it as the cmid for the recovery turn
+        /// instead of minting a fresh server UUIDv7. `None` for legacy
+        /// callers / tests that pre-date the fix.
+        originating_client_message_id: Option<String>,
     },
     /// Cancel the current operation.
     Cancel,
@@ -2162,6 +2169,12 @@ impl ActorFactory {
                 task_id: signal.task_id.clone(),
                 tool_name: signal.tool_name.clone(),
                 prompt,
+                // Issue #738 fix: forward the originating user turn's
+                // cmid into the recovery hint so the synthetic
+                // InboundMessage stamps `client_message_id` into its
+                // metadata and `process_inbound` reuses it instead of
+                // minting an orphan UUIDv7.
+                originating_client_message_id: signal.originating_client_message_id.clone(),
             });
         });
 
@@ -2714,7 +2727,29 @@ impl SessionActor {
     /// Build a synthetic `InboundMessage` carrying the recovery prompt so
     /// the existing inbound pipeline (history persistence, agent loop)
     /// runs unchanged.
-    fn synthetic_recovery_inbound(&self, prompt: String) -> InboundMessage {
+    ///
+    /// Issue #738 fix: when `originating_client_message_id` is supplied,
+    /// stamp it into `metadata.client_message_id` so `process_inbound`'s
+    /// `inbound_client_message_id` helper reads it back and the recovery
+    /// turn inherits the originating user turn's thread_id instead of
+    /// `process_inbound` minting a fresh server UUIDv7. The eventual
+    /// successful retry's deliverables (e.g. `_report.md`) then land
+    /// under the original SPA bubble rather than an orphan thread_id.
+    fn synthetic_recovery_inbound(
+        &self,
+        prompt: String,
+        originating_client_message_id: Option<String>,
+    ) -> InboundMessage {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("_recovery_turn".to_string(), serde_json::json!(true));
+        if let Some(cmid) = originating_client_message_id {
+            if !cmid.is_empty() {
+                metadata.insert(
+                    "client_message_id".to_string(),
+                    serde_json::Value::String(cmid),
+                );
+            }
+        }
         InboundMessage {
             channel: self.channel.clone(),
             sender_id: "octos-runtime".to_string(),
@@ -2722,7 +2757,7 @@ impl SessionActor {
             content: prompt,
             timestamp: chrono::Utc::now(),
             media: vec![],
-            metadata: serde_json::json!({ "_recovery_turn": true }),
+            metadata: serde_json::Value::Object(metadata),
             message_id: None,
         }
     }
@@ -2868,6 +2903,7 @@ impl SessionActor {
                             task_id,
                             tool_name,
                             prompt,
+                            originating_client_message_id,
                         }) => {
                             // Cap recovery at one attempt per task to avoid
                             // runaway loops if the recovery turn itself
@@ -2886,9 +2922,14 @@ impl SessionActor {
                                 session = %self.session_key,
                                 task_id,
                                 tool_name,
+                                originating_client_message_id =
+                                    originating_client_message_id.as_deref().unwrap_or("<none>"),
                                 "enqueueing synthetic recovery turn"
                             );
-                            let synthetic = self.synthetic_recovery_inbound(prompt);
+                            let synthetic = self.synthetic_recovery_inbound(
+                                prompt,
+                                originating_client_message_id,
+                            );
                             let final_attachment_media = self
                                 .copy_media_to_workspace(Vec::new());
                             self.process_inbound(
@@ -5749,6 +5790,20 @@ impl SessionActor {
                                 persisted_user_message = true;
                                 let mut sanitized = msg.clone();
                                 sanitized.content = persisted_user_content.clone();
+                                // Issue #738 fix: stamp the inbound's
+                                // `client_message_id` onto the persisted user
+                                // Message. The agent's `process_message`
+                                // builds the user Message with
+                                // `client_message_id: None` so without this
+                                // override, recovery turns (whose synthetic
+                                // InboundMessage carries the originating cmid
+                                // in metadata) lose the cmid before reaching
+                                // the SessionHandle — leaving the eventual
+                                // successful retry's deliverables stranded
+                                // under an orphan thread_id with no DOM bubble.
+                                if sanitized.client_message_id.is_none() {
+                                    sanitized.client_message_id = client_message_id.clone();
+                                }
                                 sanitized
                             } else {
                                 msg.clone()
@@ -10705,6 +10760,7 @@ mod tests {
             error_message: "voice 'yangmi' not registered".into(),
             suggested_alternatives: vec![],
             parent_session_key: Some("api:test".into()),
+            originating_client_message_id: None,
         };
         let prompt = build_recovery_prompt(&signal);
         assert!(prompt.starts_with("[system-internal]"));
@@ -10722,6 +10778,7 @@ mod tests {
             error_message: "voice missing".into(),
             suggested_alternatives: vec!["vivian".into(), "serena".into(), "longxiang".into()],
             parent_session_key: None,
+            originating_client_message_id: None,
         };
         let prompt = build_recovery_prompt(&signal);
         assert!(prompt.contains("Detected alternatives"));
@@ -10739,6 +10796,7 @@ mod tests {
             error_message: "internal error".into(),
             suggested_alternatives: vec![],
             parent_session_key: None,
+            originating_client_message_id: None,
         };
         let prompt = build_recovery_prompt(&signal);
         assert!(!prompt.contains("Detected alternatives"));
@@ -10753,6 +10811,7 @@ mod tests {
             error_message: "voice missing".into(),
             suggested_alternatives: vec![],
             parent_session_key: None,
+            originating_client_message_id: None,
         };
         let prompt = build_recovery_prompt(&signal);
         assert!(prompt.contains("Original input"));
@@ -10782,11 +10841,13 @@ mod tests {
             error_message: "voice 'yangmi' not registered. available: vivian, serena.".into(),
             suggested_alternatives: vec!["vivian".into(), "serena".into()],
             parent_session_key: Some("cli:test".into()),
+            originating_client_message_id: None,
         });
         tx.send(ActorMessage::RecoveryHint {
             task_id: "task-rh-1".into(),
             tool_name: "fm_tts".into(),
             prompt,
+            originating_client_message_id: None,
         })
         .await
         .unwrap();
@@ -10858,6 +10919,7 @@ mod tests {
             task_id: "task-dup".into(),
             tool_name: "fm_tts".into(),
             prompt: prompt1,
+            originating_client_message_id: None,
         })
         .await
         .unwrap();
@@ -10866,6 +10928,7 @@ mod tests {
             task_id: "task-dup".into(),
             tool_name: "fm_tts".into(),
             prompt: prompt2,
+            originating_client_message_id: None,
         })
         .await
         .unwrap();
@@ -10920,6 +10983,7 @@ mod tests {
                 task_id: signal.task_id.clone(),
                 tool_name: signal.tool_name.clone(),
                 prompt,
+                originating_client_message_id: signal.originating_client_message_id.clone(),
             });
         });
         let task_id = supervisor.register_with_input(
@@ -10961,6 +11025,102 @@ mod tests {
             prompt_present,
             "synthetic recovery prompt should be in session history: {:?}",
             session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_turn_preserves_originating_client_message_id_from_failure_signal() {
+        // Issue #738 RED test: when the supervisor emits a
+        // `SpawnOnlyFailureSignal` with `originating_client_message_id`,
+        // the synthetic recovery turn the actor enqueues MUST persist a
+        // user message whose `client_message_id` matches the originating
+        // turn's cmid. Pre-fix, `synthetic_recovery_inbound` stamped only
+        // `_recovery_turn = true` into the InboundMessage metadata, so
+        // `inbound_client_message_id` returned None and `process_inbound`
+        // minted a fresh server UUIDv7 — leaving the eventual successful
+        // retry's deliverables stranded under an orphan thread_id with no
+        // DOM bubble in the SPA.
+        use octos_agent::TaskSupervisor;
+        const ORIGINATING_CMID: &str = "45756a8f-1234-4abc-8def-cafebabe0001";
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("recovery-handled-738"),
+            )],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        // Mirror the production wiring: the failure-signal callback
+        // forwards `signal.originating_client_message_id` onto
+        // `ActorMessage::RecoveryHint` so the actor's
+        // `synthetic_recovery_inbound` builder can stamp it into metadata.
+        let supervisor = TaskSupervisor::new();
+        let recovery_tx = tx.clone();
+        supervisor.set_on_failure_signal(move |signal| {
+            let prompt = build_recovery_prompt(signal);
+            let _ = recovery_tx.try_send(ActorMessage::RecoveryHint {
+                task_id: signal.task_id.clone(),
+                tool_name: signal.tool_name.clone(),
+                prompt,
+                originating_client_message_id: signal.originating_client_message_id.clone(),
+            });
+        });
+
+        // Register the failed task with the originating user turn's
+        // cmid. The supervisor must thread it through to the failure
+        // signal so the recovery turn inherits it.
+        let task_id = supervisor.register_with_input_and_cmid(
+            "deep_research",
+            "call-738",
+            Some("cli:test"),
+            Some(serde_json::json!({"query": "rust news"})),
+            Some(ORIGINATING_CMID.to_string()),
+        );
+        supervisor.mark_failed(&task_id, "MiniMax 429 rate limited".into());
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if !msg.content.is_empty() {
+                responses.push(msg.content);
+            }
+            if responses.iter().any(|r| r.contains("recovery-handled-738")) {
+                break;
+            }
+        }
+        assert!(
+            responses.iter().any(|c| c.contains("recovery-handled-738")),
+            "expected recovery turn to drive an LLM response, got: {responses:?}",
+        );
+
+        // The decisive assertion: the persisted user message for the
+        // recovery turn must carry the originating cmid, NOT a freshly
+        // minted server UUIDv7. Pre-fix this was None or a fresh UUID
+        // because synthetic_recovery_inbound only stamped
+        // `_recovery_turn` and `process_inbound` had nothing to read.
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let recovery_msg = session
+            .messages
+            .iter()
+            .find(|m| {
+                m.role == MessageRole::User
+                    && m.content.contains("[system-internal]")
+                    && m.content.contains("deep_research")
+            })
+            .expect("synthetic recovery user message must be persisted");
+        assert_eq!(
+            recovery_msg.client_message_id.as_deref(),
+            Some(ORIGINATING_CMID),
+            "recovery user message must inherit the originating cmid; got {:?}",
+            recovery_msg.client_message_id,
         );
 
         drop(tx);
@@ -11091,6 +11251,7 @@ mod tests {
             error: None,
             session_key: Some("local:test".into()),
             tool_input: None,
+            originating_client_message_id: None,
         }
     }
 

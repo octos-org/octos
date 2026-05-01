@@ -273,10 +273,6 @@ impl Agent {
                 let bg_args = effective_args.clone();
                 let bg_sender = tools.background_result_sender();
                 let bg_tc_id = tc_id.clone();
-                let task_id =
-                    tools.register_task_with_input(&tc_name, &tc_id, Some(effective_args.clone()));
-                tools.mark_spawn_only_invoked();
-                let bg_supervisor = tools.supervisor();
                 let bg_reporter = reporter.clone();
                 // M8.10 follow-up (#649): snapshot the originating turn's
                 // thread_id NOW, before any other turn can swap reporters
@@ -286,6 +282,20 @@ impl Agent {
                 // correct turn even after subsequent unrelated user turns
                 // have advanced the per-chat sticky thread_id.
                 let bg_originating_thread_id = bg_reporter.thread_id().map(str::to_string);
+                // Issue #738 fix: thread the originating cmid into task
+                // registration so any SpawnOnlyFailureSignal emitted for
+                // this task carries it to the M8.9 synthetic recovery
+                // turn. Without this, the recovery turn mints a fresh
+                // UUIDv7 and the eventual successful retry's deliverables
+                // land under an orphan thread_id with no DOM bubble.
+                let task_id = tools.register_task_with_input_and_cmid(
+                    &tc_name,
+                    &tc_id,
+                    Some(effective_args.clone()),
+                    bg_originating_thread_id.clone(),
+                );
+                tools.mark_spawn_only_invoked();
+                let bg_supervisor = tools.supervisor();
                 // F004 B2: bridge supervised runtime-state transitions onto
                 // the per-request reporter so spawn_only tasks emit
                 // ToolProgress events keyed by `tool_call_id`. This is what
