@@ -406,11 +406,14 @@ impl PluginLoader {
                     );
                     return None;
                 }
-                // Codex review #1: warn (don't reject) on unknown
-                // concurrency_class so authors notice typos like
-                // `"exclusive "` (trailing space → silently Safe). The
-                // runtime trim added in tool.rs handles the trim case;
-                // this surface keeps unknown literals visible.
+                // Codex review #1 + issue #718: warn (don't reject) on
+                // unknown concurrency_class so authors notice typos like
+                // `"exclusive "` (trailing space → silently Safe) or
+                // `"exclusve"`. The runtime resolver in tool.rs now
+                // fails-closed to Exclusive on Unknown — matches MCP's
+                // `resolved_concurrency_class`. This warn keeps the
+                // misconfiguration visible even though it is no longer
+                // a silent downgrade.
                 if let ConcurrencyClassClassification::Unknown(raw) =
                     def.classify_concurrency_class()
                 {
@@ -418,7 +421,7 @@ impl PluginLoader {
                         plugin = %plugin_name,
                         tool = %def.name,
                         concurrency_class = %raw,
-                        "manifest declares unknown concurrency_class; falling back to Safe"
+                        "manifest declares unknown concurrency_class; falling back to Exclusive (fail-closed)"
                     );
                 }
                 let manifest_risk = def.risk.clone();

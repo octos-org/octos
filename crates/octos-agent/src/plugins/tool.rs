@@ -715,6 +715,12 @@ impl Tool for PluginTool {
         // plugin author marks the tool as `"exclusive"` (e.g. it
         // mutates shared state, posts to a remote service, or writes
         // to disk) the M8.8 scheduler serialises it against siblings.
+        //
+        // Issue #718 follow-up: align with `McpServerConfig::resolved_concurrency_class`
+        // — unknown literals fail-closed to `Exclusive` so a typo like
+        // `"exclusve"` does not silently permit parallel writes. The
+        // loader already emits a `warn!` on `Unknown` so misconfigurations
+        // are visible; this resolver is the runtime safety net.
         match self
             .tool_def
             .concurrency_class
@@ -723,8 +729,10 @@ impl Tool for PluginTool {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
+            None | Some("") | Some("safe") => super::super::tools::ConcurrencyClass::Safe,
             Some("exclusive") => super::super::tools::ConcurrencyClass::Exclusive,
-            _ => super::super::tools::ConcurrencyClass::Safe,
+            // Unknown values fail-safe to Exclusive — matches MCP behavior.
+            Some(_) => super::super::tools::ConcurrencyClass::Exclusive,
         }
     }
 
@@ -2467,12 +2475,30 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_class_unknown_falls_back_to_safe() {
+    fn plugin_unknown_concurrency_class_falls_back_to_exclusive() {
+        // Issue #718 follow-up: align with MCP's
+        // `McpServerConfig::resolved_concurrency_class`. The previous
+        // behavior was fail-open (unknown → Safe), which silently
+        // permitted parallel writes when a manifest author typoed
+        // `"exclusve"`. After the fix, unknown literals fail-closed to
+        // Exclusive — same behavior as MCP — so a typo still serialises
+        // execution.
         let mut def = make_tool_def("excl_tool", "exclusive");
         def.concurrency_class = Some("highly-exclusive".to_string());
         let tool = PluginTool::new("p".into(), def, PathBuf::from("/bin/echo"));
-        let class = tool.concurrency_class();
-        assert!(matches!(class, crate::tools::ConcurrencyClass::Safe));
+        assert!(matches!(
+            tool.concurrency_class(),
+            crate::tools::ConcurrencyClass::Exclusive,
+        ));
+
+        // The exact typo called out in #718.
+        let mut typo_def = make_tool_def("typo_tool", "exclusive");
+        typo_def.concurrency_class = Some("exclusve".to_string());
+        let typo_tool = PluginTool::new("p".into(), typo_def, PathBuf::from("/bin/echo"));
+        assert!(matches!(
+            typo_tool.concurrency_class(),
+            crate::tools::ConcurrencyClass::Exclusive,
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

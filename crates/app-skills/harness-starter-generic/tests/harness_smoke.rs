@@ -37,6 +37,28 @@ fn manifest_parses_and_declares_spawn_only_tool() {
 }
 
 #[test]
+fn harness_starter_generic_manifest_declares_exclusive_concurrency() {
+    // Issue #718: `produce_artifact` writes `output/artifact-*.txt`, so
+    // it must declare `concurrency_class = "exclusive"` to serialise
+    // against sibling mutating tools in the same batch. Without this
+    // field the M8.8 scheduler defaults to `Safe` and silently permits
+    // parallel writes — same gap PR #711 closed for the other bundled
+    // mutating skills (harness-starter-coding, harness-starter-report,
+    // account-manager, skill-evolve).
+    let manifest = PluginManifest::from_file(&manifest_path()).expect("manifest.json must parse");
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "produce_artifact")
+        .expect("produce_artifact tool present");
+    assert_eq!(
+        tool.concurrency_class.as_deref(),
+        Some("exclusive"),
+        "produce_artifact writes output/artifact-*.txt and must declare concurrency_class=exclusive",
+    );
+}
+
+#[test]
 fn workspace_policy_parses_and_declares_primary_artifact() {
     let raw =
         std::fs::read_to_string(policy_path()).expect("workspace-policy.toml must be readable");

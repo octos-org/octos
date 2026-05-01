@@ -221,9 +221,10 @@ impl PluginToolDef {
     /// Returns the trimmed/lowercased `concurrency_class` literal if it is
     /// recognised. Returns `None` for missing values; returns
     /// `Some("unknown:...")` for declared-but-unrecognised values so the
-    /// loader can warn without rejecting (silent fallback to Safe is the
-    /// existing behavior — we don't want to break a manifest that
-    /// declares e.g. `"safe"` even though Safe is the default).
+    /// loader can warn without rejecting (the runtime resolver in
+    /// `PluginTool::concurrency_class` fails-closed to Exclusive on
+    /// Unknown — see issue #718 — so a typo still serialises execution
+    /// even before the operator notices the warn log).
     ///
     /// Recognised: `exclusive`, `safe`. Anything else (including
     /// `"medium"`, `"highly-exclusive"`, ...) is reported as unknown so
@@ -256,7 +257,8 @@ pub enum ConcurrencyClassClassification {
     /// can reject Unset for mutating tools while keeping explicit Safe.
     Safe,
     /// Declared but unrecognised. Carries the original raw value for
-    /// diagnostic logging. Runtime behavior falls back to Safe.
+    /// diagnostic logging. Runtime behavior fails-closed to Exclusive
+    /// (see issue #718 — matches MCP's `resolved_concurrency_class`).
     Unknown(String),
 }
 
