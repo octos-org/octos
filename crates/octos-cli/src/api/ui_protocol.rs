@@ -4447,8 +4447,8 @@ mod tests {
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
-            harness_task_control: false,
-            header_present: true,
+                harness_task_control: false,
+                header_present: true,
             },
         );
 
@@ -4492,8 +4492,8 @@ mod tests {
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
-            harness_task_control: false,
-            header_present: true,
+                harness_task_control: false,
+                header_present: true,
             },
         );
 
@@ -4530,8 +4530,8 @@ mod tests {
                 typed_approvals: true,
                 pane_snapshots: false,
                 session_workspace_cwd: false,
-            harness_task_control: false,
-            header_present: true,
+                harness_task_control: false,
+                header_present: true,
             },
         );
 

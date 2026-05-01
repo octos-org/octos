@@ -103,12 +103,25 @@ async function getOrderedBubbles(page: Page) {
  * deep_research RESULT lands, exercising the late-binding code path
  * the #649 fix targets.
  *
+ * Issue #731 hardening: PR #688 made `run_pipeline` `spawn_only`, so
+ * deep_research now delivers as a media-attachment bubble (`.md`
+ * link) ~1-3 min after the SSE `done` event for the foreground turn,
+ * NOT as inline markdown text. The bubble's `innerText` for an
+ * attachment-only message can be a generic "✓ run_pipeline completed
+ * (...)" or empty, neither of which contains `rust`. We extend the
+ * Q1-satisfied predicate to also accept the presence of a `.md`
+ * anchor href in the slow region, which is what proves the late
+ * background result has been bound to Q1's thread.
+ *
  * Early-fail diagnostic: while polling, we also look at Q2's paired
- * bubble. If the slow marker shows up THERE before showing up under
- * Q1, that's the smoking-gun #649 misroute (late background result
- * inherited Q2's thread_id). We throw immediately with a clear
- * diagnostic instead of letting the test silently time out.
+ * bubble. If the slow marker (text or `.md` link) shows up THERE
+ * before showing up under Q1, that's the smoking-gun #649 misroute
+ * (late background result inherited Q2's thread_id). We throw
+ * immediately with a clear diagnostic instead of letting the test
+ * silently time out.
  */
+const MD_HREF_RE = /\.md(?:$|[?#])/i;
+
 async function waitForBothFinished(
   page: Page,
   expectedAssistantCount: number,
@@ -119,7 +132,7 @@ async function waitForBothFinished(
 ) {
   const start = Date.now();
   let lastFilled = 0;
-  let lastSlowMatched = false;
+  let lastSlowSatisfied = false;
   let stable = 0;
   while (Date.now() - start < maxWaitMs) {
     const isStreaming = await page
@@ -136,8 +149,10 @@ async function waitForBothFinished(
 
     // Inspect Q1's vs Q2's paired bubbles. Q1's assistants live in the
     // new region between the first user bubble and the second user
-    // bubble; Q2's assistants live after the second user bubble.
-    const regionTexts = await page.evaluate(
+    // bubble; Q2's assistants live after the second user bubble. We
+    // also collect any anchor hrefs in each region so the spawn_only
+    // `.md`-attachment delivery path (issue #731) is recognised.
+    const regionData = await page.evaluate(
       ({ baseUsers, baseAssistants }) => {
         const nodes = document.querySelectorAll(
           "[data-testid='user-message'], [data-testid='assistant-message']",
@@ -147,7 +162,9 @@ async function waitForBothFinished(
         const firstUserIdx = newRegion.findIndex(
           (el) => el.getAttribute('data-testid') === 'user-message',
         );
-        if (firstUserIdx < 0) return { slow: '', fast: '' };
+        if (firstUserIdx < 0) {
+          return { slow: '', fast: '', slowHrefs: [], fastHrefs: [] };
+        }
         const secondUserRel = newRegion
           .slice(firstUserIdx + 1)
           .findIndex((el) => el.getAttribute('data-testid') === 'user-message');
@@ -158,43 +175,77 @@ async function waitForBothFinished(
         const slowSlice = newRegion.slice(firstUserIdx + 1, slowEnd);
         const fastSlice =
           secondUserRel < 0 ? [] : newRegion.slice(slowEnd + 1);
-        const collect = (arr: Element[]) =>
+        const collectText = (arr: Element[]) =>
           arr
             .filter(
               (el) => el.getAttribute('data-testid') === 'assistant-message',
             )
             .map((el) => ((el as HTMLElement).innerText || '').trim())
             .join('\n');
-        return { slow: collect(slowSlice), fast: collect(fastSlice) };
+        const here = window.location.origin;
+        const collectHrefs = (arr: Element[]) =>
+          arr
+            .filter(
+              (el) => el.getAttribute('data-testid') === 'assistant-message',
+            )
+            .flatMap((el) =>
+              Array.from(el.querySelectorAll('a[href]')).map(
+                (a) => (a as HTMLAnchorElement).href || '',
+              ),
+            )
+            .filter((h) => {
+              if (!h) return false;
+              // Restrict to same-origin so that external citation
+              // links the LLM may emit in synthesis prose don't
+              // count as the spawn_only `.md` delivery (issue #731).
+              try {
+                return new URL(h, here).origin === here;
+              } catch {
+                return false;
+              }
+            });
+        return {
+          slow: collectText(slowSlice),
+          fast: collectText(fastSlice),
+          slowHrefs: collectHrefs(slowSlice),
+          fastHrefs: collectHrefs(fastSlice),
+        };
       },
       { baseUsers: baseUserBubbles, baseAssistants: baseAssistantBubbles },
     );
-    const slowMatched = slowMarker.test(regionTexts.slow);
-    const fastHasSlowMarker = slowMarker.test(regionTexts.fast);
+    const slowTextMatched = slowMarker.test(regionData.slow);
+    const fastTextHasSlowMarker = slowMarker.test(regionData.fast);
+    const slowHasMdLink = regionData.slowHrefs.some((h) => MD_HREF_RE.test(h));
+    const fastHasMdLink = regionData.fastHrefs.some((h) => MD_HREF_RE.test(h));
+
+    // Either a textual content marker OR an `.md` attachment anchor
+    // counts as Q1's deep_research RESULT having landed under Q1.
+    const slowSatisfied = slowTextMatched || slowHasMdLink;
+    const fastHasSlowEvidence = fastTextHasSlowMarker || fastHasMdLink;
 
     // Smoking-gun: late deep_research result landed under Q2's bubble
     // instead of Q1's. Fail fast with full diagnostics rather than
     // burning the rest of the 6-min budget.
-    if (fastHasSlowMarker && !slowMatched) {
+    if (fastHasSlowEvidence && !slowSatisfied) {
       throw new Error(
-        `BROKEN PAIRING (#649 misroute): slow-Q research-content marker (${slowMarker}) appeared under Q2's bubble while Q1's bubble has no such marker. This is exactly the #649 symptom: late background result inherited Q2's thread_id from the sticky map.\nQ1 region text: ${JSON.stringify(regionTexts.slow.slice(0, 400))}\nQ2 region text: ${JSON.stringify(regionTexts.fast.slice(0, 400))}`,
+        `BROKEN PAIRING (#649 misroute): slow-Q research evidence (text marker ${slowMarker} or .md attachment) appeared under Q2's bubble while Q1's bubble has none. This is exactly the #649 symptom: late background result inherited Q2's thread_id from the sticky map.\nQ1 region text: ${JSON.stringify(regionData.slow.slice(0, 400))}\nQ1 region hrefs: ${JSON.stringify(regionData.slowHrefs)}\nQ2 region text: ${JSON.stringify(regionData.fast.slice(0, 400))}\nQ2 region hrefs: ${JSON.stringify(regionData.fastHrefs)}`,
       );
     }
 
-    if (filled >= expectedAssistantCount && !isStreaming && slowMatched) {
+    if (filled >= expectedAssistantCount && !isStreaming && slowSatisfied) {
       stable += 1;
       if (stable >= 2) return filled;
     } else {
       stable = 0;
     }
 
-    if (filled !== lastFilled || slowMatched !== lastSlowMatched) {
+    if (filled !== lastFilled || slowSatisfied !== lastSlowSatisfied) {
       const elapsed = ((Date.now() - start) / 1000).toFixed(0);
       console.log(
-        `  [interleave] ${elapsed}s: filled=${filled}/${expectedAssistantCount} streaming=${isStreaming} slowMatched=${slowMatched} slowSnippet=${JSON.stringify(regionTexts.slow.slice(0, 120))}`,
+        `  [interleave] ${elapsed}s: filled=${filled}/${expectedAssistantCount} streaming=${isStreaming} slowSatisfied=${slowSatisfied} (text=${slowTextMatched}, mdLink=${slowHasMdLink}) slowSnippet=${JSON.stringify(regionData.slow.slice(0, 120))}`,
       );
       lastFilled = filled;
-      lastSlowMatched = slowMatched;
+      lastSlowSatisfied = slowSatisfied;
     }
     await page.waitForTimeout(3_000);
   }
@@ -317,26 +368,81 @@ test.describe('Live thread interleave (M8.10 PR #4)', () => {
       expect(slowThreadIds[0]).not.toBe(fastThreadIds[0]);
     }
 
-    // Hard content check (#649 hardening): the slow assistant's text
-    // MUST contain a research-content marker — this is what proves the
-    // late deep_research RESULT actually attached to Q1's bubble (and
-    // not Q2's, which is the #649 misrouting symptom). Without this
-    // assertion the spec would false-pass on the spawn-ack alone.
-    // `waitForBothFinished` already polls for this marker, so by the
+    // Hard content check (#649 + #731 hardening): the slow assistant's
+    // bubble MUST contain EITHER a research-content marker OR a `.md`
+    // attachment anchor — both prove the late deep_research RESULT
+    // attached to Q1's bubble (and not Q2's, which is the #649
+    // misrouting symptom). Post-PR-#688, `run_pipeline` is `spawn_only`
+    // and delivers the report as a media attachment ~1-3 min after
+    // SSE done; for those bubbles the inline text is just a generic
+    // success notification with no `rust` token, so the text-only
+    // assertion would false-fail. Without either signal, the spec
+    // would false-pass on the spawn-ack alone.
+    // `waitForBothFinished` already polls for this evidence, so by the
     // time we reach here it should be present; if it's not, the late
     // result either timed out (raise SLOW_MAX_WAIT_MS) or got bound to
     // the wrong bubble (the #649 regression).
     const slowText = slowAssistantBetween.map((b) => b.text).join(' ');
     const fastText = fastAssistantAfter.map((b) => b.text).join(' ');
+    const slowMdHrefs = await page.evaluate(
+      ({ baseUsers, baseAssistants }) => {
+        const nodes = document.querySelectorAll(
+          "[data-testid='user-message'], [data-testid='assistant-message']",
+        );
+        const all = Array.from(nodes);
+        const newRegion = all.slice(baseUsers + baseAssistants);
+        const firstUserIdx = newRegion.findIndex(
+          (el) => el.getAttribute('data-testid') === 'user-message',
+        );
+        if (firstUserIdx < 0) return [] as string[];
+        const secondUserRel = newRegion
+          .slice(firstUserIdx + 1)
+          .findIndex(
+            (el) => el.getAttribute('data-testid') === 'user-message',
+          );
+        const slowEnd =
+          secondUserRel < 0
+            ? newRegion.length
+            : firstUserIdx + 1 + secondUserRel;
+        const slowSlice = newRegion.slice(firstUserIdx + 1, slowEnd);
+        const here = window.location.origin;
+        return slowSlice
+          .filter(
+            (el) => el.getAttribute('data-testid') === 'assistant-message',
+          )
+          .flatMap((el) =>
+            Array.from(el.querySelectorAll('a[href]')).map(
+              (a) => (a as HTMLAnchorElement).href || '',
+            ),
+          )
+          .filter((h) => {
+            if (!h) return false;
+            try {
+              return new URL(h, here).origin === here;
+            } catch {
+              return false;
+            }
+          });
+      },
+      { baseUsers: userBubblesBefore, baseAssistants: assistantBubblesBefore },
+    );
+    const slowHasMdLink = slowMdHrefs.some((h) => MD_HREF_RE.test(h));
     expect(
-      SLOW_HINT_RE.test(slowText),
-      `Slow-Q's paired bubble has no research-content marker. This means the deep_research result either never arrived under Q1's bubble (possibly bound to Q2's bubble — the #649 regression) or the spawn-ack alone is what got rendered. slow="${slowText.slice(0, 400)}" fast="${fastText.slice(0, 200)}"`,
+      SLOW_HINT_RE.test(slowText) || slowHasMdLink,
+      `Slow-Q's paired bubble has neither research-content text marker nor a .md attachment. This means the deep_research result either never arrived under Q1's bubble (possibly bound to Q2's bubble — the #649 regression) or the spawn-ack alone is what got rendered. slow="${slowText.slice(0, 400)}" slowHrefs=${JSON.stringify(slowMdHrefs)} fast="${fastText.slice(0, 200)}"`,
     ).toBe(true);
 
     // Soft semantic check: the slow assistant's text should NOT include
     // any "1+1=2" content (that's the fast Q's answer). If it does, the
-    // wires got crossed.
-    if (FAST_HINT_RE.test(slowText) && !SLOW_HINT_RE.test(slowText)) {
+    // wires got crossed. Only fail if there's also no slow-content
+    // signal at all (text or .md link) — the attachment-only delivery
+    // path may legitimately have a generic notification line that
+    // happens to contain a digit.
+    if (
+      FAST_HINT_RE.test(slowText) &&
+      !SLOW_HINT_RE.test(slowText) &&
+      !slowHasMdLink
+    ) {
       throw new Error(
         `BROKEN PAIRING: slow assistant text contains fast-Q answer marker but no slow-Q content. slow="${slowText.slice(0, 200)}" fast="${fastText.slice(0, 200)}"`,
       );
