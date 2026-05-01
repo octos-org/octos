@@ -20,7 +20,8 @@
         "MOONSHOT_API_KEY",
         "DASHSCOPE_API_KEY",
         "OPENAI_API_KEY",
-        "DEEP_SEARCH_SYNTHESIS_MODEL"
+        "DEEP_SEARCH_SYNTHESIS_MODEL",
+        "DEEP_SEARCH_MAX_BROWSERS"
       ],
       "input_schema": {
         "type": "object",
