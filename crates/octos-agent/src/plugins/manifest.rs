@@ -133,6 +133,181 @@ pub struct PluginToolDef {
     pub concurrency_class: Option<String>,
 }
 
+/// Recognised values for the manifest-declared `risk` field.
+///
+/// M6 req 4 enforcement (UPCR-2026-001): a tool that declares
+/// `risk: "high"` or `risk: "critical"` must trigger an interactive approval
+/// prompt before each invocation. `low` is treated as auto-approved.
+/// `medium` and any unknown literal fall through to "no enforced gate" — the
+/// risk is still surfaced on `approval_requested.risk` for display, but the
+/// agent does not synthesise an approval check (intent: medium semantics
+/// remain ambiguous; revisit per Tier 2/3 follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestRiskGate {
+    /// Auto-approved — skip the interactive prompt.
+    Low,
+    /// Ambiguous; surfaced for display, no enforced gate.
+    MediumOrUnspecified,
+    /// Must request user approval before invocation.
+    HighOrCritical,
+}
+
+impl ManifestRiskGate {
+    /// Classify a manifest risk literal. Whitespace and ASCII case are
+    /// ignored. Unknown literals map to [`ManifestRiskGate::MediumOrUnspecified`]
+    /// so the agent does not silently strengthen a value the manifest
+    /// author did not write.
+    pub fn classify(risk: Option<&str>) -> Self {
+        match risk
+            .map(str::trim)
+            .filter(|risk| !risk.is_empty())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("low") => Self::Low,
+            Some("high") | Some("critical") => Self::HighOrCritical,
+            _ => Self::MediumOrUnspecified,
+        }
+    }
+
+    /// Whether this risk literal forces an interactive approval prompt.
+    pub fn requires_approval(self) -> bool {
+        matches!(self, Self::HighOrCritical)
+    }
+}
+
+/// Manifest-level validation error surfaced at registration time.
+///
+/// Loader code calls [`PluginToolDef::validate_for_registration`] before
+/// wiring the tool into the registry. A returned error means the plugin
+/// declares fields the harness cannot enforce safely; the plugin is
+/// rejected (loader logs and skips).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestValidationError {
+    /// `env` allowlist contains a name that fails the syntactic check.
+    /// First field: the offending name; second: human-readable reason.
+    InvalidEnvName(String, &'static str),
+}
+
+impl std::fmt::Display for ManifestValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidEnvName(name, reason) => write!(
+                f,
+                "manifest env allowlist entry {name:?} is invalid: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ManifestValidationError {}
+
+impl PluginToolDef {
+    /// Validate manifest fields whose enforcement gates run at runtime.
+    ///
+    /// M6 req 4: this is the registration-time half of the env-allowlist
+    /// gate. Runtime filtering relies on [`PluginToolDef::env`] being a
+    /// list of well-formed env-var names — anything that smells like a
+    /// shell-injection token (`=`, control chars) or a known process
+    /// hijack vector (`LD_PRELOAD`, `DYLD_*` etc.) is rejected here so a
+    /// malicious manifest cannot use the allowlist as a bypass channel.
+    pub fn validate_for_registration(&self) -> Result<(), ManifestValidationError> {
+        for name in &self.env {
+            validate_manifest_env_name(name)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the trimmed/lowercased `concurrency_class` literal if it is
+    /// recognised. Returns `None` for missing values; returns
+    /// `Some("unknown:...")` for declared-but-unrecognised values so the
+    /// loader can warn without rejecting (silent fallback to Safe is the
+    /// existing behavior — we don't want to break a manifest that
+    /// declares e.g. `"safe"` even though Safe is the default).
+    ///
+    /// Recognised: `exclusive`, `safe`. Anything else (including
+    /// `"medium"`, `"highly-exclusive"`, ...) is reported as unknown so
+    /// operators can spot typos like `"exclusive "` (trailing space —
+    /// previously silently downgraded to Safe).
+    pub fn classify_concurrency_class(&self) -> ConcurrencyClassClassification {
+        let Some(raw) = self.concurrency_class.as_deref() else {
+            return ConcurrencyClassClassification::Unset;
+        };
+        let trimmed = raw.trim().to_ascii_lowercase();
+        match trimmed.as_str() {
+            "" => ConcurrencyClassClassification::Unset,
+            "exclusive" => ConcurrencyClassClassification::Exclusive,
+            "safe" => ConcurrencyClassClassification::Safe,
+            _ => ConcurrencyClassClassification::Unknown(raw.to_string()),
+        }
+    }
+}
+
+/// Result of [`PluginToolDef::classify_concurrency_class`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrencyClassClassification {
+    /// No `concurrency_class` declared. Falls back to the trait default
+    /// (`Safe`).
+    Unset,
+    /// Declared `"exclusive"` (post-trim, case-insensitive).
+    Exclusive,
+    /// Declared `"safe"` (post-trim, case-insensitive). Equivalent to
+    /// Unset at runtime but distinguished here so a future tightening
+    /// can reject Unset for mutating tools while keeping explicit Safe.
+    Safe,
+    /// Declared but unrecognised. Carries the original raw value for
+    /// diagnostic logging. Runtime behavior falls back to Safe.
+    Unknown(String),
+}
+
+fn validate_manifest_env_name(name: &str) -> Result<(), ManifestValidationError> {
+    if name.is_empty() {
+        return Err(ManifestValidationError::InvalidEnvName(
+            name.to_string(),
+            "empty name",
+        ));
+    }
+    if name.contains('=') {
+        return Err(ManifestValidationError::InvalidEnvName(
+            name.to_string(),
+            "name must not contain '='",
+        ));
+    }
+    if name.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err(ManifestValidationError::InvalidEnvName(
+            name.to_string(),
+            "name must not contain whitespace or control characters",
+        ));
+    }
+    if name.starts_with(|ch: char| ch.is_ascii_digit()) {
+        return Err(ManifestValidationError::InvalidEnvName(
+            name.to_string(),
+            "name must not start with a digit",
+        ));
+    }
+    for ch in name.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return Err(ManifestValidationError::InvalidEnvName(
+                name.to_string(),
+                "name must use only [A-Za-z0-9_]",
+            ));
+        }
+    }
+    // Reject known process-hijack env names. The same list is stripped
+    // unconditionally at subprocess spawn time, but rejecting at
+    // registration makes the malicious manifest visible in logs instead
+    // of letting it linger as a no-op.
+    for blocked in crate::sandbox::BLOCKED_ENV_VARS {
+        if name.eq_ignore_ascii_case(blocked) {
+            return Err(ManifestValidationError::InvalidEnvName(
+                name.to_string(),
+                "name is a known process-hijack env var",
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl PluginToolDef {
     /// Whether this tool's input schema declares it accepts host-injected
     /// config under the named key (e.g. `"synthesis_config"`).
@@ -400,5 +575,188 @@ mod tests {
         );
         assert!(schema["properties"]["config"]["oneOf"].is_array());
         assert_eq!(schema["required"], serde_json::json!(["service"]));
+    }
+
+    fn def_with_env(env: Vec<&str>) -> PluginToolDef {
+        PluginToolDef {
+            name: "t".to_string(),
+            description: "d".to_string(),
+            input_schema: default_schema(),
+            spawn_only: false,
+            env: env.into_iter().map(str::to_string).collect(),
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
+    #[test]
+    fn validate_for_registration_accepts_clean_allowlist() {
+        let def = def_with_env(vec!["OPENAI_API_KEY", "SMTP_HOST", "_FOO_BAR_"]);
+        assert!(def.validate_for_registration().is_ok());
+    }
+
+    #[test]
+    fn validate_for_registration_accepts_empty_allowlist() {
+        let def = def_with_env(vec![]);
+        assert!(def.validate_for_registration().is_ok());
+    }
+
+    #[test]
+    fn validate_for_registration_rejects_empty_entry() {
+        let def = def_with_env(vec![""]);
+        let err = def.validate_for_registration().unwrap_err();
+        assert!(matches!(err, ManifestValidationError::InvalidEnvName(_, _)));
+    }
+
+    #[test]
+    fn validate_for_registration_rejects_equals_sign() {
+        let def = def_with_env(vec!["FOO=bar"]);
+        assert!(def.validate_for_registration().is_err());
+    }
+
+    #[test]
+    fn validate_for_registration_rejects_whitespace() {
+        let def = def_with_env(vec!["FOO BAR"]);
+        assert!(def.validate_for_registration().is_err());
+        let def = def_with_env(vec!["FOO\nBAR"]);
+        assert!(def.validate_for_registration().is_err());
+    }
+
+    #[test]
+    fn validate_for_registration_rejects_leading_digit() {
+        let def = def_with_env(vec!["1FOO"]);
+        assert!(def.validate_for_registration().is_err());
+    }
+
+    #[test]
+    fn validate_for_registration_rejects_non_alphanumeric() {
+        let def = def_with_env(vec!["FOO-BAR"]);
+        assert!(def.validate_for_registration().is_err());
+        let def = def_with_env(vec!["FOO.BAR"]);
+        assert!(def.validate_for_registration().is_err());
+    }
+
+    #[test]
+    fn validate_for_registration_rejects_blocked_env_names() {
+        // BLOCKED_ENV_VARS includes process-hijack vars like LD_PRELOAD,
+        // DYLD_INSERT_LIBRARIES, NODE_OPTIONS, etc.
+        let def = def_with_env(vec!["LD_PRELOAD"]);
+        assert!(def.validate_for_registration().is_err());
+        let def = def_with_env(vec!["DYLD_INSERT_LIBRARIES"]);
+        assert!(def.validate_for_registration().is_err());
+        // Case-insensitive match.
+        let def = def_with_env(vec!["ld_preload"]);
+        assert!(def.validate_for_registration().is_err());
+    }
+
+    #[test]
+    fn manifest_risk_gate_classifies_known_literals() {
+        assert_eq!(
+            ManifestRiskGate::classify(Some("low")),
+            ManifestRiskGate::Low
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("LOW")),
+            ManifestRiskGate::Low
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some(" Low ")),
+            ManifestRiskGate::Low
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("high")),
+            ManifestRiskGate::HighOrCritical
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("CRITICAL")),
+            ManifestRiskGate::HighOrCritical
+        );
+    }
+
+    #[test]
+    fn manifest_risk_gate_falls_back_for_unknown_or_blank() {
+        assert_eq!(
+            ManifestRiskGate::classify(None),
+            ManifestRiskGate::MediumOrUnspecified
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("")),
+            ManifestRiskGate::MediumOrUnspecified
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("   ")),
+            ManifestRiskGate::MediumOrUnspecified
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("medium")),
+            ManifestRiskGate::MediumOrUnspecified
+        );
+        assert_eq!(
+            ManifestRiskGate::classify(Some("super-critical")),
+            ManifestRiskGate::MediumOrUnspecified
+        );
+    }
+
+    #[test]
+    fn manifest_risk_gate_requires_approval_only_for_high_critical() {
+        assert!(!ManifestRiskGate::Low.requires_approval());
+        assert!(!ManifestRiskGate::MediumOrUnspecified.requires_approval());
+        assert!(ManifestRiskGate::HighOrCritical.requires_approval());
+    }
+
+    fn def_with_concurrency(class: Option<&str>) -> PluginToolDef {
+        PluginToolDef {
+            name: "t".to_string(),
+            description: "d".to_string(),
+            input_schema: default_schema(),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: class.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn classify_concurrency_class_recognises_known_literals() {
+        assert_eq!(
+            def_with_concurrency(Some("exclusive")).classify_concurrency_class(),
+            ConcurrencyClassClassification::Exclusive
+        );
+        assert_eq!(
+            def_with_concurrency(Some("EXCLUSIVE")).classify_concurrency_class(),
+            ConcurrencyClassClassification::Exclusive
+        );
+        // Codex review #1: trailing whitespace must not silently
+        // downgrade `"exclusive "` to Safe.
+        assert_eq!(
+            def_with_concurrency(Some("exclusive ")).classify_concurrency_class(),
+            ConcurrencyClassClassification::Exclusive
+        );
+        assert_eq!(
+            def_with_concurrency(Some("safe")).classify_concurrency_class(),
+            ConcurrencyClassClassification::Safe
+        );
+    }
+
+    #[test]
+    fn classify_concurrency_class_flags_unknown_literals() {
+        match def_with_concurrency(Some("nonsense")).classify_concurrency_class() {
+            ConcurrencyClassClassification::Unknown(raw) => assert_eq!(raw, "nonsense"),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_concurrency_class_unset_when_missing_or_blank() {
+        assert_eq!(
+            def_with_concurrency(None).classify_concurrency_class(),
+            ConcurrencyClassClassification::Unset
+        );
+        assert_eq!(
+            def_with_concurrency(Some("   ")).classify_concurrency_class(),
+            ConcurrencyClassClassification::Unset
+        );
     }
 }

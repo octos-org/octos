@@ -16,10 +16,16 @@ use crate::harness_events::{
     OCTOS_SESSION_ID_ENV, OCTOS_TASK_ID_ENV, lookup_event_sink_context, write_event_to_sink,
 };
 use crate::progress::ProgressEvent;
-use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
-use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
+use crate::subprocess_env::{
+    EnvAllowlist, sanitize_command_env, sanitize_command_env_strict, should_forward_env_name,
+    should_forward_env_name_strict,
+};
+use crate::tools::{
+    TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest, ToolContext,
+    ToolResult,
+};
 
-use super::manifest::PluginToolDef;
+use super::manifest::{ManifestRiskGate, PluginToolDef};
 
 /// Synthesis LLM provider config injected into plugin args.
 ///
@@ -713,6 +719,7 @@ impl Tool for PluginTool {
             .tool_def
             .concurrency_class
             .as_deref()
+            .map(str::trim)
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
@@ -754,6 +761,87 @@ impl Tool for PluginTool {
             "spawning plugin process"
         );
 
+        // M6 req 4: enforce manifest-declared `risk` field (UPCR-2026-001).
+        // When the manifest declares `risk: "high"` or `risk: "critical"`,
+        // request user approval before spawning the plugin process. `low`
+        // and unspecified/unknown literals fall through (no enforced gate)
+        // so existing skills that don't declare `risk` keep working
+        // unchanged.
+        let risk_gate = ManifestRiskGate::classify(self.tool_def.risk.as_deref());
+        if risk_gate.requires_approval() {
+            let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
+            let Some(requester) = requester else {
+                tracing::warn!(
+                    plugin = %self.plugin_name,
+                    tool = %self.tool_def.name,
+                    risk = ?self.tool_def.risk,
+                    "plugin tool requires approval but no interactive approval bridge is in scope — denied"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "Plugin tool '{}' requires approval (manifest risk={:?}) and was denied: no interactive approval bridge available.",
+                        self.tool_def.name,
+                        self.tool_def.risk.as_deref().unwrap_or("unspecified")
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            };
+
+            let tool_id = TOOL_CTX
+                .try_with(|ctx| ctx.tool_id.clone())
+                .unwrap_or_default();
+            let title = format!(
+                "Approve {} ({})",
+                self.tool_def.name,
+                self.tool_def
+                    .risk
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|risk| !risk.is_empty())
+                    .unwrap_or("high")
+            );
+            let body = format!(
+                "Plugin '{}' tool '{}' is declared {} risk in its manifest.",
+                self.plugin_name,
+                self.tool_def.name,
+                self.tool_def
+                    .risk
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|risk| !risk.is_empty())
+                    .unwrap_or("high")
+            );
+            let decision = requester
+                .request_approval(ToolApprovalRequest {
+                    tool_id,
+                    tool_name: self.tool_def.name.clone(),
+                    title,
+                    body,
+                    command: None,
+                    cwd: self
+                        .work_dir
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                })
+                .await;
+            if matches!(decision, ToolApprovalDecision::Deny) {
+                tracing::warn!(
+                    plugin = %self.plugin_name,
+                    tool = %self.tool_def.name,
+                    "plugin tool denied by interactive approval"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "Plugin tool '{}' denied by user approval.",
+                        self.tool_def.name
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+
         let mut cmd = Command::new(&self.executable);
         cmd.arg(&self.tool_def.name)
             .stdin(Stdio::piped())
@@ -761,7 +849,18 @@ impl Tool for PluginTool {
             .stderr(Stdio::piped());
 
         let env_allowlist = EnvAllowlist::from_strings(&self.tool_def.env);
-        sanitize_command_env(&mut cmd, &env_allowlist);
+
+        // M6 req 4: when the manifest declares a non-empty `env` list, treat
+        // it as a strict allowlist and strip every other env var (only the
+        // manifest's names + runtime essentials + harness-injected OCTOS_*
+        // are retained). Empty list keeps the legacy "secret-only" gate so
+        // existing skills that don't declare `env` continue working.
+        let strict_env_gate = !env_allowlist.is_empty();
+        if strict_env_gate {
+            sanitize_command_env_strict(&mut cmd, &env_allowlist);
+        } else {
+            sanitize_command_env(&mut cmd, &env_allowlist);
+        }
 
         // Remove blocked environment variables
         for var in &self.blocked_env {
@@ -772,14 +871,19 @@ impl Tool for PluginTool {
 
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
-            if should_forward_env_name(key, &env_allowlist) {
+            let permitted = if strict_env_gate {
+                should_forward_env_name_strict(key, &env_allowlist)
+            } else {
+                should_forward_env_name(key, &env_allowlist)
+            };
+            if permitted {
                 cmd.env(key, val);
             } else {
                 tracing::debug!(
                     plugin = %self.plugin_name,
                     tool = %self.tool_def.name,
                     env = %key,
-                "skipping non-allowlisted secret environment variable for plugin tool"
+                "skipping non-allowlisted environment variable for plugin tool"
                 );
             }
         }
@@ -2060,5 +2164,344 @@ mod tests {
 
         // Cleanup the sink registration.
         crate::harness_events::detach_event_sink_context(&ctx_path);
+    }
+
+    // -------------------------------------------------------------------
+    // M6 req 4: env allowlist + risk approval enforcement tests
+    // -------------------------------------------------------------------
+
+    /// Manifest declares `env: ["FOO_ALLOWED_PLUGIN"]`. With strict gate
+    /// active, an extra_env entry that's NOT on the manifest list is
+    /// dropped — even though it isn't a secret name, the legacy gate
+    /// would forward it. Pin the new strict semantics.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn strict_env_allowlist_drops_non_listed_extra_env() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nA=${FOO_ALLOWED_PLUGIN:-missing}\nN=${FOO_BLOCKED_PLUGIN:-missing}\necho '{\"output\":\"a='\"$A\"';n='\"$N\"'\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("env_strict_tool", "prints env");
+        def.env.push("FOO_ALLOWED_PLUGIN".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![
+                ("FOO_ALLOWED_PLUGIN".into(), "yes".into()),
+                ("FOO_BLOCKED_PLUGIN".into(), "should_be_stripped".into()),
+            ])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("a=yes"),
+            "listed extra env should reach subprocess; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("n=missing"),
+            "non-listed extra env must be stripped under strict allowlist; got: {}",
+            result.output
+        );
+    }
+
+    /// When the manifest declares an empty `env` list, legacy semantics
+    /// apply: non-secret extra_env entries pass through unfiltered. This
+    /// pins the no-regression contract: skills that don't declare `env`
+    /// see no behavior change from this PR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn empty_env_allowlist_keeps_legacy_extra_env_passthrough() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        // Use a name that isn't flagged as secret-like (no token match
+        // for SECRET/TOKEN/KEY/PASSWORD/etc).
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${MY_BASE_URL:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("legacy_env_tool", "prints env");
+        // No `env` allowlist declared → empty list → legacy gate.
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![("MY_BASE_URL".into(), "passes_through".into())])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("passes_through"),
+            "non-secret extra_env should pass through under legacy gate; got: {}",
+            result.output
+        );
+    }
+
+    /// Strict allowlist must still permit runtime essentials like PATH
+    /// even if they aren't listed in the manifest, otherwise the
+    /// subprocess can't find binaries it needs (sh, etc.). PATH is
+    /// inherited from the parent process, not injected via extra_env.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn strict_env_allowlist_retains_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${PATH:-missing}\nif [ \"$VALUE\" = \"missing\" ]; then echo '{\"output\":\"NO_PATH\",\"success\":true}'; else echo '{\"output\":\"HAS_PATH\",\"success\":true}'; fi\n",
+        );
+
+        let mut def = make_tool_def("path_tool", "prints PATH");
+        def.env.push("FOO_ALLOWED_PLUGIN".into());
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+        assert!(result.success);
+        assert!(
+            result.output.contains("HAS_PATH"),
+            "PATH must be retained under strict allowlist; got: {}",
+            result.output
+        );
+    }
+
+    // ---- risk approval gate ----
+
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    use crate::tools::ToolApprovalRequester;
+
+    struct RecordingRequester {
+        decision: ToolApprovalDecision,
+        last: Arc<Mutex<Option<ToolApprovalRequest>>>,
+    }
+
+    impl RecordingRequester {
+        fn new(
+            decision: ToolApprovalDecision,
+        ) -> (Arc<Self>, Arc<Mutex<Option<ToolApprovalRequest>>>) {
+            let last = Arc::new(Mutex::new(None));
+            let r = Arc::new(Self {
+                decision,
+                last: last.clone(),
+            });
+            (r, last)
+        }
+    }
+
+    #[async_trait]
+    impl ToolApprovalRequester for RecordingRequester {
+        async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+            *self.last.lock().unwrap() = Some(request);
+            self.decision
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn high_risk_plugin_tool_requests_approval() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\necho '{\"output\":\"ran\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_tool", "danger");
+        def.risk = Some("high".into());
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Approve);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "ran");
+        let req = last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("approval was requested");
+        assert_eq!(req.tool_name, "danger_tool");
+        assert!(req.title.contains("high"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn high_risk_plugin_tool_denied_returns_deny_message() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"should_not_run\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_tool_deny", "danger");
+        def.risk = Some("critical".into());
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let (requester, _last) = RecordingRequester::new(ToolApprovalDecision::Deny);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute returns Ok with deny message");
+
+        assert!(!result.success, "denied call must report failure");
+        assert!(
+            result.output.contains("denied"),
+            "deny message should be returned; got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("should_not_run"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn low_risk_plugin_tool_does_not_request_approval() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"ran_without_prompt\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("safe_tool", "safe");
+        def.risk = Some("low".into());
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "ran_without_prompt");
+        assert!(
+            last.lock().unwrap().is_none(),
+            "approval must not be requested for low risk"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn unspecified_risk_plugin_tool_does_not_request_approval() {
+        // Default behavior — pinning that skills without `risk` declared
+        // continue to run without ever prompting (no breakage).
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"unprompted\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("plain_tool", "plain");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "unprompted");
+        assert!(last.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn high_risk_without_approval_bridge_denies_safely() {
+        // Mirrors shell.rs behavior: if there's no interactive bridge,
+        // a high-risk plugin tool must NOT silently run.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"should_not_run\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("danger_tool_no_bridge", "danger");
+        def.risk = Some("HIGH".into());
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        // No TOOL_APPROVAL_CTX scoped → try_with returns Err → deny.
+        let result = tool
+            .execute(&json!({}))
+            .await
+            .expect("returns Ok with deny");
+        assert!(!result.success);
+        assert!(result.output.contains("denied"));
+        assert!(!result.output.contains("should_not_run"));
+    }
+
+    #[test]
+    fn concurrency_class_trims_whitespace_and_returns_exclusive() {
+        // Codex review #1 regression test: `"exclusive "` (trailing
+        // whitespace) previously silently downgraded to Safe. After the
+        // trim added at the parse site, it must classify as Exclusive.
+        let mut def = make_tool_def("excl_tool", "exclusive");
+        def.concurrency_class = Some("exclusive ".to_string());
+        let tool = PluginTool::new("p".into(), def, PathBuf::from("/bin/echo"));
+        let class = tool.concurrency_class();
+        assert!(matches!(class, crate::tools::ConcurrencyClass::Exclusive));
+    }
+
+    #[test]
+    fn concurrency_class_unknown_falls_back_to_safe() {
+        let mut def = make_tool_def("excl_tool", "exclusive");
+        def.concurrency_class = Some("highly-exclusive".to_string());
+        let tool = PluginTool::new("p".into(), def, PathBuf::from("/bin/echo"));
+        let class = tool.concurrency_class();
+        assert!(matches!(class, crate::tools::ConcurrencyClass::Safe));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn unknown_risk_literal_does_not_force_approval() {
+        // medium / weird literals fall through to "no enforced gate"
+        // (semantics ambiguous; documented as Tier-2/3 follow-up).
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"output\":\"ran\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("medium_tool", "medium");
+        def.risk = Some("medium".into());
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let (requester, last) = RecordingRequester::new(ToolApprovalDecision::Deny);
+        let requester_arc: Arc<dyn ToolApprovalRequester> = requester;
+
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester_arc, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "ran");
+        assert!(last.lock().unwrap().is_none());
     }
 }
