@@ -35,6 +35,9 @@ case "$PROVIDER" in
     API_KEY_ENV="${OCTOS_TUI_UX_API_KEY_ENV:-$(printf '%s_API_KEY' "$PROVIDER" | tr '[:lower:]' '[:upper:]')}"
     ;;
 esac
+SERVER_PROVIDER="${OCTOS_TUI_UX_SERVER_PROVIDER:-$PROVIDER}"
+SERVER_BASE_URL="${OCTOS_TUI_UX_SERVER_BASE_URL:-}"
+SERVER_API_TYPE="${OCTOS_TUI_UX_SERVER_API_TYPE:-openai}"
 PORT="${OCTOS_TUI_UX_PORT:-$((51000 + $$ % 10000))}"
 AUTH_TOKEN="${OCTOS_TUI_UX_AUTH_TOKEN:-octos-tui-ux-token-$RUN_ID}"
 SESSION_ID="${OCTOS_TUI_UX_SESSION_ID:-coding:local:prototype#tui-compare}"
@@ -44,6 +47,7 @@ if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_WAIT_TURN+x}" ]; then
 else
   MAX_WAIT_TURN="${OCTOS_TUI_UX_WAIT_TURN:-900}"
 fi
+MAX_WAIT_APPROVAL="${OCTOS_TUI_UX_WAIT_APPROVAL:-90}"
 if [ "$LONG_MODE" = "1" ] && [ -z "${OCTOS_TUI_UX_TUI_CODING_ROUNDS+x}" ]; then
   MAX_TUI_CODING_ROUNDS=8
 else
@@ -57,7 +61,7 @@ TUI_DENY_KEY="${OCTOS_TUI_UX_TUI_DENY_KEY:-n}"
 FRAME_SAMPLE_ENABLED="${OCTOS_TUI_UX_FRAME_SAMPLE:-$LONG_MODE}"
 FRAME_SAMPLE_INTERVAL="${OCTOS_TUI_UX_FRAME_SAMPLE_INTERVAL:-3}"
 SERVER_ERROR_BUDGET="${OCTOS_TUI_UX_SERVER_ERROR_BUDGET:-0}"
-QUESTION_REGEX="${OCTOS_TUI_UX_QUESTION_REGEX:-\\?}"
+QUESTION_REGEX="${OCTOS_TUI_UX_QUESTION_REGEX:-\\?|？}"
 COMPLETION_REGEX="${OCTOS_TUI_UX_COMPLETION_REGEX:-test result: ok|Finished .*test.* profile|All tests passed|all tests passed}"
 SERVER_SANDBOX_POLICY="${OCTOS_TUI_UX_SERVER_SANDBOX_POLICY:-auto}"
 RESOLVED_SERVER_SANDBOX_MODE=""
@@ -473,18 +477,30 @@ tui_style_escape_seen() {
 tui_capture_has_ready_state() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle)|>_ Octos TUI[[:space:]]+idle|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Ask Octos to change code'
+    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle|error)|>_ Octos TUI[[:space:]]+idle|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Turn error|Ask Octos to change code'
 }
 
 tui_capture_has_active_state() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Progress:)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
+    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
 }
 
 tui_capture_has_blocking_approval() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- 'Approval Requested|state[[:space:]]+[^[:space:]]+[[:space:]]+blocked'
+}
+
+tui_capture_has_error_state() {
+  local capture="$1"
+  printf '%s\n' "$capture" | grep -E -q -- 'state[[:space:]]+[^[:space:]]+[[:space:]]+error|Turn error|runtime_error'
+}
+
+tui_session_has_error_state() {
+  local session="$1"
+  local capture
+  capture="$(capture_visible_clean "$session" || true)"
+  tui_capture_has_error_state "$capture"
 }
 
 tui_capture_has_composer() {
@@ -683,12 +699,38 @@ wait_for_tui_approval_prompt() {
   while [ "$SECONDS" -le "$deadline" ]; do
     capture="$(capture_visible_clean "$session" || true)"
     without_prompt="$(printf '%s\n' "$capture" | sed '/^│user/,/^│assistant/d')"
-    if printf '%s\n' "$without_prompt" | grep -E -q -- 'Approval Requested|kind command|command sudo true|command[[:space:]]+sudo'; then
+    if printf '%s\n' "$without_prompt" | grep -E -q -- 'Approval Requested|approve this command once|approve session|deny it|y[[:space:]]*=[[:space:]]*approve|s[[:space:]]*=[[:space:]]*approve|n[[:space:]]*=[[:space:]]*deny'; then
       return 0
     fi
     sleep 0.5
   done
   return 1
+}
+
+wait_for_tui_approval_outcome() {
+  local session="$1"
+  local timeout="$2"
+  local deadline=$((SECONDS + timeout))
+  local capture
+  local without_prompt
+
+  while [ "$SECONDS" -le "$deadline" ]; do
+    capture="$(capture_visible_clean "$session" || true)"
+    without_prompt="$(printf '%s\n' "$capture" | sed '/^│user/,/^│assistant/d')"
+    if printf '%s\n' "$without_prompt" | grep -E -q -- 'Approval Requested|approve this command once|approve session|deny it|y[[:space:]]*=[[:space:]]*approve|s[[:space:]]*=[[:space:]]*approve|n[[:space:]]*=[[:space:]]*deny'; then
+      return 0
+    fi
+    if printf '%s\n' "$without_prompt" | grep -E -q -- 'blocked.*interactive approval|pending interactive approval|requires interactive approval|approve .* from your end|approval on your end|safety filter'; then
+      return 2
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+record_tui_missing_approval_prompt() {
+  local session="$1"
+  append_capture_clean_to_file "$session" "$transcript" "octos-tui approval prompt missing"
 }
 
 candidate_has_diff() {
@@ -827,6 +869,17 @@ send_line() {
   tmux_key "$session" Enter
 }
 
+tmux_paste_line() {
+  local session="$1"
+  local text="$2"
+  local buffer
+  buffer="octos-tmux-paste-${session//[^a-zA-Z0-9_.-]/-}"
+  tmux set-buffer -b "$buffer" "$text"
+  tmux paste-buffer -d -t "$session" -b "$buffer"
+  sleep "${OCTOS_TUI_UX_PASTE_ENTER_GRACE_SECS:-0.2}"
+  tmux_key "$session" Enter
+}
+
 send_tui_prompt() {
   local session="$1"
   local text="$2"
@@ -856,8 +909,7 @@ send_codex_prompt() {
   local text="$2"
   tmux_key "$session" C-u
   sleep "${OCTOS_TUI_UX_CODEX_CLEAR_GRACE_SECS:-0.2}"
-  tmux_send "$session" "$text"
-  tmux_key "$session" Enter
+  tmux_paste_line "$session" "$text"
   sleep "${OCTOS_TUI_UX_CODEX_SUBMIT_GRACE_SECS:-1}"
 }
 
@@ -974,6 +1026,8 @@ drive_tui() {
   local server_runner
   local transcript
   local server_log
+  local server_config
+  local server_config_arg=""
   local raw_transcript
   local tui_command
   local frame_sampler_pid=""
@@ -998,14 +1052,28 @@ drive_tui() {
   endpoint="ws://127.0.0.1:$PORT/api/ui-protocol/ws"
   server_fifo="$OUT_DIR/octos-tui-server-key.fifo"
   server_runner="$OUT_DIR/run-octos-tui-server.sh"
+  server_config="$OUT_DIR/octos-server-config.json"
   transcript="$OUT_DIR/octos-tui-transcript.log"
   raw_transcript="$OUT_DIR/octos-tui-raw-transcript.log"
   server_log="$OUT_DIR/octos-tui-server.log"
   : >"$transcript"
   : >"$raw_transcript"
 
+  if [ -n "$SERVER_BASE_URL" ]; then
+    cat >"$server_config" <<EOF
+{
+  "provider": "$SERVER_PROVIDER",
+  "model": "$MODEL",
+  "base_url": "$SERVER_BASE_URL",
+  "api_key_env": "$API_KEY_ENV",
+  "api_type": "$SERVER_API_TYPE"
+}
+EOF
+    server_config_arg=" --config '$server_config'"
+  fi
+
   write_secret_runner "$server_runner" "$server_fifo" \
-    "cd '$ROOT_DIR' && RUST_LOG=off exec '$octos_bin' serve --host 127.0.0.1 --port '$PORT' --cwd '$dir' --data-dir '$OUT_DIR/octos-data' --provider '$PROVIDER' --model '$MODEL' --auth-token '$AUTH_TOKEN' >'$server_log' 2>&1"
+    "cd '$ROOT_DIR' && RUST_LOG=off exec '$octos_bin' serve --host 127.0.0.1 --port '$PORT' --cwd '$dir' --data-dir '$OUT_DIR/octos-data'$server_config_arg --provider '$SERVER_PROVIDER' --model '$MODEL' --auth-token '$AUTH_TOKEN' >'$server_log' 2>&1"
   start_secret_session "$server_session" "$server_runner" "$server_fifo" "$API_KEY_ENV"
 
   local deadline=$((SECONDS + MAX_WAIT_SHORT))
@@ -1065,12 +1133,19 @@ drive_tui() {
   if ! send_tui_prompt "$tui_session" "$PROMPT_APPROVAL" "approval probe turn"; then
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval submit failure"
   fi
-  if wait_for_tui_approval_prompt "$tui_session" "$MAX_WAIT_TURN"; then
+  local approval_outcome=1
+  set +e
+  wait_for_tui_approval_outcome "$tui_session" "$MAX_WAIT_APPROVAL"
+  approval_outcome=$?
+  set -e
+  if [ "$approval_outcome" -eq 0 ]; then
     approval_seen=1
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui approval prompt"
     tmux_key "$tui_session" "$TUI_DENY_KEY"
+  elif [ "$approval_outcome" -eq 2 ]; then
+    record_tui_missing_approval_prompt "$tui_session"
   fi
-  if wait_for_tui_denial_ack "$tui_session" 180; then
+  if [ "$approval_outcome" -eq 0 ] && wait_for_tui_denial_ack "$tui_session" 180; then
     denial_seen=1
   fi
   wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
@@ -1085,6 +1160,9 @@ drive_tui() {
   local round=1
   while [ "$round" -le "$MAX_TUI_CODING_ROUNDS" ]; do
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui round $round"
+    if tui_session_has_error_state "$tui_session"; then
+      break
+    fi
     if candidate_has_diff "$dir" && candidate_tests_pass_live octos_tui "$dir" "round-$round"; then
       completion_seen=1
       break
@@ -1099,6 +1177,9 @@ drive_tui() {
     fi
     wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui continue round $round"
+    if tui_session_has_error_state "$tui_session"; then
+      break
+    fi
     round=$((round + 1))
   done
 
@@ -1737,11 +1818,15 @@ main() {
     printf 'fixture_dir=%s\n' "$FIXTURE_DIR"
     printf 'provider=%s\n' "$PROVIDER"
     printf 'api_key_env=%s\n' "$API_KEY_ENV"
+    printf 'server_provider=%s\n' "$SERVER_PROVIDER"
+    printf 'server_base_url=%s\n' "${SERVER_BASE_URL:-}"
+    printf 'server_api_type=%s\n' "$SERVER_API_TYPE"
     printf 'long_mode=%s\n' "$LONG_MODE"
     printf 'frame_sample_enabled=%s\n' "$FRAME_SAMPLE_ENABLED"
     printf 'server_sandbox_mode=%s\n' "$RESOLVED_SERVER_SANDBOX_MODE"
     printf 'server_sandbox_policy=%s\n' "$SERVER_SANDBOX_POLICY"
     printf 'max_wait_turn=%s\n' "$MAX_WAIT_TURN"
+    printf 'max_wait_approval=%s\n' "$MAX_WAIT_APPROVAL"
     printf 'max_tui_coding_rounds=%s\n' "$MAX_TUI_CODING_ROUNDS"
     printf 'model=%s\n' "$MODEL"
     printf 'port=%s\n' "$PORT"
