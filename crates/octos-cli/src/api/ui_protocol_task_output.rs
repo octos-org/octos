@@ -162,6 +162,11 @@ fn project_task_output(
         truncated: window.end_offset < text.len(),
         complete: window.end_offset >= text.len(),
         live_tail_supported: false,
+        // Audit issue #707 / accepted UPCR-2026-006: today's runtime serves
+        // every `task/output/read` from a snapshot of the task ledger, not a
+        // live disk-routed stdout/stderr stream. When the disk-routed source
+        // ships, that constructor will set this to `false`.
+        is_snapshot_projection: true,
         task_status,
         runtime_state,
         lifecycle_state,
@@ -511,6 +516,10 @@ mod tests {
 
         assert_eq!(value["source"], json!("runtime_projection"));
         assert_eq!(value["live_tail_supported"], json!(false));
+        // Audit issue #707 / accepted UPCR-2026-006: the wire result must
+        // expose snapshot-projection truth as a boolean clients can switch on
+        // without parsing the human-facing `limitations[]` strings.
+        assert_eq!(value["is_snapshot_projection"], json!(true));
         assert_eq!(value["complete"], json!(true));
         assert!(value["total_bytes"].as_u64().unwrap() >= value["bytes_read"].as_u64().unwrap());
         assert_eq!(
