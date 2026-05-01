@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::ui_protocol::{
     self, ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams, SessionOpenParams,
-    TaskOutputReadParams, TaskRuntimeState, TurnId, TurnInterruptParams, TurnStartParams,
-    UiCommand, UiNotification, UiProgressEvent, methods,
+    TaskCancelParams, TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams,
+    TaskRuntimeState, TurnId, TurnInterruptParams, TurnStartParams, UiCommand, UiNotification,
+    UiProgressEvent, methods,
 };
 use crate::{Message, SessionKey, TaskId};
 
@@ -23,6 +24,9 @@ pub type AppUiInterruptTurn = TurnInterruptParams;
 pub type AppUiRespondApproval = ApprovalRespondParams;
 pub type AppUiListApprovalScopes = ApprovalScopesListParams;
 pub type AppUiGetDiffPreview = DiffPreviewGetParams;
+pub type AppUiListTasks = TaskListParams;
+pub type AppUiCancelTask = TaskCancelParams;
+pub type AppUiRestartTaskFromNode = TaskRestartFromNodeParams;
 pub type AppUiReadTaskOutput = TaskOutputReadParams;
 pub type AppUiBackendEvent = UiNotification;
 pub type AppUiProgress = UiProgressEvent;
@@ -105,6 +109,9 @@ pub enum AppUiCommand {
     RespondApproval(AppUiRespondApproval),
     ListApprovalScopes(AppUiListApprovalScopes),
     GetDiffPreview(AppUiGetDiffPreview),
+    ListTasks(AppUiListTasks),
+    CancelTask(AppUiCancelTask),
+    RestartTaskFromNode(AppUiRestartTaskFromNode),
     ReadTaskOutput(AppUiReadTaskOutput),
 }
 
@@ -117,6 +124,9 @@ impl AppUiCommand {
             Self::RespondApproval(_) => methods::APPROVAL_RESPOND,
             Self::ListApprovalScopes(_) => methods::APPROVAL_SCOPES_LIST,
             Self::GetDiffPreview(_) => methods::DIFF_PREVIEW_GET,
+            Self::ListTasks(_) => methods::TASK_LIST,
+            Self::CancelTask(_) => methods::TASK_CANCEL,
+            Self::RestartTaskFromNode(_) => methods::TASK_RESTART_FROM_NODE,
             Self::ReadTaskOutput(_) => methods::TASK_OUTPUT_READ,
         }
     }
@@ -133,6 +143,9 @@ impl AppUiCommand {
             Self::RespondApproval(params) => UiCommand::ApprovalRespond(params),
             Self::ListApprovalScopes(params) => UiCommand::ApprovalScopesList(params),
             Self::GetDiffPreview(params) => UiCommand::DiffPreviewGet(params),
+            Self::ListTasks(params) => UiCommand::TaskList(params),
+            Self::CancelTask(params) => UiCommand::TaskCancel(params),
+            Self::RestartTaskFromNode(params) => UiCommand::TaskRestartFromNode(params),
             Self::ReadTaskOutput(params) => UiCommand::TaskOutputRead(params),
         }
     }
@@ -274,6 +287,51 @@ mod tests {
         assert_eq!(
             UiCommand::from(command).method(),
             methods::APPROVAL_SCOPES_LIST
+        );
+    }
+
+    #[test]
+    fn app_command_surface_covers_harness_task_control() {
+        let session_id = SessionKey("local:test".into());
+        let task_id = TaskId::new();
+
+        let list = AppUiCommand::ListTasks(AppUiListTasks {
+            session_id: session_id.clone(),
+            topic: Some("default".into()),
+        });
+        assert_eq!(list.method(), methods::TASK_LIST);
+        assert_eq!(
+            list.first_server_result_kind(),
+            Some(AppUiCommandResultKind::TaskList)
+        );
+        assert_eq!(UiCommand::from(list).method(), methods::TASK_LIST);
+
+        let cancel = AppUiCommand::CancelTask(AppUiCancelTask {
+            task_id: task_id.clone(),
+            session_id: Some(session_id.clone()),
+            profile_id: Some("coding".into()),
+        });
+        assert_eq!(cancel.method(), methods::TASK_CANCEL);
+        assert_eq!(
+            cancel.first_server_result_kind(),
+            Some(AppUiCommandResultKind::TaskCancel)
+        );
+        assert_eq!(UiCommand::from(cancel).method(), methods::TASK_CANCEL);
+
+        let restart = AppUiCommand::RestartTaskFromNode(AppUiRestartTaskFromNode {
+            task_id,
+            node_id: Some("node-1".into()),
+            session_id: Some(session_id),
+            profile_id: None,
+        });
+        assert_eq!(restart.method(), methods::TASK_RESTART_FROM_NODE);
+        assert_eq!(
+            restart.first_server_result_kind(),
+            Some(AppUiCommandResultKind::TaskRestartFromNode)
+        );
+        assert_eq!(
+            UiCommand::from(restart).method(),
+            methods::TASK_RESTART_FROM_NODE
         );
     }
 

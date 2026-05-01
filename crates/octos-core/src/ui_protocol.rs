@@ -3,7 +3,9 @@
 //! This module intentionally captures only the first protocol slice needed to
 //! align client and server work. A first WebSocket server slice now handles
 //! session open, turn start, turn interrupt, approval, diff preview, and
-//! task-output read requests.
+//! task-output read requests. The full protocol model also defines harness
+//! task-control requests so clients can target a stable AppUI contract while
+//! backend support lands behind capabilities.
 
 use crate::{SessionKey, TaskId};
 use chrono::{DateTime, Utc};
@@ -34,6 +36,9 @@ pub const UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1: &str = "pane.snapshots.v1";
 
 /// Feature flag for UPCR-2026-003 per-session workspace cwd requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
+
+/// Feature flag for harness task registry/control commands.
+pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1: &str = "harness.task_control.v1";
 
 pub mod approval_kinds {
     pub const COMMAND: &str = "command";
@@ -561,6 +566,9 @@ pub mod methods {
     pub const APPROVAL_RESPOND: &str = "approval/respond";
     pub const APPROVAL_SCOPES_LIST: &str = "approval/scopes/list";
     pub const DIFF_PREVIEW_GET: &str = "diff/preview/get";
+    pub const TASK_LIST: &str = "task/list";
+    pub const TASK_CANCEL: &str = "task/cancel";
+    pub const TASK_RESTART_FROM_NODE: &str = "task/restart_from_node";
     pub const TASK_OUTPUT_READ: &str = "task/output/read";
 
     pub const TURN_STARTED: &str = "turn/started";
@@ -600,6 +608,9 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
     methods::DIFF_PREVIEW_GET,
+    methods::TASK_LIST,
+    methods::TASK_CANCEL,
+    methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
 ];
 
@@ -625,7 +636,18 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
-pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = UI_PROTOCOL_COMMAND_METHODS;
+pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
+    methods::SESSION_OPEN,
+    methods::TURN_START,
+    methods::TURN_INTERRUPT,
+    methods::APPROVAL_RESPOND,
+    methods::APPROVAL_SCOPES_LIST,
+    methods::DIFF_PREVIEW_GET,
+    methods::TASK_LIST,
+    methods::TASK_CANCEL,
+    methods::TASK_RESTART_FROM_NODE,
+    methods::TASK_OUTPUT_READ,
+];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
 pub const UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS: &[&str] = &[];
@@ -688,6 +710,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
         ])
     }
 
@@ -700,6 +723,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
         ]);
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -809,6 +833,9 @@ pub enum UiResultKind {
     ApprovalRespond,
     ApprovalScopesList,
     DiffPreviewGet,
+    TaskList,
+    TaskCancel,
+    TaskRestartFromNode,
     TaskOutputRead,
     UnsupportedCapability,
 }
@@ -821,6 +848,9 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::APPROVAL_RESPOND => Some(UiResultKind::ApprovalRespond),
         methods::APPROVAL_SCOPES_LIST => Some(UiResultKind::ApprovalScopesList),
         methods::DIFF_PREVIEW_GET => Some(UiResultKind::DiffPreviewGet),
+        methods::TASK_LIST => Some(UiResultKind::TaskList),
+        methods::TASK_CANCEL => Some(UiResultKind::TaskCancel),
+        methods::TASK_RESTART_FROM_NODE => Some(UiResultKind::TaskRestartFromNode),
         methods::TASK_OUTPUT_READ => Some(UiResultKind::TaskOutputRead),
         _ => None,
     }
@@ -1021,6 +1051,95 @@ pub struct TaskOutputReadParams {
     pub limit_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCancelParams {
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRestartFromNodeParams {
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskListResult {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<TaskListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskListEntry {
+    pub id: TaskId,
+    pub tool_name: String,
+    pub tool_call_id: String,
+    pub state: TaskRuntimeState,
+    pub status: String,
+    pub lifecycle_state: String,
+    pub runtime_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_key: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_key: Option<SessionKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_terminal_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_join_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_joined_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_failure_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_detail: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<SessionKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCancelResult {
+    pub task_id: TaskId,
+    pub status: TaskRuntimeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRestartFromNodeResult {
+    pub original_task_id: TaskId,
+    pub new_task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_node: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffPreviewGetStatus {
@@ -1171,6 +1290,9 @@ pub enum UiCommand {
     ApprovalRespond(ApprovalRespondParams),
     ApprovalScopesList(ApprovalScopesListParams),
     DiffPreviewGet(DiffPreviewGetParams),
+    TaskList(TaskListParams),
+    TaskCancel(TaskCancelParams),
+    TaskRestartFromNode(TaskRestartFromNodeParams),
     TaskOutputRead(TaskOutputReadParams),
 }
 
@@ -1183,6 +1305,9 @@ impl UiCommand {
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
             Self::ApprovalScopesList(_) => methods::APPROVAL_SCOPES_LIST,
             Self::DiffPreviewGet(_) => methods::DIFF_PREVIEW_GET,
+            Self::TaskList(_) => methods::TASK_LIST,
+            Self::TaskCancel(_) => methods::TASK_CANCEL,
+            Self::TaskRestartFromNode(_) => methods::TASK_RESTART_FROM_NODE,
             Self::TaskOutputRead(_) => methods::TASK_OUTPUT_READ,
         }
     }
@@ -1199,6 +1324,9 @@ impl UiCommand {
             Self::ApprovalRespond(params) => serde_json::to_value(params),
             Self::ApprovalScopesList(params) => serde_json::to_value(params),
             Self::DiffPreviewGet(params) => serde_json::to_value(params),
+            Self::TaskList(params) => serde_json::to_value(params),
+            Self::TaskCancel(params) => serde_json::to_value(params),
+            Self::TaskRestartFromNode(params) => serde_json::to_value(params),
             Self::TaskOutputRead(params) => serde_json::to_value(params),
         }?;
 
@@ -1227,6 +1355,11 @@ impl UiCommand {
                 Ok(Self::ApprovalScopesList(decode_params(method, params)?))
             }
             methods::DIFF_PREVIEW_GET => Ok(Self::DiffPreviewGet(decode_params(method, params)?)),
+            methods::TASK_LIST => Ok(Self::TaskList(decode_params(method, params)?)),
+            methods::TASK_CANCEL => Ok(Self::TaskCancel(decode_params(method, params)?)),
+            methods::TASK_RESTART_FROM_NODE => {
+                Ok(Self::TaskRestartFromNode(decode_params(method, params)?))
+            }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_params(method, params)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
@@ -1395,6 +1528,9 @@ pub enum UiRpcResult {
     ApprovalRespond(ApprovalRespondResult),
     ApprovalScopesList(ApprovalScopesListResult),
     DiffPreviewGet(DiffPreviewGetResult),
+    TaskList(TaskListResult),
+    TaskCancel(TaskCancelResult),
+    TaskRestartFromNode(TaskRestartFromNodeResult),
     TaskOutputRead(TaskOutputReadResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
@@ -1408,6 +1544,9 @@ impl UiRpcResult {
             Self::ApprovalRespond(_) => UiResultKind::ApprovalRespond,
             Self::ApprovalScopesList(_) => UiResultKind::ApprovalScopesList,
             Self::DiffPreviewGet(_) => UiResultKind::DiffPreviewGet,
+            Self::TaskList(_) => UiResultKind::TaskList,
+            Self::TaskCancel(_) => UiResultKind::TaskCancel,
+            Self::TaskRestartFromNode(_) => UiResultKind::TaskRestartFromNode,
             Self::TaskOutputRead(_) => UiResultKind::TaskOutputRead,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
@@ -1421,6 +1560,9 @@ impl UiRpcResult {
             Self::ApprovalRespond(_) => Some(methods::APPROVAL_RESPOND),
             Self::ApprovalScopesList(_) => Some(methods::APPROVAL_SCOPES_LIST),
             Self::DiffPreviewGet(_) => Some(methods::DIFF_PREVIEW_GET),
+            Self::TaskList(_) => Some(methods::TASK_LIST),
+            Self::TaskCancel(_) => Some(methods::TASK_CANCEL),
+            Self::TaskRestartFromNode(_) => Some(methods::TASK_RESTART_FROM_NODE),
             Self::TaskOutputRead(_) => Some(methods::TASK_OUTPUT_READ),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
@@ -1434,6 +1576,9 @@ impl UiRpcResult {
             Self::ApprovalRespond(result) => serde_json::to_value(result),
             Self::ApprovalScopesList(result) => serde_json::to_value(result),
             Self::DiffPreviewGet(result) => serde_json::to_value(result),
+            Self::TaskList(result) => serde_json::to_value(result),
+            Self::TaskCancel(result) => serde_json::to_value(result),
+            Self::TaskRestartFromNode(result) => serde_json::to_value(result),
             Self::TaskOutputRead(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
@@ -1466,6 +1611,11 @@ impl UiRpcResult {
                 Ok(Self::ApprovalScopesList(decode_result(method, result)?))
             }
             methods::DIFF_PREVIEW_GET => Ok(Self::DiffPreviewGet(decode_result(method, result)?)),
+            methods::TASK_LIST => Ok(Self::TaskList(decode_result(method, result)?)),
+            methods::TASK_CANCEL => Ok(Self::TaskCancel(decode_result(method, result)?)),
+            methods::TASK_RESTART_FROM_NODE => {
+                Ok(Self::TaskRestartFromNode(decode_result(method, result)?))
+            }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
@@ -2279,6 +2429,10 @@ mod tests {
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::TASK_LIST));
+        assert!(capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
         assert!(capabilities.unsupported.is_empty());
 
         let json = serde_json::to_string(&capabilities).expect("serialize capabilities");
@@ -2309,6 +2463,19 @@ mod tests {
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+    }
+
+    #[test]
+    fn full_protocol_capabilities_advertise_harness_task_control() {
+        let capabilities = UiProtocolCapabilities::full_protocol();
+
+        assert!(capabilities.supports_method(methods::TASK_LIST));
+        assert!(capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(capabilities.supports_method(methods::TASK_OUTPUT_READ));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.unsupported.is_empty());
     }
 
     #[test]
@@ -2422,6 +2589,10 @@ mod tests {
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             "session.workspace_cwd.v1"
         );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            "harness.task_control.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -2432,6 +2603,9 @@ mod tests {
                 "approval/respond",
                 "approval/scopes/list",
                 "diff/preview/get",
+                "task/list",
+                "task/cancel",
+                "task/restart_from_node",
                 "task/output/read",
             ]
         );
@@ -2459,9 +2633,20 @@ mod tests {
         );
         assert_eq!(
             UI_PROTOCOL_FIRST_SERVER_METHODS,
-            UI_PROTOCOL_COMMAND_METHODS
+            &[
+                "session/open",
+                "turn/start",
+                "turn/interrupt",
+                "approval/respond",
+                "approval/scopes/list",
+                "diff/preview/get",
+                "task/list",
+                "task/cancel",
+                "task/restart_from_node",
+                "task/output/read",
+            ]
         );
-        assert_eq!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS, &[] as &[&str]);
+        assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
     }
 
     #[test]
@@ -2488,6 +2673,9 @@ mod tests {
                     "approval/respond",
                     "approval/scopes/list",
                     "diff/preview/get",
+                    "task/list",
+                    "task/cancel",
+                    "task/restart_from_node",
                     "task/output/read"
                 ],
                 "supported_notifications": [
@@ -2512,7 +2700,8 @@ mod tests {
                 "supported_features": [
                     "approval.typed.v1",
                     "pane.snapshots.v1",
-                    "session.workspace_cwd.v1"
+                    "session.workspace_cwd.v1",
+                    "harness.task_control.v1"
                 ]
             })
         );
@@ -3011,6 +3200,62 @@ mod tests {
     }
 
     #[test]
+    fn task_control_commands_build_and_parse_json_rpc_requests() {
+        let session_id = SessionKey("local:demo".into());
+        let task_id = TaskId(Uuid::from_u128(42));
+
+        let list = UiCommand::TaskList(TaskListParams {
+            session_id: session_id.clone(),
+            topic: Some("default".into()),
+        });
+        assert_eq!(list.method(), methods::TASK_LIST);
+        let list_wire = list
+            .clone()
+            .into_rpc_request("task-list")
+            .expect("serialize task/list");
+        assert_eq!(list_wire.method, methods::TASK_LIST);
+        assert_eq!(list_wire.params["session_id"], json!("local:demo"));
+        assert_eq!(
+            UiCommand::from_rpc_request(list_wire).expect("decode task/list"),
+            list
+        );
+
+        let cancel = UiCommand::TaskCancel(TaskCancelParams {
+            task_id: task_id.clone(),
+            session_id: Some(session_id.clone()),
+            profile_id: Some("coding".into()),
+        });
+        assert_eq!(cancel.method(), methods::TASK_CANCEL);
+        let cancel_wire = cancel
+            .clone()
+            .into_rpc_request("task-cancel")
+            .expect("serialize task/cancel");
+        assert_eq!(cancel_wire.params["task_id"], json!(task_id));
+        assert_eq!(cancel_wire.params["profile_id"], json!("coding"));
+        assert_eq!(
+            UiCommand::from_rpc_request(cancel_wire).expect("decode task/cancel"),
+            cancel
+        );
+
+        let restart = UiCommand::TaskRestartFromNode(TaskRestartFromNodeParams {
+            task_id: TaskId(Uuid::from_u128(43)),
+            node_id: Some("node-7".into()),
+            session_id: Some(session_id),
+            profile_id: None,
+        });
+        assert_eq!(restart.method(), methods::TASK_RESTART_FROM_NODE);
+        let restart_wire = restart
+            .clone()
+            .into_rpc_request("task-restart")
+            .expect("serialize task/restart_from_node");
+        assert_eq!(restart_wire.params["node_id"], json!("node-7"));
+        assert_eq!(
+            UiCommand::from_rpc_request(restart_wire).expect("decode task/restart_from_node"),
+            restart
+        );
+    }
+
+    #[test]
     fn typed_rpc_results_map_from_methods_and_round_trip() {
         let opened = SessionOpened {
             session_id: SessionKey("local:demo".into()),
@@ -3105,6 +3350,18 @@ mod tests {
             first_server_result_kind_for_method(methods::DIFF_PREVIEW_GET),
             Some(UiResultKind::DiffPreviewGet)
         );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_LIST),
+            Some(UiResultKind::TaskList)
+        );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_CANCEL),
+            Some(UiResultKind::TaskCancel)
+        );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_RESTART_FROM_NODE),
+            Some(UiResultKind::TaskRestartFromNode)
+        );
 
         let preview_id = PreviewId::new();
         let diff_result = UiRpcResult::DiffPreviewGet(DiffPreviewGetResult {
@@ -3140,6 +3397,93 @@ mod tests {
             UiRpcResult::from_method_and_result(methods::DIFF_PREVIEW_GET, value)
                 .expect("decode diff/preview/get result"),
             diff_result
+        );
+
+        let started_at = DateTime::parse_from_rfc3339("2026-04-30T12:00:00Z")
+            .expect("parse started_at")
+            .with_timezone(&Utc);
+        let updated_at = DateTime::parse_from_rfc3339("2026-04-30T12:01:00Z")
+            .expect("parse updated_at")
+            .with_timezone(&Utc);
+        let list_task_id = TaskId(Uuid::from_u128(44));
+        let task_list = UiRpcResult::TaskList(TaskListResult {
+            session_id: SessionKey("local:demo".into()),
+            topic: Some("default".into()),
+            tasks: vec![TaskListEntry {
+                id: list_task_id.clone(),
+                tool_name: "spawn_only_runner".into(),
+                tool_call_id: "call-1".into(),
+                state: TaskRuntimeState::Running,
+                status: "running".into(),
+                lifecycle_state: "running".into(),
+                runtime_state: "executing_tool".into(),
+                parent_session_key: Some(SessionKey("local:demo".into())),
+                child_session_key: Some(SessionKey("local:demo#child-1".into())),
+                child_terminal_state: None,
+                child_join_state: None,
+                child_joined_at: None,
+                child_failure_action: None,
+                runtime_detail: Some(json!({ "current_phase": "coding" })),
+                workflow_kind: Some("coding".into()),
+                current_phase: Some("coding".into()),
+                started_at,
+                updated_at,
+                completed_at: None,
+                output_files: vec!["octos-file://task-output".into()],
+                error: None,
+                session_key: Some(SessionKey("local:demo".into())),
+            }],
+        });
+        assert_eq!(task_list.kind(), UiResultKind::TaskList);
+        assert_eq!(task_list.method(), Some(methods::TASK_LIST));
+        let value = task_list
+            .clone()
+            .into_result_value()
+            .expect("serialize task/list result");
+        assert_eq!(value["tasks"][0]["id"], json!(list_task_id));
+        assert_eq!(value["tasks"][0]["state"], json!("running"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_LIST, value)
+                .expect("decode task/list result"),
+            task_list
+        );
+
+        let cancel_result = UiRpcResult::TaskCancel(TaskCancelResult {
+            task_id: TaskId(Uuid::from_u128(45)),
+            status: TaskRuntimeState::Cancelled,
+        });
+        assert_eq!(cancel_result.kind(), UiResultKind::TaskCancel);
+        assert_eq!(cancel_result.method(), Some(methods::TASK_CANCEL));
+        let value = cancel_result
+            .clone()
+            .into_result_value()
+            .expect("serialize task/cancel result");
+        assert_eq!(value["status"], json!("cancelled"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_CANCEL, value)
+                .expect("decode task/cancel result"),
+            cancel_result
+        );
+
+        let restart_result = UiRpcResult::TaskRestartFromNode(TaskRestartFromNodeResult {
+            original_task_id: TaskId(Uuid::from_u128(46)),
+            new_task_id: TaskId(Uuid::from_u128(47)),
+            from_node: Some("node-7".into()),
+        });
+        assert_eq!(restart_result.kind(), UiResultKind::TaskRestartFromNode);
+        assert_eq!(
+            restart_result.method(),
+            Some(methods::TASK_RESTART_FROM_NODE)
+        );
+        let value = restart_result
+            .clone()
+            .into_result_value()
+            .expect("serialize task/restart_from_node result");
+        assert_eq!(value["from_node"], json!("node-7"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_RESTART_FROM_NODE, value)
+                .expect("decode task/restart_from_node result"),
+            restart_result
         );
 
         let task_result = UiRpcResult::TaskOutputRead(TaskOutputReadResult {
