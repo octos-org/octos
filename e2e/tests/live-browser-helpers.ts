@@ -1,4 +1,5 @@
 import { expect, type Page } from '@playwright/test';
+import type { CaptureHandle } from '../lib/capture-replay';
 
 const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
 const PROFILE_ID = process.env.OCTOS_PROFILE || 'dspfac';
@@ -462,11 +463,28 @@ export function isSpawnAckOnly(raw: string): boolean {
 export async function sendAndWait(
   page: Page,
   message: string,
-  opts: { maxWait?: number; label?: string; throwOnTimeout?: boolean } = {},
+  opts: {
+    maxWait?: number;
+    label?: string;
+    throwOnTimeout?: boolean;
+    /**
+     * Optional capture handle (from `attachCapture`). When provided, the
+     * helper marks the user-sent event in the capture timeline so the
+     * resulting fixture correlates the prompt with the SSE frames that
+     * follow. No-op if the capture is disabled (`opts.capture.enabled ===
+     * false`). Backward compatible: existing callers pass no `capture`
+     * and observe the previous behaviour.
+     */
+    capture?: CaptureHandle;
+  } = {},
 ) {
-  const { maxWait = 120_000, label = '', throwOnTimeout = true } = opts;
+  const { maxWait = 120_000, label = '', throwOnTimeout = true, capture } = opts;
   const input = getInput(page);
   const sendBtn = getSendButton(page);
+
+  if (capture?.enabled) {
+    await capture.recordUserSent(message);
+  }
 
   await input.fill(message);
   await sendBtn.click();
