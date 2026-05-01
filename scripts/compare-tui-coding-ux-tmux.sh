@@ -474,7 +474,7 @@ tui_style_escape_seen() {
 tui_capture_has_ready_state() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle)|>_ Octos TUI[[:space:]]+idle|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Ask Octos to change code'
+    'state[[:space:]]+[^[:space:]]+[[:space:]]+(done|idle|error)|>_ Octos TUI[[:space:]]+idle|status[[:space:]]+Turn completed|system[[:space:]]+Turn completed|Turn error|Ask Octos to change code'
 }
 
 tui_capture_has_active_state() {
@@ -486,6 +486,18 @@ tui_capture_has_active_state() {
 tui_capture_has_blocking_approval() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- 'Approval Requested|state[[:space:]]+[^[:space:]]+[[:space:]]+blocked'
+}
+
+tui_capture_has_error_state() {
+  local capture="$1"
+  printf '%s\n' "$capture" | grep -E -q -- 'state[[:space:]]+[^[:space:]]+[[:space:]]+error|Turn error|runtime_error'
+}
+
+tui_session_has_error_state() {
+  local session="$1"
+  local capture
+  capture="$(capture_visible_clean "$session" || true)"
+  tui_capture_has_error_state "$capture"
 }
 
 tui_capture_has_composer() {
@@ -1128,6 +1140,9 @@ drive_tui() {
   local round=1
   while [ "$round" -le "$MAX_TUI_CODING_ROUNDS" ]; do
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui round $round"
+    if tui_session_has_error_state "$tui_session"; then
+      break
+    fi
     if candidate_has_diff "$dir" && candidate_tests_pass_live octos_tui "$dir" "round-$round"; then
       completion_seen=1
       break
@@ -1142,6 +1157,9 @@ drive_tui() {
     fi
     wait_for_tui_turn_cycle "$tui_session" "$MAX_WAIT_TURN" || true
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui continue round $round"
+    if tui_session_has_error_state "$tui_session"; then
+      break
+    fi
     round=$((round + 1))
   done
 
