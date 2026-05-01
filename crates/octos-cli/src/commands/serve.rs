@@ -463,6 +463,9 @@ impl ServeCommand {
         // `stdio` pairs with `--swarm-backend-cmd <path>`; `http` pairs
         // with `--swarm-backend-url <url>`.
         let harness_sink_init = std::env::var("OCTOS_HARNESS_EVENT_SINK").ok();
+        // #713: pass `config.tool_policy` so the swarm dispatch policy
+        // mirrors the operator's native tool-policy denylist. Cloned
+        // here because `config` is borrowed for the rest of init.
         let swarm_state_init = Self::build_swarm_state_from_flags(
             self.swarm_backend.as_deref(),
             self.swarm_backend_cmd.as_deref(),
@@ -470,6 +473,7 @@ impl ServeCommand {
             &data_dir,
             broadcaster.clone(),
             harness_sink_init.clone(),
+            config.tool_policy.clone(),
         )
         .await
         .wrap_err("failed to build swarm state")?;
@@ -924,6 +928,20 @@ impl ServeCommand {
             }
         }
 
+        // #713 codex finding (Medium): apply `config.tool_policy` to the
+        // api-mode `ToolRegistry`, mirroring the chat path
+        // (`commands/chat.rs::297`). Without this, the swarm dispatch
+        // policy (which now inherits `config.tool_policy` per #713) is
+        // strictly stricter than the native server's tool registry,
+        // breaking the parity claim. Runs AFTER MCP + plugin tools are
+        // registered so a `deny: ["dangerous_tool"]` entry catches
+        // both built-in and skill-declared tools. `apply_policy` is a
+        // no-op when `config.tool_policy` is `None`/empty, preserving
+        // legacy behaviour for operators who never set the field.
+        if let Some(ref policy) = config.tool_policy {
+            tools.apply_policy(policy);
+        }
+
         let reporter: Arc<dyn octos_agent::ProgressReporter> =
             Arc::new(MetricsReporter::new(broadcaster));
 
@@ -1025,6 +1043,25 @@ impl ServeCommand {
     /// Takes the flag slices by `&str` instead of `&self` so the caller
     /// can invoke this helper after partially moving other fields out
     /// of `self` during the main init flow.
+    ///
+    /// `tool_policy` (`config.tool_policy`) is folded into the swarm's
+    /// production [`octos_swarm::DispatchPolicy`] via
+    /// [`octos_swarm::DispatchPolicy::from_agent_gates`]. The
+    /// resulting policy reproduces two of the workspace-level gates
+    /// the native side already applies:
+    ///
+    /// - **tool-name policy** — same `config.tool_policy` value the
+    ///   api agent's `ToolRegistry` is filtered with (see
+    ///   `try_create_agent`).
+    /// - **injection-env denylist** — the workspace-shared
+    ///   [`octos_agent::sandbox::BLOCKED_ENV_VARS`] set the agent's
+    ///   sandbox + MCP subprocess paths use to scrub child env.
+    ///
+    /// Approval bridge, sandbox-required, and per-skill manifest env
+    /// allowlists are intentionally not mirrored here — see
+    /// [`octos_swarm::DispatchPolicy::from_agent_gates`] rustdoc for
+    /// the boundary. Closes audit issue #713 (M7 req 7 production
+    /// wiring).
     async fn build_swarm_state_from_flags(
         swarm_backend: Option<&str>,
         swarm_backend_cmd: Option<&str>,
@@ -1032,6 +1069,7 @@ impl ServeCommand {
         data_dir: &std::path::Path,
         broadcaster: Arc<crate::api::SseBroadcaster>,
         harness_sink: Option<String>,
+        tool_policy: Option<octos_agent::ToolPolicy>,
     ) -> Result<Option<Arc<crate::api::SwarmState>>> {
         use octos_agent::cost_ledger::PersistentCostLedger;
         use octos_agent::tools::mcp_agent::{
@@ -1083,20 +1121,40 @@ impl ServeCommand {
                 .await
                 .wrap_err("failed to open persistent cost ledger for swarm")?,
         );
-        // M7 req 7: production-grade swarm dispatch policy. We default
-        // to a no-op policy (matches the pre-fix behaviour) so CLI
-        // callers without an explicit policy are not surprised by
-        // approval prompts. Operators that want enforcement should
-        // wire `DispatchPolicy` here (a follow-up PR will add a
-        // `--swarm-dispatch-policy <path>` flag — out of scope for the
-        // M7 req 7 close).
+        // #713 / M7 req 7 production wiring: build a `DispatchPolicy`
+        // that inherits the workspace-level gates audit #701 flagged —
+        // operator tool-name policy + injection-env denylist — so
+        // MCP/CLI swarm backends fail closed on the same names native
+        // execution rejects, without requiring operators to wire a
+        // separate `--swarm-dispatch-policy` config.
+        //
+        // - `tool_policy`: cloned from `config.tool_policy` upstream so
+        //   a `deny: ["dangerous_tool"]` entry blocks both the native
+        //   registry execution (re-applied at the api agent registry,
+        //   see the `tools.apply_policy(...)` call earlier in
+        //   `try_create_agent`) AND swarm dispatch.
+        // - `block_injection_env_vars: true`: adds `LD_PRELOAD`,
+        //   `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, ... to the env
+        //   denylist so a contract carrying those keys fails closed
+        //   even if the underlying backend's own env handling were to
+        //   regress.
+        //
+        // Approval bridge, sandbox-required, manifest env allowlists,
+        // and per-skill gates are **not** wired here — they are
+        // either per-turn (approval), forward-compat (sandbox-required
+        // with no backend self-reports), or out of scope (per-skill
+        // manifests). Operators that want any of those can layer them
+        // on top via `Swarm::builder(...).with_dispatch_policy(...)`.
+        // See `DispatchPolicy::from_agent_gates` rustdoc for the full
+        // boundary.
+        let dispatch_policy = octos_swarm::DispatchPolicy::from_agent_gates(tool_policy, true);
         let state = crate::api::build_swarm_state(
             backend,
             swarm_dir,
             cost_ledger,
             broadcaster,
             harness_sink,
-            None,
+            Some(dispatch_policy),
         )
         .await
         .wrap_err("failed to build swarm state")?;
@@ -1370,6 +1428,7 @@ mod tests {
             dir.path(),
             broadcaster,
             None,
+            None,
         )
         .await
         .expect("helper must succeed when the flag is absent");
@@ -1395,6 +1454,7 @@ mod tests {
             dir.path(),
             broadcaster,
             None,
+            None,
         )
         .await
         .expect("helper must succeed when stdio backend is configured");
@@ -1417,6 +1477,7 @@ mod tests {
             None,
             dir.path(),
             broadcaster,
+            None,
             None,
         )
         .await;
@@ -1444,6 +1505,7 @@ mod tests {
             dir.path(),
             broadcaster,
             None,
+            None,
         )
         .await;
         let err = match result {
@@ -1470,6 +1532,7 @@ mod tests {
             dir.path(),
             broadcaster,
             None,
+            None,
         )
         .await;
         let err = match result {
@@ -1480,6 +1543,131 @@ mod tests {
         assert!(
             msg.contains("stdio") && msg.contains("http"),
             "error must list accepted backends, got: {msg}"
+        );
+    }
+
+    /// #713: when an operator-provided `tool_policy` denies a tool, the
+    /// constructed swarm state must inherit that policy so MCP/CLI
+    /// swarm dispatch refuses the same names native execution refuses.
+    /// This is the integration-side cover for
+    /// `gate::from_agent_gates_inherits_tool_policy_deny` — proves the
+    /// policy survives the journey through `build_swarm_state_from_flags`
+    /// into the live `Swarm`.
+    #[tokio::test]
+    async fn should_inherit_tool_policy_into_swarm_dispatch_policy() {
+        use octos_swarm::{ContractSpec, SwarmBudget, SwarmContext, SwarmTopology};
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let tool_policy = octos_agent::ToolPolicy {
+            deny: vec!["dangerous_tool".into()],
+            ..Default::default()
+        };
+        let state = ServeCommand::build_swarm_state_from_flags(
+            Some("stdio"),
+            Some("/bin/cat"),
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            Some(tool_policy),
+        )
+        .await
+        .expect("helper must succeed with tool_policy")
+        .expect("state must be Some when stdio backend is configured");
+
+        // Drive a dispatch that targets the denied tool. The wired
+        // policy must short-circuit at the gate before the (real,
+        // /bin/cat-backed) MCP backend is ever invoked. Outcome must
+        // surface `policy_denied`.
+        let outcome = state
+            .swarm
+            .dispatch(
+                "d-tool-policy-inherit".to_string(),
+                vec![ContractSpec {
+                    contract_id: "sub-1".into(),
+                    tool_name: "dangerous_tool".into(),
+                    task: serde_json::json!({}),
+                    label: None,
+                }],
+                SwarmTopology::Parallel {
+                    max_concurrency: NonZeroUsize::new(1).unwrap(),
+                },
+                SwarmBudget::default(),
+                SwarmContext {
+                    session_id: "api:swarm-test".into(),
+                    task_id: "task-1".into(),
+                    workflow: Some("swarm".into()),
+                    phase: Some("dispatch".into()),
+                },
+            )
+            .await
+            .expect("dispatch must complete (denied subtask still produces an outcome)");
+        assert_eq!(outcome.per_task_outcomes.len(), 1);
+        assert_eq!(
+            outcome.per_task_outcomes[0].last_dispatch_outcome, "policy_denied",
+            "tool_policy deny must propagate into swarm dispatch — \
+             outcome was: {:?}",
+            outcome.per_task_outcomes[0]
+        );
+    }
+
+    /// #713: even without an operator-provided tool_policy, the swarm
+    /// state must still gate against injection-class env vars
+    /// (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, ...). This proves the
+    /// `block_injection_env_vars: true` knob inside
+    /// `build_swarm_state_from_flags` is not bypassed when the
+    /// operator's tool_policy is `None`.
+    #[tokio::test]
+    async fn should_block_injection_env_in_swarm_dispatch_by_default() {
+        use octos_swarm::{ContractSpec, SwarmBudget, SwarmContext, SwarmTopology};
+        use std::num::NonZeroUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let state = ServeCommand::build_swarm_state_from_flags(
+            Some("stdio"),
+            Some("/bin/cat"),
+            None,
+            dir.path(),
+            broadcaster,
+            None,
+            None,
+        )
+        .await
+        .expect("helper must succeed without tool_policy")
+        .expect("state must be Some when stdio backend is configured");
+
+        let outcome = state
+            .swarm
+            .dispatch(
+                "d-env-denylist-inherit".to_string(),
+                vec![ContractSpec {
+                    contract_id: "sub-1".into(),
+                    tool_name: "any_tool".into(),
+                    task: serde_json::json!({"env": {"LD_PRELOAD": "/tmp/evil.so"}}),
+                    label: None,
+                }],
+                SwarmTopology::Parallel {
+                    max_concurrency: NonZeroUsize::new(1).unwrap(),
+                },
+                SwarmBudget::default(),
+                SwarmContext {
+                    session_id: "api:swarm-test".into(),
+                    task_id: "task-1".into(),
+                    workflow: Some("swarm".into()),
+                    phase: Some("dispatch".into()),
+                },
+            )
+            .await
+            .expect("dispatch must complete (denied subtask still produces an outcome)");
+        assert_eq!(outcome.per_task_outcomes.len(), 1);
+        assert_eq!(
+            outcome.per_task_outcomes[0].last_dispatch_outcome, "env_forbidden",
+            "BLOCKED_ENV_VARS must propagate into swarm dispatch — \
+             outcome was: {:?}",
+            outcome.per_task_outcomes[0]
         );
     }
 }

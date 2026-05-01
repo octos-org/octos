@@ -174,14 +174,19 @@ pub struct Swarm {
     /// keeps the legacy pre-fix behaviour so integration tests and
     /// existing callers are unchanged.
     cost_budget: Option<SwarmCostBudget>,
-    /// M7 req 7: pre-dispatch policy gate. Closes the parity gap so
-    /// MCP/CLI/native backends honour the same approval, tool policy,
-    /// sandbox, and env-allowlist enforcement the native
+    /// M7 req 7: pre-dispatch policy gate. Surfaces the same gate
+    /// *shape* the native
     /// [`octos_agent::tools::ToolRegistry::execute_with_context`] path
-    /// applies. Stored as an `Arc` so it can be cheaply cloned into the
-    /// per-subtask `JoinSet` without forcing the policy itself to be
-    /// `Clone`-cheap. A default policy (`is_noop()`) short-circuits the
-    /// gate so existing callers see no behavioural change.
+    /// applies (tool policy, approval, sandbox-required, env), so
+    /// MCP/CLI/native backends can be brought to parity. The set of
+    /// gates *actually active* is whatever the caller wired into the
+    /// [`DispatchPolicy`] — see
+    /// [`DispatchPolicy::from_agent_gates`] for the production close
+    /// (`octos serve`'s default) and what is intentionally not
+    /// mirrored. Stored as an `Arc` so it can be cheaply cloned into
+    /// the per-subtask `JoinSet` without forcing the policy itself to
+    /// be `Clone`-cheap. A default policy (`is_noop()`) short-circuits
+    /// the gate so existing callers see no behavioural change.
     dispatch_policy: Arc<DispatchPolicy>,
 }
 
@@ -685,11 +690,17 @@ impl SwarmBuilder {
     }
 
     /// M7 req 7: wire a [`DispatchPolicy`] gate that runs before every
-    /// `McpAgentBackend::dispatch` call. Mirrors the gate sequence the
-    /// native [`octos_agent::tools::ToolRegistry::execute_with_context`]
-    /// path applies (tool policy, approval, sandbox, env allowlist) so
-    /// MCP/CLI/native backends are gated uniformly. Without this call
-    /// the swarm runs with the default no-op policy, preserving
+    /// `McpAgentBackend::dispatch` call. The policy exposes the same
+    /// gate shape the native
+    /// [`octos_agent::tools::ToolRegistry::execute_with_context`] path
+    /// applies (tool policy, approval, sandbox-required, env). Whether
+    /// each gate is active depends on what the caller put into the
+    /// passed [`DispatchPolicy`] — see
+    /// [`DispatchPolicy::from_agent_gates`] for the production close
+    /// `octos serve` uses and the boundary (tool policy + injection-env
+    /// denylist are mirrored; approval bridge / sandbox-required /
+    /// per-skill manifest env are intentionally not). Without this
+    /// call the swarm runs with the default no-op policy, preserving
     /// pre-fix behaviour for existing callers.
     pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
         self.dispatch_policy = Arc::new(policy);
