@@ -4706,7 +4706,32 @@ impl SessionActor {
                         &conv_response.messages
                     };
                     for msg in messages_to_save {
-                        if let Err(e) = handle.add_message(msg.clone()).await {
+                        // Issue #740 fix: pre-stamp `thread_id` on Assistant /
+                        // Tool messages produced inside the agent loop. The
+                        // agent builds these with `thread_id: None` and on
+                        // persist `add_message_with_seq` derives thread_id
+                        // from the most-recent USER message in history. Under
+                        // rapid-fire fast-burst (live-overflow-stress.spec
+                        // `rapid-fire-five-fast`), Q2/Q3 user rows have already
+                        // been persisted to the same JSONL by the speculative-
+                        // overflow tasks before THIS primary turn finalises,
+                        // so derivation picks Qn's cmid instead of Q1's —
+                        // mis-binding Q1's reply under Q3's bubble on reload.
+                        // Pre-stamping the originating turn's cmid here pins
+                        // the persisted JSONL row to the correct thread, the
+                        // same fix shape PR #739 applied to the M8.9 spawn_only
+                        // recovery path.
+                        let mut to_save = msg.clone();
+                        if to_save.thread_id.is_none()
+                            && matches!(to_save.role, MessageRole::Assistant | MessageRole::Tool)
+                        {
+                            if let Some(ref tid) = client_message_id {
+                                if !tid.is_empty() {
+                                    to_save.thread_id = Some(tid.clone());
+                                }
+                            }
+                        }
+                        if let Err(e) = handle.add_message(to_save).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
@@ -4724,7 +4749,19 @@ impl SessionActor {
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             client_message_id: None,
-                            thread_id: None,
+                            // Issue #740 fix: pre-stamp `thread_id` from the
+                            // originating turn's cmid so the persisted JSONL
+                            // row is pinned to the correct thread. Without
+                            // this, `add_message_with_seq`'s "most recent
+                            // user in history" derivation picks the LATEST
+                            // user message — which under rapid-fire is a
+                            // sibling overflow user, not THIS turn — and
+                            // reload mis-pairs the assistant under the
+                            // wrong bubble (live-overflow-stress mini3
+                            // `rapid-fire-five-fast` evidence: 1+1=2 rendered
+                            // under the 3+3 bubble). Mirrors PR #739's M8.9
+                            // recovery-path fix for the foreground SSE path.
+                            thread_id: client_message_id.clone(),
                             timestamp: chrono::Utc::now(),
                         };
                         // M8.10-A: capture the committed seq so the SSE `done`
@@ -5338,7 +5375,19 @@ impl SessionActor {
                         tool_call_id: None,
                         reasoning_content: conv_response.reasoning_content.clone(),
                         client_message_id: None,
-                        thread_id: None,
+                        // Issue #740 fix: pre-stamp `thread_id` with the
+                        // overflow user's own cmid. Without this, when
+                        // multiple rapid-fire overflow tasks finalise in
+                        // an out-of-order sequence (e.g. Q2's reply lands
+                        // after Q5's user message has been persisted),
+                        // `add_message_with_seq`'s derivation fallback
+                        // picks the latest user (Q5) instead of THIS
+                        // overflow's originating user (Q2), and the
+                        // persisted JSONL row mis-binds the reply under
+                        // Q5's bubble on reload. Mirrors PR #739's
+                        // BackgroundResult fix for the speculative-
+                        // overflow code path.
+                        thread_id: overflow_client_message_id.clone(),
                         timestamp: final_reply_timestamp,
                     };
                     let committed_seq = {
@@ -5806,7 +5855,28 @@ impl SessionActor {
                                 }
                                 sanitized
                             } else {
-                                msg.clone()
+                                let mut to_save = msg.clone();
+                                // Issue #740 fix: pre-stamp `thread_id` on
+                                // Assistant / Tool messages so the persisted
+                                // JSONL row is pinned to THIS turn's cmid
+                                // rather than letting `add_message_with_seq`
+                                // derive it from the most-recent user in
+                                // history (which can be a sibling rapid-fire
+                                // turn that landed in the JSONL between this
+                                // turn's user persist and assistant persist).
+                                if to_save.thread_id.is_none()
+                                    && matches!(
+                                        to_save.role,
+                                        MessageRole::Assistant | MessageRole::Tool
+                                    )
+                                {
+                                    if let Some(ref tid) = client_message_id {
+                                        if !tid.is_empty() {
+                                            to_save.thread_id = Some(tid.clone());
+                                        }
+                                    }
+                                }
+                                to_save
                             };
                         if let Err(e) = handle.add_message(message_to_save).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
@@ -5826,7 +5896,11 @@ impl SessionActor {
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             client_message_id: None,
-                            thread_id: None,
+                            // Issue #740 fix: pre-stamp `thread_id` from the
+                            // originating turn's cmid so reload pairs the
+                            // assistant under the correct user bubble.
+                            // Sibling fix to PR #739's M8.9 recovery path.
+                            thread_id: client_message_id.clone(),
                             timestamp: chrono::Utc::now(),
                         };
                         if let Err(e) = handle.add_message(assistant_msg).await {
