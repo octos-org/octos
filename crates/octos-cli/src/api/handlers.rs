@@ -455,9 +455,16 @@ async fn chat_streaming(
                         let mut to_save = msg.clone();
                         if !user_persisted && msg.role == MessageRole::User {
                             user_persisted = true;
+                            // PR A: stamp via the typed setter so callers
+                            // wired to a `ClientMessageId` can't pass the
+                            // wrong identity here. Bare-`String` overrides
+                            // remain available for inbound paths where the
+                            // cmid is already a `String` from the wire.
                             if let Some(ref cmid) = client_message_id {
                                 if !cmid.is_empty() {
-                                    to_save.client_message_id = Some(cmid.clone());
+                                    to_save = to_save.with_typed_client_message_id(
+                                        octos_core::ClientMessageId::new(cmid),
+                                    );
                                 }
                             }
                             let timestamp = to_save.timestamp.to_rfc3339();

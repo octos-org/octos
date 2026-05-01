@@ -213,8 +213,12 @@ async fn persist_assistant_message(
     media: Vec<String>,
     thread_id: Option<String>,
 ) -> Option<PersistedSessionMessage> {
-    let mut assistant_msg = Message::assistant(content);
-    assistant_msg.media = media;
+    // PR A: prefer the typed constructor when the originating thread is
+    // known so the type system rejects a future regression that drops the
+    // pre-stamp. `assistant_with_thread` is the structural fix Codex's
+    // critique called out for the M8.10 thread-binding bug class
+    // (#649 → #664 → #673 → #680 → #738 → #740).
+    //
     // M8.10 follow-up (#649): pre-stamp `thread_id` BEFORE handing the
     // message to the canonical persist helper. `add_message_with_seq`'s
     // derivation falls back to "most recent user in history" — for a
@@ -225,11 +229,13 @@ async fn persist_assistant_message(
     // persisted JSONL row to the correct thread so reload pairs the
     // assistant under the originating user bubble. Foreground turns pass
     // `None` and continue to use the derivation fallback (correct).
-    if let Some(tid) = thread_id {
-        if !tid.is_empty() {
-            assistant_msg.thread_id = Some(tid);
+    let mut assistant_msg = match thread_id {
+        Some(tid) if !tid.is_empty() => {
+            Message::assistant_with_thread(content, octos_core::ThreadId::new(tid))
         }
-    }
+        _ => Message::assistant(content),
+    };
+    assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
 
     // Funnel through the canonical helper so the per-key Tokio mutex
@@ -3952,16 +3958,18 @@ impl SessionActor {
         };
 
         let client_message_id = inbound_client_message_id(inbound);
-        let user_msg = Message {
-            role: MessageRole::User,
-            content: persisted_user_content.to_string(),
-            media: vec![],
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: client_message_id.clone(),
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
+        // PR A: when the inbound carries a cmid, build the user message via
+        // the typed constructor — `user_with_cmid` requires the
+        // `ClientMessageId` argument so the cmid cannot be silently dropped.
+        // `thread_id` stays `None` here because `add_message_with_seq` runs
+        // its own derivation; PR-F will migrate that derivation onto the
+        // typed setters.
+        let user_msg = match client_message_id.as_deref() {
+            Some(cmid) if !cmid.is_empty() => Message::user_with_cmid(
+                persisted_user_content.to_string(),
+                octos_core::ClientMessageId::new(cmid),
+            ),
+            _ => Message::user(persisted_user_content.to_string()),
         };
         let user_msg_timestamp = user_msg.timestamp;
         let user_seq = {
@@ -4180,21 +4188,21 @@ impl SessionActor {
         let client_message_id = inbound_client_message_id(&inbound);
         let persisted_user_content_for_event = persisted_user_content.clone();
         let user_media_for_event = image_media.clone();
-        let user_msg = Message {
-            role: MessageRole::User,
-            content: persisted_user_content,
-            media: image_media
-                .iter()
-                .chain(attachment_media.iter())
-                .cloned()
-                .collect(),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-            client_message_id: client_message_id.clone(),
-            thread_id: None,
-            timestamp: chrono::Utc::now(),
+        // PR A: typed constructor for the cmid-bearing path; legacy
+        // `Message::user` for the rare cmid-less path. See sibling site
+        // around line 3961 for the rationale.
+        let mut user_msg = match client_message_id.as_deref() {
+            Some(cmid) if !cmid.is_empty() => Message::user_with_cmid(
+                persisted_user_content,
+                octos_core::ClientMessageId::new(cmid),
+            ),
+            _ => Message::user(persisted_user_content),
         };
+        user_msg.media = image_media
+            .iter()
+            .chain(attachment_media.iter())
+            .cloned()
+            .collect();
         let user_msg_timestamp = user_msg.timestamp;
         let user_seq = {
             let mut handle = self.session_handle.lock().await;
@@ -4741,29 +4749,29 @@ impl SessionActor {
                     // `messages` (EndTurn returns early without appending).
                     // Persist it explicitly so session history is complete.
                     if !conv_response.content.is_empty() {
-                        let assistant_msg = Message {
-                            role: MessageRole::Assistant,
-                            content: final_content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: conv_response.reasoning_content.clone(),
-                            client_message_id: None,
-                            // Issue #740 fix: pre-stamp `thread_id` from the
-                            // originating turn's cmid so the persisted JSONL
-                            // row is pinned to the correct thread. Without
-                            // this, `add_message_with_seq`'s "most recent
-                            // user in history" derivation picks the LATEST
-                            // user message — which under rapid-fire is a
-                            // sibling overflow user, not THIS turn — and
-                            // reload mis-pairs the assistant under the
-                            // wrong bubble (live-overflow-stress mini3
-                            // `rapid-fire-five-fast` evidence: 1+1=2 rendered
-                            // under the 3+3 bubble). Mirrors PR #739's M8.9
-                            // recovery-path fix for the foreground SSE path.
-                            thread_id: client_message_id.clone(),
-                            timestamp: chrono::Utc::now(),
+                        // PR A: when the originating turn supplied a cmid,
+                        // build via `assistant_with_thread` so the typed
+                        // ThreadId argument can't be silently dropped.
+                        // Issue #740 fix: pre-stamp `thread_id` from the
+                        // originating turn's cmid so the persisted JSONL
+                        // row is pinned to the correct thread. Without
+                        // this, `add_message_with_seq`'s "most recent
+                        // user in history" derivation picks the LATEST
+                        // user message — which under rapid-fire is a
+                        // sibling overflow user, not THIS turn — and
+                        // reload mis-pairs the assistant under the
+                        // wrong bubble (live-overflow-stress mini3
+                        // `rapid-fire-five-fast` evidence: 1+1=2 rendered
+                        // under the 3+3 bubble). Mirrors PR #739's M8.9
+                        // recovery-path fix for the foreground SSE path.
+                        let mut assistant_msg = match client_message_id.as_deref() {
+                            Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                                final_content.clone(),
+                                octos_core::ThreadId::new(tid),
+                            ),
+                            _ => Message::assistant(final_content.clone()),
                         };
+                        assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
                         // M8.10-A: capture the committed seq so the SSE `done`
                         // event can thread it back to the web client. The
                         // assistant timestamp is `Utc::now()` (newer than any
@@ -5116,17 +5124,17 @@ impl SessionActor {
             // primary turn or this overflow agent fails — preserves the user's
             // query in the session log no matter what.
             let user_msg_timestamp = chrono::Utc::now();
-            let user_msg = Message {
-                role: MessageRole::User,
-                content: content.clone(),
-                media: vec![],
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-                client_message_id: overflow_client_message_id.clone(),
-                thread_id: None,
-                timestamp: user_msg_timestamp,
+            // PR A: typed user-message construction for the overflow path.
+            // The cmid is mandatory for routing the response back to the
+            // right SPA bubble — typing it here means a regression that
+            // strips it would fail to compile.
+            let mut user_msg = match overflow_client_message_id.as_deref() {
+                Some(cmid) if !cmid.is_empty() => {
+                    Message::user_with_cmid(content.clone(), octos_core::ClientMessageId::new(cmid))
+                }
+                _ => Message::user(content.clone()),
             };
+            user_msg.timestamp = user_msg_timestamp;
             let user_seq_for_overflow = {
                 let mut handle = session_handle.lock().await;
                 handle.add_message_with_seq(user_msg).await.ok()
@@ -5367,29 +5375,27 @@ impl SessionActor {
                     // primary turn completed — and would be silently dropped
                     // (FA-11 defect B).
                     let final_reply_timestamp = chrono::Utc::now();
-                    let final_reply = Message {
-                        role: MessageRole::Assistant,
-                        content: final_content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: conv_response.reasoning_content.clone(),
-                        client_message_id: None,
-                        // Issue #740 fix: pre-stamp `thread_id` with the
-                        // overflow user's own cmid. Without this, when
-                        // multiple rapid-fire overflow tasks finalise in
-                        // an out-of-order sequence (e.g. Q2's reply lands
-                        // after Q5's user message has been persisted),
-                        // `add_message_with_seq`'s derivation fallback
-                        // picks the latest user (Q5) instead of THIS
-                        // overflow's originating user (Q2), and the
-                        // persisted JSONL row mis-binds the reply under
-                        // Q5's bubble on reload. Mirrors PR #739's
-                        // BackgroundResult fix for the speculative-
-                        // overflow code path.
-                        thread_id: overflow_client_message_id.clone(),
-                        timestamp: final_reply_timestamp,
+                    // PR A: typed assistant-message construction for the
+                    // speculative-overflow path. Issue #740 fix: pre-stamp
+                    // `thread_id` with the overflow user's own cmid.
+                    // Without this, when multiple rapid-fire overflow tasks
+                    // finalise in an out-of-order sequence (e.g. Q2's reply
+                    // lands after Q5's user message has been persisted),
+                    // `add_message_with_seq`'s derivation fallback picks
+                    // the latest user (Q5) instead of THIS overflow's
+                    // originating user (Q2), and the persisted JSONL row
+                    // mis-binds the reply under Q5's bubble on reload.
+                    // Mirrors PR #739's BackgroundResult fix for the
+                    // speculative-overflow code path.
+                    let mut final_reply = match overflow_client_message_id.as_deref() {
+                        Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                            final_content.clone(),
+                            octos_core::ThreadId::new(tid),
+                        ),
+                        _ => Message::assistant(final_content.clone()),
                     };
+                    final_reply.reasoning_content = conv_response.reasoning_content.clone();
+                    final_reply.timestamp = final_reply_timestamp;
                     let committed_seq = {
                         let mut handle = session_handle.lock().await;
                         handle
@@ -5888,21 +5894,22 @@ impl SessionActor {
                     // `messages` (EndTurn returns early without appending).
                     // Persist it explicitly so session history is complete.
                     if !conv_response.content.is_empty() {
-                        let assistant_msg = Message {
-                            role: MessageRole::Assistant,
-                            content: final_content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: conv_response.reasoning_content.clone(),
-                            client_message_id: None,
-                            // Issue #740 fix: pre-stamp `thread_id` from the
-                            // originating turn's cmid so reload pairs the
-                            // assistant under the correct user bubble.
-                            // Sibling fix to PR #739's M8.9 recovery path.
-                            thread_id: client_message_id.clone(),
-                            timestamp: chrono::Utc::now(),
+                        // PR A: when we know the originating cmid, build the
+                        // assistant Message via the typed constructor — that
+                        // requires the ThreadId argument at the type level so
+                        // a future regression cannot silently drop the
+                        // pre-stamp. Issue #740 fix: pre-stamp `thread_id`
+                        // from the originating turn's cmid so reload pairs
+                        // the assistant under the correct user bubble.
+                        // Sibling fix to PR #739's M8.9 recovery path.
+                        let mut assistant_msg = match client_message_id.as_deref() {
+                            Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
+                                final_content.clone(),
+                                octos_core::ThreadId::new(tid),
+                            ),
+                            _ => Message::assistant(final_content.clone()),
                         };
+                        assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
                         if let Err(e) = handle.add_message(assistant_msg).await {
                             warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                         }
