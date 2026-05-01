@@ -40,6 +40,37 @@ pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspac
 /// Feature flag for harness task registry/control commands.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1: &str = "harness.task_control.v1";
 
+/// Server-known feature registry. Used by
+/// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
+/// intersect a client's `X-Octos-Ui-Features` request with the names the
+/// server actually honours. The order is the canonical advertisement order
+/// surfaced through `supported_features`.
+pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+];
+
+/// Returns the feature flag that gates `method` per spec § 7 capability
+/// negotiation, or `None` if the method is unconditionally available.
+///
+/// Used by [`UiProtocolCapabilities::for_negotiated_features`] so the
+/// negotiated `supported_methods` only advertises capability-gated methods
+/// when their gating feature is also in the negotiated `supported_features`
+/// set. Without this gate a client that did not request
+/// `harness.task_control.v1` would see `task/list` / `task/cancel` /
+/// `task/restart_from_node` in the response and then receive
+/// `method_not_supported` errors when it tried to call them.
+fn method_capability_gate(method: &str) -> Option<&'static str> {
+    match method {
+        methods::TASK_LIST | methods::TASK_CANCEL | methods::TASK_RESTART_FROM_NODE => {
+            Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1)
+        }
+        _ => None,
+    }
+}
+
 pub mod approval_kinds {
     pub const COMMAND: &str = "command";
     pub const DIFF: &str = "diff";
@@ -719,12 +750,69 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FIRST_SERVER_METHODS,
             UI_PROTOCOL_NOTIFICATION_METHODS,
         )
-        .with_supported_features([
-            UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-            UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-            UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-        ]);
+        .with_supported_features(UI_PROTOCOL_KNOWN_FEATURES.iter().copied());
+        capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
+            .iter()
+            .map(|method| {
+                UnsupportedCapabilityReport::method(
+                    *method,
+                    "not implemented by the first server runtime slice",
+                )
+            })
+            .collect();
+        capabilities
+    }
+
+    /// Build a server-side capabilities payload reflecting the negotiated
+    /// feature set per spec § 4 (UPCR-2026-007). `supported_features` is the
+    /// intersection of `requested` (typically from `X-Octos-Ui-Features`)
+    /// with the server's known feature registry, preserving the order of
+    /// the registry. Unknown feature names in `requested` are dropped — the
+    /// server does not advertise capabilities it cannot honour.
+    ///
+    /// Method-level capability gates honour the same intersection: methods
+    /// that spec § 7 marks as capability-gated (e.g. `task/list`,
+    /// `task/cancel`, `task/restart_from_node` behind
+    /// `harness.task_control.v1`) appear in `supported_methods` only when
+    /// the gating feature is in the negotiated set. The spec contract is
+    /// "servers expose it only when the feature flag is advertised", so
+    /// the advertised method set must agree with the advertised feature
+    /// set — otherwise a client that did not negotiate `harness.task_control.v1`
+    /// would still see the methods in the response and make calls the
+    /// server would then reject with `method_not_supported`.
+    pub fn for_negotiated_features<I, S>(requested: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let requested: Vec<String> = requested
+            .into_iter()
+            .map(|feature| feature.as_ref().to_owned())
+            .collect();
+        let supported_features: Vec<String> = UI_PROTOCOL_KNOWN_FEATURES
+            .iter()
+            .filter(|feature| requested.iter().any(|requested| requested == **feature))
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        let supported_methods: Vec<String> = UI_PROTOCOL_FIRST_SERVER_METHODS
+            .iter()
+            .filter(|method| {
+                method_capability_gate(method).is_none_or(|gating_feature| {
+                    supported_features
+                        .iter()
+                        .any(|advertised| advertised == gating_feature)
+                })
+            })
+            .map(|method| (*method).to_owned())
+            .collect();
+        let mut capabilities = Self {
+            version: UiProtocolVersion::current(),
+            capabilities_schema_version: UI_PROTOCOL_CAPABILITIES_SCHEMA_VERSION,
+            supported_methods,
+            supported_notifications: string_list(UI_PROTOCOL_NOTIFICATION_METHODS),
+            supported_features,
+            unsupported: Vec::new(),
+        };
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
             .map(|method| {
@@ -1489,6 +1577,23 @@ pub struct SessionOpened {
     pub cursor: Option<UiCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panes: Option<UiPaneSnapshot>,
+    /// Server-supported features negotiated for this session per spec § 4
+    /// capability negotiation (UPCR-2026-007). Carries the protocol version,
+    /// schema version, supported method/notification sets, and the negotiated
+    /// `supported_features` intersection of the client's
+    /// `X-Octos-Ui-Features` request with the server's known feature
+    /// registry. Clients without the header receive the server's
+    /// `first_server_slice` default so they can still discover the surface
+    /// in-band.
+    ///
+    /// Older clients that don't expect the field continue to ignore it per
+    /// spec § 4 ("clients should treat unknown fields as ignorable"). Older
+    /// serialized payloads (e.g. ledger replays from before the field
+    /// existed) decode successfully because `UiProtocolCapabilities` itself
+    /// fills missing optional members with `serde(default)`; the field uses
+    /// `serde(default)` for forward compatibility.
+    #[serde(default = "UiProtocolCapabilities::first_server_slice")]
+    pub capabilities: UiProtocolCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2652,6 +2757,7 @@ mod tests {
                 }),
                 limitations: Vec::new(),
             }),
+            capabilities: UiProtocolCapabilities::first_server_slice(),
         };
 
         let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -2666,6 +2772,129 @@ mod tests {
         let decoded: SessionOpened =
             serde_json::from_value(wire).expect("deserialize session/open panes");
         assert_eq!(decoded, opened);
+    }
+
+    // ----- UPCR-2026-007: capability advertisement on `SessionOpened` -----
+
+    #[test]
+    fn session_open_result_includes_capabilities_field() {
+        // Golden: `SessionOpened` serializes a `capabilities` payload that
+        // covers protocol version, method/notification surface, and the
+        // negotiated feature set so clients can discover the contract
+        // in-band per spec § 4 / UPCR-2026-007.
+        let opened = SessionOpened {
+            session_id: SessionKey("local:demo".into()),
+            active_profile_id: None,
+            workspace_root: None,
+            cursor: None,
+            panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
+        };
+        let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+        let capabilities = wire
+            .get("capabilities")
+            .expect("SessionOpened must serialize a capabilities field");
+        assert_eq!(capabilities["version"]["protocol"], json!(UI_PROTOCOL_V1));
+        assert_eq!(
+            capabilities["capabilities_schema_version"],
+            json!(UI_PROTOCOL_CAPABILITIES_SCHEMA_VERSION)
+        );
+        assert!(
+            capabilities["supported_methods"]
+                .as_array()
+                .expect("supported_methods array")
+                .iter()
+                .any(|method| method == &json!(methods::SESSION_OPEN))
+        );
+        let supported_features = capabilities["supported_features"]
+            .as_array()
+            .expect("supported_features array");
+        for feature in UI_PROTOCOL_KNOWN_FEATURES {
+            assert!(
+                supported_features
+                    .iter()
+                    .any(|advertised| advertised == &json!(*feature)),
+                "first_server_slice must advertise {feature}"
+            );
+        }
+
+        // Older payloads (e.g. ledger replays from before the field
+        // existed) decode successfully because the field carries
+        // `serde(default = "first_server_slice")`.
+        let legacy = json!({
+            "session_id": "local:demo",
+        });
+        let decoded: SessionOpened =
+            serde_json::from_value(legacy).expect("legacy SessionOpened decode");
+        assert_eq!(
+            decoded.capabilities,
+            UiProtocolCapabilities::first_server_slice()
+        );
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_full_protocol_when_no_features_requested() {
+        // No header => `for_negotiated_features([])` returns the
+        // first-slice baseline with an empty `supported_features` so the
+        // server does not silently advertise flags the client did not ask
+        // for. The no-header fallback handled by callers is the
+        // `first_server_slice` default; this test pins the empty-request
+        // intersection contract.
+        let none: [&str; 0] = [];
+        let capabilities = UiProtocolCapabilities::for_negotiated_features(none);
+        assert!(capabilities.supported_features.is_empty());
+        assert!(capabilities.supports_method(methods::SESSION_OPEN));
+        assert!(capabilities.supports_method(methods::TURN_START));
+        // Capability-gated methods MUST NOT leak when their gating feature
+        // is not in the negotiated set — otherwise a client would call
+        // them and receive `method_not_supported`.
+        assert!(!capabilities.supports_method(methods::TASK_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+    }
+
+    #[test]
+    fn negotiated_capabilities_intersect_requested_with_known_features() {
+        // Client asked only for pane snapshots — the server returns just
+        // that feature, never leaking the typed-approval / cwd / task-
+        // control flags the client did not negotiate.
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+            "made.up.feature.v9",
+        ]);
+        assert_eq!(
+            capabilities.supported_features,
+            vec![UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1.to_owned()]
+        );
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        // Task-control methods are gated by harness.task_control.v1 — they
+        // must not appear in the advertised method set when the gating
+        // feature is not negotiated.
+        assert!(!capabilities.supports_method(methods::TASK_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        // Unconditional methods stay present.
+        assert!(capabilities.supports_method(methods::SESSION_OPEN));
+        assert!(capabilities.supports_method(methods::TURN_START));
+        assert!(capabilities.supports_method(methods::TASK_OUTPUT_READ));
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_task_control_methods_when_feature_requested() {
+        // Pre-condition for the gating change: when the client *did*
+        // request `harness.task_control.v1`, the server's negotiated
+        // method set includes the task-control RPCs so the spec § 7
+        // "expose only when feature flag is advertised" rule is honoured
+        // bidirectionally.
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+        ]);
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::TASK_LIST));
+        assert!(capabilities.supports_method(methods::TASK_CANCEL));
+        assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
     }
 
     #[test]
@@ -3359,6 +3588,7 @@ mod tests {
                 seq: 42,
             }),
             panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
         };
 
         let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -3889,6 +4119,7 @@ mod tests {
             workspace_root: None,
             cursor: Some(opened_cursor.clone()),
             panes: None,
+            capabilities: UiProtocolCapabilities::first_server_slice(),
         });
 
         let opened_wire = opened
