@@ -828,6 +828,16 @@ send_line() {
   tmux_key "$session" Enter
 }
 
+tmux_paste_line() {
+  local session="$1"
+  local text="$2"
+  local buffer
+  buffer="octos-tmux-paste-${session//[^a-zA-Z0-9_.-]/-}"
+  tmux set-buffer -b "$buffer" "$text"
+  tmux paste-buffer -d -t "$session" -b "$buffer"
+  tmux_key "$session" Enter
+}
+
 send_tui_prompt() {
   local session="$1"
   local text="$2"
@@ -857,8 +867,7 @@ send_codex_prompt() {
   local text="$2"
   tmux_key "$session" C-u
   sleep "${OCTOS_TUI_UX_CODEX_CLEAR_GRACE_SECS:-0.2}"
-  tmux_send "$session" "$text"
-  tmux_key "$session" Enter
+  tmux_paste_line "$session" "$text"
   sleep "${OCTOS_TUI_UX_CODEX_SUBMIT_GRACE_SECS:-1}"
 }
 
