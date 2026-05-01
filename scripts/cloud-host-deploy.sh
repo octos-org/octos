@@ -395,13 +395,20 @@ dashboard_auth = data.get("dashboard_auth")
 if enable_smtp:
     if not isinstance(dashboard_auth, dict):
         dashboard_auth = {}
-    dashboard_auth["smtp"] = {
-        "host": smtp_host,
-        "port": smtp_port,
-        "username": smtp_username,
-        "password_env": "SMTP_PASSWORD",
-        "from_address": smtp_from,
-    }
+    # Per-field merge so any keys the dashboard wizard may have set
+    # (e.g. a non-default password_env, or fields the script doesn't
+    # know about yet) survive the rewrite. Only the four fields the
+    # operator just supplied are replaced; password_env is set as a
+    # default if absent so lettre has something to fall back on.
+    existing_smtp = dashboard_auth.get("smtp")
+    if not isinstance(existing_smtp, dict):
+        existing_smtp = {}
+    existing_smtp["host"] = smtp_host
+    existing_smtp["port"] = smtp_port
+    existing_smtp["username"] = smtp_username
+    existing_smtp["from_address"] = smtp_from
+    existing_smtp.setdefault("password_env", "SMTP_PASSWORD")
+    dashboard_auth["smtp"] = existing_smtp
     dashboard_auth["session_expiry_hours"] = dashboard_auth.get("session_expiry_hours", 24)
     dashboard_auth["allow_self_registration"] = allow_self_registration
     data["dashboard_auth"] = dashboard_auth
@@ -774,6 +781,22 @@ else
     # and the dashboard_auth block (which is omitted when SMTP is off) does
     # not need this field at all.
     ALLOW_SELF_REGISTRATION=false
+fi
+# Preserve auth_token from existing config.json on re-runs so live dashboard
+# sessions don't get silently invalidated when the operator re-runs the
+# deploy (e.g. to update HTTPS settings) without explicitly passing
+# --auth-token. Only generates a fresh token on truly first-time installs.
+# Resolution order (highest precedence first):
+#   1. --auth-token CLI flag (set above at line 99)
+#   2. AUTH_TOKEN restored from cloud-bootstrap.env state file (line 174)
+#   3. existing config.json's auth_token field (added here)
+#   4. fresh-generated random hex
+if [ -z "$AUTH_TOKEN" ] && [ -f "$DATA_DIR/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    AUTH_TOKEN=$(python3 -c 'import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("auth_token", ""))
+except Exception:
+    pass' "$DATA_DIR/config.json" 2>/dev/null || true)
 fi
 if [ -z "$AUTH_TOKEN" ]; then
     AUTH_TOKEN="$(openssl rand -hex 32)"
