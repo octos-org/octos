@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::Response;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use octos_agent::{Agent, ToolApprovalDecision, ToolApprovalRequest};
 use octos_core::ui_protocol::{
@@ -23,17 +23,19 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, InputItem, MessageDeltaEvent, OutputCursor,
     ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse, SessionOpenParams,
-    SessionOpenResult, SessionOpened, TaskOutputDeltaEvent, TaskRuntimeState as UiTaskRuntimeState,
-    TaskUpdatedEvent, ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent,
-    TurnErrorEvent, TurnId, TurnInterruptParams, TurnStartParams,
-    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot, approval_cancelled_reasons,
-    approval_kinds, progress_kinds,
+    SessionOpenResult, SessionOpened, TaskCancelParams, TaskCancelResult, TaskListEntry,
+    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
+    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
+    TurnId, TurnInterruptParams, TurnStartParams, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiCursor, UiFileMutationNotice,
+    UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot,
+    UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, approval_cancelled_reasons, approval_kinds, progress_kinds,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
@@ -85,7 +87,6 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
-
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
 type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
@@ -1132,6 +1133,15 @@ async fn ui_protocol_connection(
             UiCommand::TaskOutputRead(params) => {
                 handle_task_output_read(&ws, &state, connection_profile_id, id, params).await;
             }
+            UiCommand::TaskList(params) => {
+                handle_task_list(&ws, &state, connection_profile_id, id, params).await;
+            }
+            UiCommand::TaskCancel(params) => {
+                handle_task_cancel(&ws, &state, connection_profile_id, id, params).await;
+            }
+            UiCommand::TaskRestartFromNode(params) => {
+                handle_task_restart_from_node(&ws, &state, connection_profile_id, id, params).await;
+            }
         }
     }
 
@@ -1154,13 +1164,6 @@ fn parse_rpc_request(text: &str) -> Result<RpcRequest<Value>, RpcError> {
 }
 
 fn route_rpc_command(request: RpcRequest<Value>) -> Result<UiCommand, RpcError> {
-    if !request.is_jsonrpc_v2() {
-        return Err(RpcError::invalid_request(format!(
-            "unsupported JSON-RPC version: {}",
-            request.jsonrpc
-        )));
-    }
-
     let command = UiCommand::from_rpc_request(request)?;
     if !ui_protocol_server_supported_methods().contains(&command.method()) {
         return Err(RpcError::method_not_supported(command.method()));
@@ -1168,8 +1171,8 @@ fn route_rpc_command(request: RpcRequest<Value>) -> Result<UiCommand, RpcError> 
     Ok(command)
 }
 
-fn ui_protocol_server_supported_methods() -> &'static [&'static str] {
-    octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS
+fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
+    octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec()
 }
 
 fn frame_too_large_error() -> RpcError {
@@ -2383,6 +2386,341 @@ async fn handle_task_output_read(
         },
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_task_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: TaskListParams,
+) {
+    let query_session_id =
+        session_key_with_optional_topic(&params.session_id, params.topic.as_deref());
+    if let Err(error) = validate_session_scope(&query_session_id, None, connection_profile_id) {
+        let _ = send_rpc_error(ws, Some(id), error);
+        return;
+    }
+
+    match task_list_snapshot(state, &query_session_id) {
+        Ok(tasks) => {
+            let result = TaskListResult {
+                session_id: params.session_id,
+                topic: params.topic,
+                tasks,
+            };
+            send_serialized_rpc_result(ws, id, octos_core::ui_protocol::methods::TASK_LIST, result);
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_task_cancel(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: TaskCancelParams,
+) {
+    let Some(session_id) = params.session_id.as_ref() else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params("task/cancel requires session_id for scoped cancellation"),
+        );
+        return;
+    };
+    if let Err(error) = validate_session_scope(
+        session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    ) {
+        let _ = send_rpc_error(ws, Some(id), error);
+        return;
+    }
+
+    let store = match task_query_store_or_error(state) {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let task_id = params.task_id.clone();
+    match ensure_task_in_session(state, session_id, &task_id).and_then(|()| {
+        store
+            .cancel_task(&task_id.to_string())
+            .map_err(|error| task_cancel_rpc_error(&task_id, error))
+    }) {
+        Ok(()) => {
+            let result = TaskCancelResult {
+                task_id,
+                status: UiTaskRuntimeState::Cancelled,
+            };
+            send_serialized_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::methods::TASK_CANCEL,
+                result,
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_task_restart_from_node(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    id: String,
+    params: TaskRestartFromNodeParams,
+) {
+    let Some(session_id) = params.session_id.as_ref() else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(
+                "task/restart_from_node requires session_id for scoped restart",
+            ),
+        );
+        return;
+    };
+    if let Err(error) = validate_session_scope(
+        session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    ) {
+        let _ = send_rpc_error(ws, Some(id), error);
+        return;
+    }
+
+    let store = match task_query_store_or_error(state) {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let task_id = params.task_id.clone();
+    let from_node = params.node_id.clone();
+    let opts = octos_agent::RelaunchOpts {
+        from_node: from_node.clone(),
+    };
+    match ensure_task_in_session(state, session_id, &task_id).and_then(|()| {
+        store
+            .relaunch_task(&task_id.to_string(), opts)
+            .map_err(|error| task_relaunch_rpc_error(&task_id, error))
+    }) {
+        Ok(new_task_id) => {
+            let new_task_id = match new_task_id.parse::<TaskId>() {
+                Ok(task_id) => task_id,
+                Err(error) => {
+                    let _ = send_rpc_error(
+                        ws,
+                        Some(id),
+                        RpcError::internal_error(format!(
+                            "task supervisor returned an invalid relaunched task id: {error}"
+                        )),
+                    );
+                    return;
+                }
+            };
+            let result = TaskRestartFromNodeResult {
+                original_task_id: task_id,
+                new_task_id,
+                from_node,
+            };
+            send_serialized_rpc_result(
+                ws,
+                id,
+                octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE,
+                result,
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+fn send_serialized_rpc_result<T: Serialize>(
+    ws: &WsConnection,
+    id: String,
+    method: &str,
+    result: T,
+) {
+    match serde_json::to_value(result) {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, result);
+        }
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("failed to serialize {method} result: {error}")),
+            );
+        }
+    }
+}
+
+fn task_query_store_or_error(
+    state: &Arc<AppState>,
+) -> Result<&crate::session_actor::SessionTaskQueryStore, RpcError> {
+    state.task_query_store.as_ref().ok_or_else(|| {
+        RpcError::runtime_not_ready("task supervisor not wired for AppUI task commands")
+            .with_data(json!({ "kind": "runtime_unavailable" }))
+    })
+}
+
+fn task_list_snapshot(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> Result<Vec<TaskListEntry>, RpcError> {
+    let store = task_query_store_or_error(state)?;
+    match store.query_json(&session_id.to_string()) {
+        Value::Array(tasks) => tasks
+            .into_iter()
+            .map(task_list_entry_from_value)
+            .collect::<Result<Vec<_>, _>>(),
+        _ => Err(RpcError::internal_error(
+            "task supervisor query returned a non-array task snapshot",
+        )),
+    }
+}
+
+fn session_key_with_optional_topic(session_id: &SessionKey, topic: Option<&str>) -> SessionKey {
+    let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) else {
+        return session_id.clone();
+    };
+    SessionKey(format!("{}#{topic}", session_id.base_key()))
+}
+
+#[derive(serde::Deserialize)]
+struct TaskListProjection {
+    id: TaskId,
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_call_id: String,
+    #[serde(default)]
+    parent_session_key: Option<SessionKey>,
+    #[serde(default)]
+    child_session_key: Option<SessionKey>,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    lifecycle_state: String,
+    #[serde(default)]
+    runtime_state: String,
+    #[serde(default)]
+    child_terminal_state: Option<String>,
+    #[serde(default)]
+    child_join_state: Option<String>,
+    #[serde(default)]
+    child_joined_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    child_failure_action: Option<String>,
+    #[serde(default)]
+    runtime_detail: Option<Value>,
+    #[serde(default)]
+    workflow_kind: Option<String>,
+    #[serde(default)]
+    current_phase: Option<String>,
+    started_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    output_files: Vec<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    session_key: Option<SessionKey>,
+}
+
+fn task_list_entry_from_value(value: Value) -> Result<TaskListEntry, RpcError> {
+    let projected: TaskListProjection = serde_json::from_value(value)
+        .map_err(|error| RpcError::internal_error(format!("invalid task snapshot: {error}")))?;
+    let state = ui_task_state_from_label(&projected.lifecycle_state)
+        .or_else(|| ui_task_state_from_label(&projected.runtime_state))
+        .or_else(|| ui_task_state_from_label(&projected.status))
+        .unwrap_or(UiTaskRuntimeState::Running);
+
+    Ok(TaskListEntry {
+        id: projected.id,
+        tool_name: projected.tool_name,
+        tool_call_id: projected.tool_call_id,
+        state,
+        status: projected.status,
+        lifecycle_state: projected.lifecycle_state,
+        runtime_state: projected.runtime_state,
+        parent_session_key: projected.parent_session_key,
+        child_session_key: projected.child_session_key,
+        child_terminal_state: projected.child_terminal_state,
+        child_join_state: projected.child_join_state,
+        child_joined_at: projected.child_joined_at,
+        child_failure_action: projected.child_failure_action,
+        runtime_detail: projected.runtime_detail,
+        workflow_kind: projected.workflow_kind,
+        current_phase: projected.current_phase,
+        started_at: projected.started_at,
+        updated_at: projected.updated_at,
+        completed_at: projected.completed_at,
+        output_files: projected.output_files,
+        error: projected.error,
+        session_key: projected.session_key,
+    })
+}
+
+fn ui_task_state_from_label(label: &str) -> Option<UiTaskRuntimeState> {
+    match label {
+        "pending" | "queued" | "spawned" => Some(UiTaskRuntimeState::Pending),
+        "running" | "executing_tool" | "resolving_outputs" | "verifying_outputs"
+        | "delivering_outputs" | "cleaning_up" | "verifying" => Some(UiTaskRuntimeState::Running),
+        "completed" | "ready" => Some(UiTaskRuntimeState::Completed),
+        "failed" => Some(UiTaskRuntimeState::Failed),
+        "cancelled" | "canceled" => Some(UiTaskRuntimeState::Cancelled),
+        _ => None,
+    }
+}
+
+fn ensure_task_in_session(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    task_id: &TaskId,
+) -> Result<(), RpcError> {
+    if task_list_snapshot(state, session_id)?
+        .iter()
+        .any(|task| &task.id == task_id)
+    {
+        Ok(())
+    } else {
+        Err(RpcError::unknown_task_id(task_id))
+    }
+}
+
+fn task_cancel_rpc_error(task_id: &TaskId, error: octos_agent::TaskCancelError) -> RpcError {
+    match error {
+        octos_agent::TaskCancelError::NotFound => RpcError::unknown_task_id(task_id),
+        octos_agent::TaskCancelError::AlreadyTerminal => {
+            RpcError::invalid_params("task is already terminal")
+                .with_data(json!({ "kind": "task_already_terminal" }))
+        }
+    }
+}
+
+fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchError) -> RpcError {
+    match error {
+        octos_agent::TaskRelaunchError::NotFound => RpcError::unknown_task_id(task_id),
+        octos_agent::TaskRelaunchError::StillActive => {
+            RpcError::invalid_params("task is still active; cancel it before relaunching")
+                .with_data(json!({ "kind": "task_still_active" }))
         }
     }
 }
@@ -4099,6 +4437,24 @@ mod tests {
                 preview_id: decoded_preview_id,
             }) if decoded_session_id == session_id && decoded_preview_id == preview_id
         ));
+
+        let task_id = TaskId::new();
+        let task_cancel = RpcRequest::new(
+            "task-cancel",
+            methods::TASK_CANCEL,
+            json!({
+                "session_id": session_id.clone(),
+                "task_id": task_id.clone(),
+            }),
+        );
+        assert!(matches!(
+            route_rpc_command(task_cancel).expect("task/cancel routes"),
+            UiCommand::TaskCancel(TaskCancelParams {
+                session_id: Some(decoded_session_id),
+                task_id: decoded_task_id,
+                ..
+            }) if decoded_session_id == session_id && decoded_task_id == task_id
+        ));
     }
 
     #[test]
@@ -4157,6 +4513,30 @@ mod tests {
                     "task_id": task_id.clone(),
                 }),
             ),
+            RpcRequest::new(
+                "task-list",
+                methods::TASK_LIST,
+                json!({
+                    "session_id": session_id.clone(),
+                }),
+            ),
+            RpcRequest::new(
+                "task-cancel",
+                methods::TASK_CANCEL,
+                json!({
+                    "session_id": session_id.clone(),
+                    "task_id": task_id.clone(),
+                }),
+            ),
+            RpcRequest::new(
+                "task-restart",
+                methods::TASK_RESTART_FROM_NODE,
+                json!({
+                    "session_id": session_id.clone(),
+                    "task_id": task_id.clone(),
+                    "node_id": "design",
+                }),
+            ),
         ] {
             let method = request.method.clone();
             assert!(
@@ -4166,6 +4546,127 @@ mod tests {
             let command = route_rpc_command(request).expect("server-supported method routes");
             assert_eq!(command.method(), method);
         }
+    }
+
+    fn appui_task_state_with_running_task(
+        session_id: &SessionKey,
+    ) -> (Arc<AppState>, Arc<octos_agent::TaskSupervisor>, TaskId) {
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register(
+            "run_pipeline",
+            "call-appui-task",
+            Some(&session_id.to_string()),
+        );
+        supervisor.mark_running(&task_id);
+        let parsed_task_id = task_id
+            .parse::<TaskId>()
+            .expect("supervisor task id is UUID");
+
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        store.register(session_id, &supervisor, tmp.path());
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        (state, supervisor, parsed_task_id)
+    }
+
+    async fn recv_rpc_json(rx: &mut mpsc::Receiver<WsMessage>) -> Value {
+        match rx.recv().await.expect("rpc frame") {
+            WsMessage::Text(text) => serde_json::from_str(text.as_str()).expect("json frame"),
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn appui_task_list_returns_runtime_snapshot() {
+        let session_id = SessionKey("local:test".into());
+        let (state, _supervisor, task_id) = appui_task_state_with_running_task(&session_id);
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_task_list(
+            &ws,
+            &state,
+            None,
+            "task-list-1".into(),
+            TaskListParams {
+                session_id: session_id.clone(),
+                topic: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "task-list-1");
+        assert_eq!(frame["result"]["session_id"], session_id.to_string());
+        let tasks = frame["result"]["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], task_id.to_string());
+        assert_eq!(tasks[0]["status"], "running");
+        assert_eq!(tasks[0]["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn appui_task_cancel_uses_supervisor_cancel_path() {
+        let session_id = SessionKey("local:test".into());
+        let (state, supervisor, task_id) = appui_task_state_with_running_task(&session_id);
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_task_cancel(
+            &ws,
+            &state,
+            None,
+            "task-cancel-1".into(),
+            TaskCancelParams {
+                task_id: task_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "task-cancel-1");
+        assert_eq!(frame["result"]["task_id"], task_id.to_string());
+        assert_eq!(frame["result"]["status"], "cancelled");
+        let task = supervisor
+            .get_task(&task_id.to_string())
+            .expect("task remains queryable");
+        assert_eq!(task.status, octos_agent::TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn appui_task_restart_from_node_uses_relaunch_path() {
+        let session_id = SessionKey("local:test".into());
+        let (state, supervisor, task_id) = appui_task_state_with_running_task(&session_id);
+        supervisor.mark_failed(&task_id.to_string(), "ready to relaunch".into());
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_task_restart_from_node(
+            &ws,
+            &state,
+            None,
+            "task-restart-1".into(),
+            TaskRestartFromNodeParams {
+                task_id: task_id.clone(),
+                node_id: Some("design".into()),
+                session_id: Some(session_id),
+                profile_id: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "task-restart-1");
+        assert_eq!(frame["result"]["original_task_id"], task_id.to_string());
+        assert_eq!(frame["result"]["from_node"], "design");
+        let new_task_id = frame["result"]["new_task_id"]
+            .as_str()
+            .expect("new task id");
+        assert_ne!(new_task_id, task_id.to_string());
+        let successor = supervisor.get_task(new_task_id).expect("successor task");
+        assert_eq!(successor.tool_name, "run_pipeline");
     }
 
     #[test]
