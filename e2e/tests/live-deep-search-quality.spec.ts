@@ -103,7 +103,7 @@ test.describe('W3.C1 deep_search quality gate', () => {
 });
 
 /**
- * Wait for the assistant to deliver a deep_search report. We try two
+ * Wait for the assistant to deliver a deep_search report. We try three
  * extraction paths in priority order:
  *
  * 1. Chat thread contains a markdown rendering of the report. Look for
@@ -111,9 +111,18 @@ test.describe('W3.C1 deep_search quality gate', () => {
  *    `_report.md` reference.
  * 2. Latest assistant message contains a fenced markdown block we can
  *    inspect verbatim.
+ * 3. An assistant bubble exposes a `.md` link/attachment (the
+ *    spawn_only delivery path post-PR #688: `run_pipeline` runs in the
+ *    background and the SSE `done` event fires when the LLM EndTurns
+ *    after the spawn-ack, NOT when the artifact is produced. The
+ *    actual `_report.md` is delivered as a media attachment 1-3 min
+ *    later via a separate assistant bubble — see issue #731). When we
+ *    find that anchor, we fetch its content using the browser's auth
+ *    token so the assertions still run against the report body.
  */
 async function waitForReportContent(page: Page, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
+  let lastErr: string | undefined;
   while (Date.now() < deadline) {
     // Look at the rendered chat thread text for the report content.
     const threadText = await page.evaluate(() => {
@@ -140,10 +149,70 @@ async function waitForReportContent(page: Page, timeoutMs: number): Promise<stri
       return lastAssistant;
     }
 
+    // Spawn_only delivery path (issue #731): the report lands as a
+    // media attachment in a *later* assistant bubble. Look for any
+    // SAME-ORIGIN anchor with an `.md` href and fetch it via the same
+    // auth token the SPA holds in localStorage. Restricting to
+    // same-origin avoids matching external citation links (e.g.
+    // `https://github.com/.../README.md`) that the LLM may emit in
+    // its synthesis prose, and prevents leaking the bearer token to
+    // a third-party host. We pick the most-recent matching anchor so
+    // that re-runs in the same session pick the latest report.
+    const mdHref = await page.evaluate(() => {
+      const re = /\.md(?:$|[?#])/i;
+      const here = window.location.origin;
+      const anchors = Array.from(
+        document.querySelectorAll(
+          "[data-testid='assistant-message'] a[href]",
+        ),
+      ) as HTMLAnchorElement[];
+      const matches = anchors.filter((a) => {
+        const href = a.href || '';
+        if (!re.test(href)) return false;
+        try {
+          return new URL(href, here).origin === here;
+        } catch {
+          // Relative URLs that can't be parsed against the doc base
+          // would have already been resolved by `a.href` getter;
+          // anything that throws here is malformed and we skip.
+          return false;
+        }
+      });
+      return matches.length ? matches[matches.length - 1].href : '';
+    });
+    if (mdHref) {
+      const fetched = await page.evaluate(async (href) => {
+        try {
+          const token =
+            localStorage.getItem('octos_session_token') ||
+            localStorage.getItem('octos_auth_token') ||
+            '';
+          const profile = localStorage.getItem('selected_profile') || '';
+          const headers: Record<string, string> = {};
+          if (token) headers.Authorization = `Bearer ${token}`;
+          if (profile) headers['X-Profile-Id'] = profile;
+          const resp = await fetch(href, {
+            headers,
+            credentials: 'include',
+          });
+          if (!resp.ok) return { ok: false, status: resp.status, text: '' };
+          const text = await resp.text();
+          return { ok: true, status: resp.status, text };
+        } catch (err) {
+          return { ok: false, status: -1, text: String(err) };
+        }
+      }, mdHref);
+      if (fetched.ok && fetched.text && fetched.text.length > 200) {
+        return fetched.text;
+      }
+      lastErr = `fetched ${mdHref}: ok=${fetched.ok} status=${fetched.status} bodyLen=${fetched.text.length}`;
+    }
+
     await page.waitForTimeout(POLL_INTERVAL_MS);
   }
   throw new Error(
-    `Timed out after ${(timeoutMs / 1000).toFixed(0)}s waiting for deep_search report content`,
+    `Timed out after ${(timeoutMs / 1000).toFixed(0)}s waiting for deep_search report content` +
+      (lastErr ? ` (last attachment fetch: ${lastErr})` : ''),
   );
 }
 
