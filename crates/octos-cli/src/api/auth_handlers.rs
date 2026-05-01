@@ -423,7 +423,7 @@ pub async fn send_code(
     let root_login_target = if scoped_profile_id.is_none() {
         match resolve_root_login_target(&state, &requested_email) {
             Some(target) => Some(target),
-            None if auth_mgr.allow_self_registration => Some(RootLoginTarget::Allowlisted),
+            None if auth_mgr.allow_self_registration() => Some(RootLoginTarget::Allowlisted),
             None => None,
         }
     } else {
@@ -443,7 +443,7 @@ pub async fn send_code(
             }));
         }
     } else if root_login_target.is_none() {
-        if !auth_mgr.allow_self_registration {
+        if !auth_mgr.allow_self_registration() {
             tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
             return Ok(Json(SendCodeResponse {
                 ok: false,
@@ -563,7 +563,7 @@ pub async fn auth_status(
         allow_self_registration: state
             .auth_manager
             .as_ref()
-            .map(|m| m.allow_self_registration)
+            .map(|m| m.allow_self_registration())
             .unwrap_or(false),
         scoped_profile,
     }))
@@ -599,7 +599,7 @@ pub async fn verify(
                 message: Some("Invalid or expired code".into()),
             }));
         }
-    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration {
+    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration() {
         return Ok(Json(VerifyResponse {
             ok: false,
             token: None,
@@ -624,7 +624,7 @@ pub async fn verify(
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await
             }
-            None if auth_mgr.allow_self_registration => {
+            None if auth_mgr.allow_self_registration() => {
                 auth_mgr
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await

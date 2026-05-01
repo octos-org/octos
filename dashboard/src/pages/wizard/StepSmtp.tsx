@@ -27,6 +27,11 @@ export default function StepSmtp({ mode, onContinue }: Props) {
   const [fromAddress, setFromAddress] = useState('')
   const [password, setPassword] = useState('')
   const [passwordConfigured, setPasswordConfigured] = useState(false)
+  // Default-on so a fresh cloud-host install (or any fresh wizard pass)
+  // matches cloud-host-deploy.sh's interactive default. Unchecking this
+  // forces a deliberate operator decision rather than silently leaving
+  // tenants unable to register.
+  const [allowSelfRegistration, setAllowSelfRegistration] = useState(true)
   const [loaded, setLoaded] = useState(false)
 
   const [testTo, setTestTo] = useState('')
@@ -44,6 +49,12 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         setUsername(s.username)
         setFromAddress(s.from_address)
         setPasswordConfigured(s.password_configured)
+        // If the field has never been written, the default-on UX still
+        // applies. If it has been written (true or false), respect it so
+        // re-entering the wizard reflects the saved state.
+        if (s.host.trim().length > 0) {
+          setAllowSelfRegistration(s.allow_self_registration)
+        }
         setLoaded(true)
       })
       .catch((e) => {
@@ -78,6 +89,7 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         username: username.trim(),
         from_address: fromAddress.trim(),
         password: password.length > 0 ? password : undefined,
+        allow_self_registration: allowSelfRegistration,
       })
       setSave({ kind: 'saved' })
       if (password.length > 0) {
@@ -99,6 +111,7 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         username: username.trim(),
         from_address: fromAddress.trim(),
         password: password.length > 0 ? password : undefined,
+        allow_self_registration: allowSelfRegistration,
       })
       if (password.length > 0) {
         setPassword('')
@@ -218,6 +231,21 @@ export default function StepSmtp({ mode, onContinue }: Props) {
           />
         </div>
       </div>
+
+      <label className="flex items-start gap-3 p-3 rounded-lg border border-gray-700/50 bg-background/60 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={allowSelfRegistration}
+          onChange={(e) => setAllowSelfRegistration(e.target.checked)}
+          className="mt-1"
+        />
+        <div className="flex-1 text-sm">
+          <div className="text-white font-medium">Allow self-registration via email OTP</div>
+          <div className="text-xs text-gray-400 mt-0.5">
+            New users can sign in with any email by completing the OTP flow — a profile is created on first verify. Leave on for a public cloud relay; turn off if only invited users (allowlist) should be able to log in. Mirrors <span className="font-mono text-gray-300">cloud-host-deploy.sh</span>'s self-registration prompt.
+          </div>
+        </div>
+      </label>
 
       <div className="border-t border-gray-700/50 pt-3 space-y-2">
         <label className="block text-xs font-medium text-gray-400">Send test email to</label>
