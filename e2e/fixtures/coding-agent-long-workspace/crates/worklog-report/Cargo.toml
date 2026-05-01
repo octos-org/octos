@@ -1,0 +1,7 @@
+[package]
+name = "worklog-report"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+worklog-core = { path = "../worklog-core" }
