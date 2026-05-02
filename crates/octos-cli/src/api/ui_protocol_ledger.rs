@@ -63,7 +63,14 @@ use octos_core::ui_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::broadcast;
 use tracing::{info, warn};
+
+/// Per-session broadcast buffer size. Bounded so a slow subscriber cannot
+/// pin unbounded memory; on overflow the receiver sees `Lagged(n)` and
+/// the connection should fall back to cursor-based replay. The ledger is
+/// still the durable source of truth — broadcast is a live-fan-out shortcut.
+const LIVE_BROADCAST_CAPACITY: usize = 256;
 
 // ---------- Public configuration ----------
 
@@ -243,6 +250,12 @@ struct LedgerInner {
     sessions: HashMap<SessionKey, SessionLedger>,
     /// LRU order: front is most-recently-touched, back is least.
     lru: VecDeque<SessionKey>,
+    /// Per-session live broadcast senders. Lazily created the first time a
+    /// connection calls [`UiProtocolLedger::subscribe`]. Each subsequent
+    /// `append_*` fans the persisted event out to all live receivers. The
+    /// channel is bounded — slow consumers see `Lagged(_)` and should fall
+    /// back to cursor replay rather than block the producer.
+    subscribers: HashMap<SessionKey, broadcast::Sender<LedgeredUiProtocolEvent>>,
     /// Process-lifetime aggregate counters.
     evicted_count: u64,
     dropped_count: u64,
@@ -254,6 +267,7 @@ impl LedgerInner {
         Self {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
+            subscribers: HashMap::new(),
             evicted_count: 0,
             dropped_count: 0,
             on_disk_bytes: 0,
@@ -605,10 +619,69 @@ impl UiProtocolLedger {
             inner.touch_lru(&session_id);
         }
 
-        LedgeredUiProtocolEvent {
+        let ledgered = LedgeredUiProtocolEvent {
             cursor,
             event: stamped,
+        };
+        self.publish_live(&session_id, &ledgered);
+        ledgered
+    }
+
+    /// Fan the just-persisted event out to live subscribers. Runs after the
+    /// disk + ring write so reconnect-replay and live-publish always agree
+    /// on what was emitted. We use `broadcast` so multiple WS connections
+    /// to the same session each see the event; absence of receivers is
+    /// fine — the event is durably persisted and any future reconnect
+    /// will see it via cursor replay.
+    fn publish_live(&self, session_id: &SessionKey, event: &LedgeredUiProtocolEvent) {
+        let inner = self.inner.lock().expect("ui protocol ledger lock");
+        if let Some(sender) = inner.subscribers.get(session_id) {
+            // `send` returns `Err` only if there are zero live receivers;
+            // ignore that — the durable record stands.
+            let _ = sender.send(event.clone());
         }
+    }
+
+    /// Subscribe to live `LedgeredUiProtocolEvent`s for `session_id`. The
+    /// returned `Receiver` observes events appended after this call
+    /// returns. Past events must still be obtained via [`replay_after`]
+    /// (the broadcast channel is fan-out only, not history).
+    ///
+    /// Idempotent: if a sender already exists for the session, a fresh
+    /// receiver is attached to it; otherwise a new bounded sender is
+    /// created.
+    pub(crate) fn subscribe(
+        &self,
+        session_id: &SessionKey,
+    ) -> broadcast::Receiver<LedgeredUiProtocolEvent> {
+        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        if let Some(sender) = inner.subscribers.get(session_id) {
+            return sender.subscribe();
+        }
+        let (tx, rx) = broadcast::channel(LIVE_BROADCAST_CAPACITY);
+        inner.subscribers.insert(session_id.clone(), tx);
+        rx
+    }
+
+    /// Drop the broadcast sender for a session if no live receivers
+    /// remain. Best-effort housekeeping; not required for correctness
+    /// because tokio's broadcast channel will release queued frames once
+    /// every receiver drops them, but it keeps the per-session map from
+    /// growing without bound across long-lived ledgers.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prune_idle_subscribers(&self) -> usize {
+        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let to_remove: Vec<SessionKey> = inner
+            .subscribers
+            .iter()
+            .filter(|(_, sender)| sender.receiver_count() == 0)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let pruned = to_remove.len();
+        for key in to_remove {
+            inner.subscribers.remove(&key);
+        }
+        pruned
     }
 
     fn snapshot_if_session_absent(&self, session_id: &SessionKey) -> Option<DiskSessionSnapshot> {
@@ -1926,5 +1999,143 @@ mod tests {
             outcome.events_recovered
         );
         assert_eq!(outcome.sessions_recovered, sessions.len());
+    }
+
+    // ---------- live publish-subscribe (issue #760) ----------
+
+    fn message_persisted_event(session: &SessionKey, role_str: &str) -> UiNotification {
+        use chrono::Utc;
+        use octos_core::ui_protocol::{MessagePersistedEvent, MessagePersistedSource};
+        UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: None,
+            seq: 0,
+            role: role_str.into(),
+            message_id: "msg-1".into(),
+            client_message_id: None,
+            source: MessagePersistedSource::Tool,
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+        })
+    }
+
+    #[tokio::test]
+    async fn subscribe_delivers_message_persisted_to_live_receiver() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:live".into());
+        let mut rx = ledger.subscribe(&session_id);
+
+        let appended =
+            ledger.append_notification(message_persisted_event(&session_id, "assistant"));
+
+        let received = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("live event arrived")
+            .expect("receiver still open");
+
+        assert_eq!(received.cursor, appended.cursor);
+        assert!(matches!(
+            received.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscribe_fans_out_to_multiple_receivers() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:fanout".into());
+        let mut rx_one = ledger.subscribe(&session_id);
+        let mut rx_two = ledger.subscribe(&session_id);
+
+        let appended = ledger.append_notification(delta(&session_id, "fanout"));
+
+        let one = tokio::time::timeout(StdDuration::from_secs(1), rx_one.recv())
+            .await
+            .expect("rx_one timeout")
+            .expect("rx_one open");
+        let two = tokio::time::timeout(StdDuration::from_secs(1), rx_two.recv())
+            .await
+            .expect("rx_two timeout")
+            .expect("rx_two open");
+
+        assert_eq!(one.cursor, appended.cursor);
+        assert_eq!(two.cursor, appended.cursor);
+    }
+
+    #[tokio::test]
+    async fn subscribe_continues_after_one_receiver_drops() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:drop-one".into());
+        let rx_one = ledger.subscribe(&session_id);
+        let mut rx_two = ledger.subscribe(&session_id);
+        drop(rx_one);
+
+        let appended = ledger.append_notification(delta(&session_id, "after-drop"));
+
+        let received = tokio::time::timeout(StdDuration::from_secs(1), rx_two.recv())
+            .await
+            .expect("rx_two timeout")
+            .expect("rx_two still open after sibling dropped");
+
+        assert_eq!(received.cursor, appended.cursor);
+    }
+
+    #[tokio::test]
+    async fn subscribe_does_not_replay_past_events() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:no-replay".into());
+        ledger.append_notification(delta(&session_id, "before"));
+
+        let mut rx = ledger.subscribe(&session_id);
+
+        // Nothing should be queued — broadcast is live-only fan-out.
+        let try_recv = rx.try_recv();
+        assert!(
+            matches!(try_recv, Err(broadcast::error::TryRecvError::Empty)),
+            "broadcast must not deliver past events; got {try_recv:?}"
+        );
+
+        // Once a new event lands, the receiver does see it.
+        let after = ledger.append_notification(delta(&session_id, "after"));
+        let live = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv open");
+        assert_eq!(live.cursor, after.cursor);
+    }
+
+    #[tokio::test]
+    async fn append_without_subscribers_is_durable_no_op_for_broadcast() {
+        // No subscribe call — append must still succeed and persist.
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:no-sub".into());
+        let appended = ledger.append_notification(delta(&session_id, "alone"));
+        assert_eq!(appended.cursor.seq, 1);
+
+        // Subscriber arriving after the fact only sees future events,
+        // and `replay_after` covers the durable history.
+        let mut rx = ledger.subscribe(&session_id);
+        let after = ledger.append_notification(delta(&session_id, "alone-2"));
+        let live = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv open");
+        assert_eq!(live.cursor, after.cursor);
+    }
+
+    #[test]
+    fn prune_idle_subscribers_drops_orphaned_senders() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:prune".into());
+        let rx = ledger.subscribe(&session_id);
+        // Sanity: prune is a no-op while a receiver is alive.
+        assert_eq!(ledger.prune_idle_subscribers(), 0);
+        drop(rx);
+        // After all receivers drop, the orphaned sender is removed.
+        assert_eq!(ledger.prune_idle_subscribers(), 1);
     }
 }

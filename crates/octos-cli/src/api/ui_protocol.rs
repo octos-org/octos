@@ -98,6 +98,12 @@ type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
 type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
 
+/// Per-connection registry of live ledger-forwarder tasks keyed by session.
+/// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
+/// into the WS write channel for the lifetime of the connection. Dropping
+/// or aborting a handle terminates the pump.
+type SharedLiveForwarders = Arc<tokio::sync::Mutex<HashMap<SessionKey, AbortHandle>>>;
+
 /// Outcome of pushing a frame onto the per-connection writer channel.
 ///
 /// All cases are non-fatal at the channel layer; callers decide how to react.
@@ -1240,6 +1246,8 @@ async fn ui_protocol_connection(
     let ws = WsConnection::new(writer_tx);
     let active_turns = active_turns_registry();
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let live_forwarders: SharedLiveForwarders =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
     let ledger = event_ledger(&state).await;
     // Force lazy init of the diff-preview store on this connection so
@@ -1287,6 +1295,7 @@ async fn ui_protocol_connection(
                     &state,
                     &ledger,
                     &contracts.approvals,
+                    &live_forwarders,
                     connection_profile_id,
                     features,
                     id,
@@ -1392,10 +1401,18 @@ async fn ui_protocol_connection(
     }
 
     abort_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
+    abort_live_forwarders(&live_forwarders).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
+}
+
+async fn abort_live_forwarders(forwarders: &SharedLiveForwarders) {
+    let mut guard = forwarders.lock().await;
+    for (_, abort) in guard.drain() {
+        abort.abort();
+    }
 }
 
 fn parse_ws_text_frame(text: &str) -> Result<RpcRequest<Value>, RpcError> {
@@ -1541,13 +1558,24 @@ fn profile_mismatch_error(
 async fn handle_session_open(
     ws: &WsConnection,
     state: &Arc<AppState>,
-    ledger: &UiProtocolLedger,
+    ledger: &Arc<UiProtocolLedger>,
     approvals: &PendingApprovalStore,
+    live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     params: SessionOpenParams,
 ) {
+    // Subscribe to the live ledger broadcast BEFORE the replay query so any
+    // event that lands while we're still computing replay/opened sits in the
+    // broadcast buffer and gets emitted by the forwarder once we hand it off
+    // (filtered to seq > opened.cursor.seq to avoid duplicating replay).
+    // Issue #760: without this, late background-task artifacts (deep_research
+    // result, mofa podcast, run_pipeline output, TTS audio) reach the ledger
+    // but never push to the live WS.
+    let session_id_for_subscribe = params.session_id.clone();
+    let live_rx = ledger.subscribe(&session_id_for_subscribe);
+
     let outcome = match open_session_result(
         state,
         ledger,
@@ -1560,6 +1588,8 @@ async fn handle_session_open(
     {
         Ok(outcome) => outcome,
         Err(error) => {
+            // Receiver drops on return; broadcast sender stays — future
+            // session/open on this WS just resubscribes.
             let _ = send_rpc_error(ws, Some(id), error);
             return;
         }
@@ -1613,7 +1643,108 @@ async fn handle_session_open(
             UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(event)),
         );
     }
+    let opened_seq = outcome.opened_event.cursor.seq;
+    let session_id = match &outcome.opened_event.event {
+        UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) => {
+            opened.session_id.clone()
+        }
+        _ => session_id_for_subscribe,
+    };
+    let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
+
+    // Hand the broadcast receiver to a per-session forwarder. The previous
+    // forwarder for this session on this connection (if any) is aborted —
+    // a re-`session/open` always restarts the live pump from a fresh
+    // baseline cursor.
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger_for_forwarder,
+        session_id,
+        opened_seq,
+        features,
+        live_rx,
+        live_forwarders.clone(),
+    )
+    .await;
+}
+
+/// Pump live ledger events for `session_id` into the connection's WS write
+/// channel. Filters out events with `cursor.seq <= baseline_seq` (which
+/// were already shipped via replay) and applies the same capability
+/// gating as the live-emit path. The task ends when the WS write channel
+/// closes (peer gone), the broadcast sender is dropped (rare), or the
+/// connection cleanup aborts the handle.
+async fn spawn_live_forwarder(
+    ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
+    session_id: SessionKey,
+    baseline_seq: u64,
+    features: ConnectionUiFeatures,
+    mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
+    forwarders: SharedLiveForwarders,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let session_for_log = session_id.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.cursor.seq <= baseline_seq {
+                        continue;
+                    }
+                    if !live_event_passes_capability_filter(&event.event, features) {
+                        continue;
+                    }
+                    match send_ledger_event_durable(&ws, &ledger, event.event) {
+                        Ok(()) => {}
+                        Err(SendError::Closed) => break,
+                        // BackpressureDrop: `send_ledger_event_durable`
+                        // already opportunistically emits replay_lossy; keep
+                        // pumping so a recovered consumer gets caught up.
+                        Err(_) => {}
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    // Slow consumer fell behind. The ledger is durable; the
+                    // client's cursor is the source of truth and a follow-up
+                    // session/hydrate or reconnect with the last cursor
+                    // catches them up. Log and keep pumping new events.
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        session_id = %session_for_log.0,
+                        "live ledger forwarder lagged; client must rehydrate via cursor"
+                    );
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    let abort = task.abort_handle();
+    // Replace any prior forwarder for this session on this connection —
+    // re-`session/open` restarts the live pump from a fresh baseline.
+    let mut guard = forwarders.lock().await;
+    if let Some(prev) = guard.insert(session_id, abort) {
+        prev.abort();
+    }
+}
+
+/// Mirror the capability filter at `ui_protocol.rs` session/open replay
+/// loop (UPCR-2026-012): a connection that did not negotiate
+/// `event.message_persisted.v1` must not receive `message/persisted`
+/// notifications via the live broadcast either. Other notifications pass
+/// unchanged today; future capability-gated kinds get added here.
+fn live_event_passes_capability_filter(
+    event: &UiProtocolLedgerEvent,
+    features: ConnectionUiFeatures,
+) -> bool {
+    if !features.message_persisted {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) = event {
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug)]
@@ -9367,5 +9498,231 @@ mod tests {
             parsed.get("thread_id").is_none(),
             "unbound reporter must not stamp thread_id (legacy compat): {parsed}"
         );
+    }
+
+    // ========================================================================
+    // Live ledger publish-subscribe (issue #760, Phase C blocker)
+    // ========================================================================
+
+    fn message_persisted_for(session: &SessionKey) -> UiNotification {
+        UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: None,
+            seq: 0,
+            role: "assistant".into(),
+            message_id: "msg-1".into(),
+            client_message_id: None,
+            source: MessagePersistedSource::Tool,
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+        })
+    }
+
+    fn features_with_message_persisted(enabled: bool) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            message_persisted: enabled,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Decodes a queued WS frame back to its JSON-RPC method name (or
+    /// returns `None` for non-text / non-JSON frames). Lets tests assert
+    /// the live broadcast forwarder routed a notification, without
+    /// coupling to whatever frame_for serialization shape is.
+    fn frame_method(frame: &WsMessage) -> Option<String> {
+        match frame {
+            WsMessage::Text(text) => {
+                let v: Value = serde_json::from_str(text).ok()?;
+                v.get("method").and_then(Value::as_str).map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_pushes_message_persisted_to_subscribed_ws() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:livefwd".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Background-task path appends late artifact AFTER the WS is wired up.
+        ledger.append_notification(message_persisted_for(&session_id));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("ws received frame within 1s")
+            .expect("ws channel still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            "live forwarder must emit message/persisted; frame={frame:?}"
+        );
+
+        // Cleanup: aborting the forwarder must not panic and must release
+        // the receiver so subsequent prune_idle_subscribers reclaims the slot.
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:baseline".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Pre-existing event so baseline_seq=1 represents "we already sent
+        // this in replay; do not re-emit live."
+        let baseline = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(baseline.cursor.seq, 1);
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            baseline.cursor.seq,
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // A new append must surface; the forwarder filters strictly on
+        // seq > baseline.
+        let next = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(next.cursor.seq, 2);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("ws received frame within 1s")
+            .expect("ws channel still open");
+        let v: Value = match &frame {
+            WsMessage::Text(t) => serde_json::from_str(t).expect("valid json"),
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        assert_eq!(
+            v.get("method").and_then(Value::as_str),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        // No further frames are queued (only one live event emitted).
+        assert!(rx.try_recv().is_err(), "no more frames expected");
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_respects_message_persisted_capability_filter() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:nofeat".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            features_with_message_persisted(false),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        ledger.append_notification(message_persisted_for(&session_id));
+        // Give the forwarder a chance to observe + filter.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "client without event.message_persisted.v1 must not receive message/persisted"
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
+        let (ws_a, mut rx_a) = ws_connection_for_test(16);
+        let (ws_b, mut rx_b) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:fanout".into());
+        let forwarders_a: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let forwarders_b: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let rx_a_live = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_a.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            features_with_message_persisted(true),
+            rx_a_live,
+            forwarders_a.clone(),
+        )
+        .await;
+        let rx_b_live = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_b.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            features_with_message_persisted(true),
+            rx_b_live,
+            forwarders_b.clone(),
+        )
+        .await;
+
+        ledger.append_notification(message_persisted_for(&session_id));
+
+        let frame_a = tokio::time::timeout(std::time::Duration::from_secs(1), rx_a.recv())
+            .await
+            .expect("ws_a frame")
+            .expect("ws_a open");
+        let frame_b = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+            .await
+            .expect("ws_b frame")
+            .expect("ws_b open");
+        assert_eq!(
+            frame_method(&frame_a).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+        assert_eq!(
+            frame_method(&frame_b).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        // Disconnect ws_a; ws_b must continue receiving subsequent events.
+        abort_live_forwarders(&forwarders_a).await;
+        drop(rx_a);
+        ledger.append_notification(message_persisted_for(&session_id));
+        let frame_b2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+            .await
+            .expect("ws_b frame after sibling drop")
+            .expect("ws_b still open");
+        assert_eq!(
+            frame_method(&frame_b2).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        abort_live_forwarders(&forwarders_b).await;
     }
 }
