@@ -579,7 +579,15 @@ pub async fn run_stream_forwarder(
             StreamProgressEvent::RawSse { json } => {
                 // Forward raw SSE JSON directly to the channel.
                 // Only ApiChannel implements this; other channels ignore it.
-                let _ = channel.send_raw_sse(&chat_id, &json).await;
+                //
+                // PR F (M8.10 thread-binding chain): use the `_bound`
+                // variant so the originating turn's `thread_id`
+                // (captured at this forwarder's task spawn) overrides
+                // any stale `thread_id` field embedded in `json` and
+                // short-circuits the api_channel's sticky-map fallback.
+                let _ = channel
+                    .send_raw_sse_bound(&chat_id, &json, thread_id.as_deref())
+                    .await;
             }
         }
     }
@@ -681,10 +689,23 @@ async fn do_flush(
     thread_id: Option<&str>,
 ) {
     if let Some(mid) = message_id.as_ref() {
+        // PR F (M8.10 thread-binding chain `#649 → #740`): use the
+        // `_bound` variants so the originating turn's `thread_id`
+        // (captured at this forwarder's task spawn and threaded through
+        // `flush_to_channel`/`finish_flush_to_channel`) is the ONLY
+        // input to the api_channel's wire-side `thread_id` resolution
+        // when the bound id is present. Falling back to the legacy
+        // (non-bound) trait methods here re-opens LEAK 2 — the sticky
+        // map rotates under rapid-fire so late deltas of an earlier
+        // turn would mis-route to a later turn's bubble.
         let result = if finish {
-            channel.finish_stream(chat_id, mid, text).await
+            channel
+                .finish_stream_bound(chat_id, mid, text, thread_id)
+                .await
         } else {
-            channel.edit_message(chat_id, mid, text).await
+            channel
+                .edit_message_bound(chat_id, mid, text, thread_id)
+                .await
         };
         if let Err(e) = result {
             warn!("stream edit failed: {e}");
@@ -752,9 +773,15 @@ mod tests {
     use octos_core::{InboundMessage, METADATA_SENDER_USER_ID};
     use tokio::sync::{Mutex, mpsc};
 
+    /// PR F (M8.10): record every `_bound` call's `thread_id`
+    /// argument so the test can assert the forwarder threads it
+    /// through the trait correctly.
+    type BoundCall = (&'static str, Option<String>);
+
     #[derive(Default)]
     struct MockChannel {
         sent: Arc<Mutex<Vec<OutboundMessage>>>,
+        bound_thread_ids: Arc<Mutex<Vec<BoundCall>>>,
     }
 
     #[async_trait]
@@ -779,6 +806,47 @@ mod tests {
 
         fn supports_edit(&self) -> bool {
             true
+        }
+
+        async fn edit_message_bound(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _new_content: &str,
+            thread_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.bound_thread_ids
+                .lock()
+                .await
+                .push(("edit_message_bound", thread_id.map(str::to_string)));
+            Ok(())
+        }
+
+        async fn finish_stream_bound(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _final_content: &str,
+            thread_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.bound_thread_ids
+                .lock()
+                .await
+                .push(("finish_stream_bound", thread_id.map(str::to_string)));
+            Ok(())
+        }
+
+        async fn send_raw_sse_bound(
+            &self,
+            _chat_id: &str,
+            _json: &str,
+            thread_id: Option<&str>,
+        ) -> eyre::Result<()> {
+            self.bound_thread_ids
+                .lock()
+                .await
+                .push(("send_raw_sse_bound", thread_id.map(str::to_string)));
+            Ok(())
         }
     }
 
@@ -1109,6 +1177,62 @@ mod tests {
             first2.metadata.get("thread_id").is_none(),
             "empty-string thread_id must be treated as absent, got {}",
             first2.metadata
+        );
+    }
+
+    /// PR F (M8.10 thread-binding chain `#649 → #740`): when
+    /// `do_flush` (via `flush_to_channel`/`finish_flush_to_channel`)
+    /// receives a non-`None` `thread_id`, it must thread that through
+    /// the `_bound` Channel trait methods rather than the legacy
+    /// `edit_message`/`finish_stream` (which fall back to the
+    /// api_channel's per-chat sticky map). The mock asserts the actual
+    /// argument observed.
+    #[tokio::test]
+    async fn do_flush_passes_thread_id_to_bound_methods() {
+        let mock = Arc::new(MockChannel::default());
+        let bound_calls = Arc::clone(&mock.bound_thread_ids);
+        let channel: Arc<dyn Channel> = mock.clone();
+
+        // edit path: message_id is set so do_flush dispatches to
+        // `edit_message_bound`. The forwarder's captured `thread_id` is
+        // forwarded as Some("cmid-A").
+        let mut message_id = Some("$stream-1".to_string());
+        let mut no_edit_support = false;
+        flush_to_channel(
+            &channel,
+            "chat-A",
+            "hello",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-A"),
+        )
+        .await;
+        // finish path: dispatches to `finish_stream_bound`.
+        finish_flush_to_channel(
+            &channel,
+            "chat-A",
+            "hello (final)",
+            &mut message_id,
+            &mut no_edit_support,
+            None,
+            Some("cmid-A"),
+        )
+        .await;
+
+        let calls = bound_calls.lock().await.clone();
+        assert!(
+            calls.iter().any(
+                |(name, tid)| *name == "edit_message_bound" && tid.as_deref() == Some("cmid-A")
+            ),
+            "expected edit_message_bound call with thread_id=cmid-A, got: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(name, tid)| *name == "finish_stream_bound"
+                    && tid.as_deref() == Some("cmid-A")),
+            "expected finish_stream_bound call with thread_id=cmid-A, got: {calls:?}"
         );
     }
 }

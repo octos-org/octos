@@ -490,6 +490,31 @@ async fn chat_streaming(
                             }
                         } else {
                             let is_assistant = msg.role == MessageRole::Assistant;
+                            // PR F (M8.10): pre-stamp `thread_id` on
+                            // Assistant/Tool rows so the canonical
+                            // persist's new-write fail-closed split
+                            // accepts them. Bind to the originating
+                            // `client_message_id` (the REST `chat`
+                            // endpoint requires it for proper threading).
+                            // When the request didn't supply one (legacy
+                            // clients), fall back to a UUIDv7 so the
+                            // persist still succeeds — these rows would
+                            // be invisible to per-thread routing
+                            // anyway, but at least they survive reload.
+                            if to_save.thread_id.is_none()
+                                && matches!(
+                                    to_save.role,
+                                    MessageRole::Assistant | MessageRole::Tool
+                                )
+                            {
+                                to_save.thread_id = Some(
+                                    client_message_id
+                                        .as_deref()
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                                );
+                            }
                             match persist_chat_message_through_canonical(
                                 &sessions,
                                 &session_key,

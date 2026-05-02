@@ -612,6 +612,19 @@ fn inject_thread_id(value: &mut serde_json::Value, thread_id: Option<&str>) {
     }
 }
 
+/// PR F (M8.10 thread-binding): record a `last_thread_id_fallback_total`
+/// counter increment when wire-side `thread_id` resolution fell back to the
+/// per-chat sticky map instead of using a caller-supplied bound id. Pure
+/// observability — gives the deploy soak something to alert on if a new
+/// caller forgets to wire `_bound` variants.
+fn record_thread_id_fallback(site: &'static str) {
+    counter!(
+        "octos_last_thread_id_fallback_total",
+        "site" => site.to_string()
+    )
+    .increment(1);
+}
+
 /// Read the `thread_id` (if any) from outbound metadata. Empty strings are
 /// treated as absent.
 fn outbound_thread_id(metadata: &serde_json::Value) -> Option<String> {
@@ -1173,6 +1186,22 @@ impl Channel for ApiChannel {
     }
 
     async fn edit_message(&self, chat_id: &str, message_id: &str, new_content: &str) -> Result<()> {
+        // PR F (M8.10): forward to the bound implementation with no
+        // explicit override. Legacy callers that haven't migrated to
+        // `edit_message_bound` continue to fall back to the sticky map.
+        // This keeps non-API channels (Telegram/Discord/etc.) bug-for-bug
+        // compatible and gives deprecated callers a single place to land.
+        self.edit_message_bound(chat_id, message_id, new_content, None)
+            .await
+    }
+
+    async fn edit_message_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        bound: Option<&str>,
+    ) -> Result<()> {
         if new_content.is_empty() {
             return Ok(());
         }
@@ -1181,20 +1210,27 @@ impl Channel for ApiChannel {
         // demultiplexed by web clients running multiple in-flight threads
         // against the same chat_id.
         let (_, decoded_thread_id) = decode_sse_message_id(message_id);
-        // M8.10 follow-up (#632): the synthetic message_id is bound by
-        // `send_with_id`, but the FIRST `edit_message` of a turn can fire
-        // BEFORE that bind happens (the placeholder bubble's first text
-        // streams in via `flush_to_channel`'s `send_with_id` call, but
-        // `do_flush` builds outbound metadata that lacks `thread_id`). Fall
-        // back to the sticky map populated by earlier `send`/`send_with_id`
-        // events on the same chat_id so the streaming `token`/`replace`
-        // payload still carries the right thread.
-        let sticky_thread_id = if decoded_thread_id.is_none() {
+        // PR F (M8.10): resolution priority is `bound > decoded > sticky`.
+        // Bound wins so the originating turn's thread_id beats any stale
+        // value that may have been encoded into `message_id` (rare but
+        // possible if the encode/decode pair races a sticky rotation).
+        // Sticky is consulted ONLY when both bound and decoded are absent
+        // — that's the legacy `edit_message` callers' compat surface.
+        let bound_thread_id = bound.filter(|s| !s.is_empty());
+        let resolved_thread_id = bound_thread_id.or(decoded_thread_id);
+        let sticky_thread_id = if resolved_thread_id.is_none() {
             self.sticky_thread_id(chat_id).await
         } else {
             None
         };
-        let thread_id = decoded_thread_id.or(sticky_thread_id.as_deref());
+        let thread_id = resolved_thread_id.or(sticky_thread_id.as_deref());
+        // Increment the fallback metric ONLY when the sticky branch was
+        // the actual source — codex's structural critique
+        // (`/tmp/codex-arch-final-review.log:12137+`) flags this as the
+        // observability hook that catches new callers forgetting to bind.
+        if bound_thread_id.is_none() && decoded_thread_id.is_none() && sticky_thread_id.is_some() {
+            record_thread_id_fallback("edit_message");
+        }
         // Update the sticky map whenever we resolved a thread_id, so a
         // subsequent edit on a different (legacy single-segment) message_id
         // still recovers it.
@@ -1249,33 +1285,69 @@ impl Channel for ApiChannel {
     }
 
     async fn send_raw_sse(&self, chat_id: &str, json: &str) -> Result<()> {
+        // PR F (M8.10): forward to the bound implementation with no
+        // explicit override. Legacy callers fall back to sticky/decoded
+        // payload. Non-API channels' default trait impl makes this a no-op.
+        self.send_raw_sse_bound(chat_id, json, None).await
+    }
+
+    async fn send_raw_sse_bound(
+        &self,
+        chat_id: &str,
+        json: &str,
+        bound: Option<&str>,
+    ) -> Result<()> {
         // M8.10 follow-up (#632): the stream reporter forwards discrete
         // events (thinking, response, tool_start, ...) here as pre-rendered
         // JSON. When the reporter constructed its payload before
         // `with_thread_id` had been bound, the JSON arrives without a
-        // `thread_id` field. Inject from the sticky map so wire events are
-        // still tagged with the right thread.
+        // `thread_id` field.
+        //
+        // PR F: resolution priority is `bound > payload > sticky`.
+        // - `bound`: caller-supplied via `send_raw_sse_bound` (the stream
+        //   forwarder's captured `thread_id`). When present, it OVERWRITES
+        //   any `thread_id` field on the JSON payload — this closes the
+        //   wire-side leak where a forwarder built its payload before its
+        //   reporter bound the thread, leaving an empty/wrong `thread_id`
+        //   in the rendered JSON.
+        // - `payload`: pre-rendered `thread_id` field on the JSON. Trusted
+        //   when no bound id was supplied (legacy callers).
+        // - `sticky`: per-chat sticky map (rotates under rapid-fire — the
+        //   reason `_bound` exists in the first place). Increments
+        //   `last_thread_id_fallback_total` so soak alerts on new callers
+        //   that forget to wire `_bound`.
+        let bound_thread_id = bound.filter(|s| !s.is_empty());
         let payload = match serde_json::from_str::<serde_json::Value>(json) {
             Ok(mut value) => {
-                let already_has = value
-                    .get("thread_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .is_some();
-                if already_has {
-                    if let Some(tid) = value
-                        .get("thread_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                    {
-                        self.remember_thread_id(chat_id, Some(tid.as_str())).await;
-                    }
-                    json.to_string()
-                } else if let Some(sticky) = self.sticky_thread_id(chat_id).await {
-                    inject_thread_id(&mut value, Some(sticky.as_str()));
+                if let Some(tid) = bound_thread_id {
+                    // Bound wins: overwrite any payload thread_id (or insert
+                    // when absent). Update sticky so subsequent untagged
+                    // legacy events on the same chat_id can recover.
+                    inject_thread_id(&mut value, Some(tid));
+                    self.remember_thread_id(chat_id, Some(tid)).await;
                     value.to_string()
                 } else {
-                    json.to_string()
+                    let already_has = value
+                        .get("thread_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .is_some();
+                    if already_has {
+                        if let Some(tid) = value
+                            .get("thread_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        {
+                            self.remember_thread_id(chat_id, Some(tid.as_str())).await;
+                        }
+                        json.to_string()
+                    } else if let Some(sticky) = self.sticky_thread_id(chat_id).await {
+                        record_thread_id_fallback("send_raw_sse");
+                        inject_thread_id(&mut value, Some(sticky.as_str()));
+                        value.to_string()
+                    } else {
+                        json.to_string()
+                    }
                 }
             }
             Err(_) => json.to_string(),
@@ -1364,7 +1436,7 @@ impl ApiChannel {
         &self,
         chat_id: &str,
         topic: Option<&str>,
-        message: Message,
+        mut message: Message,
     ) -> Option<MessageInfo> {
         let key =
             current_profile_api_session_key_with_topic(self.profile_id.as_deref(), chat_id, topic);
@@ -1372,6 +1444,31 @@ impl ApiChannel {
             let sess = self.sessions.lock().await;
             sess.data_dir()
         };
+
+        // PR F (M8.10) — codex review P1 #3: API-channel fail-closed
+        // posture. The previous "derive from most-recent user" fallback
+        // is exactly the bug shape PR F closes for concurrent web turns
+        // (LEAK 1). Running it inside `persist_to_session` would re-open
+        // the leak. Instead, when a caller hands us an unbound
+        // Assistant/Tool row, prefer the per-chat sticky map (which the
+        // streaming forwarder maintains for THIS turn — wire-side state
+        // for the live request). If sticky is empty too, synthesize a
+        // UUIDv7 so the persist still succeeds — those rare orphan rows
+        // would be unrouted on the wire anyway, and at least the disk
+        // write is intact for legacy replay. Increments
+        // `octos_last_thread_id_fallback_total{site="persist_to_session"}`
+        // so soak alerts on new API call sites that forgot to bind.
+        if message.thread_id.is_none()
+            && matches!(
+                message.role,
+                octos_core::MessageRole::Assistant | octos_core::MessageRole::Tool
+            )
+        {
+            let sticky = self.sticky_thread_id(chat_id).await;
+            let resolved = sticky.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+            record_thread_id_fallback("persist_to_session");
+            message.thread_id = Some(resolved);
+        }
 
         let result = crate::session::persist_message_through_canonical_path(
             &data_dir,
@@ -2662,7 +2759,10 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
-            thread_id: None,
+            // PR F (M8.10): pre-stamp thread_id for the test helper so the
+            // new-write fail-closed split accepts it. Production code uses
+            // `Message::assistant_with_thread`.
+            thread_id: Some("test-thread".to_string()),
             timestamp: Utc::now(),
         }
     }
@@ -3765,12 +3865,35 @@ mod tests {
     /// Mirrors `SessionActor::deliver_background_notification` for spawn_only
     /// file deliveries — the actor stamps `_history_persisted=true` on the
     /// outbound, so ApiChannel never writes for these.
+    ///
+    /// PR F (M8.10): pre-stamp `thread_id` on Assistant/Tool rows before
+    /// the canonical persist's new-write fail-closed split runs. Mirrors
+    /// the production `fallback_thread_id_for_assistant` helper.
     async fn actor_persist_to_per_user(
         data_dir: &Path,
         session_key: &SessionKey,
-        message: Message,
+        mut message: Message,
     ) {
         let mut handle = crate::session::SessionHandle::open(data_dir, session_key);
+        if message.thread_id.is_none()
+            && matches!(
+                message.role,
+                octos_core::MessageRole::Assistant | octos_core::MessageRole::Tool
+            )
+        {
+            message.thread_id = handle
+                .session()
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, octos_core::MessageRole::User))
+                .and_then(|user| {
+                    user.thread_id
+                        .clone()
+                        .or_else(|| user.client_message_id.clone())
+                })
+                .or_else(|| Some(uuid::Uuid::now_v7().to_string()));
+        }
         handle.add_message_with_seq(message).await.unwrap();
     }
 
@@ -4345,13 +4468,22 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("first result"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant_with_thread(
+                        "first result",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
+                )
                 .await
                 .unwrap();
             manager
                 .add_message_with_seq(
                     &key,
-                    Message::assistant("✓ report completed — file delivered"),
+                    Message::assistant_with_thread(
+                        "✓ report completed — file delivered",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -4405,7 +4537,13 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("first result"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant_with_thread(
+                        "first result",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
+                )
                 .await
                 .unwrap();
             manager
@@ -4419,7 +4557,8 @@ mod tests {
                         tool_call_id: None,
                         reasoning_content: None,
                         client_message_id: None,
-                        thread_id: None,
+                        // PR F: pre-stamp for the new-write fail-closed split.
+                        thread_id: Some("test-thread".to_string()),
                         timestamp: chrono::Utc::now(),
                     },
                 )
@@ -4578,7 +4717,10 @@ mod tests {
             manager
                 .add_message_with_seq(
                     &key,
-                    Message::assistant("John Ternus is Apple's SVP of hardware engineering."),
+                    Message::assistant_with_thread(
+                        "John Ternus is Apple's SVP of hardware engineering.",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -4634,7 +4776,10 @@ mod tests {
             manager
                 .add_message_with_seq(
                     &key,
-                    Message::assistant("好的，已记住你的时区为 PDT（America/Los_Angeles）。"),
+                    Message::assistant_with_thread(
+                        "好的，已记住你的时区为 PDT（America/Los_Angeles）。",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
                 )
                 .await
                 .unwrap();
@@ -6157,7 +6302,10 @@ mod tests {
             let mut sess = sessions.lock().await;
             sess.add_message(
                 &key,
-                Message::assistant("✓ fm_tts completed — file delivered"),
+                Message::assistant_with_thread(
+                    "✓ fm_tts completed — file delivered",
+                    octos_core::ThreadId::new("test-thread"),
+                ),
             )
             .await
             .unwrap();
@@ -6346,11 +6494,23 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("first result"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant_with_thread(
+                        "first result",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
+                )
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("second result"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant_with_thread(
+                        "second result",
+                        octos_core::ThreadId::new("test-thread"),
+                    ),
+                )
                 .await
                 .unwrap();
         }
@@ -6406,7 +6566,13 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("two"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant_with_thread(
+                        "two",
+                        octos_core::ThreadId::new("test-thread-1"),
+                    ),
+                )
                 .await
                 .unwrap();
             manager
@@ -6414,7 +6580,13 @@ mod tests {
                 .await
                 .unwrap();
             manager
-                .add_message_with_seq(&key, Message::assistant("four"))
+                .add_message_with_seq(
+                    &key,
+                    Message::assistant_with_thread(
+                        "four",
+                        octos_core::ThreadId::new("test-thread-2"),
+                    ),
+                )
                 .await
                 .unwrap();
         }
@@ -6589,5 +6761,253 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // PR F (M8.10 thread-binding chain `#649 → #740`) — `_bound` variants
+    // ------------------------------------------------------------------
+    //
+    // The `_bound` methods (`edit_message_bound`, `send_raw_sse_bound`)
+    // implement codex's structural critique: when the originating turn's
+    // `thread_id` is in the caller's hand, the wire-side resolution must
+    // be `bound > decoded > sticky`, not the legacy `decoded > sticky`.
+    // The sticky fallback rotates per-chat under rapid-fire, so the
+    // legacy path mis-routed late deltas of an earlier turn into a later
+    // turn's bubble. These tests pin that invariant.
+
+    /// PR F: the bound-turn-override invariant — when the caller supplies
+    /// a `thread_id` via `_bound`, BOTH `edit_message_bound` AND
+    /// `send_raw_sse_bound` must emit that thread_id even if the sticky
+    /// map has rotated past the originating turn. Drives the same
+    /// rapid-fire setup the live soak hit on mini3:
+    ///   - chat `c`, sticky map rotated A → B → C
+    ///   - the user persist for cmid A is the typed `assistant_with_thread`
+    ///     constructor (no derive-from-history fallback)
+    ///   - edit_message_bound + send_raw_sse_bound for turn A's stream
+    ///     forwarder
+    /// The invariant: every wire payload tagged with `thread_id="A"`,
+    /// even though the sticky map points to `"C"`.
+    #[tokio::test]
+    async fn rapid_fire_bound_turn_overrides_sticky_for_persist_edit_and_raw_sse() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-rapid-bound".into(), tx);
+        }
+
+        // Sticky rotated A → B → C — by the time any of A's late deltas
+        // reach the channel, sticky has moved on to C. This is the
+        // production race window the bug class kept tripping over.
+        for cmid in ["A", "B", "C"] {
+            ch.remember_thread_id("chat-rapid-bound", Some(cmid)).await;
+        }
+
+        // Persist Assistant for turn A using the typed
+        // `assistant_with_thread` constructor — codex's PR-A type-system
+        // enforcement. The persist must produce a row pinned to A
+        // regardless of sticky's "most recent user is C" answer.
+        let mut sessions = ch.sessions.lock().await;
+        let session_key = octos_core::SessionKey::new("api", "chat-rapid-bound");
+        // Seed the session with three siblings so the legacy
+        // "derive from most-recent user" walk would find C — the bug
+        // shape the bound path beats.
+        for cmid in ["A", "B", "C"] {
+            let user = octos_core::Message::user_with_cmid(
+                format!("question-{cmid}"),
+                octos_core::ClientMessageId::new(cmid),
+            );
+            sessions
+                .add_message(&session_key, user)
+                .await
+                .expect("user persist");
+        }
+        let assistant_for_a = octos_core::Message::assistant_with_thread(
+            "answer for A",
+            octos_core::ThreadId::new("A"),
+        );
+        sessions
+            .add_message(&session_key, assistant_for_a)
+            .await
+            .expect("assistant persist");
+        // Reload the in-memory session and assert the assistant row
+        // lands under thread A, NOT C (the most-recent user). This is
+        // the LEAK 1 closing assertion.
+        let session = sessions.get_or_create(&session_key).await;
+        let assistant_row = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, octos_core::MessageRole::Assistant))
+            .expect("assistant present");
+        assert_eq!(
+            assistant_row.thread_id.as_deref(),
+            Some("A"),
+            "PR F LEAK 1: typed `assistant_with_thread` must persist with the bound \
+             thread_id (`A`), NOT derive `C` from sticky/most-recent-user. \
+             Got: {:?}",
+            assistant_row.thread_id,
+        );
+        drop(sessions);
+
+        // LEAK 2 wire path: every emitted SSE event for turn A must carry
+        // `thread_id=A`, even though sticky points to C. We exercise both
+        // the `send_raw_sse_bound` path (used by the stream forwarder for
+        // discrete events: thinking, tool_start, ...) and the
+        // `edit_message_bound` path (used for streaming `token`/`replace`
+        // deltas).
+
+        // Step 1: send_raw_sse_bound with bound=A. Even though the JSON
+        // payload has NO thread_id and sticky points to C, the bound
+        // wins.
+        let raw = serde_json::json!({"type": "thinking", "iteration": 0});
+        ch.send_raw_sse_bound("chat-rapid-bound", &raw.to_string(), Some("A"))
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            parsed["thread_id"], "A",
+            "send_raw_sse_bound must emit bound=A, NOT sticky=C. event: {parsed}"
+        );
+
+        // Step 2: send_raw_sse_bound with bound=A AND a stale thread_id
+        // already on the payload. Bound MUST overwrite — codex's spec at
+        // /tmp/codex-arch-final-review.log: bound > decoded > sticky.
+        let raw_with_stale = serde_json::json!({
+            "type": "thinking",
+            "iteration": 1,
+            "thread_id": "C-stale"
+        });
+        ch.send_raw_sse_bound("chat-rapid-bound", &raw_with_stale.to_string(), Some("A"))
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            parsed["thread_id"], "A",
+            "send_raw_sse_bound must OVERWRITE stale payload thread_id (C-stale) with bound (A). event: {parsed}"
+        );
+
+        // Step 3: send_with_id seeds an encoded message_id (production
+        // path captures cmid in the synthetic id). Then edit_message_bound
+        // with bound=A must emit thread_id=A even when bound matches the
+        // encoded id (no sticky consulted).
+        let initial = OutboundMessage {
+            channel: "api".into(),
+            chat_id: "chat-rapid-bound".into(),
+            content: "Hi".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({"streaming": true, "thread_id": "A"}),
+        };
+        let msg_id = ch.send_with_id(&initial).await.unwrap().unwrap();
+        // Drain the initial replace event from send_with_id.
+        let _ = rx.recv().await.unwrap();
+
+        ch.edit_message_bound("chat-rapid-bound", &msg_id, "Hi there", Some("A"))
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            parsed["thread_id"], "A",
+            "edit_message_bound must emit bound=A, NOT sticky=C. event: {parsed}"
+        );
+    }
+
+    /// PR F: when `edit_message_bound` is called with an explicit `bound`
+    /// id, the sticky map MUST NOT be consulted (and the
+    /// `last_thread_id_fallback_total` metric MUST NOT increment from
+    /// this call). Mirrors the codex-spec resolution priority.
+    #[tokio::test]
+    async fn edit_message_bound_does_not_consult_sticky_when_explicit_id_supplied() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-bound-only".into(), tx);
+        }
+
+        // Sticky points to Z — should be ignored.
+        ch.remember_thread_id("chat-bound-only", Some("Z")).await;
+
+        // Encoded message_id decodes to X — should be overridden by bound A.
+        let encoded = encode_sse_message_id("chat-bound-only", Some("X"));
+
+        // Seed last_content for chat-bound-only/A so the edit emits a
+        // `token` delta.
+        ch.last_content.lock().await.insert(
+            last_content_key("chat-bound-only", Some("A")),
+            "Hi".to_string(),
+        );
+
+        ch.edit_message_bound("chat-bound-only", &encoded, "Hi there", Some("A"))
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        // Bound wins: not X (decoded), not Z (sticky).
+        assert_eq!(
+            parsed["thread_id"], "A",
+            "edit_message_bound must use bound=A, ignoring decoded=X and sticky=Z. event: {parsed}"
+        );
+    }
+
+    /// PR F: when `send_raw_sse_bound` is called with a bound id and the
+    /// JSON payload carries a STALE thread_id, bound MUST overwrite.
+    /// Without the overwrite, a forwarder that pre-rendered its payload
+    /// before its reporter rebound would leak the stale id on the wire —
+    /// the exact issue codex flagged at
+    /// `/tmp/codex-arch-final-review.log:12137+`.
+    #[tokio::test]
+    async fn send_raw_sse_bound_overwrites_stale_thread_id_in_payload() {
+        let ch = ApiChannel::new(
+            8091,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            test_sessions(),
+            Some(TEST_PROFILE_ID.to_string()),
+        );
+        let (tx, mut rx) = new_sse_channel();
+        {
+            let mut pending = ch.pending.lock().await;
+            pending.insert("chat-overwrite".into(), tx);
+        }
+
+        let payload = serde_json::json!({
+            "type": "thinking",
+            "iteration": 0,
+            "thread_id": "stale-Z",
+        });
+        ch.send_raw_sse_bound("chat-overwrite", &payload.to_string(), Some("fresh-A"))
+            .await
+            .unwrap();
+        let event = rx.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(
+            parsed["thread_id"], "fresh-A",
+            "send_raw_sse_bound must overwrite stale payload thread_id with bound id. event: {parsed}"
+        );
+
+        // Sticky map should now reflect the bound id (so a subsequent
+        // legacy untagged event recovers it correctly).
+        assert_eq!(
+            ch.sticky_thread_id("chat-overwrite").await.as_deref(),
+            Some("fresh-A"),
+            "send_raw_sse_bound must update the sticky map to the bound id"
+        );
     }
 }
