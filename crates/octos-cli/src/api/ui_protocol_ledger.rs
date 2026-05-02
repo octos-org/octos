@@ -151,6 +151,12 @@ impl UiProtocolLedgerEvent {
                 }) => {
                     *event_cursor = Some(cursor);
                 }
+                // UPCR-2026-012: stamp the assigned cursor onto the
+                // `MessagePersisted` payload so the wire `cursor` field
+                // matches the ledger envelope's cursor.
+                UiNotification::MessagePersisted(persisted) => {
+                    persisted.cursor = cursor;
+                }
                 _ => {}
             }
         }
@@ -816,6 +822,176 @@ impl UiProtocolLedger {
         }
     }
 
+    /// Atomically snapshot the session's events ≥ `after` AND the head cursor
+    /// at the moment of the snapshot. Used by `session/hydrate`
+    /// (UPCR-2026-009) and `turn/state/get` (UPCR-2026-011) to satisfy
+    /// codex's "snapshot+cursor must be atomic, or reload misses events
+    /// between them" ask: a single lock acquisition reads both, so a
+    /// concurrent appender cannot land an event with cursor ≤ snapshot.cursor
+    /// that the client did not observe.
+    ///
+    /// Falls through to `replay_after` for the bulk of the work (which has
+    /// the disk-recovery path); the difference is that this method returns
+    /// the head cursor that pairs with the returned events. Callers
+    /// (handlers) use the returned cursor in their result payload — a
+    /// follow-up `session/hydrate` with `after = result.cursor` is
+    /// guaranteed to see only events strictly after the snapshot.
+    pub(crate) fn snapshot_with_cursor(
+        &self,
+        session_id: &SessionKey,
+        after: Option<&UiCursor>,
+    ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
+        // Atomicity contract (codex review #1): events and the returned
+        // cursor are observed under a single lock acquisition. Concurrent
+        // appenders see the same `inner` mutex, so no event can land
+        // between the two reads with a seq ≤ the head we return — a
+        // follow-up `session/hydrate { after: cursor }` returns only
+        // strictly-newer events.
+        //
+        // When `after` is `None` we materialise an seq-0 cursor (the
+        // disk replay path treats that as "from the beginning"). The
+        // disk-snapshot read happens BEFORE we take the lock — that's
+        // OK because (a) disk records are append-only, (b) the lock is
+        // held while we observe `next_seq` and the in-memory ring, and
+        // (c) any append concurrent with our disk read must take the
+        // lock to update `next_seq`, so its cursor will be > our
+        // returned head_seq. The pair we return therefore reflects a
+        // single consistent snapshot moment.
+        let default_cursor;
+        let after = match after {
+            Some(after) => after,
+            None => {
+                default_cursor = UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                };
+                &default_cursor
+            }
+        };
+        validate_cursor_stream(session_id, after)?;
+
+        // Pre-load disk snapshot for sessions whose ring has dropped
+        // below `after`. We do this before the lock to avoid blocking
+        // append paths on slow disk I/O.
+        let preload_snapshot = if self
+            .inner
+            .lock()
+            .expect("ui protocol ledger lock")
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                let oldest = session.entries.front().map(|entry| entry.seq);
+                match oldest {
+                    Some(oldest_seq) => after.seq < oldest_seq.saturating_sub(1),
+                    None => after.seq != session.next_seq,
+                }
+            })
+            .unwrap_or(true)
+        {
+            self.read_disk_snapshot_for_replay(session_id, after)?
+        } else {
+            None
+        };
+
+        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        if let Some(snapshot) = preload_snapshot {
+            // Hydrate the in-memory ring from disk, mirroring what
+            // `replay_after_from_disk` does, but inside the same lock
+            // we read `next_seq` from. This closes the atomicity gap
+            // codex flagged: events and head_seq come out of the same
+            // critical section.
+            if !inner.sessions.contains_key(session_id)
+                && inner.sessions.len() >= self.config.active_session_cap
+            {
+                self.evict_lru_locked(&mut inner);
+            }
+            let session = inner
+                .sessions
+                .entry(session_id.clone())
+                .or_insert_with(SessionLedger::new);
+            hydrate_session_from_snapshot(session, snapshot);
+        }
+
+        let session = match inner.sessions.get(session_id) {
+            Some(session) => session,
+            None => {
+                // Empty session — return empty events and a seq-0 cursor.
+                let cursor = UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                };
+                return Ok((Vec::new(), cursor));
+            }
+        };
+
+        let head_seq = session.next_seq;
+        // `replay_from_entries` filters in-memory ring to events with
+        // seq > after.seq; we re-derive locally so we do not call out
+        // to a sibling method that would re-acquire the lock.
+        let events: Vec<LedgeredUiProtocolEvent> = session
+            .entries
+            .iter()
+            .filter(|entry| entry.seq > after.seq)
+            .map(|entry| LedgeredUiProtocolEvent {
+                cursor: UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: entry.seq,
+                },
+                event: entry.event.clone(),
+            })
+            .collect();
+
+        // Range validation echoes the existing replay_after error.
+        if let Some(oldest_seq) = session.entries.front().map(|entry| entry.seq) {
+            let min_after_seq = oldest_seq.saturating_sub(1);
+            if after.seq < min_after_seq || after.seq > head_seq {
+                let head_cursor = UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: head_seq,
+                };
+                return Err(RpcError::cursor_out_of_range(after, &head_cursor));
+            }
+        } else if after.seq != head_seq && after.seq != 0 {
+            let head_cursor = UiCursor {
+                stream: session_id.0.clone(),
+                seq: head_seq,
+            };
+            return Err(RpcError::cursor_out_of_range(after, &head_cursor));
+        }
+
+        inner.touch_lru(session_id);
+        let cursor = UiCursor {
+            stream: session_id.0.clone(),
+            seq: head_seq,
+        };
+        Ok((events, cursor))
+    }
+
+    fn read_disk_snapshot_for_replay(
+        &self,
+        session_id: &SessionKey,
+        after: &UiCursor,
+    ) -> Result<Option<DiskSessionSnapshot>, RpcError> {
+        let Some(data_dir) = &self.config.data_dir else {
+            return Ok(None);
+        };
+        let session_dir = data_dir
+            .join("ui-protocol")
+            .join(encode_session_dir_name(session_id));
+        match self.read_session_disk_snapshot(session_id, &session_dir, Some(after.seq)) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                warn!(
+                    target = "octos::ledger",
+                    ?error,
+                    session_id = %session_id.0,
+                    "failed to read retained ledger logs for atomic snapshot"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) fn replay_after(
         &self,
         session_id: &SessionKey,
@@ -1102,6 +1278,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::TurnCompleted(event) => &event.session_id,
         UiNotification::TurnError(event) => &event.session_id,
         UiNotification::ReplayLossy(event) => &event.session_id,
+        UiNotification::MessagePersisted(event) => &event.session_id,
     }
 }
 

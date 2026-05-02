@@ -7,7 +7,7 @@
 - Author: 5-day structural plan, Day 1 (coding-green)
 - Date: 2026-04-30
 - Target protocol: `octos-ui/v1alpha1`
-- Status: proposed
+- Status: accepted
 - Related issues: `#738`, `#740`, `#742` (thread-binding bug chain — ack/result divergence and reload misbinding under spawn_only flows)
 - Related plan: `/tmp/octos-architecture-FINAL.md` § Day 1 (UPCR-2026-012)
 - Sibling UPCRs: `UPCR-2026-009` (session/hydrate), `UPCR-2026-010` (thread/graph/get), `UPCR-2026-011` (turn/state/get)
