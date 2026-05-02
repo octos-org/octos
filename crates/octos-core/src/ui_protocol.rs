@@ -40,6 +40,20 @@ pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspac
 /// Feature flag for harness task registry/control commands.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1: &str = "harness.task_control.v1";
 
+/// Feature flag for UPCR-2026-009 `session/hydrate` authoritative chat-state
+/// reload RPC.
+pub const UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1: &str = "state.session_hydrate.v1";
+
+/// Feature flag for UPCR-2026-010 `thread/graph/get` thread partition RPC.
+pub const UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1: &str = "state.thread_graph.v1";
+
+/// Feature flag for UPCR-2026-011 `turn/state/get` turn lifecycle RPC.
+pub const UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1: &str = "state.turn_state_get.v1";
+
+/// Feature flag for UPCR-2026-012 `message/persisted` durable-commit
+/// notification.
+pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persisted.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -50,6 +64,10 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
     UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -67,6 +85,9 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::TASK_LIST | methods::TASK_CANCEL | methods::TASK_RESTART_FROM_NODE => {
             Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1)
         }
+        methods::SESSION_HYDRATE => Some(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
+        methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
+        methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
         _ => None,
     }
 }
@@ -602,6 +623,13 @@ pub mod methods {
     pub const TASK_RESTART_FROM_NODE: &str = "task/restart_from_node";
     pub const TASK_OUTPUT_READ: &str = "task/output/read";
 
+    /// UPCR-2026-009 `session/hydrate` — authoritative chat-state reload.
+    pub const SESSION_HYDRATE: &str = "session/hydrate";
+    /// UPCR-2026-010 `thread/graph/get` — thread partition for the session.
+    pub const THREAD_GRAPH_GET: &str = "thread/graph/get";
+    /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
+    pub const TURN_STATE_GET: &str = "turn/state/get";
+
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_ERROR: &str = "turn/error";
@@ -622,6 +650,8 @@ pub mod methods {
     /// rehydrate via `session/open` (or REST). Carries the last known durable
     /// cursor so the client can resume cleanly.
     pub const REPLAY_LOSSY: &str = "protocol/replay_lossy";
+    /// UPCR-2026-012 `message/persisted` — durable-commit confirmation.
+    pub const MESSAGE_PERSISTED: &str = "message/persisted";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -643,6 +673,9 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TASK_CANCEL,
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
+    methods::SESSION_HYDRATE,
+    methods::THREAD_GRAPH_GET,
+    methods::TURN_STATE_GET,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -664,6 +697,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::PROGRESS_UPDATED,
     methods::WARNING,
     methods::REPLAY_LOSSY,
+    methods::MESSAGE_PERSISTED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -678,6 +712,9 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TASK_CANCEL,
     methods::TASK_RESTART_FROM_NODE,
     methods::TASK_OUTPUT_READ,
+    methods::SESSION_HYDRATE,
+    methods::THREAD_GRAPH_GET,
+    methods::TURN_STATE_GET,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -742,6 +779,10 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+            UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+            UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+            UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
         ])
     }
 
@@ -925,6 +966,9 @@ pub enum UiResultKind {
     TaskCancel,
     TaskRestartFromNode,
     TaskOutputRead,
+    SessionHydrate,
+    ThreadGraphGet,
+    TurnStateGet,
     UnsupportedCapability,
 }
 
@@ -940,6 +984,9 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_CANCEL => Some(UiResultKind::TaskCancel),
         methods::TASK_RESTART_FROM_NODE => Some(UiResultKind::TaskRestartFromNode),
         methods::TASK_OUTPUT_READ => Some(UiResultKind::TaskOutputRead),
+        methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
+        methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
+        methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         _ => None,
     }
 }
@@ -1375,6 +1422,247 @@ pub struct TaskOutputReadResult {
     pub limitations: Vec<TaskOutputReadLimitation>,
 }
 
+// ----- UPCR-2026-009 `session/hydrate` -----
+
+/// Optional include-section tokens recognised by `session/hydrate`'s
+/// `include` filter. Unknown tokens are silently dropped per UPCR-2026-009.
+pub mod hydrate_sections {
+    pub const MESSAGES: &str = "messages";
+    pub const THREADS: &str = "threads";
+    pub const TURNS: &str = "turns";
+    pub const PENDING_APPROVALS: &str = "pending_approvals";
+}
+
+/// Defensive ceiling on the size of `SessionHydrateParams.include`. Matches
+/// the documented `include_too_large` invalid-params variant in UPCR-2026-009.
+pub const SESSION_HYDRATE_INCLUDE_MAX: usize = 32;
+
+/// Params for `session/hydrate` (UPCR-2026-009).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHydrateParams {
+    pub session_id: SessionKey,
+    /// Hydrate only items strictly greater than this cursor. Absent = full
+    /// hydrate from the beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<UiCursor>,
+    /// Selection set for response sections. Empty / absent = include all.
+    /// Unknown tokens are dropped server-side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+}
+
+/// Single hydrated chat row in `SessionHydrateResult.messages`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedMessage {
+    pub seq: u64,
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    pub persisted_at: DateTime<Utc>,
+}
+
+/// Lifecycle state strings for a thread in `ThreadGraphEntry.status` and the
+/// hydrate result. Open registry per UPCR-2026-010 / UPCR-2026-011.
+pub mod thread_status {
+    pub const ACTIVE: &str = "active";
+    pub const COMPLETED: &str = "completed";
+    pub const ERRORED: &str = "errored";
+    pub const INTERRUPTED: &str = "interrupted";
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// Wire shape for one thread entry in `thread/graph/get` and `session/hydrate`.
+/// Mirrors the in-memory `Session::threads()` projection (UPCR-2026-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadGraphEntry {
+    pub thread_id: String,
+    pub root_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_client_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    pub message_seqs: Vec<u64>,
+    /// Open string registry. Initial values: `active | completed | errored |
+    /// interrupted | unknown`. Future values must be registered via UPCR.
+    pub status: String,
+}
+
+/// Per-turn lifecycle summary bundled into `session/hydrate`. Mirrors
+/// `TurnStateGetResult` so a client can assert turn liveness from a single
+/// hydrate round-trip without a follow-up RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedTurn {
+    pub turn_id: TurnId,
+    pub state: TurnLifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// Result for `session/hydrate` (UPCR-2026-009). All non-`session_id` /
+/// non-`cursor` sections honour the request's `include` filter — sections
+/// the client did not request are omitted entirely (NOT serialized as
+/// `null`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHydrateResult {
+    pub session_id: SessionKey,
+    pub cursor: UiCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<HydratedMessage>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<Vec<ThreadGraphEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<Vec<HydratedTurn>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approvals: Option<Vec<ApprovalRequestedEvent>>,
+}
+
+// ----- UPCR-2026-010 `thread/graph/get` -----
+
+/// Params for `thread/graph/get` (UPCR-2026-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadGraphGetParams {
+    pub session_id: SessionKey,
+    /// Point-in-time projection cursor. Absent = current head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<UiCursor>,
+}
+
+/// Result for `thread/graph/get` (UPCR-2026-010).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadGraphGetResult {
+    pub session_id: SessionKey,
+    pub cursor: UiCursor,
+    pub threads: Vec<ThreadGraphEntry>,
+    /// Persisted message seqs whose `thread_id` could not be resolved to a
+    /// known thread (e.g. legacy load, recovery row). Empty in steady state.
+    pub orphans: Vec<u64>,
+}
+
+// ----- UPCR-2026-011 `turn/state/get` -----
+
+/// Lifecycle state surface for `turn/state/get` (UPCR-2026-011).
+///
+/// Open registry: future variants must be added via a follow-up UPCR.
+/// Wire form is snake_case to match the rest of the v1 enum surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnLifecycleState {
+    Active,
+    Interrupting,
+    Completed,
+    Errored,
+    Interrupted,
+    Unknown,
+}
+
+impl TurnLifecycleState {
+    /// Wire-form discriminant string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Interrupting => "interrupting",
+            Self::Completed => "completed",
+            Self::Errored => "errored",
+            Self::Interrupted => "interrupted",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Params for `turn/state/get` (UPCR-2026-011).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStateGetParams {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+}
+
+/// Result for `turn/state/get` (UPCR-2026-011).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStateGetResult {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub state: TurnLifecycleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// Persisted-message seqs owned by this turn. Empty for `unknown` and for
+    /// turns that have started but not yet committed a row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub committed_seqs: Vec<u64>,
+}
+
+// ----- UPCR-2026-012 `message/persisted` -----
+
+/// Open registry for `MessagePersistedEvent.source`. Future variants must be
+/// added via a follow-up UPCR. Wire form is snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePersistedSource {
+    /// Direct API ingress (web `POST /api/chat`, `turn/start`, telegram, ...).
+    User,
+    /// Primary turn assistant output.
+    Assistant,
+    /// Tool invocation result attached to a turn.
+    Tool,
+    /// `spawn_only` background result row that commits after the parent
+    /// turn's `turn/completed`.
+    Background,
+    /// Synthetic recovery turn row (M8.9 path).
+    Recovery,
+}
+
+impl MessagePersistedSource {
+    /// Best-effort mapping from `MessageRole` for write paths that lack a
+    /// dedicated source discriminator. The result is a sensible default the
+    /// caller can override before emit when richer provenance is known
+    /// (e.g. `Background` for spawn-only commits).
+    pub fn from_role(role: crate::types::MessageRole) -> Self {
+        match role {
+            crate::types::MessageRole::User => Self::User,
+            crate::types::MessageRole::Assistant => Self::Assistant,
+            crate::types::MessageRole::Tool => Self::Tool,
+            // System messages rarely commit through the persistence path
+            // covered by `message/persisted`; treat as assistant for the
+            // typed enum since `system` is not a registered source.
+            crate::types::MessageRole::System => Self::Assistant,
+        }
+    }
+}
+
+/// Notification params for `message/persisted` (UPCR-2026-012). Emitted once
+/// per durable commit of a row by `Session::add_message_with_seq` AFTER the
+/// row is fsynced to the JSONL ledger. Strict-ordered per session: a client
+/// that consumes the notification and tracks the latest cursor has an
+/// authoritative replay-safe view of the session message log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePersistedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub seq: u64,
+    pub role: String,
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    pub source: MessagePersistedSource,
+    pub cursor: UiCursor,
+    pub persisted_at: DateTime<Utc>,
+}
+
 /// Draft command payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1389,6 +1677,9 @@ pub enum UiCommand {
     TaskCancel(TaskCancelParams),
     TaskRestartFromNode(TaskRestartFromNodeParams),
     TaskOutputRead(TaskOutputReadParams),
+    SessionHydrate(SessionHydrateParams),
+    ThreadGraphGet(ThreadGraphGetParams),
+    TurnStateGet(TurnStateGetParams),
 }
 
 impl UiCommand {
@@ -1404,6 +1695,9 @@ impl UiCommand {
             Self::TaskCancel(_) => methods::TASK_CANCEL,
             Self::TaskRestartFromNode(_) => methods::TASK_RESTART_FROM_NODE,
             Self::TaskOutputRead(_) => methods::TASK_OUTPUT_READ,
+            Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
+            Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
+            Self::TurnStateGet(_) => methods::TURN_STATE_GET,
         }
     }
 
@@ -1423,6 +1717,9 @@ impl UiCommand {
             Self::TaskCancel(params) => serde_json::to_value(params),
             Self::TaskRestartFromNode(params) => serde_json::to_value(params),
             Self::TaskOutputRead(params) => serde_json::to_value(params),
+            Self::SessionHydrate(params) => serde_json::to_value(params),
+            Self::ThreadGraphGet(params) => serde_json::to_value(params),
+            Self::TurnStateGet(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -1456,6 +1753,9 @@ impl UiCommand {
                 Ok(Self::TaskRestartFromNode(decode_params(method, params)?))
             }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_params(method, params)?)),
+            methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
+            methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
+            methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -1728,6 +2028,9 @@ pub enum UiRpcResult {
     TaskCancel(TaskCancelResult),
     TaskRestartFromNode(TaskRestartFromNodeResult),
     TaskOutputRead(TaskOutputReadResult),
+    SessionHydrate(SessionHydrateResult),
+    ThreadGraphGet(ThreadGraphGetResult),
+    TurnStateGet(TurnStateGetResult),
     UnsupportedCapability(UnsupportedCapabilityResult),
 }
 
@@ -1744,6 +2047,9 @@ impl UiRpcResult {
             Self::TaskCancel(_) => UiResultKind::TaskCancel,
             Self::TaskRestartFromNode(_) => UiResultKind::TaskRestartFromNode,
             Self::TaskOutputRead(_) => UiResultKind::TaskOutputRead,
+            Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
+            Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
+            Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
             Self::UnsupportedCapability(_) => UiResultKind::UnsupportedCapability,
         }
     }
@@ -1760,6 +2066,9 @@ impl UiRpcResult {
             Self::TaskCancel(_) => Some(methods::TASK_CANCEL),
             Self::TaskRestartFromNode(_) => Some(methods::TASK_RESTART_FROM_NODE),
             Self::TaskOutputRead(_) => Some(methods::TASK_OUTPUT_READ),
+            Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
+            Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
+            Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
             Self::UnsupportedCapability(result) => Some(result.unsupported.method.as_str()),
         }
     }
@@ -1776,6 +2085,9 @@ impl UiRpcResult {
             Self::TaskCancel(result) => serde_json::to_value(result),
             Self::TaskRestartFromNode(result) => serde_json::to_value(result),
             Self::TaskOutputRead(result) => serde_json::to_value(result),
+            Self::SessionHydrate(result) => serde_json::to_value(result),
+            Self::ThreadGraphGet(result) => serde_json::to_value(result),
+            Self::TurnStateGet(result) => serde_json::to_value(result),
             Self::UnsupportedCapability(result) => serde_json::to_value(result),
         }
     }
@@ -1813,6 +2125,9 @@ impl UiRpcResult {
                 Ok(Self::TaskRestartFromNode(decode_result(method, result)?))
             }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_result(method, result)?)),
+            methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
+            methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
+            methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -2501,6 +2816,8 @@ pub enum UiNotification {
     TurnCompleted(TurnCompletedEvent),
     TurnError(TurnErrorEvent),
     ReplayLossy(ReplayLossyEvent),
+    /// UPCR-2026-012: durable-commit confirmation per session row.
+    MessagePersisted(MessagePersistedEvent),
 }
 
 impl UiNotification {
@@ -2523,6 +2840,7 @@ impl UiNotification {
             Self::TurnCompleted(_) => methods::TURN_COMPLETED,
             Self::TurnError(_) => methods::TURN_ERROR,
             Self::ReplayLossy(_) => methods::REPLAY_LOSSY,
+            Self::MessagePersisted(_) => methods::MESSAGE_PERSISTED,
         }
     }
 
@@ -2546,6 +2864,7 @@ impl UiNotification {
             Self::TurnCompleted(params) => serde_json::to_value(params),
             Self::TurnError(params) => serde_json::to_value(params),
             Self::ReplayLossy(params) => serde_json::to_value(params),
+            Self::MessagePersisted(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -2587,6 +2906,9 @@ impl UiNotification {
             methods::TURN_COMPLETED => Ok(Self::TurnCompleted(decode_params(method, params)?)),
             methods::TURN_ERROR => Ok(Self::TurnError(decode_params(method, params)?)),
             methods::REPLAY_LOSSY => Ok(Self::ReplayLossy(decode_params(method, params)?)),
+            methods::MESSAGE_PERSISTED => {
+                Ok(Self::MessagePersisted(decode_params(method, params)?))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -2913,6 +3235,19 @@ mod tests {
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
             "harness.task_control.v1"
         );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+            "state.session_hydrate.v1"
+        );
+        assert_eq!(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, "state.thread_graph.v1");
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+            "state.turn_state_get.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+            "event.message_persisted.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -2927,6 +3262,9 @@ mod tests {
                 "task/cancel",
                 "task/restart_from_node",
                 "task/output/read",
+                "session/hydrate",
+                "thread/graph/get",
+                "turn/state/get",
             ]
         );
         assert_eq!(
@@ -2949,6 +3287,7 @@ mod tests {
                 "progress/updated",
                 "warning",
                 "protocol/replay_lossy",
+                "message/persisted",
             ]
         );
         assert_eq!(
@@ -2964,6 +3303,9 @@ mod tests {
                 "task/cancel",
                 "task/restart_from_node",
                 "task/output/read",
+                "session/hydrate",
+                "thread/graph/get",
+                "turn/state/get",
             ]
         );
         assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
@@ -2996,7 +3338,10 @@ mod tests {
                     "task/list",
                     "task/cancel",
                     "task/restart_from_node",
-                    "task/output/read"
+                    "task/output/read",
+                    "session/hydrate",
+                    "thread/graph/get",
+                    "turn/state/get"
                 ],
                 "supported_notifications": [
                     "session/open",
@@ -3015,13 +3360,18 @@ mod tests {
                     "task/output/delta",
                     "progress/updated",
                     "warning",
-                    "protocol/replay_lossy"
+                    "protocol/replay_lossy",
+                    "message/persisted"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
                     "pane.snapshots.v1",
                     "session.workspace_cwd.v1",
-                    "harness.task_control.v1"
+                    "harness.task_control.v1",
+                    "state.session_hydrate.v1",
+                    "state.thread_graph.v1",
+                    "state.turn_state_get.v1",
+                    "event.message_persisted.v1"
                 ]
             })
         );
@@ -4679,5 +5029,341 @@ mod tests {
         let decoded =
             UiNotification::from_rpc_notification(rpc).expect("deserialize task/updated cancelled");
         assert_eq!(decoded, event);
+    }
+
+    // ===== UPCR-2026-009 / -010 / -011 / -012 golden tests (PR G) =====
+
+    fn sample_session_id() -> SessionKey {
+        SessionKey("local:demo".into())
+    }
+
+    fn sample_turn_id() -> TurnId {
+        TurnId(Uuid::from_u128(0x10))
+    }
+
+    fn sample_cursor() -> UiCursor {
+        UiCursor {
+            stream: "local:demo".into(),
+            seq: 142,
+        }
+    }
+
+    fn sample_persisted_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-04-30T12:00:00Z")
+            .expect("rfc3339 parse")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn golden_session_hydrate_params_serde() {
+        let params = SessionHydrateParams {
+            session_id: sample_session_id(),
+            after: Some(UiCursor {
+                stream: "local:demo".into(),
+                seq: 0,
+            }),
+            include: vec!["messages".into(), "threads".into()],
+        };
+        let value = serde_json::to_value(&params).expect("serialize hydrate params");
+        assert_eq!(
+            value,
+            json!({
+                "session_id": "local:demo",
+                "after": { "stream": "local:demo", "seq": 0 },
+                "include": ["messages", "threads"],
+            })
+        );
+        let parsed: SessionHydrateParams =
+            serde_json::from_value(value).expect("deserialize hydrate params");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn golden_session_hydrate_result_serde() {
+        let result = SessionHydrateResult {
+            session_id: sample_session_id(),
+            cursor: sample_cursor(),
+            messages: Some(vec![HydratedMessage {
+                seq: 17,
+                role: "user".into(),
+                content: "hello".into(),
+                turn_id: Some(sample_turn_id()),
+                thread_id: Some("thread-1".into()),
+                client_message_id: Some("cmid-1".into()),
+                persisted_at: sample_persisted_at(),
+            }]),
+            threads: Some(vec![ThreadGraphEntry {
+                thread_id: "thread-1".into(),
+                root_seq: 17,
+                root_client_message_id: Some("cmid-1".into()),
+                turn_id: Some(sample_turn_id()),
+                message_seqs: vec![17, 18],
+                status: thread_status::COMPLETED.into(),
+            }]),
+            turns: Some(vec![HydratedTurn {
+                turn_id: sample_turn_id(),
+                state: TurnLifecycleState::Completed,
+                started_at: Some(sample_persisted_at()),
+                completed_at: Some(sample_persisted_at()),
+                thread_id: Some("thread-1".into()),
+            }]),
+            pending_approvals: Some(vec![]),
+        };
+        let value = serde_json::to_value(&result).expect("serialize hydrate result");
+        let parsed: SessionHydrateResult =
+            serde_json::from_value(value).expect("deserialize hydrate result");
+        assert_eq!(parsed, result);
+
+        // Sections excluded from `include` are omitted (NOT `null`) per UPCR.
+        let messages_only = SessionHydrateResult {
+            session_id: sample_session_id(),
+            cursor: sample_cursor(),
+            messages: Some(vec![]),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+        };
+        let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
+        let object = value.as_object().expect("hydrate result is object");
+        assert!(object.contains_key("messages"));
+        assert!(!object.contains_key("threads"));
+        assert!(!object.contains_key("turns"));
+        assert!(!object.contains_key("pending_approvals"));
+    }
+
+    #[test]
+    fn golden_thread_graph_get_params_serde() {
+        let params = ThreadGraphGetParams {
+            session_id: sample_session_id(),
+            at: Some(sample_cursor()),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        assert_eq!(
+            value,
+            json!({
+                "session_id": "local:demo",
+                "at": { "stream": "local:demo", "seq": 142 },
+            })
+        );
+        let parsed: ThreadGraphGetParams = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn golden_thread_graph_get_result_serde() {
+        let result = ThreadGraphGetResult {
+            session_id: sample_session_id(),
+            cursor: sample_cursor(),
+            threads: vec![ThreadGraphEntry {
+                thread_id: "thread-1".into(),
+                root_seq: 17,
+                root_client_message_id: Some("cmid-1".into()),
+                turn_id: Some(sample_turn_id()),
+                message_seqs: vec![17, 18, 19],
+                status: thread_status::COMPLETED.into(),
+            }],
+            orphans: vec![42],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        let parsed: ThreadGraphGetResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn golden_turn_state_get_params_serde() {
+        let params = TurnStateGetParams {
+            session_id: sample_session_id(),
+            turn_id: sample_turn_id(),
+        };
+        let value = serde_json::to_value(&params).expect("serialize");
+        let parsed: TurnStateGetParams = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
+    fn golden_turn_state_get_result_serde() {
+        let result = TurnStateGetResult {
+            session_id: sample_session_id(),
+            turn_id: sample_turn_id(),
+            state: TurnLifecycleState::Active,
+            started_at: Some(sample_persisted_at()),
+            completed_at: None,
+            thread_id: Some("thread-1".into()),
+            committed_seqs: vec![17, 18, 19],
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        // `state` is snake_case wire form.
+        assert_eq!(value.get("state"), Some(&json!("active")));
+        let parsed: TurnStateGetResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, result);
+
+        // All five lifecycle states round-trip.
+        for state in [
+            TurnLifecycleState::Active,
+            TurnLifecycleState::Interrupting,
+            TurnLifecycleState::Completed,
+            TurnLifecycleState::Errored,
+            TurnLifecycleState::Interrupted,
+            TurnLifecycleState::Unknown,
+        ] {
+            let r = TurnStateGetResult {
+                session_id: sample_session_id(),
+                turn_id: sample_turn_id(),
+                state,
+                started_at: None,
+                completed_at: None,
+                thread_id: None,
+                committed_seqs: vec![],
+            };
+            let v = serde_json::to_value(&r).expect("serialize state");
+            let p: TurnStateGetResult = serde_json::from_value(v).expect("deserialize state");
+            assert_eq!(p.state, state);
+        }
+    }
+
+    #[test]
+    fn golden_message_persisted_event_serde() {
+        let event = MessagePersistedEvent {
+            session_id: sample_session_id(),
+            turn_id: Some(sample_turn_id()),
+            thread_id: Some("thread-1".into()),
+            seq: 18,
+            role: "assistant".into(),
+            message_id: "msg-1".into(),
+            client_message_id: Some("cmid-1".into()),
+            source: MessagePersistedSource::Assistant,
+            cursor: UiCursor {
+                stream: "local:demo".into(),
+                seq: 18,
+            },
+            persisted_at: sample_persisted_at(),
+        };
+        let value = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(value.get("source"), Some(&json!("assistant")));
+        let parsed: MessagePersistedEvent = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, event);
+
+        // All five source variants round-trip.
+        for source in [
+            MessagePersistedSource::User,
+            MessagePersistedSource::Assistant,
+            MessagePersistedSource::Tool,
+            MessagePersistedSource::Background,
+            MessagePersistedSource::Recovery,
+        ] {
+            let e = MessagePersistedEvent {
+                session_id: sample_session_id(),
+                turn_id: None,
+                thread_id: None,
+                seq: 1,
+                role: "tool".into(),
+                message_id: "msg-x".into(),
+                client_message_id: None,
+                source,
+                cursor: UiCursor {
+                    stream: "local:demo".into(),
+                    seq: 1,
+                },
+                persisted_at: sample_persisted_at(),
+            };
+            let v = serde_json::to_value(&e).expect("serialize source");
+            let p: MessagePersistedEvent = serde_json::from_value(v).expect("deserialize source");
+            assert_eq!(p, e);
+        }
+
+        // Wire-level: round-trip via the JSON-RPC notification envelope.
+        let notif = UiNotification::MessagePersisted(event.clone());
+        let rpc = notif
+            .clone()
+            .into_rpc_notification()
+            .expect("notification serialize");
+        assert_eq!(rpc.method, methods::MESSAGE_PERSISTED);
+        let decoded = UiNotification::from_rpc_notification(rpc).expect("notification deserialize");
+        assert_eq!(decoded, notif);
+    }
+
+    #[test]
+    fn golden_capabilities_includes_new_features_when_negotiated() {
+        // No header at all -> server falls back to `first_server_slice` and
+        // advertises every known feature including the four new ones.
+        let full = UiProtocolCapabilities::first_server_slice();
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1));
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1));
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1));
+        // And the gated methods are visible.
+        assert!(full.supports_method(methods::SESSION_HYDRATE));
+        assert!(full.supports_method(methods::THREAD_GRAPH_GET));
+        assert!(full.supports_method(methods::TURN_STATE_GET));
+
+        // Negotiated subset: only `state.thread_graph.v1` requested.
+        let only_thread_graph =
+            UiProtocolCapabilities::for_negotiated_features([UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1]);
+        assert!(only_thread_graph.supports_feature(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1));
+        assert!(only_thread_graph.supports_method(methods::THREAD_GRAPH_GET));
+        assert!(
+            !only_thread_graph.supports_feature(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
+            "non-requested feature must NOT be advertised"
+        );
+        assert!(
+            !only_thread_graph.supports_method(methods::SESSION_HYDRATE),
+            "non-requested method must NOT be advertised"
+        );
+        assert!(!only_thread_graph.supports_method(methods::TURN_STATE_GET));
+
+        // Negotiated subset: all four UPCR-2026-009..012 flags requested.
+        let all_new = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+            UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+            UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+            UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+        ]);
+        assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1));
+        assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1));
+        assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1));
+        assert!(all_new.supports_feature(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1));
+        assert!(all_new.supports_method(methods::SESSION_HYDRATE));
+        assert!(all_new.supports_method(methods::THREAD_GRAPH_GET));
+        assert!(all_new.supports_method(methods::TURN_STATE_GET));
+    }
+
+    #[test]
+    fn upcr_009_010_011_command_methods_round_trip_through_rpc_envelope() {
+        let hydrate = UiCommand::SessionHydrate(SessionHydrateParams {
+            session_id: sample_session_id(),
+            after: None,
+            include: vec![],
+        });
+        let rpc = hydrate
+            .clone()
+            .into_rpc_request("req-1")
+            .expect("serialize hydrate");
+        assert_eq!(rpc.method, methods::SESSION_HYDRATE);
+        let decoded = UiCommand::from_rpc_request(rpc).expect("decode hydrate");
+        assert_eq!(decoded, hydrate);
+
+        let graph = UiCommand::ThreadGraphGet(ThreadGraphGetParams {
+            session_id: sample_session_id(),
+            at: None,
+        });
+        let rpc = graph
+            .clone()
+            .into_rpc_request("req-2")
+            .expect("serialize graph");
+        assert_eq!(rpc.method, methods::THREAD_GRAPH_GET);
+        let decoded = UiCommand::from_rpc_request(rpc).expect("decode graph");
+        assert_eq!(decoded, graph);
+
+        let state = UiCommand::TurnStateGet(TurnStateGetParams {
+            session_id: sample_session_id(),
+            turn_id: sample_turn_id(),
+        });
+        let rpc = state
+            .clone()
+            .into_rpc_request("req-3")
+            .expect("serialize state");
+        assert_eq!(rpc.method, methods::TURN_STATE_GET);
+        let decoded = UiCommand::from_rpc_request(rpc).expect("decode state");
+        assert_eq!(decoded, state);
     }
 }

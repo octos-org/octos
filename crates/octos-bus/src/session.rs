@@ -15,6 +15,79 @@ use tracing::{debug, warn};
 /// Current schema version for session JSONL files.
 const CURRENT_SESSION_SCHEMA: u32 = 1;
 
+/// Observer callback invoked AFTER a successful durable commit by
+/// [`SessionManager::add_message_with_seq`] (and the equivalent
+/// `SessionHandle` path). Implements the post-fsync hook UPCR-2026-012's
+/// `message/persisted` notification dispatches through.
+///
+/// Strict-ordering invariant: `add_message_with_seq` calls observers
+/// synchronously after the in-memory append, with the registry global lock
+/// held in [`set_message_commit_observer`]. Two concurrent commits to the
+/// same session serialize on the `&mut self` borrow of `SessionManager` /
+/// `SessionHandle`, so observer fires preserve commit order per session.
+///
+/// The seq passed to the observer is the row's index in `Session::messages`
+/// after the append (`messages.len() - 1`).
+///
+/// Errors raised by an observer are logged and dropped: the durable commit
+/// has already happened, and the observer is best-effort fan-out for
+/// downstream wire-protocol notifications. A failing observer must not roll
+/// back the session row.
+pub type MessageCommitObserver =
+    std::sync::Arc<dyn Fn(&SessionKey, &Message, usize) + Send + Sync + 'static>;
+
+static MESSAGE_COMMIT_OBSERVER: std::sync::OnceLock<
+    std::sync::RwLock<Option<MessageCommitObserver>>,
+> = std::sync::OnceLock::new();
+
+fn observer_slot() -> &'static std::sync::RwLock<Option<MessageCommitObserver>> {
+    MESSAGE_COMMIT_OBSERVER.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install a process-global observer that fires after every successful
+/// `add_message_with_seq` commit. Returns the previous observer if any,
+/// allowing layered installs (e.g. tests can save / restore).
+///
+/// Wired by the AppUI server entry-point to dispatch
+/// `message/persisted` notifications per UPCR-2026-012. Off-thread fan-out
+/// happens inside the observer callback; this call is cheap and non-blocking.
+pub fn set_message_commit_observer(
+    observer: Option<MessageCommitObserver>,
+) -> Option<MessageCommitObserver> {
+    let slot = observer_slot();
+    let mut guard = slot.write().expect("message commit observer poisoned");
+    std::mem::replace(&mut *guard, observer)
+}
+
+/// Read-side accessor used by the durable-commit path. Cloned out so the
+/// callback does not hold the global lock while it runs.
+fn current_message_commit_observer() -> Option<MessageCommitObserver> {
+    let slot = observer_slot();
+    slot.read()
+        .expect("message commit observer poisoned")
+        .clone()
+}
+
+/// Fire the observer if installed. Panics inside the observer are caught
+/// (best-effort) so a faulty subscriber cannot poison the commit path. The
+/// commit has already succeeded by the time we get here — observer failure
+/// is fan-out failure, not commit failure.
+fn notify_message_commit(key: &SessionKey, message: &Message, committed_seq: usize) {
+    let Some(observer) = current_message_commit_observer() else {
+        return;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer(key, message, committed_seq);
+    }));
+    if let Err(err) = result {
+        warn!(
+            session = %key.0,
+            "message commit observer panicked: {:?}",
+            err
+        );
+    }
+}
+
 /// Per-process counter for unique rewrite-temp-file names.
 ///
 /// Two writers racing the same session file (e.g. fanout children of one
@@ -856,6 +929,20 @@ impl SessionManager {
         })
     }
 
+    /// Check whether a session is known to this manager. Returns `true`
+    /// when the session is either resident in the LRU cache or has a
+    /// JSONL file on disk under the configured `sessions_dir`. Does NOT
+    /// create the session if missing — used by handlers that need to
+    /// reject `unknown_session` requests per UPCR-2026-009 / -010 / -011.
+    pub fn session_known(&mut self, key: &SessionKey) -> bool {
+        let key_str = key.0.clone();
+        if self.cache.contains(&key_str) {
+            return true;
+        }
+        let path = self.session_path(key);
+        path.exists()
+    }
+
     /// Add a message to a session and persist it.
     pub async fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
         self.add_message_with_seq(key, message).await.map(|_| ())
@@ -898,7 +985,17 @@ impl SessionManager {
         session.messages.push(message);
         session.updated_at = Utc::now();
         record_session_persist("committed");
-        Ok(session.messages.len().saturating_sub(1))
+        let committed_seq = session.messages.len().saturating_sub(1);
+        // UPCR-2026-012: post-fsync observer fan-out. Fires AFTER the
+        // append_to_disk above succeeded and the in-memory mirror is
+        // updated, so a `message/persisted` notification reflects a row
+        // that is durably visible. A failed disk write returns above
+        // before this point, so the observer never sees a row that did
+        // not commit.
+        if let Some(committed) = session.messages.last() {
+            notify_message_commit(key, committed, committed_seq);
+        }
+        Ok(committed_seq)
     }
 
     /// Get the JSONL file path for a session key.
@@ -1149,6 +1246,13 @@ impl SessionManager {
 
             // Refuse to append if the file is already at the size limit.
             // The session should be compacted before it reaches this point.
+            //
+            // Per UPCR-2026-012: the durable-commit observer fires only
+            // when this function returns Ok; previously a silent
+            // `Ok(())` here would have leaked an observer notification
+            // for a row that never reached disk. Return an error so the
+            // caller path (`add_message_with_seq`) propagates the
+            // failure and the observer is skipped.
             if !is_new && file_len >= MAX_SESSION_FILE_SIZE {
                 warn!(
                     key = key_str,
@@ -1156,7 +1260,11 @@ impl SessionManager {
                     limit = MAX_SESSION_FILE_SIZE,
                     "session file at size limit, skipping append"
                 );
-                return Ok(());
+                return Err(eyre::eyre!(
+                    "session file at size limit ({} >= {}), refusing append",
+                    file_len,
+                    MAX_SESSION_FILE_SIZE
+                ));
             }
 
             if is_new {
@@ -1869,14 +1977,26 @@ impl SessionHandle {
             message.thread_id = derive_thread_id_for_new_message(&message, &self.session.messages);
         }
 
-        self.session.messages.push(message.clone());
-        self.session.updated_at = Utc::now();
+        // UPCR-2026-012: write to disk BEFORE the in-memory push so a
+        // size-cap rejection (or any other I/O failure) leaves disk and
+        // RAM in lockstep. Previously the push happened first, which
+        // would leave a row in `Session::messages` that never reached
+        // disk on failure — and the observer would have fired for it.
         if let Err(error) = self.append_to_disk(&message).await {
             record_session_persist("failed");
             return Err(error);
         }
+        self.session.messages.push(message.clone());
+        self.session.updated_at = Utc::now();
         record_session_persist("committed");
-        Ok(self.session.messages.len().saturating_sub(1))
+        let committed_seq = self.session.messages.len().saturating_sub(1);
+        // Post-commit observer fan-out: fires AFTER the disk write
+        // returned Ok AND after the in-memory mirror was updated. A
+        // commit failure (`append_to_disk` Err) returns above without
+        // firing, satisfying the "MUST NOT emit on commit failure"
+        // invariant.
+        notify_message_commit(&self.session.key, &message, committed_seq);
+        Ok(committed_seq)
     }
 
     /// Append a message to the in-memory transcript only — no disk I/O.
