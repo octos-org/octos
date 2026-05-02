@@ -1566,7 +1566,25 @@ async fn handle_session_open(
     }
     // Replay frames are durable: drops surface as `protocol/replay_lossy`
     // and the client can refetch via REST.
+    //
+    // Capability filtering: UPCR-2026-012 requires that `message/persisted`
+    // notifications are emitted ONLY to clients that negotiated
+    // `event.message_persisted.v1`. The live handler path enforces this,
+    // but replay during session/open must enforce it too — otherwise a
+    // client that did NOT request the feature still receives the events
+    // during reconnect-replay, violating the wire contract.
+    //
+    // We silently skip filtered events rather than emitting
+    // `protocol/replay_lossy`. The client never asked for these events,
+    // so dropping them is not lossy from their perspective.
     for event in outcome.replay {
+        if !features.message_persisted {
+            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) =
+                &event.event
+            {
+                continue;
+            }
+        }
         let _ = send_ledger_event_durable(ws, ledger, event.event);
     }
     for event in outcome.pending_approvals {
