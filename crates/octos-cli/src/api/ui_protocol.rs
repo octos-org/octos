@@ -827,6 +827,12 @@ struct BoundedChannelReporter {
     /// the cursor would lie. Surfaced opportunistically as `protocol/replay_lossy`
     /// from the consuming task.
     progress_dropped: Arc<AtomicU64>,
+    /// PR F (M8.10 thread-binding): bound `thread_id` for every progress
+    /// event this reporter emits. Set once at turn-start to the originating
+    /// `TurnId`; from then on every JSON payload carries `thread_id` so the
+    /// SPA reducer can demultiplex without a sticky-map fallback. `None`
+    /// preserves the legacy untagged path for callers that haven't migrated.
+    thread_id: Option<String>,
 }
 
 impl BoundedChannelReporter {
@@ -834,13 +840,26 @@ impl BoundedChannelReporter {
         Self {
             tx,
             progress_dropped,
+            thread_id: None,
         }
+    }
+
+    /// PR F: bind a `thread_id` to this reporter. Typically the originating
+    /// `TurnId` (the `params.turn_id` passed into `run_standalone_turn`),
+    /// stamped into every emitted SSE payload so wire events are routed
+    /// to the right per-turn bubble on the client.
+    fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
+        self.thread_id = thread_id.filter(|s| !s.is_empty());
+        self
     }
 }
 
 impl octos_agent::ProgressReporter for BoundedChannelReporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
-        let json = match serde_json::to_string(&super::sse::event_to_json(&event, None)) {
+        let json = match serde_json::to_string(&super::sse::event_to_json(
+            &event,
+            self.thread_id.as_deref(),
+        )) {
             Ok(json) => json,
             Err(_) => return,
         };
@@ -4093,11 +4112,16 @@ async fn run_standalone_turn(
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
     let progress_dropped = Arc::new(AtomicU64::new(0));
+    // PR F (M8.10 thread-binding chain `#649 → #740`): bind the originating
+    // `TurnId` into the reporter so every progress event the agent emits
+    // carries `thread_id`. Closes the wire-side leak where standalone-turn
+    // SSE events landed unbound and the SPA reducer had to fall back to
+    // sticky-map heuristics.
     let reporter: Arc<dyn octos_agent::ProgressReporter> =
-        Arc::new(MetricsReporter::new(Arc::new(BoundedChannelReporter::new(
-            progress_tx.clone(),
-            progress_dropped.clone(),
-        ))));
+        Arc::new(MetricsReporter::new(Arc::new(
+            BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
+                .with_thread_id(Some(turn_id.0.to_string())),
+        )));
     let progress_tx_for_result = progress_tx.clone();
     let progress_tx_for_tasks = progress_tx.clone();
     let task_progress_dropped = progress_dropped.clone();
@@ -4133,6 +4157,14 @@ async fn run_standalone_turn(
             turn_id: turn_id.clone(),
             features,
         });
+    // PR F (M8.10): capture the originating `TurnId` as a string so the
+    // tokio::spawn closure (which moves everything it touches) can pre-stamp
+    // each persisted Assistant/Tool message with the correct thread_id.
+    // Required because Patch 8 fails the persist closed if Assistant/Tool
+    // arrives unbound — the previous derive-from-history fallback picked
+    // the WRONG sibling user under rapid-fire concurrent turns.
+    let turn_thread_id_for_persist = turn_id.0.to_string();
+    let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
     let agent_task = tokio::spawn(async move {
         let result = octos_agent::tools::TOOL_APPROVAL_CTX
             .scope(
@@ -4152,8 +4184,21 @@ async fn run_standalone_turn(
                         response.reasoning_content.clone(),
                     );
                     for message in response.messages.iter().cloned().chain(final_assistant) {
+                        let mut to_save = message;
+                        // PR F (M8.10): pre-stamp `thread_id` on the
+                        // persist path so Patch 8's fail-closed
+                        // `derive_thread_id_for_new_write` accepts the
+                        // write. The bound id is the originating `TurnId`,
+                        // the same value the reporter is broadcasting on
+                        // every wire event — keeps persist and wire in
+                        // lockstep so reload renders match the live UI.
+                        if to_save.thread_id.is_none()
+                            && matches!(to_save.role, MessageRole::Assistant | MessageRole::Tool)
+                        {
+                            to_save.thread_id = Some(turn_thread_id_for_persist.clone());
+                        }
                         if let Ok(seq) = sessions
-                            .add_message_with_seq(&agent_session_id, message)
+                            .add_message_with_seq(&agent_session_id, to_save)
                             .await
                         {
                             cursor = Some(UiCursor {
@@ -4169,6 +4214,7 @@ async fn run_standalone_turn(
                     "tokens_in": response.token_usage.input_tokens,
                     "tokens_out": response.token_usage.output_tokens,
                     "cursor": cursor,
+                    "thread_id": turn_thread_id_for_done,
                 });
                 let _ = progress_tx_for_result.send(done.to_string()).await;
             }
@@ -9286,5 +9332,40 @@ mod tests {
         );
 
         octos_bus::set_message_commit_observer(prev);
+    }
+
+    /// PR F (M8.10 thread-binding chain `#649 → #740`): every progress
+    /// event the BoundedChannelReporter emits MUST carry the bound
+    /// `thread_id`. Without this, the SPA reducer for the standalone
+    /// `octos serve` UI Protocol path falls back to sticky-map
+    /// heuristics — the exact wire-side leak PR F closes.
+    #[tokio::test]
+    async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
+        use octos_agent::ProgressReporter;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let dropped = Arc::new(AtomicU64::new(0));
+
+        let reporter = BoundedChannelReporter::new(tx, dropped.clone())
+            .with_thread_id(Some("turn-pr-f-A".to_string()));
+        reporter.report(octos_agent::ProgressEvent::Thinking { iteration: 0 });
+
+        let event = rx.try_recv().expect("event must be available");
+        let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
+        assert_eq!(
+            parsed["thread_id"], "turn-pr-f-A",
+            "BoundedChannelReporter must stamp every progress event with the bound thread_id. event: {parsed}"
+        );
+
+        // Without binding, `thread_id` must be absent (legacy compat).
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<String>(8);
+        let unbound = BoundedChannelReporter::new(tx2, dropped);
+        unbound.report(octos_agent::ProgressEvent::Thinking { iteration: 1 });
+        let event = rx2.try_recv().expect("event must be available");
+        let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
+        assert!(
+            parsed.get("thread_id").is_none(),
+            "unbound reporter must not stamp thread_id (legacy compat): {parsed}"
+        );
     }
 }

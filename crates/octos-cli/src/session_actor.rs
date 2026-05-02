@@ -205,6 +205,29 @@ fn save_retry_state(path: &std::path::Path, state: &LoopRetryState) {
     }
 }
 
+/// PR F (M8.10): pick a `thread_id` for an Assistant row when the caller
+/// didn't supply one and we want to honor the new-write fail-closed split.
+/// Walks `history` backwards for the most-recent User; falls back to a
+/// freshly-synthesized UUIDv7 (mirrors the legacy synthesizer's
+/// `synth_{seq}` shape but with temporal ordering).
+///
+/// Use ONLY for foreground turns on linear single-channel transcripts
+/// (CLI / telegram / discord) — these never have the concurrent-sibling
+/// problem #649 documented (one user at a time on the wire).
+fn fallback_thread_id_for_assistant(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, MessageRole::User))
+        .and_then(|user| {
+            user.thread_id
+                .clone()
+                .or_else(|| user.client_message_id.clone())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
+}
+
 async fn persist_assistant_message(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
@@ -227,13 +250,49 @@ async fn persist_assistant_message(
     // originating turn (background results carry `originating_thread_id`
     // through `BackgroundResultPayload`), passing it here pins the
     // persisted JSONL row to the correct thread so reload pairs the
-    // assistant under the originating user bubble. Foreground turns pass
-    // `None` and continue to use the derivation fallback (correct).
-    let mut assistant_msg = match thread_id {
+    // assistant under the originating user bubble.
+    //
+    // PR F (M8.10): the fail-closed split in
+    // `derive_thread_id_for_new_write` means callers MUST supply
+    // `thread_id` for Assistant rows. Foreground turns on linear
+    // single-channel transcripts (CLI / telegram / discord) where the
+    // session_actor has no `client_message_id` to forward fall back to
+    // the load-style derivation here — those channels never have the
+    // concurrent-sibling problem #649 documented (one user at a time on
+    // the wire), so deriving from the most-recent user is safe.
+    let resolved_thread_id = match thread_id {
+        Some(tid) if !tid.is_empty() => Some(tid),
+        _ => {
+            // Linear-channel fallback: derive from history. Holding the
+            // lock briefly to read messages is fine — we're about to
+            // re-acquire below for the persist itself.
+            let handle = session_handle.lock().await;
+            handle
+                .session()
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, MessageRole::User))
+                .and_then(|user| {
+                    user.thread_id
+                        .clone()
+                        .or_else(|| user.client_message_id.clone())
+                })
+        }
+    };
+    let mut assistant_msg = match resolved_thread_id {
         Some(tid) if !tid.is_empty() => {
             Message::assistant_with_thread(content, octos_core::ThreadId::new(tid))
         }
-        _ => Message::assistant(content),
+        _ => {
+            // Orphan assistant (no user in history). Synthesize a stable
+            // UUIDv7 thread_id so the persist still succeeds — this
+            // mirrors the legacy synthesizer's `synth_{seq}` shape but
+            // uses UUIDv7 for temporal ordering. Rare: only fires for
+            // System-primer transcripts.
+            let synth = uuid::Uuid::now_v7().to_string();
+            Message::assistant_with_thread(content, octos_core::ThreadId::new(synth))
+        }
     };
     assistant_msg.media = media;
     let timestamp = assistant_msg.timestamp;
@@ -704,7 +763,14 @@ async fn persist_child_session_lifecycle(
                     message.role == MessageRole::Assistant && message.content == note
                 });
             if !exists {
-                child.add_message(Message::assistant(note)).await?;
+                // PR F (M8.10): the child session terminal note is a
+                // synthetic Assistant row injected by the lifecycle
+                // helper. Use the linear-channel fallback to derive a
+                // thread_id from the child's history (or synthesize
+                // a UUIDv7 if the child is brand new).
+                let tid = fallback_thread_id_for_assistant(&child.session().messages);
+                let note_msg = Message::assistant_with_thread(note, octos_core::ThreadId::new(tid));
+                child.add_message(note_msg).await?;
             }
             let contract = ChildSessionContract {
                 task_id: payload.task_id.clone(),
@@ -4242,13 +4308,19 @@ impl SessionActor {
                 .get("voice_transcript")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            si.start(
+            // PR F (M8.10) — codex review P1 #1: bind the originating
+            // turn's `client_message_id` to the status composer so its
+            // `edit_message_bound` calls and initial `send_with_id`
+            // metadata route to THIS turn's bubble, even when sticky
+            // has rotated under rapid-fire concurrent writes.
+            si.start_with_thread(
                 self.chat_id.clone(),
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
                 self.sender_user_id.clone(),
+                client_message_id.clone(),
             )
         });
 
@@ -4713,6 +4785,25 @@ impl SessionActor {
                     } else {
                         &conv_response.messages
                     };
+                    // PR F (M8.10): cache the linear-channel fallback once
+                    // up front so all intermediate Assistant/Tool rows of
+                    // this turn share the same thread_id. Codex's PR-F
+                    // review (P1 #2) flagged that the per-message
+                    // pre-stamp dropped intermediate rows on linear
+                    // channels (CLI/telegram/discord) where
+                    // `client_message_id` is None — those rows now
+                    // hit the new-write fail-closed split and get
+                    // dropped silently. Computing the fallback once
+                    // here keeps the whole turn pinned to one thread.
+                    let linear_fallback_for_turn: Option<String> = if client_message_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        Some(fallback_thread_id_for_assistant(&handle.session().messages))
+                    } else {
+                        None
+                    };
                     for msg in messages_to_save {
                         // Issue #740 fix: pre-stamp `thread_id` on Assistant /
                         // Tool messages produced inside the agent loop. The
@@ -4729,6 +4820,11 @@ impl SessionActor {
                         // the persisted JSONL row to the correct thread, the
                         // same fix shape PR #739 applied to the M8.9 spawn_only
                         // recovery path.
+                        //
+                        // PR F (M8.10): when `client_message_id` is absent
+                        // (linear channels), use the cached
+                        // `linear_fallback_for_turn` so intermediate
+                        // Assistant/Tool rows pass the fail-closed split.
                         let mut to_save = msg.clone();
                         if to_save.thread_id.is_none()
                             && matches!(to_save.role, MessageRole::Assistant | MessageRole::Tool)
@@ -4737,6 +4833,8 @@ impl SessionActor {
                                 if !tid.is_empty() {
                                     to_save.thread_id = Some(tid.clone());
                                 }
+                            } else if let Some(ref tid) = linear_fallback_for_turn {
+                                to_save.thread_id = Some(tid.clone());
                             }
                         }
                         if let Err(e) = handle.add_message(to_save).await {
@@ -4764,12 +4862,28 @@ impl SessionActor {
                         // `rapid-fire-five-fast` evidence: 1+1=2 rendered
                         // under the 3+3 bubble). Mirrors PR #739's M8.9
                         // recovery-path fix for the foreground SSE path.
+                        //
+                        // PR F (M8.10): non-API channels (CLI/telegram/etc.)
+                        // arrive with `client_message_id == None`. The
+                        // session.rs new-write split fail-closes for
+                        // unbound Assistant rows; on those linear
+                        // single-channel transcripts (one user at a time
+                        // on the wire) deriving from the most-recent
+                        // user is structurally safe. Use the helper to
+                        // keep the fallback in one place.
                         let mut assistant_msg = match client_message_id.as_deref() {
                             Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
                                 final_content.clone(),
                                 octos_core::ThreadId::new(tid),
                             ),
-                            _ => Message::assistant(final_content.clone()),
+                            _ => {
+                                let tid =
+                                    fallback_thread_id_for_assistant(&handle.session().messages);
+                                Message::assistant_with_thread(
+                                    final_content.clone(),
+                                    octos_core::ThreadId::new(tid),
+                                )
+                            }
                         };
                         assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
                         // M8.10-A: capture the committed seq so the SSE `done`
@@ -5246,14 +5360,20 @@ impl SessionActor {
             let tracker = Arc::new(TokenTracker::new());
 
             // ── Per-overflow status indicator (own "✦ Thinking..." message) ──
+            //
+            // PR F (M8.10): bind the overflow turn's cmid to the status
+            // composer so its wire events route to the OVERFLOW
+            // bubble, not whatever sticky/primary turn the chat is
+            // currently on.
             let status_handle = status_indicator.as_ref().map(|si| {
-                si.start(
+                si.start_with_thread(
                     chat_id.clone(),
                     &content,
                     Arc::clone(&tracker),
                     None,
                     &user_status_config,
                     sender_user_id.clone(),
+                    overflow_client_message_id.clone(),
                 )
             });
 
@@ -5392,7 +5512,20 @@ impl SessionActor {
                             final_content.clone(),
                             octos_core::ThreadId::new(tid),
                         ),
-                        _ => Message::assistant(final_content.clone()),
+                        _ => {
+                            // PR F (M8.10): non-API channels arrive
+                            // without cmid. Derive from history under
+                            // the session_handle lock so the persist
+                            // succeeds with the new-write fail-closed
+                            // split. See `fallback_thread_id_for_assistant`.
+                            let handle = session_handle.lock().await;
+                            let tid = fallback_thread_id_for_assistant(&handle.session().messages);
+                            drop(handle);
+                            Message::assistant_with_thread(
+                                final_content.clone(),
+                                octos_core::ThreadId::new(tid),
+                            )
+                        }
                     };
                     final_reply.reasoning_content = conv_response.reasoning_content.clone();
                     final_reply.timestamp = final_reply_timestamp;
@@ -5641,6 +5774,10 @@ impl SessionActor {
         let token_tracker = Arc::new(TokenTracker::new());
 
         // Start status indicator
+        //
+        // PR F (M8.10) — codex review P1 #1: bind the inbound's cmid
+        // to the status composer so its wire events route to the
+        // correct turn under rapid-fire concurrent writes.
         let status_handle = self.status_indicator.as_ref().map(|si| {
             let voice_transcript = inbound
                 .metadata
@@ -5648,13 +5785,14 @@ impl SessionActor {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            si.start(
+            si.start_with_thread(
                 self.chat_id.clone(),
                 &inbound.content,
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
                 self.sender_user_id.clone(),
+                client_message_id.clone(),
             )
         });
 
@@ -5838,6 +5976,19 @@ impl SessionActor {
                         }
                     }
 
+                    // PR F (M8.10): cache the linear-channel fallback
+                    // once per turn so intermediate Assistant/Tool rows
+                    // share a stable thread_id when no `client_message_id`
+                    // is supplied. See codex's PR-F review P1 #2.
+                    let recovery_linear_fallback: Option<String> = if client_message_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                    {
+                        Some(fallback_thread_id_for_assistant(&handle.session().messages))
+                    } else {
+                        None
+                    };
                     let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
                         let message_to_save =
@@ -5870,6 +6021,11 @@ impl SessionActor {
                                 // history (which can be a sibling rapid-fire
                                 // turn that landed in the JSONL between this
                                 // turn's user persist and assistant persist).
+                                //
+                                // PR F (M8.10): when client_message_id is
+                                // absent (linear channels), use the cached
+                                // recovery_linear_fallback so intermediate
+                                // rows pass the fail-closed split.
                                 if to_save.thread_id.is_none()
                                     && matches!(
                                         to_save.role,
@@ -5880,6 +6036,8 @@ impl SessionActor {
                                         if !tid.is_empty() {
                                             to_save.thread_id = Some(tid.clone());
                                         }
+                                    } else if let Some(ref tid) = recovery_linear_fallback {
+                                        to_save.thread_id = Some(tid.clone());
                                     }
                                 }
                                 to_save
@@ -5902,12 +6060,22 @@ impl SessionActor {
                         // from the originating turn's cmid so reload pairs
                         // the assistant under the correct user bubble.
                         // Sibling fix to PR #739's M8.9 recovery path.
+                        //
+                        // PR F (M8.10): linear-channel fallback when no
+                        // cmid is present. See site 1 above.
                         let mut assistant_msg = match client_message_id.as_deref() {
                             Some(tid) if !tid.is_empty() => Message::assistant_with_thread(
                                 final_content.clone(),
                                 octos_core::ThreadId::new(tid),
                             ),
-                            _ => Message::assistant(final_content.clone()),
+                            _ => {
+                                let tid =
+                                    fallback_thread_id_for_assistant(&handle.session().messages);
+                                Message::assistant_with_thread(
+                                    final_content.clone(),
+                                    octos_core::ThreadId::new(tid),
+                                )
+                            }
                         };
                         assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
                         if let Err(e) = handle.add_message(assistant_msg).await {
@@ -10441,7 +10609,10 @@ mod tests {
             .await
             .unwrap();
         parent_handle
-            .add_message(Message::assistant("Starting research"))
+            .add_message(Message::assistant_with_thread(
+                "Starting research",
+                octos_core::ThreadId::new("test-thread"),
+            ))
             .await
             .unwrap();
 
@@ -10684,7 +10855,10 @@ mod tests {
                 .await
                 .expect("seed user");
             handle
-                .add_message(Message::assistant("hello, where to?"))
+                .add_message(Message::assistant_with_thread(
+                    "hello, where to?",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await
                 .expect("seed assistant");
         }
@@ -10708,7 +10882,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let mut handle = writer_handle.lock().await;
             let _ = handle
-                .add_message(Message::assistant("Saratoga: 72°F sunny"))
+                .add_message(Message::assistant_with_thread(
+                    "Saratoga: 72°F sunny",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await;
         });
 
@@ -10753,7 +10930,10 @@ mod tests {
                 .await
                 .expect("seed user");
             handle
-                .add_message(Message::assistant("hello, where to?"))
+                .add_message(Message::assistant_with_thread(
+                    "hello, where to?",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await
                 .expect("seed assistant");
         }
@@ -10806,7 +10986,10 @@ mod tests {
             let mut handle = session_handle.lock().await;
             handle.add_message(Message::user("q")).await.expect("seed");
             handle
-                .add_message(Message::assistant("a"))
+                .add_message(Message::assistant_with_thread(
+                    "a",
+                    octos_core::ThreadId::new("test-thread"),
+                ))
                 .await
                 .expect("seed");
         }
@@ -11263,7 +11446,16 @@ mod tests {
                 } else {
                     // "Channel" path — the canonical helper directly (this is
                     // the same code `ApiChannel::persist_to_session` calls).
-                    let assistant = Message::assistant(format!("channel-{i}"));
+                    //
+                    // PR F (M8.10): the canonical helper now fails closed
+                    // for unbound Assistant rows. Production callers
+                    // (`ApiChannel::persist_to_session`) pre-stamp via the
+                    // typed `Message::assistant_with_thread`. The test
+                    // mirrors that.
+                    let assistant = Message::assistant_with_thread(
+                        format!("channel-{i}"),
+                        octos_core::ThreadId::new(format!("test-thread-{i}")),
+                    );
                     octos_bus::session::persist_message_through_canonical_path(
                         &data_dir, &key, assistant,
                     )
