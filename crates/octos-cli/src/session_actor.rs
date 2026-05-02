@@ -2517,6 +2517,7 @@ impl ActorFactory {
             persistent_retry_state,
             retry_state_path: Some(retry_state_path),
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         // Spawn the outbound forwarding task — buffers messages from inactive sessions
@@ -2695,6 +2696,15 @@ struct SessionActor {
     /// turn (M8.9). Caps recovery at one attempt per task so a recovery
     /// turn that itself fails cannot ignite a runaway loop.
     recovered_tasks: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// Codex pre-merge review of #748 P1.2: cmid of the inbound currently
+    /// being handled by `try_handle_command`. `send_reply` reads this so
+    /// slash-command replies + `_completion` events stamp `thread_id` from
+    /// the originating turn instead of falling back to the per-chat sticky
+    /// map (which would mis-route replies to a sibling turn under
+    /// rapid-fire interleave). Set at the top of `try_handle_command`,
+    /// cleared at the end. `None` outside command handling — `send_reply`
+    /// then falls back to legacy behavior (stamping no thread_id).
+    current_command_cmid: Option<String>,
 }
 
 impl SessionActor {
@@ -3047,10 +3057,30 @@ impl SessionActor {
             return false;
         }
 
+        // Codex pre-merge review of #748 P1.2: stash the originating turn's
+        // cmid so `send_reply` can stamp `thread_id` in metadata. Without
+        // this, slash-command replies + `_completion` events emit with
+        // empty metadata and `ApiChannel::send` falls back to the per-chat
+        // sticky map — which has been seeded by every queued/overlapping
+        // user message, so reply A can land under bubble B.
+        //
+        // Set here, cleared at end of this function (and on early returns
+        // via the same drop pattern).
+        self.current_command_cmid = message
+            .metadata
+            .get("client_message_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // Defensive: clear at the tail-cleanup line just before the
+        // function returns (see end of this fn). Single-actor task means
+        // no concurrent reader can observe the transient field; all
+        // command handlers `await` and return back here.
+
         let parts: Vec<&str> = text.split_whitespace().collect();
         let cmd = parts[0];
 
-        match cmd {
+        let consumed = match cmd {
             "/adaptive" => {
                 self.handle_adaptive_command(&parts[1..]).await;
                 true
@@ -3089,7 +3119,14 @@ impl SessionActor {
                 .await;
                 true
             }
-        }
+        };
+
+        // Codex pre-merge review of #748 P1.2: clear cmid stash so any
+        // subsequent non-command message handling (sent later via the
+        // normal turn flow) doesn't accidentally re-stamp using this
+        // command's cmid.
+        self.current_command_cmid = None;
+        consumed
     }
 
     /// `/adaptive` — view or toggle adaptive routing features.
@@ -3499,7 +3536,32 @@ impl SessionActor {
     }
 
     /// Send a short reply to the user (for command responses).
+    ///
+    /// Codex pre-merge review of #748 P1.2: when the reply is to a slash
+    /// command (i.e. `try_handle_command` set `current_command_cmid`),
+    /// stamp `thread_id` in metadata so `ApiChannel::send` does NOT fall
+    /// back to the per-chat sticky map. Without this, queued/overlapping
+    /// command A could be emitted with sticky B and land under bubble B.
     async fn send_reply(&self, content: &str) {
+        let mut reply_metadata = serde_json::json!({});
+        let mut completion_metadata = serde_json::json!({"_completion": true});
+        if let Some(cmid) = self.current_command_cmid.as_deref() {
+            if !cmid.is_empty() {
+                if let serde_json::Value::Object(ref mut m) = reply_metadata {
+                    m.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
+                if let serde_json::Value::Object(ref mut m) = completion_metadata {
+                    m.insert(
+                        "thread_id".to_string(),
+                        serde_json::Value::String(cmid.to_string()),
+                    );
+                }
+            }
+        }
+
         let _ = self
             .out_tx
             .send(OutboundMessage {
@@ -3508,7 +3570,7 @@ impl SessionActor {
                 content: content.to_string(),
                 reply_to: None,
                 media: vec![],
-                metadata: serde_json::json!({}),
+                metadata: reply_metadata,
             })
             .await;
 
@@ -3522,7 +3584,7 @@ impl SessionActor {
                     content: String::new(),
                     reply_to: None,
                     media: vec![],
-                    metadata: serde_json::json!({"_completion": true}),
+                    metadata: completion_metadata,
                 })
                 .await;
         }
@@ -4959,15 +5021,35 @@ impl SessionActor {
                             chat_id = %self.chat_id,
                             "auto-delivering report file"
                         );
+                        // Codex pre-merge review of #748 P1: media metadata
+                        // must carry `thread_id` so `ApiChannel::send` does
+                        // NOT fall back to sticky-map lookup. Without this,
+                        // an A/B race where B's request seeds sticky after
+                        // A's user row but before A's report delivery causes
+                        // A's file row to land under B's bubble (same leak
+                        // class the rest of PR F closes elsewhere).
+                        let mut file_metadata = serde_json::json!({
+                            "topic": self.session_key.topic(),
+                        });
+                        let report_thread_id = client_message_id
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        if let Some(tid) = report_thread_id.as_deref() {
+                            if let serde_json::Value::Object(ref mut m) = file_metadata {
+                                m.insert(
+                                    "thread_id".to_string(),
+                                    serde_json::Value::String(tid.to_string()),
+                                );
+                            }
+                        }
                         let file_msg = OutboundMessage {
                             channel: self.channel.clone(),
                             chat_id: self.chat_id.clone(),
                             content: String::new(),
                             reply_to: None,
                             media: vec![abs_file.to_string_lossy().into_owned()],
-                            metadata: serde_json::json!({
-                                "topic": self.session_key.topic()
-                            }),
+                            metadata: file_metadata,
                         };
                         if let Err(e) = self.out_tx.send(file_msg).await {
                             warn!(session = %self.session_key, error = %e, "failed to auto-deliver report file");
@@ -7444,6 +7526,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7515,6 +7598,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7592,6 +7676,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7716,6 +7801,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7836,6 +7922,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -7928,6 +8015,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());
@@ -8019,6 +8107,7 @@ mod tests {
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            current_command_cmid: None,
         };
 
         let handle = tokio::spawn(actor.run());

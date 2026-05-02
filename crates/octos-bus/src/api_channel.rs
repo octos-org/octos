@@ -1445,29 +1445,45 @@ impl ApiChannel {
             sess.data_dir()
         };
 
-        // PR F (M8.10) — codex review P1 #3: API-channel fail-closed
-        // posture. The previous "derive from most-recent user" fallback
-        // is exactly the bug shape PR F closes for concurrent web turns
-        // (LEAK 1). Running it inside `persist_to_session` would re-open
-        // the leak. Instead, when a caller hands us an unbound
-        // Assistant/Tool row, prefer the per-chat sticky map (which the
-        // streaming forwarder maintains for THIS turn — wire-side state
-        // for the live request). If sticky is empty too, synthesize a
-        // UUIDv7 so the persist still succeeds — those rare orphan rows
-        // would be unrouted on the wire anyway, and at least the disk
-        // write is intact for legacy replay. Increments
-        // `octos_last_thread_id_fallback_total{site="persist_to_session"}`
-        // so soak alerts on new API call sites that forgot to bind.
+        // PR F (M8.10) + codex pre-merge review of #748 P1.3: API-channel
+        // fail-closed posture. The previous "derive from most-recent user"
+        // fallback is exactly the bug shape PR F closes for concurrent web
+        // turns (LEAK 1). Running it inside `persist_to_session` would
+        // re-open the leak. Do NOT fall back to the sticky map either:
+        // sticky is
+        // last-writer-wins per chat — under rapid-fire interleave, sticky
+        // can be rotated by sibling B between A's user row and A's
+        // assistant row commit, so falling back stamps the WRONG thread_id
+        // (the same #649/#664/#673/#680/#738/#740 bug class this PR is
+        // supposed to close).
+        //
+        // New behavior: synthesize a fresh UUIDv7 for unbound rows. The
+        // row is then deterministically un-routable to any user bubble —
+        // which is the correct fail-closed posture: an unbound persist is
+        // a bug; it MUST NOT silently mis-route. The fallback metric
+        // increments so soak alerts on call sites that forgot to bind,
+        // and the resulting orphan thread_id is observable in the JSONL.
+        //
+        // Sticky is still consulted on the WIRE path (`send`,
+        // `send_with_id`, `edit_message`, `send_raw_sse`) for legacy
+        // compatibility — those sites have `record_thread_id_fallback`
+        // metrics so production fallback rate is observable.
         if message.thread_id.is_none()
             && matches!(
                 message.role,
                 octos_core::MessageRole::Assistant | octos_core::MessageRole::Tool
             )
         {
-            let sticky = self.sticky_thread_id(chat_id).await;
-            let resolved = sticky.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-            record_thread_id_fallback("persist_to_session");
-            message.thread_id = Some(resolved);
+            record_thread_id_fallback("persist_to_session_synthesized");
+            let synthesized = uuid::Uuid::now_v7().to_string();
+            tracing::warn!(
+                chat_id = %chat_id,
+                role = ?message.role,
+                synthesized_thread_id = %synthesized,
+                "persist_to_session: unbound Assistant/Tool row — synthesized orphan thread_id; \
+                 caller forgot to set thread_id (rapid-fire-safe fail-closed)"
+            );
+            message.thread_id = Some(synthesized);
         }
 
         let result = crate::session::persist_message_through_canonical_path(
@@ -5162,7 +5178,7 @@ mod tests {
         // encoded id naked and rely on `edit_message`'s sticky
         // fallback alone — that path is still exercised below.
         assert_eq!(
-            decode_sse_message_id(&message_id).1.as_deref(),
+            decode_sse_message_id(&message_id).1,
             Some("cmid-sticky-T"),
             "send_with_id should encode thread_id from sticky map (#636)",
         );
@@ -5388,7 +5404,7 @@ mod tests {
             .expect("send_with_id always returns Some");
         let (_, q1_decoded) = decode_sse_message_id(&q1_msg_id);
         assert_eq!(
-            q1_decoded.as_deref(),
+            q1_decoded,
             Some("cmid-A"),
             "Q1's encoded message_id must capture its OWN cmid, not the sticky's last value (cmid-E). Got: {q1_msg_id}"
         );
@@ -5414,7 +5430,7 @@ mod tests {
             .expect("send_with_id always returns Some");
         let (_, q3_decoded) = decode_sse_message_id(&q3_msg_id);
         assert_eq!(
-            q3_decoded.as_deref(),
+            q3_decoded,
             Some("cmid-C"),
             "Q3's encoded message_id must capture its OWN cmid even with concurrent sticky rotations. Got: {q3_msg_id}"
         );
