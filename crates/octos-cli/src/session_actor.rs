@@ -3072,8 +3072,10 @@ impl SessionActor {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        // Defensive: clear on function exit regardless of which branch
-        // returns. Implemented via a guard pattern below.
+        // Defensive: clear at the tail-cleanup line just before the
+        // function returns (see end of this fn). Single-actor task means
+        // no concurrent reader can observe the transient field; all
+        // command handlers `await` and return back here.
 
         let parts: Vec<&str> = text.split_whitespace().collect();
         let cmd = parts[0];

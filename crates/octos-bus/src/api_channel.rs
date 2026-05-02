@@ -1445,15 +1445,12 @@ impl ApiChannel {
             sess.data_dir()
         };
 
-        // PR F (M8.10) — codex review P1 #3: API-channel fail-closed
-        // posture. The previous "derive from most-recent user" fallback
-        // is exactly the bug shape PR F closes for concurrent web turns
-        // (LEAK 1). Running it inside `persist_to_session` would re-open
-        // the leak. Instead, when a caller hands us an unbound
-        // Assistant/Tool row, prefer the per-chat sticky map (which the
-        // streaming forwarder maintains for THIS turn — wire-side state
-        // Codex pre-merge review of #748 P1.3: do NOT fall back to the
-        // sticky map for unbound Assistant/Tool persists. Sticky is
+        // PR F (M8.10) + codex pre-merge review of #748 P1.3: API-channel
+        // fail-closed posture. The previous "derive from most-recent user"
+        // fallback is exactly the bug shape PR F closes for concurrent web
+        // turns (LEAK 1). Running it inside `persist_to_session` would
+        // re-open the leak. Do NOT fall back to the sticky map either:
+        // sticky is
         // last-writer-wins per chat — under rapid-fire interleave, sticky
         // can be rotated by sibling B between A's user row and A's
         // assistant row commit, so falling back stamps the WRONG thread_id
