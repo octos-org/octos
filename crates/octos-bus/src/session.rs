@@ -15,6 +15,79 @@ use tracing::{debug, warn};
 /// Current schema version for session JSONL files.
 const CURRENT_SESSION_SCHEMA: u32 = 1;
 
+/// Observer callback invoked AFTER a successful durable commit by
+/// [`SessionManager::add_message_with_seq`] (and the equivalent
+/// `SessionHandle` path). Implements the post-fsync hook UPCR-2026-012's
+/// `message/persisted` notification dispatches through.
+///
+/// Strict-ordering invariant: `add_message_with_seq` calls observers
+/// synchronously after the in-memory append, with the registry global lock
+/// held in [`set_message_commit_observer`]. Two concurrent commits to the
+/// same session serialize on the `&mut self` borrow of `SessionManager` /
+/// `SessionHandle`, so observer fires preserve commit order per session.
+///
+/// The seq passed to the observer is the row's index in `Session::messages`
+/// after the append (`messages.len() - 1`).
+///
+/// Errors raised by an observer are logged and dropped: the durable commit
+/// has already happened, and the observer is best-effort fan-out for
+/// downstream wire-protocol notifications. A failing observer must not roll
+/// back the session row.
+pub type MessageCommitObserver =
+    std::sync::Arc<dyn Fn(&SessionKey, &Message, usize) + Send + Sync + 'static>;
+
+static MESSAGE_COMMIT_OBSERVER: std::sync::OnceLock<
+    std::sync::RwLock<Option<MessageCommitObserver>>,
+> = std::sync::OnceLock::new();
+
+fn observer_slot() -> &'static std::sync::RwLock<Option<MessageCommitObserver>> {
+    MESSAGE_COMMIT_OBSERVER.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install a process-global observer that fires after every successful
+/// `add_message_with_seq` commit. Returns the previous observer if any,
+/// allowing layered installs (e.g. tests can save / restore).
+///
+/// Wired by the AppUI server entry-point to dispatch
+/// `message/persisted` notifications per UPCR-2026-012. Off-thread fan-out
+/// happens inside the observer callback; this call is cheap and non-blocking.
+pub fn set_message_commit_observer(
+    observer: Option<MessageCommitObserver>,
+) -> Option<MessageCommitObserver> {
+    let slot = observer_slot();
+    let mut guard = slot.write().expect("message commit observer poisoned");
+    std::mem::replace(&mut *guard, observer)
+}
+
+/// Read-side accessor used by the durable-commit path. Cloned out so the
+/// callback does not hold the global lock while it runs.
+fn current_message_commit_observer() -> Option<MessageCommitObserver> {
+    let slot = observer_slot();
+    slot.read()
+        .expect("message commit observer poisoned")
+        .clone()
+}
+
+/// Fire the observer if installed. Panics inside the observer are caught
+/// (best-effort) so a faulty subscriber cannot poison the commit path. The
+/// commit has already succeeded by the time we get here — observer failure
+/// is fan-out failure, not commit failure.
+fn notify_message_commit(key: &SessionKey, message: &Message, committed_seq: usize) {
+    let Some(observer) = current_message_commit_observer() else {
+        return;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer(key, message, committed_seq);
+    }));
+    if let Err(err) = result {
+        warn!(
+            session = %key.0,
+            "message commit observer panicked: {:?}",
+            err
+        );
+    }
+}
+
 /// Per-process counter for unique rewrite-temp-file names.
 ///
 /// Two writers racing the same session file (e.g. fanout children of one
@@ -106,10 +179,23 @@ fn derive_title_from_message(content: &str) -> String {
         .to_string()
 }
 
-/// Derive `thread_id` for a freshly-arrived message about to be persisted
-/// (M8.10 PR #1). Strictly additive: callers that don't care about threads
-/// can ignore the field, and old clients that didn't set it on inbound
-/// messages still produce sensible groupings (see [`synthesize_thread_ids`]).
+/// Derive `thread_id` for a legacy JSONL load — gap-fill only.
+///
+/// PR F (M8.10): preserves the historical `derive_thread_id_for_new_message`
+/// semantics verbatim, but is reachable ONLY via the load-time
+/// [`synthesize_thread_ids`] call site. The new write path uses
+/// [`derive_thread_id_for_new_write`] instead, which fail-closes for
+/// Assistant/Tool roles when the caller didn't pre-stamp.
+///
+/// Why split? Under concurrent web turns (rapid-fire-five-fast,
+/// speculative-overflow) the in-memory `history` has been mutated by
+/// sibling user persists between *this* turn's user write and *this*
+/// turn's assistant write. Walking history backwards looking for the
+/// "most recent user" picks the WRONG cmid for Assistant rows. The fix
+/// is structural: the persist hot path now refuses to derive — every
+/// caller MUST pre-stamp the originating turn's `thread_id`. Legacy
+/// JSONL replay (which has no concurrent siblings to confuse it) keeps
+/// the old derivation.
 ///
 /// Rules (matches the spec in the M8.10 tracking issue):
 /// - `User`: thread_id = the message's `client_message_id`. If absent the
@@ -123,7 +209,12 @@ fn derive_title_from_message(content: &str) -> String {
 ///   thread_id when present, otherwise falls back to the most recent user
 ///   message's thread_id.
 /// - `System`: `None` — system messages are session-scoped, not thread-scoped.
-pub(crate) fn derive_thread_id_for_new_message(
+///
+/// Currently exercised only by the unit tests (and reserved for any future
+/// per-message legacy-load callers that arrive). [`synthesize_thread_ids`]
+/// inlines the same algorithm in batch form for full-transcript gap-fill.
+#[allow(dead_code)]
+pub(crate) fn derive_thread_id_for_legacy_load(
     message: &Message,
     history: &[Message],
 ) -> Option<String> {
@@ -171,10 +262,49 @@ pub(crate) fn derive_thread_id_for_new_message(
     }
 }
 
+/// Derive `thread_id` for a brand-new write about to be persisted.
+///
+/// PR F (M8.10 thread-binding chain `#649 → #740`): fail-closed for
+/// Assistant/Tool roles. Returns:
+/// - `Ok(Some(tid))` — User message: from `client_message_id`, or a
+///   freshly-synthesized UUIDv7 if no cmid was supplied.
+/// - `Ok(None)` — System message (system rows aren't thread-scoped).
+/// - `Err(_)` — Assistant/Tool message arrived unbound. The previous
+///   "walk history for the most recent user" derivation was structurally
+///   wrong under concurrent web turns: sibling users could rotate the
+///   in-memory history between the originating turn's user-write and its
+///   assistant-write, picking the WRONG cmid. The fix forces every
+///   caller on the new write path to pre-stamp `thread_id`. The metric
+///   `octos_session_persist_total{outcome="rejected_unbound_assistant"}`
+///   alerts on regressions.
+pub(crate) fn derive_thread_id_for_new_write(
+    message: &Message,
+    _history: &[Message],
+) -> Result<Option<String>> {
+    use octos_core::MessageRole;
+
+    match message.role {
+        MessageRole::System => Ok(None),
+        MessageRole::User => Ok(Some(
+            message
+                .client_message_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        )),
+        MessageRole::Assistant | MessageRole::Tool => Err(eyre::eyre!(
+            "PR F (M8.10 thread-binding): Assistant/Tool persist on new write \
+             path requires caller-supplied `thread_id`. Pre-stamp the \
+             originating turn's `thread_id` before calling \
+             `add_message_with_seq` — see `persist_assistant_message` in \
+             `octos-cli/src/session_actor.rs` for the canonical helper."
+        )),
+    }
+}
+
 /// Synthesize `thread_id` for legacy JSONL records that pre-date the field
 /// (M8.10 PR #1). Runs on session load — the synthesized values are
 /// in-memory only; nothing is persisted at load time. On the next write,
-/// [`derive_thread_id_for_new_message`] produces the same logical structure
+/// [`derive_thread_id_for_new_write`] produces the same logical structure
 /// going forward, so transcripts converge naturally.
 ///
 /// Algorithm walks the messages in JSONL order and threads them via the
@@ -856,6 +986,45 @@ impl SessionManager {
         })
     }
 
+    /// Check whether a session is known to this manager. Returns `true`
+    /// when the session is either resident in the LRU cache or has a
+    /// JSONL file on disk under the configured `sessions_dir`. Does NOT
+    /// create the session if missing — used by handlers that need to
+    /// reject `unknown_session` requests per UPCR-2026-009 / -010 / -011.
+    ///
+    /// Checks BOTH the legacy flat layout (`<sessions_dir>/<key>.jsonl`)
+    /// AND the canonical per-user layout (`<data_dir>/users/<base>/sessions/<topic>.jsonl`)
+    /// to mirror `load_from_disk`'s discovery rules. Without this dual check,
+    /// after LRU eviction or daemon restart, sessions persisted via
+    /// `ApiChannel::persist_to_session` (which uses the canonical per-user
+    /// path) would be reported as unknown — causing UPCR-2026-009 / -010 /
+    /// -011 handlers to reject valid sessions.
+    pub fn session_known(&mut self, key: &SessionKey) -> bool {
+        let key_str = key.0.clone();
+        if self.cache.contains(&key_str) {
+            return true;
+        }
+        let flat_path = self.session_path(key);
+        if flat_path.exists() {
+            return true;
+        }
+        // Mirror load_from_disk's per-user fallback (this fn @ ~line 1079).
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        let per_user_path = users_dir
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        per_user_path.exists()
+    }
+
     /// Add a message to a session and persist it.
     pub async fn add_message(&mut self, key: &SessionKey, message: Message) -> Result<()> {
         self.add_message_with_seq(key, message).await.map(|_| ())
@@ -884,9 +1053,22 @@ impl SessionManager {
         // the persisted JSONL line and the in-memory mirror agree (M8.10
         // PR #1). Caller-supplied `thread_id` wins — covers replay paths
         // and tests that pre-fill the field deliberately.
+        //
+        // PR F (M8.10): the new-write derivation is fail-closed for
+        // Assistant/Tool roles. Callers MUST pre-stamp before calling this;
+        // the previous "derive from history" fallback picked the wrong
+        // sibling user under concurrent rapid-fire turns. Failure here
+        // surfaces a structural caller bug rather than silently shipping
+        // a mis-routed thread.
         if message.thread_id.is_none() {
             let session = self.get_or_create(key).await;
-            message.thread_id = derive_thread_id_for_new_message(&message, &session.messages);
+            match derive_thread_id_for_new_write(&message, &session.messages) {
+                Ok(tid) => message.thread_id = tid,
+                Err(error) => {
+                    record_session_persist("rejected_unbound_assistant");
+                    return Err(error);
+                }
+            }
         }
 
         let _ = self.get_or_create(key).await;
@@ -898,7 +1080,17 @@ impl SessionManager {
         session.messages.push(message);
         session.updated_at = Utc::now();
         record_session_persist("committed");
-        Ok(session.messages.len().saturating_sub(1))
+        let committed_seq = session.messages.len().saturating_sub(1);
+        // UPCR-2026-012: post-fsync observer fan-out. Fires AFTER the
+        // append_to_disk above succeeded and the in-memory mirror is
+        // updated, so a `message/persisted` notification reflects a row
+        // that is durably visible. A failed disk write returns above
+        // before this point, so the observer never sees a row that did
+        // not commit.
+        if let Some(committed) = session.messages.last() {
+            notify_message_commit(key, committed, committed_seq);
+        }
+        Ok(committed_seq)
     }
 
     /// Get the JSONL file path for a session key.
@@ -1149,6 +1341,13 @@ impl SessionManager {
 
             // Refuse to append if the file is already at the size limit.
             // The session should be compacted before it reaches this point.
+            //
+            // Per UPCR-2026-012: the durable-commit observer fires only
+            // when this function returns Ok; previously a silent
+            // `Ok(())` here would have leaked an observer notification
+            // for a row that never reached disk. Return an error so the
+            // caller path (`add_message_with_seq`) propagates the
+            // failure and the observer is skipped.
             if !is_new && file_len >= MAX_SESSION_FILE_SIZE {
                 warn!(
                     key = key_str,
@@ -1156,7 +1355,11 @@ impl SessionManager {
                     limit = MAX_SESSION_FILE_SIZE,
                     "session file at size limit, skipping append"
                 );
-                return Ok(());
+                return Err(eyre::eyre!(
+                    "session file at size limit ({} >= {}), refusing append",
+                    file_len,
+                    MAX_SESSION_FILE_SIZE
+                ));
             }
 
             if is_new {
@@ -1865,18 +2068,39 @@ impl SessionHandle {
         // values are preserved; `None` triggers derivation against the
         // current in-memory log so the persisted line carries the field
         // and the in-memory copy matches without a reload.
+        //
+        // PR F (M8.10): fail-closed for Assistant/Tool. See the matching
+        // comment in [`SessionManager::add_message_with_seq`].
         if message.thread_id.is_none() {
-            message.thread_id = derive_thread_id_for_new_message(&message, &self.session.messages);
+            match derive_thread_id_for_new_write(&message, &self.session.messages) {
+                Ok(tid) => message.thread_id = tid,
+                Err(error) => {
+                    record_session_persist("rejected_unbound_assistant");
+                    return Err(error);
+                }
+            }
         }
 
-        self.session.messages.push(message.clone());
-        self.session.updated_at = Utc::now();
+        // UPCR-2026-012: write to disk BEFORE the in-memory push so a
+        // size-cap rejection (or any other I/O failure) leaves disk and
+        // RAM in lockstep. Previously the push happened first, which
+        // would leave a row in `Session::messages` that never reached
+        // disk on failure — and the observer would have fired for it.
         if let Err(error) = self.append_to_disk(&message).await {
             record_session_persist("failed");
             return Err(error);
         }
+        self.session.messages.push(message.clone());
+        self.session.updated_at = Utc::now();
         record_session_persist("committed");
-        Ok(self.session.messages.len().saturating_sub(1))
+        let committed_seq = self.session.messages.len().saturating_sub(1);
+        // Post-commit observer fan-out: fires AFTER the disk write
+        // returned Ok AND after the in-memory mirror was updated. A
+        // commit failure (`append_to_disk` Err) returns above without
+        // firing, satisfying the "MUST NOT emit on commit failure"
+        // invariant.
+        notify_message_commit(&self.session.key, &message, committed_seq);
+        Ok(committed_seq)
     }
 
     /// Append a message to the in-memory transcript only — no disk I/O.
@@ -2052,9 +2276,21 @@ impl SessionHandle {
                     key = key_str,
                     size = file_len,
                     limit = MAX_SESSION_FILE_SIZE,
-                    "session file at size limit, skipping append"
+                    "session file at size limit, refusing append"
                 );
-                return Ok(());
+                // Issue: post-merge codex review of #747 found this path lied
+                // by returning Ok(()), which let SessionHandle::add_message_with_seq
+                // push to memory and fire the message/persisted observer for a
+                // row that was NEVER persisted to disk. That violates UPCR-2026-012's
+                // "must not emit message/persisted for a row that did not commit"
+                // contract and creates phantom seq advances.
+                //
+                // Mirrors the SessionManager::append_to_disk fix at line 1256.
+                return Err(eyre::eyre!(
+                    "session file at size limit ({} >= {}), refusing append",
+                    file_len,
+                    MAX_SESSION_FILE_SIZE
+                ));
             }
 
             if is_new {
@@ -2448,6 +2684,17 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_message(role: MessageRole, content: &str) -> Message {
+        // PR F (M8.10): pre-stamp Assistant/Tool messages with a synthetic
+        // thread_id so they pass the new-write fail-closed check. Tests
+        // that exercise the legacy untagged path use bare struct literals
+        // or the dedicated helpers directly. Production code uses the
+        // typed `Message::assistant_with_thread`/`tool_with_thread`
+        // constructors and the canonical `persist_assistant_message`
+        // helper, both of which already supply thread_id.
+        let thread_id = match role {
+            MessageRole::Assistant | MessageRole::Tool => Some("test-thread-default".to_string()),
+            _ => None,
+        };
         Message {
             role,
             content: content.into(),
@@ -2456,7 +2703,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
-            thread_id: None,
+            thread_id,
             timestamp: Utc::now(),
         }
     }
@@ -4258,10 +4505,13 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            handle
-                .add_message(make_message(MessageRole::Assistant, "answer"))
-                .await
-                .unwrap();
+            // PR F (M8.10): caller pre-stamps Assistant with the
+            // originating turn's `thread_id`. In production this is the
+            // canonical helper `persist_assistant_message` (see
+            // `octos-cli/src/session_actor.rs`); the test mirrors that.
+            let mut assistant = make_message(MessageRole::Assistant, "answer");
+            assistant.thread_id = Some("cmid-alpha".into());
+            handle.add_message(assistant).await.unwrap();
         }
 
         let reload = SessionHandle::open(tmp.path(), &key);
@@ -4447,14 +4697,14 @@ mod tests {
     #[test]
     fn derive_thread_id_user_uses_client_message_id() {
         let user_msg = make_message_with_cmid(MessageRole::User, "hi", Some("cmid-x"));
-        let id = derive_thread_id_for_new_message(&user_msg, &[]);
+        let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
         assert_eq!(id.as_deref(), Some("cmid-x"));
     }
 
     #[test]
     fn derive_thread_id_user_without_cmid_synthesizes_uuid() {
         let user_msg = make_message(MessageRole::User, "hi");
-        let id = derive_thread_id_for_new_message(&user_msg, &[]);
+        let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
         assert!(
             id.is_some(),
             "user without cmid still gets a synthesized id"
@@ -4469,7 +4719,7 @@ mod tests {
         user_msg.thread_id = Some("cmid-q".into());
         let history = vec![user_msg];
         let asst = make_message(MessageRole::Assistant, "answer");
-        let id = derive_thread_id_for_new_message(&asst, &history);
+        let id = derive_thread_id_for_legacy_load(&asst, &history);
         assert_eq!(id.as_deref(), Some("cmid-q"));
     }
 
@@ -4481,21 +4731,134 @@ mod tests {
         asst.thread_id = Some("cmid-q".into());
         let history = vec![user_msg, asst];
         let tool = make_message(MessageRole::Tool, "tool result");
-        let id = derive_thread_id_for_new_message(&tool, &history);
+        let id = derive_thread_id_for_legacy_load(&tool, &history);
         assert_eq!(id.as_deref(), Some("cmid-q"));
     }
 
     #[test]
     fn derive_thread_id_system_returns_none() {
         let sys = make_message(MessageRole::System, "system primer");
-        let id = derive_thread_id_for_new_message(&sys, &[]);
+        let id = derive_thread_id_for_legacy_load(&sys, &[]);
         assert!(id.is_none(), "system messages aren't thread-scoped");
+    }
+
+    /// PR F (M8.10): the new-write derivation MUST refuse Assistant rows
+    /// that arrived without a caller-supplied `thread_id`. Pre-fix, this
+    /// silently walked history backwards and picked the most-recent user
+    /// — under concurrent rapid-fire writes that's the WRONG turn (a
+    /// sibling user has rotated the in-memory history between the
+    /// originating turn's user-write and its assistant-write). The
+    /// metric `octos_session_persist_total{outcome="rejected_unbound_assistant"}`
+    /// is the alerting hook for soak.
+    #[test]
+    fn derive_thread_id_for_new_write_rejects_unbound_assistant() {
+        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        user_msg.thread_id = Some("cmid-q".into());
+        let history = vec![user_msg];
+        let asst = make_message(MessageRole::Assistant, "answer");
+        let result = derive_thread_id_for_new_write(&asst, &history);
+        assert!(
+            result.is_err(),
+            "new-write path must fail-closed for unbound Assistant; got {result:?}"
+        );
+    }
+
+    /// PR F: the new-write derivation MUST refuse Tool rows that arrived
+    /// without a caller-supplied `thread_id`, for the same structural
+    /// reason as Assistant. Tools must inherit from the originating turn
+    /// (carried via `originating_thread_id` in BackgroundResultPayload),
+    /// not from history walking.
+    #[test]
+    fn derive_thread_id_for_new_write_rejects_unbound_tool() {
+        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        user_msg.thread_id = Some("cmid-q".into());
+        let history = vec![user_msg];
+        let tool = make_message(MessageRole::Tool, "tool result");
+        let result = derive_thread_id_for_new_write(&tool, &history);
+        assert!(
+            result.is_err(),
+            "new-write path must fail-closed for unbound Tool; got {result:?}"
+        );
+    }
+
+    /// PR F: User rows always synthesize/derive cleanly (cmid → thread_id).
+    /// System rows return `Ok(None)`. These remain non-fail-closed
+    /// because the rule is structurally well-defined for them.
+    #[test]
+    fn derive_thread_id_for_new_write_accepts_user_and_system() {
+        let user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        let id = derive_thread_id_for_new_write(&user_msg, &[]).expect("user must succeed");
+        assert_eq!(id.as_deref(), Some("cmid-q"));
+
+        let sys = make_message(MessageRole::System, "primer");
+        let id = derive_thread_id_for_new_write(&sys, &[]).expect("system must succeed");
+        assert!(id.is_none());
+    }
+
+    /// PR F: legacy JSONL replay must continue to gap-fill via
+    /// `derive_thread_id_for_legacy_load` — a transcript that pre-dates
+    /// the PR #1 typed write path has Assistant rows without thread_id
+    /// and must reconstruct via history walking. The new-write
+    /// fail-closed split MUST NOT regress this.
+    #[tokio::test]
+    async fn add_message_with_seq_accepts_legacy_replay_via_legacy_load() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "legacy-replay");
+
+        // Build a session in memory with legacy rows (no thread_id) using
+        // bare struct literals so the test exercises the actual legacy
+        // wire shape (Assistant/Tool rows lacking thread_id).
+        fn legacy_msg(role: MessageRole, content: &str, cmid: Option<&str>) -> Message {
+            Message {
+                role,
+                content: content.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: cmid.map(String::from),
+                thread_id: None,
+                timestamp: Utc::now(),
+            }
+        }
+        let mut messages = vec![
+            legacy_msg(MessageRole::User, "first", Some("cmid-old-1")),
+            legacy_msg(MessageRole::Assistant, "first reply", None),
+            legacy_msg(MessageRole::User, "second", Some("cmid-old-2")),
+            legacy_msg(MessageRole::Assistant, "second reply", None),
+        ];
+        for m in &mut messages {
+            assert!(m.thread_id.is_none(), "legacy fixture must lack thread_id");
+        }
+        synthesize_thread_ids(&mut messages);
+        // Synthesis populates every row.
+        assert_eq!(messages[0].thread_id.as_deref(), Some("cmid-old-1"));
+        assert_eq!(messages[1].thread_id.as_deref(), Some("cmid-old-1"));
+        assert_eq!(messages[2].thread_id.as_deref(), Some("cmid-old-2"));
+        assert_eq!(messages[3].thread_id.as_deref(), Some("cmid-old-2"));
+
+        // After legacy gap-fill, the rows can be re-persisted via the
+        // new-write path because the gap-fill stamped thread_id.
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        for m in messages {
+            handle
+                .add_message(m)
+                .await
+                .expect("legacy-gap-filled rows must persist via new write path");
+        }
     }
 
     #[tokio::test]
     async fn add_message_with_seq_stamps_thread_id_on_inbound_messages() {
         // The new write path must populate thread_id on the persisted line so
         // a later reload doesn't have to fall back to synthesis.
+        //
+        // PR F (M8.10): the persist path is fail-closed for unbound
+        // Assistant — the caller must pre-stamp `thread_id`. The test
+        // mirrors production: the User row derives its thread_id from
+        // its `client_message_id`; the Assistant row arrives pre-stamped
+        // with the originating turn's `thread_id` (in production via
+        // `Message::assistant_with_thread`).
         let tmp = TempDir::new().unwrap();
         let key = SessionKey::new("api", "stamp-on-write");
 
@@ -4508,10 +4871,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        handle
-            .add_message(make_message(MessageRole::Assistant, "first reply"))
-            .await
-            .unwrap();
+        let mut assistant = make_message(MessageRole::Assistant, "first reply");
+        assistant.thread_id = Some("cmid-write-1".into());
+        handle.add_message(assistant).await.unwrap();
 
         // In-memory copy carries thread_id.
         assert_eq!(
@@ -4552,5 +4914,78 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "cmid-1");
         assert_eq!(threads[0].responses.len(), 0);
+    }
+
+    /// Regression for codex retro-review BLOCKING #1: SessionHandle::append_to_disk
+    /// must return Err on size-cap rejection (was returning Ok(()), letting the
+    /// caller push to memory and fire message/persisted observer for a row that
+    /// never committed to disk — UPCR-2026-012 contract violation).
+    #[tokio::test]
+    async fn session_handle_append_returns_err_when_at_size_cap() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-cap-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        // Pre-fill the JSONL above MAX_SESSION_FILE_SIZE so the next
+        // append must refuse.
+        let path = handle.session_path();
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        let oversize = vec![b'a'; (MAX_SESSION_FILE_SIZE + 1) as usize];
+        std::fs::write(&path, oversize).expect("pre-fill oversize jsonl");
+
+        let msg = make_message(MessageRole::User, "after-cap");
+        let result = handle.add_message_with_seq(msg).await;
+
+        assert!(
+            result.is_err(),
+            "add_message_with_seq must return Err when file at size cap; got {:?}",
+            result
+        );
+        // In-memory state must NOT advance on a refused append.
+        assert_eq!(
+            handle.get_history(10).len(),
+            0,
+            "no message should be in memory when disk append refused"
+        );
+    }
+
+    /// Regression for codex retro-review BLOCKING #2: SessionManager::session_known
+    /// must check both legacy flat layout AND canonical per-user layout. Without
+    /// this dual check, after LRU eviction or daemon restart, sessions persisted
+    /// via ApiChannel's per-user path become un-discoverable to UPCR-2026-009 /
+    /// -010 / -011 handlers.
+    #[tokio::test]
+    async fn session_known_finds_canonical_per_user_path_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Simulate ApiChannel's canonical layout:
+        // <data_dir>/users/<encoded-base>/sessions/<encoded-topic>.jsonl
+        let users_dir = tmp.path().join("users");
+        let key = SessionKey::new("api", "user42#chat-1");
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let per_user_path = users_dir
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
+        std::fs::write(&per_user_path, b"{}\n").unwrap();
+
+        // Fresh manager (cache empty — simulates post-restart). The legacy flat
+        // path does NOT exist; only the canonical per-user path exists.
+        let mut mgr = SessionManager::open(tmp.path()).expect("open SessionManager");
+        assert!(
+            !mgr.session_path(&key).exists(),
+            "precondition: flat path must NOT exist for this test"
+        );
+        assert!(
+            mgr.session_known(&key),
+            "session_known must find session via canonical per-user layout \
+             when only that layout has the file (regression for UPCR-2026-009/010/011 handlers)"
+        );
     }
 }

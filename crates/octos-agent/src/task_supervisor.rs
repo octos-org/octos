@@ -226,6 +226,16 @@ pub struct BackgroundTask {
     /// surface the exact input the LLM passed when offering alternatives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_input: Option<Value>,
+    /// Issue #738 fix: the `client_message_id` of the user turn that
+    /// originated this background task. Captured at register time so the
+    /// M8.9 failure-recovery synthetic turn can inherit the same cmid
+    /// (instead of the recovery turn minting a fresh server UUIDv7 that
+    /// the SPA has no DOM bubble for, leaving the eventual successful
+    /// retry's deliverables stranded under an orphan thread_id).
+    /// `#[serde(default)]` so tasks persisted before this field was added
+    /// still deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originating_client_message_id: Option<String>,
 }
 
 impl BackgroundTask {
@@ -275,6 +285,16 @@ pub struct SpawnOnlyFailureSignal {
     pub suggested_alternatives: Vec<String>,
     /// Owning session, when the failed task is bound to one.
     pub parent_session_key: Option<String>,
+    /// Issue #738 fix: the `client_message_id` of the user turn that
+    /// originated this spawn_only task. Threaded end-to-end so the
+    /// synthetic recovery `InboundMessage` built by the session actor
+    /// inherits the original turn's cmid — without it, `process_inbound`
+    /// mints a fresh server UUIDv7 and the eventual successful retry's
+    /// deliverables (e.g. `_report.md`) land under an orphan thread_id
+    /// with no DOM bubble in the SPA. `None` for legacy callers that
+    /// pre-date the field; receivers must tolerate that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originating_client_message_id: Option<String>,
 }
 
 /// Callback invoked when a `spawn_only` task fails. Receives the structured
@@ -1169,11 +1189,15 @@ impl TaskSupervisor {
 
         // Pre-allocate a successor task id and seed it on the supervisor
         // so dashboards see the relaunch as a peer of the original task.
-        let new_task_id = self.register_with_input(
+        // Issue #738: carry the originating cmid forward so a relaunched
+        // task that itself fails again still has the right thread anchor
+        // for any synthetic recovery turn.
+        let new_task_id = self.register_with_input_and_cmid(
             &original.tool_name,
             &original.tool_call_id,
             original.session_key.as_deref(),
             original.tool_input.clone(),
+            original.originating_client_message_id.clone(),
         );
 
         // Stamp the lineage on the new task: callers can use
@@ -1258,7 +1282,14 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         task_ledger_path: Option<&str>,
     ) -> String {
-        match self.register_full(tool_name, tool_call_id, session_key, task_ledger_path, None) {
+        match self.register_full(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            None,
+            None,
+        ) {
             Ok(id) => id,
             Err(error) => {
                 tracing::error!(
@@ -1285,7 +1316,7 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         tool_input: Option<Value>,
     ) -> String {
-        match self.register_full(tool_name, tool_call_id, session_key, None, tool_input) {
+        match self.register_full(tool_name, tool_call_id, session_key, None, tool_input, None) {
             Ok(id) => id,
             Err(error) => {
                 tracing::error!(
@@ -1294,6 +1325,41 @@ impl TaskSupervisor {
                     session_key = ?session_key,
                     error = %error,
                     "task supervisor register_with_input refused (legacy entry point); returning empty id"
+                );
+                String::new()
+            }
+        }
+    }
+
+    /// Issue #738 fix: register a task and capture the originating user
+    /// turn's `client_message_id`. The cmid is later threaded into any
+    /// `SpawnOnlyFailureSignal` emitted for this task so the M8.9
+    /// recovery `InboundMessage` keeps the original thread_id rather
+    /// than minting an orphan UUIDv7.
+    pub fn register_with_input_and_cmid(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        tool_input: Option<Value>,
+        originating_client_message_id: Option<String>,
+    ) -> String {
+        match self.register_full(
+            tool_name,
+            tool_call_id,
+            session_key,
+            None,
+            tool_input,
+            originating_client_message_id,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(
+                    tool = tool_name,
+                    tool_call_id = tool_call_id,
+                    session_key = ?session_key,
+                    error = %error,
+                    "task supervisor register_with_input_and_cmid refused (legacy entry point); returning empty id"
                 );
                 String::new()
             }
@@ -1311,7 +1377,7 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         tool_input: Option<Value>,
     ) -> Result<String, RegisterTaskError> {
-        self.register_full(tool_name, tool_call_id, session_key, None, tool_input)
+        self.register_full(tool_name, tool_call_id, session_key, None, tool_input, None)
     }
 
     fn register_full(
@@ -1321,6 +1387,7 @@ impl TaskSupervisor {
         session_key: Option<&str>,
         task_ledger_path: Option<&str>,
         tool_input: Option<Value>,
+        originating_client_message_id: Option<String>,
     ) -> Result<String, RegisterTaskError> {
         // Per-parent fan-out cap. Detached registrations (`session_key ==
         // None`) skip the gate because they do not have a parent to
@@ -1446,6 +1513,7 @@ impl TaskSupervisor {
             error: None,
             session_key: session_key.map(|s| s.to_string()),
             tool_input,
+            originating_client_message_id,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.insert(id.clone(), task);
@@ -1700,6 +1768,7 @@ impl TaskSupervisor {
             error_message,
             suggested_alternatives,
             parent_session_key: task.parent_session_key.clone(),
+            originating_client_message_id: task.originating_client_message_id.clone(),
         };
         cb(&signal);
     }
