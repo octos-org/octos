@@ -92,8 +92,8 @@ Live notification flow:
 Recovery (`UiProtocolLedger::recover` at startup):
 
 1. Scan `<data_dir>/ui-protocol/`.
-2. Per session: pick most recent log file.
-3. Replay up to `retained_per_session` entries into RAM ring.
+2. Per session: stream all retained log files in sorted order.
+3. Replay tail entries into RAM ring (bounded by `retained_per_session`).
 4. Next `seq` continues from highest replayed seq.
 
 ## Eviction (both paths share)
@@ -129,8 +129,8 @@ Documented but not implemented in M9-FIX-05:
 ## Tradeoff acceptance
 
 - Disk I/O on the hot path. Mitigated by append-only + buffered writes.
-- One file handle per active session. Mitigated by LRU eviction.
-- Recovery scan on cold start. Bounded by `retained_per_session × active session count`.
+- File handles opened per write (open/append/flush per call) rather than long-lived per-session handles. Avoids handle exhaustion at the cost of per-write open overhead.
+- Recovery scan on cold start. Bounded by retained log files on disk (not active session count) — each session contributes up to 5 retained files (`retained_files_per_session` default).
 
 ## Backward compatibility
 
