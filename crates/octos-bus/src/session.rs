@@ -934,13 +934,38 @@ impl SessionManager {
     /// JSONL file on disk under the configured `sessions_dir`. Does NOT
     /// create the session if missing — used by handlers that need to
     /// reject `unknown_session` requests per UPCR-2026-009 / -010 / -011.
+    ///
+    /// Checks BOTH the legacy flat layout (`<sessions_dir>/<key>.jsonl`)
+    /// AND the canonical per-user layout (`<data_dir>/users/<base>/sessions/<topic>.jsonl`)
+    /// to mirror `load_from_disk`'s discovery rules. Without this dual check,
+    /// after LRU eviction or daemon restart, sessions persisted via
+    /// `ApiChannel::persist_to_session` (which uses the canonical per-user
+    /// path) would be reported as unknown — causing UPCR-2026-009 / -010 /
+    /// -011 handlers to reject valid sessions.
     pub fn session_known(&mut self, key: &SessionKey) -> bool {
         let key_str = key.0.clone();
         if self.cache.contains(&key_str) {
             return true;
         }
-        let path = self.session_path(key);
-        path.exists()
+        let flat_path = self.session_path(key);
+        if flat_path.exists() {
+            return true;
+        }
+        // Mirror load_from_disk's per-user fallback (this fn @ ~line 1079).
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let users_dir = self
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.sessions_dir)
+            .join("users");
+        let per_user_path = users_dir
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        per_user_path.exists()
     }
 
     /// Add a message to a session and persist it.
@@ -2172,9 +2197,21 @@ impl SessionHandle {
                     key = key_str,
                     size = file_len,
                     limit = MAX_SESSION_FILE_SIZE,
-                    "session file at size limit, skipping append"
+                    "session file at size limit, refusing append"
                 );
-                return Ok(());
+                // Issue: post-merge codex review of #747 found this path lied
+                // by returning Ok(()), which let SessionHandle::add_message_with_seq
+                // push to memory and fire the message/persisted observer for a
+                // row that was NEVER persisted to disk. That violates UPCR-2026-012's
+                // "must not emit message/persisted for a row that did not commit"
+                // contract and creates phantom seq advances.
+                //
+                // Mirrors the SessionManager::append_to_disk fix at line 1256.
+                return Err(eyre::eyre!(
+                    "session file at size limit ({} >= {}), refusing append",
+                    file_len,
+                    MAX_SESSION_FILE_SIZE
+                ));
             }
 
             if is_new {
@@ -4672,5 +4709,78 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "cmid-1");
         assert_eq!(threads[0].responses.len(), 0);
+    }
+
+    /// Regression for codex retro-review BLOCKING #1: SessionHandle::append_to_disk
+    /// must return Err on size-cap rejection (was returning Ok(()), letting the
+    /// caller push to memory and fire message/persisted observer for a row that
+    /// never committed to disk — UPCR-2026-012 contract violation).
+    #[tokio::test]
+    async fn session_handle_append_returns_err_when_at_size_cap() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "web-cap-test");
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+
+        // Pre-fill the JSONL above MAX_SESSION_FILE_SIZE so the next
+        // append must refuse.
+        let path = handle.session_path();
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+        let oversize = vec![b'a'; (MAX_SESSION_FILE_SIZE + 1) as usize];
+        std::fs::write(&path, oversize).expect("pre-fill oversize jsonl");
+
+        let msg = make_message(MessageRole::User, "after-cap");
+        let result = handle.add_message_with_seq(msg).await;
+
+        assert!(
+            result.is_err(),
+            "add_message_with_seq must return Err when file at size cap; got {:?}",
+            result
+        );
+        // In-memory state must NOT advance on a refused append.
+        assert_eq!(
+            handle.get_history(10).len(),
+            0,
+            "no message should be in memory when disk append refused"
+        );
+    }
+
+    /// Regression for codex retro-review BLOCKING #2: SessionManager::session_known
+    /// must check both legacy flat layout AND canonical per-user layout. Without
+    /// this dual check, after LRU eviction or daemon restart, sessions persisted
+    /// via ApiChannel's per-user path become un-discoverable to UPCR-2026-009 /
+    /// -010 / -011 handlers.
+    #[tokio::test]
+    async fn session_known_finds_canonical_per_user_path_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Simulate ApiChannel's canonical layout:
+        // <data_dir>/users/<encoded-base>/sessions/<encoded-topic>.jsonl
+        let users_dir = tmp.path().join("users");
+        let key = SessionKey::new("api", "user42#chat-1");
+        let base_key = key.base_key();
+        let encoded_base = encode_path_component(base_key);
+        let topic = key.topic().unwrap_or("default");
+        let encoded_topic = encode_path_component(topic);
+        let per_user_path = users_dir
+            .join(&encoded_base)
+            .join("sessions")
+            .join(format!("{encoded_topic}.jsonl"));
+        std::fs::create_dir_all(per_user_path.parent().unwrap()).unwrap();
+        std::fs::write(&per_user_path, b"{}\n").unwrap();
+
+        // Fresh manager (cache empty — simulates post-restart). The legacy flat
+        // path does NOT exist; only the canonical per-user path exists.
+        let mut mgr = SessionManager::open(tmp.path()).expect("open SessionManager");
+        assert!(
+            !mgr.session_path(&key).exists(),
+            "precondition: flat path must NOT exist for this test"
+        );
+        assert!(
+            mgr.session_known(&key),
+            "session_known must find session via canonical per-user layout \
+             when only that layout has the file (regression for UPCR-2026-009/010/011 handlers)"
+        );
     }
 }
