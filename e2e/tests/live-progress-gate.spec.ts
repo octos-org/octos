@@ -490,11 +490,40 @@ test.describe('M4.1A live progress gate', () => {
       expect(value).toBeLessThanOrEqual(1);
     }
 
-    // Each required phase must have been observed at least once.
+    // Each required phase must have been observed at least once,
+    // EXCEPT for the deep_search-plugin transient phases which the
+    // workflow may iterate through faster than the harness's poll
+    // cadence (5s default per fixture). On wave-4 mini3 we observed
+    // `["research","search","deliver_result"]` for a successful run —
+    // `synthesize` and `completion` fired between two adjacent polls
+    // and were never sampled, even though the workflow visibly
+    // advanced through them (final task lifecycle reached `ready`).
+    //
+    // Rather than weaken assertions wholesale, we keep the canonical
+    // bookend phases (`research` initial + `deliver_result` terminal)
+    // as `must_appear: true` and treat the deep_search transients
+    // (`search` / `synthesize` / `completion`) as "at least one of
+    // them must appear" — that proves the pipeline iterated without
+    // requiring every individual sub-phase to be sampled. The bookends
+    // alone don't prove iteration; the at-least-one-mid-phase check
+    // backstops it.
+    //
+    // Per codex review on 2026-05-01 — the strict phase-contract truth
+    // (every phase emitted by the SERVER) is enforced by the third
+    // test in this describe block (`task API and event SSE stream
+    // expose the same phase truth`), which subscribes to the
+    // `/api/sessions/:id/events/stream` SSE feed and is not subject
+    // to polling-cadence race. This relaxation only weakens UI
+    // liveness coverage, NOT the phase-contract guarantee.
+    const TRANSIENT_PHASES = new Set(['search', 'synthesize', 'completion']);
     const requiredPhases = FIXTURE.required_phases
       .filter((entry) => entry.must_appear)
       .map((entry) => entry.phase);
+    const observedTransients = requiredPhases.filter(
+      (p) => TRANSIENT_PHASES.has(p) && observation.phases.has(p),
+    );
     for (const requiredPhase of requiredPhases) {
+      if (TRANSIENT_PHASES.has(requiredPhase)) continue;
       expect(
         observation.phases.has(requiredPhase),
         `required phase "${requiredPhase}" not observed. saw=${JSON.stringify(
@@ -502,6 +531,10 @@ test.describe('M4.1A live progress gate', () => {
         )}`,
       ).toBe(true);
     }
+    expect(
+      observedTransients.length,
+      `none of the deep_search transient phases (${[...TRANSIENT_PHASES].join(', ')}) were observed — pipeline did not iterate. saw=${JSON.stringify(observation.phaseSequence)}`,
+    ).toBeGreaterThan(0);
 
     // The research_report workflow loops through evidence-gathering passes,
     // so the deep_search plugin re-cycles `search`/`synthesize`/`completion`
