@@ -26,6 +26,7 @@ pub use task::{
     TaskStatus, TokenUsage, UnsupportedSessionSummaryVersion,
 };
 pub use types::{
-    AgentId, EpisodeRef, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId, ToolCall,
+    AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID, Message,
+    MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId,
 };
 pub use utils::{tool_output_limit, truncate_head_tail, truncate_utf8, truncated_utf8};

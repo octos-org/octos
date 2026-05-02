@@ -455,9 +455,16 @@ async fn chat_streaming(
                         let mut to_save = msg.clone();
                         if !user_persisted && msg.role == MessageRole::User {
                             user_persisted = true;
+                            // PR A: stamp via the typed setter so callers
+                            // wired to a `ClientMessageId` can't pass the
+                            // wrong identity here. Bare-`String` overrides
+                            // remain available for inbound paths where the
+                            // cmid is already a `String` from the wire.
                             if let Some(ref cmid) = client_message_id {
                                 if !cmid.is_empty() {
-                                    to_save.client_message_id = Some(cmid.clone());
+                                    to_save = to_save.with_typed_client_message_id(
+                                        octos_core::ClientMessageId::new(cmid),
+                                    );
                                 }
                             }
                             let timestamp = to_save.timestamp.to_rfc3339();
@@ -483,6 +490,31 @@ async fn chat_streaming(
                             }
                         } else {
                             let is_assistant = msg.role == MessageRole::Assistant;
+                            // PR F (M8.10): pre-stamp `thread_id` on
+                            // Assistant/Tool rows so the canonical
+                            // persist's new-write fail-closed split
+                            // accepts them. Bind to the originating
+                            // `client_message_id` (the REST `chat`
+                            // endpoint requires it for proper threading).
+                            // When the request didn't supply one (legacy
+                            // clients), fall back to a UUIDv7 so the
+                            // persist still succeeds — these rows would
+                            // be invisible to per-thread routing
+                            // anyway, but at least they survive reload.
+                            if to_save.thread_id.is_none()
+                                && matches!(
+                                    to_save.role,
+                                    MessageRole::Assistant | MessageRole::Tool
+                                )
+                            {
+                                to_save.thread_id = Some(
+                                    client_message_id
+                                        .as_deref()
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                                );
+                            }
                             match persist_chat_message_through_canonical(
                                 &sessions,
                                 &session_key,
