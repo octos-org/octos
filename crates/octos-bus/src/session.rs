@@ -179,10 +179,23 @@ fn derive_title_from_message(content: &str) -> String {
         .to_string()
 }
 
-/// Derive `thread_id` for a freshly-arrived message about to be persisted
-/// (M8.10 PR #1). Strictly additive: callers that don't care about threads
-/// can ignore the field, and old clients that didn't set it on inbound
-/// messages still produce sensible groupings (see [`synthesize_thread_ids`]).
+/// Derive `thread_id` for a legacy JSONL load — gap-fill only.
+///
+/// PR F (M8.10): preserves the historical `derive_thread_id_for_new_message`
+/// semantics verbatim, but is reachable ONLY via the load-time
+/// [`synthesize_thread_ids`] call site. The new write path uses
+/// [`derive_thread_id_for_new_write`] instead, which fail-closes for
+/// Assistant/Tool roles when the caller didn't pre-stamp.
+///
+/// Why split? Under concurrent web turns (rapid-fire-five-fast,
+/// speculative-overflow) the in-memory `history` has been mutated by
+/// sibling user persists between *this* turn's user write and *this*
+/// turn's assistant write. Walking history backwards looking for the
+/// "most recent user" picks the WRONG cmid for Assistant rows. The fix
+/// is structural: the persist hot path now refuses to derive — every
+/// caller MUST pre-stamp the originating turn's `thread_id`. Legacy
+/// JSONL replay (which has no concurrent siblings to confuse it) keeps
+/// the old derivation.
 ///
 /// Rules (matches the spec in the M8.10 tracking issue):
 /// - `User`: thread_id = the message's `client_message_id`. If absent the
@@ -196,7 +209,12 @@ fn derive_title_from_message(content: &str) -> String {
 ///   thread_id when present, otherwise falls back to the most recent user
 ///   message's thread_id.
 /// - `System`: `None` — system messages are session-scoped, not thread-scoped.
-pub(crate) fn derive_thread_id_for_new_message(
+///
+/// Currently exercised only by the unit tests (and reserved for any future
+/// per-message legacy-load callers that arrive). [`synthesize_thread_ids`]
+/// inlines the same algorithm in batch form for full-transcript gap-fill.
+#[allow(dead_code)]
+pub(crate) fn derive_thread_id_for_legacy_load(
     message: &Message,
     history: &[Message],
 ) -> Option<String> {
@@ -244,10 +262,49 @@ pub(crate) fn derive_thread_id_for_new_message(
     }
 }
 
+/// Derive `thread_id` for a brand-new write about to be persisted.
+///
+/// PR F (M8.10 thread-binding chain `#649 → #740`): fail-closed for
+/// Assistant/Tool roles. Returns:
+/// - `Ok(Some(tid))` — User message: from `client_message_id`, or a
+///   freshly-synthesized UUIDv7 if no cmid was supplied.
+/// - `Ok(None)` — System message (system rows aren't thread-scoped).
+/// - `Err(_)` — Assistant/Tool message arrived unbound. The previous
+///   "walk history for the most recent user" derivation was structurally
+///   wrong under concurrent web turns: sibling users could rotate the
+///   in-memory history between the originating turn's user-write and its
+///   assistant-write, picking the WRONG cmid. The fix forces every
+///   caller on the new write path to pre-stamp `thread_id`. The metric
+///   `octos_session_persist_total{outcome="rejected_unbound_assistant"}`
+///   alerts on regressions.
+pub(crate) fn derive_thread_id_for_new_write(
+    message: &Message,
+    _history: &[Message],
+) -> Result<Option<String>> {
+    use octos_core::MessageRole;
+
+    match message.role {
+        MessageRole::System => Ok(None),
+        MessageRole::User => Ok(Some(
+            message
+                .client_message_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        )),
+        MessageRole::Assistant | MessageRole::Tool => Err(eyre::eyre!(
+            "PR F (M8.10 thread-binding): Assistant/Tool persist on new write \
+             path requires caller-supplied `thread_id`. Pre-stamp the \
+             originating turn's `thread_id` before calling \
+             `add_message_with_seq` — see `persist_assistant_message` in \
+             `octos-cli/src/session_actor.rs` for the canonical helper."
+        )),
+    }
+}
+
 /// Synthesize `thread_id` for legacy JSONL records that pre-date the field
 /// (M8.10 PR #1). Runs on session load — the synthesized values are
 /// in-memory only; nothing is persisted at load time. On the next write,
-/// [`derive_thread_id_for_new_message`] produces the same logical structure
+/// [`derive_thread_id_for_new_write`] produces the same logical structure
 /// going forward, so transcripts converge naturally.
 ///
 /// Algorithm walks the messages in JSONL order and threads them via the
@@ -996,9 +1053,22 @@ impl SessionManager {
         // the persisted JSONL line and the in-memory mirror agree (M8.10
         // PR #1). Caller-supplied `thread_id` wins — covers replay paths
         // and tests that pre-fill the field deliberately.
+        //
+        // PR F (M8.10): the new-write derivation is fail-closed for
+        // Assistant/Tool roles. Callers MUST pre-stamp before calling this;
+        // the previous "derive from history" fallback picked the wrong
+        // sibling user under concurrent rapid-fire turns. Failure here
+        // surfaces a structural caller bug rather than silently shipping
+        // a mis-routed thread.
         if message.thread_id.is_none() {
             let session = self.get_or_create(key).await;
-            message.thread_id = derive_thread_id_for_new_message(&message, &session.messages);
+            match derive_thread_id_for_new_write(&message, &session.messages) {
+                Ok(tid) => message.thread_id = tid,
+                Err(error) => {
+                    record_session_persist("rejected_unbound_assistant");
+                    return Err(error);
+                }
+            }
         }
 
         let _ = self.get_or_create(key).await;
@@ -1998,8 +2068,17 @@ impl SessionHandle {
         // values are preserved; `None` triggers derivation against the
         // current in-memory log so the persisted line carries the field
         // and the in-memory copy matches without a reload.
+        //
+        // PR F (M8.10): fail-closed for Assistant/Tool. See the matching
+        // comment in [`SessionManager::add_message_with_seq`].
         if message.thread_id.is_none() {
-            message.thread_id = derive_thread_id_for_new_message(&message, &self.session.messages);
+            match derive_thread_id_for_new_write(&message, &self.session.messages) {
+                Ok(tid) => message.thread_id = tid,
+                Err(error) => {
+                    record_session_persist("rejected_unbound_assistant");
+                    return Err(error);
+                }
+            }
         }
 
         // UPCR-2026-012: write to disk BEFORE the in-memory push so a
@@ -2605,6 +2684,17 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_message(role: MessageRole, content: &str) -> Message {
+        // PR F (M8.10): pre-stamp Assistant/Tool messages with a synthetic
+        // thread_id so they pass the new-write fail-closed check. Tests
+        // that exercise the legacy untagged path use bare struct literals
+        // or the dedicated helpers directly. Production code uses the
+        // typed `Message::assistant_with_thread`/`tool_with_thread`
+        // constructors and the canonical `persist_assistant_message`
+        // helper, both of which already supply thread_id.
+        let thread_id = match role {
+            MessageRole::Assistant | MessageRole::Tool => Some("test-thread-default".to_string()),
+            _ => None,
+        };
         Message {
             role,
             content: content.into(),
@@ -2613,7 +2703,7 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
-            thread_id: None,
+            thread_id,
             timestamp: Utc::now(),
         }
     }
@@ -4415,10 +4505,13 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            handle
-                .add_message(make_message(MessageRole::Assistant, "answer"))
-                .await
-                .unwrap();
+            // PR F (M8.10): caller pre-stamps Assistant with the
+            // originating turn's `thread_id`. In production this is the
+            // canonical helper `persist_assistant_message` (see
+            // `octos-cli/src/session_actor.rs`); the test mirrors that.
+            let mut assistant = make_message(MessageRole::Assistant, "answer");
+            assistant.thread_id = Some("cmid-alpha".into());
+            handle.add_message(assistant).await.unwrap();
         }
 
         let reload = SessionHandle::open(tmp.path(), &key);
@@ -4604,14 +4697,14 @@ mod tests {
     #[test]
     fn derive_thread_id_user_uses_client_message_id() {
         let user_msg = make_message_with_cmid(MessageRole::User, "hi", Some("cmid-x"));
-        let id = derive_thread_id_for_new_message(&user_msg, &[]);
+        let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
         assert_eq!(id.as_deref(), Some("cmid-x"));
     }
 
     #[test]
     fn derive_thread_id_user_without_cmid_synthesizes_uuid() {
         let user_msg = make_message(MessageRole::User, "hi");
-        let id = derive_thread_id_for_new_message(&user_msg, &[]);
+        let id = derive_thread_id_for_legacy_load(&user_msg, &[]);
         assert!(
             id.is_some(),
             "user without cmid still gets a synthesized id"
@@ -4626,7 +4719,7 @@ mod tests {
         user_msg.thread_id = Some("cmid-q".into());
         let history = vec![user_msg];
         let asst = make_message(MessageRole::Assistant, "answer");
-        let id = derive_thread_id_for_new_message(&asst, &history);
+        let id = derive_thread_id_for_legacy_load(&asst, &history);
         assert_eq!(id.as_deref(), Some("cmid-q"));
     }
 
@@ -4638,21 +4731,134 @@ mod tests {
         asst.thread_id = Some("cmid-q".into());
         let history = vec![user_msg, asst];
         let tool = make_message(MessageRole::Tool, "tool result");
-        let id = derive_thread_id_for_new_message(&tool, &history);
+        let id = derive_thread_id_for_legacy_load(&tool, &history);
         assert_eq!(id.as_deref(), Some("cmid-q"));
     }
 
     #[test]
     fn derive_thread_id_system_returns_none() {
         let sys = make_message(MessageRole::System, "system primer");
-        let id = derive_thread_id_for_new_message(&sys, &[]);
+        let id = derive_thread_id_for_legacy_load(&sys, &[]);
         assert!(id.is_none(), "system messages aren't thread-scoped");
+    }
+
+    /// PR F (M8.10): the new-write derivation MUST refuse Assistant rows
+    /// that arrived without a caller-supplied `thread_id`. Pre-fix, this
+    /// silently walked history backwards and picked the most-recent user
+    /// — under concurrent rapid-fire writes that's the WRONG turn (a
+    /// sibling user has rotated the in-memory history between the
+    /// originating turn's user-write and its assistant-write). The
+    /// metric `octos_session_persist_total{outcome="rejected_unbound_assistant"}`
+    /// is the alerting hook for soak.
+    #[test]
+    fn derive_thread_id_for_new_write_rejects_unbound_assistant() {
+        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        user_msg.thread_id = Some("cmid-q".into());
+        let history = vec![user_msg];
+        let asst = make_message(MessageRole::Assistant, "answer");
+        let result = derive_thread_id_for_new_write(&asst, &history);
+        assert!(
+            result.is_err(),
+            "new-write path must fail-closed for unbound Assistant; got {result:?}"
+        );
+    }
+
+    /// PR F: the new-write derivation MUST refuse Tool rows that arrived
+    /// without a caller-supplied `thread_id`, for the same structural
+    /// reason as Assistant. Tools must inherit from the originating turn
+    /// (carried via `originating_thread_id` in BackgroundResultPayload),
+    /// not from history walking.
+    #[test]
+    fn derive_thread_id_for_new_write_rejects_unbound_tool() {
+        let mut user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        user_msg.thread_id = Some("cmid-q".into());
+        let history = vec![user_msg];
+        let tool = make_message(MessageRole::Tool, "tool result");
+        let result = derive_thread_id_for_new_write(&tool, &history);
+        assert!(
+            result.is_err(),
+            "new-write path must fail-closed for unbound Tool; got {result:?}"
+        );
+    }
+
+    /// PR F: User rows always synthesize/derive cleanly (cmid → thread_id).
+    /// System rows return `Ok(None)`. These remain non-fail-closed
+    /// because the rule is structurally well-defined for them.
+    #[test]
+    fn derive_thread_id_for_new_write_accepts_user_and_system() {
+        let user_msg = make_message_with_cmid(MessageRole::User, "ask", Some("cmid-q"));
+        let id = derive_thread_id_for_new_write(&user_msg, &[]).expect("user must succeed");
+        assert_eq!(id.as_deref(), Some("cmid-q"));
+
+        let sys = make_message(MessageRole::System, "primer");
+        let id = derive_thread_id_for_new_write(&sys, &[]).expect("system must succeed");
+        assert!(id.is_none());
+    }
+
+    /// PR F: legacy JSONL replay must continue to gap-fill via
+    /// `derive_thread_id_for_legacy_load` — a transcript that pre-dates
+    /// the PR #1 typed write path has Assistant rows without thread_id
+    /// and must reconstruct via history walking. The new-write
+    /// fail-closed split MUST NOT regress this.
+    #[tokio::test]
+    async fn add_message_with_seq_accepts_legacy_replay_via_legacy_load() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("api", "legacy-replay");
+
+        // Build a session in memory with legacy rows (no thread_id) using
+        // bare struct literals so the test exercises the actual legacy
+        // wire shape (Assistant/Tool rows lacking thread_id).
+        fn legacy_msg(role: MessageRole, content: &str, cmid: Option<&str>) -> Message {
+            Message {
+                role,
+                content: content.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: cmid.map(String::from),
+                thread_id: None,
+                timestamp: Utc::now(),
+            }
+        }
+        let mut messages = vec![
+            legacy_msg(MessageRole::User, "first", Some("cmid-old-1")),
+            legacy_msg(MessageRole::Assistant, "first reply", None),
+            legacy_msg(MessageRole::User, "second", Some("cmid-old-2")),
+            legacy_msg(MessageRole::Assistant, "second reply", None),
+        ];
+        for m in &mut messages {
+            assert!(m.thread_id.is_none(), "legacy fixture must lack thread_id");
+        }
+        synthesize_thread_ids(&mut messages);
+        // Synthesis populates every row.
+        assert_eq!(messages[0].thread_id.as_deref(), Some("cmid-old-1"));
+        assert_eq!(messages[1].thread_id.as_deref(), Some("cmid-old-1"));
+        assert_eq!(messages[2].thread_id.as_deref(), Some("cmid-old-2"));
+        assert_eq!(messages[3].thread_id.as_deref(), Some("cmid-old-2"));
+
+        // After legacy gap-fill, the rows can be re-persisted via the
+        // new-write path because the gap-fill stamped thread_id.
+        let mut handle = SessionHandle::open(tmp.path(), &key);
+        for m in messages {
+            handle
+                .add_message(m)
+                .await
+                .expect("legacy-gap-filled rows must persist via new write path");
+        }
     }
 
     #[tokio::test]
     async fn add_message_with_seq_stamps_thread_id_on_inbound_messages() {
         // The new write path must populate thread_id on the persisted line so
         // a later reload doesn't have to fall back to synthesis.
+        //
+        // PR F (M8.10): the persist path is fail-closed for unbound
+        // Assistant — the caller must pre-stamp `thread_id`. The test
+        // mirrors production: the User row derives its thread_id from
+        // its `client_message_id`; the Assistant row arrives pre-stamped
+        // with the originating turn's `thread_id` (in production via
+        // `Message::assistant_with_thread`).
         let tmp = TempDir::new().unwrap();
         let key = SessionKey::new("api", "stamp-on-write");
 
@@ -4665,10 +4871,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        handle
-            .add_message(make_message(MessageRole::Assistant, "first reply"))
-            .await
-            .unwrap();
+        let mut assistant = make_message(MessageRole::Assistant, "first reply");
+        assistant.thread_id = Some("cmid-write-1".into());
+        handle.add_message(assistant).await.unwrap();
 
         // In-memory copy carries thread_id.
         assert_eq!(
