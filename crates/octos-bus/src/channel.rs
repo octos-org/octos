@@ -92,6 +92,28 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Edit an existing message with an explicit `thread_id` binding.
+    ///
+    /// PR F (M8.10 thread-binding chain `#649 → #740`): the originating
+    /// turn's `thread_id` is captured at the stream forwarder's task spawn
+    /// and threaded through every flush. Forwarding it explicitly here
+    /// closes the wire-side leak where the legacy `edit_message` path
+    /// recovered `thread_id` via `decode_sse_message_id` and then a
+    /// per-chat sticky map — under rapid-fire concurrent turns the sticky
+    /// has rotated, so late deltas of an earlier turn mis-routed to a
+    /// later turn's bubble. Channels that don't track threads ignore this
+    /// argument; the default impl forwards to legacy `edit_message`,
+    /// preserving Telegram/Discord/etc. behavior bug-for-bug.
+    async fn edit_message_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        new_content: &str,
+        _thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.edit_message(chat_id, message_id, new_content).await
+    }
+
     /// Finalize a streamed message.
     ///
     /// Called once after the last streaming chunk. Channels that need special
@@ -104,6 +126,23 @@ pub trait Channel: Send + Sync {
         final_content: &str,
     ) -> Result<()> {
         self.edit_message(chat_id, message_id, final_content).await
+    }
+
+    /// Finalize a streamed message with an explicit `thread_id` binding.
+    ///
+    /// PR F sibling of [`edit_message_bound`]. Default: forwards to
+    /// [`edit_message_bound`] so the bound argument propagates through
+    /// the same `bound > decoded > sticky` resolution shape the API
+    /// channel implements.
+    async fn finish_stream_bound(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        final_content: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.edit_message_bound(chat_id, message_id, final_content, thread_id)
+            .await
     }
 
     /// Delete a message by platform message ID.
@@ -140,6 +179,24 @@ pub trait Channel: Send + Sync {
     /// (Telegram, Matrix, etc.) ignore this.
     async fn send_raw_sse(&self, _chat_id: &str, _json: &str) -> Result<()> {
         Ok(())
+    }
+
+    /// Send a raw SSE JSON event with an explicit `thread_id` binding.
+    ///
+    /// PR F (M8.10): the API channel implements this to override any
+    /// `thread_id` on the JSON payload (or absence thereof) with the
+    /// caller-supplied `bound` value before broadcasting. This closes the
+    /// LEAK 2 wire path — the legacy `send_raw_sse` falls back to a
+    /// per-chat sticky map that rotates under rapid-fire concurrent turns.
+    /// Default impl forwards to [`send_raw_sse`] so non-SSE channels
+    /// remain a strict no-op.
+    async fn send_raw_sse_bound(
+        &self,
+        chat_id: &str,
+        json: &str,
+        _thread_id: Option<&str>,
+    ) -> Result<()> {
+        self.send_raw_sse(chat_id, json).await
     }
 
     /// Add an emoji reaction to a message. Default: no-op.
