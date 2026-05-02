@@ -182,6 +182,28 @@ Current M9 sandbox-parity decision:
   the intersection of the client's `X-Octos-Ui-Features` request with
   the server's known feature registry; absent header falls back to the
   first-server-slice default.
+- The additive `session/hydrate` command (returning the authoritative
+  chat-state projection: messages, threads, turns, pending approvals) is
+  governed by accepted
+  [UPCR-2026-009](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_009_SESSION_HYDRATE.md),
+  gated behind the `state.session_hydrate.v1` feature flag.
+- The additive `thread/graph/get` command (lifting the in-memory
+  `Session::threads()` partition onto the wire so clients no longer
+  reconstruct grouping from message-ordering heuristics) is governed by
+  accepted
+  [UPCR-2026-010](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_010_THREAD_GRAPH_GET.md),
+  gated behind `state.thread_graph.v1`.
+- The additive `turn/state/get` command (deterministic turn lifecycle
+  introspection backed by the active-turn registry AND a durable ledger
+  projection) is governed by accepted
+  [UPCR-2026-011](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_011_TURN_STATE_GET.md),
+  gated behind `state.turn_state_get.v1`. Returns `state: "unknown"`
+  rather than an error for missing turns.
+- The additive `message/persisted` notification (durable-commit
+  confirmation per session row, fired AFTER `add_message_with_seq`'s
+  fsync) is governed by accepted
+  [UPCR-2026-012](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_012_MESSAGE_PERSISTED.md),
+  gated behind `event.message_persisted.v1`. Strict-ordered per session.
 
 ## 5. Identity Model
 
