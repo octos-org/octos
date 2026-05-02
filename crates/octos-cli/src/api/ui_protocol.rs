@@ -55,7 +55,7 @@ use super::ui_protocol_approvals::PendingApprovalStore;
 use super::ui_protocol_audit::{ApprovalsAuditConfig, ApprovalsAuditLog, log_decision_tracing};
 use super::ui_protocol_diff::{DiffPreviewConfig, PendingDiffPreviewStore};
 use super::ui_protocol_ledger::{
-    LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
+    ConnectionId, LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
     spawn_eviction_task,
 };
 use super::ui_protocol_progress::{
@@ -172,6 +172,11 @@ impl ConnectionMetrics {
 pub(crate) struct WsConnection {
     writer: mpsc::Sender<WsMessage>,
     metrics: Arc<ConnectionMetrics>,
+    /// Unique within the process. Stamped onto every ledger append we
+    /// also direct-send so the live forwarder running on this same
+    /// connection can drop the broadcast copy and avoid duplicate
+    /// delivery to the WS.
+    connection_id: ConnectionId,
 }
 
 impl WsConnection {
@@ -179,7 +184,13 @@ impl WsConnection {
         Self {
             writer,
             metrics: Arc::new(ConnectionMetrics::default()),
+            connection_id: ConnectionId::next(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_id(&self) -> ConnectionId {
+        self.connection_id
     }
 
     #[cfg(test)]
@@ -745,16 +756,16 @@ async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// UPCR-2026-012's ordering invariant.
 ///
 /// Delivery model: the entry is persisted to the ledger ring (disk +
-/// in-memory). Clients receive `message/persisted` via the existing
-/// cursor-based replay path on `session/open { after: <cursor> }` or
-/// via the next durable replay window. Live wire fan-out to currently
-/// connected subscribers is a follow-up: there is no general
-/// publish-subscribe broadcast for ledger events in v1, and adding one
-/// is governed by a separate UPCR. Until then, clients that need
-/// near-real-time `message/persisted` should reopen with the latest
-/// cursor after each turn boundary; UPCR-2026-012 explicitly permits
-/// this delivery model ("Clients use this as their `after` value for
-/// subsequent `session/hydrate` and `session/open` calls").
+/// in-memory). Clients receive `message/persisted` via two paths,
+/// whichever wins the race: (a) cursor-based replay on
+/// `session/open { after: <cursor> }`, or (b) the per-session live
+/// publish-subscribe broadcast (`UiProtocolLedger::subscribe`) drained
+/// by `spawn_live_forwarder` for currently connected WebSocket clients.
+/// Both paths are reconciled by the forwarder's `baseline_seq` filter
+/// (replay snapshot head) and `from_connection` self-suppression so
+/// each event reaches each WS exactly once. Issue #760 / PR #761
+/// closed the original "no live fan-out" gap; clients that go offline
+/// still resync via cursor on reconnect.
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
     let observer: octos_bus::MessageCommitObserver =
         Arc::new(move |session_key, message, committed_seq| {
@@ -1569,7 +1580,7 @@ async fn handle_session_open(
     // Subscribe to the live ledger broadcast BEFORE the replay query so any
     // event that lands while we're still computing replay/opened sits in the
     // broadcast buffer and gets emitted by the forwarder once we hand it off
-    // (filtered to seq > opened.cursor.seq to avoid duplicating replay).
+    // (filtered to seq > replay snapshot head to avoid duplicating replay).
     // Issue #760: without this, late background-task artifacts (deep_research
     // result, mofa podcast, run_pipeline output, TTS audio) reach the ledger
     // but never push to the live WS.
@@ -1580,6 +1591,7 @@ async fn handle_session_open(
         state,
         ledger,
         approvals,
+        ws.connection_id,
         connection_profile_id,
         features,
         params,
@@ -1588,8 +1600,12 @@ async fn handle_session_open(
     {
         Ok(outcome) => outcome,
         Err(error) => {
-            // Receiver drops on return; broadcast sender stays — future
-            // session/open on this WS just resubscribes.
+            // Drop the receiver, then opportunistically reclaim the
+            // broadcast sender slot if no other connection is subscribed
+            // (codex MUST-FIX-3: failure paths previously leaked one
+            // sender per failed open).
+            drop(live_rx);
+            ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
             let _ = send_rpc_error(ws, Some(id), error);
             return;
         }
@@ -1643,7 +1659,11 @@ async fn handle_session_open(
             UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(event)),
         );
     }
-    let opened_seq = outcome.opened_event.cursor.seq;
+    // Baseline = head_seq captured atomically with replay (codex MUST-FIX-1).
+    // Using opened_event.cursor.seq instead would silently filter out any
+    // event that happened to land between replay and the session/open
+    // append, exactly the gap codex flagged.
+    let baseline_seq = outcome.replay_baseline_seq;
     let session_id = match &outcome.opened_event.event {
         UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) => {
             opened.session_id.clone()
@@ -1661,7 +1681,8 @@ async fn handle_session_open(
         ws.clone(),
         ledger_for_forwarder,
         session_id,
-        opened_seq,
+        baseline_seq,
+        ws.connection_id,
         features,
         live_rx,
         live_forwarders.clone(),
@@ -1680,6 +1701,7 @@ async fn spawn_live_forwarder(
     ledger: Arc<UiProtocolLedger>,
     session_id: SessionKey,
     baseline_seq: u64,
+    self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
@@ -1694,6 +1716,14 @@ async fn spawn_live_forwarder(
                     if event.cursor.seq <= baseline_seq {
                         continue;
                     }
+                    // Codex MUST-FIX-2: when the originating handler ran
+                    // on this same connection it already direct-sent the
+                    // wire frame; dropping the broadcast copy here is the
+                    // only way to keep delivery exactly-once. Other
+                    // connections still receive the event via fan-out.
+                    if event.from_connection == Some(self_connection_id) {
+                        continue;
+                    }
                     if !live_event_passes_capability_filter(&event.event, features) {
                         continue;
                     }
@@ -1706,7 +1736,7 @@ async fn spawn_live_forwarder(
                         Err(_) => {}
                     }
                 }
-                Err(RecvError::Lagged(_)) => {
+                Err(RecvError::Lagged(skipped)) => {
                     // Slow consumer fell behind. The ledger is durable; the
                     // client's cursor is the source of truth and a follow-up
                     // session/hydrate or reconnect with the last cursor
@@ -1714,6 +1744,7 @@ async fn spawn_live_forwarder(
                     tracing::warn!(
                         target: "octos::ui_protocol::ws",
                         session_id = %session_for_log.0,
+                        skipped_events = skipped,
                         "live ledger forwarder lagged; client must rehydrate via cursor"
                     );
                 }
@@ -1753,12 +1784,19 @@ struct SessionOpenOutcome {
     replay: Vec<LedgeredUiProtocolEvent>,
     pending_approvals: Vec<ApprovalRequestedEvent>,
     opened_event: LedgeredUiProtocolEvent,
+    /// Head seq observed atomically with the replay snapshot. The live
+    /// forwarder uses this — NOT `opened_event.cursor.seq` — as its
+    /// drop-everything-≤-this baseline. Closes the replay/open race
+    /// where an event landing between replay and the session/open append
+    /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
+    replay_baseline_seq: u64,
 }
 
 async fn open_session_result(
     state: &Arc<AppState>,
     ledger: &UiProtocolLedger,
     approvals: &PendingApprovalStore,
+    connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     params: SessionOpenParams,
@@ -1772,7 +1810,8 @@ async fn open_session_result(
     if let Some(workspace_root) = requested_workspace {
         session_workspaces().set(params.session_id.clone(), workspace_root);
     }
-    let replay = ledger.replay_after(&params.session_id, params.after.as_ref())?;
+    let (replay, replay_baseline_seq) =
+        ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     let replayed_approval_ids = replay
         .iter()
         .filter_map(|event| match &event.event {
@@ -1806,14 +1845,20 @@ async fn open_session_result(
     // clients don't have to rely on out-of-band knowledge of which feature
     // tokens the server honours.
     let capabilities = features.negotiated_capabilities();
-    let opened_event = ledger.append_notification(UiNotification::SessionOpened(SessionOpened {
-        session_id: params.session_id,
-        active_profile_id,
-        workspace_root: workspace_root.map(|path| path.to_string_lossy().to_string()),
-        cursor: None,
-        panes,
-        capabilities,
-    }));
+    // Tag the broadcast with our connection id so the live forwarder
+    // installed below skips this event (we direct-send it inline at the
+    // call site). Other connections still observe the broadcast.
+    let opened_event = ledger.append_notification_from(
+        UiNotification::SessionOpened(SessionOpened {
+            session_id: params.session_id,
+            active_profile_id,
+            workspace_root: workspace_root.map(|path| path.to_string_lossy().to_string()),
+            cursor: None,
+            panes,
+            capabilities,
+        }),
+        connection_id,
+    );
     let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
         opened_event.event.clone()
     else {
@@ -1824,6 +1869,7 @@ async fn open_session_result(
         replay,
         pending_approvals,
         opened_event,
+        replay_baseline_seq,
     })
 }
 
@@ -4498,7 +4544,9 @@ async fn run_standalone_turn(
                         send_notification_durable(&ws, &ledger, UiNotification::Warning(warning));
                 }
                 if let Some(status) = mapping.status {
-                    let event = ledger.append_progress(status.event);
+                    // Tag with this connection's id so its forwarder skips
+                    // the broadcast copy after the direct send below.
+                    let event = ledger.append_progress_from(status.event, ws.connection_id);
                     let _ = send_ledger_event_durable(&ws, &ledger, event.event);
                 }
             }
@@ -4954,7 +5002,9 @@ fn send_notification_lifecycle(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
-    let event = ledger.append_notification(notification);
+    // Tag the broadcast with the originating connection so this
+    // connection's own live forwarder skips the duplicate copy.
+    let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
     let frame = frame_from_ledger(event.event)
@@ -4984,7 +5034,7 @@ fn send_notification_durable(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
-    let event = ledger.append_notification(notification);
+    let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
     let frame = match frame_from_ledger(event.event) {
@@ -5120,7 +5170,7 @@ fn emit_replay_lossy_opportunistic(
         dropped_count: dropped,
         last_durable_cursor: last_cursor,
     });
-    let event = ledger.append_notification(lossy);
+    let event = ledger.append_notification_from(lossy, ws.connection_id);
     let method = octos_core::ui_protocol::methods::REPLAY_LOSSY.to_string();
     let frame = match frame_from_ledger(event.event) {
         Some(frame) => frame,
@@ -6656,6 +6706,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6691,6 +6742,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6746,6 +6798,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6799,6 +6852,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6845,6 +6899,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6888,6 +6943,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures {
                 typed_approvals: false,
@@ -6946,6 +7002,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6981,6 +7038,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -7033,6 +7091,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             features,
             SessionOpenParams {
@@ -7452,6 +7511,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -7474,6 +7534,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -8760,6 +8821,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -9557,6 +9619,7 @@ mod tests {
             ledger.clone(),
             session_id.clone(),
             0,
+            ws.connection_id(),
             features_with_message_persisted(true),
             live_rx,
             forwarders.clone(),
@@ -9599,6 +9662,7 @@ mod tests {
             ledger.clone(),
             session_id.clone(),
             baseline.cursor.seq,
+            ws.connection_id(),
             features_with_message_persisted(true),
             live_rx,
             forwarders.clone(),
@@ -9642,6 +9706,7 @@ mod tests {
             ledger.clone(),
             session_id.clone(),
             0,
+            ws.connection_id(),
             features_with_message_persisted(false),
             live_rx,
             forwarders.clone(),
@@ -9674,6 +9739,7 @@ mod tests {
             ledger.clone(),
             session_id.clone(),
             0,
+            ws_a.connection_id(),
             features_with_message_persisted(true),
             rx_a_live,
             forwarders_a.clone(),
@@ -9685,6 +9751,7 @@ mod tests {
             ledger.clone(),
             session_id.clone(),
             0,
+            ws_b.connection_id(),
             features_with_message_persisted(true),
             rx_b_live,
             forwarders_b.clone(),
@@ -9724,5 +9791,260 @@ mod tests {
         );
 
         abort_live_forwarders(&forwarders_b).await;
+    }
+
+    // -- Codex PR #761 review fixes ----------------------------------------
+
+    /// MUST-FIX-1: an event appended *after* the replay snapshot but
+    /// *before* the live forwarder is wired up (the gap between
+    /// `replay_after_with_head` returning and `spawn_live_forwarder`
+    /// being awaited) must still reach the WS via the broadcast. The
+    /// baseline must come from the replay snapshot's head — not the
+    /// later session/open seq — otherwise a session/open append at H+2
+    /// would shift the baseline up and silently drop the H+1 event.
+    #[tokio::test]
+    async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_install() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:gap".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Pre-existing event at seq=1 — would be in replay history.
+        let initial = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(initial.cursor.seq, 1);
+
+        // Snapshot replay (head=1) + subscribe in the same order
+        // handle_session_open does.
+        let live_rx = ledger.subscribe(&session_id);
+        let (_replay, replay_head) = ledger
+            .replay_after_with_head(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay snapshot");
+        assert_eq!(replay_head, 1);
+
+        // GAP event — landed AFTER replay snapshot was taken but BEFORE
+        // the forwarder is installed. With the broken design this would
+        // be filtered out (baseline shifted to session/open's seq=H+2);
+        // with the fix the broadcast buffer holds it and the forwarder
+        // emits it once installed.
+        let gap = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(gap.cursor.seq, 2);
+
+        // Append session/open AFTER the gap event — exactly the
+        // ordering open_session_result produces.
+        let opened = ledger.append_notification_from(
+            UiNotification::SessionOpened(SessionOpened {
+                session_id: session_id.clone(),
+                active_profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                workspace_root: None,
+                cursor: None,
+                panes: None,
+                capabilities: UiProtocolCapabilities::first_server_slice(),
+            }),
+            ws.connection_id(),
+        );
+        assert_eq!(opened.cursor.seq, 3);
+
+        // Wire up the forwarder using replay_head as the baseline. The
+        // gap event has seq > baseline AND it is not from this
+        // connection, so it must surface on the WS.
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            replay_head,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("forwarder must emit gap event")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            "the H+1 gap event must reach the WS, not be silently filtered"
+        );
+
+        // The session/open event itself must NOT come back via the
+        // broadcast (it carries our connection_id, so the forwarder
+        // skips it — the handler already direct-sent it inline).
+        assert!(
+            rx.try_recv().is_err(),
+            "no further frames expected: session/open must be self-suppressed"
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    /// MUST-FIX-2: a `send_notification_durable` call from the same
+    /// connection that owns an active live forwarder must deliver the
+    /// frame exactly once. Without `from_connection` self-suppression
+    /// the forwarder would receive the broadcast and double-send.
+    #[tokio::test]
+    async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:dedup".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Direct-send via the standard handler path. This both persists
+        // (with our connection_id stamped) and direct-sends inline.
+        send_notification_durable(&ws, &ledger, message_persisted_for(&session_id))
+            .expect("direct send succeeds");
+
+        // Exactly one frame must arrive.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first frame")
+            .expect("ws open");
+        assert_eq!(
+            frame_method(&first).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+        // Give the forwarder time to (incorrectly) re-emit if the fix
+        // regresses; with self-suppression nothing further must arrive.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "send_notification_durable must deliver exactly once on its own connection"
+        );
+
+        // Sanity: a different connection's forwarder still receives the
+        // event via fan-out (the suppression is per-connection).
+        let (ws_other, mut rx_other) = ws_connection_for_test(16);
+        let forwarders_other: SharedLiveForwarders =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let live_rx_other = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_other.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws_other.connection_id(),
+            features_with_message_persisted(true),
+            live_rx_other,
+            forwarders_other.clone(),
+        )
+        .await;
+        send_notification_durable(&ws, &ledger, message_persisted_for(&session_id))
+            .expect("second send");
+        let frame_other = tokio::time::timeout(std::time::Duration::from_secs(1), rx_other.recv())
+            .await
+            .expect("other connection sees fan-out")
+            .expect("ws_other open");
+        assert_eq!(
+            frame_method(&frame_other).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders_other).await;
+    }
+
+    /// MUST-FIX-3: a `subscribe()` call followed by dropping the
+    /// receiver (modelling a failed `session/open` path) must not leak
+    /// a sender. The `prune_subscriber_if_idle` hook called on the
+    /// failure path reclaims the slot immediately.
+    #[tokio::test]
+    async fn session_open_failure_path_does_not_leak_broadcast_sender() {
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:leakcheck".into());
+
+        // Mirror handle_session_open's "subscribe BEFORE
+        // open_session_result" ordering. Then simulate failure: drop
+        // the receiver, prune.
+        let live_rx = ledger.subscribe(&session_id);
+        assert_eq!(ledger.subscriber_count(), 1, "sender installed");
+
+        drop(live_rx);
+        let pruned = ledger.prune_subscriber_if_idle(&session_id);
+        assert!(pruned, "failed open must reclaim the orphan sender");
+        assert_eq!(
+            ledger.subscriber_count(),
+            0,
+            "no senders survive a failed session/open"
+        );
+
+        // Steady-state sweep also reclaims any orphans that escape the
+        // failure path (defence in depth).
+        let kept = ledger.subscribe(&session_id);
+        ledger.prune_idle_subscribers(); // receiver still alive — no-op.
+        assert_eq!(ledger.subscriber_count(), 1);
+        drop(kept);
+        assert_eq!(
+            ledger.prune_idle_subscribers(),
+            1,
+            "sweep reclaims orphans after every receiver drops"
+        );
+        assert_eq!(ledger.subscriber_count(), 0);
+    }
+
+    /// Lag handling: when the broadcast buffer overflows, the receiver
+    /// observes `RecvError::Lagged(n)` and the forwarder must NOT die —
+    /// it logs and keeps pumping subsequent events. The earlier missed
+    /// events are recoverable via cursor replay (the ledger is durable).
+    #[tokio::test]
+    async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
+        let (ws, mut rx) = ws_connection_for_test(WS_WRITER_CHANNEL_CAPACITY);
+        let ledger = Arc::new(UiProtocolLedger::new(2048));
+        let session_id = SessionKey("local:lag".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Subscribe but don't pump yet. Overflow the broadcast capacity
+        // (LIVE_BROADCAST_CAPACITY = 256) so the receiver lags.
+        let live_rx = ledger.subscribe(&session_id);
+        for _ in 0..512 {
+            ledger.append_notification(message_persisted_for(&session_id));
+        }
+
+        // Now install the forwarder — its first recv() will see
+        // Lagged(n). It must log and continue, not abort.
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // A fresh append after lag must be delivered.
+        ledger.append_notification(message_persisted_for(&session_id));
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("post-lag frame must arrive — forwarder kept pumping")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        abort_live_forwarders(&forwarders).await;
     }
 }

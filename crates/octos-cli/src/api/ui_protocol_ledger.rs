@@ -53,7 +53,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use octos_core::SessionKey;
@@ -171,10 +173,29 @@ impl UiProtocolLedgerEvent {
     }
 }
 
+/// Process-unique identifier for a single WebSocket connection. Used to
+/// suppress duplicate delivery: when a handler direct-sends an event AND
+/// also persists it via `append_*`, the persisting connection tags the
+/// broadcast with its own id so its forwarder can drop the duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ConnectionId(pub(crate) u64);
+
+impl ConnectionId {
+    pub(crate) fn next() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LedgeredUiProtocolEvent {
     pub(crate) cursor: UiCursor,
     pub(crate) event: UiProtocolLedgerEvent,
+    /// If `Some`, identifies the connection whose handler direct-sent this
+    /// event to the wire. Forwarders running on the same connection must
+    /// skip these to avoid double delivery; forwarders on other
+    /// connections deliver normally.
+    pub(crate) from_connection: Option<ConnectionId>,
 }
 
 // ---------- On-disk record ----------
@@ -497,6 +518,7 @@ impl UiProtocolLedger {
                             seq: record.seq,
                         },
                         event: record.event.clone(),
+                        from_connection: None,
                     });
                 }
 
@@ -527,14 +549,43 @@ impl UiProtocolLedger {
         &self,
         notification: UiNotification,
     ) -> LedgeredUiProtocolEvent {
-        self.append(UiProtocolLedgerEvent::Notification(notification))
+        self.append(UiProtocolLedgerEvent::Notification(notification), None)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_progress(&self, event: UiProgressEvent) -> LedgeredUiProtocolEvent {
-        self.append(UiProtocolLedgerEvent::Progress(event))
+        self.append(UiProtocolLedgerEvent::Progress(event), None)
     }
 
-    fn append(&self, event: UiProtocolLedgerEvent) -> LedgeredUiProtocolEvent {
+    /// Like [`append_notification`] but tags the broadcast event with the
+    /// originating connection so that connection's live forwarder can skip
+    /// it (the handler already direct-sent the wire frame). Other
+    /// connections still receive it via fan-out.
+    pub(crate) fn append_notification_from(
+        &self,
+        notification: UiNotification,
+        from_connection: ConnectionId,
+    ) -> LedgeredUiProtocolEvent {
+        self.append(
+            UiProtocolLedgerEvent::Notification(notification),
+            Some(from_connection),
+        )
+    }
+
+    /// Progress counterpart of [`append_notification_from`].
+    pub(crate) fn append_progress_from(
+        &self,
+        event: UiProgressEvent,
+        from_connection: ConnectionId,
+    ) -> LedgeredUiProtocolEvent {
+        self.append(UiProtocolLedgerEvent::Progress(event), Some(from_connection))
+    }
+
+    fn append(
+        &self,
+        event: UiProtocolLedgerEvent,
+        from_connection: Option<ConnectionId>,
+    ) -> LedgeredUiProtocolEvent {
         let session_id = event.session_id().clone();
         let preload_snapshot = self.snapshot_if_session_absent(&session_id);
         let cursor;
@@ -622,6 +673,7 @@ impl UiProtocolLedger {
         let ledgered = LedgeredUiProtocolEvent {
             cursor,
             event: stamped,
+            from_connection,
         };
         self.publish_live(&session_id, &ledgered);
         ledgered
@@ -634,8 +686,14 @@ impl UiProtocolLedger {
     /// fine — the event is durably persisted and any future reconnect
     /// will see it via cursor replay.
     fn publish_live(&self, session_id: &SessionKey, event: &LedgeredUiProtocolEvent) {
-        let inner = self.inner.lock().expect("ui protocol ledger lock");
-        if let Some(sender) = inner.subscribers.get(session_id) {
+        // Clone the sender, then release the lock before `send` so a slow
+        // broadcast subscriber (which is bounded but still does work in
+        // `send`) can never block the next `append`.
+        let sender = {
+            let inner = self.inner.lock().expect("ui protocol ledger lock");
+            inner.subscribers.get(session_id).cloned()
+        };
+        if let Some(sender) = sender {
             // `send` returns `Err` only if there are zero live receivers;
             // ignore that — the durable record stands.
             let _ = sender.send(event.clone());
@@ -663,12 +721,11 @@ impl UiProtocolLedger {
         rx
     }
 
-    /// Drop the broadcast sender for a session if no live receivers
-    /// remain. Best-effort housekeeping; not required for correctness
-    /// because tokio's broadcast channel will release queued frames once
-    /// every receiver drops them, but it keeps the per-session map from
-    /// growing without bound across long-lived ledgers.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Drop the broadcast sender for every session whose receiver count
+    /// reached zero. Called from the periodic [`sweep_idle`] sweep so the
+    /// per-session subscriber map never grows unbounded across long-lived
+    /// ledgers, and on the `session/open` failure path so a `subscribe()`
+    /// that never paired with a forwarder doesn't leak a sender.
     pub(crate) fn prune_idle_subscribers(&self) -> usize {
         let mut inner = self.inner.lock().expect("ui protocol ledger lock");
         let to_remove: Vec<SessionKey> = inner
@@ -682,6 +739,23 @@ impl UiProtocolLedger {
             inner.subscribers.remove(&key);
         }
         pruned
+    }
+
+    /// Drop the sender for `session_id` only if no live receivers remain.
+    /// Used by callers (e.g. failed `session/open`) that just dropped
+    /// their `Receiver` and want to immediately reclaim the sender slot
+    /// rather than waiting for the next sweep.
+    pub(crate) fn prune_subscriber_if_idle(&self, session_id: &SessionKey) -> bool {
+        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let drop_it = inner
+            .subscribers
+            .get(session_id)
+            .map(|sender| sender.receiver_count() == 0)
+            .unwrap_or(false);
+        if drop_it {
+            inner.subscribers.remove(session_id);
+        }
+        drop_it
     }
 
     fn snapshot_if_session_absent(&self, session_id: &SessionKey) -> Option<DiskSessionSnapshot> {
@@ -869,6 +943,12 @@ impl UiProtocolLedger {
         let evicted_total = inner.evicted_count;
         let dropped_total = inner.dropped_count;
         drop(inner);
+        // Same-tick subscriber GC: any broadcast sender whose every
+        // receiver has dropped is dead weight. Calling the dedicated
+        // helper (rather than inlining) is what wires
+        // `prune_idle_subscribers` into a production path so the
+        // per-session subscribers map cannot grow without bound.
+        self.prune_idle_subscribers();
         info!(
             target = "octos::ledger",
             ledger.sessions.active = active,
@@ -879,6 +959,14 @@ impl UiProtocolLedger {
             "ledger sweep tick"
         );
         evicted
+    }
+
+    /// Test helper: count broadcast senders currently held in the
+    /// subscribers map. Used to assert pruning behaviour.
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
+        let inner = self.inner.lock().expect("ui protocol ledger lock");
+        inner.subscribers.len()
     }
 
     /// Snapshot of the observability counters. Useful for tests and the
@@ -1011,6 +1099,7 @@ impl UiProtocolLedger {
                     seq: entry.seq,
                 },
                 event: entry.event.clone(),
+                from_connection: None,
             })
             .collect();
 
@@ -1065,13 +1154,44 @@ impl UiProtocolLedger {
         }
     }
 
+    /// Compatibility wrapper used by tests that pre-date
+    /// [`replay_after_with_head`]. Production callers should prefer the
+    /// `_with_head` variant so a live forwarder can baseline against the
+    /// snapshot's atomic head seq.
+    #[cfg(test)]
     pub(crate) fn replay_after(
         &self,
         session_id: &SessionKey,
         after: Option<&UiCursor>,
     ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
+        self.replay_after_with_head(session_id, after)
+            .map(|(events, _head)| events)
+    }
+
+    /// Like [`replay_after`] but also returns the head seq observed at the
+    /// moment the replay snapshot was taken. The pair is atomic: any event
+    /// appended after this call returns has a seq strictly greater than
+    /// the returned head, so a live forwarder using `head` as its baseline
+    /// cannot drop events that landed between replay and forwarder
+    /// install. Closes the replay/open race called out in PR #761 review.
+    pub(crate) fn replay_after_with_head(
+        &self,
+        session_id: &SessionKey,
+        after: Option<&UiCursor>,
+    ) -> Result<(Vec<LedgeredUiProtocolEvent>, u64), RpcError> {
         let Some(after) = after else {
-            return Ok(Vec::new());
+            // No `after` — caller asked for "live only", no replay history.
+            // Pair the empty replay with the current head_seq so the
+            // forwarder baseline matches a no-op snapshot.
+            let head_seq = {
+                let inner = self.inner.lock().expect("ui protocol ledger lock");
+                inner
+                    .sessions
+                    .get(session_id)
+                    .map(|s| s.next_seq)
+                    .unwrap_or(0)
+            };
+            return Ok((Vec::new(), head_seq));
         };
         validate_cursor_stream(session_id, after)?;
 
@@ -1082,12 +1202,14 @@ impl UiProtocolLedger {
                     let min_after_seq = oldest_seq.saturating_sub(1);
                     if after.seq >= min_after_seq && after.seq <= ledger.next_seq {
                         let result = replay_from_entries(session_id, &ledger.entries, after.seq);
+                        let head_seq = ledger.next_seq;
                         inner.touch_lru(session_id);
-                        return Ok(result);
+                        return Ok((result, head_seq));
                     }
                 } else if after.seq == ledger.next_seq {
+                    let head_seq = ledger.next_seq;
                     inner.touch_lru(session_id);
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), head_seq));
                 }
 
                 if self.config.data_dir.is_none() {
@@ -1100,21 +1222,21 @@ impl UiProtocolLedger {
                 }
             } else if self.config.data_dir.is_none() {
                 return if after.seq == 0 {
-                    Ok(Vec::new())
+                    Ok((Vec::new(), 0))
                 } else {
                     Err(cursor_out_of_range_error(session_id, after, 0, None))
                 };
             }
         }
 
-        self.replay_after_from_disk(session_id, after)
+        self.replay_after_from_disk_with_head(session_id, after)
     }
 
-    fn replay_after_from_disk(
+    fn replay_after_from_disk_with_head(
         &self,
         session_id: &SessionKey,
         after: &UiCursor,
-    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
+    ) -> Result<(Vec<LedgeredUiProtocolEvent>, u64), RpcError> {
         let Some(data_dir) = &self.config.data_dir else {
             return Err(cursor_out_of_range_error(session_id, after, 0, None));
         };
@@ -1127,12 +1249,14 @@ impl UiProtocolLedger {
                 let min_after_seq = oldest_seq.saturating_sub(1);
                 if after.seq >= min_after_seq && after.seq <= ledger.next_seq {
                     let result = replay_from_entries(session_id, &ledger.entries, after.seq);
+                    let head_seq = ledger.next_seq;
                     inner.touch_lru(session_id);
-                    return Ok(result);
+                    return Ok((result, head_seq));
                 }
             } else if after.seq == ledger.next_seq {
+                let head_seq = ledger.next_seq;
                 inner.touch_lru(session_id);
-                return Ok(Vec::new());
+                return Ok((Vec::new(), head_seq));
             }
         }
 
@@ -1149,7 +1273,7 @@ impl UiProtocolLedger {
             })?;
         let Some(mut snapshot) = snapshot else {
             return if after.seq == 0 {
-                Ok(Vec::new())
+                Ok((Vec::new(), 0))
             } else {
                 Err(cursor_out_of_range_error(session_id, after, 0, None))
             };
@@ -1168,7 +1292,7 @@ impl UiProtocolLedger {
 
         let Some(oldest_seq) = snapshot.oldest_seq else {
             return if after.seq == 0 {
-                Ok(Vec::new())
+                Ok((Vec::new(), 0))
             } else {
                 Err(cursor_out_of_range_error(session_id, after, 0, None))
             };
@@ -1193,6 +1317,7 @@ impl UiProtocolLedger {
         }
 
         let result = std::mem::take(&mut snapshot.replay_entries);
+        let head_seq = snapshot.head_seq;
         let is_new = !inner.sessions.contains_key(session_id);
         if is_new && inner.sessions.len() >= self.config.active_session_cap {
             self.evict_lru_locked(&mut inner);
@@ -1203,7 +1328,7 @@ impl UiProtocolLedger {
             .or_insert_with(SessionLedger::new);
         hydrate_session_from_snapshot(session, snapshot);
         inner.touch_lru(session_id);
-        Ok(result)
+        Ok((result, head_seq))
     }
 }
 
@@ -1266,6 +1391,7 @@ fn replay_from_entries(
                 seq: entry.seq,
             },
             event: entry.event.clone(),
+            from_connection: None,
         })
         .collect()
 }
