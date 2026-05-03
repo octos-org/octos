@@ -928,6 +928,44 @@ impl ServeCommand {
             }
         }
 
+        // Pin core builtins + plugin tools as base so the LRU evictor in
+        // `auto_evict()` does not remove them after a few unused iterations.
+        // `ToolRegistry::with_builtins_and_sandbox()` registers core tools but
+        // does NOT seed `base_tools`, so without this call every core tool
+        // (shell, file ops, web_*, browser, workspace_*) is evictable. Mirrors
+        // gateway's `set_base_tools(...)` + `add_base_tools(plugin tool names)`
+        // pair at `gateway_runtime.rs:1002` and `:1022`. Only includes tools
+        // actually registered in the api/serve path — `run_pipeline`, `spawn`,
+        // `send_file`, `message`, `activate_tools` are gateway-only and live
+        // in a follow-up PR.
+        let mut base_tools: Vec<&str> = vec![
+            "shell",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "diff_edit",
+            "glob",
+            "grep",
+            "list_dir",
+            "web_search",
+            "web_fetch",
+            "browser",
+            "check_workspace_contract",
+            "workspace_log",
+            "workspace_show",
+            "workspace_diff",
+        ];
+        if cfg!(feature = "git") {
+            base_tools.push("git");
+        }
+        if cfg!(feature = "ast") {
+            base_tools.push("code_structure");
+        }
+        tools.set_base_tools(base_tools);
+        if !plugin_result.tool_names.is_empty() {
+            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
+        }
+
         // #713 codex finding (Medium): apply `config.tool_policy` to the
         // api-mode `ToolRegistry`, mirroring the chat path
         // (`commands/chat.rs::297`). Without this, the swarm dispatch
