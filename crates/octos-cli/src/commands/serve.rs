@@ -928,6 +928,17 @@ impl ServeCommand {
             }
         }
 
+        // Pin plugin tools (deep_search, mofa_*, fm_tts, voice, news, ...) as
+        // base so the LRU evictor in `auto_evict()` does not remove them after
+        // a few unused iterations. The api/serve agent surfaces these tools
+        // sparsely across long sessions; without this pin they are evicted
+        // before the LLM has a chance to invoke them on a later turn (e.g.
+        // user follows up with a slides request after a coding turn). The
+        // gateway path applies the same pin in `gateway_runtime.rs:1043`.
+        if !plugin_result.tool_names.is_empty() {
+            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
+        }
+
         // #713 codex finding (Medium): apply `config.tool_policy` to the
         // api-mode `ToolRegistry`, mirroring the chat path
         // (`commands/chat.rs::297`). Without this, the swarm dispatch
@@ -1014,6 +1025,15 @@ impl ServeCommand {
                 "appui: anchoring api agent to operator-configured default cwd",
             );
         }
+
+        // Inject api-mode prompt extras (Background Tasks for Media & Research,
+        // Research & Search Triage). The default worker.txt prompt is generic
+        // and gives the LLM no guidance on when to wrap research/media calls
+        // in `spawn` vs invoking the underlying skill synchronously. Without
+        // this fragment the model inlines deep_search / mofa_* results as
+        // text instead of producing the user-facing artefact the wave-6 soak
+        // assertions expect.
+        agent.append_system_prompt(include_str!("../prompts/api_chat_extras.txt"));
 
         // Inject skill prompt fragments
         for fragment in &plugin_result.prompt_fragments {
