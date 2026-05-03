@@ -1026,15 +1026,6 @@ impl ServeCommand {
             );
         }
 
-        // Inject api-mode prompt extras (Background Tasks for Media & Research,
-        // Research & Search Triage). The default worker.txt prompt is generic
-        // and gives the LLM no guidance on when to wrap research/media calls
-        // in `spawn` vs invoking the underlying skill synchronously. Without
-        // this fragment the model inlines deep_search / mofa_* results as
-        // text instead of producing the user-facing artefact the wave-6 soak
-        // assertions expect.
-        agent.append_system_prompt(include_str!("../prompts/api_chat_extras.txt"));
-
         // Inject skill prompt fragments
         for fragment in &plugin_result.prompt_fragments {
             agent.append_system_prompt(fragment);
