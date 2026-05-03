@@ -17,7 +17,9 @@ use axum::http::{HeaderMap, Uri};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
-use octos_agent::{Agent, ToolApprovalDecision, ToolApprovalRequest};
+use octos_agent::{
+    Agent, BackgroundResultKind, BackgroundResultPayload, ToolApprovalDecision, ToolApprovalRequest,
+};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
@@ -766,6 +768,57 @@ async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// each event reaches each WS exactly once. Issue #760 / PR #761
 /// closed the original "no live fan-out" gap; clients that go offline
 /// still resync via cursor on reconnect.
+/// Bounded channel capacity for the per-session `SendFileTool` sink. Each
+/// session drains its own channel into the canonical-persist path, so 64
+/// pending messages is generous; if a runaway tool ever exceeds this we'd
+/// rather backpressure the agent loop than balloon memory.
+const SEND_FILE_CHANNEL_CAPACITY: usize = 64;
+
+/// Shared persist helper used by the api/serve background-result sender
+/// (spawn_only completions) and the `send_file` sink. Builds an assistant
+/// `Message` with the given content + media + thread_id, writes it through
+/// the canonical session helper (which serialises with other writers via
+/// the per-key Tokio mutex and triggers `MessageCommitObserver`), then
+/// invalidates the cached `SessionManager` entry so subsequent
+/// `session/hydrate` and `/api/sessions/:id/messages` reads pick up the
+/// new row instead of the pre-persist snapshot. Mirrors the gateway's
+/// `session_actor.rs::deliver_background_notification` post-write
+/// invalidate at `api_channel.rs:1503`.
+async fn persist_assistant_with_media(
+    sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
+    data_dir: &Path,
+    session_id: &SessionKey,
+    content: String,
+    media: Vec<String>,
+    thread_id: String,
+    label: &str,
+) -> bool {
+    let mut message = Message::assistant_with_thread(
+        content,
+        octos_core::ThreadId::new(thread_id),
+    );
+    message.media = media;
+
+    if let Err(error) = octos_bus::session::persist_message_through_canonical_path(
+        data_dir,
+        session_id,
+        message,
+    )
+    .await
+    {
+        tracing::warn!(
+            session = %session_id.0,
+            label,
+            error = %error,
+            "api/serve: failed to persist background-delivered message"
+        );
+        return false;
+    }
+
+    sessions.lock().await.invalidate_cache(session_id);
+    true
+}
+
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
     let observer: octos_bus::MessageCommitObserver =
         Arc::new(move |session_key, message, committed_seq| {
@@ -1996,13 +2049,18 @@ fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -
 fn session_tool_registry(
     base_agent: &Agent,
     session_id: &SessionKey,
-) -> Result<(Arc<octos_agent::ToolRegistry>, Option<PathBuf>), String> {
+) -> Result<(octos_agent::ToolRegistry, Option<PathBuf>), String> {
     let base_tools = base_agent.tool_registry();
     let Some(workspace_root) = session_workspaces()
         .get(session_id)
         .or_else(|| base_tools.workspace_root().map(Path::to_path_buf))
     else {
-        return Ok((base_tools.clone(), None));
+        // β: snapshot the base registry rather than re-Arc'ing the shared
+        // pointer so callers can install a per-session
+        // `BackgroundResultSender` without contending for `Arc::get_mut`.
+        // `snapshot_excluding(&[])` is the existing primitive for owning a
+        // copy with shared `Arc<dyn Tool>` instances.
+        return Ok((base_tools.snapshot_excluding(&[]), None));
     };
 
     session_filesystem_profile_for_workspace(base_tools.as_ref(), &workspace_root)
@@ -2019,9 +2077,16 @@ fn session_tool_registry(
         .sandbox_config()
         .unwrap_or_else(octos_agent::SandboxConfig::default);
     let sandbox = octos_agent::sandbox::create_sandbox(&sandbox_config);
-    let rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
+    let mut rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
+    // β: mirror gateway's `session_actor.rs:2116` — rebind plugin tool
+    // work_dirs so skills like `deep_search` (which writes its `.md` report
+    // under `OCTOS_WORK_DIR` / `.`) materialise files INSIDE the session
+    // workspace instead of the server process cwd. Without this, the new
+    // `SendFileTool` registration (whose base_dir is the workspace) would
+    // correctly reject paths the skill wrote outside the workspace.
+    rebound.rebind_plugin_work_dirs(&workspace_root);
 
-    Ok((Arc::new(rebound), Some(workspace_root)))
+    Ok((rebound, Some(workspace_root)))
 }
 
 fn session_system_prompt(base_agent: &Agent, workspace_root: Option<&Path>) -> String {
@@ -4263,7 +4328,7 @@ async fn run_standalone_turn(
         session.get_history(50).to_vec()
     };
 
-    let (tool_registry, workspace_root) =
+    let (mut tool_registry, workspace_root) =
         match session_tool_registry(base_agent.as_ref(), &session_id) {
             Ok(registry) => registry,
             Err(error) => {
@@ -4282,6 +4347,145 @@ async fn run_standalone_turn(
                 return;
             }
         };
+
+    // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
+    // completions and explicit `send_file` calls persist as assistant
+    // messages on the session and reach connected WS clients via the
+    // existing `MessageCommitObserver` -> `message/persisted` ledger append
+    // (#761 live publish-subscribe). Without this, the api/serve path drops
+    // spawn_only file deliveries on the floor — gateway wires the
+    // equivalent in `session_actor.rs::deliver_background_notification`.
+    //
+    // The canonical persist
+    // (`octos_bus::session::persist_message_through_canonical_path`)
+    // serialises with other writers via a per-key Tokio mutex, so this is
+    // safe to invoke from a `tokio::spawn`-driven background task that may
+    // complete after the originating turn has ended. After each persist we
+    // invalidate the cached `SessionManager` so `session/hydrate` and
+    // `/api/sessions/:id/messages` reads pick up the new row instead of
+    // the pre-persist snapshot (matches `ApiChannel::persist_to_session`'s
+    // post-write invalidate at `api_channel.rs:1503`).
+    {
+        let bg_data_dir = sessions.lock().await.data_dir().to_path_buf();
+        let bg_sessions = sessions.clone();
+        let bg_session_id = session_id.clone();
+        let bg_thread_id = turn_id.0.to_string();
+
+        // Wire spawn_only contract-satisfied path.
+        let payload_sessions = bg_sessions.clone();
+        let payload_data_dir = bg_data_dir.clone();
+        let payload_session_id = bg_session_id.clone();
+        let payload_thread_id = bg_thread_id.clone();
+        tool_registry.set_background_result_sender(std::sync::Arc::new(
+            move |payload: BackgroundResultPayload| {
+                let sessions = payload_sessions.clone();
+                let data_dir = payload_data_dir.clone();
+                let session_id = payload_session_id.clone();
+                let thread_id = payload
+                    .originating_thread_id
+                    .clone()
+                    .filter(|tid| !tid.is_empty())
+                    .unwrap_or_else(|| payload_thread_id.clone());
+                let task_label = payload.task_label.clone();
+                let media = payload.media.clone();
+                let kind = payload.kind;
+                let raw_content = payload.content.clone();
+                Box::pin(async move {
+                    let content_text = match kind {
+                        BackgroundResultKind::Notification => {
+                            if raw_content.is_empty() && !media.is_empty() {
+                                format!("✅ {} delivered.", task_label)
+                            } else {
+                                raw_content
+                            }
+                        }
+                        BackgroundResultKind::Report => {
+                            if raw_content.is_empty() && !media.is_empty() {
+                                format!("✅ {} completed.", task_label)
+                            } else if raw_content.len() > 1000 {
+                                let preview: String =
+                                    raw_content.chars().take(300).collect();
+                                format!(
+                                    "✅ **{}** completed.\n\n{}…",
+                                    task_label, preview,
+                                )
+                            } else {
+                                format!(
+                                    "✅ **{}** completed.\n\n{}",
+                                    task_label, raw_content,
+                                )
+                            }
+                        }
+                    };
+                    persist_assistant_with_media(
+                        &sessions,
+                        &data_dir,
+                        &session_id,
+                        content_text,
+                        media,
+                        thread_id,
+                        &task_label,
+                    )
+                    .await
+                })
+            },
+        ));
+
+        // Wire `send_file` for the legacy non-contract `files_to_send` path
+        // and any explicit agent calls. The spawn_only auto-background
+        // branch falls back to `send_file` when the workspace contract is
+        // `NotConfigured` (`execution.rs:549`) — without this registration,
+        // tools like `deep_search` (no default api-mode workspace policy)
+        // emit `files_to_send` that have nowhere to land.
+        let (out_tx, mut out_rx) =
+            mpsc::channel::<octos_core::OutboundMessage>(SEND_FILE_CHANNEL_CAPACITY);
+        // Mirror gateway's session_actor.rs:2087 base/extra split: use the
+        // session workspace root as the base_dir (so a spawn_only tool
+        // returning `files_to_send: ["output/report.md"]` resolves under
+        // the user's workspace), and keep `data_dir` as an extra-allowed
+        // directory for pipeline-generated artefacts. Fall back to
+        // `data_dir` as base when the session has no workspace (rare —
+        // CLI clients without `session.workspace_cwd.v1` capability).
+        let send_file_base = workspace_root
+            .clone()
+            .unwrap_or_else(|| bg_data_dir.clone());
+        let send_file_tool = octos_agent::SendFileTool::new(out_tx)
+            .with_base_dir(send_file_base)
+            .with_extra_allowed_dir(bg_data_dir.clone());
+        send_file_tool.set_context("api", &bg_session_id.0);
+        tool_registry.register(send_file_tool);
+
+        // Drain `OutboundMessage`s emitted by `send_file` calls and persist
+        // each one as an assistant message + media via the same canonical
+        // path used by the spawn_only sender. Drops out when the turn ends
+        // (the `out_tx` half is dropped along with the registry / agent
+        // when the turn-scoped state is freed).
+        let consumer_sessions = bg_sessions.clone();
+        let consumer_data_dir = bg_data_dir.clone();
+        let consumer_session_id = bg_session_id.clone();
+        let consumer_thread_id = bg_thread_id.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                let thread_id = msg
+                    .metadata
+                    .get("thread_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| consumer_thread_id.clone());
+                let _ = persist_assistant_with_media(
+                    &consumer_sessions,
+                    &consumer_data_dir,
+                    &consumer_session_id,
+                    msg.content,
+                    msg.media,
+                    thread_id,
+                    "send_file",
+                )
+                .await;
+            }
+        });
+    }
     let progress_workspace_root = workspace_root
         .clone()
         .or_else(|| tool_registry.workspace_root().map(Path::to_path_buf));
@@ -4313,7 +4517,7 @@ async fn run_standalone_turn(
     let request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
         base_agent.llm_provider(),
-        tool_registry,
+        Arc::new(tool_registry),
         base_agent.memory_store(),
     )
     .with_config(base_agent.agent_config())
