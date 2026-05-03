@@ -4432,8 +4432,18 @@ async fn run_standalone_turn(
         // emit `files_to_send` that have nowhere to land.
         let (out_tx, mut out_rx) =
             mpsc::channel::<octos_core::OutboundMessage>(SEND_FILE_CHANNEL_CAPACITY);
+        // Mirror gateway's session_actor.rs:2087 base/extra split: use the
+        // session workspace root as the base_dir (so a spawn_only tool
+        // returning `files_to_send: ["output/report.md"]` resolves under
+        // the user's workspace), and keep `data_dir` as an extra-allowed
+        // directory for pipeline-generated artefacts. Fall back to
+        // `data_dir` as base when the session has no workspace (rare —
+        // CLI clients without `session.workspace_cwd.v1` capability).
+        let send_file_base = workspace_root
+            .clone()
+            .unwrap_or_else(|| bg_data_dir.clone());
         let send_file_tool = octos_agent::SendFileTool::new(out_tx)
-            .with_base_dir(bg_data_dir.clone())
+            .with_base_dir(send_file_base)
             .with_extra_allowed_dir(bg_data_dir.clone());
         send_file_tool.set_context("api", &bg_session_id.0);
         tool_registry.register(send_file_tool);
