@@ -2077,7 +2077,14 @@ fn session_tool_registry(
         .sandbox_config()
         .unwrap_or_else(octos_agent::SandboxConfig::default);
     let sandbox = octos_agent::sandbox::create_sandbox(&sandbox_config);
-    let rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
+    let mut rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
+    // β: mirror gateway's `session_actor.rs:2116` — rebind plugin tool
+    // work_dirs so skills like `deep_search` (which writes its `.md` report
+    // under `OCTOS_WORK_DIR` / `.`) materialise files INSIDE the session
+    // workspace instead of the server process cwd. Without this, the new
+    // `SendFileTool` registration (whose base_dir is the workspace) would
+    // correctly reject paths the skill wrote outside the workspace.
+    rebound.rebind_plugin_work_dirs(&workspace_root);
 
     Ok((rebound, Some(workspace_root)))
 }
