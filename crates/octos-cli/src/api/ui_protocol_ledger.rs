@@ -2141,6 +2141,7 @@ mod tests {
             message_id: "msg-1".into(),
             client_message_id: None,
             source: MessagePersistedSource::Tool,
+            media: vec![],
             cursor: UiCursor {
                 stream: session.0.clone(),
                 seq: 0,

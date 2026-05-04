@@ -1464,6 +1464,16 @@ pub struct HydratedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     pub persisted_at: DateTime<Utc>,
+    /// File attachments stored with this row in the canonical session
+    /// JSONL — surfaced so clients reconstructing history after a
+    /// disconnect can render the same attachment they would have rendered
+    /// on the original `message/persisted` push (cf. the `media` field
+    /// on `MessagePersistedEvent`).
+    ///
+    /// Backwards-compatible: omitted from the wire when empty so clients
+    /// running older protocol versions see the same shape they used to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
 }
 
 /// Lifecycle state strings for a thread in `ThreadGraphEntry.status` and the
@@ -1661,6 +1671,18 @@ pub struct MessagePersistedEvent {
     pub source: MessagePersistedSource,
     pub cursor: UiCursor,
     pub persisted_at: DateTime<Utc>,
+    /// File attachments persisted with this message — typically a single
+    /// `.md` / `.mp3` / `.pptx` artefact path emitted by `spawn_only`
+    /// background tools (`deep_search`, `mofa_*`, `fm_tts`) or an explicit
+    /// `send_file` call. Clients that advertise `event.message_persisted.v1`
+    /// AND understand a non-empty `media` field should render the attachment
+    /// inline (e.g. an `<a href>` to the file URL); legacy clients that only
+    /// know about `content` continue to render the text.
+    ///
+    /// Backwards-compatible: serialized as omitted when empty so clients
+    /// running older protocol versions see the same wire shape they used to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
 }
 
 /// Draft command payloads for UI protocol v1.
@@ -5091,6 +5113,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
                 client_message_id: Some("cmid-1".into()),
                 persisted_at: sample_persisted_at(),
+                media: vec![],
             }]),
             threads: Some(vec![ThreadGraphEntry {
                 thread_id: "thread-1".into(),
@@ -5237,6 +5260,7 @@ mod tests {
                 seq: 18,
             },
             persisted_at: sample_persisted_at(),
+            media: vec!["report.md".into()],
         };
         let value = serde_json::to_value(&event).expect("serialize");
         assert_eq!(value.get("source"), Some(&json!("assistant")));
@@ -5265,6 +5289,7 @@ mod tests {
                     seq: 1,
                 },
                 persisted_at: sample_persisted_at(),
+                media: vec![],
             };
             let v = serde_json::to_value(&e).expect("serialize source");
             let p: MessagePersistedEvent = serde_json::from_value(v).expect("deserialize source");

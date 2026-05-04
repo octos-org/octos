@@ -850,6 +850,12 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                     seq: 0,
                 },
                 persisted_at: Utc::now(),
+                // P1.3 fix: surface the persisted message's `media`
+                // attachments on the wire so spawn_only / send_file
+                // deliveries reach the chat bubble. Empty Vec
+                // serialises to omitted (back-compat for clients
+                // that don't yet understand the field).
+                media: message.media.clone(),
             };
             // Append to the ledger; the ledger stamps the cursor onto
             // both the envelope AND the `MessagePersistedEvent.cursor`
@@ -3205,6 +3211,13 @@ async fn handle_session_hydrate(
                         thread_id: msg.thread_id.clone(),
                         client_message_id: msg.client_message_id.clone(),
                         persisted_at: msg.timestamp,
+                        // P1.3 fix: surface canonical-ledger media so a
+                        // client reconnecting after a disconnect can
+                        // re-render the same `.md` / `.mp3` / `.pptx`
+                        // attachment it would have seen via the live
+                        // `message/persisted` push (`media` field on
+                        // MessagePersistedEvent).
+                        media: msg.media.clone(),
                     })
                     .collect::<Vec<_>>(),
             )
@@ -9785,6 +9798,7 @@ mod tests {
                 seq: 0,
             },
             persisted_at: Utc::now(),
+            media: vec![],
         })
     }
 
