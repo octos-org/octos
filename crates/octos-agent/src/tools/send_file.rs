@@ -120,6 +120,43 @@ struct Input {
     topic: Option<String>,
 }
 
+tokio::task_local! {
+    /// M10 Phase 5a: scoped flag that marks an in-flight `send_file`
+    /// invocation as a per-file companion to a `spawn_only` completion's
+    /// `turn/spawn_complete` envelope. When the scope is active, the
+    /// emitted [`OutboundMessage`] carries
+    /// `metadata.spawn_complete_companion = true`, which the api/serve
+    /// `send_file` consumer reads to persist the row under
+    /// `MessagePersistedSource::Background`. Dual-negotiated clients then
+    /// suppress that row in favour of the single envelope.
+    ///
+    /// Internal-only by construction: the flag is NEVER read from tool
+    /// `args`, so an LLM cannot inject it from a generated JSON payload.
+    /// Only [`execution.rs`]'s `NotConfigured` success branch enters this
+    /// scope around its retry-loop calls into `send_file`.
+    static SPAWN_COMPLETE_COMPANION_SCOPE: bool;
+}
+
+/// Run `fut` with the spawn-complete-companion scope active, so any
+/// `send_file` calls executed inside its task tree set the
+/// `spawn_complete_companion` outbound metadata. Use exclusively from
+/// the agent-internal NotConfigured-branch retry loop in
+/// `execution.rs`. `pub(crate)` so only the agent crate can enter the
+/// scope; not part of the tool's external surface.
+pub(crate) async fn with_spawn_complete_companion_scope<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SPAWN_COMPLETE_COMPANION_SCOPE.scope(true, fut).await
+}
+
+fn current_spawn_complete_companion() -> bool {
+    SPAWN_COMPLETE_COMPANION_SCOPE
+        .try_with(|v| *v)
+        .ok()
+        .unwrap_or(false)
+}
+
 #[async_trait]
 impl Tool for SendFileTool {
     fn name(&self) -> &str {
@@ -283,6 +320,17 @@ impl Tool for SendFileTool {
         });
         if let Some(topic) = topic {
             metadata.insert("topic".to_string(), serde_json::Value::String(topic));
+        }
+        // M10 Phase 5a: read the task-local scope (NOT the args) to
+        // decide whether this invocation is a `spawn_complete_companion`.
+        // Scope-only by design — see [`SPAWN_COMPLETE_COMPANION_SCOPE`]
+        // — keeps the LLM unable to spoof the flag through generated
+        // tool args.
+        if current_spawn_complete_companion() {
+            metadata.insert(
+                "spawn_complete_companion".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
 
         let msg = OutboundMessage {
@@ -631,6 +679,97 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert!(msg.metadata.get("tool_call_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_set_spawn_complete_companion_metadata_when_scope_active() {
+        // M10 Phase 5a: when execution.rs's NotConfigured success branch
+        // wraps the per-file `send_file` retry loop in
+        // `with_spawn_complete_companion_scope`, the in-flight execute()
+        // call sees the task-local flag and stamps the OutboundMessage's
+        // metadata with `spawn_complete_companion: true`. The api/serve
+        // consumer reads the flag and persists the resulting row with
+        // `MessagePersistedSource::Background`, letting dual-negotiated
+        // clients suppress the duplicate in favour of `turn/spawn_complete`.
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1");
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "report").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        // Wrapping in the scope is the ONLY way to set the flag — the
+        // input schema deliberately does not accept it from JSON args, so
+        // an LLM cannot spoof the marker through generated tool calls.
+        let result = with_spawn_complete_companion_scope(
+            tool.execute(&serde_json::json!({"file_path": path})),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata
+                .get("spawn_complete_companion")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    #[tokio::test]
+    async fn should_omit_spawn_complete_companion_metadata_outside_scope() {
+        // The flag is scope-driven. A regular agent-issued `send_file` call
+        // (LLM tool-use, explicit user request) runs OUTSIDE the
+        // companion scope, so the metadata key must stay absent and the
+        // resulting row reaches all clients with `source: Assistant`.
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1");
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({"file_path": path}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert!(msg.metadata.get("spawn_complete_companion").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_ignore_spawn_complete_companion_field_in_args() {
+        // Defense-in-depth: even if a malicious or buggy caller puts an
+        // `_spawn_complete_companion` key in the JSON args, the field is
+        // not part of the tool's `Input` shape (no struct field deserializes
+        // it). The tool ignores it and decides solely from the task-local
+        // scope. The metadata flag stays absent — preventing an LLM from
+        // spoofing the Background-source filter through generated args.
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "api", "sess-1");
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "data").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+                "_spawn_complete_companion": true,
+                "spawn_complete_companion": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert!(
+            msg.metadata.get("spawn_complete_companion").is_none(),
+            "args-passed companion flag must be ignored — only the task-local scope can mark a row",
+        );
     }
 
     #[tokio::test]

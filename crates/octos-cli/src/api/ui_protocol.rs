@@ -3379,6 +3379,18 @@ async fn handle_session_hydrate(
     let (messages, threads_projection) = {
         let mut sessions_guard = sessions.lock().await;
         let session = sessions_guard.get_or_create(&params.session_id).await;
+        // M10 Phase 5a known-limitation: hydrate returns the raw `Message`
+        // history without per-row `source` filtering. For dual-negotiated
+        // clients the `event.spawn_complete.v1` capability suppresses
+        // duplicate `Background`-source rows on the LIVE wire, but the
+        // hydrate path has no such filter today — `Message` does not carry
+        // a source field. After a `session/hydrate` (e.g. on page reload)
+        // a new client receives the per-file rows + the spawn-ack row
+        // alongside the durable `turn/spawn_complete` envelope, restoring
+        // pre-Phase-5a multi-bubble rendering until Phase 6 plumbs source
+        // (or a turn/spawn_complete-aware hydrate replay) through. The
+        // live path probe (the wave-6m gate) is not affected. Tracked as
+        // a follow-up — see codex round on Phase 5a.
         let messages = if include_set.messages {
             Some(
                 session
@@ -4645,6 +4657,21 @@ async fn run_standalone_turn(
                     .unwrap_or_else(|| payload_thread_id.clone());
                 let task_label = payload.task_label.clone();
                 let media = payload.media.clone();
+                // M10 Phase 5a: envelope_media is the media list to surface
+                // ONLY on the `turn/spawn_complete` envelope. The
+                // `NotConfigured` `send_file` fallback populates this with
+                // its `sent_files` paths so dual-negotiated clients see the
+                // file URLs on the envelope; the persisted row keeps
+                // `media: vec![]` (no double-render on old clients that DO
+                // see the per-file `message/persisted` companions). The
+                // contract-`Satisfied` path leaves `envelope_media` as the
+                // empty default; in that case the envelope falls back to
+                // `media`.
+                let envelope_media = if payload.envelope_media.is_empty() {
+                    payload.media.clone()
+                } else {
+                    payload.envelope_media.clone()
+                };
                 let kind = payload.kind;
                 let raw_content = payload.content.clone();
                 let task_id = payload.task_id.clone();
@@ -4764,7 +4791,7 @@ async fn run_standalone_turn(
                             },
                             persisted_at: Utc::now(),
                             content: content_text,
-                            media,
+                            media: envelope_media,
                         };
                         ledger.append_notification(UiNotification::TurnSpawnComplete(event));
                     } else if task_id_clean.is_none() {
@@ -4783,17 +4810,35 @@ async fn run_standalone_turn(
                             "background result missing task_id; turn/spawn_complete suppressed"
                         );
                     } else {
-                        // Persist failed — the row never landed in the
-                        // session ledger, so emitting a `turn/spawn_complete`
-                        // would advertise a row that doesn't exist on
-                        // hydrate. Log; old clients also see nothing
-                        // (the observer never fired). The agent's
-                        // task_supervisor still records the failure for
-                        // operator visibility.
+                        // Persist of the spawn-ack/completion row failed.
+                        // The agent's task_supervisor records the failure
+                        // for operator visibility.
+                        //
+                        // M10 Phase 5a coalesce: the per-file `send_file`
+                        // companion rows for the NotConfigured branch
+                        // were already committed *before* this final
+                        // persist (the consumer drains them off
+                        // `out_rx` independently). Those companion rows
+                        // are tagged `MessagePersistedSource::Background`
+                        // so dual-negotiated clients suppress them at
+                        // `live_event_passes_capability_filter` —
+                        // meaning a new client whose envelope persist
+                        // failed sees ZERO file rows for the completion
+                        // (the per-file rows are filtered, the envelope
+                        // never fired). Old clients see the per-file
+                        // rows unchanged (they pass the legacy gate
+                        // regardless of source). Accepted as a
+                        // low-probability degradation: persist is
+                        // durable, this branch fires only when the
+                        // session ledger cannot accept a write, and the
+                        // task_supervisor captures the failure for
+                        // recovery follow-ups. Phase 6 will reorder the
+                        // companion rows AFTER the envelope persist
+                        // commits to close this window.
                         tracing::warn!(
                             session_id = %session_id.0,
                             task_label,
-                            "background result persist failed; both wire shapes suppressed"
+                            "background result persist failed; new clients miss this completion (per-file companion rows already committed under source: background and are suppressed)"
                         );
                     }
                     persisted_meta.is_some()
@@ -4839,6 +4884,16 @@ async fn run_standalone_turn(
         // path used by the spawn_only sender. Drops out when the turn ends
         // (the `out_tx` half is dropped along with the registry / agent
         // when the turn-scoped state is freed).
+        //
+        // M10 Phase 5a coalesce: when the outbound carries
+        // `metadata.spawn_complete_companion = true`, persist the row with
+        // `MessagePersistedSource::Background` (via the
+        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local). This marks each
+        // per-file row from a spawn_only completion as a duplicate of the
+        // forthcoming `turn/spawn_complete` envelope so dual-negotiated
+        // clients suppress it at `live_event_passes_capability_filter`.
+        // Without the capability the override has no wire-visible effect —
+        // the row still reaches old clients as `message/persisted`.
         let consumer_sessions = bg_sessions.clone();
         let consumer_data_dir = bg_data_dir.clone();
         let consumer_session_id = bg_session_id.clone();
@@ -4852,7 +4907,12 @@ async fn run_standalone_turn(
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
                     .unwrap_or_else(|| consumer_thread_id.clone());
-                let _ = persist_assistant_with_media(
+                let is_spawn_complete_companion = msg
+                    .metadata
+                    .get("spawn_complete_companion")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let persist = persist_assistant_with_media(
                     &consumer_sessions,
                     &consumer_data_dir,
                     &consumer_session_id,
@@ -4860,8 +4920,14 @@ async fn run_standalone_turn(
                     msg.media,
                     thread_id,
                     "send_file",
-                )
-                .await;
+                );
+                if is_spawn_complete_companion {
+                    let _ = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                        .scope(Some(MessagePersistedSource::Background), persist)
+                        .await;
+                } else {
+                    let _ = persist.await;
+                }
             }
         });
     }

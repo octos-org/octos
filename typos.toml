@@ -9,6 +9,11 @@ extend-ignore-identifiers-re = [
 AttributeIDSupressMenu = "AttributeIDSupressMenu"
 
 [default.extend-words]
+# Intentional typo fixture in mcp.rs / m8_integration_concurrency.rs:
+# both tests assert that the parser correctly REJECTS "exlusive" as
+# an invalid concurrency_class value. Allowlist the misspelling so
+# the typos lint doesn't flag the negative-test JSON literal.
+exlusive = "exlusive"
 # Don't correct the surname "Teh"
 teh = "teh"
 Hashi = "Hashi"
