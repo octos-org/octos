@@ -818,6 +818,35 @@ fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePer
         .unwrap_or_else(|| MessagePersistedSource::from_role(role))
 }
 
+/// Pre-stamp `thread_id` on a row about to be persisted by the standalone
+/// turn loop so every User/Assistant/Tool row from the same turn shares the
+/// originating `TurnId`-derived thread id.
+///
+/// Caller-supplied `thread_id` values are preserved. System rows are left
+/// alone (they aren't thread-scoped). For `User`/`Assistant`/`Tool` rows
+/// missing a `thread_id`, the supplied `turn_thread_id` is stamped.
+///
+/// **M10 Phase 6.1**: extending this from Assistant/Tool only to also cover
+/// `User` closes the empty-placeholder bubble. `process_message_inner`
+/// builds the user row with `client_message_id: None`, so without the
+/// pre-stamp `derive_thread_id_for_new_write` falls back to a fresh
+/// `now_v7()` for the user row while assistant rows are stamped with the
+/// `TurnId`. The SPA reducer keys threads on `thread_id`; a divergent user
+/// thread leaves an empty pending bubble in the user's thread and creates
+/// an orphan thread for the assistant rows.
+fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
+    let mut to_save = message;
+    if to_save.thread_id.is_none()
+        && matches!(
+            to_save.role,
+            MessageRole::User | MessageRole::Assistant | MessageRole::Tool
+        )
+    {
+        to_save.thread_id = Some(turn_thread_id.to_owned());
+    }
+    to_save
+}
+
 /// Shared persist helper used by the api/serve background-result sender
 /// (spawn_only completions) and the `send_file` sink. Builds an assistant
 /// `Message` with the given content + media + thread_id, writes it through
@@ -5010,19 +5039,8 @@ async fn run_standalone_turn(
                         response.reasoning_content.clone(),
                     );
                     for message in response.messages.iter().cloned().chain(final_assistant) {
-                        let mut to_save = message;
-                        // PR F (M8.10): pre-stamp `thread_id` on the
-                        // persist path so Patch 8's fail-closed
-                        // `derive_thread_id_for_new_write` accepts the
-                        // write. The bound id is the originating `TurnId`,
-                        // the same value the reporter is broadcasting on
-                        // every wire event — keeps persist and wire in
-                        // lockstep so reload renders match the live UI.
-                        if to_save.thread_id.is_none()
-                            && matches!(to_save.role, MessageRole::Assistant | MessageRole::Tool)
-                        {
-                            to_save.thread_id = Some(turn_thread_id_for_persist.clone());
-                        }
+                        let to_save =
+                            pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         if let Ok(seq) = sessions
                             .add_message_with_seq(&agent_session_id, to_save)
                             .await
@@ -7997,6 +8015,87 @@ mod tests {
         let messages = vec![Message::assistant("world")];
 
         assert!(final_assistant_message(&messages, "world", None).is_none());
+    }
+
+    /// M10 Phase 6.1: the standalone-turn persist loop must pre-stamp the
+    /// `User` row with the originating `TurnId`-derived thread id so the
+    /// user prompt and the assistant reply land in the same thread on the
+    /// SPA. Without this the SPA renders an empty placeholder bubble in
+    /// the user's `clientMessageId`-keyed thread and creates an orphan
+    /// thread for the assistant reply (3 bubbles per spawn_only turn
+    /// instead of the target 2).
+    #[test]
+    fn pre_stamp_turn_thread_id_stamps_user_assistant_and_tool_when_unbound() {
+        let turn_thread_id = "turn-abc";
+
+        let user = pre_stamp_turn_thread_id(Message::user("hi"), turn_thread_id);
+        let assistant = pre_stamp_turn_thread_id(Message::assistant("ok"), turn_thread_id);
+        let tool = pre_stamp_turn_thread_id(
+            Message {
+                role: MessageRole::Tool,
+                content: "result".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call-1".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            turn_thread_id,
+        );
+
+        assert_eq!(
+            user.thread_id.as_deref(),
+            Some(turn_thread_id),
+            "user row must inherit the turn-derived thread_id so its bubble \
+             coalesces with the assistant reply"
+        );
+        assert_eq!(assistant.thread_id.as_deref(), Some(turn_thread_id));
+        assert_eq!(tool.thread_id.as_deref(), Some(turn_thread_id));
+    }
+
+    /// Caller-supplied `thread_id` values must NOT be overwritten — that
+    /// would corrupt rows already routed to the correct sub-thread (e.g.
+    /// spawn_only completion rows that bind a different originating
+    /// thread).
+    #[test]
+    fn pre_stamp_turn_thread_id_preserves_caller_supplied_thread_id() {
+        let mut user = Message::user("hi");
+        user.thread_id = Some("explicit-thread".into());
+
+        let stamped = pre_stamp_turn_thread_id(user, "turn-other");
+
+        assert_eq!(
+            stamped.thread_id.as_deref(),
+            Some("explicit-thread"),
+            "caller-supplied thread_id must be preserved"
+        );
+    }
+
+    /// System rows are not thread-scoped — the helper must leave them
+    /// alone so the per-turn system primer (when present) does not get
+    /// retro-rooted into a turn thread that didn't author it.
+    #[test]
+    fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
+        let system = Message {
+            role: MessageRole::System,
+            content: "primer".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let stamped = pre_stamp_turn_thread_id(system, "turn-abc");
+
+        assert!(
+            stamped.thread_id.is_none(),
+            "system rows must remain unbound to a turn thread"
+        );
     }
 
     #[tokio::test]
