@@ -4401,11 +4401,35 @@ async fn run_standalone_turn(
         (history, data_dir)
     };
 
+    // For hosted multi-tenant standalone serve, the file API resolves
+    // `/api/files/...` against the per-profile data dir (`<server_data>/
+    // profiles/<profile>/data`), not the server-wide one. Plugin output
+    // must land under the SAME root the file API will check, otherwise
+    // `resolve_legacy_file_request` rejects it. Resolve the profile data
+    // dir from the session_id's encoded profile (set by the SPA's hosted
+    // subdomain) and fall back to the runtime data dir for local sessions.
+    let plugin_root_dir = session_id
+        .profile_id()
+        .and_then(|profile_id| {
+            state
+                .profile_store
+                .as_ref()
+                .and_then(|store| store.get(profile_id).ok().flatten())
+                .map(|profile| {
+                    state
+                        .profile_store
+                        .as_ref()
+                        .map(|store| store.resolve_data_dir(&profile))
+                        .unwrap_or_else(|| runtime_data_dir.clone())
+                })
+        })
+        .unwrap_or_else(|| runtime_data_dir.clone());
+
     let (mut tool_registry, workspace_root) =
         match session_tool_registry(
             base_agent.as_ref(),
             &session_id,
-            &runtime_data_dir,
+            &plugin_root_dir,
             state.appui_default_session_cwd.as_deref(),
         ) {
             Ok(registry) => registry,
