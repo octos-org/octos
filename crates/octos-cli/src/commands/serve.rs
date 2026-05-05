@@ -542,6 +542,12 @@ impl ServeCommand {
             // `resolve_api_port`. The gateway runtime sets its own
             // store on the embedded api channel.
             task_query_store: None,
+            // Mirror the operator-configured Tier-2 default cwd so
+            // `session_tool_registry` can distinguish "operator chose this
+            // dir for sessions" from the boot fallback baked in by
+            // `with_builtins_and_sandbox(serve_cwd)`. See
+            // `api/ui_protocol.rs::session_tool_registry`.
+            appui_default_session_cwd: config.appui.default_session_cwd.clone(),
         });
 
         // Auto-start enabled profiles
