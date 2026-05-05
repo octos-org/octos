@@ -322,6 +322,19 @@ impl ReadTaskOutputTool {
             );
         }
 
+        // Codex P1 (round 4): the lexical normalisation in
+        // `resolve_handle_path` only checks path *spelling*, not
+        // filesystem topology. An intermediate directory symlink under
+        // the workspace (e.g. `workspace/out -> /etc`) would still
+        // satisfy `starts_with(workspace_root)` even though `out/foo`
+        // resolves to `/etc/foo` at open time. `O_NOFOLLOW` on the
+        // final open only rejects the leaf component, not ancestors.
+        // Verify NO ancestor of the resolved path is a symlink before
+        // reading. Equivalent to canonicalising and re-checking
+        // containment but without following the leaf (which is what
+        // O_NOFOLLOW exists for).
+        reject_symlinked_ancestors(&self.workspace_root, &resolved)?;
+
         // Codex P1 (round 1): use the existing O_NOFOLLOW reader so a
         // symlink inside the workspace cannot redirect the read to a file
         // outside the workspace boundary. This matches the safety the
@@ -351,6 +364,65 @@ fn resolve_handle_path(workspace_root: &Path, user_path: &str) -> Result<PathBuf
     } else {
         resolve_path(workspace_root, user_path).wrap_err("path must stay inside the workspace")
     }
+}
+
+/// Reject any resolved path whose ancestors (between `workspace_root` and
+/// the leaf, exclusive of both) include a symlink.
+///
+/// Codex round 4 P1: lexical containment is not enough — a symlink under
+/// the workspace root that points outside (e.g. `workspace/out -> /etc`)
+/// would still satisfy `resolved.starts_with(workspace_root)` while the
+/// open-time `O_NOFOLLOW` only rejects the final component. We walk
+/// every parent directory of `resolved` up to `workspace_root` and
+/// refuse if any segment along the way is itself a symlink.
+fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<()> {
+    // Walk from workspace_root downwards: each ancestor must NOT be a
+    // symlink. We deliberately stop one level above the leaf — the leaf
+    // is policed by the O_NOFOLLOW open in `read_capped_no_follow`.
+    let mut current = workspace_root.to_path_buf();
+    let suffix = match resolved.strip_prefix(workspace_root) {
+        Ok(s) => s.to_path_buf(),
+        Err(_) => {
+            // Should not happen: `resolved` was already verified to be
+            // inside `workspace_root` by `resolve_handle_path`. Defend
+            // anyway.
+            eyre::bail!(
+                "internal: resolved path {} not inside workspace {}",
+                resolved.display(),
+                workspace_root.display()
+            );
+        }
+    };
+    let comps: Vec<_> = suffix.components().collect();
+    if comps.is_empty() {
+        return Ok(());
+    }
+    // Check every intermediate directory. The last component is the
+    // file leaf — leave it for O_NOFOLLOW.
+    for comp in &comps[..comps.len().saturating_sub(1)] {
+        current.push(comp.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                eyre::bail!(
+                    "ancestor of '{}' is a symlink ({}); refusing to follow",
+                    resolved.display(),
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Doesn't exist yet — open will fail later; not our concern.
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(eyre::eyre!(
+                    "failed to stat ancestor {}: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a normalised PathBuf for an absolute path, returning `None` if
@@ -853,6 +925,54 @@ mod tests {
             !body.contains("BAIT"),
             "exact-path whitelist must reject {trap_rel:?} when only {allowed_rel:?} \
              is recorded; got: {body}"
+        );
+    }
+
+    // Codex P1 (round 4): a symlinked PARENT directory under the workspace
+    // would let `out/passwd` lexically pass containment while resolving to
+    // a file outside the workspace at open time. O_NOFOLLOW only checks
+    // the leaf — we need to refuse symlinks anywhere along the ancestor
+    // chain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_mode_rejects_symlinked_parent_directory() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-parent-sym", "stdout\n");
+
+        // Create a target directory outside the workspace with a secret.
+        let outside_dir = dir.path().join("etc-fake");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("passwd"), "root:x:0:0").unwrap();
+
+        // Symlink workspace/out -> outside_dir.
+        let link_inside = dir.path().join("workspace").join("out");
+        std::os::unix::fs::symlink(&outside_dir, &link_inside).unwrap();
+
+        // Record an output that traverses the parent symlink. From the
+        // tool's POV `out/passwd` looks like a workspace-relative path
+        // and the leaf `passwd` is a real file — only the parent is a
+        // symlink. Without ancestor checks this would read /etc-fake/passwd.
+        let recorded = "out/passwd";
+        supervisor.mark_completed(&task_id, vec![recorded.to_string()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": recorded,
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("root:x:0:0"),
+            "parent-directory symlink must not grant read; got: {body}"
         );
     }
 
