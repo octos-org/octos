@@ -5039,7 +5039,8 @@ async fn run_standalone_turn(
                         response.reasoning_content.clone(),
                     );
                     for message in response.messages.iter().cloned().chain(final_assistant) {
-                        let to_save = pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                        let to_save =
+                            pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         if let Ok(seq) = sessions
                             .add_message_with_seq(&agent_session_id, to_save)
                             .await
