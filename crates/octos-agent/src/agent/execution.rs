@@ -472,6 +472,7 @@ impl Agent {
                                             content: String::new(),
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
+                                            envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
                                             task_id: Some(task_id.clone()),
                                         })
@@ -502,6 +503,7 @@ impl Agent {
                                                     ),
                                                     kind: BackgroundResultKind::Notification,
                                                     media: vec![],
+                                                    envelope_media: vec![],
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
                                                     task_id: Some(task_id.clone()),
@@ -543,6 +545,7 @@ impl Agent {
                                             content,
                                             kind: BackgroundResultKind::Notification,
                                             media: vec![],
+                                            envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
                                             task_id: Some(task_id.clone()),
                                         })
@@ -567,6 +570,7 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                envelope_media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
@@ -605,6 +609,7 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                envelope_media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
@@ -640,11 +645,40 @@ impl Agent {
                                         );
                                         let send_args = serde_json::json!({
                                             "file_path": path_str,
-                                            "tool_call_id": bg_tc_id
+                                            "tool_call_id": bg_tc_id,
                                         });
+                                        // M10 Phase 5a (coalesce): enter the
+                                        // `spawn_complete_companion` task-local
+                                        // scope so the in-flight `send_file`
+                                        // emits an OutboundMessage carrying
+                                        // `metadata.spawn_complete_companion =
+                                        // true`. The api/serve consumer reads
+                                        // the flag and persists each per-file
+                                        // row with
+                                        // `MessagePersistedSource::Background`,
+                                        // letting dual-negotiated clients
+                                        // suppress the duplicate at the
+                                        // `live_event_passes_capability_filter`
+                                        // gate in favour of the single
+                                        // `turn/spawn_complete` envelope (which
+                                        // carries the same media via
+                                        // `BackgroundResultPayload.envelope_media`
+                                        // populated below). Internal-only by
+                                        // design: the scope is keyed on a
+                                        // `tokio::task_local!`, NOT on tool
+                                        // args, so an LLM cannot spoof the
+                                        // flag through generated JSON. Old
+                                        // clients without
+                                        // `event.spawn_complete.v1` still
+                                        // receive the per-file rows
+                                        // unchanged.
                                         let mut delivered = false;
                                         for attempt in 0..3 {
-                                            match bg_tools.execute("send_file", &send_args).await {
+                                            match crate::tools::send_file::with_spawn_complete_companion_scope(
+                                                bg_tools.execute("send_file", &send_args),
+                                            )
+                                            .await
+                                            {
                                                 Ok(sr) if sr.success => {
                                                     tracing::info!(
                                                         tool = %bg_name,
@@ -707,6 +741,7 @@ impl Agent {
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
+                                                envelope_media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
@@ -728,40 +763,48 @@ impl Agent {
                                                         .join(", ")
                                                 );
                                                 if let Some(ref sender) = bg_sender {
-                                                    // M10 Phase 1 design choice
-                                                    // (codex rounds 5+7 traded
-                                                    // duplicate-attachments vs
-                                                    // missing-attachments): keep
-                                                    // `media: vec![]` for the
-                                                    // `NotConfigured`/`send_file`
-                                                    // fallback success path. Each
-                                                    // file already has its own
-                                                    // `message/persisted` row
-                                                    // emitted by the `send_file`
-                                                    // consumer (with `source:
-                                                    // assistant`, which passes
-                                                    // both legacy and
-                                                    // dual-negotiated client
-                                                    // filters). Adding the same
-                                                    // files here would duplicate
-                                                    // attachment bubbles for
-                                                    // clients that negotiated
-                                                    // both `event.message_persisted.v1`
-                                                    // AND `event.spawn_complete.v1`.
+                                                    // M10 Phase 5a (coalesce):
+                                                    // - `media: vec![]` keeps
+                                                    //   the persisted row's
+                                                    //   wire shape
+                                                    //   byte-identical to the
+                                                    //   pre-Phase-5a
+                                                    //   "spawn-ack with text
+                                                    //   only" row that old
+                                                    //   clients already render.
+                                                    //   Each `sent_files`
+                                                    //   entry has its OWN
+                                                    //   per-file
+                                                    //   `message/persisted`
+                                                    //   row from the
+                                                    //   `send_file` consumer
+                                                    //   above; double-listing
+                                                    //   them here would render
+                                                    //   the same attachments
+                                                    //   twice for old clients.
+                                                    // - `envelope_media:
+                                                    //   sent_files.clone()`
+                                                    //   surfaces those files
+                                                    //   on the
+                                                    //   `turn/spawn_complete`
+                                                    //   envelope so
+                                                    //   dual-negotiated
+                                                    //   clients (which
+                                                    //   suppress the per-file
+                                                    //   `Background` rows in
+                                                    //   `live_event_passes_capability_filter`)
+                                                    //   still see the
+                                                    //   attachments inline on
+                                                    //   the single completion
+                                                    //   bubble.
                                                     //
-                                                    // Documented limitation:
-                                                    // `event.spawn_complete.v1`-only
-                                                    // negotiation in this fallback
-                                                    // sees the completion text
-                                                    // without inline attachments.
-                                                    // The web SPA (Phase 2)
-                                                    // negotiates both flags, so
-                                                    // production hits the
-                                                    // both-flags path. CLI/TUI
-                                                    // clients use the contract-
-                                                    // `Satisfied` branch above
-                                                    // (which carries `output_files`
-                                                    // directly).
+                                                    // Splitting persist-media
+                                                    // from envelope-media is
+                                                    // what lets the same
+                                                    // producer serve both
+                                                    // wire shapes correctly
+                                                    // without regressing
+                                                    // either.
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
                                                         content: format!(
@@ -770,6 +813,7 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        envelope_media: sent_files.clone(),
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
                                                         task_id: Some(task_id.clone()),
@@ -793,6 +837,7 @@ impl Agent {
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
+                                                        envelope_media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
                                                         task_id: Some(task_id.clone()),
@@ -819,6 +864,7 @@ impl Agent {
                                     content: format!("✗ {} failed: {}", bg_name, r.output),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
                                     task_id: Some(task_id.clone()),
                                 })
@@ -838,6 +884,7 @@ impl Agent {
                                     content: format!("✗ {} error: {}", bg_name, e),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
+                                    envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
                                     task_id: Some(task_id.clone()),
                                 })
