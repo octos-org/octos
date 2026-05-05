@@ -728,45 +728,40 @@ impl Agent {
                                                         .join(", ")
                                                 );
                                                 if let Some(ref sender) = bg_sender {
-                                                    // M10 Phase 1 (codex rounds 5+6):
-                                                    // carry `sent_files` into the
-                                                    // payload so the
-                                                    // `turn/spawn_complete` envelope
-                                                    // surfaces the attachments
-                                                    // inline. Clients that negotiated
-                                                    // ONLY `event.spawn_complete.v1`
-                                                    // (not `event.message_persisted.v1`)
-                                                    // suppress the per-file
-                                                    // `message/persisted` rows the
-                                                    // `send_file` consumer emits, so
-                                                    // without the media here they'd
-                                                    // see a "completed" bubble with
-                                                    // no downloadable attachments.
+                                                    // M10 Phase 1 design choice
+                                                    // (codex rounds 5+7 traded
+                                                    // duplicate-attachments vs
+                                                    // missing-attachments): keep
+                                                    // `media: vec![]` for the
+                                                    // `NotConfigured`/`send_file`
+                                                    // fallback success path. Each
+                                                    // file already has its own
+                                                    // `message/persisted` row
+                                                    // emitted by the `send_file`
+                                                    // consumer (with `source:
+                                                    // assistant`, which passes
+                                                    // both legacy and
+                                                    // dual-negotiated client
+                                                    // filters). Adding the same
+                                                    // files here would duplicate
+                                                    // attachment bubbles for
+                                                    // clients that negotiated
+                                                    // both `event.message_persisted.v1`
+                                                    // AND `event.spawn_complete.v1`.
                                                     //
-                                                    // Round 6 P2-A: canonicalize
-                                                    // each path so a relative
-                                                    // `files_to_send` entry from
-                                                    // the tool resolves to an
-                                                    // absolute path matching what
-                                                    // `SendFileTool` writes into
-                                                    // its own per-file row. Falls
-                                                    // back to the original string
-                                                    // if canonicalization fails
-                                                    // (broken symlink, missing
-                                                    // file) — same posture as
-                                                    // `SendFileTool`'s own
-                                                    // resolver.
-                                                    let resolved_media: Vec<String> = sent_files
-                                                        .iter()
-                                                        .map(|p| {
-                                                            std::fs::canonicalize(p)
-                                                                .map(|cp| {
-                                                                    cp.to_string_lossy()
-                                                                        .into_owned()
-                                                                })
-                                                                .unwrap_or_else(|_| p.clone())
-                                                        })
-                                                        .collect();
+                                                    // Documented limitation:
+                                                    // `event.spawn_complete.v1`-only
+                                                    // negotiation in this fallback
+                                                    // sees the completion text
+                                                    // without inline attachments.
+                                                    // The web SPA (Phase 2)
+                                                    // negotiates both flags, so
+                                                    // production hits the
+                                                    // both-flags path. CLI/TUI
+                                                    // clients use the contract-
+                                                    // `Satisfied` branch above
+                                                    // (which carries `output_files`
+                                                    // directly).
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
                                                         content: format!(
@@ -774,7 +769,7 @@ impl Agent {
                                                             bg_name, file_info
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
-                                                        media: resolved_media,
+                                                        media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
                                                         task_id: Some(task_id.clone()),
