@@ -2130,6 +2130,13 @@ impl ActorFactory {
             Some(self.subagent_output_router.clone()),
             user_workspace.clone(),
         ));
+        // Codex round 3 P2: pin `read_task_output` against the
+        // `ToolLifecycle` LRU evictor. Without this, in long-running
+        // gateway sessions the reader can be auto-deferred after the
+        // idle threshold and disappear from `specs()`, making the
+        // `task_handle` envelope point at a tool the LLM is no longer
+        // offered. The base-tool list is the LRU pin point.
+        tools.add_base_tools(["read_task_output"]);
         tools.register(message_tool);
         tools.register(send_file_tool);
 
