@@ -2055,8 +2055,32 @@ fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -
 fn session_tool_registry(
     base_agent: &Agent,
     session_id: &SessionKey,
+    data_dir: &Path,
+    operator_default_cwd: Option<&Path>,
 ) -> Result<(octos_agent::ToolRegistry, Option<PathBuf>), String> {
     let base_tools = base_agent.tool_registry();
+
+    // Plugin tools (deep_search, mofa_*, fm_tts, …) emit their artefacts
+    // through `OCTOS_WORK_DIR`. Without an explicit work_dir they inherit
+    // the serve process's CWD (typically `~` under launchd), and the
+    // resulting absolute paths fall outside the profile root — so
+    // `MessagePersistedEvent.media` gets fetched via
+    // `/api/files/<encoded-abs-path>` and `resolve_legacy_file_request`
+    // 403s the response.
+    //
+    // `<data_dir>/skill-output` is the gateway convention
+    // (`gateway/profile_factory.rs:581`, `gateway/gateway_runtime.rs:643`)
+    // and is a starts_with prefix of profile_root for
+    // `resolve_legacy_file_request`, so emitted paths round-trip cleanly
+    // through `/api/files/...`. We canonicalise to keep the work_dir
+    // absolute even when `--data-dir` is relative; pre-create the directory
+    // so canonicalize succeeds on first boot.
+    let plugin_default_dir = {
+        let candidate = data_dir.join("skill-output");
+        std::fs::create_dir_all(&candidate).ok();
+        std::fs::canonicalize(&candidate).unwrap_or(candidate)
+    };
+
     let Some(workspace_root) = session_workspaces()
         .get(session_id)
         .or_else(|| base_tools.workspace_root().map(Path::to_path_buf))
@@ -2066,7 +2090,9 @@ fn session_tool_registry(
         // `BackgroundResultSender` without contending for `Arc::get_mut`.
         // `snapshot_excluding(&[])` is the existing primitive for owning a
         // copy with shared `Arc<dyn Tool>` instances.
-        return Ok((base_tools.snapshot_excluding(&[]), None));
+        let mut snapshot = base_tools.snapshot_excluding(&[]);
+        snapshot.rebind_plugin_work_dirs(&plugin_default_dir);
+        return Ok((snapshot, None));
     };
 
     session_filesystem_profile_for_workspace(base_tools.as_ref(), &workspace_root)
@@ -2085,14 +2111,46 @@ fn session_tool_registry(
     let sandbox = octos_agent::sandbox::create_sandbox(&sandbox_config);
     let mut rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
     // β: mirror gateway's `session_actor.rs:2116` — rebind plugin tool
-    // work_dirs so skills like `deep_search` (which writes its `.md` report
-    // under `OCTOS_WORK_DIR` / `.`) materialise files INSIDE the session
-    // workspace instead of the server process cwd. Without this, the new
-    // `SendFileTool` registration (whose base_dir is the workspace) would
-    // correctly reject paths the skill wrote outside the workspace.
-    rebound.rebind_plugin_work_dirs(&workspace_root);
+    // work_dirs so skills materialise files INSIDE a directory that
+    // round-trips through `/api/files/...`.
+    //
+    //  • Tier-1 (`session_workspaces().get(session_id).is_some()`):
+    //    client-sent cwd. Use it directly — that's the user's explicit
+    //    request and where they expect outputs to land.
+    //  • Tier-2 (operator set `appui.default_session_cwd` and the
+    //    workspace_root we resolved matches it): respect the operator's
+    //    choice and rebind plugins to that dir, matching the existing
+    //    shell/file-tool cwd binding.
+    //  • Tier-3 (boot fallback from `with_builtins_and_sandbox(serve_cwd)`,
+    //    which under launchd is `~` outside the profile root): fall back
+    //    to `<data_dir>/skill-output` so spawn_only artefacts resolve
+    //    through the file API instead of 403'ing.
+    let plugin_target =
+        if session_workspaces().get(session_id).is_some() || matches_operator_default(
+            operator_default_cwd,
+            &workspace_root,
+        ) {
+            &workspace_root
+        } else {
+            &plugin_default_dir
+        };
+    rebound.rebind_plugin_work_dirs(plugin_target);
 
     Ok((rebound, Some(workspace_root)))
+}
+
+/// Returns true when `workspace_root` resolves to the same canonical path
+/// as the operator-configured `appui.default_session_cwd`. We canonicalise
+/// both sides so a config that uses a symlinked or relative path still
+/// matches the registry's recorded root.
+fn matches_operator_default(operator_default: Option<&Path>, workspace_root: &Path) -> bool {
+    let Some(default) = operator_default else {
+        return false;
+    };
+    let canonical_default = std::fs::canonicalize(default).unwrap_or_else(|_| default.to_path_buf());
+    let canonical_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    canonical_default == canonical_root
 }
 
 fn session_system_prompt(base_agent: &Agent, workspace_root: Option<&Path>) -> String {
@@ -4335,14 +4393,21 @@ async fn run_standalone_turn(
         }
     };
 
-    let history: Vec<Message> = {
+    let (history, runtime_data_dir): (Vec<Message>, PathBuf) = {
         let mut sessions = sessions.lock().await;
         let session = sessions.get_or_create(&session_id).await;
-        session.get_history(50).to_vec()
+        let history = session.get_history(50).to_vec();
+        let data_dir = sessions.data_dir();
+        (history, data_dir)
     };
 
     let (mut tool_registry, workspace_root) =
-        match session_tool_registry(base_agent.as_ref(), &session_id) {
+        match session_tool_registry(
+            base_agent.as_ref(),
+            &session_id,
+            &runtime_data_dir,
+            state.appui_default_session_cwd.as_deref(),
+        ) {
             Ok(registry) => registry,
             Err(error) => {
                 // FIX-03 pattern: terminal emission + state transition is atomic.
@@ -7437,8 +7502,17 @@ mod tests {
         // the process-global `session_workspaces()` store.
         let session_id = SessionKey("local:tier2-fallback-test".into());
 
-        let (registry, root) =
-            session_tool_registry(&agent, &session_id).expect("session_tool_registry");
+        let runtime_data_dir = tempfile::tempdir().expect("runtime data dir");
+        let (registry, root) = session_tool_registry(
+            &agent,
+            &session_id,
+            runtime_data_dir.path(),
+            // Mirror the operator-default cwd so the Tier-2 branch
+            // recognises the workspace_root as user-meaningful and binds
+            // plugin work_dirs to it rather than to `skill-output`.
+            Some(workspace.path()),
+        )
+        .expect("session_tool_registry");
 
         let root = root.expect("Tier-2 must populate workspace_root");
         assert_eq!(
@@ -7485,8 +7559,14 @@ mod tests {
         let session_id = SessionKey("local:tier1-wins-test".into());
         session_workspaces().set(session_id.clone(), tier1_subdir.clone());
 
-        let (_registry, root) =
-            session_tool_registry(&agent, &session_id).expect("session_tool_registry");
+        let runtime_data_dir = tempfile::tempdir().expect("runtime data dir");
+        let (_registry, root) = session_tool_registry(
+            &agent,
+            &session_id,
+            runtime_data_dir.path(),
+            Some(tier2_default.path()),
+        )
+        .expect("session_tool_registry");
 
         let root = root.expect("workspace_root must be set");
         assert_eq!(

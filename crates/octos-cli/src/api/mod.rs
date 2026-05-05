@@ -191,6 +191,15 @@ pub struct AppState {
     /// Unavailable` so they fail closed instead of pretending a task
     /// was cancelled.
     pub task_query_store: Option<crate::session_actor::SessionTaskQueryStore>,
+    /// Operator-configured default session cwd (`config.appui.default_session_cwd`).
+    /// Mirrored into `AppState` so the per-session tool registry can tell
+    /// the difference between "operator approved this directory as the
+    /// session cwd" (Tier-2: respect it for plugin work_dirs too) and the
+    /// boot-time `with_builtins_and_sandbox(serve_cwd)` fallback (Tier-3:
+    /// route plugin output to `<data_dir>/skill-output` instead, since the
+    /// serve cwd under launchd is `~`, outside the profile root, and
+    /// `/api/files` would 403 anything written there).
+    pub appui_default_session_cwd: Option<PathBuf>,
 }
 
 impl AppState {
@@ -242,6 +251,7 @@ impl AppState {
             credential_pool: None,
             content_classifier: None,
             task_query_store: None,
+            appui_default_session_cwd: None,
         }
     }
 }
