@@ -4737,21 +4737,21 @@ async fn run_standalone_turn(
                             turn_id: Some(turn_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             task_id: task_id_value,
-                            // The bound thread_id IS the originating
-                            // thread anchor — in the gateway path it's
-                            // the user's `client_message_id`; in this
-                            // standalone-turn path it's the `TurnId`
-                            // (the reporter is wired with `turn_id`).
-                            // Either way, surfacing the same
-                            // identifier the user-prompt row carries
-                            // as `thread_id` is what lets the SPA
-                            // reducer anchor the new bubble under the
-                            // right prompt without falling back to
-                            // sticky-map heuristics. Phase 4 plumbing
-                            // will replace `originating_thread_id` with
-                            // a typed `originating_client_message_id`
-                            // for unambiguous semantics.
-                            response_to_client_message_id: originating_thread_id.clone(),
+                            // Codex rounds 2/6: leave this `None`. In
+                            // the standalone-turn path the reporter
+                            // binds `thread_id = turn_id.0.to_string()`
+                            // (a TurnId UUID), so `originating_thread_id`
+                            // here is NOT the user's `client_message_id`
+                            // the field is documented to carry. Phase 4
+                            // plumbing will add a typed
+                            // `originating_client_message_id` to
+                            // `BackgroundResultPayload` and populate
+                            // this from there. Today the SPA reducer
+                            // already anchors via `thread_id` (which
+                            // matches the user-prompt row's thread_id
+                            // through the M8.10 root-on-cmid
+                            // invariant), so this `None` is safe.
+                            response_to_client_message_id: None,
                             seq: meta.committed_seq as u64,
                             // Reuse the `MessageCommitObserver`-style
                             // wire id for the same durable row — see

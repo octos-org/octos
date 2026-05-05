@@ -728,7 +728,7 @@ impl Agent {
                                                         .join(", ")
                                                 );
                                                 if let Some(ref sender) = bg_sender {
-                                                    // M10 Phase 1 (codex round 5):
+                                                    // M10 Phase 1 (codex rounds 5+6):
                                                     // carry `sent_files` into the
                                                     // payload so the
                                                     // `turn/spawn_complete` envelope
@@ -742,6 +742,31 @@ impl Agent {
                                                     // without the media here they'd
                                                     // see a "completed" bubble with
                                                     // no downloadable attachments.
+                                                    //
+                                                    // Round 6 P2-A: canonicalize
+                                                    // each path so a relative
+                                                    // `files_to_send` entry from
+                                                    // the tool resolves to an
+                                                    // absolute path matching what
+                                                    // `SendFileTool` writes into
+                                                    // its own per-file row. Falls
+                                                    // back to the original string
+                                                    // if canonicalization fails
+                                                    // (broken symlink, missing
+                                                    // file) — same posture as
+                                                    // `SendFileTool`'s own
+                                                    // resolver.
+                                                    let resolved_media: Vec<String> = sent_files
+                                                        .iter()
+                                                        .map(|p| {
+                                                            std::fs::canonicalize(p)
+                                                                .map(|cp| {
+                                                                    cp.to_string_lossy()
+                                                                        .into_owned()
+                                                                })
+                                                                .unwrap_or_else(|_| p.clone())
+                                                        })
+                                                        .collect();
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
                                                         content: format!(
@@ -749,7 +774,7 @@ impl Agent {
                                                             bg_name, file_info
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
-                                                        media: sent_files.clone(),
+                                                        media: resolved_media,
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
                                                         task_id: Some(task_id.clone()),
