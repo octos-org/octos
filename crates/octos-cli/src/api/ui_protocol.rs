@@ -828,6 +828,11 @@ fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePer
 /// new row instead of the pre-persist snapshot. Mirrors the gateway's
 /// `session_actor.rs::deliver_background_notification` post-write
 /// invalidate at `api_channel.rs:1503`.
+///
+/// Returns `Some(committed_seq)` on success — the row's index in the
+/// session's message log, matching `MessagePersistedEvent.seq` and the
+/// authoritative `seq` for any wire-protocol confirmation event. `None`
+/// signals a persist failure (already logged).
 async fn persist_assistant_with_media(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
     data_dir: &Path,
@@ -836,25 +841,29 @@ async fn persist_assistant_with_media(
     media: Vec<String>,
     thread_id: String,
     label: &str,
-) -> bool {
+) -> Option<usize> {
     let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
     message.media = media;
 
-    if let Err(error) =
-        octos_bus::session::persist_message_through_canonical_path(data_dir, session_id, message)
-            .await
+    let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
+        data_dir, session_id, message,
+    )
+    .await
     {
-        tracing::warn!(
-            session = %session_id.0,
-            label,
-            error = %error,
-            "api/serve: failed to persist background-delivered message"
-        );
-        return false;
-    }
+        Ok(seq) => seq,
+        Err(error) => {
+            tracing::warn!(
+                session = %session_id.0,
+                label,
+                error = %error,
+                "api/serve: failed to persist background-delivered message"
+            );
+            return None;
+        }
+    };
 
     sessions.lock().await.invalidate_cache(session_id);
-    true
+    Some(committed_seq)
 }
 
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
@@ -4648,7 +4657,7 @@ async fn run_standalone_turn(
                     // duplicate-suppression filter would never fire,
                     // delivering both `message/persisted` AND
                     // `turn/spawn_complete` to upgraded clients.
-                    let persisted = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                    let committed_seq = MESSAGE_PERSISTED_SOURCE_OVERRIDE
                         .scope(
                             Some(MessagePersistedSource::Background),
                             persist_assistant_with_media(
@@ -4662,44 +4671,43 @@ async fn run_standalone_turn(
                             ),
                         )
                         .await;
-                    // M10 Phase 1: even if persistence failed (rare —
-                    // canonical path returned an error), still emit
-                    // `turn/spawn_complete` so connected new-shape
-                    // clients see the completion. Persistence is the
-                    // ledger durability + `message/persisted`
-                    // confirmation path; the envelope event is the
-                    // authoritative wire shape for the new client and
-                    // is independently durable through the UI protocol
-                    // ledger. If we suppressed it on persist failure
-                    // we'd silently drop a completion the user is
-                    // waiting for. Only the legacy `message/persisted`
-                    // path is gated on persisted=true (that's
-                    // `MessageCommitObserver`'s contract).
-                    if let Some(task_id_value) = task_id.clone() {
+                    // M10 Phase 1: emit `turn/spawn_complete` only when
+                    // persistence succeeded (codex P2 follow-up). The
+                    // wire `seq` field carries the COMMITTED-ROW seq
+                    // (the index in the session message log that
+                    // `MessagePersistedEvent.seq` carries today) — NOT
+                    // the UI-ledger cursor seq. Upgraded clients route
+                    // `turn/spawn_complete` through the same persisted
+                    // -message reducer they use for `message/persisted`,
+                    // so the two events MUST agree on this seq or the
+                    // reducer dedupes/anchors against a non-existent
+                    // row. The cursor is stamped separately by the
+                    // ledger so cursor-driven replay still works.
+                    //
+                    // `response_to_client_message_id` is intentionally
+                    // left `None` here: the UI-protocol turn-start path
+                    // doesn't propagate the user's `client_message_id`
+                    // through to this layer (the reporter's `thread_id`
+                    // is the `TurnId`, not the user cmid). Phase 2's
+                    // SPA reducer keys off `thread_id` to anchor the
+                    // bubble; once the user cmid is plumbed through
+                    // `BackgroundResultPayload`, this field will carry
+                    // the real value.
+                    if let (Some(task_id_value), Some(seq)) = (task_id.clone(), committed_seq) {
                         let event = TurnSpawnCompleteEvent {
                             session_id: session_id.clone(),
                             turn_id: Some(turn_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             task_id: task_id_value,
-                            response_to_client_message_id: originating_thread_id.clone(),
-                            // Cursor + seq are stamped by
-                            // `LedgeredUiProtocolEvent::with_cursor`
-                            // when the ledger appends. We seed `0` so
-                            // the field is well-formed if a future
-                            // change observes the event pre-stamp.
-                            seq: 0,
+                            response_to_client_message_id: None,
+                            seq: seq as u64,
                             // Stable id mirroring `MessageCommitObserver`'s
-                            // convention. The seq isn't yet known here;
-                            // the ledger fills cursor authoritatively.
-                            // Format keeps it human-debuggable (session
-                            // + task) — the spec does not constrain
-                            // collision properties beyond "stable
-                            // string per row."
+                            // convention so the wire-id is consistent
+                            // across the two shapes for the same row.
                             message_id: format!(
-                                "{}:spawn:{}:{}",
+                                "{}:{seq}:spawn:{}",
                                 session_id.0,
                                 task_id.as_deref().unwrap_or(""),
-                                Utc::now().timestamp_nanos_opt().unwrap_or(0),
                             ),
                             source: "background".to_owned(),
                             cursor: UiCursor {
@@ -4711,21 +4719,32 @@ async fn run_standalone_turn(
                             media,
                         };
                         ledger.append_notification(UiNotification::TurnSpawnComplete(event));
-                    } else {
+                    } else if task_id.is_none() {
                         // Best-effort: a payload without `task_id`
                         // arrives only from legacy callers (cf.
                         // `BackgroundResultPayload.task_id` doc). Old
                         // clients see `message/persisted` as before;
                         // new clients miss this single completion.
-                        // Logging surfaces the gap so we can fix
-                        // upstream callers.
                         tracing::debug!(
                             session_id = %session_id.0,
                             task_label,
                             "background result missing task_id; turn/spawn_complete suppressed"
                         );
+                    } else {
+                        // Persist failed — the row never landed in the
+                        // session ledger, so emitting a `turn/spawn_complete`
+                        // would advertise a row that doesn't exist on
+                        // hydrate. Log; old clients also see nothing
+                        // (the observer never fired). The agent's
+                        // task_supervisor still records the failure for
+                        // operator visibility.
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            task_label,
+                            "background result persist failed; both wire shapes suppressed"
+                        );
                     }
-                    persisted
+                    committed_seq.is_some()
                 })
             },
         ));
@@ -10482,52 +10501,58 @@ mod tests {
         assert_eq!(after, MessagePersistedSource::Assistant);
     }
 
-    /// Codex P2: every `turn/spawn_complete` event must carry the same
-    /// monotonically-assigned ledger seq as its envelope, NOT 0. Producers
-    /// seed `seq: 0` at construction (they don't know the assigned cursor
-    /// yet); `LedgeredUiProtocolEvent::with_cursor` stamps it during
-    /// `append_notification`. Without this, replay/dedup reduces every
-    /// spawn_complete to the same logical row.
+    /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat
+    /// `seq` field carries the COMMITTED-ROW seq (the index in the
+    /// session message log, identical to `MessagePersistedEvent.seq`)
+    /// — NOT the UI-ledger cursor seq. The two scales differ in any
+    /// turn that has prior ledger notifications, so upgraded clients
+    /// reusing their `MessagePersisted` reducer for spawn completions
+    /// MUST observe the persisted-row seq the producer wrote, not the
+    /// ledger-assigned cursor seq.
     #[tokio::test]
-    async fn ledger_stamps_turn_spawn_complete_seq_in_lockstep_with_cursor() {
+    async fn ledger_preserves_producer_seq_and_stamps_only_cursor() {
         let ledger = UiProtocolLedger::new(8);
         let session_id = SessionKey("local:seq".into());
 
-        // Append twice — each event must observe a distinct, monotonically
-        // increasing seq stamped onto BOTH the cursor and the flat
-        // `seq` field.
-        let first = ledger.append_notification(turn_spawn_complete_for(&session_id));
-        let second = ledger.append_notification(turn_spawn_complete_for(&session_id));
-
-        let extract_seq = |event: &UiProtocolLedgerEvent| -> Option<(u64, u64)> {
-            match event {
-                UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => {
-                    Some((ev.seq, ev.cursor.seq))
-                }
-                _ => None,
-            }
+        // Producer sets `seq = 7` (the committed-row index from the
+        // persist path). Ledger appends and stamps cursor.seq, but
+        // must leave `seq` untouched.
+        let mut event = match turn_spawn_complete_for(&session_id) {
+            UiNotification::TurnSpawnComplete(ev) => ev,
+            _ => unreachable!("test fixture is turn/spawn_complete"),
         };
-        let (first_seq, first_cursor_seq) =
-            extract_seq(&first.event).expect("first event is turn/spawn_complete");
-        let (second_seq, second_cursor_seq) =
-            extract_seq(&second.event).expect("second event is turn/spawn_complete");
+        event.seq = 7;
+        event.cursor.seq = 0; // producer seeds 0; ledger stamps the real cursor.
+        let appended = ledger.append_notification(UiNotification::TurnSpawnComplete(event));
 
-        assert!(
-            first_seq > 0,
-            "ledger must stamp non-zero seq onto first event"
-        );
+        let stamped = match &appended.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
+            _ => panic!("expected turn/spawn_complete back from the ledger"),
+        };
         assert_eq!(
-            first_seq, first_cursor_seq,
-            "flat seq must equal cursor seq for the same event",
+            stamped.seq, 7,
+            "ledger must NOT overwrite the producer's committed-row seq",
         );
         assert!(
-            second_seq > first_seq,
-            "seq is strictly monotonic per session"
+            stamped.cursor.seq > 0,
+            "cursor.seq must be the ledger-assigned non-zero cursor",
         );
-        assert_eq!(
-            second_seq, second_cursor_seq,
-            "flat seq remains in lockstep with cursor seq across appends",
-        );
+
+        // Cursor is strictly monotonic across appends (same contract
+        // as the existing MessagePersisted path); flat `seq` is
+        // independent and tracked by the producer.
+        let mut event2 = match turn_spawn_complete_for(&session_id) {
+            UiNotification::TurnSpawnComplete(ev) => ev,
+            _ => unreachable!(),
+        };
+        event2.seq = 8;
+        let appended2 = ledger.append_notification(UiNotification::TurnSpawnComplete(event2));
+        let stamped2 = match &appended2.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
+            _ => panic!("turn/spawn_complete"),
+        };
+        assert!(stamped2.cursor.seq > stamped.cursor.seq);
+        assert_eq!(stamped2.seq, 8);
     }
 
     /// End-to-end through the live forwarder for an OLD client (did NOT

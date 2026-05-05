@@ -166,17 +166,18 @@ impl UiProtocolLedgerEvent {
                 UiNotification::MessagePersisted(persisted) => {
                     persisted.cursor = cursor;
                 }
-                // M10 Phase 1: same convention for the `turn/spawn_complete`
-                // envelope — the wire `cursor` field tracks the ledger
-                // seq so cursor-driven clients can resume cleanly across
-                // both event shapes. The flat `seq` field mirrors
-                // `MessagePersistedEvent.seq` (codex P2: producers seed
-                // 0 at construction; the assigned seq is only known
-                // here, so stamp both fields in lockstep — otherwise
-                // every spawn_complete arrives at the client as
-                // sequence 0 and reorder/dedup logic breaks).
+                // M10 Phase 1: stamp the ledger cursor onto the
+                // `turn/spawn_complete` envelope so cursor-driven
+                // clients can resume cleanly. The flat `seq` field is
+                // intentionally NOT overwritten here — it carries the
+                // committed-row index from the persistence path
+                // (matching `MessagePersistedEvent.seq`), which the
+                // producer set before append (codex P2 follow-up).
+                // The persisted-row seq and the UI-ledger cursor seq
+                // are different scales — conflating them would make
+                // upgraded clients dedupe / anchor against a
+                // non-existent message row on hydrate.
                 UiNotification::TurnSpawnComplete(spawn_complete) => {
-                    spawn_complete.seq = cursor.seq;
                     spawn_complete.cursor = cursor;
                 }
                 _ => {}
