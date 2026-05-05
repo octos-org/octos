@@ -162,6 +162,52 @@ impl ToolRegistry {
         format!("{base}\nOutput directory: {output_dir}")
     }
 
+    /// M10 Phase 4 — agent context isolation.
+    ///
+    /// Build the JSON-shaped tool result returned to the LLM when a
+    /// `spawn_only` tool is auto-backgrounded. Instead of the previous
+    /// free-text "SUCCESS…" line plus the full tool stdout, the LLM now
+    /// receives a small `task_handle` envelope and is expected to call
+    /// `read_task_output(task_handle, mode=…)` if it wants to inspect the
+    /// background work.
+    ///
+    /// Wire-compat note: the full output is still persisted server-side
+    /// via the M8.7 `SubAgentOutputRouter` and delivered to the SPA via
+    /// `BackgroundResultSender::turn.spawn_complete`. This change only
+    /// alters what the *LLM* sees; the UI envelope is unchanged.
+    pub fn spawn_only_handle_message(
+        &self,
+        name: &str,
+        task_id: &str,
+        expected_files: &[String],
+    ) -> String {
+        let custom = self.spawn_only_messages.get(name).cloned();
+        let summary = custom.unwrap_or_else(|| {
+            format!(
+                "Background work started for `{name}`. The final result will be delivered \
+                 automatically when ready. Use read_task_output(task_handle, mode={{…}}) to \
+                 inspect intermediate output without bloating context."
+            )
+        });
+        let output_dir = self
+            .output_dir_hint
+            .clone()
+            .unwrap_or_else(|| "skill-output/".to_string());
+        let payload = serde_json::json!({
+            "ok": true,
+            "task_handle": task_id,
+            "summary": summary,
+            "expected_files": expected_files,
+            "output_dir": output_dir,
+            "read_with": "read_task_output",
+            "read_modes": ["head", "tail", "grep", "line_range", "file"],
+        });
+        // serde_json::to_string never fails on a json!{} value built from
+        // owned strings + arrays, but fall back to lossy stringification
+        // just in case.
+        serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
+    }
+
     /// Set the output directory hint included in spawn_only tool messages.
     pub fn set_output_dir_hint(&mut self, output_dir: impl Into<String>) {
         let mut output_dir = output_dir.into();
@@ -1449,6 +1495,56 @@ mod lifecycle_tests {
         let msg = reg.spawn_only_message("mofa_slides");
 
         assert!(msg.contains("Output directory: /tmp/octos-profile/skill-output/"));
+    }
+
+    #[test]
+    fn spawn_only_handle_message_returns_task_handle_envelope() {
+        let mut reg = make_registry(5, 3);
+        reg.mark_spawn_only("deep_search", None);
+        reg.set_output_dir_hint("/tmp/octos/skill-output");
+
+        let payload = reg.spawn_only_handle_message(
+            "deep_search",
+            "task_abc123",
+            &["research/_report.md".to_string()],
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&payload)
+            .expect("spawn_only_handle_message must produce valid JSON");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["task_handle"], "task_abc123");
+        assert_eq!(value["read_with"], "read_task_output");
+        assert!(
+            value["expected_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "research/_report.md")
+        );
+        // The summary must point the LLM at read_task_output rather than
+        // dumping content into context.
+        assert!(
+            value["summary"]
+                .as_str()
+                .unwrap()
+                .contains("read_task_output")
+        );
+    }
+
+    #[test]
+    fn spawn_only_handle_message_payload_stays_under_one_kb() {
+        // Phase 4 acceptance criterion: spawn_only tool result in agent
+        // context is < 1KB (was 50KB+).
+        let mut reg = make_registry(5, 3);
+        reg.mark_spawn_only("deep_search", None);
+
+        let payload = reg.spawn_only_handle_message("deep_search", "task_xyz", &[]);
+
+        assert!(
+            payload.len() < 1024,
+            "spawn_only handle envelope must be < 1KB, got {} bytes",
+            payload.len()
+        );
     }
 }
 
