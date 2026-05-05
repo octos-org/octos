@@ -376,6 +376,37 @@ impl ToolRegistry {
 
     /// Get tool specifications for the LLM, filtered by provider policy if set.
     /// Results are cached and invalidated when the registry is mutated.
+    /// Codex round 2 P2: visibility-aware tool lookup.
+    ///
+    /// Returns `true` only if `name` is registered AND would be exposed to
+    /// the LLM by `specs()` — i.e. it is not deferred, not denied by the
+    /// provider policy, and (when a context filter is set) carries a
+    /// matching tag. Used by the spawn_only intercept to decide whether
+    /// the LLM can actually call `read_task_output` before it advertises
+    /// the new `task_handle` envelope.
+    pub fn is_tool_visible(&self, name: &str) -> bool {
+        let Some(tool) = self.tools.get(name) else {
+            return false;
+        };
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if deferred.contains(name) {
+            return false;
+        }
+        if let Some(ref policy) = self.provider_policy {
+            if !policy.is_allowed_with_tags(name, tool.tags()) {
+                return false;
+            }
+        }
+        if let Some(ref tags) = self.context_filter {
+            let tool_tags = tool.tags();
+            if !tool_tags.is_empty() && !tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut cache = self.cached_specs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref specs) = *cache {
@@ -1529,6 +1560,33 @@ mod lifecycle_tests {
                 .unwrap()
                 .contains("read_task_output")
         );
+    }
+
+    #[test]
+    fn is_tool_visible_respects_provider_policy_deny() {
+        // Codex round 2 P2: visibility helper must mirror the same filters
+        // `specs()` applies, so the spawn_only intercept does not advertise
+        // a tool the provider policy hid from the LLM's tool list.
+        let mut reg = make_registry(5, 3);
+        // After make_registry, "shell" exists.
+        assert!(reg.is_tool_visible("shell"));
+
+        let policy = ToolPolicy {
+            deny: vec!["shell".to_string()],
+            ..Default::default()
+        };
+        reg.set_provider_policy(policy);
+
+        assert!(
+            !reg.is_tool_visible("shell"),
+            "provider-policy-denied tools must not be reported as visible"
+        );
+    }
+
+    #[test]
+    fn is_tool_visible_returns_false_for_unregistered_tools() {
+        let reg = make_registry(5, 3);
+        assert!(!reg.is_tool_visible("nope_does_not_exist"));
     }
 
     #[test]

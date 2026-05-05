@@ -928,15 +928,14 @@ impl Agent {
                 // `turn.spawn_complete`; the agent now reads selectively
                 // via `read_task_output`.
                 //
-                // Codex P2 (round 1): gate the envelope on the
-                // `read_task_output` tool actually being registered. Some
-                // Agent setups (CLI chat, swarm workers) construct
-                // registries that do not include `read_task_output`; in
-                // those, returning a handle would advertise a tool the
-                // LLM cannot call. Fall back to the legacy free-text
-                // message there so behaviour is unchanged for those
-                // entry points until they wire the tool.
-                let handle_payload = if tools.get("read_task_output").is_some() {
+                // Codex P2 (round 1+2): gate the envelope on the
+                // `read_task_output` tool actually being VISIBLE to the
+                // LLM in this turn — registered AND not filtered out by
+                // provider policy / deferred set / context tag filter.
+                // Otherwise the envelope advertises a tool the LLM was
+                // not offered. Fall back to the legacy free-text message
+                // for those entry points.
+                let handle_payload = if tools.is_tool_visible("read_task_output") {
                     tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[])
                 } else {
                     tools.spawn_only_message(&tc_name)

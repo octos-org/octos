@@ -317,7 +317,12 @@ impl ReadTaskOutputTool {
         // symlink inside the workspace cannot redirect the read to a file
         // outside the workspace boundary. This matches the safety the
         // built-in `read_file` tool gets.
-        let text = read_capped_no_follow(&resolved)?;
+        //
+        // Codex P2 (round 2): for `file` mode with an inner `tail`, the
+        // reader must seek to the END of multi-megabyte files; otherwise
+        // tail returns the last lines of the first 1 MiB. Mirror the
+        // router-side hint logic.
+        let text = read_capped_no_follow(&resolved, mode_hint(&mode))?;
         apply_mode(&text, mode)
     }
 }
@@ -423,7 +428,7 @@ fn read_capped(path: &Path, direction: ReadDirection) -> Result<String> {
 /// O_NOFOLLOW variant for `file` mode: a symlink inside the workspace must
 /// not redirect the read to a file outside the workspace boundary.
 /// Mirrors the safety the built-in `read_file` tool gets.
-fn read_capped_no_follow(path: &Path) -> Result<String> {
+fn read_capped_no_follow(path: &Path, direction: ReadDirection) -> Result<String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -442,8 +447,7 @@ fn read_capped_no_follow(path: &Path) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(eyre::eyre!("failed to open {}: {e}", path.display())),
     };
-    // File mode always reads from the start — the inner mode then slices it.
-    read_capped_with_direction(file, ReadDirection::FromStart, path)
+    read_capped_with_direction(file, direction, path)
 }
 
 fn read_capped_with_direction(
@@ -830,6 +834,46 @@ mod tests {
         assert!(
             !body.contains("secret outside"),
             "O_NOFOLLOW must reject symlink target reads; got: {body}"
+        );
+    }
+
+    // Codex P2 (round 2): file mode with an inner `tail` must also read
+    // from the end of multi-megabyte expected files.
+    #[tokio::test]
+    async fn file_mode_tail_reads_from_end_for_large_expected_files() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-big-file", "stdout\n");
+
+        let report_rel = "research/big_report.md";
+        let report_abs = dir.path().join("workspace").join(report_rel);
+        std::fs::create_dir_all(report_abs.parent().unwrap()).unwrap();
+
+        // Build a > MAX_READ_BYTES file with a unique marker at the end.
+        let bulk = "filler-line-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad\n";
+        let chunk_count = (MAX_READ_BYTES / bulk.len()) + 100;
+        let mut body = bulk.repeat(chunk_count);
+        body.push_str("UNIQUE_FILE_TAIL_MARKER\n");
+        std::fs::write(&report_abs, &body).unwrap();
+
+        supervisor.mark_completed(&task_id, vec![report_rel.to_string()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": report_rel,
+                    "mode": {"kind": "tail", "lines": 5}
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert!(
+            result.output.contains("UNIQUE_FILE_TAIL_MARKER"),
+            "file-mode tail must surface lines from the END of the file; got: {}",
+            result.output
         );
     }
 

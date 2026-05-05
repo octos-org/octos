@@ -11,38 +11,6 @@ use crate::mcp::McpServerConfig;
 
 use super::manifest::{PluginManifest, SkillHookDef, SkillMcpServer};
 
-/// Static prompt fragment auto-injected when a skill ships spawn_only tools.
-/// Documents the M10 Phase 4 agent-context-isolation contract: the LLM gets
-/// a small `task_handle` envelope from spawn_only tools, and reads bounded
-/// slices of the captured output via `read_task_output`.
-const SPAWN_ONLY_HANDLE_GUIDANCE: &str = r#"## Background tasks (spawn_only) — context-isolation contract
-
-When you invoke a spawn_only tool (e.g. deep_search, mofa_*), the tool returns
-immediately with a small JSON envelope, NOT the full result:
-
-  {
-    "ok": true,
-    "task_handle": "task_<uuid>",
-    "summary": "...",
-    "expected_files": [...],
-    "read_with": "read_task_output"
-  }
-
-The full output is delivered to the user automatically when the background
-work completes. Do NOT assume the result content is in your context — it isn't.
-
-If you need to inspect the captured output before finishing the turn, call
-`read_task_output(task_handle, mode={...})`. Modes:
-- {"kind": "head", "lines": 50}              — first N lines (start here)
-- {"kind": "tail", "lines": 50}               — last N lines
-- {"kind": "grep", "pattern": "term", "max_matches": 20}
-- {"kind": "line_range", "start": 1, "end": 100}
-- {"kind": "file", "path": "research/_report.md", "mode": {"kind": "head", "lines": 50}}
-
-Every call returns at most ~4 KB. Prefer `head: 50` first, then `grep` for
-specifics, before reading whole files.
-"#;
-
 /// Resolved extras from a skill manifest, ready to merge into agent config.
 #[derive(Debug, Default)]
 pub struct SkillExtras {
@@ -83,6 +51,18 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
 
     // Auto-inject SKILL.md when skill has spawn_only tools so the LLM
     // knows how to access deferred tools via spawn.
+    //
+    // M10 Phase 4 (codex round 2 P2): the `read_task_output` contract
+    // teaching is NOT injected globally here. The `extras.prompt_fragments`
+    // are merged into the system prompt on every agent that loads the
+    // skill — including CLI chat / swarm workers whose registries do not
+    // wire `read_task_output`. Without registry-aware gating those agents
+    // would learn about a tool they cannot call. Instead, the
+    // `spawn_only_handle_message` envelope itself documents the contract
+    // inline (`read_with`, `read_modes`, and the `summary` field), so
+    // only agents that actually emit the new envelope teach the LLM
+    // about it — automatic and consistent with the gating in
+    // `execution.rs::is_tool_visible`.
     if manifest.tools.iter().any(|t| t.spawn_only) {
         let skill_md = skill_dir.join("SKILL.md");
         if skill_md.exists() {
@@ -90,13 +70,6 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
                 extras.prompt_fragments.push(content);
             }
         }
-        // M10 Phase 4 — agent context isolation. Teach the LLM the new
-        // contract once per skill that ships any spawn_only tool: the
-        // tool result is now a small `task_handle` envelope, and the
-        // way to inspect the actual output is `read_task_output`.
-        extras
-            .prompt_fragments
-            .push(SPAWN_ONLY_HANDLE_GUIDANCE.to_string());
     }
 
     if let Some(prompts) = &manifest.prompts {
