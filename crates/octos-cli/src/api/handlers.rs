@@ -132,7 +132,10 @@ fn resolve_profile_id_candidate(state: &AppState, candidate: &str) -> Option<Str
         .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
 }
 
-fn routed_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn routed_profile_id_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<String> {
     if let Some(host) = request_host(headers) {
         if !is_local_request_host(&host) {
             if let Some(candidate) = host.split('.').next() {

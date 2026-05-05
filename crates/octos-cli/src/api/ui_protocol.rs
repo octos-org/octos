@@ -1295,9 +1295,23 @@ pub async fn ws_handler(
         .as_ref()
         .and_then(|Extension(identity)| authenticated_profile_id(identity))
         .map(ToOwned::to_owned);
+    // Hosted multi-tenant standalone serve routes by subdomain
+    // (`<profile>.<base>.example.com`). Admin tokens authenticate as
+    // `AuthIdentity::Admin` so `connection_profile_id` is `None`, but the
+    // `Host` header still carries the per-tenant profile. Stash it on the
+    // connection so per-session resolution (notably plugin work_dir →
+    // file-API root) can pick the right profile data dir even for admin
+    // sessions originated from a hosted subdomain.
+    let routed_profile_id = super::handlers::routed_profile_id_from_headers(&state, &headers);
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
     ws.on_upgrade(move |socket| {
-        ui_protocol_connection(socket, state, connection_profile_id, features)
+        ui_protocol_connection(
+            socket,
+            state,
+            connection_profile_id,
+            routed_profile_id,
+            features,
+        )
     })
 }
 
@@ -1305,6 +1319,7 @@ async fn ui_protocol_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     connection_profile_id: Option<String>,
+    routed_profile_id: Option<String>,
     features: ConnectionUiFeatures,
 ) {
     let (ws_sink, mut ws_rx) = socket.split();
@@ -1327,6 +1342,7 @@ async fn ui_protocol_connection(
     // installs the ephemeral RAM-only fallback.
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let connection_profile_id = connection_profile_id.as_deref();
+    let routed_profile_id = routed_profile_id.as_deref();
 
     while let Some(Ok(msg)) = ws_rx.next().await {
         let text = match msg {
@@ -1382,6 +1398,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -2555,6 +2572,7 @@ async fn handle_turn_start(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     params: TurnStartParams,
@@ -2592,6 +2610,9 @@ async fn handle_turn_start(
     let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
     let turn_state_for_task = turn_state.clone();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let resolved_profile_id = connection_profile_id
+        .or(routed_profile_id)
+        .map(ToOwned::to_owned);
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -2617,6 +2638,7 @@ async fn handle_turn_start(
                 features,
                 params,
                 prompt,
+                resolved_profile_id,
                 turn_state_for_task,
                 interrupt_rx,
             )
@@ -4352,6 +4374,7 @@ async fn run_standalone_turn(
     features: ConnectionUiFeatures,
     params: TurnStartParams,
     prompt: String,
+    routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
 ) {
@@ -4405,11 +4428,22 @@ async fn run_standalone_turn(
     // `/api/files/...` against the per-profile data dir (`<server_data>/
     // profiles/<profile>/data`), not the server-wide one. Plugin output
     // must land under the SAME root the file API will check, otherwise
-    // `resolve_legacy_file_request` rejects it. Resolve the profile data
-    // dir from the session_id's encoded profile (set by the SPA's hosted
-    // subdomain) and fall back to the runtime data dir for local sessions.
-    let plugin_root_dir = session_id
+    // `resolve_legacy_file_request` rejects it.
+    //
+    // The active profile id can come from three places, in order:
+    //   1. `session_id.profile_id()` — when the SPA encodes it via
+    //      `SessionKey::with_profile`. Bare-channel session ids
+    //      (`web-…`) skip this.
+    //   2. `routed_profile_id` — derived from the connection's `Host`
+    //      header during WS handshake. Hosted admin-token requests land
+    //      here; the SPA at `dspfac.crew.ominix.io` matches.
+    // Falls back to the server-wide data dir for local sessions / dev.
+    let active_profile_id = session_id
         .profile_id()
+        .map(ToOwned::to_owned)
+        .or(routed_profile_id);
+    let plugin_root_dir = active_profile_id
+        .as_deref()
         .and_then(|profile_id| {
             state
                 .profile_store
@@ -4551,9 +4585,18 @@ async fn run_standalone_turn(
         let send_file_base = workspace_root
             .clone()
             .unwrap_or_else(|| bg_data_dir.clone());
-        let send_file_tool = octos_agent::SendFileTool::new(out_tx)
+        let mut send_file_tool = octos_agent::SendFileTool::new(out_tx)
             .with_base_dir(send_file_base)
             .with_extra_allowed_dir(bg_data_dir.clone());
+        // Profiles with a custom `data_dir` outside `bg_data_dir` host
+        // their plugin output under a path the default extras above would
+        // reject. Add `plugin_root_dir` (resolved per-profile via
+        // `routed_profile_id` or `session_id.profile_id()`) as an extra
+        // allowed dir so spawn_only `send_file` deliveries from those
+        // profiles still pass the path-scoping check.
+        if plugin_root_dir != bg_data_dir {
+            send_file_tool = send_file_tool.with_extra_allowed_dir(plugin_root_dir.clone());
+        }
         send_file_tool.set_context("api", &bg_session_id.0);
         tool_registry.register(send_file_tool);
 
