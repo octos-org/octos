@@ -829,10 +829,14 @@ fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePer
 /// `session_actor.rs::deliver_background_notification` post-write
 /// invalidate at `api_channel.rs:1503`.
 ///
-/// Returns `Some(committed_seq)` on success — the row's index in the
-/// session's message log, matching `MessagePersistedEvent.seq` and the
-/// authoritative `seq` for any wire-protocol confirmation event. `None`
-/// signals a persist failure (already logged).
+/// Returns `Some(PersistedMessageMeta)` on success — the row's committed
+/// seq plus the wire `message_id` derived the same way `MessageCommitObserver`
+/// computes it (`session:seq:timestamp_ns`). The shared id lets the
+/// `BackgroundResultSender` callback emit a `turn/spawn_complete`
+/// envelope whose `message_id` matches the parallel `message/persisted`
+/// event — clients that key dedup or confirmation off `message_id`
+/// then see one logical row, regardless of which wire shape they
+/// negotiated. `None` signals a persist failure (already logged).
 async fn persist_assistant_with_media(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
     data_dir: &Path,
@@ -841,9 +845,15 @@ async fn persist_assistant_with_media(
     media: Vec<String>,
     thread_id: String,
     label: &str,
-) -> Option<usize> {
+) -> Option<PersistedMessageMeta> {
     let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
     message.media = media;
+    // Capture the stamped timestamp BEFORE the canonical persist
+    // consumes the message — `MessageCommitObserver` derives the wire
+    // `message_id` from `(session_id, committed_seq, message.timestamp)`,
+    // and we need that same value here so the spawn_complete envelope
+    // can advertise the identical id.
+    let timestamp_ns = message.timestamp.timestamp_nanos_opt().unwrap_or(0);
 
     let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
         data_dir, session_id, message,
@@ -863,7 +873,19 @@ async fn persist_assistant_with_media(
     };
 
     sessions.lock().await.invalidate_cache(session_id);
-    Some(committed_seq)
+    Some(PersistedMessageMeta {
+        committed_seq,
+        message_id: format!("{}:{committed_seq}:{timestamp_ns}", session_id.0),
+    })
+}
+
+/// Metadata returned by [`persist_assistant_with_media`] so callers can
+/// emit wire events whose identity matches the durable row written by
+/// `MessageCommitObserver`. See the helper's doc comment for rationale.
+#[derive(Debug, Clone)]
+struct PersistedMessageMeta {
+    committed_seq: usize,
+    message_id: String,
 }
 
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
@@ -4657,7 +4679,7 @@ async fn run_standalone_turn(
                     // duplicate-suppression filter would never fire,
                     // delivering both `message/persisted` AND
                     // `turn/spawn_complete` to upgraded clients.
-                    let committed_seq = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                    let persisted_meta = MESSAGE_PERSISTED_SOURCE_OVERRIDE
                         .scope(
                             Some(MessagePersistedSource::Background),
                             persist_assistant_with_media(
@@ -4672,43 +4694,47 @@ async fn run_standalone_turn(
                         )
                         .await;
                     // M10 Phase 1: emit `turn/spawn_complete` only when
-                    // persistence succeeded (codex P2 follow-up). The
-                    // wire `seq` field carries the COMMITTED-ROW seq
-                    // (the index in the session message log that
-                    // `MessagePersistedEvent.seq` carries today) — NOT
-                    // the UI-ledger cursor seq. Upgraded clients route
-                    // `turn/spawn_complete` through the same persisted
-                    // -message reducer they use for `message/persisted`,
-                    // so the two events MUST agree on this seq or the
-                    // reducer dedupes/anchors against a non-existent
-                    // row. The cursor is stamped separately by the
-                    // ledger so cursor-driven replay still works.
-                    //
-                    // `response_to_client_message_id` is intentionally
-                    // left `None` here: the UI-protocol turn-start path
-                    // doesn't propagate the user's `client_message_id`
-                    // through to this layer (the reporter's `thread_id`
-                    // is the `TurnId`, not the user cmid). Phase 2's
-                    // SPA reducer keys off `thread_id` to anchor the
-                    // bubble; once the user cmid is plumbed through
-                    // `BackgroundResultPayload`, this field will carry
-                    // the real value.
-                    if let (Some(task_id_value), Some(seq)) = (task_id.clone(), committed_seq) {
+                    // persistence succeeded AND the supervisor returned
+                    // a real (non-empty) `task_id`. The wire `seq` and
+                    // `message_id` mirror `MessagePersistedEvent` for
+                    // the same durable row so a client that replays
+                    // with a different negotiated capability set sees
+                    // ONE logical row across both shapes (codex round 3
+                    // P2). Empty `Some("")` — the legacy register sentinel
+                    // returned when the supervisor's fan-out cap refuses
+                    // a task — is treated like `None` (codex round 3 P3).
+                    let task_id_clean = task_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    if let (Some(task_id_value), Some(meta)) =
+                        (task_id_clean.clone(), persisted_meta.as_ref())
+                    {
                         let event = TurnSpawnCompleteEvent {
                             session_id: session_id.clone(),
                             turn_id: Some(turn_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             task_id: task_id_value,
-                            response_to_client_message_id: None,
-                            seq: seq as u64,
-                            // Stable id mirroring `MessageCommitObserver`'s
-                            // convention so the wire-id is consistent
-                            // across the two shapes for the same row.
-                            message_id: format!(
-                                "{}:{seq}:spawn:{}",
-                                session_id.0,
-                                task_id.as_deref().unwrap_or(""),
-                            ),
+                            // The bound thread_id IS the originating
+                            // thread anchor — in the gateway path it's
+                            // the user's `client_message_id`; in this
+                            // standalone-turn path it's the `TurnId`
+                            // (the reporter is wired with `turn_id`).
+                            // Either way, surfacing the same
+                            // identifier the user-prompt row carries
+                            // as `thread_id` is what lets the SPA
+                            // reducer anchor the new bubble under the
+                            // right prompt without falling back to
+                            // sticky-map heuristics. Phase 4 plumbing
+                            // will replace `originating_thread_id` with
+                            // a typed `originating_client_message_id`
+                            // for unambiguous semantics.
+                            response_to_client_message_id: originating_thread_id.clone(),
+                            seq: meta.committed_seq as u64,
+                            // Reuse the `MessageCommitObserver`-style
+                            // wire id for the same durable row — see
+                            // `PersistedMessageMeta` doc.
+                            message_id: meta.message_id.clone(),
                             source: "background".to_owned(),
                             cursor: UiCursor {
                                 stream: session_id.0.clone(),
@@ -4719,15 +4745,19 @@ async fn run_standalone_turn(
                             media,
                         };
                         ledger.append_notification(UiNotification::TurnSpawnComplete(event));
-                    } else if task_id.is_none() {
-                        // Best-effort: a payload without `task_id`
-                        // arrives only from legacy callers (cf.
-                        // `BackgroundResultPayload.task_id` doc). Old
-                        // clients see `message/persisted` as before;
-                        // new clients miss this single completion.
+                    } else if task_id_clean.is_none() {
+                        // Best-effort: a payload without `task_id` (or
+                        // with the empty-string sentinel returned by
+                        // the legacy register-task path under fan-out
+                        // pressure) arrives only from edge-case
+                        // callers. Old clients see `message/persisted`
+                        // as before; new clients miss this single
+                        // completion. Logging surfaces the gap so we
+                        // can fix upstream callers.
                         tracing::debug!(
                             session_id = %session_id.0,
                             task_label,
+                            had_empty_task_id = task_id.as_deref() == Some(""),
                             "background result missing task_id; turn/spawn_complete suppressed"
                         );
                     } else {
@@ -4744,7 +4774,7 @@ async fn run_standalone_turn(
                             "background result persist failed; both wire shapes suppressed"
                         );
                     }
-                    committed_seq.is_some()
+                    persisted_meta.is_some()
                 })
             },
         ));
