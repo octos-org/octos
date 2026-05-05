@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use octos_agent::{Agent, AgentConfig, Tool, ToolRegistry, ToolResult};
+use octos_agent::{Agent, AgentConfig, ReadTaskOutputTool, Tool, ToolRegistry, ToolResult};
 use octos_core::{AgentId, Message, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
 use octos_memory::EpisodeStore;
@@ -139,6 +139,20 @@ async fn spawn_only_intercept_returns_task_handle_envelope_not_full_output() {
     tools.register(probe);
     tools.mark_spawn_only("deep_research_probe", None);
 
+    // Phase 4 gating: the spawn_only intercept emits the new task_handle
+    // envelope only when `read_task_output` is registered (so legacy
+    // chat/swarm registries that lack the reader keep their old free-text
+    // message). Wire the reader so this test exercises the new path.
+    let supervisor = tools.supervisor();
+    let workspace = memory_dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    tools.register(ReadTaskOutputTool::new(
+        supervisor,
+        "test-session",
+        None,
+        workspace,
+    ));
+
     let memory = Arc::new(
         EpisodeStore::open(memory_dir.path().join(".octos"))
             .await
@@ -208,5 +222,77 @@ async fn spawn_only_intercept_returns_task_handle_envelope_not_full_output() {
     assert!(envelope["summary"].is_string());
 
     // Settle any spurious background tasks before we tear down.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// Codex P2 (round 1) regression guard: when `read_task_output` is NOT
+// registered, the spawn_only intercept must fall back to the legacy
+// free-text message instead of advertising a tool the LLM cannot call.
+#[tokio::test]
+async fn spawn_only_intercept_falls_back_to_legacy_text_without_reader() {
+    let memory_dir = TempDir::new().unwrap();
+
+    let invocations = Arc::new(AtomicU32::new(0));
+    let probe = HugeOutputTool {
+        name: "deep_research_probe_legacy",
+        invocations: invocations.clone(),
+        payload: "X".repeat(10_000),
+    };
+
+    let mut tools = ToolRegistry::new();
+    tools.register(probe);
+    tools.mark_spawn_only("deep_research_probe_legacy", None);
+    // Deliberately do NOT register `read_task_output` here — this
+    // mirrors the chat / swarm registries.
+
+    let memory = Arc::new(
+        EpisodeStore::open(memory_dir.path().join(".octos"))
+            .await
+            .unwrap(),
+    );
+
+    let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm::new(vec![
+        tool_use(vec![tc("call-legacy-1", "deep_research_probe_legacy")]),
+        end_turn("done"),
+    ]));
+
+    let agent =
+        Agent::new(AgentId::new("legacy-fallback"), llm, tools, memory).with_config(AgentConfig {
+            save_episodes: false,
+            suppress_auto_send_files: true,
+            ..Default::default()
+        });
+
+    let response = agent
+        .process_message("kick legacy", &[], vec![])
+        .await
+        .expect("agent loop must not error");
+
+    let tool_msg = response
+        .messages
+        .iter()
+        .find(|m| {
+            matches!(m.role, octos_core::MessageRole::Tool)
+                && m.tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id.contains("call-legacy-1"))
+        })
+        .expect("expected a Tool message for the spawn_only call");
+
+    // Legacy free-text message still ends with "Output directory: …".
+    // It must NOT be a JSON envelope advertising read_task_output —
+    // that would mislead the LLM into calling a tool that isn't there.
+    assert!(
+        !tool_msg.content.contains("read_task_output"),
+        "without read_task_output registered, the envelope must not advertise it; \
+         got: {}",
+        tool_msg.content
+    );
+    assert!(
+        tool_msg.content.contains("Output directory:"),
+        "expected legacy free-text fallback; got: {}",
+        tool_msg.content
+    );
+
     tokio::time::sleep(Duration::from_millis(50)).await;
 }

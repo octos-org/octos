@@ -927,8 +927,20 @@ impl Agent {
                 // M8.7 router and delivered to the SPA via
                 // `turn.spawn_complete`; the agent now reads selectively
                 // via `read_task_output`.
-                let handle_payload =
-                    tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[]);
+                //
+                // Codex P2 (round 1): gate the envelope on the
+                // `read_task_output` tool actually being registered. Some
+                // Agent setups (CLI chat, swarm workers) construct
+                // registries that do not include `read_task_output`; in
+                // those, returning a handle would advertise a tool the
+                // LLM cannot call. Fall back to the legacy free-text
+                // message there so behaviour is unchanged for those
+                // entry points until they wire the tool.
+                let handle_payload = if tools.get("read_task_output").is_some() {
+                    tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[])
+                } else {
+                    tools.spawn_only_message(&tc_name)
+                };
                 return (
                     Message {
                         role: MessageRole::Tool,

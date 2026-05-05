@@ -22,6 +22,7 @@
 //!   `expected_files` if any are recorded.
 //! - All reads are bounded by `MAX_OUTPUT_BYTES` to keep agent context lean.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -219,8 +220,11 @@ impl Tool for ReadTaskOutputTool {
 
         let body = match input.mode {
             ReadMode::File { path, mode } => self.read_file(&task, &path, *mode)?,
+            // Codex P2 (round 1): tail mode for multi-megabyte logs must
+            // sample the END of the file, not the first 1 MiB. Pass the
+            // mode hint into the read helper so it can seek-from-end.
             inline_mode => {
-                let text = self.read_router_text(&task)?;
+                let text = self.read_router_text(&task, mode_hint(&inline_mode))?;
                 apply_mode(&text, inline_mode)?
             }
         };
@@ -243,12 +247,16 @@ impl ReadTaskOutputTool {
         Some(router.path_for(&session_id, &task.id))
     }
 
-    fn read_router_text(&self, task: &crate::task_supervisor::BackgroundTask) -> Result<String> {
+    fn read_router_text(
+        &self,
+        task: &crate::task_supervisor::BackgroundTask,
+        hint: ReadDirection,
+    ) -> Result<String> {
         let path = match self.router_path_for(task) {
             Some(p) => p,
             None => return Ok(String::new()),
         };
-        read_capped(&path)
+        read_capped(&path, hint)
     }
 
     fn read_file(
@@ -260,26 +268,56 @@ impl ReadTaskOutputTool {
         if matches!(mode, ReadMode::File { .. }) {
             eyre::bail!("file mode does not nest inside file mode");
         }
-        // If the supervisor has recorded `output_files` for this completed
-        // task, restrict access to those paths. Otherwise (still running, no
-        // recorded outputs) allow any path within the workspace root.
-        if !task.output_files.is_empty() {
-            let normalised = path.trim_start_matches("./");
-            let allowed = task
-                .output_files
-                .iter()
-                .any(|f| f == path || f == normalised || f.ends_with(normalised));
-            if !allowed {
-                eyre::bail!(
-                    "path '{}' is not in the task's expected_files; allowed: {:?}",
-                    path,
-                    task.output_files
-                );
-            }
+        // Codex P1 (round 1): refuse `file` mode until the supervisor has
+        // recorded the task's output paths. Without this guard, any task
+        // handle with an empty `output_files` (still running, or pre-
+        // declaration) grants the LLM read access to any file inside the
+        // workspace — far broader than the "dive into one of the task's
+        // expected_files" contract documented in the schema. The router
+        // modes (head/tail/grep/line_range) still work pre-completion;
+        // only `file` is gated.
+        if task.output_files.is_empty() {
+            eyre::bail!(
+                "task '{}' has not yet declared output files; use head/tail/grep on \
+                 the captured stdout instead, or wait for the task to complete",
+                task.id
+            );
         }
+
+        // Codex P1 (round 1): exact normalised-path comparison. The previous
+        // `ends_with(normalised)` predicate let `_report.md` slip past the
+        // whitelist for an allowed `research/_report.md`, then resolve to
+        // `<workspace>/_report.md` — a different file. We now build a
+        // canonical `<workspace>/<allowed>` path for every recorded output
+        // and require the caller's resolved path to match exactly.
         let resolved = resolve_path(&self.workspace_root, path)
             .wrap_err("path must stay inside the workspace")?;
-        let text = read_capped(&resolved)?;
+        let allowed_match = task.output_files.iter().any(|f| {
+            // Recorded outputs may be stored as workspace-relative paths
+            // ("research/_report.md") or absolute paths produced by the
+            // tool. Normalise both forms against the workspace root.
+            let candidate = Path::new(f);
+            if candidate.is_absolute() {
+                candidate == resolved.as_path()
+            } else {
+                resolve_path(&self.workspace_root, f)
+                    .map(|p| p == resolved)
+                    .unwrap_or(false)
+            }
+        });
+        if !allowed_match {
+            eyre::bail!(
+                "path '{}' is not in the task's expected_files; allowed: {:?}",
+                path,
+                task.output_files
+            );
+        }
+
+        // Codex P1 (round 1): use the existing O_NOFOLLOW reader so a
+        // symlink inside the workspace cannot redirect the read to a file
+        // outside the workspace boundary. This matches the safety the
+        // built-in `read_file` tool gets.
+        let text = read_capped_no_follow(&resolved)?;
         apply_mode(&text, mode)
     }
 }
@@ -348,15 +386,79 @@ fn apply_mode(text: &str, mode: ReadMode) -> Result<String> {
     }
 }
 
-/// Read a file on disk, capped at `MAX_READ_BYTES`. Returns an empty string
-/// if the file does not exist (the task may not have produced output yet).
-fn read_capped(path: &Path) -> Result<String> {
-    use std::io::Read;
-    let mut file = match std::fs::File::open(path) {
+/// Direction hint for the bounded reader. Tail-style modes need the LAST
+/// `MAX_READ_BYTES` of the file rather than the first slice — otherwise a
+/// log larger than 1 MiB has its tail clipped to "the last lines of the
+/// beginning" and the contract advertised on the schema is broken.
+#[derive(Debug, Clone, Copy)]
+enum ReadDirection {
+    /// Read from the start of the file (head/grep/line_range).
+    FromStart,
+    /// Read the last `MAX_READ_BYTES` of the file (tail).
+    FromEnd,
+}
+
+/// Pick the appropriate read direction for a router-side mode.
+fn mode_hint(mode: &ReadMode) -> ReadDirection {
+    match mode {
+        ReadMode::Tail { .. } => ReadDirection::FromEnd,
+        _ => ReadDirection::FromStart,
+    }
+}
+
+/// Read a file from disk, capped at `MAX_READ_BYTES`. Returns an empty
+/// string if the file does not exist (the task may not have produced
+/// output yet). When `direction` is `FromEnd`, seeks to the end of the
+/// file and reads the trailing window — required for `tail` mode against
+/// multi-megabyte logs.
+fn read_capped(path: &Path, direction: ReadDirection) -> Result<String> {
+    let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(eyre::eyre!("failed to open {}: {e}", path.display())),
     };
+    read_capped_with_direction(file, direction, path)
+}
+
+/// O_NOFOLLOW variant for `file` mode: a symlink inside the workspace must
+/// not redirect the read to a file outside the workspace boundary.
+/// Mirrors the safety the built-in `read_file` tool gets.
+fn read_capped_no_follow(path: &Path) -> Result<String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+            eyre::bail!("symlink rejected: {}", path.display());
+        }
+    }
+    let file = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(eyre::eyre!("failed to open {}: {e}", path.display())),
+    };
+    // File mode always reads from the start — the inner mode then slices it.
+    read_capped_with_direction(file, ReadDirection::FromStart, path)
+}
+
+fn read_capped_with_direction(
+    mut file: std::fs::File,
+    direction: ReadDirection,
+    path: &Path,
+) -> Result<String> {
+    let len = file
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(MAX_READ_BYTES as u64);
+    if matches!(direction, ReadDirection::FromEnd) && len > MAX_READ_BYTES as u64 {
+        file.seek(SeekFrom::Start(len - MAX_READ_BYTES as u64))
+            .wrap_err_with(|| format!("seek {}", path.display()))?;
+    }
     let mut buf = Vec::with_capacity(MAX_READ_BYTES.min(64 * 1024));
     let mut limited = file.by_ref().take(MAX_READ_BYTES as u64);
     limited
@@ -613,5 +715,161 @@ mod tests {
             },
         );
         assert!(res.is_err());
+    }
+
+    // Codex P1 (round 1): file mode must refuse to read until the task has
+    // declared its output_files. Without this guard a fresh handle gives the
+    // LLM read access to any file inside the workspace.
+    #[tokio::test]
+    async fn file_mode_rejects_when_task_has_no_recorded_outputs() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-pre", "still running\n");
+        // Do NOT call mark_completed — output_files stays empty.
+
+        let secret_rel = "secret.md";
+        let secret_abs = dir.path().join("workspace").join(secret_rel);
+        std::fs::write(&secret_abs, "shh").unwrap();
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": secret_rel,
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        // `execute` may surface this as Err or as success=false; either is
+        // a refusal. The important thing is the secret is NOT in the body.
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("shh"),
+            "file mode must not return content before output_files declared; got: {body}"
+        );
+    }
+
+    // Codex P1 (round 1): exact path comparison — `_report.md` must NOT
+    // satisfy a whitelist of `research/_report.md`.
+    #[tokio::test]
+    async fn file_mode_basename_does_not_satisfy_path_whitelist() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-prefix", "stdout\n");
+
+        // Recorded output: a path under research/.
+        let allowed_rel = "research/_report.md";
+        let allowed_abs = dir.path().join("workspace").join(allowed_rel);
+        std::fs::create_dir_all(allowed_abs.parent().unwrap()).unwrap();
+        std::fs::write(&allowed_abs, "# allowed").unwrap();
+
+        // Trap file with a name that COULD match a sloppy `ends_with` check.
+        let trap_rel = "_report.md";
+        let trap_abs = dir.path().join("workspace").join(trap_rel);
+        std::fs::write(&trap_abs, "BAIT - not the report").unwrap();
+
+        supervisor.mark_completed(&task_id, vec![allowed_rel.to_string()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": trap_rel,
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("BAIT"),
+            "exact-path whitelist must reject {trap_rel:?} when only {allowed_rel:?} \
+             is recorded; got: {body}"
+        );
+    }
+
+    // Codex P1 (round 1): symlink inside the workspace must not redirect
+    // reads outside the workspace boundary.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_mode_rejects_symlink_targets() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-sym", "stdout\n");
+
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "secret outside the workspace").unwrap();
+
+        let inside_rel = "linkedin.md";
+        let inside_abs = dir.path().join("workspace").join(inside_rel);
+        std::os::unix::fs::symlink(&outside, &inside_abs).unwrap();
+
+        supervisor.mark_completed(&task_id, vec![inside_rel.to_string()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": inside_rel,
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("secret outside"),
+            "O_NOFOLLOW must reject symlink target reads; got: {body}"
+        );
+    }
+
+    // Codex P2 (round 1): tail mode must read the END of multi-megabyte
+    // logs, not the first MAX_READ_BYTES.
+    #[tokio::test]
+    async fn tail_reads_from_end_for_logs_larger_than_max_read_bytes() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = supervisor.register("deep_search", "tc-big", Some("session-A"));
+        supervisor.mark_running(&task_id);
+
+        // Build a body well over MAX_READ_BYTES with a unique line near the
+        // end. Each line is short so we can fit > 1 MiB while keeping the
+        // unique marker in the very last line.
+        let bulk = "filler-line-that-takes-up-space-padding-pad-pad\n";
+        let session_id = "agent:tc-big";
+        // Append bulk in chunks until we're well past MAX_READ_BYTES.
+        let chunk_count = (MAX_READ_BYTES / bulk.len()) + 100;
+        let bulk_chunk = bulk.repeat(chunk_count);
+        router
+            .append(session_id, &task_id, bulk_chunk.as_bytes())
+            .unwrap();
+        let unique_tail = "\nUNIQUE_LAST_LINE_MARKER\n";
+        router
+            .append(session_id, &task_id, unique_tail.as_bytes())
+            .unwrap();
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {"kind": "tail", "lines": 5}
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("UNIQUE_LAST_LINE_MARKER"),
+            "tail mode must surface lines from the END of the log; got: {}",
+            result.output
+        );
     }
 }
