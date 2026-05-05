@@ -473,6 +473,7 @@ impl Agent {
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
                                             originating_thread_id: bg_originating_thread_id.clone(),
+                                            task_id: Some(task_id.clone()),
                                         })
                                         .await
                                     } else {
@@ -503,6 +504,7 @@ impl Agent {
                                                     media: vec![],
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
+                                                    task_id: Some(task_id.clone()),
                                                 })
                                                 .await;
                                             }
@@ -542,6 +544,7 @@ impl Agent {
                                             kind: BackgroundResultKind::Notification,
                                             media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
+                                            task_id: Some(task_id.clone()),
                                         })
                                         .await;
                                     }
@@ -566,6 +569,7 @@ impl Agent {
                                                 media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -603,6 +607,7 @@ impl Agent {
                                                 media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -704,6 +709,7 @@ impl Agent {
                                                 media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -722,6 +728,40 @@ impl Agent {
                                                         .join(", ")
                                                 );
                                                 if let Some(ref sender) = bg_sender {
+                                                    // M10 Phase 1 design choice
+                                                    // (codex rounds 5+7 traded
+                                                    // duplicate-attachments vs
+                                                    // missing-attachments): keep
+                                                    // `media: vec![]` for the
+                                                    // `NotConfigured`/`send_file`
+                                                    // fallback success path. Each
+                                                    // file already has its own
+                                                    // `message/persisted` row
+                                                    // emitted by the `send_file`
+                                                    // consumer (with `source:
+                                                    // assistant`, which passes
+                                                    // both legacy and
+                                                    // dual-negotiated client
+                                                    // filters). Adding the same
+                                                    // files here would duplicate
+                                                    // attachment bubbles for
+                                                    // clients that negotiated
+                                                    // both `event.message_persisted.v1`
+                                                    // AND `event.spawn_complete.v1`.
+                                                    //
+                                                    // Documented limitation:
+                                                    // `event.spawn_complete.v1`-only
+                                                    // negotiation in this fallback
+                                                    // sees the completion text
+                                                    // without inline attachments.
+                                                    // The web SPA (Phase 2)
+                                                    // negotiates both flags, so
+                                                    // production hits the
+                                                    // both-flags path. CLI/TUI
+                                                    // clients use the contract-
+                                                    // `Satisfied` branch above
+                                                    // (which carries `output_files`
+                                                    // directly).
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
                                                         content: format!(
@@ -732,6 +772,7 @@ impl Agent {
                                                         media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
                                                 }
@@ -754,6 +795,7 @@ impl Agent {
                                                         media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
                                                 }
@@ -778,6 +820,7 @@ impl Agent {
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
+                                    task_id: Some(task_id.clone()),
                                 })
                                 .await;
                             }
@@ -796,6 +839,7 @@ impl Agent {
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
+                                    task_id: Some(task_id.clone()),
                                 })
                                 .await;
                             }

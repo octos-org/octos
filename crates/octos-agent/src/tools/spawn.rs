@@ -81,6 +81,13 @@ pub struct BackgroundResultPayload {
     /// map happens to hold when the background task finally finalises.
     /// `None` for legacy callers and tests that don't track origination.
     pub originating_thread_id: Option<String>,
+    /// M10 Phase 1: the task supervisor `TaskId` for the spawn_only task
+    /// that produced this completion. Surfaced on the wire as
+    /// `TurnSpawnCompleteEvent.task_id` so the client can attribute the
+    /// new bubble to a specific background task (and, in Phase 4, drive
+    /// `read_task_output` against it). `None` for legacy callers and
+    /// tests that do not register tasks with the supervisor.
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2936,6 +2943,7 @@ impl Tool for SpawnTool {
                         kind: result_kind,
                         media: result_media.clone(),
                         originating_thread_id: originating_thread_id.clone(),
+                        task_id: tracked_task_id.clone(),
                     },
                 )
                 .await
@@ -3940,6 +3948,7 @@ PY
             kind: BackgroundResultKind::Notification,
             media: vec!["/tmp/output.mp3".to_string()],
             originating_thread_id: None,
+            task_id: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);
