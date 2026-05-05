@@ -473,6 +473,7 @@ impl Agent {
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
                                             originating_thread_id: bg_originating_thread_id.clone(),
+                                            task_id: Some(task_id.clone()),
                                         })
                                         .await
                                     } else {
@@ -503,6 +504,7 @@ impl Agent {
                                                     media: vec![],
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
+                                                    task_id: Some(task_id.clone()),
                                                 })
                                                 .await;
                                             }
@@ -542,6 +544,7 @@ impl Agent {
                                             kind: BackgroundResultKind::Notification,
                                             media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
+                                            task_id: Some(task_id.clone()),
                                         })
                                         .await;
                                     }
@@ -566,6 +569,7 @@ impl Agent {
                                                 media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -603,6 +607,7 @@ impl Agent {
                                                 media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -704,6 +709,7 @@ impl Agent {
                                                 media: vec![],
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
+                                                task_id: Some(task_id.clone()),
                                             })
                                             .await;
                                         }
@@ -732,6 +738,7 @@ impl Agent {
                                                         media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
                                                 }
@@ -754,6 +761,7 @@ impl Agent {
                                                         media: vec![],
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
                                                 }
@@ -778,6 +786,7 @@ impl Agent {
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
+                                    task_id: Some(task_id.clone()),
                                 })
                                 .await;
                             }
@@ -796,6 +805,7 @@ impl Agent {
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
+                                    task_id: Some(task_id.clone()),
                                 })
                                 .await;
                             }

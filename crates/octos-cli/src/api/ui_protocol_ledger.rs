@@ -166,6 +166,13 @@ impl UiProtocolLedgerEvent {
                 UiNotification::MessagePersisted(persisted) => {
                     persisted.cursor = cursor;
                 }
+                // M10 Phase 1: same convention for the `turn/spawn_complete`
+                // envelope — the wire `cursor` field tracks the ledger
+                // seq so cursor-driven clients can resume cleanly across
+                // both event shapes.
+                UiNotification::TurnSpawnComplete(spawn_complete) => {
+                    spawn_complete.cursor = cursor;
+                }
                 _ => {}
             }
         }
@@ -578,7 +585,10 @@ impl UiProtocolLedger {
         event: UiProgressEvent,
         from_connection: ConnectionId,
     ) -> LedgeredUiProtocolEvent {
-        self.append(UiProtocolLedgerEvent::Progress(event), Some(from_connection))
+        self.append(
+            UiProtocolLedgerEvent::Progress(event),
+            Some(from_connection),
+        )
     }
 
     fn append(
@@ -1478,6 +1488,7 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::TurnError(event) => &event.session_id,
         UiNotification::ReplayLossy(event) => &event.session_id,
         UiNotification::MessagePersisted(event) => &event.session_id,
+        UiNotification::TurnSpawnComplete(event) => &event.session_id,
     }
 }
 
