@@ -728,6 +728,20 @@ impl Agent {
                                                         .join(", ")
                                                 );
                                                 if let Some(ref sender) = bg_sender {
+                                                    // M10 Phase 1 (codex round 5):
+                                                    // carry `sent_files` into the
+                                                    // payload so the
+                                                    // `turn/spawn_complete` envelope
+                                                    // surfaces the attachments
+                                                    // inline. Clients that negotiated
+                                                    // ONLY `event.spawn_complete.v1`
+                                                    // (not `event.message_persisted.v1`)
+                                                    // suppress the per-file
+                                                    // `message/persisted` rows the
+                                                    // `send_file` consumer emits, so
+                                                    // without the media here they'd
+                                                    // see a "completed" bubble with
+                                                    // no downloadable attachments.
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
                                                         content: format!(
@@ -735,7 +749,7 @@ impl Agent {
                                                             bg_name, file_info
                                                         ),
                                                         kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
+                                                        media: sent_files.clone(),
                                                         originating_thread_id:
                                                             bg_originating_thread_id.clone(),
                                                         task_id: Some(task_id.clone()),
