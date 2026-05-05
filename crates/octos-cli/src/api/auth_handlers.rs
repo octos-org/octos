@@ -2798,6 +2798,11 @@ pub async fn my_wechat_qr_start(
     let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
     let resp = client
         .get(url)
+        .header("iLink-App-Id", octos_bus::ilink::ILINK_APP_ID)
+        .header(
+            "iLink-App-ClientVersion",
+            octos_bus::ilink::ILINK_CLIENT_VERSION,
+        )
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed to fetch QR: {e}")))?;
@@ -2854,7 +2859,11 @@ pub async fn my_wechat_qr_poll(
     );
     let resp = client
         .get(&url)
-        .header("iLink-App-ClientVersion", "1")
+        .header("iLink-App-Id", octos_bus::ilink::ILINK_APP_ID)
+        .header(
+            "iLink-App-ClientVersion",
+            octos_bus::ilink::ILINK_CLIENT_VERSION,
+        )
         .send()
         .await
         .map_err(|e| {

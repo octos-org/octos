@@ -29,6 +29,12 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 const WECHAT_API_BASE: &str = "https://ilinkai.weixin.qq.com";
 const LONG_POLL_TIMEOUT_SECS: u64 = 40;
 
+// iLink version identifiers — must match upstream @tencent-weixin/openclaw-weixin.
+// Keep in sync with crates/octos-bus/src/ilink.rs.
+const ILINK_APP_ID: &str = "bot";
+const ILINK_CHANNEL_VERSION: &str = "2.1.7";
+const ILINK_CLIENT_VERSION: &str = "131335"; // 2.1.7 → 0x020107
+
 #[derive(Parser)]
 #[command(name = "wechat-bridge")]
 struct Args {
@@ -83,6 +89,8 @@ impl BridgeState {
             ("Authorization", format!("Bearer {token}")),
             ("AuthorizationType", "ilink_bot_token".into()),
             ("X-WECHAT-UIN", "MTIzNA==".into()),
+            ("iLink-App-Id", ILINK_APP_ID.into()),
+            ("iLink-App-ClientVersion", ILINK_CLIENT_VERSION.into()),
         ]
     }
 
@@ -111,7 +119,7 @@ impl BridgeState {
                 "item_list": [{"type": 1, "text_item": {"text": text}}],
                 "context_token": context_token,
             },
-            "base_info": {"channel_version": "1.0.0"}
+            "base_info": {"channel_version": ILINK_CHANNEL_VERSION}
         });
 
         let mut req = self
@@ -137,6 +145,8 @@ async fn qr_login(base_url: &str) -> Result<String, String> {
         // Get QR code
         let resp = client
             .get(format!("{base_url}/ilink/bot/get_bot_qrcode?bot_type=3"))
+            .header("iLink-App-Id", ILINK_APP_ID)
+            .header("iLink-App-ClientVersion", ILINK_CLIENT_VERSION)
             .send()
             .await
             .map_err(|e| format!("QR fetch failed: {e}"))?;
@@ -164,7 +174,8 @@ async fn qr_login(base_url: &str) -> Result<String, String> {
             let url = format!("{base_url}/ilink/bot/get_qrcode_status?qrcode={qrcode}");
             let resp = match poll_client
                 .get(&url)
-                .header("iLink-App-ClientVersion", "1")
+                .header("iLink-App-Id", ILINK_APP_ID)
+                .header("iLink-App-ClientVersion", ILINK_CLIENT_VERSION)
                 .send()
                 .await
             {
@@ -216,7 +227,7 @@ async fn poll_loop(state: Arc<BridgeState>) {
 
         let body = json!({
             "get_updates_buf": buf,
-            "base_info": {"channel_version": "1.0.0"}
+            "base_info": {"channel_version": ILINK_CHANNEL_VERSION}
         });
 
         let mut req = state
