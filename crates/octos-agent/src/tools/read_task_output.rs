@@ -16,10 +16,16 @@
 //! Path safety:
 //! - The router-managed output file path is computed from the supervisor's
 //!   `BackgroundTask::tool_call_id`; the LLM never supplies a path.
-//! - For `file` mode the LLM-supplied path is resolved via `resolve_path`
-//!   against `workspace_root`, so traversal (`..`) and absolute paths are
-//!   rejected. The file is also restricted to one of the task's
-//!   `expected_files` if any are recorded.
+//! - For `file` mode the LLM-supplied path is resolved against
+//!   `workspace_root`. Workspace-relative paths go through `resolve_path`
+//!   (rejects traversal). Absolute paths are accepted only when (a) they
+//!   appear verbatim in `task.output_files` and (b) they normalise to a
+//!   path inside the workspace root. The file is also restricted to one
+//!   of the task's `output_files`, which the supervisor records once the
+//!   task has completed.
+//! - All file reads use `O_NOFOLLOW` on Unix (symlink-target reads are
+//!   refused atomically; see `read_capped_no_follow`) so a symlink
+//!   inside the workspace cannot redirect a read outside it.
 //! - All reads are bounded by `MAX_OUTPUT_BYTES` to keep agent context lean.
 
 use std::io::{Read, Seek, SeekFrom};
@@ -284,21 +290,24 @@ impl ReadTaskOutputTool {
             );
         }
 
-        // Codex P1 (round 1): exact normalised-path comparison. The previous
-        // `ends_with(normalised)` predicate let `_report.md` slip past the
-        // whitelist for an allowed `research/_report.md`, then resolve to
-        // `<workspace>/_report.md` — a different file. We now build a
-        // canonical `<workspace>/<allowed>` path for every recorded output
-        // and require the caller's resolved path to match exactly.
-        let resolved = resolve_path(&self.workspace_root, path)
-            .wrap_err("path must stay inside the workspace")?;
+        // Codex P1 (round 1) + P2 (round 3): exact normalised-path
+        // comparison, supporting both workspace-relative AND absolute
+        // `output_files` entries. `check_background_tasks` exposes the
+        // exact strings from the supervisor — for tasks routed through
+        // the workspace contract those are typically absolute paths
+        // under the workspace root — so the LLM may legitimately pass
+        // an absolute path back. We accept absolute paths only when:
+        //   (a) they appear verbatim in `task.output_files`, AND
+        //   (b) they normalise to a path that still lies inside
+        //       `workspace_root` (so an absolute `output_files` entry
+        //       outside the workspace cannot grant escape).
+        let resolved = resolve_handle_path(&self.workspace_root, path)?;
         let allowed_match = task.output_files.iter().any(|f| {
-            // Recorded outputs may be stored as workspace-relative paths
-            // ("research/_report.md") or absolute paths produced by the
-            // tool. Normalise both forms against the workspace root.
             let candidate = Path::new(f);
             if candidate.is_absolute() {
-                candidate == resolved.as_path()
+                normalize_inside_workspace(&self.workspace_root, candidate)
+                    .map(|p| p == resolved)
+                    .unwrap_or(false)
             } else {
                 resolve_path(&self.workspace_root, f)
                     .map(|p| p == resolved)
@@ -324,6 +333,54 @@ impl ReadTaskOutputTool {
         // router-side hint logic.
         let text = read_capped_no_follow(&resolved, mode_hint(&mode))?;
         apply_mode(&text, mode)
+    }
+}
+
+/// Resolve a caller-supplied path against `workspace_root`, accepting
+/// either workspace-relative input (the original contract) or an
+/// absolute path so long as it lies inside the workspace.
+///
+/// Codex round 3 P2: required so the LLM can pass back the absolute
+/// strings that `check_background_tasks` exposes from the supervisor's
+/// `output_files` field (which are often absolute under the workspace).
+fn resolve_handle_path(workspace_root: &Path, user_path: &str) -> Result<PathBuf> {
+    let p = Path::new(user_path);
+    if p.is_absolute() {
+        normalize_inside_workspace(workspace_root, p)
+            .ok_or_else(|| eyre::eyre!("absolute path '{}' is outside the workspace", user_path))
+    } else {
+        resolve_path(workspace_root, user_path).wrap_err("path must stay inside the workspace")
+    }
+}
+
+/// Build a normalised PathBuf for an absolute path, returning `None` if
+/// it does not lie inside `workspace_root` after normalisation.
+fn normalize_inside_workspace(workspace_root: &Path, abs: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    let mut root = PathBuf::new();
+    for comp in workspace_root.components() {
+        match comp {
+            Component::ParentDir => {
+                root.pop();
+            }
+            Component::CurDir => {}
+            other => root.push(other.as_os_str()),
+        }
+    }
+    if out.starts_with(&root) {
+        Some(out)
+    } else {
+        None
     }
 }
 
@@ -834,6 +891,74 @@ mod tests {
         assert!(
             !body.contains("secret outside"),
             "O_NOFOLLOW must reject symlink target reads; got: {body}"
+        );
+    }
+
+    // Codex P2 (round 3): file mode must accept absolute paths that
+    // appear in `output_files` verbatim, so long as they lie inside
+    // the workspace. Workspace-contract spawn tasks often record
+    // absolute paths and `check_background_tasks` surfaces those.
+    #[tokio::test]
+    async fn file_mode_accepts_absolute_path_recorded_in_output_files() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-abs", "stdout\n");
+
+        let rel = "research/_report.md";
+        let abs = dir.path().join("workspace").join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "# Report\nLine A\nLine B\n").unwrap();
+
+        // Record the ABSOLUTE path — this is what the workspace contract
+        // path produces in many real spawn_only tasks.
+        supervisor.mark_completed(&task_id, vec![abs.to_string_lossy().into_owned()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": abs.to_string_lossy(),
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "got: {}", result.output);
+        assert_eq!(result.output, "# Report");
+    }
+
+    // Codex P2 (round 3): even when an LLM supplies an absolute path,
+    // it must still lie inside the workspace root — otherwise an
+    // accidentally recorded absolute output_files entry outside the
+    // workspace cannot grant escape.
+    #[tokio::test]
+    async fn file_mode_rejects_absolute_path_outside_workspace() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-esc", "stdout\n");
+
+        let outside = dir.path().join("escape.md");
+        std::fs::write(&outside, "secret outside workspace").unwrap();
+        supervisor.mark_completed(&task_id, vec![outside.to_string_lossy().into_owned()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": outside.to_string_lossy(),
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("secret outside workspace"),
+            "absolute paths recorded outside the workspace must not grant access; got: {body}"
         );
     }
 
