@@ -4679,34 +4679,56 @@ async fn run_standalone_turn(
                     // duplicate-suppression filter would never fire,
                     // delivering both `message/persisted` AND
                     // `turn/spawn_complete` to upgraded clients.
-                    let persisted_meta = MESSAGE_PERSISTED_SOURCE_OVERRIDE
-                        .scope(
-                            Some(MessagePersistedSource::Background),
-                            persist_assistant_with_media(
-                                &sessions,
-                                &data_dir,
-                                &session_id,
-                                content_text.clone(),
-                                media.clone(),
-                                thread_id.clone(),
-                                &task_label,
-                            ),
-                        )
-                        .await;
-                    // M10 Phase 1: emit `turn/spawn_complete` only when
-                    // persistence succeeded AND the supervisor returned
-                    // a real (non-empty) `task_id`. The wire `seq` and
-                    // `message_id` mirror `MessagePersistedEvent` for
-                    // the same durable row so a client that replays
-                    // with a different negotiated capability set sees
-                    // ONE logical row across both shapes (codex round 3
-                    // P2). Empty `Some("")` — the legacy register sentinel
+                    // M10 Phase 1 (codex round 4): only mark this row as
+                    // `source: background` if we will emit a replacement
+                    // `turn/spawn_complete` envelope for it. Otherwise
+                    // upgraded clients filter the legacy
+                    // `message/persisted` row AND see no envelope —
+                    // they receive nothing for the completion. The
+                    // marker has to stay coupled to the envelope emit
+                    // for the dual-gate invariant to hold.
+                    //
+                    // Empty `Some("")` — the legacy register sentinel
                     // returned when the supervisor's fan-out cap refuses
                     // a task — is treated like `None` (codex round 3 P3).
                     let task_id_clean = task_id
                         .as_deref()
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    let will_emit_envelope = task_id_clean.is_some();
+                    let persisted_meta = if will_emit_envelope {
+                        MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                            .scope(
+                                Some(MessagePersistedSource::Background),
+                                persist_assistant_with_media(
+                                    &sessions,
+                                    &data_dir,
+                                    &session_id,
+                                    content_text.clone(),
+                                    media.clone(),
+                                    thread_id.clone(),
+                                    &task_label,
+                                ),
+                            )
+                            .await
+                    } else {
+                        // No envelope incoming → leave the source as
+                        // role-derived (Assistant) so upgraded clients
+                        // still receive the `message/persisted` row.
+                        // This degrades to legacy behaviour for the
+                        // edge cases (no tracked task, empty sentinel)
+                        // rather than silently dropping the completion.
+                        persist_assistant_with_media(
+                            &sessions,
+                            &data_dir,
+                            &session_id,
+                            content_text.clone(),
+                            media.clone(),
+                            thread_id.clone(),
+                            &task_label,
+                        )
+                        .await
+                    };
                     if let (Some(task_id_value), Some(meta)) =
                         (task_id_clean.clone(), persisted_meta.as_ref())
                     {
