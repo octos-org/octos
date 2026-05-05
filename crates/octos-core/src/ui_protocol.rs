@@ -54,6 +54,19 @@ pub const UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1: &str = "state.turn_state_get.v1
 /// notification.
 pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persisted.v1";
 
+/// Feature flag for M10 Phase 1 `turn/spawn_complete` envelope event.
+///
+/// Negotiated by clients that understand the new "completion-as-new-envelope"
+/// wire shape for `spawn_only` background tool results. Clients that
+/// negotiate this capability receive `turn/spawn_complete` notifications in
+/// place of the `message/persisted` row that carries the late assistant
+/// content (the legacy splice-merge target). Clients that do NOT negotiate
+/// it continue to see `message/persisted` for the same row.
+///
+/// The persistence path is unchanged — the durability ledger still records
+/// the message — only the wire event the connected client observes flips.
+pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -68,6 +81,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -652,6 +666,15 @@ pub mod methods {
     pub const REPLAY_LOSSY: &str = "protocol/replay_lossy";
     /// UPCR-2026-012 `message/persisted` — durable-commit confirmation.
     pub const MESSAGE_PERSISTED: &str = "message/persisted";
+    /// M10 Phase 1 `turn/spawn_complete` — completion-as-new-envelope event
+    /// for `spawn_only` background tool results. Carries the late assistant
+    /// `content` + `media` plus the originating user prompt's
+    /// `client_message_id` (`response_to_client_message_id`) so the client
+    /// can render the result as a NEW assistant bubble under the correct
+    /// user prompt — without splice-merging into the existing
+    /// spawn-acknowledgement bubble. Gated by
+    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`].
+    pub const TURN_SPAWN_COMPLETE: &str = "turn/spawn_complete";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -698,6 +721,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::WARNING,
     methods::REPLAY_LOSSY,
     methods::MESSAGE_PERSISTED,
+    methods::TURN_SPAWN_COMPLETE,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -783,6 +807,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
             UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+            UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
         ])
     }
 
@@ -1681,6 +1706,68 @@ pub struct MessagePersistedEvent {
     ///
     /// Backwards-compatible: serialized as omitted when empty so clients
     /// running older protocol versions see the same wire shape they used to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
+}
+
+// ----- M10 Phase 1 `turn/spawn_complete` -----
+
+/// Notification params for `turn/spawn_complete` (M10 Phase 1). Emitted once
+/// per `spawn_only` background tool completion AFTER the late assistant row
+/// is durably persisted, in addition to (and as the wire-level replacement
+/// of) the corresponding `message/persisted` event for clients that
+/// negotiated [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`].
+///
+/// The wire shape mirrors [`MessagePersistedEvent`] (durable cursor, seq,
+/// `message_id`, `persisted_at`) so a client that already has a
+/// `MessagePersisted` reducer can route this through the same persistence
+/// confirmation path. It adds two distinguishing fields:
+///
+/// - `task_id` — which `spawn_only` task the completion came from.
+/// - `response_to_client_message_id` — the originating user message's
+///   `client_message_id`, telling the client which user prompt's thread
+///   the new assistant bubble belongs under (analogous to the existing
+///   `MessagePersistedEvent.thread_id`, but specifically the *user-prompt*
+///   anchor; the splice-merge logic in legacy clients was the bug surface
+///   the new envelope replaces).
+///
+/// Unlike `message/persisted` (which is metadata-only and works alongside
+/// streaming `message/delta` deltas to reconstruct content), this event
+/// carries the full `content` and `media` for the late completion in one
+/// frame — by design, the client never needs to splice-merge or wait for
+/// further deltas. `media` mirrors the convention in `MessagePersistedEvent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnSpawnCompleteEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// The `spawn_only` task that produced this completion. Always
+    /// populated — a `turn/spawn_complete` without a task_id is a server
+    /// bug.
+    pub task_id: String,
+    /// The originating user message's `client_message_id`, i.e. the
+    /// user-prompt anchor under which the new assistant bubble should be
+    /// rendered. `None` only for legacy callers that did not propagate
+    /// origination through the spawn pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_to_client_message_id: Option<String>,
+    pub seq: u64,
+    pub message_id: String,
+    /// Source of the completion. Always `background` today; reserved as
+    /// `String` so future variants (e.g. `recovery_background`) can extend
+    /// without a wire-breaking enum change.
+    pub source: String,
+    pub cursor: UiCursor,
+    pub persisted_at: DateTime<Utc>,
+    /// REQUIRED. The full assistant text for the completion bubble. Unlike
+    /// [`MessagePersistedEvent`] (where `content` lives only in the
+    /// session ledger), this event carries the text inline so the client
+    /// can render the new bubble atomically without a follow-up fetch.
+    pub content: String,
+    /// File attachments for this completion (e.g. `_report.md`,
+    /// `output.mp3`). Same convention as `MessagePersistedEvent.media`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
 }
@@ -2840,6 +2927,11 @@ pub enum UiNotification {
     ReplayLossy(ReplayLossyEvent),
     /// UPCR-2026-012: durable-commit confirmation per session row.
     MessagePersisted(MessagePersistedEvent),
+    /// M10 Phase 1: completion-as-new-envelope event for `spawn_only`
+    /// background results. Emitted in addition to `MessagePersisted` for
+    /// the same row; per-connection capability filtering (the
+    /// `event.spawn_complete.v1` flag) decides which one the client sees.
+    TurnSpawnComplete(TurnSpawnCompleteEvent),
 }
 
 impl UiNotification {
@@ -2863,6 +2955,7 @@ impl UiNotification {
             Self::TurnError(_) => methods::TURN_ERROR,
             Self::ReplayLossy(_) => methods::REPLAY_LOSSY,
             Self::MessagePersisted(_) => methods::MESSAGE_PERSISTED,
+            Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
         }
     }
 
@@ -2887,6 +2980,7 @@ impl UiNotification {
             Self::TurnError(params) => serde_json::to_value(params),
             Self::ReplayLossy(params) => serde_json::to_value(params),
             Self::MessagePersisted(params) => serde_json::to_value(params),
+            Self::TurnSpawnComplete(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -2930,6 +3024,9 @@ impl UiNotification {
             methods::REPLAY_LOSSY => Ok(Self::ReplayLossy(decode_params(method, params)?)),
             methods::MESSAGE_PERSISTED => {
                 Ok(Self::MessagePersisted(decode_params(method, params)?))
+            }
+            methods::TURN_SPAWN_COMPLETE => {
+                Ok(Self::TurnSpawnComplete(decode_params(method, params)?))
             }
             _ => Err(RpcError::method_not_found(method)),
         }
@@ -3310,6 +3407,7 @@ mod tests {
                 "warning",
                 "protocol/replay_lossy",
                 "message/persisted",
+                "turn/spawn_complete",
             ]
         );
         assert_eq!(
@@ -3383,7 +3481,8 @@ mod tests {
                     "progress/updated",
                     "warning",
                     "protocol/replay_lossy",
-                    "message/persisted"
+                    "message/persisted",
+                    "turn/spawn_complete"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
@@ -3393,7 +3492,8 @@ mod tests {
                     "state.session_hydrate.v1",
                     "state.thread_graph.v1",
                     "state.turn_state_get.v1",
-                    "event.message_persisted.v1"
+                    "event.message_persisted.v1",
+                    "event.spawn_complete.v1"
                 ]
             })
         );
@@ -5305,6 +5405,116 @@ mod tests {
         assert_eq!(rpc.method, methods::MESSAGE_PERSISTED);
         let decoded = UiNotification::from_rpc_notification(rpc).expect("notification deserialize");
         assert_eq!(decoded, notif);
+    }
+
+    #[test]
+    fn golden_turn_spawn_complete_event_serde() {
+        let event = TurnSpawnCompleteEvent {
+            session_id: sample_session_id(),
+            turn_id: Some(sample_turn_id()),
+            thread_id: Some("thread-1".into()),
+            task_id: "task_abc123".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 42,
+            message_id: "msg-spawn-1".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: "local:demo".into(),
+                seq: 42,
+            },
+            persisted_at: sample_persisted_at(),
+            content: "Research complete: 3 sources reviewed.".into(),
+            media: vec!["research/_report.md".into()],
+        };
+        let value = serde_json::to_value(&event).expect("serialize");
+        // Wire shape matches the spec: required fields land on the
+        // top-level object with snake_case keys; absent optional fields
+        // omit cleanly.
+        assert_eq!(value.get("task_id"), Some(&json!("task_abc123")));
+        assert_eq!(
+            value.get("response_to_client_message_id"),
+            Some(&json!("cmid-user-1")),
+        );
+        assert_eq!(
+            value.get("content"),
+            Some(&json!("Research complete: 3 sources reviewed.")),
+        );
+        assert_eq!(value.get("source"), Some(&json!("background")));
+        let parsed: TurnSpawnCompleteEvent = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, event);
+
+        // Empty media + absent optionals omit on the wire (legacy
+        // clients see the same shape as `MessagePersistedEvent`'s
+        // optional-fields convention).
+        let bare = TurnSpawnCompleteEvent {
+            session_id: sample_session_id(),
+            turn_id: None,
+            thread_id: None,
+            task_id: "task_zzz".into(),
+            response_to_client_message_id: None,
+            seq: 1,
+            message_id: "msg-bare".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: "local:demo".into(),
+                seq: 1,
+            },
+            persisted_at: sample_persisted_at(),
+            content: String::new(),
+            media: vec![],
+        };
+        let bare_v = serde_json::to_value(&bare).expect("serialize bare");
+        assert!(bare_v.get("turn_id").is_none(), "absent turn_id omits");
+        assert!(bare_v.get("thread_id").is_none(), "absent thread_id omits");
+        assert!(
+            bare_v.get("response_to_client_message_id").is_none(),
+            "absent response_to_client_message_id omits",
+        );
+        assert!(bare_v.get("media").is_none(), "empty media omits");
+        let bare_p: TurnSpawnCompleteEvent =
+            serde_json::from_value(bare_v).expect("deserialize bare");
+        assert_eq!(bare_p, bare);
+
+        // Wire-level: round-trip via the JSON-RPC notification envelope.
+        let notif = UiNotification::TurnSpawnComplete(event.clone());
+        let rpc = notif
+            .clone()
+            .into_rpc_notification()
+            .expect("notification serialize");
+        assert_eq!(rpc.method, methods::TURN_SPAWN_COMPLETE);
+        let decoded = UiNotification::from_rpc_notification(rpc).expect("notification deserialize");
+        assert_eq!(decoded, notif);
+    }
+
+    #[test]
+    fn golden_capabilities_advertise_spawn_complete_v1() {
+        // No header at all -> server falls back to `first_server_slice` and
+        // advertises every known feature including `event.spawn_complete.v1`.
+        let full = UiProtocolCapabilities::first_server_slice();
+        assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1));
+
+        // `full_protocol()` advertises the same.
+        let full_proto = UiProtocolCapabilities::full_protocol();
+        assert!(full_proto.supports_feature(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1));
+
+        // Negotiated subset: only `event.spawn_complete.v1` requested.
+        let only_spawn = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+        ]);
+        assert!(only_spawn.supports_feature(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1));
+        assert!(
+            !only_spawn.supports_feature(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
+            "non-requested feature must NOT be advertised",
+        );
+
+        // The notification method is advertised regardless of negotiated
+        // gating today (mirrors how `message/persisted` is unconditionally
+        // listed in `UI_PROTOCOL_NOTIFICATION_METHODS`); per-connection
+        // emit-time filtering is what enforces the capability.
+        assert!(
+            UI_PROTOCOL_NOTIFICATION_METHODS.contains(&methods::TURN_SPAWN_COMPLETE),
+            "turn/spawn_complete is in the notification method registry",
+        );
     }
 
     #[test]

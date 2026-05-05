@@ -32,16 +32,17 @@ use octos_core::ui_protocol::{
     TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
     ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
     ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnStartParams,
-    TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand,
-    UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem,
-    UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    progress_kinds, thread_status,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
 use serde::Serialize;
@@ -509,6 +510,14 @@ struct ConnectionUiFeatures {
     turn_state_get: bool,
     /// UPCR-2026-012 `event.message_persisted.v1` negotiated.
     message_persisted: bool,
+    /// M10 Phase 1 `event.spawn_complete.v1` negotiated. When set, the
+    /// connection receives `turn/spawn_complete` envelope events for
+    /// `spawn_only` background completions and the corresponding
+    /// `message/persisted` row (with `source: background`) is suppressed
+    /// at the per-connection wire-emit gate. When unset, the legacy
+    /// `message/persisted` shape is preserved and `turn/spawn_complete`
+    /// is suppressed.
+    spawn_complete: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -541,6 +550,7 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             ),
+            spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             header_present: has_any_ui_feature_token(headers, query),
         }
     }
@@ -582,6 +592,9 @@ impl ConnectionUiFeatures {
         }
         if self.message_persisted {
             requested.push(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1);
+        }
+        if self.spawn_complete {
+            requested.push(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -774,6 +787,37 @@ async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// rather backpressure the agent loop than balloon memory.
 const SEND_FILE_CHANNEL_CAPACITY: usize = 64;
 
+tokio::task_local! {
+    /// M10 Phase 1: task-local override for `MessagePersistedSource` read
+    /// by `install_message_commit_observer`. The
+    /// [`BackgroundResultSender`] callback enters this scope before
+    /// invoking [`persist_assistant_with_media`] so the resulting
+    /// `MessagePersistedEvent` carries `source: background` instead of
+    /// the role-derived `assistant` default. The per-connection
+    /// capability filter then identifies "this is a duplicate of a
+    /// `turn/spawn_complete`" and suppresses it for clients that
+    /// negotiated the new wire shape.
+    ///
+    /// Without this override the `Message` role is `Assistant`, the
+    /// observer maps it to `MessagePersistedSource::Assistant`, and
+    /// the duplicate-suppression branch at
+    /// `live_event_passes_capability_filter` never fires — which
+    /// codex flagged as a P1 against the Phase 1 wire contract.
+    static MESSAGE_PERSISTED_SOURCE_OVERRIDE: Option<MessagePersistedSource>;
+}
+
+/// Resolve the source for an upcoming `MessagePersistedEvent`. Returns the
+/// task-local override when one is set (e.g. inside the `BackgroundResultSender`
+/// scope), otherwise falls back to the role-derived default — preserving
+/// the pre-M10 behaviour for every other persist path.
+fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePersistedSource {
+    MESSAGE_PERSISTED_SOURCE_OVERRIDE
+        .try_with(|override_value| *override_value)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| MessagePersistedSource::from_role(role))
+}
+
 /// Shared persist helper used by the api/serve background-result sender
 /// (spawn_only completions) and the `send_file` sink. Builds an assistant
 /// `Message` with the given content + media + thread_id, writes it through
@@ -784,6 +828,15 @@ const SEND_FILE_CHANNEL_CAPACITY: usize = 64;
 /// new row instead of the pre-persist snapshot. Mirrors the gateway's
 /// `session_actor.rs::deliver_background_notification` post-write
 /// invalidate at `api_channel.rs:1503`.
+///
+/// Returns `Some(PersistedMessageMeta)` on success — the row's committed
+/// seq plus the wire `message_id` derived the same way `MessageCommitObserver`
+/// computes it (`session:seq:timestamp_ns`). The shared id lets the
+/// `BackgroundResultSender` callback emit a `turn/spawn_complete`
+/// envelope whose `message_id` matches the parallel `message/persisted`
+/// event — clients that key dedup or confirmation off `message_id`
+/// then see one logical row, regardless of which wire shape they
+/// negotiated. `None` signals a persist failure (already logged).
 async fn persist_assistant_with_media(
     sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
     data_dir: &Path,
@@ -792,31 +845,47 @@ async fn persist_assistant_with_media(
     media: Vec<String>,
     thread_id: String,
     label: &str,
-) -> bool {
-    let mut message = Message::assistant_with_thread(
-        content,
-        octos_core::ThreadId::new(thread_id),
-    );
+) -> Option<PersistedMessageMeta> {
+    let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
     message.media = media;
+    // Capture the stamped timestamp BEFORE the canonical persist
+    // consumes the message — `MessageCommitObserver` derives the wire
+    // `message_id` from `(session_id, committed_seq, message.timestamp)`,
+    // and we need that same value here so the spawn_complete envelope
+    // can advertise the identical id.
+    let timestamp_ns = message.timestamp.timestamp_nanos_opt().unwrap_or(0);
 
-    if let Err(error) = octos_bus::session::persist_message_through_canonical_path(
-        data_dir,
-        session_id,
-        message,
+    let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
+        data_dir, session_id, message,
     )
     .await
     {
-        tracing::warn!(
-            session = %session_id.0,
-            label,
-            error = %error,
-            "api/serve: failed to persist background-delivered message"
-        );
-        return false;
-    }
+        Ok(seq) => seq,
+        Err(error) => {
+            tracing::warn!(
+                session = %session_id.0,
+                label,
+                error = %error,
+                "api/serve: failed to persist background-delivered message"
+            );
+            return None;
+        }
+    };
 
     sessions.lock().await.invalidate_cache(session_id);
-    true
+    Some(PersistedMessageMeta {
+        committed_seq,
+        message_id: format!("{}:{committed_seq}:{timestamp_ns}", session_id.0),
+    })
+}
+
+/// Metadata returned by [`persist_assistant_with_media`] so callers can
+/// emit wire events whose identity matches the durable row written by
+/// `MessageCommitObserver`. See the helper's doc comment for rationale.
+#[derive(Debug, Clone)]
+struct PersistedMessageMeta {
+    committed_seq: usize,
+    message_id: String,
 }
 
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
@@ -842,7 +911,13 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                     message.timestamp.timestamp_nanos_opt().unwrap_or(0)
                 ),
                 client_message_id: message.client_message_id.clone(),
-                source: MessagePersistedSource::from_role(message.role),
+                // M10 Phase 1: read the task-local source override
+                // first so a `BackgroundResultSender` persist (which
+                // duplicates a `turn/spawn_complete` envelope) emits
+                // `source: background`. The per-connection wire
+                // filter keys off this to suppress the duplicate for
+                // clients that negotiated `event.spawn_complete.v1`.
+                source: current_message_persisted_source(message.role),
                 // Placeholder; the ledger's `with_cursor` hook
                 // overwrites this with the assigned seq.
                 cursor: UiCursor {
@@ -1331,8 +1406,7 @@ async fn ui_protocol_connection(
     let ws = WsConnection::new(writer_tx);
     let active_turns = active_turns_registry();
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let live_forwarders: SharedLiveForwarders =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
     let ledger = event_ledger(&state).await;
     // Force lazy init of the diff-preview store on this connection so
@@ -1718,13 +1792,16 @@ async fn handle_session_open(
     // We silently skip filtered events rather than emitting
     // `protocol/replay_lossy`. The client never asked for these events,
     // so dropping them is not lossy from their perspective.
+    //
+    // M10 Phase 1: the same dual filter that `live_event_passes_capability_filter`
+    // applies for the live broadcast must apply during replay so a
+    // reconnecting client sees exactly one shape per `spawn_only`
+    // completion (either the legacy `message/persisted` OR the new
+    // `turn/spawn_complete`, never both). Reusing the helper keeps replay
+    // and live in lockstep.
     for event in outcome.replay {
-        if !features.message_persisted {
-            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) =
-                &event.event
-            {
-                continue;
-            }
+        if !live_event_passes_capability_filter(&event.event, features) {
+            continue;
         }
         let _ = send_ledger_event_durable(ws, ledger, event.event);
     }
@@ -1842,6 +1919,19 @@ async fn spawn_live_forwarder(
 /// `event.message_persisted.v1` must not receive `message/persisted`
 /// notifications via the live broadcast either. Other notifications pass
 /// unchanged today; future capability-gated kinds get added here.
+///
+/// M10 Phase 1 extends this with two intertwined gates for the
+/// `event.spawn_complete.v1` capability:
+///
+/// 1. Clients that did NOT negotiate `event.spawn_complete.v1` must not
+///    receive `turn/spawn_complete` notifications. They continue to see
+///    the legacy `message/persisted` row for the same `spawn_only`
+///    completion, preserving the wire shape they shipped with.
+/// 2. Clients that DID negotiate `event.spawn_complete.v1` see
+///    `turn/spawn_complete` instead — and the corresponding
+///    `message/persisted` row (carrying `source: background`) is
+///    suppressed at this gate so the same logical event is not
+///    delivered twice in two different shapes.
 fn live_event_passes_capability_filter(
     event: &UiProtocolLedgerEvent,
     features: ConnectionUiFeatures,
@@ -1849,6 +1939,23 @@ fn live_event_passes_capability_filter(
     if !features.message_persisted {
         if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) = event {
             return false;
+        }
+    }
+    if !features.spawn_complete {
+        // Old client: never deliver the new envelope.
+        if let UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(_)) = event {
+            return false;
+        }
+    } else {
+        // New client: suppress the `message/persisted` row that
+        // duplicates a `turn/spawn_complete` envelope. The row is
+        // identified by `source: background` — the only path through
+        // `MessageCommitObserver` that fires from `BackgroundResultSender`.
+        if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(event)) = event
+        {
+            if matches!(event.source, MessagePersistedSource::Background) {
+                return false;
+            }
         }
     }
     true
@@ -2142,15 +2249,13 @@ fn session_tool_registry(
     //    which under launchd is `~` outside the profile root): fall back
     //    to `<data_dir>/skill-output` so spawn_only artefacts resolve
     //    through the file API instead of 403'ing.
-    let plugin_target =
-        if session_workspaces().get(session_id).is_some() || matches_operator_default(
-            operator_default_cwd,
-            &workspace_root,
-        ) {
-            &workspace_root
-        } else {
-            &plugin_default_dir
-        };
+    let plugin_target = if session_workspaces().get(session_id).is_some()
+        || matches_operator_default(operator_default_cwd, &workspace_root)
+    {
+        &workspace_root
+    } else {
+        &plugin_default_dir
+    };
     rebound.rebind_plugin_work_dirs(plugin_target);
 
     Ok((rebound, Some(workspace_root)))
@@ -2164,7 +2269,8 @@ fn matches_operator_default(operator_default: Option<&Path>, workspace_root: &Pa
     let Some(default) = operator_default else {
         return false;
     };
-    let canonical_default = std::fs::canonicalize(default).unwrap_or_else(|_| default.to_path_buf());
+    let canonical_default =
+        std::fs::canonicalize(default).unwrap_or_else(|_| default.to_path_buf());
     let canonical_root =
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
     canonical_default == canonical_root
@@ -4459,30 +4565,29 @@ async fn run_standalone_turn(
         })
         .unwrap_or_else(|| runtime_data_dir.clone());
 
-    let (mut tool_registry, workspace_root) =
-        match session_tool_registry(
-            base_agent.as_ref(),
-            &session_id,
-            &plugin_root_dir,
-            state.appui_default_session_cwd.as_deref(),
-        ) {
-            Ok(registry) => registry,
-            Err(error) => {
-                // FIX-03 pattern: terminal emission + state transition is atomic.
-                try_emit_terminal(
-                    &turn_state,
-                    TerminalReason::Errored,
-                    &ws,
-                    &ledger,
-                    &session_id,
-                    &turn_id,
-                    Some(("cwd_binding_failed", error.as_str())),
-                )
-                .await;
-                contracts.scopes.evict_turn(&session_id, &turn_id);
-                return;
-            }
-        };
+    let (mut tool_registry, workspace_root) = match session_tool_registry(
+        base_agent.as_ref(),
+        &session_id,
+        &plugin_root_dir,
+        state.appui_default_session_cwd.as_deref(),
+    ) {
+        Ok(registry) => registry,
+        Err(error) => {
+            // FIX-03 pattern: terminal emission + state transition is atomic.
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some(("cwd_binding_failed", error.as_str())),
+            )
+            .await;
+            contracts.scopes.evict_turn(&session_id, &turn_id);
+            return;
+        }
+    };
 
     // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
     // completions and explicit `send_file` calls persist as assistant
@@ -4501,31 +4606,50 @@ async fn run_standalone_turn(
     // `/api/sessions/:id/messages` reads pick up the new row instead of
     // the pre-persist snapshot (matches `ApiChannel::persist_to_session`'s
     // post-write invalidate at `api_channel.rs:1503`).
+    //
+    // M10 Phase 1: in addition to persisting (which still fires
+    // `message/persisted` via `MessageCommitObserver` for ledger
+    // durability + `event.message_persisted.v1` clients), the closure
+    // now appends a `turn/spawn_complete` envelope event to the ledger
+    // for clients that negotiated `event.spawn_complete.v1`. The
+    // per-connection capability filter (`live_event_passes_capability_filter`)
+    // routes each connection to exactly one wire shape — old clients
+    // see `message/persisted` as before, new clients see
+    // `turn/spawn_complete` and the duplicate `message/persisted`
+    // (with `source: background`) is suppressed.
     {
         let bg_data_dir = sessions.lock().await.data_dir().to_path_buf();
         let bg_sessions = sessions.clone();
         let bg_session_id = session_id.clone();
         let bg_thread_id = turn_id.0.to_string();
+        let bg_turn_id = turn_id.clone();
 
         // Wire spawn_only contract-satisfied path.
         let payload_sessions = bg_sessions.clone();
         let payload_data_dir = bg_data_dir.clone();
         let payload_session_id = bg_session_id.clone();
         let payload_thread_id = bg_thread_id.clone();
+        let payload_turn_id = bg_turn_id.clone();
+        let payload_ledger = ledger.clone();
         tool_registry.set_background_result_sender(std::sync::Arc::new(
             move |payload: BackgroundResultPayload| {
                 let sessions = payload_sessions.clone();
                 let data_dir = payload_data_dir.clone();
                 let session_id = payload_session_id.clone();
-                let thread_id = payload
+                let originating_thread_id = payload
                     .originating_thread_id
                     .clone()
-                    .filter(|tid| !tid.is_empty())
+                    .filter(|tid| !tid.is_empty());
+                let thread_id = originating_thread_id
+                    .clone()
                     .unwrap_or_else(|| payload_thread_id.clone());
                 let task_label = payload.task_label.clone();
                 let media = payload.media.clone();
                 let kind = payload.kind;
                 let raw_content = payload.content.clone();
+                let task_id = payload.task_id.clone();
+                let turn_id = payload_turn_id.clone();
+                let ledger = payload_ledger.clone();
                 Box::pin(async move {
                     let content_text = match kind {
                         BackgroundResultKind::Notification => {
@@ -4539,30 +4663,140 @@ async fn run_standalone_turn(
                             if raw_content.is_empty() && !media.is_empty() {
                                 format!("✅ {} completed.", task_label)
                             } else if raw_content.len() > 1000 {
-                                let preview: String =
-                                    raw_content.chars().take(300).collect();
-                                format!(
-                                    "✅ **{}** completed.\n\n{}…",
-                                    task_label, preview,
-                                )
+                                let preview: String = raw_content.chars().take(300).collect();
+                                format!("✅ **{}** completed.\n\n{}…", task_label, preview,)
                             } else {
-                                format!(
-                                    "✅ **{}** completed.\n\n{}",
-                                    task_label, raw_content,
-                                )
+                                format!("✅ **{}** completed.\n\n{}", task_label, raw_content,)
                             }
                         }
                     };
-                    persist_assistant_with_media(
-                        &sessions,
-                        &data_dir,
-                        &session_id,
-                        content_text,
-                        media,
-                        thread_id,
-                        &task_label,
-                    )
-                    .await
+                    // M10 Phase 1 (codex P1): scope the persist call in
+                    // the `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local
+                    // so `install_message_commit_observer` emits
+                    // `source: background` for this row. Without this,
+                    // `MessagePersistedSource::from_role(Assistant)`
+                    // would return `Assistant` and the per-connection
+                    // duplicate-suppression filter would never fire,
+                    // delivering both `message/persisted` AND
+                    // `turn/spawn_complete` to upgraded clients.
+                    // M10 Phase 1 (codex round 4): only mark this row as
+                    // `source: background` if we will emit a replacement
+                    // `turn/spawn_complete` envelope for it. Otherwise
+                    // upgraded clients filter the legacy
+                    // `message/persisted` row AND see no envelope —
+                    // they receive nothing for the completion. The
+                    // marker has to stay coupled to the envelope emit
+                    // for the dual-gate invariant to hold.
+                    //
+                    // Empty `Some("")` — the legacy register sentinel
+                    // returned when the supervisor's fan-out cap refuses
+                    // a task — is treated like `None` (codex round 3 P3).
+                    let task_id_clean = task_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let will_emit_envelope = task_id_clean.is_some();
+                    let persisted_meta = if will_emit_envelope {
+                        MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                            .scope(
+                                Some(MessagePersistedSource::Background),
+                                persist_assistant_with_media(
+                                    &sessions,
+                                    &data_dir,
+                                    &session_id,
+                                    content_text.clone(),
+                                    media.clone(),
+                                    thread_id.clone(),
+                                    &task_label,
+                                ),
+                            )
+                            .await
+                    } else {
+                        // No envelope incoming → leave the source as
+                        // role-derived (Assistant) so upgraded clients
+                        // still receive the `message/persisted` row.
+                        // This degrades to legacy behaviour for the
+                        // edge cases (no tracked task, empty sentinel)
+                        // rather than silently dropping the completion.
+                        persist_assistant_with_media(
+                            &sessions,
+                            &data_dir,
+                            &session_id,
+                            content_text.clone(),
+                            media.clone(),
+                            thread_id.clone(),
+                            &task_label,
+                        )
+                        .await
+                    };
+                    if let (Some(task_id_value), Some(meta)) =
+                        (task_id_clean.clone(), persisted_meta.as_ref())
+                    {
+                        let event = TurnSpawnCompleteEvent {
+                            session_id: session_id.clone(),
+                            turn_id: Some(turn_id.clone()),
+                            thread_id: Some(thread_id.clone()),
+                            task_id: task_id_value,
+                            // Codex rounds 2/6: leave this `None`. In
+                            // the standalone-turn path the reporter
+                            // binds `thread_id = turn_id.0.to_string()`
+                            // (a TurnId UUID), so `originating_thread_id`
+                            // here is NOT the user's `client_message_id`
+                            // the field is documented to carry. Phase 4
+                            // plumbing will add a typed
+                            // `originating_client_message_id` to
+                            // `BackgroundResultPayload` and populate
+                            // this from there. Today the SPA reducer
+                            // already anchors via `thread_id` (which
+                            // matches the user-prompt row's thread_id
+                            // through the M8.10 root-on-cmid
+                            // invariant), so this `None` is safe.
+                            response_to_client_message_id: None,
+                            seq: meta.committed_seq as u64,
+                            // Reuse the `MessageCommitObserver`-style
+                            // wire id for the same durable row — see
+                            // `PersistedMessageMeta` doc.
+                            message_id: meta.message_id.clone(),
+                            source: "background".to_owned(),
+                            cursor: UiCursor {
+                                stream: session_id.0.clone(),
+                                seq: 0,
+                            },
+                            persisted_at: Utc::now(),
+                            content: content_text,
+                            media,
+                        };
+                        ledger.append_notification(UiNotification::TurnSpawnComplete(event));
+                    } else if task_id_clean.is_none() {
+                        // Best-effort: a payload without `task_id` (or
+                        // with the empty-string sentinel returned by
+                        // the legacy register-task path under fan-out
+                        // pressure) arrives only from edge-case
+                        // callers. Old clients see `message/persisted`
+                        // as before; new clients miss this single
+                        // completion. Logging surfaces the gap so we
+                        // can fix upstream callers.
+                        tracing::debug!(
+                            session_id = %session_id.0,
+                            task_label,
+                            had_empty_task_id = task_id.as_deref() == Some(""),
+                            "background result missing task_id; turn/spawn_complete suppressed"
+                        );
+                    } else {
+                        // Persist failed — the row never landed in the
+                        // session ledger, so emitting a `turn/spawn_complete`
+                        // would advertise a row that doesn't exist on
+                        // hydrate. Log; old clients also see nothing
+                        // (the observer never fired). The agent's
+                        // task_supervisor still records the failure for
+                        // operator visibility.
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            task_label,
+                            "background result persist failed; both wire shapes suppressed"
+                        );
+                    }
+                    persisted_meta.is_some()
                 })
             },
         ));
@@ -5694,6 +5928,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5743,6 +5978,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5837,6 +6073,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5886,6 +6123,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5928,6 +6166,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -6013,6 +6252,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -7303,6 +7543,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
             SessionOpenParams {
@@ -9957,6 +10198,68 @@ mod tests {
         }
     }
 
+    /// Build a `ConnectionUiFeatures` with the M10 Phase 1 dual gating
+    /// flags set as requested. `message_persisted` is independent so the
+    /// test can simulate clients that negotiated only one or both.
+    fn features_for_spawn_complete_test(
+        message_persisted: bool,
+        spawn_complete: bool,
+    ) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            message_persisted,
+            spawn_complete,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Builds a minimal `MessagePersistedEvent` with `source: background`,
+    /// matching what `BackgroundResultSender`'s persist path produces
+    /// via `MessageCommitObserver`. M10 Phase 1's per-connection filter
+    /// suppresses this exact shape for new clients (which receive
+    /// `turn/spawn_complete` instead).
+    fn background_message_persisted_for(session: &SessionKey) -> UiNotification {
+        UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: Some("thread-1".into()),
+            seq: 0,
+            role: "assistant".into(),
+            message_id: "msg-bg".into(),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        })
+    }
+
+    /// Build a representative `TurnSpawnCompleteEvent` that mirrors what
+    /// `BackgroundResultSender` emits when a `spawn_only` task contracts
+    /// and the originating `client_message_id` was tracked.
+    fn turn_spawn_complete_for(session: &SessionKey) -> UiNotification {
+        UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: Some("thread-1".into()),
+            task_id: "task_abc123".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 0,
+            message_id: "msg-spawn".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "Background research complete.".into(),
+            media: vec!["research/_report.md".into()],
+        })
+    }
+
     /// Decodes a queued WS frame back to its JSON-RPC method name (or
     /// returns `None` for non-text / non-JSON frames). Lets tests assert
     /// the live broadcast forwarder routed a notification, without
@@ -10084,6 +10387,270 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "client without event.message_persisted.v1 must not receive message/persisted"
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    // ========================================================================
+    // M10 Phase 1: `event.spawn_complete.v1` capability gating
+    // ========================================================================
+
+    /// Pure unit-level coverage of the dual filter — no WS / forwarder
+    /// machinery. Documents the four corners of the negotiation matrix
+    /// against the two relevant event shapes.
+    #[test]
+    fn capability_filter_routes_spawn_complete_dual_gating() {
+        let session = SessionKey("local:filter".into());
+        let bg_persisted =
+            UiProtocolLedgerEvent::Notification(background_message_persisted_for(&session));
+        let spawn_complete = UiProtocolLedgerEvent::Notification(turn_spawn_complete_for(&session));
+
+        // Old client (no spawn_complete capability, has message_persisted):
+        // sees `message/persisted` (Background source preserved); does NOT
+        // see `turn/spawn_complete`.
+        let old = features_for_spawn_complete_test(true, false);
+        assert!(
+            live_event_passes_capability_filter(&bg_persisted, old),
+            "old client must keep receiving the legacy message/persisted shape",
+        );
+        assert!(
+            !live_event_passes_capability_filter(&spawn_complete, old),
+            "old client must not receive the new turn/spawn_complete shape",
+        );
+
+        // New client (has both capabilities): sees `turn/spawn_complete`;
+        // the duplicate `message/persisted` (source: background) is
+        // suppressed so the same logical event is delivered exactly once.
+        let new = features_for_spawn_complete_test(true, true);
+        assert!(
+            !live_event_passes_capability_filter(&bg_persisted, new),
+            "new client must NOT receive the duplicate message/persisted background row",
+        );
+        assert!(
+            live_event_passes_capability_filter(&spawn_complete, new),
+            "new client must receive the turn/spawn_complete envelope",
+        );
+
+        // New client without message_persisted negotiation: still gets
+        // turn/spawn_complete. (The two capabilities are independent —
+        // a forward-only client can opt into the new shape without ever
+        // having shipped the older one.)
+        let new_only = features_for_spawn_complete_test(false, true);
+        assert!(
+            !live_event_passes_capability_filter(&bg_persisted, new_only),
+            "client without message_persisted does not see message/persisted regardless",
+        );
+        assert!(
+            live_event_passes_capability_filter(&spawn_complete, new_only),
+            "spawn_complete-only client receives turn/spawn_complete",
+        );
+
+        // Legacy client with NO negotiated features at all: sees neither
+        // (the old gate already blocks message/persisted; the new gate
+        // blocks turn/spawn_complete).
+        let neither = features_for_spawn_complete_test(false, false);
+        assert!(!live_event_passes_capability_filter(&bg_persisted, neither));
+        assert!(!live_event_passes_capability_filter(
+            &spawn_complete,
+            neither
+        ));
+
+        // Sanity: a non-spawn `message/persisted` (source != background,
+        // e.g. a regular assistant row) is unaffected by the spawn_complete
+        // gate. Only the duplicate-suppression branch keys on
+        // `MessagePersistedSource::Background`.
+        let regular = UiProtocolLedgerEvent::Notification(message_persisted_for(&session));
+        assert!(
+            live_event_passes_capability_filter(&regular, new),
+            "non-background message/persisted must still flow to new clients",
+        );
+    }
+
+    /// End-to-end through the live forwarder for a NEW client (negotiated
+    /// `event.spawn_complete.v1`): asserts they receive `turn/spawn_complete`
+    /// AND the duplicate `message/persisted` (source: background) is
+    /// suppressed. The combination is what kills the splice-merge
+    /// double-render.
+    #[tokio::test]
+    async fn live_forwarder_routes_spawn_complete_to_new_client() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:newfeat".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_for_spawn_complete_test(true, true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Producer side fires both — the persistence-driven
+        // `message/persisted` (via `MessageCommitObserver`) AND the new
+        // envelope (direct ledger append from `BackgroundResultSender`).
+        ledger.append_notification(background_message_persisted_for(&session_id));
+        ledger.append_notification(turn_spawn_complete_for(&session_id));
+
+        // The new client must observe exactly one frame: the spawn_complete
+        // envelope. The duplicate background message/persisted is filtered.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expected the spawn_complete envelope within 1s")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::TURN_SPAWN_COMPLETE),
+            "first frame must be turn/spawn_complete (background message/persisted suppressed)",
+        );
+
+        // No further frames should arrive — the background message/persisted
+        // was filtered.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no second frame: background message/persisted is suppressed for new clients",
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    /// Codex P1: when the BackgroundResultSender persist scope is
+    /// active, `current_message_persisted_source` must report
+    /// `Background` regardless of the `Message` role. Outside the scope
+    /// it falls back to the role-derived default — the pre-M10
+    /// behaviour stays intact for every other persist path.
+    #[tokio::test]
+    async fn message_persisted_source_override_routes_through_task_local() {
+        // Outside any scope: role-derived default.
+        let default_for_assistant = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(default_for_assistant, MessagePersistedSource::Assistant);
+        let default_for_tool = current_message_persisted_source(MessageRole::Tool);
+        assert_eq!(default_for_tool, MessagePersistedSource::Tool);
+
+        // Inside the override scope (mirrors what the
+        // `BackgroundResultSender` closure does): every role maps to
+        // `Background`.
+        let bg = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+            .scope(Some(MessagePersistedSource::Background), async {
+                (
+                    current_message_persisted_source(MessageRole::Assistant),
+                    current_message_persisted_source(MessageRole::Tool),
+                )
+            })
+            .await;
+        assert_eq!(bg.0, MessagePersistedSource::Background);
+        assert_eq!(bg.1, MessagePersistedSource::Background);
+
+        // After the scope ends, the default behaviour is restored.
+        let after = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(after, MessagePersistedSource::Assistant);
+    }
+
+    /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat
+    /// `seq` field carries the COMMITTED-ROW seq (the index in the
+    /// session message log, identical to `MessagePersistedEvent.seq`)
+    /// — NOT the UI-ledger cursor seq. The two scales differ in any
+    /// turn that has prior ledger notifications, so upgraded clients
+    /// reusing their `MessagePersisted` reducer for spawn completions
+    /// MUST observe the persisted-row seq the producer wrote, not the
+    /// ledger-assigned cursor seq.
+    #[tokio::test]
+    async fn ledger_preserves_producer_seq_and_stamps_only_cursor() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:seq".into());
+
+        // Producer sets `seq = 7` (the committed-row index from the
+        // persist path). Ledger appends and stamps cursor.seq, but
+        // must leave `seq` untouched.
+        let mut event = match turn_spawn_complete_for(&session_id) {
+            UiNotification::TurnSpawnComplete(ev) => ev,
+            _ => unreachable!("test fixture is turn/spawn_complete"),
+        };
+        event.seq = 7;
+        event.cursor.seq = 0; // producer seeds 0; ledger stamps the real cursor.
+        let appended = ledger.append_notification(UiNotification::TurnSpawnComplete(event));
+
+        let stamped = match &appended.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
+            _ => panic!("expected turn/spawn_complete back from the ledger"),
+        };
+        assert_eq!(
+            stamped.seq, 7,
+            "ledger must NOT overwrite the producer's committed-row seq",
+        );
+        assert!(
+            stamped.cursor.seq > 0,
+            "cursor.seq must be the ledger-assigned non-zero cursor",
+        );
+
+        // Cursor is strictly monotonic across appends (same contract
+        // as the existing MessagePersisted path); flat `seq` is
+        // independent and tracked by the producer.
+        let mut event2 = match turn_spawn_complete_for(&session_id) {
+            UiNotification::TurnSpawnComplete(ev) => ev,
+            _ => unreachable!(),
+        };
+        event2.seq = 8;
+        let appended2 = ledger.append_notification(UiNotification::TurnSpawnComplete(event2));
+        let stamped2 = match &appended2.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
+            _ => panic!("turn/spawn_complete"),
+        };
+        assert!(stamped2.cursor.seq > stamped.cursor.seq);
+        assert_eq!(stamped2.seq, 8);
+    }
+
+    /// End-to-end through the live forwarder for an OLD client (did NOT
+    /// negotiate `event.spawn_complete.v1`): they see `message/persisted`
+    /// (Background source preserved) and do NOT see `turn/spawn_complete`.
+    /// This is the back-compat path that keeps existing TUI/CLI consumers
+    /// working unchanged.
+    #[tokio::test]
+    async fn live_forwarder_falls_back_to_message_persisted_for_old_client() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:oldfeat".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            // Old client: has message_persisted but NOT spawn_complete.
+            features_for_spawn_complete_test(true, false),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        ledger.append_notification(background_message_persisted_for(&session_id));
+        ledger.append_notification(turn_spawn_complete_for(&session_id));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expected the legacy message/persisted within 1s")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            "first frame must be the legacy message/persisted shape for old clients",
+        );
+
+        // The new envelope must NOT be delivered to an un-negotiated client.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no second frame: turn/spawn_complete is suppressed for old clients",
         );
 
         abort_live_forwarders(&forwarders).await;
