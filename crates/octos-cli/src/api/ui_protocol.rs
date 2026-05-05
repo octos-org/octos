@@ -787,6 +787,37 @@ async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// rather backpressure the agent loop than balloon memory.
 const SEND_FILE_CHANNEL_CAPACITY: usize = 64;
 
+tokio::task_local! {
+    /// M10 Phase 1: task-local override for `MessagePersistedSource` read
+    /// by `install_message_commit_observer`. The
+    /// [`BackgroundResultSender`] callback enters this scope before
+    /// invoking [`persist_assistant_with_media`] so the resulting
+    /// `MessagePersistedEvent` carries `source: background` instead of
+    /// the role-derived `assistant` default. The per-connection
+    /// capability filter then identifies "this is a duplicate of a
+    /// `turn/spawn_complete`" and suppresses it for clients that
+    /// negotiated the new wire shape.
+    ///
+    /// Without this override the `Message` role is `Assistant`, the
+    /// observer maps it to `MessagePersistedSource::Assistant`, and
+    /// the duplicate-suppression branch at
+    /// `live_event_passes_capability_filter` never fires — which
+    /// codex flagged as a P1 against the Phase 1 wire contract.
+    static MESSAGE_PERSISTED_SOURCE_OVERRIDE: Option<MessagePersistedSource>;
+}
+
+/// Resolve the source for an upcoming `MessagePersistedEvent`. Returns the
+/// task-local override when one is set (e.g. inside the `BackgroundResultSender`
+/// scope), otherwise falls back to the role-derived default — preserving
+/// the pre-M10 behaviour for every other persist path.
+fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePersistedSource {
+    MESSAGE_PERSISTED_SOURCE_OVERRIDE
+        .try_with(|override_value| *override_value)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| MessagePersistedSource::from_role(role))
+}
+
 /// Shared persist helper used by the api/serve background-result sender
 /// (spawn_only completions) and the `send_file` sink. Builds an assistant
 /// `Message` with the given content + media + thread_id, writes it through
@@ -849,7 +880,13 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                     message.timestamp.timestamp_nanos_opt().unwrap_or(0)
                 ),
                 client_message_id: message.client_message_id.clone(),
-                source: MessagePersistedSource::from_role(message.role),
+                // M10 Phase 1: read the task-local source override
+                // first so a `BackgroundResultSender` persist (which
+                // duplicates a `turn/spawn_complete` envelope) emits
+                // `source: background`. The per-connection wire
+                // filter keys off this to suppress the duplicate for
+                // clients that negotiated `event.spawn_complete.v1`.
+                source: current_message_persisted_source(message.role),
                 // Placeholder; the ledger's `with_cursor` hook
                 // overwrites this with the assigned seq.
                 cursor: UiCursor {
@@ -4602,16 +4639,29 @@ async fn run_standalone_turn(
                             }
                         }
                     };
-                    let persisted = persist_assistant_with_media(
-                        &sessions,
-                        &data_dir,
-                        &session_id,
-                        content_text.clone(),
-                        media.clone(),
-                        thread_id.clone(),
-                        &task_label,
-                    )
-                    .await;
+                    // M10 Phase 1 (codex P1): scope the persist call in
+                    // the `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local
+                    // so `install_message_commit_observer` emits
+                    // `source: background` for this row. Without this,
+                    // `MessagePersistedSource::from_role(Assistant)`
+                    // would return `Assistant` and the per-connection
+                    // duplicate-suppression filter would never fire,
+                    // delivering both `message/persisted` AND
+                    // `turn/spawn_complete` to upgraded clients.
+                    let persisted = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                        .scope(
+                            Some(MessagePersistedSource::Background),
+                            persist_assistant_with_media(
+                                &sessions,
+                                &data_dir,
+                                &session_id,
+                                content_text.clone(),
+                                media.clone(),
+                                thread_id.clone(),
+                                &task_label,
+                            ),
+                        )
+                        .await;
                     // M10 Phase 1: even if persistence failed (rare —
                     // canonical path returned an error), still emit
                     // `turn/spawn_complete` so connected new-shape
@@ -10398,6 +10448,86 @@ mod tests {
         );
 
         abort_live_forwarders(&forwarders).await;
+    }
+
+    /// Codex P1: when the BackgroundResultSender persist scope is
+    /// active, `current_message_persisted_source` must report
+    /// `Background` regardless of the `Message` role. Outside the scope
+    /// it falls back to the role-derived default — the pre-M10
+    /// behaviour stays intact for every other persist path.
+    #[tokio::test]
+    async fn message_persisted_source_override_routes_through_task_local() {
+        // Outside any scope: role-derived default.
+        let default_for_assistant = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(default_for_assistant, MessagePersistedSource::Assistant);
+        let default_for_tool = current_message_persisted_source(MessageRole::Tool);
+        assert_eq!(default_for_tool, MessagePersistedSource::Tool);
+
+        // Inside the override scope (mirrors what the
+        // `BackgroundResultSender` closure does): every role maps to
+        // `Background`.
+        let bg = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+            .scope(Some(MessagePersistedSource::Background), async {
+                (
+                    current_message_persisted_source(MessageRole::Assistant),
+                    current_message_persisted_source(MessageRole::Tool),
+                )
+            })
+            .await;
+        assert_eq!(bg.0, MessagePersistedSource::Background);
+        assert_eq!(bg.1, MessagePersistedSource::Background);
+
+        // After the scope ends, the default behaviour is restored.
+        let after = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(after, MessagePersistedSource::Assistant);
+    }
+
+    /// Codex P2: every `turn/spawn_complete` event must carry the same
+    /// monotonically-assigned ledger seq as its envelope, NOT 0. Producers
+    /// seed `seq: 0` at construction (they don't know the assigned cursor
+    /// yet); `LedgeredUiProtocolEvent::with_cursor` stamps it during
+    /// `append_notification`. Without this, replay/dedup reduces every
+    /// spawn_complete to the same logical row.
+    #[tokio::test]
+    async fn ledger_stamps_turn_spawn_complete_seq_in_lockstep_with_cursor() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:seq".into());
+
+        // Append twice — each event must observe a distinct, monotonically
+        // increasing seq stamped onto BOTH the cursor and the flat
+        // `seq` field.
+        let first = ledger.append_notification(turn_spawn_complete_for(&session_id));
+        let second = ledger.append_notification(turn_spawn_complete_for(&session_id));
+
+        let extract_seq = |event: &UiProtocolLedgerEvent| -> Option<(u64, u64)> {
+            match event {
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => {
+                    Some((ev.seq, ev.cursor.seq))
+                }
+                _ => None,
+            }
+        };
+        let (first_seq, first_cursor_seq) =
+            extract_seq(&first.event).expect("first event is turn/spawn_complete");
+        let (second_seq, second_cursor_seq) =
+            extract_seq(&second.event).expect("second event is turn/spawn_complete");
+
+        assert!(
+            first_seq > 0,
+            "ledger must stamp non-zero seq onto first event"
+        );
+        assert_eq!(
+            first_seq, first_cursor_seq,
+            "flat seq must equal cursor seq for the same event",
+        );
+        assert!(
+            second_seq > first_seq,
+            "seq is strictly monotonic per session"
+        );
+        assert_eq!(
+            second_seq, second_cursor_seq,
+            "flat seq remains in lockstep with cursor seq across appends",
+        );
     }
 
     /// End-to-end through the live forwarder for an OLD client (did NOT

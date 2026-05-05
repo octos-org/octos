@@ -169,8 +169,14 @@ impl UiProtocolLedgerEvent {
                 // M10 Phase 1: same convention for the `turn/spawn_complete`
                 // envelope — the wire `cursor` field tracks the ledger
                 // seq so cursor-driven clients can resume cleanly across
-                // both event shapes.
+                // both event shapes. The flat `seq` field mirrors
+                // `MessagePersistedEvent.seq` (codex P2: producers seed
+                // 0 at construction; the assigned seq is only known
+                // here, so stamp both fields in lockstep — otherwise
+                // every spawn_complete arrives at the client as
+                // sequence 0 and reorder/dedup logic breaks).
                 UiNotification::TurnSpawnComplete(spawn_complete) => {
+                    spawn_complete.seq = cursor.seq;
                     spawn_complete.cursor = cursor;
                 }
                 _ => {}
