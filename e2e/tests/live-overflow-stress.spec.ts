@@ -146,18 +146,18 @@ const SCENARIOS: Scenario[] = [
   },
   {
     name: 'rapid-fire-five-fast',
-    // Wave-4 against `0.1.1+b78703bb` deterministically reproduces an
+    // Wave-4 against `0.1.1+b78703bb` deterministically reproduced an
     // M8.10 thread-binding regression on this scenario: all five 1+1=…
-    // turns are pure-fast (no spawn_only path), but late-arriving
-    // assistant tokens cluster under the LAST user thread instead of
+    // turns were pure-fast (no spawn_only path), but late-arriving
+    // assistant tokens clustered under the LAST user thread instead of
     // each turn's originating user. Filed in #740 as the follow-up to
-    // the #649/#664/#673/#680/#739 regression chain — the symptom is
-    // identical (sticky-map drift under fast bursts) but the failing
-    // path is the foreground SSE turn rather than spawn_only background
-    // delivery, so #739 (which only covers spawn_only originating cmid)
-    // does not fix it. Skipped here so the suite goes green; will
-    // re-enable as the regression check once #740 ships.
-    fixme_pending: '#740 — fast-burst sticky-map drift in foreground SSE',
+    // the #649/#664/#673/#680/#739 regression chain.
+    //
+    // Re-enabled post-M10: the M10 envelope migration (PRs #75/#79/
+    // #774/#782/#791 + the WS lane that replaces the legacy SSE foreground
+    // path) eliminates the sticky-map drift that #740 tracked. Verified
+    // PASS at workers=1 against `dspfac.crew.ominix.io` on 2026-05-06
+    // (5/5 real-content paired ~3s after the last send).
     messages: [
       { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
       { gap_ms: 800, text: '2+2 = ?', expected_in_response: ['4', '四'] },
@@ -173,10 +173,11 @@ const SCENARIOS: Scenario[] = [
     // which is the failure window most likely to be missed by the
     // 5-message rapid-fire scenario.
     name: 'seven-messages-mixed-pacing',
-    // Same #740 regression as `rapid-fire-five-fast` — the 5 arithmetic
-    // turns mid-scenario reproduce the foreground sticky-map drift.
-    // Skipped pending #740.
-    fixme_pending: '#740 — fast-burst sticky-map drift in foreground SSE',
+    // Same #740 regression as `rapid-fire-five-fast`. Re-enabled
+    // post-M10: PASS on 2026-05-06 against dspfac at workers=1
+    // (7/7 real-content paired ~12s after the last send). See
+    // `rapid-fire-five-fast` rationale above for the M10-envelope-
+    // migration justification.
     messages: [
       {
         gap_ms: 0,
@@ -303,12 +304,13 @@ const SCENARIOS: Scenario[] = [
     // times; each turn is well-separated so any drift across turns
     // shows as a binding collision or content-mismatch in the DOM.
     name: 'long-session-ten-messages',
-    // Same #740 regression as `rapid-fire-five-fast`. With 30s gaps
-    // each turn the SPA *should* finalise cleanly before the next
-    // user — but wave-4 against `0.1.1+b78703bb` shows even normal-
-    // paced bursts mis-route a fraction of late tokens once enough
-    // turns rotate. Skipped pending #740.
-    fixme_pending: '#740 — fast-burst sticky-map drift in foreground SSE',
+    // Same #740 regression as `rapid-fire-five-fast`. Re-enabled
+    // post-M10: PASS on 2026-05-06 against dspfac at workers=1
+    // (10/10 real-content paired ~3s after the last 30s-gap send,
+    // i.e. the harness saw no late-token drift across all 10 turns
+    // even after the sticky-map would historically have rotated).
+    // The M10 WS envelope replaces the sticky-map-driven foreground
+    // SSE path that fed the drift.
     messages: [
       { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
       { gap_ms: 30000, text: '2+2 = ?', expected_in_response: ['4', '四'] },
