@@ -199,16 +199,22 @@ fn standalone_api_session_key_candidates(
 ///    sessions persisted via that flow.
 /// 2. **Main-profile key** with topic — picks up sessions written before a
 ///    profile was promoted out of `_main`.
-/// 3. **Bare-channel key** with topic (`api:<id>#<topic>`) — what
-///    `run_standalone_turn` (the WS `turn/start` path) ends up using when the
-///    SPA sends a bare-channel `SessionKey` (e.g. `web-…`). M10.5 reload-mid-
-///    stream fix: without this candidate, REST returns `[]` for any session
-///    created by the WS path, causing the SPA to render an orphan completion
-///    bubble after a reload.
+/// 3. **Bare-channel key** with topic (`api:<id>#<topic>`) — what the WS
+///    `turn/start` path uses when the SPA sends a `SessionKey::new("api",
+///    "web-…")`. Without this REST returns `[]` for any session created via
+///    that flow.
+/// 4. **Raw-id key** (`<id>` or `<id>#<topic>`) — when the SPA sends a
+///    bare-channel `SessionKey` whose serialized form is just `web-…` (no
+///    `api:` prefix), `run_standalone_turn` calls
+///    `sessions.get_or_create(&SessionKey("web-…"))` and persists under that
+///    literal key. Picking this up requires a final raw-id candidate. Codex
+///    review P1 on the M10.5 reload-mid-stream PR — without it, the
+///    reload-mid-stream test still returns `[]` for that variant and the
+///    SPA still renders an orphan completion bubble.
 ///
 /// The dedup pass collapses duplicates when the profile resolves to
 /// `MAIN_PROFILE_ID` or when the topic is empty (in which case the bare-key
-/// form coincides with the no-topic key).
+/// and raw-id forms collapse with their no-topic counterparts).
 fn standalone_api_session_key_candidates_with_topic(
     state: &AppState,
     headers: &HeaderMap,
@@ -217,10 +223,16 @@ fn standalone_api_session_key_candidates_with_topic(
 ) -> Vec<SessionKey> {
     let profile_id = api_profile_id_from_headers(state, headers);
     let topic = topic.unwrap_or_default();
+    let raw_id = if topic.is_empty() {
+        SessionKey(session_id.to_string())
+    } else {
+        SessionKey(format!("{session_id}#{topic}"))
+    };
     let mut candidates = vec![
         SessionKey::with_profile_topic(&profile_id, "api", session_id, topic),
         SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic),
         SessionKey::with_topic("api", session_id, topic),
+        raw_id,
     ];
     candidates.dedup_by(|left, right| left.0 == right.0);
     candidates
@@ -898,16 +910,23 @@ pub async fn session_messages(
             };
             // M10.5 reload-mid-stream fix: WS turns persisted by `turn/start`
             // (which calls `sessions.get_or_create(&params.session_id)` with
-            // whatever `SessionKey` the SPA sent) may live under the bare
-            // channel key (`api:<id>`) rather than the profiled key
-            // (`<profile>:api:<id>`). The REST `/messages` lookup historically
-            // checked only the profiled key, so reload-mid-stream returned
-            // `[]` and the SPA rendered an orphan completion bubble.
+            // whatever `SessionKey` the SPA sent) may live under a key that
+            // does NOT match the profiled key (`<profile>:api:<id>`) the REST
+            // `/messages` lookup historically used. Concretely:
             //
-            // Fix: walk the candidate key list (profiled first, bare last) and
-            // return the first non-empty match. Order matches
-            // `standalone_api_session_key_candidates` so writes still land
-            // under the canonical (profiled) key — only the read path widens.
+            //   • Bare channel key (`api:<id>`) — `with_profile_topic`
+            //     fall-through when no profile context is set.
+            //   • Raw SPA id (`web-…`) — when the SPA sends a bare-channel
+            //     `SessionKey::new("web-…")` literally, the WS handler
+            //     persists under `web-…` verbatim (no `api:` prefix).
+            //
+            // Fix: walk the candidate key list (profiled first, bare last)
+            // and return the first candidate that *has any history* (not
+            // just any rows on this page) — using `messages.is_empty()`
+            // after `skip(offset).take(limit)` would silently fall through
+            // to a sibling key whenever the requested page is past the end
+            // of the canonical session, mixing histories under pagination
+            // (codex review P2).
             let candidate_keys = standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
@@ -915,7 +934,15 @@ pub async fn session_messages(
                 params.topic.as_deref(),
             );
             let mut sess = sessions.lock().await;
+            let mut chosen: Option<&SessionKey> = None;
             for key in &candidate_keys {
+                let session = sess.get_or_create(key).await;
+                if !session.get_history(1).is_empty() {
+                    chosen = Some(key);
+                    break;
+                }
+            }
+            if let Some(key) = chosen {
                 let session = sess.get_or_create(key).await;
                 let messages: Vec<MessageInfo> = session
                     .get_history(fetch_count)
@@ -929,11 +956,12 @@ pub async fn session_messages(
                         thread_id: m.thread_id.clone(),
                     })
                     .collect();
-                if !messages.is_empty() {
-                    return Json(messages).into_response();
-                }
+                // Keep the historical contract: a page that is past the
+                // end of a real session returns `[]` (and stays on this
+                // session — does NOT flip to a sibling candidate).
+                return Json(messages).into_response();
             }
-            // Fall through to gateway if no candidate has history.
+            // Fall through to gateway if no candidate has any history.
         }
     } // !use_full
 
@@ -3642,18 +3670,26 @@ mod tests {
 
         // No tenant_store on the AppState -> profile resolution returns the
         // synthetic main-profile id. The candidate list still contains the
-        // bare-channel form so `run_standalone_turn`'s `api:web-…` writes
-        // are reachable from REST.
+        // bare-channel and raw-id forms so `run_standalone_turn`'s WS-side
+        // writes are reachable from REST regardless of which `SessionKey`
+        // shape the SPA sent.
         let candidates =
             standalone_api_session_key_candidates_with_topic(&state, &headers, "web-7c9e", None);
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         // Profiled key must come first so existing chat-history reads keep
         // hitting the canonical write target before walking fallbacks.
         assert_eq!(keys.first().copied(), Some("_main:api:web-7c9e"));
-        // Bare-channel key must be present so REST returns WS-persisted rows.
+        // Bare-channel key must be present so REST returns WS-persisted rows
+        // for `SessionKey::new("api", "web-…")`.
         assert!(
             keys.iter().any(|k| *k == "api:web-7c9e"),
             "bare-channel candidate missing from {keys:?}"
+        );
+        // Raw-id key must be present so REST returns rows when the SPA sent
+        // a bare `SessionKey("web-…")` (no `api:` prefix). Codex P1.
+        assert!(
+            keys.iter().any(|k| *k == "web-7c9e"),
+            "raw-id candidate missing from {keys:?}"
         );
     }
 
@@ -3727,6 +3763,148 @@ mod tests {
         assert_eq!(messages[0]["content"], "hi please weather");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "on it");
+    }
+
+    /// Codex review P2 regression: the fallback decision must be based on
+    /// whether the candidate session has *any* history, not on whether the
+    /// requested page is non-empty. Otherwise, when the canonical session
+    /// has rows but the requested page is past the end, REST silently
+    /// switches to a sibling candidate's history under pagination,
+    /// corrupting the response stream.
+    #[tokio::test]
+    async fn session_messages_does_not_mix_candidate_histories_under_pagination() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // The "real" session (under the canonical profiled key) has 2 rows.
+        let profiled_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-pagi");
+        // A sibling bare-key session has 1 unrelated row (e.g. left over
+        // from an earlier WS write before profile promotion).
+        let bare_key = SessionKey::new("api", "web-pagi");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&profiled_key, Message::user("page one user"))
+                .await
+                .unwrap();
+            sess.add_message(
+                &profiled_key,
+                Message::assistant_with_thread(
+                    "page one reply",
+                    octos_core::ThreadId::new("thread-pagi-1"),
+                ),
+            )
+            .await
+            .unwrap();
+            sess.add_message(&bare_key, Message::user("UNRELATED bare-key row"))
+                .await
+                .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        // Request a page past the end of the profiled session: offset=10,
+        // limit=10. Pre-fix this returned the bare-key's
+        // `UNRELATED bare-key row`. Post-fix it returns `[]` and stays
+        // anchored to the profiled session.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+        let response = session_messages(
+            State(state),
+            headers,
+            axum::extract::Path("web-pagi".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 10,
+                offset: 10,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            messages.is_empty(),
+            "page past end of profiled session must return [] without leaking bare-key rows: {messages:?}"
+        );
+    }
+
+    /// Codex review P1 regression: when the SPA sends a bare `SessionKey`
+    /// whose serialized form is the literal SPA id (e.g. `web-…`, no
+    /// `api:` prefix), `run_standalone_turn` persists under that raw key.
+    /// The fallback list MUST include the raw-id candidate so REST reaches
+    /// those rows after a reload.
+    #[tokio::test]
+    async fn session_messages_falls_back_to_raw_id_for_bareless_session_keys() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist under the raw id (no `api:` prefix) — this is what the
+        // WS handler ends up doing when the SPA sends `SessionKey("web-…")`
+        // verbatim.
+        let raw_key = SessionKey("web-raw-id-only".to_string());
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&raw_key, Message::user("raw user"))
+                .await
+                .unwrap();
+            sess.add_message(
+                &raw_key,
+                Message::assistant_with_thread(
+                    "raw reply",
+                    octos_core::ThreadId::new("thread-raw"),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+        let response = session_messages(
+            State(state),
+            headers,
+            axum::extract::Path("web-raw-id-only".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 2, "raw-id fallback must surface rows");
+        assert_eq!(messages[0]["content"], "raw user");
+        assert_eq!(messages[1]["content"], "raw reply");
     }
 
     #[tokio::test]
