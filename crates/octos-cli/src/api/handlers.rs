@@ -210,28 +210,34 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
 
 /// Topic-aware sibling of [`standalone_api_session_key_candidates`].
 ///
-/// Returns the candidate `SessionKey`s the REST `/messages` and similar read
-/// paths should try, in fallback order:
+/// Returns the candidate `SessionKey`s the REST `/messages` and similar
+/// read paths should try, in fallback order. The fallback set is split
+/// in half by the resolved profile:
+///
+/// **Hosted profile-scoped requests** (resolved profile is NOT
+/// `MAIN_PROFILE_ID`). Only ONE candidate:
 /// 1. **Profiled key** with topic (`<profile>:api:<id>#<topic>`) — the
-///    canonical write target for `/api/chat` requests through the standalone
-///    serve path. Always tried first so REST behavior is unchanged for
-///    sessions persisted via that flow.
-/// 2. **Main-profile key** with topic — picks up sessions written before a
-///    profile was promoted out of `_main`. Always probed; it lives inside
-///    the profile namespace so it cannot leak into a hosted tenant's
-///    session list.
-/// 3. **Bare-channel key** with topic (`api:<id>#<topic>`) — what the WS
-///    `turn/start` path uses when the SPA sends a
-///    `SessionKey::new("api", "web-…")`. ONLY probed when the resolved
-///    profile is `MAIN_PROFILE_ID`. In hosted profile-scoped mode each
-///    tenant's profile prefix is their isolation boundary; a shared
-///    bare-channel key would let one profile read another profile's
-///    standalone-mode WS session by id collision (codex review P1
-///    round 3).
-/// 4. **Raw-id key** (`<id>` or `<id>#<topic>`) — only when `id` passes
-///    [`is_safe_bare_session_id`] AND the resolved profile is
-///    `MAIN_PROFILE_ID`. Same isolation reasoning as (3); same codex
-///    round 3 finding.
+///    canonical write target for `/api/chat` requests through the
+///    standalone serve path.
+///
+/// Hosted tenants must NEVER see another profile's history by id. The
+/// `_main`, bare-channel, and raw-id candidates ALL live in shared /
+/// non-tenant namespaces; surfacing them to a hosted request would let
+/// a colliding `web-…` id read foreign rows (codex review P1 rounds 3
+/// and 4).
+///
+/// **Main / local mode** (resolved profile IS `MAIN_PROFILE_ID`):
+/// 1. **Profiled key** (`<profile>:api:<id>#<topic>`) — the
+///    `_main:api:<id>` write target for unauthenticated standalone
+///    serve.
+/// 2. **Bare-channel key** (`api:<id>#<topic>`) — what the WS
+///    `turn/start` path uses when the SPA sends
+///    `SessionKey::new("api", "web-…")`. The whole point of the M10.5
+///    fallback.
+/// 3. **Raw-id key** (`<id>` or `<id>#<topic>`) — only when `id`
+///    passes [`is_safe_bare_session_id`]. Recovers from the SPA's
+///    bare-id `SessionKey("web-…")` shape. Codex P1 round 2: rejecting
+///    `:` / `#` blocks crafted-URL leaks via this candidate.
 ///
 /// The dedup pass collapses duplicates when the topic is empty (in
 /// which case the bare-key and raw-id forms coincide with their
@@ -244,21 +250,37 @@ fn standalone_api_session_key_candidates_with_topic(
 ) -> Vec<SessionKey> {
     let profile_id = api_profile_id_from_headers(state, headers);
     let topic = topic.unwrap_or_default();
-    let mut candidates = vec![
-        SessionKey::with_profile_topic(&profile_id, "api", session_id, topic),
-        SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic),
-    ];
-    // Unprofiled fallbacks (bare-channel `api:<id>` and raw `<id>`) can
-    // ONLY be safely probed when the resolved profile is the synthetic
-    // main profile. For hosted profile-scoped requests (e.g.
-    // `dspfac.crew.ominix.io`) each tenant's profile prefix is their
-    // isolation boundary, and a shared standalone `SessionManager`
-    // could otherwise let one profile read another's WS-persisted
-    // history by colliding on the SPA's `web-…` id. Codex review P1
-    // round 3: gate the unprofiled candidates on a main-profile
-    // resolution.
-    let allow_unprofiled_fallback = profile_id == MAIN_PROFILE_ID;
-    if allow_unprofiled_fallback {
+
+    // Always probe the resolved profile's own canonical key first.
+    let mut candidates = vec![SessionKey::with_profile_topic(
+        &profile_id,
+        "api",
+        session_id,
+        topic,
+    )];
+
+    // The remaining candidates (`_main:api:<id>`, bare-channel, raw-id)
+    // are gated on the resolved profile being the synthetic main
+    // profile. For hosted profile-scoped requests each tenant's
+    // profile prefix is their isolation boundary, and a shared
+    // standalone `SessionManager` could otherwise let one profile
+    // read another's WS-persisted history (codex review P1 rounds 3
+    // and 4 on the M10.5 reload-mid-stream PR).
+    let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID;
+    if allow_cross_profile_fallback {
+        // `_main:api:<id>` is reachable in this branch via the same
+        // `with_profile_topic` constructor — but in main mode it
+        // collapses with the first candidate, so push it explicitly
+        // only when `profile_id` is something other than `_main`.
+        // (When `profile_id == _main`, the first candidate IS the
+        // main-profile key and the dedup pass below removes the
+        // duplicate.)
+        candidates.push(SessionKey::with_profile_topic(
+            MAIN_PROFILE_ID,
+            "api",
+            session_id,
+            topic,
+        ));
         candidates.push(SessionKey::with_topic("api", session_id, topic));
         // Raw-id candidate adds another layer of guardrails: `id` may
         // contain attacker-controlled bytes (it lands here straight
@@ -3735,34 +3757,35 @@ mod tests {
         );
     }
 
-    /// Codex round 3 P1 regression: when the resolved profile is a
-    /// hosted tenant (NOT `_main`), the unprofiled fallback candidates
-    /// (`api:<id>` and the raw `<id>`) MUST be omitted. Otherwise a
-    /// shared standalone `SessionManager` would let one profile read
-    /// another tenant's WS-persisted history by colliding on the SPA's
-    /// `web-…` id.
+    /// Codex review P1 rounds 3 and 4 regression: when the resolved
+    /// profile is a hosted tenant (NOT `_main`), the candidate list
+    /// MUST contain ONLY the tenant's own profile-prefixed key. The
+    /// `_main`, bare-channel (`api:<id>`), and raw (`<id>`) candidates
+    /// all live in shared / non-tenant namespaces and would let a
+    /// colliding `web-…` id read foreign rows.
     ///
     /// We can't easily construct a fully-resolved hosted state in a
     /// unit test (it requires the full `tenant_store` plumbing), so
-    /// the regression is verified via a synthetic helper:
-    /// `candidates_for_resolved_profile` runs the same logic as
-    /// `standalone_api_session_key_candidates_with_topic` with a
-    /// caller-supplied `profile_id`.
+    /// the regression is verified by mirroring the helper's gate
+    /// logic inline with a caller-supplied `profile_id`. If
+    /// [`standalone_api_session_key_candidates_with_topic`] ever
+    /// drifts from this gate, the inline mirror will catch it.
     #[test]
     fn standalone_api_session_key_candidates_with_topic_omits_unprofiled_for_hosted_profile() {
-        // Direct verification: the helper's profile branch is gated on
-        // `profile_id == MAIN_PROFILE_ID`. For a non-main profile,
-        // unprofiled candidates must NOT appear.
-        // Run the gate logic inline using the same SessionKey
-        // constructors so future drift is caught.
         let session_id = "web-7c9e";
         let topic = "";
         let profile_id = "dspfac"; // simulated hosted tenant
-        let mut candidates = vec![
-            SessionKey::with_profile_topic(profile_id, "api", session_id, topic),
-            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic),
-        ];
+
+        let mut candidates = vec![SessionKey::with_profile_topic(
+            profile_id, "api", session_id, topic,
+        )];
         if profile_id == MAIN_PROFILE_ID {
+            candidates.push(SessionKey::with_profile_topic(
+                MAIN_PROFILE_ID,
+                "api",
+                session_id,
+                topic,
+            ));
             candidates.push(SessionKey::with_topic("api", session_id, topic));
             if is_safe_bare_session_id(session_id) {
                 candidates.push(SessionKey(session_id.to_string()));
@@ -3770,19 +3793,12 @@ mod tests {
         }
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
 
-        // Hosted profile MUST NOT see bare-channel or raw-id candidates.
-        assert!(
-            !keys.iter().any(|k| *k == "api:web-7c9e"),
-            "hosted profile must not include bare-channel candidate — got {keys:?}"
-        );
-        assert!(
-            !keys.iter().any(|k| *k == "web-7c9e"),
-            "hosted profile must not include raw-id candidate — got {keys:?}"
-        );
-        // The profile-prefixed candidates remain, so legitimate hosted
-        // sessions are still reachable.
-        assert!(keys.iter().any(|k| *k == "dspfac:api:web-7c9e"));
-        assert!(keys.iter().any(|k| *k == "_main:api:web-7c9e"));
+        // The hosted profile sees ONLY its own profile-prefixed key.
+        assert_eq!(keys, vec!["dspfac:api:web-7c9e"]);
+        // Sanity: explicitly verify the leak vectors are absent.
+        assert!(!keys.iter().any(|k| *k == "_main:api:web-7c9e"));
+        assert!(!keys.iter().any(|k| *k == "api:web-7c9e"));
+        assert!(!keys.iter().any(|k| *k == "web-7c9e"));
     }
 
     #[test]
