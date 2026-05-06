@@ -331,6 +331,12 @@ impl Agent {
                 // depth into the spawn_only TOOL_CTX builder.
                 let bg_spawn_depth = spawn_depth;
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
+                // M10 Phase 4: keep a copy of the task_id so the synthesized
+                // tool-result message returned to the LLM (built after this
+                // `tokio::spawn` moves `task_id` into the closure) can carry
+                // the same handle the supervisor and the SubAgentOutputRouter
+                // know it by.
+                let task_id_for_handle = task_id.clone();
                 tokio::spawn(async move {
                     bg_supervisor.mark_running(&task_id);
                     // M8.7 (item 4): start a periodic-summary watcher for
@@ -915,10 +921,29 @@ impl Agent {
                     output_preview: "Running in background — audio will be sent when ready.".into(),
                     duration: tool_start.elapsed(),
                 });
+                // M10 Phase 4 — agent context isolation: hand the LLM a
+                // small `task_handle` JSON envelope instead of the full
+                // tool output. The full result is still persisted via the
+                // M8.7 router and delivered to the SPA via
+                // `turn.spawn_complete`; the agent now reads selectively
+                // via `read_task_output`.
+                //
+                // Codex P2 (round 1+2): gate the envelope on the
+                // `read_task_output` tool actually being VISIBLE to the
+                // LLM in this turn — registered AND not filtered out by
+                // provider policy / deferred set / context tag filter.
+                // Otherwise the envelope advertises a tool the LLM was
+                // not offered. Fall back to the legacy free-text message
+                // for those entry points.
+                let handle_payload = if tools.is_tool_visible("read_task_output") {
+                    tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[])
+                } else {
+                    tools.spawn_only_message(&tc_name)
+                };
                 return (
                     Message {
                         role: MessageRole::Tool,
-                        content: tools.spawn_only_message(&tc_name),
+                        content: handle_payload,
                         media: vec![],
                         tool_calls: None,
                         tool_call_id: Some(tc_id),
