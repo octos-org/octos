@@ -1558,6 +1558,39 @@ pub struct SessionHydrateResult {
     pub turns: Option<Vec<HydratedTurn>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<ApprovalRequestedEvent>>,
+    /// M10 Phase 6.2 (Bug C). Retained `turn/spawn_complete` envelopes
+    /// from the ledger replay window for clients that negotiated
+    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]. Populated only when
+    /// the request asks for `messages` (the dedup target) and the
+    /// connection has the capability negotiated; absent otherwise so
+    /// the legacy wire shape is preserved bit-for-bit for older
+    /// clients.
+    ///
+    /// Semantics for negotiated clients on a full reload (where
+    /// `session/open` with no `after` returns no historical replay
+    /// and the `messages` list necessarily includes the legacy
+    /// `Background`-source rows):
+    ///
+    ///   * Each envelope's `message_id` matches exactly one Background
+    ///     row in `messages` — that row is the spawn-ack, the
+    ///     canonical visible bubble for the completion.
+    ///   * Per-file `send_file` companion rows (Background source,
+    ///     emitted before the ack) are NOT carried on the envelope as
+    ///     individual `message_id`s; their content is summarised by
+    ///     the envelope's `media` array.
+    ///
+    /// A reducer that wants the "single bubble per completion" wire
+    /// shape on reload should: (a) render the envelope, (b) drop the
+    /// matching spawn-ack row (`message_id` match) plus any Background
+    /// rows in the envelope's thread that precede the spawn-ack and
+    /// don't match any retained envelope's `message_id`. The server
+    /// declines to make this decision because it has no way to
+    /// distinguish "row covered by an envelope that has aged out" from
+    /// "row covered by an envelope that never landed (persist
+    /// failed)" — see the multi-task per-turn and orphan-companion
+    /// edge cases codex flagged on PR landing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
 }
 
 // ----- UPCR-2026-010 `thread/graph/get` -----
@@ -5231,6 +5264,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: Some(vec![]),
+            replayed_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
         let parsed: SessionHydrateResult =
@@ -5245,6 +5279,7 @@ mod tests {
             threads: None,
             turns: None,
             pending_approvals: None,
+            replayed_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
         let object = value.as_object().expect("hydrate result is object");
@@ -5252,6 +5287,8 @@ mod tests {
         assert!(!object.contains_key("threads"));
         assert!(!object.contains_key("turns"));
         assert!(!object.contains_key("pending_approvals"));
+        // Bug C: a non-negotiated client never sees the new field.
+        assert!(!object.contains_key("replayed_envelopes"));
     }
 
     #[test]
