@@ -1498,10 +1498,29 @@ pub struct HydratedMessage {
     /// rows against [`SessionHydrateResult::replayed_envelopes`]
     /// envelope `message_id`s when deciding which legacy
     /// `Background`-source rows to render and which to coalesce
-    /// behind a single envelope bubble. Omitted from the wire when
-    /// `None` so legacy clients see the pre-fix shape.
+    /// behind a single envelope bubble. Server populates this only
+    /// for connections that negotiated
+    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]; otherwise omitted
+    /// so non-negotiated clients see the pre-fix wire shape
+    /// bit-for-bit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// M10 Phase 6.2 (Bug C). Wire-form
+    /// [`MessagePersistedSource`] for the row, captured from the
+    /// retained `message/persisted` ledger event matching this row's
+    /// `seq`. Negotiated clients use this in combination with
+    /// [`SessionHydrateResult::replayed_envelopes`] to coalesce the
+    /// per-file `send_file` companion rows behind a single envelope
+    /// bubble: a row with `source == "background"` whose
+    /// `message_id` does NOT match any envelope's `message_id` is
+    /// the kind the live wire suppresses for negotiated clients.
+    /// Omitted when the row's commit ledger event has aged out of
+    /// the retention window OR the connection didn't negotiate
+    /// `event.spawn_complete.v1` — in those cases the client falls
+    /// back to the legacy multi-row render (one extra bubble vs
+    /// live, but never lossy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// File attachments stored with this row in the canonical session
     /// JSONL — surfaced so clients reconstructing history after a
     /// disconnect can render the same attachment they would have rendered
@@ -1718,6 +1737,20 @@ impl MessagePersistedSource {
             // covered by `message/persisted`; treat as assistant for the
             // typed enum since `system` is not a registered source.
             crate::types::MessageRole::System => Self::Assistant,
+        }
+    }
+
+    /// Wire-form discriminant string. Mirrors the snake_case serde
+    /// rename and matches what serializing the enum to a JSON string
+    /// would produce. Used by the `session/hydrate` projection to
+    /// surface per-row provenance on `HydratedMessage.source`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::Background => "background",
+            Self::Recovery => "recovery",
         }
     }
 }
@@ -5260,6 +5293,7 @@ mod tests {
                 client_message_id: Some("cmid-1".into()),
                 persisted_at: sample_persisted_at(),
                 message_id: Some("local:demo:17:1700000000000000000".into()),
+                source: Some("user".into()),
                 media: vec![],
             }]),
             threads: Some(vec![ThreadGraphEntry {

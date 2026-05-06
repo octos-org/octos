@@ -3439,6 +3439,32 @@ async fn handle_session_hydrate(
         None
     };
 
+    // Codex Bug C round-6: gate the new identity/provenance fields
+    // on `features.spawn_complete`. Without negotiation we leave
+    // `HydratedMessage.message_id` and `HydratedMessage.source` as
+    // `None` so legacy clients (TUI, pre-spawn_complete SPA bundles,
+    // strict-codegen consumers) see byte-identical wire. With
+    // negotiation we synthesize `message_id` (mirrors
+    // `MessageCommitObserver`'s formula) and lift `source` from the
+    // retained `MessagePersisted` events — giving the client the
+    // identity AND provenance signals it needs to drop both the
+    // spawn-ack row AND the per-file companion rows in favour of the
+    // envelope on hydrate-time dedup.
+    let row_sources: HashMap<u64, String> = if features.spawn_complete && include_set.messages {
+        replayed
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) => {
+                    Some((ev.seq, ev.source.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let expose_message_id = features.spawn_complete && include_set.messages;
+
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
     let (messages, threads_projection) = {
@@ -3454,31 +3480,42 @@ async fn handle_session_hydrate(
                         Some(after) => *seq as u64 > after.seq,
                         None => true,
                     })
-                    .map(|(seq, msg)| HydratedMessage {
-                        seq: seq as u64,
-                        role: msg.role.as_str().to_owned(),
-                        content: msg.content.clone(),
-                        turn_id: None, // Message struct does not carry typed turn_id today
-                        thread_id: msg.thread_id.clone(),
-                        client_message_id: msg.client_message_id.clone(),
-                        persisted_at: msg.timestamp,
-                        // M10 Phase 6.2 (Bug C): mirror
-                        // `MessageCommitObserver`'s `(session, seq,
-                        // timestamp_nanos)` `message_id` so a
-                        // negotiated client can match rows against
-                        // `replayed_envelopes` for hydrate-time dedup.
-                        message_id: Some(format!(
-                            "{}:{seq}:{}",
-                            params.session_id.0,
-                            msg.timestamp.timestamp_nanos_opt().unwrap_or(0),
-                        )),
-                        // P1.3 fix: surface canonical-ledger media so a
-                        // client reconnecting after a disconnect can
-                        // re-render the same `.md` / `.mp3` / `.pptx`
-                        // attachment it would have seen via the live
-                        // `message/persisted` push (`media` field on
-                        // MessagePersistedEvent).
-                        media: msg.media.clone(),
+                    .map(|(seq, msg)| {
+                        let seq = seq as u64;
+                        // M10 Phase 6.2 (Bug C). Negotiated clients
+                        // get `(message_id, source)` so they can
+                        // dedup the hydrated rows against
+                        // `replayed_envelopes`. Non-negotiated
+                        // clients keep the pre-fix shape (both
+                        // fields `None`, omitted from the wire).
+                        let message_id = if expose_message_id {
+                            Some(format!(
+                                "{}:{seq}:{}",
+                                params.session_id.0,
+                                msg.timestamp.timestamp_nanos_opt().unwrap_or(0),
+                            ))
+                        } else {
+                            None
+                        };
+                        let source = row_sources.get(&seq).cloned();
+                        HydratedMessage {
+                            seq,
+                            role: msg.role.as_str().to_owned(),
+                            content: msg.content.clone(),
+                            turn_id: None, // Message struct does not carry typed turn_id today
+                            thread_id: msg.thread_id.clone(),
+                            client_message_id: msg.client_message_id.clone(),
+                            persisted_at: msg.timestamp,
+                            message_id,
+                            source,
+                            // P1.3 fix: surface canonical-ledger media so a
+                            // client reconnecting after a disconnect can
+                            // re-render the same `.md` / `.mp3` / `.pptx`
+                            // attachment it would have seen via the live
+                            // `message/persisted` push (`media` field on
+                            // MessagePersistedEvent).
+                            media: msg.media.clone(),
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
@@ -10234,6 +10271,43 @@ mod tests {
             session_id.0,
             spawn_ack_ts.timestamp_nanos_opt().unwrap_or(0),
         );
+        // Append the matching `MessagePersisted` events so the
+        // hydrate handler can surface `source: background` on the
+        // hydrated rows (mirrors what `MessageCommitObserver` would
+        // emit at live persist time under the
+        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local).
+        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            seq: 1,
+            role: "assistant".into(),
+            message_id: format!("{}:1:0", session_id.0),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        }));
+        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            seq: 2,
+            role: "assistant".into(),
+            message_id: spawn_ack_message_id.clone(),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        }));
         ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
             session_id: session_id.clone(),
             turn_id: None,
@@ -10294,6 +10368,29 @@ mod tests {
             spawn_ack_row["message_id"], spawn_ack_message_id,
             "spawn-ack row must expose message_id matching the envelope",
         );
+        // Codex Bug C round-6: per-row provenance. The companion
+        // and spawn-ack rows surface `source: "background"` so the
+        // client can drop them in favour of the envelope. Without
+        // `source`, the client could only dedup the spawn-ack and
+        // companion rows would still render as duplicate bubbles.
+        let companion_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 1)
+            .expect("seq=1 companion row");
+        assert_eq!(companion_row["source"], "background");
+        assert_eq!(spawn_ack_row["source"], "background");
+        let user_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 0)
+            .expect("seq=0 user row");
+        // The user row never had a `MessagePersisted` ledger event in
+        // this test (we only seeded background events), so its
+        // `source` is omitted. That's fine: the client doesn't need
+        // provenance for non-coalescible rows.
+        assert!(
+            user_row.get("source").map(|v| v.is_null()).unwrap_or(true),
+            "user row's source field is omitted absent a matching ledger event; got: {user_row:?}",
+        );
         let envelopes = frame_new["result"]["replayed_envelopes"]
             .as_array()
             .expect("replayed_envelopes array");
@@ -10339,6 +10436,21 @@ mod tests {
             "legacy clients see byte-identical wire (no replayed_envelopes key); got keys: {:?}",
             result.keys().collect::<Vec<_>>(),
         );
+        // Codex Bug C round-6: non-negotiated clients also see the
+        // pre-fix `messages` shape — no `message_id`, no `source`
+        // keys. This protects strict-codegen consumers that have no
+        // `replayed_envelopes` to bind to.
+        for msg in messages_legacy {
+            let msg_obj = msg.as_object().expect("message object");
+            assert!(
+                !msg_obj.contains_key("message_id"),
+                "legacy client message MUST NOT carry message_id; got: {msg_obj:?}",
+            );
+            assert!(
+                !msg_obj.contains_key("source"),
+                "legacy client message MUST NOT carry source; got: {msg_obj:?}",
+            );
+        }
     }
 
     /// Bug C corollary: a negotiated client whose hydrate request
