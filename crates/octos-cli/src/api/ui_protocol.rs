@@ -1558,6 +1558,7 @@ async fn ui_protocol_connection(
                     &contracts.approvals,
                     &active_turns,
                     connection_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -3344,6 +3345,7 @@ async fn handle_session_hydrate(
     approvals: &PendingApprovalStore,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
     params: SessionHydrateParams,
 ) {
@@ -3403,23 +3405,71 @@ async fn handle_session_hydrate(
             return;
         }
     }
+    // M10 Phase 6.2 (Bug C). Closes the Phase 5a documented punt by
+    // surfacing every retained `turn/spawn_complete` envelope from the
+    // ledger replay window on the hydrate response when (and only
+    // when) the client negotiated `event.spawn_complete.v1`. Server
+    // does NOT suppress the legacy `Background`-source rows in
+    // `messages` — the `SessionHydrateResult` payload has no
+    // alternative channel for the envelope's `content`/`media`, and
+    // codex's review rounds on the suppression-side designs surfaced
+    // multiple correctness regressions (NotConfigured-branch empty
+    // media, multi-task per-turn ambiguity, orphan companions from
+    // failed final-ack persists). Negotiated clients dedup against
+    // `replayed_envelopes` on their side using `message_id` —
+    // mirroring the live wire's split: producer emits both shapes,
+    // consumer chooses one per `event.spawn_complete.v1` capability.
+    //
+    // Non-negotiated clients receive `replayed_envelopes: None`
+    // (omitted via `skip_serializing_if`); the `messages` payload they
+    // see is byte-identical to pre-fix.
+    let replayed_envelopes = if features.spawn_complete && include_set.messages {
+        Some(
+            replayed
+                .iter()
+                .filter_map(|event| match &event.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => {
+                        Some(ev.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
+    // Codex Bug C round-6: gate the new identity/provenance fields
+    // on `features.spawn_complete`. Without negotiation we leave
+    // `HydratedMessage.message_id` and `HydratedMessage.source` as
+    // `None` so legacy clients (TUI, pre-spawn_complete SPA bundles,
+    // strict-codegen consumers) see byte-identical wire. With
+    // negotiation we synthesize `message_id` (mirrors
+    // `MessageCommitObserver`'s formula) and lift `source` from the
+    // retained `MessagePersisted` events — giving the client the
+    // identity AND provenance signals it needs to drop both the
+    // spawn-ack row AND the per-file companion rows in favour of the
+    // envelope on hydrate-time dedup.
+    let row_sources: HashMap<u64, String> = if features.spawn_complete && include_set.messages {
+        replayed
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) => {
+                    Some((ev.seq, ev.source.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let expose_message_id = features.spawn_complete && include_set.messages;
+
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
     let (messages, threads_projection) = {
         let mut sessions_guard = sessions.lock().await;
         let session = sessions_guard.get_or_create(&params.session_id).await;
-        // M10 Phase 5a known-limitation: hydrate returns the raw `Message`
-        // history without per-row `source` filtering. For dual-negotiated
-        // clients the `event.spawn_complete.v1` capability suppresses
-        // duplicate `Background`-source rows on the LIVE wire, but the
-        // hydrate path has no such filter today — `Message` does not carry
-        // a source field. After a `session/hydrate` (e.g. on page reload)
-        // a new client receives the per-file rows + the spawn-ack row
-        // alongside the durable `turn/spawn_complete` envelope, restoring
-        // pre-Phase-5a multi-bubble rendering until Phase 6 plumbs source
-        // (or a turn/spawn_complete-aware hydrate replay) through. The
-        // live path probe (the wave-6m gate) is not affected. Tracked as
-        // a follow-up — see codex round on Phase 5a.
         let messages = if include_set.messages {
             Some(
                 session
@@ -3430,21 +3480,42 @@ async fn handle_session_hydrate(
                         Some(after) => *seq as u64 > after.seq,
                         None => true,
                     })
-                    .map(|(seq, msg)| HydratedMessage {
-                        seq: seq as u64,
-                        role: msg.role.as_str().to_owned(),
-                        content: msg.content.clone(),
-                        turn_id: None, // Message struct does not carry typed turn_id today
-                        thread_id: msg.thread_id.clone(),
-                        client_message_id: msg.client_message_id.clone(),
-                        persisted_at: msg.timestamp,
-                        // P1.3 fix: surface canonical-ledger media so a
-                        // client reconnecting after a disconnect can
-                        // re-render the same `.md` / `.mp3` / `.pptx`
-                        // attachment it would have seen via the live
-                        // `message/persisted` push (`media` field on
-                        // MessagePersistedEvent).
-                        media: msg.media.clone(),
+                    .map(|(seq, msg)| {
+                        let seq = seq as u64;
+                        // M10 Phase 6.2 (Bug C). Negotiated clients
+                        // get `(message_id, source)` so they can
+                        // dedup the hydrated rows against
+                        // `replayed_envelopes`. Non-negotiated
+                        // clients keep the pre-fix shape (both
+                        // fields `None`, omitted from the wire).
+                        let message_id = if expose_message_id {
+                            Some(format!(
+                                "{}:{seq}:{}",
+                                params.session_id.0,
+                                msg.timestamp.timestamp_nanos_opt().unwrap_or(0),
+                            ))
+                        } else {
+                            None
+                        };
+                        let source = row_sources.get(&seq).cloned();
+                        HydratedMessage {
+                            seq,
+                            role: msg.role.as_str().to_owned(),
+                            content: msg.content.clone(),
+                            turn_id: None, // Message struct does not carry typed turn_id today
+                            thread_id: msg.thread_id.clone(),
+                            client_message_id: msg.client_message_id.clone(),
+                            persisted_at: msg.timestamp,
+                            message_id,
+                            source,
+                            // P1.3 fix: surface canonical-ledger media so a
+                            // client reconnecting after a disconnect can
+                            // re-render the same `.md` / `.mp3` / `.pptx`
+                            // attachment it would have seen via the live
+                            // `message/persisted` push (`media` field on
+                            // MessagePersistedEvent).
+                            media: msg.media.clone(),
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
@@ -3498,6 +3569,7 @@ async fn handle_session_hydrate(
         threads,
         turns,
         pending_approvals,
+        replayed_envelopes,
     };
     send_serialized_rpc_result(
         ws,
@@ -9841,6 +9913,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            ConnectionUiFeatures::default(),
             "h1".into(),
             SessionHydrateParams {
                 session_id: session_id.clone(),
@@ -10118,6 +10191,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            ConnectionUiFeatures::default(),
             "h-unknown".into(),
             SessionHydrateParams {
                 session_id: SessionKey("local:nope".into()),
@@ -10130,6 +10204,312 @@ mod tests {
         let frame = recv_rpc_json(&mut rx).await;
         assert!(frame.get("error").is_some(), "must return error frame");
         assert_eq!(frame["error"]["data"]["kind"], "unknown_session");
+    }
+
+    /// M10 Phase 6.2 / Bug C: a negotiated client receives the
+    /// retained `turn/spawn_complete` envelopes on the hydrate
+    /// response so it can dedup against the legacy `Background`-source
+    /// rows in `messages` on its side. The server itself does NOT
+    /// suppress rows — codex flagged multiple correctness regressions
+    /// in every server-side suppression design (NotConfigured-branch
+    /// empty media, multi-task per-turn ambiguity, orphan companions
+    /// from failed final-ack persists). Surfacing both signals lets
+    /// the client mirror the live wire's "consumer chooses one shape"
+    /// semantics without server-side guesswork.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
+        let session_id = SessionKey("local:hydrate-envelopes".into());
+        // Capture the spawn-ack row's timestamp so the envelope's
+        // `message_id` can mirror what `MessageCommitObserver` would
+        // emit on the live wire (and what the hydrate handler now
+        // synthesizes for `HydratedMessage.message_id`).
+        let spawn_ack_ts = Utc::now() + chrono::Duration::milliseconds(10);
+        let state = prg_state_with_session(&session_id, |session| {
+            let now = spawn_ack_ts - chrono::Duration::milliseconds(10);
+            session.messages.push(Message {
+                role: MessageRole::User,
+                content: "kick off deep_research".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: Some("cmid-user-1".into()),
+                thread_id: Some("cmid-user-1".into()),
+                timestamp: now,
+            });
+            // Background companion (legacy `send_file` per-file row).
+            session.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec!["research/_report.md".into()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some("cmid-user-1".into()),
+                timestamp: now + chrono::Duration::milliseconds(5),
+            });
+            // Background spawn-ack.
+            session.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: "deep_research delivered.".into(),
+                media: vec!["research/_report.md".into()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some("cmid-user-1".into()),
+                timestamp: spawn_ack_ts,
+            });
+        });
+        let approvals = PendingApprovalStore::default();
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+
+        let spawn_ack_message_id = format!(
+            "{}:2:{}",
+            session_id.0,
+            spawn_ack_ts.timestamp_nanos_opt().unwrap_or(0),
+        );
+        // Append the matching `MessagePersisted` events so the
+        // hydrate handler can surface `source: background` on the
+        // hydrated rows (mirrors what `MessageCommitObserver` would
+        // emit at live persist time under the
+        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local).
+        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            seq: 1,
+            role: "assistant".into(),
+            message_id: format!("{}:1:0", session_id.0),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        }));
+        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            seq: 2,
+            role: "assistant".into(),
+            message_id: spawn_ack_message_id.clone(),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        }));
+        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            task_id: "task_abc".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 2,
+            message_id: spawn_ack_message_id.clone(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "deep_research delivered.".into(),
+            media: vec!["research/_report.md".into()],
+        }));
+
+        // 1) Negotiated client: messages list is byte-identical to
+        // the legacy shape (3 rows), AND the new
+        // `replayed_envelopes` field carries the envelope so the
+        // client can dedup on its side.
+        let (ws_new, mut rx_new) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws_new,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            features_for_spawn_complete_test(true, true),
+            "h-new".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec![],
+            },
+        )
+        .await;
+        let frame_new = recv_rpc_json(&mut rx_new).await;
+        let messages_new = frame_new["result"]["messages"]
+            .as_array()
+            .expect("messages array");
+        assert_eq!(
+            messages_new.len(),
+            3,
+            "server does NOT suppress rows; negotiated client dedups using replayed_envelopes",
+        );
+        // Codex Bug C round-5: the spawn-ack row's `message_id` must
+        // be present on the hydrated wire so the client can match it
+        // against the envelope. Without this, the client has nothing
+        // to dedup against.
+        let spawn_ack_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 2)
+            .expect("seq=2 spawn-ack row");
+        assert_eq!(
+            spawn_ack_row["message_id"], spawn_ack_message_id,
+            "spawn-ack row must expose message_id matching the envelope",
+        );
+        // Codex Bug C round-6: per-row provenance. The companion
+        // and spawn-ack rows surface `source: "background"` so the
+        // client can drop them in favour of the envelope. Without
+        // `source`, the client could only dedup the spawn-ack and
+        // companion rows would still render as duplicate bubbles.
+        let companion_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 1)
+            .expect("seq=1 companion row");
+        assert_eq!(companion_row["source"], "background");
+        assert_eq!(spawn_ack_row["source"], "background");
+        let user_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 0)
+            .expect("seq=0 user row");
+        // The user row never had a `MessagePersisted` ledger event in
+        // this test (we only seeded background events), so its
+        // `source` is omitted. That's fine: the client doesn't need
+        // provenance for non-coalescible rows.
+        assert!(
+            user_row.get("source").map(|v| v.is_null()).unwrap_or(true),
+            "user row's source field is omitted absent a matching ledger event; got: {user_row:?}",
+        );
+        let envelopes = frame_new["result"]["replayed_envelopes"]
+            .as_array()
+            .expect("replayed_envelopes array");
+        assert_eq!(envelopes.len(), 1, "single envelope retained");
+        assert_eq!(
+            envelopes[0]["message_id"], spawn_ack_message_id,
+            "envelope's message_id matches the spawn-ack row's id by construction",
+        );
+        assert_eq!(envelopes[0]["task_id"], "task_abc");
+        assert_eq!(envelopes[0]["thread_id"], "cmid-user-1");
+        assert_eq!(envelopes[0]["seq"], 2);
+        assert_eq!(envelopes[0]["content"], "deep_research delivered.");
+        assert_eq!(envelopes[0]["media"], json!(["research/_report.md"]));
+
+        // 2) Non-negotiated client: legacy wire shape — messages
+        // list intact, and `replayed_envelopes` field is OMITTED
+        // (not `null`) so the JSON shape matches pre-fix exactly.
+        let (ws_legacy, mut rx_legacy) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws_legacy,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            ConnectionUiFeatures::default(),
+            "h-legacy".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec![],
+            },
+        )
+        .await;
+        let frame_legacy = recv_rpc_json(&mut rx_legacy).await;
+        let messages_legacy = frame_legacy["result"]["messages"]
+            .as_array()
+            .expect("messages array");
+        assert_eq!(messages_legacy.len(), 3, "legacy unchanged");
+        let result = frame_legacy["result"].as_object().expect("result object");
+        assert!(
+            !result.contains_key("replayed_envelopes"),
+            "legacy clients see byte-identical wire (no replayed_envelopes key); got keys: {:?}",
+            result.keys().collect::<Vec<_>>(),
+        );
+        // Codex Bug C round-6: non-negotiated clients also see the
+        // pre-fix `messages` shape — no `message_id`, no `source`
+        // keys. This protects strict-codegen consumers that have no
+        // `replayed_envelopes` to bind to.
+        for msg in messages_legacy {
+            let msg_obj = msg.as_object().expect("message object");
+            assert!(
+                !msg_obj.contains_key("message_id"),
+                "legacy client message MUST NOT carry message_id; got: {msg_obj:?}",
+            );
+            assert!(
+                !msg_obj.contains_key("source"),
+                "legacy client message MUST NOT carry source; got: {msg_obj:?}",
+            );
+        }
+    }
+
+    /// Bug C corollary: a negotiated client whose hydrate request
+    /// excludes `messages` does not need the envelopes either — they
+    /// only matter as a dedup key against the messages list. Keep
+    /// `replayed_envelopes` absent in that case so the response stays
+    /// minimal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_hydrate_omits_envelopes_when_messages_excluded() {
+        let session_id = SessionKey("local:hydrate-envelopes-no-msgs".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let approvals = PendingApprovalStore::default();
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            task_id: "task_x".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 1,
+            message_id: format!("{}:1:0", session_id.0),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "done".into(),
+            media: vec![],
+        }));
+
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            features_for_spawn_complete_test(true, true),
+            "h-no-msgs".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec!["threads".into()],
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let result = frame["result"].as_object().expect("result object");
+        assert!(
+            !result.contains_key("messages"),
+            "messages excluded by include filter",
+        );
+        assert!(
+            !result.contains_key("replayed_envelopes"),
+            "envelopes are a messages-list dedup key; omit when messages aren't requested",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
