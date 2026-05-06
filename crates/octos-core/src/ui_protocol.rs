@@ -1489,6 +1489,38 @@ pub struct HydratedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     pub persisted_at: DateTime<Utc>,
+    /// Stable per-row identity, derived from `(session_id, seq,
+    /// timestamp_nanos)` — identical to what
+    /// [`MessagePersistedEvent::message_id`] and
+    /// [`TurnSpawnCompleteEvent::message_id`] carry on the live wire
+    /// (see `persist_assistant_with_media`'s `PersistedMessageMeta`).
+    /// M10 Phase 6.2 (Bug C): negotiated clients use this to match
+    /// rows against [`SessionHydrateResult::replayed_envelopes`]
+    /// envelope `message_id`s when deciding which legacy
+    /// `Background`-source rows to render and which to coalesce
+    /// behind a single envelope bubble. Server populates this only
+    /// for connections that negotiated
+    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]; otherwise omitted
+    /// so non-negotiated clients see the pre-fix wire shape
+    /// bit-for-bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// M10 Phase 6.2 (Bug C). Wire-form
+    /// [`MessagePersistedSource`] for the row, captured from the
+    /// retained `message/persisted` ledger event matching this row's
+    /// `seq`. Negotiated clients use this in combination with
+    /// [`SessionHydrateResult::replayed_envelopes`] to coalesce the
+    /// per-file `send_file` companion rows behind a single envelope
+    /// bubble: a row with `source == "background"` whose
+    /// `message_id` does NOT match any envelope's `message_id` is
+    /// the kind the live wire suppresses for negotiated clients.
+    /// Omitted when the row's commit ledger event has aged out of
+    /// the retention window OR the connection didn't negotiate
+    /// `event.spawn_complete.v1` — in those cases the client falls
+    /// back to the legacy multi-row render (one extra bubble vs
+    /// live, but never lossy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// File attachments stored with this row in the canonical session
     /// JSONL — surfaced so clients reconstructing history after a
     /// disconnect can render the same attachment they would have rendered
@@ -1558,6 +1590,39 @@ pub struct SessionHydrateResult {
     pub turns: Option<Vec<HydratedTurn>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<ApprovalRequestedEvent>>,
+    /// M10 Phase 6.2 (Bug C). Retained `turn/spawn_complete` envelopes
+    /// from the ledger replay window for clients that negotiated
+    /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`]. Populated only when
+    /// the request asks for `messages` (the dedup target) and the
+    /// connection has the capability negotiated; absent otherwise so
+    /// the legacy wire shape is preserved bit-for-bit for older
+    /// clients.
+    ///
+    /// Semantics for negotiated clients on a full reload (where
+    /// `session/open` with no `after` returns no historical replay
+    /// and the `messages` list necessarily includes the legacy
+    /// `Background`-source rows):
+    ///
+    ///   * Each envelope's `message_id` matches exactly one Background
+    ///     row in `messages` — that row is the spawn-ack, the
+    ///     canonical visible bubble for the completion.
+    ///   * Per-file `send_file` companion rows (Background source,
+    ///     emitted before the ack) are NOT carried on the envelope as
+    ///     individual `message_id`s; their content is summarised by
+    ///     the envelope's `media` array.
+    ///
+    /// A reducer that wants the "single bubble per completion" wire
+    /// shape on reload should: (a) render the envelope, (b) drop the
+    /// matching spawn-ack row (`message_id` match) plus any Background
+    /// rows in the envelope's thread that precede the spawn-ack and
+    /// don't match any retained envelope's `message_id`. The server
+    /// declines to make this decision because it has no way to
+    /// distinguish "row covered by an envelope that has aged out" from
+    /// "row covered by an envelope that never landed (persist
+    /// failed)" — see the multi-task per-turn and orphan-companion
+    /// edge cases codex flagged on PR landing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed_envelopes: Option<Vec<TurnSpawnCompleteEvent>>,
 }
 
 // ----- UPCR-2026-010 `thread/graph/get` -----
@@ -1672,6 +1737,20 @@ impl MessagePersistedSource {
             // covered by `message/persisted`; treat as assistant for the
             // typed enum since `system` is not a registered source.
             crate::types::MessageRole::System => Self::Assistant,
+        }
+    }
+
+    /// Wire-form discriminant string. Mirrors the snake_case serde
+    /// rename and matches what serializing the enum to a JSON string
+    /// would produce. Used by the `session/hydrate` projection to
+    /// surface per-row provenance on `HydratedMessage.source`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::Background => "background",
+            Self::Recovery => "recovery",
         }
     }
 }
@@ -5213,6 +5292,8 @@ mod tests {
                 thread_id: Some("thread-1".into()),
                 client_message_id: Some("cmid-1".into()),
                 persisted_at: sample_persisted_at(),
+                message_id: Some("local:demo:17:1700000000000000000".into()),
+                source: Some("user".into()),
                 media: vec![],
             }]),
             threads: Some(vec![ThreadGraphEntry {
@@ -5231,6 +5312,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
             }]),
             pending_approvals: Some(vec![]),
+            replayed_envelopes: Some(vec![]),
         };
         let value = serde_json::to_value(&result).expect("serialize hydrate result");
         let parsed: SessionHydrateResult =
@@ -5245,6 +5327,7 @@ mod tests {
             threads: None,
             turns: None,
             pending_approvals: None,
+            replayed_envelopes: None,
         };
         let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
         let object = value.as_object().expect("hydrate result is object");
@@ -5252,6 +5335,8 @@ mod tests {
         assert!(!object.contains_key("threads"));
         assert!(!object.contains_key("turns"));
         assert!(!object.contains_key("pending_approvals"));
+        // Bug C: a non-negotiated client never sees the new field.
+        assert!(!object.contains_key("replayed_envelopes"));
     }
 
     #[test]
