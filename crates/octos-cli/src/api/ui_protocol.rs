@@ -3462,6 +3462,16 @@ async fn handle_session_hydrate(
                         thread_id: msg.thread_id.clone(),
                         client_message_id: msg.client_message_id.clone(),
                         persisted_at: msg.timestamp,
+                        // M10 Phase 6.2 (Bug C): mirror
+                        // `MessageCommitObserver`'s `(session, seq,
+                        // timestamp_nanos)` `message_id` so a
+                        // negotiated client can match rows against
+                        // `replayed_envelopes` for hydrate-time dedup.
+                        message_id: Some(format!(
+                            "{}:{seq}:{}",
+                            params.session_id.0,
+                            msg.timestamp.timestamp_nanos_opt().unwrap_or(0),
+                        )),
                         // P1.3 fix: surface canonical-ledger media so a
                         // client reconnecting after a disconnect can
                         // re-render the same `.md` / `.mp3` / `.pptx`
@@ -10172,8 +10182,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
         let session_id = SessionKey("local:hydrate-envelopes".into());
+        // Capture the spawn-ack row's timestamp so the envelope's
+        // `message_id` can mirror what `MessageCommitObserver` would
+        // emit on the live wire (and what the hydrate handler now
+        // synthesizes for `HydratedMessage.message_id`).
+        let spawn_ack_ts = Utc::now() + chrono::Duration::milliseconds(10);
         let state = prg_state_with_session(&session_id, |session| {
-            let now = Utc::now();
+            let now = spawn_ack_ts - chrono::Duration::milliseconds(10);
             session.messages.push(Message {
                 role: MessageRole::User,
                 content: "kick off deep_research".into(),
@@ -10207,14 +10222,18 @@ mod tests {
                 reasoning_content: None,
                 client_message_id: None,
                 thread_id: Some("cmid-user-1".into()),
-                timestamp: now + chrono::Duration::milliseconds(10),
+                timestamp: spawn_ack_ts,
             });
         });
         let approvals = PendingApprovalStore::default();
         let active_turns = active_turns_registry();
         let ledger = event_ledger(&state).await;
 
-        let spawn_ack_message_id = format!("{}:2:0", session_id.0);
+        let spawn_ack_message_id = format!(
+            "{}:2:{}",
+            session_id.0,
+            spawn_ack_ts.timestamp_nanos_opt().unwrap_or(0),
+        );
         ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
             session_id: session_id.clone(),
             turn_id: None,
@@ -10262,6 +10281,18 @@ mod tests {
             messages_new.len(),
             3,
             "server does NOT suppress rows; negotiated client dedups using replayed_envelopes",
+        );
+        // Codex Bug C round-5: the spawn-ack row's `message_id` must
+        // be present on the hydrated wire so the client can match it
+        // against the envelope. Without this, the client has nothing
+        // to dedup against.
+        let spawn_ack_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 2)
+            .expect("seq=2 spawn-ack row");
+        assert_eq!(
+            spawn_ack_row["message_id"], spawn_ack_message_id,
+            "spawn-ack row must expose message_id matching the envelope",
         );
         let envelopes = frame_new["result"]["replayed_envelopes"]
             .as_array()

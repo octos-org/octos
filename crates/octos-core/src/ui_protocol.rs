@@ -1489,6 +1489,19 @@ pub struct HydratedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     pub persisted_at: DateTime<Utc>,
+    /// Stable per-row identity, derived from `(session_id, seq,
+    /// timestamp_nanos)` — identical to what
+    /// [`MessagePersistedEvent::message_id`] and
+    /// [`TurnSpawnCompleteEvent::message_id`] carry on the live wire
+    /// (see `persist_assistant_with_media`'s `PersistedMessageMeta`).
+    /// M10 Phase 6.2 (Bug C): negotiated clients use this to match
+    /// rows against [`SessionHydrateResult::replayed_envelopes`]
+    /// envelope `message_id`s when deciding which legacy
+    /// `Background`-source rows to render and which to coalesce
+    /// behind a single envelope bubble. Omitted from the wire when
+    /// `None` so legacy clients see the pre-fix shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// File attachments stored with this row in the canonical session
     /// JSONL — surfaced so clients reconstructing history after a
     /// disconnect can render the same attachment they would have rendered
@@ -5246,6 +5259,7 @@ mod tests {
                 thread_id: Some("thread-1".into()),
                 client_message_id: Some("cmid-1".into()),
                 persisted_at: sample_persisted_at(),
+                message_id: Some("local:demo:17:1700000000000000000".into()),
                 media: vec![],
             }]),
             threads: Some(vec![ThreadGraphEntry {
