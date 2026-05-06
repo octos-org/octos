@@ -189,6 +189,43 @@ fn standalone_api_session_key_candidates(
     candidates
 }
 
+/// Topic-aware sibling of [`standalone_api_session_key_candidates`].
+///
+/// Returns the candidate `SessionKey`s the REST `/messages` and similar read
+/// paths should try, in fallback order:
+/// 1. **Profiled key** with topic (`<profile>:api:<id>#<topic>`) — the
+///    canonical write target for `/api/chat` requests through the standalone
+///    serve path. Always tried first so REST behavior is unchanged for
+///    sessions persisted via that flow.
+/// 2. **Main-profile key** with topic — picks up sessions written before a
+///    profile was promoted out of `_main`.
+/// 3. **Bare-channel key** with topic (`api:<id>#<topic>`) — what
+///    `run_standalone_turn` (the WS `turn/start` path) ends up using when the
+///    SPA sends a bare-channel `SessionKey` (e.g. `web-…`). M10.5 reload-mid-
+///    stream fix: without this candidate, REST returns `[]` for any session
+///    created by the WS path, causing the SPA to render an orphan completion
+///    bubble after a reload.
+///
+/// The dedup pass collapses duplicates when the profile resolves to
+/// `MAIN_PROFILE_ID` or when the topic is empty (in which case the bare-key
+/// form coincides with the no-topic key).
+fn standalone_api_session_key_candidates_with_topic(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+    topic: Option<&str>,
+) -> Vec<SessionKey> {
+    let profile_id = api_profile_id_from_headers(state, headers);
+    let topic = topic.unwrap_or_default();
+    let mut candidates = vec![
+        SessionKey::with_profile_topic(&profile_id, "api", session_id, topic),
+        SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic),
+        SessionKey::with_topic("api", session_id, topic),
+    ];
+    candidates.dedup_by(|left, right| left.0 == right.0);
+    candidates
+}
+
 fn encode_api_session_path_id(id: &str) -> String {
     octos_bus::session::encode_path_component(id)
 }
@@ -859,30 +896,44 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key_with_topic(
+            // M10.5 reload-mid-stream fix: WS turns persisted by `turn/start`
+            // (which calls `sessions.get_or_create(&params.session_id)` with
+            // whatever `SessionKey` the SPA sent) may live under the bare
+            // channel key (`api:<id>`) rather than the profiled key
+            // (`<profile>:api:<id>`). The REST `/messages` lookup historically
+            // checked only the profiled key, so reload-mid-stream returned
+            // `[]` and the SPA rendered an orphan completion bubble.
+            //
+            // Fix: walk the candidate key list (profiled first, bare last) and
+            // return the first non-empty match. Order matches
+            // `standalone_api_session_key_candidates` so writes still land
+            // under the canonical (profiled) key — only the read path widens.
+            let candidate_keys = standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
                 &id,
                 params.topic.as_deref(),
             );
             let mut sess = sessions.lock().await;
-            let session = sess.get_or_create(&key).await;
-            let messages: Vec<MessageInfo> = session
-                .get_history(fetch_count)
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .map(|m| MessageInfo {
-                    role: m.role.to_string(),
-                    content: m.content.clone(),
-                    timestamp: m.timestamp.to_rfc3339(),
-                    thread_id: m.thread_id.clone(),
-                })
-                .collect();
-            if !messages.is_empty() {
-                return Json(messages).into_response();
+            for key in &candidate_keys {
+                let session = sess.get_or_create(key).await;
+                let messages: Vec<MessageInfo> = session
+                    .get_history(fetch_count)
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|m| MessageInfo {
+                        role: m.role.to_string(),
+                        content: m.content.clone(),
+                        timestamp: m.timestamp.to_rfc3339(),
+                        thread_id: m.thread_id.clone(),
+                    })
+                    .collect();
+                if !messages.is_empty() {
+                    return Json(messages).into_response();
+                }
             }
-            // Fall through to gateway if the standalone store has no history.
+            // Fall through to gateway if no candidate has history.
         }
     } // !use_full
 
@@ -3578,6 +3629,104 @@ mod tests {
         assert!(is_internal_api_session_id("web-123#research.tasks"));
         assert!(!is_internal_api_session_id("web-123#research"));
         assert!(!is_internal_api_session_id("web-123"));
+    }
+
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_prefers_profiled_then_falls_back_to_bare() {
+        let state = AppState::empty_for_tests();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+
+        // No tenant_store on the AppState -> profile resolution returns the
+        // synthetic main-profile id. The candidate list still contains the
+        // bare-channel form so `run_standalone_turn`'s `api:web-…` writes
+        // are reachable from REST.
+        let candidates =
+            standalone_api_session_key_candidates_with_topic(&state, &headers, "web-7c9e", None);
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+        // Profiled key must come first so existing chat-history reads keep
+        // hitting the canonical write target before walking fallbacks.
+        assert_eq!(keys.first().copied(), Some("_main:api:web-7c9e"));
+        // Bare-channel key must be present so REST returns WS-persisted rows.
+        assert!(
+            keys.iter().any(|k| *k == "api:web-7c9e"),
+            "bare-channel candidate missing from {keys:?}"
+        );
+    }
+
+    /// M10.5 reload-mid-stream regression guard. WS turns persisted by
+    /// `turn/start` may live under the bare-channel key (`api:<id>`) when the
+    /// SPA sends a bare `SessionKey`. The REST `/messages` lookup must walk
+    /// the candidate-key list and surface those rows so the SPA's hydrate
+    /// step renders the user prompt + completion bubble together instead of
+    /// a placeholder orphan thread.
+    #[tokio::test]
+    async fn session_messages_falls_back_to_bare_channel_key_for_ws_persisted_sessions() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist under the bare-channel key — this is what `turn/start`
+        // does when the WS client passes `SessionKey::new("api", "web-…")`.
+        let bare_key = SessionKey::new("api", "web-reload-mid-stream");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&bare_key, Message::user("hi please weather"))
+                .await
+                .unwrap();
+            sess.add_message(
+                &bare_key,
+                Message::assistant_with_thread(
+                    "on it",
+                    octos_core::ThreadId::new("thread-reload-mid-stream"),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let mut headers = HeaderMap::new();
+        // No routed-profile resolution here, so the profiled candidate is
+        // `_main:api:web-…` (which has no JSONL on disk). The bare-channel
+        // fallback is what makes the response non-empty.
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+
+        let response = session_messages(
+            State(state),
+            headers,
+            axum::extract::Path("web-reload-mid-stream".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 2, "bare-key fallback must surface rows");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hi please weather");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "on it");
     }
 
     #[tokio::test]
