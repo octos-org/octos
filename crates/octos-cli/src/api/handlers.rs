@@ -212,32 +212,36 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
 ///
 /// Returns the candidate `SessionKey`s the REST `/messages` and similar
 /// read paths should try, in fallback order. The fallback set is split
-/// in half by the resolved profile:
+/// by the resolved profile and the request's auth identity:
 ///
-/// **Hosted profile-scoped requests** (resolved profile is NOT
-/// `MAIN_PROFILE_ID`). Only ONE candidate:
-/// 1. **Profiled key** with topic (`<profile>:api:<id>#<topic>`) — the
-///    canonical write target for `/api/chat` requests through the
-///    standalone serve path.
+/// **Tenant-scoped requests** (resolved profile is NOT `MAIN_PROFILE_ID`
+/// AND the request is NOT admin-authenticated). Only ONE candidate:
+/// 1. **Profiled key** with topic (`<profile>:api:<id>#<topic>`).
 ///
-/// Hosted tenants must NEVER see another profile's history by id. The
+/// Tenant accounts must NEVER see another profile's history by id. The
 /// `_main`, bare-channel, and raw-id candidates ALL live in shared /
-/// non-tenant namespaces; surfacing them to a hosted request would let
-/// a colliding `web-…` id read foreign rows (codex review P1 rounds 3
-/// and 4).
+/// non-tenant namespaces; surfacing them to a tenant-scoped request
+/// would let a colliding `web-…` id read foreign rows (codex P1
+/// rounds 3 and 4).
 ///
-/// **Main / local mode** (resolved profile IS `MAIN_PROFILE_ID`):
-/// 1. **Profiled key** (`<profile>:api:<id>#<topic>`) — the
-///    `_main:api:<id>` write target for unauthenticated standalone
-///    serve.
-/// 2. **Bare-channel key** (`api:<id>#<topic>`) — what the WS
-///    `turn/start` path uses when the SPA sends
-///    `SessionKey::new("api", "web-…")`. The whole point of the M10.5
-///    fallback.
-/// 3. **Raw-id key** (`<id>` or `<id>#<topic>`) — only when `id`
+/// **Main / local / admin mode** (resolved profile IS `MAIN_PROFILE_ID`
+/// OR the request carries admin auth):
+/// 1. **Profiled key** (`<profile>:api:<id>#<topic>`).
+/// 2. **`_main:api:<id>` key** — picks up legacy main-profile rows.
+/// 3. **Bare-channel key** (`api:<id>#<topic>`) — what the WS
+///    `turn/start` path uses when an admin-authenticated SPA sends
+///    `SessionKey::new("api", "web-…")`. The dominant production
+///    reload-mid-stream shape on hosted subdomains under admin auth
+///    (codex P2 round 5 — `connection_profile_id == None` for admin so
+///    `validate_authenticated_session_scope` accepts the bare key).
+/// 4. **Raw-id key** (`<id>` or `<id>#<topic>`) — only when `id`
 ///    passes [`is_safe_bare_session_id`]. Recovers from the SPA's
 ///    bare-id `SessionKey("web-…")` shape. Codex P1 round 2: rejecting
 ///    `:` / `#` blocks crafted-URL leaks via this candidate.
+///
+/// Admin already has read-all privileges across all profiles via the
+/// other admin handlers, so unlocking the cross-namespace fallbacks
+/// for admin requests is no privilege escalation.
 ///
 /// The dedup pass collapses duplicates when the topic is empty (in
 /// which case the bare-key and raw-id forms coincide with their
@@ -245,6 +249,7 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
 fn standalone_api_session_key_candidates_with_topic(
     state: &AppState,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     session_id: &str,
     topic: Option<&str>,
 ) -> Vec<SessionKey> {
@@ -261,20 +266,21 @@ fn standalone_api_session_key_candidates_with_topic(
 
     // The remaining candidates (`_main:api:<id>`, bare-channel, raw-id)
     // are gated on the resolved profile being the synthetic main
-    // profile. For hosted profile-scoped requests each tenant's
-    // profile prefix is their isolation boundary, and a shared
-    // standalone `SessionManager` could otherwise let one profile
-    // read another's WS-persisted history (codex review P1 rounds 3
+    // profile OR the request being admin-authenticated. For tenant
+    // user requests each profile prefix is the isolation boundary, and
+    // a shared standalone `SessionManager` could otherwise let one
+    // profile read another's WS-persisted history (codex P1 rounds 3
     // and 4 on the M10.5 reload-mid-stream PR).
-    let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID;
+    //
+    // Codex P2 round 5: admin auth on a hosted subdomain is the
+    // canonical reload-mid-stream production shape; the WS handler
+    // there accepts bare `SessionKey`s (admin's
+    // `connection_profile_id` is `None`, so
+    // `validate_authenticated_session_scope` doesn't fire). The
+    // unprofiled fallback MUST be reachable from REST in that mode.
+    let is_admin = matches!(identity, Some(AuthIdentity::Admin));
+    let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID || is_admin;
     if allow_cross_profile_fallback {
-        // `_main:api:<id>` is reachable in this branch via the same
-        // `with_profile_topic` constructor — but in main mode it
-        // collapses with the first candidate, so push it explicitly
-        // only when `profile_id` is something other than `_main`.
-        // (When `profile_id == _main`, the first candidate IS the
-        // main-profile key and the dedup pass below removes the
-        // duplicate.)
         candidates.push(SessionKey::with_profile_topic(
             MAIN_PROFILE_ID,
             "api",
@@ -285,8 +291,8 @@ fn standalone_api_session_key_candidates_with_topic(
         // Raw-id candidate adds another layer of guardrails: `id` may
         // contain attacker-controlled bytes (it lands here straight
         // from `axum::extract::Path`), and `SessionKey` accepts any
-        // string. Codex review P1 round 2: only emit the raw-id form
-        // when `id` is a safe bare SPA id (no `:` / no `#`).
+        // string. Codex P1 round 2: only emit the raw-id form when
+        // `id` is a safe bare SPA id (no `:` / no `#`).
         if is_safe_bare_session_id(session_id) {
             let raw_id = if topic.is_empty() {
                 SessionKey(session_id.to_string())
@@ -954,6 +960,7 @@ fn session_messages_proxy_path(
 pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
@@ -989,9 +996,20 @@ pub async fn session_messages(
             // to a sibling key whenever the requested page is past the end
             // of the canonical session, mixing histories under pagination
             // (codex review P2).
+            //
+            // Codex P2 round 5: in production deployments using admin auth
+            // on a hosted subdomain (`dspfac.crew.ominix.io` +
+            // `OCTOS_AUTH_TOKEN=admin-…`), the WS handler accepts bare
+            // `SessionKey`s and persists under those raw keys. Pass the
+            // request identity into the candidate helper so admin auth
+            // unlocks the unprofiled fallbacks even when the request
+            // resolved to a hosted profile (admin already has read-all
+            // privileges, so this is no privilege escalation).
+            let identity_ref = identity.as_ref().map(|ext| &ext.0);
             let candidate_keys = standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
+                identity_ref,
                 &id,
                 params.topic.as_deref(),
             );
@@ -3744,9 +3762,14 @@ mod tests {
 
         // `id` containing `:` must NOT produce a raw-id candidate so a
         // crafted REST URL can't pull history from another channel.
+        // Use admin identity here so the unprofiled fallbacks ARE
+        // permitted by the cross-profile gate — that way the test
+        // isolates the `is_safe_bare_session_id` filter rather than
+        // confounding it with the cross-profile gate.
         let candidates = standalone_api_session_key_candidates_with_topic(
             &state,
             &headers,
+            Some(&AuthIdentity::Admin),
             "telegram:123",
             None,
         );
@@ -3770,16 +3793,26 @@ mod tests {
     /// logic inline with a caller-supplied `profile_id`. If
     /// [`standalone_api_session_key_candidates_with_topic`] ever
     /// drifts from this gate, the inline mirror will catch it.
+    /// Codex review P1 rounds 3 and 4 regression: a tenant
+    /// (non-admin) request resolved to a hosted profile MUST see only
+    /// its own profile-prefixed candidate. The `_main`, bare-channel,
+    /// and raw-id candidates would let one tenant read another's
+    /// history by id collision.
+    ///
+    /// This test mirrors the helper's gate logic inline so future
+    /// drift is caught.
     #[test]
-    fn standalone_api_session_key_candidates_with_topic_omits_unprofiled_for_hosted_profile() {
+    fn standalone_api_session_key_candidates_with_topic_omits_unprofiled_for_hosted_tenant() {
         let session_id = "web-7c9e";
         let topic = "";
         let profile_id = "dspfac"; // simulated hosted tenant
+        let is_admin = false;
+        let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID || is_admin;
 
         let mut candidates = vec![SessionKey::with_profile_topic(
             profile_id, "api", session_id, topic,
         )];
-        if profile_id == MAIN_PROFILE_ID {
+        if allow_cross_profile_fallback {
             candidates.push(SessionKey::with_profile_topic(
                 MAIN_PROFILE_ID,
                 "api",
@@ -3793,12 +3826,53 @@ mod tests {
         }
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
 
-        // The hosted profile sees ONLY its own profile-prefixed key.
+        // Tenant sees ONLY its own profile-prefixed key.
         assert_eq!(keys, vec!["dspfac:api:web-7c9e"]);
-        // Sanity: explicitly verify the leak vectors are absent.
         assert!(!keys.iter().any(|k| *k == "_main:api:web-7c9e"));
         assert!(!keys.iter().any(|k| *k == "api:web-7c9e"));
         assert!(!keys.iter().any(|k| *k == "web-7c9e"));
+    }
+
+    /// Codex P2 round 5 regression: the canonical reload-mid-stream
+    /// production shape is admin auth on a hosted subdomain. The WS
+    /// handler accepts bare `SessionKey`s in admin mode (admin's
+    /// `connection_profile_id` is `None`), so REST must walk the
+    /// unprofiled fallbacks too — otherwise the just-persisted WS
+    /// rows are unreachable through `/messages` and reload-mid-stream
+    /// shows the orphan completion the M10 hardening test catches.
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_unlocks_unprofiled_for_admin_on_hosted() {
+        let session_id = "web-7c9e";
+        let topic = "";
+        let profile_id = "dspfac";
+        let is_admin = true;
+        let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID || is_admin;
+
+        let mut candidates = vec![SessionKey::with_profile_topic(
+            profile_id, "api", session_id, topic,
+        )];
+        if allow_cross_profile_fallback {
+            candidates.push(SessionKey::with_profile_topic(
+                MAIN_PROFILE_ID,
+                "api",
+                session_id,
+                topic,
+            ));
+            candidates.push(SessionKey::with_topic("api", session_id, topic));
+            if is_safe_bare_session_id(session_id) {
+                candidates.push(SessionKey(session_id.to_string()));
+            }
+        }
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+
+        // Admin on hosted DOES see the bare-channel + raw-id
+        // candidates so reload-mid-stream after WS-bare persistence
+        // works. This is no privilege escalation: admin already has
+        // read-all access through other endpoints.
+        assert_eq!(keys.first().copied(), Some("dspfac:api:web-7c9e"));
+        assert!(keys.iter().any(|k| *k == "_main:api:web-7c9e"));
+        assert!(keys.iter().any(|k| *k == "api:web-7c9e"));
+        assert!(keys.iter().any(|k| *k == "web-7c9e"));
     }
 
     #[test]
@@ -3815,8 +3889,14 @@ mod tests {
         // bare-channel and raw-id forms so `run_standalone_turn`'s WS-side
         // writes are reachable from REST regardless of which `SessionKey`
         // shape the SPA sent.
-        let candidates =
-            standalone_api_session_key_candidates_with_topic(&state, &headers, "web-7c9e", None);
+        // No identity (no admin auth, no user) — the resolved profile
+        // is `MAIN_PROFILE_ID` (no tenant_store on the AppState so
+        // profile resolution falls back to the synthetic main), so
+        // the cross-profile gate is open and the full candidate list
+        // is returned.
+        let candidates = standalone_api_session_key_candidates_with_topic(
+            &state, &headers, None, "web-7c9e", None,
+        );
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         // Profiled key must come first so existing chat-history reads keep
         // hitting the canonical write target before walking fallbacks.
@@ -3881,9 +3961,12 @@ mod tests {
             axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
         );
 
+        // No identity — main-profile resolution unlocks the unprofiled
+        // fallbacks via the cross-profile gate's main-profile branch.
         let response = session_messages(
             State(state),
             headers,
+            None,
             axum::extract::Path("web-reload-mid-stream".to_string()),
             axum::extract::Query(PaginationParams {
                 limit: 100,
@@ -3961,6 +4044,7 @@ mod tests {
         let response = session_messages(
             State(state),
             headers,
+            None,
             axum::extract::Path("web-pagi".to_string()),
             axum::extract::Query(PaginationParams {
                 limit: 10,
@@ -4013,9 +4097,15 @@ mod tests {
             ..AppState::empty_for_tests()
         });
         let headers = HeaderMap::new();
+        // Pass admin identity so the cross-profile gate is open and the
+        // ONLY thing keeping the telegram row out of the response is
+        // the `is_safe_bare_session_id` filter on the raw-id candidate.
+        // Pre-filter, this would have leaked.
+        let identity = Some(Extension(AuthIdentity::Admin));
         let response = session_messages(
             State(state),
             headers,
+            identity,
             axum::extract::Path("telegram:123".to_string()),
             axum::extract::Query(PaginationParams {
                 limit: 100,
@@ -4086,6 +4176,7 @@ mod tests {
         let response = session_messages(
             State(state),
             headers,
+            None,
             axum::extract::Path("web-raw-id-only".to_string()),
             axum::extract::Query(PaginationParams {
                 limit: 100,
