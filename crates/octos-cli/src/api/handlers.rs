@@ -189,6 +189,25 @@ fn standalone_api_session_key_candidates(
     candidates
 }
 
+/// Returns `true` when `session_id` is a bare SPA id whose raw form is
+/// safe to query as a `SessionKey` directly. Specifically: no `:` (which
+/// is the channel/profile separator in
+/// [`octos_core::SessionKey`]) and no `#` (the topic separator).
+///
+/// Without this guard, `/api/sessions/{id}/messages?id=telegram:123`
+/// would walk the raw-id candidate and return that telegram session's
+/// history under a REST endpoint scoped to the API channel — a
+/// cross-channel / cross-profile leak (codex review P1 round 2 on the
+/// M10.5 reload-mid-stream PR).
+///
+/// We allow `web-…`, raw UUIDs, and similar punctuation-light shapes;
+/// ANY id that contains `:` is rejected for the raw-id fallback. The
+/// API-channel and profile-prefixed candidates still cover those ids
+/// — the raw-id candidate is purely the recovery path for SPA bare ids.
+fn is_safe_bare_session_id(session_id: &str) -> bool {
+    !session_id.contains(':') && !session_id.contains('#')
+}
+
 /// Topic-aware sibling of [`standalone_api_session_key_candidates`].
 ///
 /// Returns the candidate `SessionKey`s the REST `/messages` and similar read
@@ -203,14 +222,15 @@ fn standalone_api_session_key_candidates(
 ///    `turn/start` path uses when the SPA sends a `SessionKey::new("api",
 ///    "web-…")`. Without this REST returns `[]` for any session created via
 ///    that flow.
-/// 4. **Raw-id key** (`<id>` or `<id>#<topic>`) — when the SPA sends a
-///    bare-channel `SessionKey` whose serialized form is just `web-…` (no
-///    `api:` prefix), `run_standalone_turn` calls
-///    `sessions.get_or_create(&SessionKey("web-…"))` and persists under that
-///    literal key. Picking this up requires a final raw-id candidate. Codex
-///    review P1 on the M10.5 reload-mid-stream PR — without it, the
-///    reload-mid-stream test still returns `[]` for that variant and the
-///    SPA still renders an orphan completion bubble.
+/// 4. **Raw-id key** (`<id>` or `<id>#<topic>`) — only when `id` passes
+///    [`is_safe_bare_session_id`]. When the SPA sends a bare-channel
+///    `SessionKey` whose serialized form is just `web-…` (no `api:`
+///    prefix), `run_standalone_turn` calls
+///    `sessions.get_or_create(&SessionKey("web-…"))` and persists under
+///    that literal key. The raw-id candidate is the recovery path for
+///    that shape. Codex round 2 P1: rejecting `:` / `#` in `id` blocks
+///    cross-channel / cross-profile history leaks via crafted REST URLs
+///    (`/api/sessions/telegram:123/messages`, etc.).
 ///
 /// The dedup pass collapses duplicates when the profile resolves to
 /// `MAIN_PROFILE_ID` or when the topic is empty (in which case the bare-key
@@ -223,17 +243,24 @@ fn standalone_api_session_key_candidates_with_topic(
 ) -> Vec<SessionKey> {
     let profile_id = api_profile_id_from_headers(state, headers);
     let topic = topic.unwrap_or_default();
-    let raw_id = if topic.is_empty() {
-        SessionKey(session_id.to_string())
-    } else {
-        SessionKey(format!("{session_id}#{topic}"))
-    };
     let mut candidates = vec![
         SessionKey::with_profile_topic(&profile_id, "api", session_id, topic),
         SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic),
         SessionKey::with_topic("api", session_id, topic),
-        raw_id,
     ];
+    // Only add the raw-id candidate for safe bare SPA ids. Codex review
+    // P1 round 2: `id` may contain attacker-controlled bytes (it lands
+    // here straight from `axum::extract::Path`), and SessionKey accepts
+    // any string. Restricting to no-`:` / no-`#` ids confines the raw
+    // fallback to the WS-bare-key recovery shape it was designed for.
+    if is_safe_bare_session_id(session_id) {
+        let raw_id = if topic.is_empty() {
+            SessionKey(session_id.to_string())
+        } else {
+            SessionKey(format!("{session_id}#{topic}"))
+        };
+        candidates.push(raw_id);
+    }
     candidates.dedup_by(|left, right| left.0 == right.0);
     candidates
 }
@@ -3660,6 +3687,42 @@ mod tests {
     }
 
     #[test]
+    fn is_safe_bare_session_id_rejects_separator_chars() {
+        // Codex P1 round 2: the raw-id candidate must NOT be added when
+        // `id` carries the channel separator (`:`) or topic separator
+        // (`#`). Otherwise crafted REST URLs like
+        // `/api/sessions/telegram:123/messages` would expose
+        // cross-channel session history.
+        assert!(is_safe_bare_session_id("web-7c9e"));
+        assert!(is_safe_bare_session_id(
+            "018f8e34-1c2d-7000-9000-000000000001"
+        ));
+        assert!(!is_safe_bare_session_id("telegram:123"));
+        assert!(!is_safe_bare_session_id("dspfac:api:web-7c9e"));
+        assert!(!is_safe_bare_session_id("web-123#secret-topic"));
+    }
+
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_omits_raw_for_unsafe_ids() {
+        let state = AppState::empty_for_tests();
+        let headers = HeaderMap::new();
+
+        // `id` containing `:` must NOT produce a raw-id candidate so a
+        // crafted REST URL can't pull history from another channel.
+        let candidates = standalone_api_session_key_candidates_with_topic(
+            &state,
+            &headers,
+            "telegram:123",
+            None,
+        );
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+        assert!(
+            !keys.iter().any(|k| *k == "telegram:123"),
+            "raw-id candidate must be skipped for ids with `:` — got {keys:?}"
+        );
+    }
+
+    #[test]
     fn standalone_api_session_key_candidates_with_topic_prefers_profiled_then_falls_back_to_bare() {
         let state = AppState::empty_for_tests();
         let mut headers = HeaderMap::new();
@@ -3838,6 +3901,64 @@ mod tests {
         assert!(
             messages.is_empty(),
             "page past end of profiled session must return [] without leaking bare-key rows: {messages:?}"
+        );
+    }
+
+    /// Codex P1 round 2 regression: a crafted REST URL whose `id`
+    /// contains the channel separator (`:`) MUST NOT pull history from
+    /// the bare-key store of another channel. Without
+    /// [`is_safe_bare_session_id`] the raw-id fallback would walk
+    /// `SessionKey("telegram:123")` directly and surface that
+    /// telegram session's rows under an API endpoint.
+    #[tokio::test]
+    async fn session_messages_does_not_leak_cross_channel_history_via_crafted_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist a telegram-channel row under the canonical key shape
+        // (`telegram:123`). REST `/api/sessions/...` is API-channel
+        // scoped — its handler must NOT see this row regardless of
+        // what `id` the caller passes.
+        let telegram_key = SessionKey::new("telegram", "123");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&telegram_key, Message::user("telegram secret"))
+                .await
+                .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        let response = session_messages(
+            State(state),
+            headers,
+            axum::extract::Path("telegram:123".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        // Either the standalone path returns [] (no API-channel rows
+        // for that id) and the gateway proxy fires (returning 503 in
+        // tests), or the standalone path returns []. Both outcomes
+        // are acceptable; what we MUST NOT see is the telegram row.
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            !body_str.contains("telegram secret"),
+            "REST must not leak telegram-channel history via crafted id; got: {body_str}"
         );
     }
 
