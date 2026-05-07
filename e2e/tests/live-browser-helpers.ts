@@ -412,6 +412,14 @@ const SPAWN_ACK_PATTERNS: RegExp[] = [
   /^.{0,30}已在後台運行/,
   /^.{0,80}\b(?:has\s+)?started\s+in\s+(?:the\s+)?background\b/i,
   /^.{0,80}\b(?:is\s+now\s+)?running\s+in\s+(?:the\s+)?background\b/i,
+  // M10 spawn_only intercept (octos-cli/src/agent/loop_runner.rs):
+  // "Background work started for <tool>. The final result will be
+  // delivered automatically when it is ready." — phrase doesn't match
+  // the older "started in (the) background" anchor, so without this
+  // pattern bubbleHasRealContent false-positives on M10 spawn-ack
+  // chrome and assertPairing fails before the real envelope lands
+  // (two-fast-then-one-slow soak regression discovered 2026-05-07).
+  /^Background\s+work\s+started\s+for\b/i,
 ];
 
 /**
