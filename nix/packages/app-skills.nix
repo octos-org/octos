@@ -1,6 +1,8 @@
 {
   lib,
   rustPlatform,
+  pkg-config,
+  openssl,
 }:
 let
   skillCrates = [
@@ -30,6 +32,9 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../../Cargo.lock;
 
   doCheck = false;
+
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ openssl ];
 
   buildPhase = ''
     runHook preBuild
