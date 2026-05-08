@@ -27,21 +27,7 @@
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
         {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              nix
-              nixfmt
-              statix
-
-              openssl
-              pkg-config
-              cargo
-              clippy
-              rust-analyzer
-              rustc
-              rustfmt
-            ];
-          };
+          default = pkgs.callPackage ./nix/shell.nix { };
         }
       );
 
