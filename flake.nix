@@ -36,20 +36,26 @@
         {
           default = self.packages.${system}.octos-minimal;
           octos-minimal = pkgs.callPackage ./nix/packages/default.nix { };
-          octos-full = pkgs.callPackage ./nix/packages/default.nix {
-            features =
-              # Full feature set — must match scripts/local-tenant-deploy.sh --full
-              [
-                "api"
-                "telegram"
-                "discord"
-                "slack"
-                "whatsapp"
-                "feishu"
-                "email"
-                "twilio"
-                "wecom"
-              ];
+          octos-full = pkgs.buildEnv {
+            name = "octos-full";
+            paths = [
+              (pkgs.callPackage ./nix/packages/default.nix {
+                features =
+                  # Full feature set — must match scripts/local-tenant-deploy.sh --full
+                  [
+                    "api"
+                    "telegram"
+                    "discord"
+                    "slack"
+                    "whatsapp"
+                    "feishu"
+                    "email"
+                    "twilio"
+                    "wecom"
+                  ];
+              })
+              (pkgs.callPackage ./nix/packages/app-skills.nix { })
+            ];
           };
         }
       );
