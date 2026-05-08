@@ -32,9 +32,25 @@
       );
 
       packages = forEachSupportedSystem (
-        { pkgs, ... }:
+        { pkgs, system }:
         {
-          default = pkgs.callPackage ./nix/packages/default.nix { };
+          default = self.packages.${system}.octos-minimal;
+          octos-minimal = pkgs.callPackage ./nix/packages/default.nix { };
+          octos-full = pkgs.callPackage ./nix/packages/default.nix {
+            features =
+              # Full feature set — must match scripts/local-tenant-deploy.sh --full
+              [
+                "api"
+                "telegram"
+                "discord"
+                "slack"
+                "whatsapp"
+                "feishu"
+                "email"
+                "twilio"
+                "wecom"
+              ];
+          };
         }
       );
 
