@@ -232,7 +232,7 @@ export async function login(page: Page) {
     { token: effectiveToken, profile: PROFILE_ID },
   );
 
-  await page.goto('/chat', { waitUntil: 'networkidle' });
+  await page.goto('/chat', { waitUntil: 'domcontentloaded' });
 
   const onChat = await page
     .locator(SEL.chatInput)
@@ -240,7 +240,7 @@ export async function login(page: Page) {
     .catch(() => false);
   if (onChat) return;
 
-  await page.goto('/chat', { waitUntil: 'networkidle' });
+  await page.goto('/chat', { waitUntil: 'domcontentloaded' });
   const chatVisible = await page
     .locator(SEL.chatInput)
     .isVisible({ timeout: 5_000 })
@@ -284,14 +284,14 @@ export async function login(page: Page) {
     );
 
     if (apiLoginResult) {
-      await page.reload({ waitUntil: 'networkidle' });
+      await page.reload({ waitUntil: 'domcontentloaded' });
       const apiLoginVisible = await page
         .locator(SEL.chatInput)
         .isVisible({ timeout: 10_000 })
         .catch(() => false);
       if (apiLoginVisible) return;
 
-      await page.goto('/chat', { waitUntil: 'networkidle' });
+      await page.goto('/chat', { waitUntil: 'domcontentloaded' });
       const chatAfterLogin = await page
         .locator(SEL.chatInput)
         .isVisible({ timeout: 10_000 })
