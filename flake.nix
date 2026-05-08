@@ -45,5 +45,12 @@
         }
       );
 
+      packages = forEachSupportedSystem (
+        { pkgs, ... }:
+        {
+          default = pkgs.callPackage ./nix/packages/default.nix { };
+        }
+      );
+
     };
 }
