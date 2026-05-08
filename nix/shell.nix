@@ -1,28 +1,29 @@
 {
-  mkShellNoCC,
+  mkShell,
   nix,
   nixfmt,
   statix,
-  openssl,
-  pkg-config,
   cargo,
   clippy,
   rust-analyzer,
   rustc,
   rustfmt,
+  pkg-config,
+  openssl,
 }:
-mkShellNoCC {
+mkShell {
   packages = [
     nix
     nixfmt
     statix
 
-    openssl
-    pkg-config
     cargo
     clippy
     rust-analyzer
     rustc
     rustfmt
+
+    pkg-config
+    openssl
   ];
 }
