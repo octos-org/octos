@@ -7,9 +7,17 @@
 //     Higher-level robotics handlers (SensorCheck, Motion, SafetyGate) are
 //     described conceptually in the README but are not yet implemented; this
 //     graph stands them in with `codergen` (LLM-driven reasoning over the
-//     bridge tool list) and `gate` (boolean branch on a condition).
+//     bridge tool list), `gate` (boolean predicate over the last outcome),
+//     and `noop` (terminal sink).
+//   * `gate` nodes evaluate `prompt` as a condition against the previous
+//     outcome — the supported predicate language is
+//     `outcome.status == "pass"|"fail"`, `outcome.contains("...")`, plus
+//     `&& || !` combinators (see crates/octos-pipeline/src/condition.rs).
+//   * Edges that need to branch must use `condition="..."`. Plain `label=`
+//     is only a substring fallback against outcome content; this graph uses
+//     real conditions on every gate-outgoing edge.
 //   * `deadline_action` accepts lowercase `abort`, `skip`, `escalate`, and
-//     `retry:<n>`. Anything else is silently dropped.
+//     `retry:<n>`.
 //   * `invariant=...` / `on_violation=...` are not currently parsed; the
 //     `checkpoint="true"` attribute is.
 //
@@ -22,7 +30,7 @@ digraph inspection_mission {
     // Stand-in for SensorCheck: LLM is asked to confirm preflight via the
     // bridge's read_pressure_gauge / observe-tier sensor tools.
     preflight [shape=octagon, label="Preflight\nSensor Check", handler="codergen",
-               prompt="Confirm battery_soc > 20 via the observe-tier sensor tools before continuing.",
+               prompt="Confirm battery_soc > 20 via the observe-tier sensor tools. If healthy, end your reply with the literal token preflight_ok.",
                tools="read_pressure_gauge"];
 
     // Stand-in for Motion: LLM drives the safe-motion bridge tool. Deadline
@@ -33,25 +41,34 @@ digraph inspection_mission {
               deadline_secs="120", deadline_action="abort",
               checkpoint="true"];
 
-    // Stand-in for arrival SensorCheck.
+    // Stand-in for arrival SensorCheck. Ends its reply with `force_ok` only
+    // when force/torque is within spec — the safety_gate predicate below
+    // depends on this sentinel.
     arrival_check [shape=octagon, label="Arrival\nSensor Check", handler="codergen",
-                   prompt="Confirm position_error_m < 0.01 using the observe-tier sensors.",
+                   prompt="Confirm position_error_m < 0.01 and max_force_n < 50 via the observe-tier sensors. End with force_ok if both hold, otherwise force_fail.",
                    tools="capture_valve_image"];
 
-    // Stand-in for SafetyGate: a boolean gate on whether force is within
-    // limits. The decision logic lives in `condition` (evaluated by the gate
-    // handler at runtime).
-    safety_gate [shape=doubleoctagon, label="Force/Torque\nSafety Gate", handler="gate"];
+    // SafetyGate: pass iff the upstream outcome contains `force_ok`. On Fail
+    // the executor selects the conditional edge to emergency_stop.
+    safety_gate [shape=doubleoctagon, label="Force/Torque\nSafety Gate", handler="gate",
+                 prompt="outcome.contains(\"force_ok\")"];
 
-    // LLM-driven valve inspection.
+    // Terminal sink for the safety-gate failure branch. Distinct from the
+    // happy-path return_home node so an operator can grep the outcome graph
+    // for emergency stops.
+    emergency_stop [shape=Msquare, label="Emergency\nStop", handler="noop"];
+
+    // LLM-driven valve inspection. Ends with `anomaly_detected` when it
+    // believes the valve needs corrective action.
     inspect [shape=box, label="Inspect Valve\nCodergen", handler="codergen",
-             prompt="Inspect the valve using capture_valve_image and read_pressure_gauge; decide if it is anomalous.",
+             prompt="Inspect the valve using capture_valve_image and read_pressure_gauge. End with anomaly_detected if the valve looks anomalous, otherwise anomaly_clear.",
              tools="capture_valve_image,read_pressure_gauge",
              deadline_secs="60", deadline_action="skip",
              checkpoint="true"];
 
-    // Gate: was an anomaly detected?
-    result_gate [shape=diamond, label="Anomaly\nDetected?", handler="gate"];
+    // Branch on whether inspection flagged an anomaly. Pass = anomaly seen.
+    result_gate [shape=diamond, label="Anomaly\nDetected?", handler="gate",
+                 prompt="outcome.contains(\"anomaly_detected\")"];
 
     // Corrective action: LLM plans the response, may use the full-actuation
     // turn_valve tool (gated upstream by RobotPermissionPolicy).
@@ -66,13 +83,16 @@ digraph inspection_mission {
                  tools="move_to_valve",
                  deadline_secs="120", deadline_action="skip"];
 
-    // Edges
+    // Edges. Gate-outgoing edges carry real predicates over the gate's
+    // outcome (Pass/Fail) so the executor's condition step routes
+    // deterministically rather than falling back to label substring match.
     preflight -> navigate;
     navigate -> arrival_check;
     arrival_check -> safety_gate;
-    safety_gate -> inspect;
+    safety_gate -> inspect        [condition="outcome.status == \"pass\"", label="ok"];
+    safety_gate -> emergency_stop [condition="outcome.status == \"fail\"", label="halt"];
     inspect -> result_gate;
-    result_gate -> corrective [label="yes"];
-    result_gate -> return_home [label="no"];
+    result_gate -> corrective     [condition="outcome.status == \"pass\"", label="anomaly"];
+    result_gate -> return_home    [condition="outcome.status == \"fail\"", label="clear"];
     corrective -> return_home;
 }

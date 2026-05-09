@@ -67,7 +67,7 @@ inspection, the deadline fires after 60s and skips to the next step.
 | File | What It Shows |
 |------|---------------|
 | `dora_tool_map.json` | 4 tool mappings with safety tiers and timeouts |
-| `inspection_mission.dot` | 8-node pipeline DAG with all handler types |
+| `inspection_mission.dot` | 9-node pipeline DAG using `codergen` / `gate` / `noop` |
 
 ## dora_tool_map.json — Tool Mappings
 
@@ -139,12 +139,21 @@ inspect [handler="codergen", deadline_secs="60", deadline_action="skip"];
 
 **Invariants / safety gates** — modelled here with the `gate` handler. The
 parser does not yet recognise `invariant=...` / `on_violation=...` as
-attributes, so safety conditions live in the gate's runtime condition
-rather than node attributes:
+attributes, so safety conditions are encoded in the gate's `prompt` (a
+predicate against the upstream outcome) and routing is encoded on the
+outgoing edges' `condition=` attribute:
 ```dot
-safety_gate [handler="gate"];
-// Branch on whether force/torque is within limits before manipulation.
+safety_gate [handler="gate", prompt="outcome.contains(\"force_ok\")"];
+
+safety_gate -> inspect        [condition="outcome.status == \"pass\""];
+safety_gate -> emergency_stop [condition="outcome.status == \"fail\""];
 ```
+The supported predicate language is `outcome.status == "pass"|"fail"`,
+`outcome.contains("...")`, plus `&& || !` combinators (see
+`crates/octos-pipeline/src/condition.rs`). Without a `prompt`, `gate` nodes
+default to `"true"` (always Pass), and without `condition=` on the
+outgoing edges the executor falls back to label substring matching against
+outcome content — so both halves are required for real branching.
 
 **Checkpoints** — resume a failed mission from where it left off:
 ```dot
