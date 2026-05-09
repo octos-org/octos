@@ -74,19 +74,21 @@ in the tool list.
 ### Loading the config
 
 ```rust
-use octos_dora_mcp::{BridgeConfig, DoraToolBridge};
+use octos_dora_mcp::{load_bridges, BridgeConfig};
 
-// Load all tool mappings from the JSON config
+// Load all tool mappings from the JSON config.
 let config = BridgeConfig::from_file("examples/dora-bridge-config/dora_tool_map.json")?;
 
-// Each mapping becomes an MCP-compatible tool
-let tools: Vec<DoraToolBridge> = config
-    .mappings
-    .into_iter()
-    .map(DoraToolBridge::new)
-    .collect();
+// `load_bridges` does TWO things:
+//   1. Constructs a `DoraToolBridge` per mapping (each impls `Tool`).
+//   2. Inserts each tool's name into the global `RobotToolRegistry` at its
+//      declared `safety_tier`. This is what wires `group:robot:<tier>`
+//      `ToolPolicy` allow/deny against these bridges. Constructing
+//      `DoraToolBridge::new` directly skips the registry registration and
+//      tier-based access control silently no-ops — always go through
+//      `load_bridges`.
+let tools = load_bridges(&config);
 
-// Register with the agent — safety tier is enforced automatically
 for tool in &tools {
     let mapping = tool.mapping();
     println!(

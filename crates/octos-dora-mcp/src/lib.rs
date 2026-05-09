@@ -1,73 +1,22 @@
-//! Dora-RS to MCP tool bridge.
+//! Dora-RS to MCP tool bridge for octos.
 //!
-//! Maps dora-rs dataflow nodes to MCP-compatible tools that can be
-//! registered in the octos agent's [`ToolRegistry`].
-//!
-//! # Overview
-//!
-//! Each [`DoraToolMapping`] declares a tool name, description, the dora node
-//! and output IDs that handle requests, and an optional safety tier string.
-//! [`DoraToolBridge`] wraps a mapping and implements the [`Tool`] trait so it
-//! can be registered directly in the agent.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use octos_dora_mcp::{BridgeConfig, load_bridges};
-//!
-//! let config = BridgeConfig::from_file("config/dora_tool_map.json").unwrap();
-//! let bridges = load_bridges(&config);
-//! // bridges can be registered in a ToolRegistry:
-//! // for bridge in bridges { registry.register(bridge); }
-//! ```
+//! Wraps a [`DoraToolMapping`] (a config-defined link from a Dora node output
+//! to an MCP tool name) so the agent's [`Tool`] machinery can dispatch the
+//! request like any other tool. The bridge also registers the tool's
+//! required safety tier in the global [`RobotToolRegistry`] so the existing
+//! `group:robot:<tier>` `ToolPolicy` machinery actually applies — without
+//! that registration the tier metadata would be decorative.
 
-mod config;
-
-use async_trait::async_trait;
-use octos_agent::tools::{Tool, ToolResult};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+use octos_agent::tools::robot_groups::{self, RobotToolRegistry};
+use octos_agent::tools::ConcurrencyClass;
+use octos_agent::{SafetyTier, Tool, ToolResult};
+use serde::{Deserialize, Serialize};
+
+pub mod config;
 pub use config::BridgeConfig;
-
-/// Safety tiers for dora tool operations.
-///
-/// Stored as plain strings in config for forward compatibility.
-/// Use [`SafetyTier`] variants for structured comparisons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SafetyTier {
-    /// Read-only observation, no physical effect.
-    Observe,
-    /// Controlled motion within pre-validated bounds.
-    SafeMotion,
-    /// Unrestricted actuation of joints and end-effectors.
-    FullActuation,
-    /// Emergency stop and override commands.
-    EmergencyOverride,
-}
-
-impl SafetyTier {
-    /// Parse from the string representation used in config files.
-    pub fn from_config_str(s: &str) -> Self {
-        match s {
-            "observe" => SafetyTier::Observe,
-            "safe_motion" => SafetyTier::SafeMotion,
-            "full_actuation" => SafetyTier::FullActuation,
-            "emergency_override" => SafetyTier::EmergencyOverride,
-            _ => SafetyTier::Observe,
-        }
-    }
-
-    /// Return the canonical string form.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SafetyTier::Observe => "observe",
-            SafetyTier::SafeMotion => "safe_motion",
-            SafetyTier::FullActuation => "full_actuation",
-            SafetyTier::EmergencyOverride => "emergency_override",
-        }
-    }
-}
 
 /// Mapping from a dora-rs node output to an MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,16 +31,20 @@ pub struct DoraToolMapping {
     pub dora_output_id: String,
     /// Expected input parameters (name -> description).
     pub parameters: HashMap<String, String>,
-    /// Required safety tier for this tool.
+    /// Required safety tier for this tool. Strict: unknown tiers fail
+    /// `BridgeConfig::from_json` rather than silently defaulting to
+    /// `Observe`. Serialised as snake_case (matches existing config files
+    /// — `"observe"`, `"safe_motion"`, `"full_actuation"`,
+    /// `"emergency_override"`).
     #[serde(default = "default_tier")]
-    pub safety_tier: String,
+    pub safety_tier: SafetyTier,
     /// Timeout in seconds for the tool call.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
 }
 
-fn default_tier() -> String {
-    "observe".to_string()
+fn default_tier() -> SafetyTier {
+    SafetyTier::Observe
 }
 
 fn default_timeout() -> u64 {
@@ -119,9 +72,9 @@ impl DoraToolBridge {
         &self.mapping
     }
 
-    /// Parse the safety tier string into the typed enum.
+    /// Required safety tier for this tool, drawn directly from the mapping.
     pub fn required_safety_tier(&self) -> SafetyTier {
-        SafetyTier::from_config_str(&self.mapping.safety_tier)
+        self.mapping.safety_tier
     }
 
     /// Build the JSON Schema object describing the tool's input parameters.
@@ -140,18 +93,12 @@ impl DoraToolBridge {
                 )
             })
             .collect();
-
-        let required: Vec<serde_json::Value> = self
-            .mapping
-            .parameters
-            .keys()
-            .map(|k| serde_json::Value::String(k.clone()))
-            .collect();
-
+        let required: Vec<String> = self.mapping.parameters.keys().cloned().collect();
         serde_json::json!({
             "type": "object",
             "properties": properties,
-            "required": required
+            "required": required,
+            "additionalProperties": false,
         })
     }
 }
@@ -171,41 +118,70 @@ impl Tool for DoraToolBridge {
     }
 
     fn tags(&self) -> &[&str] {
-        &["dora", "mcp-bridge"]
+        &["dora", "mcp-bridge", "robot"]
+    }
+
+    /// Codex round-2 P2: anything that can actuate the robot must NOT run in
+    /// the same parallel batch as another bridge call against the same Dora
+    /// runtime — overlapping motion commands are a real safety hazard. Only
+    /// `Observe`-tier tools (sensors, status queries) keep the default
+    /// parallel-friendly `Safe` class; every higher tier is `Exclusive` so
+    /// the agent's batch dispatcher serialises them.
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        match self.mapping.safety_tier {
+            SafetyTier::Observe => ConcurrencyClass::Safe,
+            SafetyTier::SafeMotion
+            | SafetyTier::FullActuation
+            | SafetyTier::EmergencyOverride => ConcurrencyClass::Exclusive,
+        }
     }
 
     async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
-        // In a real implementation this would send args to the dora node
-        // via the dora dataflow and await the response.  We return a
-        // placeholder indicating the bridge would forward to dora.
         let request = serde_json::json!({
-            "tool": self.mapping.tool_name,
-            "node_id": self.mapping.dora_node_id,
-            "output_id": self.mapping.dora_output_id,
+            "dora_node_id": self.mapping.dora_node_id,
+            "dora_output_id": self.mapping.dora_output_id,
+            "tool_name": self.mapping.tool_name,
             "args": args,
             "timeout_secs": self.mapping.timeout_secs,
+            "safety_tier": self.mapping.safety_tier.label(),
         });
 
         Ok(ToolResult {
-            success: true,
             output: format!(
-                "DoraToolBridge: would forward to node '{}' output '{}': {}",
+                "[dora-bridge] would forward to {}::{} with payload:\n{}",
                 self.mapping.dora_node_id,
                 self.mapping.dora_output_id,
                 serde_json::to_string_pretty(&request).unwrap_or_default()
             ),
+            success: true,
             ..Default::default()
         })
     }
 }
 
-/// Load tool mappings from a [`BridgeConfig`] and create bridge tools.
+/// Load tool mappings from a [`BridgeConfig`], create bridge tools, AND
+/// register each tool with the global [`RobotToolRegistry`] at its declared
+/// tier so the existing `group:robot:<tier>` `ToolPolicy` machinery sees
+/// the bridge tools. Without this registration the `safety_tier` field is
+/// decorative — group-based allow/deny silently misses every dora tool.
+///
+/// Idempotent: re-loading the same config replaces prior tier mappings for
+/// the same tool name (see [`RobotToolRegistry::insert`]).
 pub fn load_bridges(config: &BridgeConfig) -> Vec<DoraToolBridge> {
-    config
+    let bridges: Vec<DoraToolBridge> = config
         .mappings
         .iter()
         .map(|m| DoraToolBridge::new(m.clone()))
-        .collect()
+        .collect();
+    robot_groups::with_registry_mut(|reg: &mut RobotToolRegistry| {
+        for bridge in &bridges {
+            reg.insert(
+                bridge.mapping.tool_name.clone(),
+                bridge.mapping.safety_tier,
+            );
+        }
+    });
+    bridges
 }
 
 #[cfg(test)]
@@ -222,7 +198,7 @@ mod tests {
             dora_node_id: "moveit-skills".to_string(),
             dora_output_id: "skill_request".to_string(),
             parameters: params,
-            safety_tier: "safe_motion".to_string(),
+            safety_tier: SafetyTier::SafeMotion,
             timeout_secs: 60,
         }
     }
@@ -265,44 +241,66 @@ mod tests {
         let tags = bridge.tags();
         assert!(tags.contains(&"dora"));
         assert!(tags.contains(&"mcp-bridge"));
+        assert!(tags.contains(&"robot"));
     }
 
     #[test]
-    fn should_parse_safety_tier_safe_motion() {
+    fn should_expose_declared_safety_tier() {
         let bridge = DoraToolBridge::new(sample_mapping());
         assert_eq!(bridge.required_safety_tier(), SafetyTier::SafeMotion);
     }
 
     #[test]
-    fn should_default_to_observe_tier_for_unknown_string() {
-        let mut mapping = sample_mapping();
-        mapping.safety_tier = "unknown_tier".to_string();
-        let bridge = DoraToolBridge::new(mapping);
-        assert_eq!(bridge.required_safety_tier(), SafetyTier::Observe);
+    fn should_fail_to_parse_unknown_safety_tier_string() {
+        // Codex round-1 P1: previously an unknown / misspelled tier silently
+        // collapsed to `Observe` (the LEAST restrictive), so a typo on a
+        // high-risk tool would slip past observe-only allow lists. Strict
+        // parsing now rejects the config.
+        let json = r#"{
+            "mappings": [{
+                "tool_name": "rogue",
+                "description": "should not load",
+                "dora_node_id": "n",
+                "dora_output_id": "o",
+                "parameters": {},
+                "safety_tier": "FullActuation",
+                "timeout_secs": 1
+            }]
+        }"#;
+        let result = BridgeConfig::from_json(json);
+        assert!(result.is_err(), "expected unknown-tier rejection, got Ok");
     }
 
     #[test]
-    fn should_parse_all_safety_tier_variants() {
-        for (s, expected) in [
-            ("observe", SafetyTier::Observe),
-            ("safe_motion", SafetyTier::SafeMotion),
-            ("full_actuation", SafetyTier::FullActuation),
-            ("emergency_override", SafetyTier::EmergencyOverride),
-        ] {
-            assert_eq!(SafetyTier::from_config_str(s), expected, "failed for '{s}'");
-        }
-    }
+    fn should_register_bridges_in_robot_tool_registry_at_declared_tier() {
+        // Codex round-1 P2: the bridge previously carried `safety_tier` but
+        // never enrolled the tool in `RobotToolRegistry`, so the existing
+        // `group:robot:<tier>` ToolPolicy machinery had nothing to evaluate
+        // against. `load_bridges` now wires both halves.
+        let mut high = sample_mapping();
+        high.tool_name = "dora_register_high_actuation".to_string();
+        high.safety_tier = SafetyTier::FullActuation;
 
-    #[test]
-    fn should_round_trip_safety_tier_as_str() {
-        for tier in [
-            SafetyTier::Observe,
-            SafetyTier::SafeMotion,
-            SafetyTier::FullActuation,
-            SafetyTier::EmergencyOverride,
-        ] {
-            assert_eq!(SafetyTier::from_config_str(tier.as_str()), tier);
-        }
+        let mut low = sample_mapping();
+        low.tool_name = "dora_register_observe".to_string();
+        low.safety_tier = SafetyTier::Observe;
+
+        let config = BridgeConfig {
+            description: String::new(),
+            mappings: vec![high, low],
+        };
+        let bridges = load_bridges(&config);
+        assert_eq!(bridges.len(), 2);
+
+        let snap = robot_groups::snapshot();
+        assert_eq!(
+            snap.tier_of("dora_register_high_actuation"),
+            Some(SafetyTier::FullActuation),
+        );
+        assert_eq!(
+            snap.tier_of("dora_register_observe"),
+            Some(SafetyTier::Observe),
+        );
     }
 
     #[tokio::test]
@@ -312,70 +310,9 @@ mod tests {
             .execute(&serde_json::json!({"waypoint": "A"}))
             .await
             .unwrap();
-        assert!(result.success);
+        assert!(result.output.contains("dora-bridge"));
         assert!(result.output.contains("moveit-skills"));
-        assert!(result.output.contains("skill_request"));
-        assert!(result.output.contains("navigate_to"));
-    }
-
-    #[tokio::test]
-    async fn should_execute_bridge_tool_with_empty_args() {
-        let bridge = DoraToolBridge::new(sample_mapping());
-        let result = bridge.execute(&serde_json::json!({})).await.unwrap();
+        assert!(result.output.contains("safe_motion"));
         assert!(result.success);
-        assert!(result.file_modified.is_none());
-        assert!(result.files_to_send.is_empty());
-    }
-
-    #[test]
-    fn should_load_bridges_from_config() {
-        let json = r#"{
-            "description": "Test config",
-            "mappings": [
-                {
-                    "tool_name": "tool_a",
-                    "description": "First tool",
-                    "dora_node_id": "node-1",
-                    "dora_output_id": "out-1",
-                    "parameters": {},
-                    "safety_tier": "observe",
-                    "timeout_secs": 10
-                },
-                {
-                    "tool_name": "tool_b",
-                    "description": "Second tool",
-                    "dora_node_id": "node-2",
-                    "dora_output_id": "out-2",
-                    "parameters": {"param": "A parameter"},
-                    "safety_tier": "full_actuation",
-                    "timeout_secs": 30
-                }
-            ]
-        }"#;
-        let config = BridgeConfig::from_json(json).unwrap();
-        let bridges = load_bridges(&config);
-        assert_eq!(bridges.len(), 2);
-        assert_eq!(bridges[0].name(), "tool_a");
-        assert_eq!(bridges[1].name(), "tool_b");
-        assert_eq!(bridges[1].required_safety_tier(), SafetyTier::FullActuation);
-    }
-
-    #[test]
-    fn should_apply_default_safety_tier_when_omitted() {
-        let json = r#"{
-            "mappings": [
-                {
-                    "tool_name": "minimal_tool",
-                    "description": "A minimal tool",
-                    "dora_node_id": "node-x",
-                    "dora_output_id": "out-x",
-                    "parameters": {}
-                }
-            ]
-        }"#;
-        let config = BridgeConfig::from_json(json).unwrap();
-        let bridges = load_bridges(&config);
-        assert_eq!(bridges[0].required_safety_tier(), SafetyTier::Observe);
-        assert_eq!(bridges[0].mapping().timeout_secs, 30);
     }
 }

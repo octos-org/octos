@@ -38,6 +38,7 @@ impl BridgeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octos_agent::SafetyTier;
 
     #[test]
     fn should_parse_config_from_json() {
@@ -58,7 +59,7 @@ mod tests {
         let config = BridgeConfig::from_json(json).unwrap();
         assert_eq!(config.mappings.len(), 1);
         assert_eq!(config.mappings[0].tool_name, "scan_station");
-        assert_eq!(config.mappings[0].safety_tier, "full_actuation");
+        assert_eq!(config.mappings[0].safety_tier, SafetyTier::FullActuation);
     }
 
     #[test]
@@ -72,5 +73,43 @@ mod tests {
     fn should_fail_on_invalid_json() {
         let result = BridgeConfig::from_json("{not valid json}");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_reject_unknown_safety_tier_string() {
+        // Strict parser: typos / forward-looking tier names must fail loading
+        // rather than silently downgrade to Observe (codex round-1 P1).
+        let json = r#"{
+            "mappings": [{
+                "tool_name": "x",
+                "description": "x",
+                "dora_node_id": "n",
+                "dora_output_id": "o",
+                "parameters": {},
+                "safety_tier": "kind_of_dangerous",
+                "timeout_secs": 1
+            }]
+        }"#;
+        let result = BridgeConfig::from_json(json);
+        assert!(result.is_err(), "expected unknown-tier rejection");
+    }
+
+    #[test]
+    fn should_default_safety_tier_when_field_omitted() {
+        // Omitting `safety_tier` falls back to `Observe` (the safest default
+        // for an explicitly-not-declared tool); only an explicit unknown
+        // string fails. Mirrors `default_tier()` in lib.rs.
+        let json = r#"{
+            "mappings": [{
+                "tool_name": "x",
+                "description": "x",
+                "dora_node_id": "n",
+                "dora_output_id": "o",
+                "parameters": {},
+                "timeout_secs": 1
+            }]
+        }"#;
+        let config = BridgeConfig::from_json(json).unwrap();
+        assert_eq!(config.mappings[0].safety_tier, SafetyTier::Observe);
     }
 }
