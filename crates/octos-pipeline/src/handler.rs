@@ -865,6 +865,12 @@ impl GateHandler {
             },
             1 => ctx.predecessor_outcomes[0].clone(),
             _ => {
+                // Severity ladder: Error > Fail > Skipped > Pass.
+                // The ladder is exhaustive over `OutcomeStatus`; adding
+                // a new variant is a compile-error if this match isn't
+                // updated, so we keep the ladder explicit rather than
+                // collapsing to "any non-pass" (codex round-7 P2:
+                // skipped predecessors were silently treated as pass).
                 let aggregate_status = if ctx
                     .predecessor_outcomes
                     .iter()
@@ -877,6 +883,12 @@ impl GateHandler {
                     .any(|o| o.status == OutcomeStatus::Fail)
                 {
                     OutcomeStatus::Fail
+                } else if ctx
+                    .predecessor_outcomes
+                    .iter()
+                    .any(|o| o.status == OutcomeStatus::Skipped)
+                {
+                    OutcomeStatus::Skipped
                 } else {
                     OutcomeStatus::Pass
                 };
@@ -1271,6 +1283,128 @@ mod tests {
             outcome.status,
             OutcomeStatus::Pass,
             "fan-in gate must aggregate predecessor statuses to Fail if any branch failed, so that `outcome.status == \"fail\"` Passes",
+        );
+    }
+
+    /// Codex round-7 P2: fan-in aggregation must surface `Skipped`
+    /// predecessors. The previous round-6 implementation collapsed
+    /// any non-`Error`/non-`Fail` set to `Pass`, so a gate predicate
+    /// of `outcome.status == "skipped"` after a fan-in that included
+    /// a deadline-skipped branch could never detect it. Severity
+    /// ladder is now `Error > Fail > Skipped > Pass`.
+    #[tokio::test]
+    async fn gate_handler_aggregates_fan_in_predecessor_status_as_skipped() {
+        use crate::graph::{HandlerKind, PipelineNode};
+
+        let pass = NodeOutcome {
+            node_id: "branch_a".to_string(),
+            status: OutcomeStatus::Pass,
+            content: "branch a ok".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+        let skipped = NodeOutcome {
+            node_id: "branch_b".to_string(),
+            status: OutcomeStatus::Skipped,
+            content: "branch b skipped".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+
+        let ctx = HandlerContext {
+            input: format!("{}\n\n---\n\n{}", pass.content, skipped.content),
+            completed: HashMap::new(),
+            predecessor_outcomes: vec![pass, skipped],
+            working_dir: std::env::temp_dir(),
+        };
+
+        let gate = PipelineNode {
+            id: "skip_gate".to_string(),
+            handler: HandlerKind::Gate,
+            prompt: Some("outcome.status == \"skipped\"".to_string()),
+            label: None,
+            model: None,
+            context_window: None,
+            max_output_tokens: None,
+            tools: vec![],
+            goal_gate: false,
+            max_retries: 0,
+            timeout_secs: None,
+            suggested_next: None,
+            converge: None,
+            worker_prompt: None,
+            planner_model: None,
+            max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: vec![],
+        };
+
+        let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Pass,
+            "fan-in with a skipped predecessor must aggregate to Skipped, so `outcome.status == \"skipped\"` Passes",
+        );
+    }
+
+    /// Codex round-7 P2 mirror: the `Skipped` tier must lose to `Fail`
+    /// in the severity ladder. A fan-in containing both a `Skipped`
+    /// and a `Fail` should aggregate to `Fail`, not `Skipped`.
+    #[tokio::test]
+    async fn gate_handler_fail_dominates_skipped_in_fan_in_aggregation() {
+        use crate::graph::{HandlerKind, PipelineNode};
+
+        let skipped = NodeOutcome {
+            node_id: "skipped".to_string(),
+            status: OutcomeStatus::Skipped,
+            content: "skipped".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+        let fail = NodeOutcome {
+            node_id: "fail".to_string(),
+            status: OutcomeStatus::Fail,
+            content: "fail".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+
+        let ctx = HandlerContext {
+            input: format!("{}\n\n---\n\n{}", skipped.content, fail.content),
+            completed: HashMap::new(),
+            predecessor_outcomes: vec![skipped, fail],
+            working_dir: std::env::temp_dir(),
+        };
+
+        let gate = PipelineNode {
+            id: "merge_gate".to_string(),
+            handler: HandlerKind::Gate,
+            // Skipped-only branch would Pass; Fail aggregation is required.
+            prompt: Some("outcome.status == \"fail\"".to_string()),
+            label: None,
+            model: None,
+            context_window: None,
+            max_output_tokens: None,
+            tools: vec![],
+            goal_gate: false,
+            max_retries: 0,
+            timeout_secs: None,
+            suggested_next: None,
+            converge: None,
+            worker_prompt: None,
+            planner_model: None,
+            max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: vec![],
+        };
+
+        let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Pass,
+            "Fail must dominate Skipped in fan-in aggregation",
         );
     }
 
