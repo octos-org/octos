@@ -1,4 +1,6 @@
-{ lib, pkgs, ... }:
+selfPackages:
+
+{ lib, ... }:
 
 let
   inherit (lib)
@@ -21,14 +23,9 @@ in
   options = {
     programs.octos = {
       enable = mkEnableOption "octos CLI";
-      enableAppSkills = mkEnableOption "octos app-skills (news, weather, etc.)";
+      package = mkPackageOption selfPackages "octos-minimal" { };
       enableDashboard = mkEnableOption "octos web dashboard";
       enableExtraPackages = mkEnableOption "Auto-install optional runtime deps based on features";
-
-      package = mkPackageOption pkgs "octos-minimal" {
-        nullable = true;
-        default = null;
-      };
 
       features = mkOption {
         type = listOf (enum [
@@ -45,6 +42,17 @@ in
         ]);
         default = [ ];
         description = "Cargo features to enable";
+      };
+
+      skills = mkOption {
+        type = submodule {
+          options = {
+            enable = mkEnableOption "Install app-skills (news, weather, etc.). Requires features containing api.";
+            package = mkPackageOption selfPackages "octos-app-skills" { };
+          };
+        };
+        default = { };
+        description = "App Skills configuration";
       };
 
       service = mkOption {
