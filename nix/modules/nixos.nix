@@ -3,13 +3,15 @@
   lib,
   pkgs,
   ...
+
 }:
 
 let
   cfg = config.programs.octos;
+  serviceCfg = cfg.service;
 
   finalFeatures =
-    if !lib.elem "api" cfg.features && (cfg.enableDashboard || cfg.skills.enable) then
+    if !lib.elem "api" cfg.features && (cfg.skills.enable || serviceCfg.enable) then
       cfg.features ++ [ "api" ]
     else
       cfg.features;
@@ -32,6 +34,26 @@ in
       pkgs.nodejs
       pkgs.poppler_utils
     ];
+
+    systemd.tmpfiles.rules = lib.mkIf serviceCfg.enable [
+      "d ${cfg.service.dataDir} 0770 root root -"
+    ];
+
+    systemd.services.octos-gateway = lib.mkIf serviceCfg.enable {
+      description = "octos gateway service";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+
+      serviceConfig = {
+        Type = "simple";
+        RestartSec = 5;
+        Restart = "on-failure";
+        ExecStart = "${finalPackage}/bin/octos serve --port ${toString serviceCfg.port} --host ${serviceCfg.host} --auth-token ${serviceCfg.authToken}";
+        Environment = [ "OCTOS_DATA_DIR=${serviceCfg.dataDir}" ];
+        WorkingDirectory = cfg.service.dataDir;
+      };
+    };
 
   };
 }
