@@ -194,6 +194,15 @@ pub struct HandlerContext {
     pub input: String,
     /// All completed node outcomes so far.
     pub completed: HashMap<String, NodeOutcome>,
+    /// Outcomes of the current node's *direct* predecessors, in graph
+    /// edge order. Empty when the current node is a root (no incoming
+    /// edges). Critical for `GateHandler`: a gate must evaluate against
+    /// its real predecessor's status — the predecessor may have completed
+    /// with `OutcomeStatus::Fail`, which the executor permits to flow
+    /// through conditional edges. Without this field a gate predicate
+    /// like `outcome.status == "fail"` could never detect predecessor
+    /// failure (codex round-6 P2).
+    pub predecessor_outcomes: Vec<NodeOutcome>,
     /// Working directory for tools.
     pub working_dir: PathBuf,
 }
@@ -825,32 +834,69 @@ impl Handler for ShellHandler {
 }
 
 /// Evaluate a condition without any LLM call.
-/// The node prompt is treated as a condition expression evaluated against
-/// the gate's predecessor outcome — sourced from `ctx.input`, the
-/// executor's deterministic concatenation of the node's direct
-/// predecessor contents (see `executor.rs` predecessor-input
-/// construction). Earlier revisions read `ctx.completed.values().last()`
-/// from a `HashMap`, which is unordered and produced nondeterministic
-/// branching once more than one node had completed (codex round-5 P2).
+///
+/// The node prompt is treated as a condition expression. The outcome it
+/// evaluates against comes from `HandlerContext::predecessor_outcomes`:
+///
+///   * Exactly one direct predecessor (the common branching case) →
+///     use that predecessor's outcome verbatim, preserving its status.
+///     Round-6 fix: a `Fail` predecessor must remain `Fail` so a gate
+///     prompt of `outcome.status == "fail"` can detect it. Round-5
+///     fix: a `HashMap` last-value read was nondeterministic.
+///   * Fan-in (≥ 2 direct predecessors) → aggregate: status is `Error`
+///     if any predecessor errored, `Fail` if any predecessor failed,
+///     otherwise `Pass`. Content is `ctx.input` (executor's
+///     concatenation).
+///   * No direct predecessors (root gate) → synthesize a `Pass` outcome
+///     from `ctx.input`. Tests that don't populate
+///     `predecessor_outcomes` also fall through this branch and see
+///     content-only semantics, which matches their original intent.
 pub struct GateHandler;
+
+impl GateHandler {
+    fn synthesize_predecessor_outcome(gate_id: &str, ctx: &HandlerContext) -> NodeOutcome {
+        match ctx.predecessor_outcomes.len() {
+            0 => NodeOutcome {
+                node_id: format!("{gate_id}__no_predecessor"),
+                status: OutcomeStatus::Pass,
+                content: ctx.input.clone(),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            },
+            1 => ctx.predecessor_outcomes[0].clone(),
+            _ => {
+                let aggregate_status = if ctx
+                    .predecessor_outcomes
+                    .iter()
+                    .any(|o| o.status == OutcomeStatus::Error)
+                {
+                    OutcomeStatus::Error
+                } else if ctx
+                    .predecessor_outcomes
+                    .iter()
+                    .any(|o| o.status == OutcomeStatus::Fail)
+                {
+                    OutcomeStatus::Fail
+                } else {
+                    OutcomeStatus::Pass
+                };
+                NodeOutcome {
+                    node_id: format!("{gate_id}__fan_in"),
+                    status: aggregate_status,
+                    content: ctx.input.clone(),
+                    token_usage: TokenUsage::default(),
+                    files_modified: vec![],
+                }
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl Handler for GateHandler {
     async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> Result<NodeOutcome> {
         let cond_str = node.prompt.as_deref().unwrap_or("true");
-
-        // The executor only schedules a node after its direct predecessors
-        // have completed without aborting the run; the predecessor content
-        // therefore comes from `ctx.input` and the gate's "incoming status"
-        // is `Pass` by construction. (A skipped predecessor produces a
-        // skipped/unreachable path that never reaches us.)
-        let predecessor_outcome = NodeOutcome {
-            node_id: format!("{}__predecessor", node.id),
-            status: OutcomeStatus::Pass,
-            content: ctx.input.clone(),
-            token_usage: TokenUsage::default(),
-            files_modified: vec![],
-        };
+        let predecessor_outcome = Self::synthesize_predecessor_outcome(&node.id, ctx);
 
         if cond_str == "true" {
             return Ok(NodeOutcome {
@@ -1012,6 +1058,7 @@ mod tests {
             // Direct-predecessor content has no sentinel — gate must Fail.
             input: "fresh inspection: anomaly_clear".to_string(),
             completed,
+            predecessor_outcomes: Vec::new(),
             working_dir: std::env::temp_dir(),
         };
 
@@ -1079,6 +1126,7 @@ mod tests {
         let ctx = HandlerContext {
             input: "fresh inspection: anomaly_detected reading".to_string(),
             completed,
+            predecessor_outcomes: Vec::new(),
             working_dir: std::env::temp_dir(),
         };
 
@@ -1106,6 +1154,124 @@ mod tests {
 
         let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
         assert_eq!(outcome.status, OutcomeStatus::Pass);
+    }
+
+    /// Codex round-6 P2: a gate predicate of `outcome.status == "fail"`
+    /// must actually detect a `Fail` predecessor. Round-5's fix
+    /// hard-coded the synthesized predecessor status to `Pass`, which
+    /// silently broke status-based predicates. This test pins both the
+    /// status-preservation and the single-predecessor-source rule:
+    /// `predecessor_outcomes[0].status` propagates verbatim into the
+    /// outcome the gate evaluates.
+    #[tokio::test]
+    async fn gate_handler_preserves_predecessor_fail_status_for_status_predicates() {
+        use crate::graph::{HandlerKind, PipelineNode};
+
+        let predecessor = NodeOutcome {
+            node_id: "inspect".to_string(),
+            status: OutcomeStatus::Fail,
+            content: "no anomaly here".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+
+        let ctx = HandlerContext {
+            input: predecessor.content.clone(),
+            completed: HashMap::new(),
+            predecessor_outcomes: vec![predecessor.clone()],
+            working_dir: std::env::temp_dir(),
+        };
+
+        let gate = PipelineNode {
+            id: "fail_gate".to_string(),
+            handler: HandlerKind::Gate,
+            prompt: Some("outcome.status == \"fail\"".to_string()),
+            label: None,
+            model: None,
+            context_window: None,
+            max_output_tokens: None,
+            tools: vec![],
+            goal_gate: false,
+            max_retries: 0,
+            timeout_secs: None,
+            suggested_next: None,
+            converge: None,
+            worker_prompt: None,
+            planner_model: None,
+            max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: vec![],
+        };
+
+        let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Pass,
+            "predicate `outcome.status == \"fail\"` must Pass when the predecessor outcome has status Fail; the gate must not lose the predecessor status",
+        );
+    }
+
+    /// Codex round-6 P2: fan-in aggregation. With multiple direct
+    /// predecessors the gate should evaluate against an aggregate whose
+    /// status is `Fail` if ANY predecessor failed, and content is the
+    /// executor's `ctx.input` concatenation. Without this rule a
+    /// fan-in safety gate after a partially-failed merge would never
+    /// detect the failure.
+    #[tokio::test]
+    async fn gate_handler_aggregates_fan_in_predecessor_status_as_fail_if_any_fail() {
+        use crate::graph::{HandlerKind, PipelineNode};
+
+        let pass = NodeOutcome {
+            node_id: "branch_a".to_string(),
+            status: OutcomeStatus::Pass,
+            content: "branch a ok".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+        let fail = NodeOutcome {
+            node_id: "branch_b".to_string(),
+            status: OutcomeStatus::Fail,
+            content: "branch b broke".to_string(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
+
+        let ctx = HandlerContext {
+            input: format!("{}\n\n---\n\n{}", pass.content, fail.content),
+            completed: HashMap::new(),
+            predecessor_outcomes: vec![pass, fail],
+            working_dir: std::env::temp_dir(),
+        };
+
+        let gate = PipelineNode {
+            id: "merge_gate".to_string(),
+            handler: HandlerKind::Gate,
+            prompt: Some("outcome.status == \"fail\"".to_string()),
+            label: None,
+            model: None,
+            context_window: None,
+            max_output_tokens: None,
+            tools: vec![],
+            goal_gate: false,
+            max_retries: 0,
+            timeout_secs: None,
+            suggested_next: None,
+            converge: None,
+            worker_prompt: None,
+            planner_model: None,
+            max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: vec![],
+        };
+
+        let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Pass,
+            "fan-in gate must aggregate predecessor statuses to Fail if any branch failed, so that `outcome.status == \"fail\"` Passes",
+        );
     }
 
     /// Sanity check — the existing event arms still forward as before so
