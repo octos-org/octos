@@ -5958,8 +5958,9 @@ mod tests {
         ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
         DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-        approval_scopes, methods, rpc_error_codes,
+        TaskOutputReadParams, approval_scopes, methods, rpc_error_codes,
     };
+    use uuid::Uuid;
 
     #[test]
     fn parses_turn_start_rpc_request() {
@@ -6653,6 +6654,636 @@ mod tests {
         match rx.recv().await.expect("rpc frame") {
             WsMessage::Text(text) => serde_json::from_str(text.as_str()).expect("json frame"),
             other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+
+    async fn collect_ws_json_frames(
+        rx: &mut mpsc::Receiver<WsMessage>,
+        expected: usize,
+    ) -> Vec<Value> {
+        let mut frames = Vec::with_capacity(expected);
+        for _ in 0..expected {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv_rpc_json(rx))
+                .await
+                .expect("timed out waiting for golden frame");
+            frames.push(frame);
+        }
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(25), rx.recv()).await;
+        assert!(
+            !matches!(extra, Ok(Some(_))),
+            "golden scenario emitted more than {expected} frames"
+        );
+        frames
+    }
+
+    fn fixed_turn_id(seed: u128) -> TurnId {
+        TurnId(Uuid::from_u128(seed))
+    }
+
+    fn fixed_approval_id(seed: u128) -> ApprovalId {
+        ApprovalId(Uuid::from_u128(seed))
+    }
+
+    fn fixed_preview_id(seed: u128) -> PreviewId {
+        PreviewId(Uuid::from_u128(seed))
+    }
+
+    fn fixed_timestamp(offset_seconds: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-05-09T00:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&Utc)
+            + chrono::Duration::seconds(offset_seconds)
+    }
+
+    fn normalize_ws_frames(frames: Vec<Value>) -> Value {
+        let mut uuid_placeholders: HashMap<String, String> = HashMap::new();
+        let mut next_uuid = 1usize;
+        Value::Array(
+            frames
+                .into_iter()
+                .map(|frame| normalize_json_value(frame, &mut uuid_placeholders, &mut next_uuid))
+                .collect(),
+        )
+    }
+
+    fn normalize_json_value(
+        value: Value,
+        uuid_placeholders: &mut HashMap<String, String>,
+        next_uuid: &mut usize,
+    ) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(
+                values
+                    .into_iter()
+                    .map(|value| normalize_json_value(value, uuid_placeholders, next_uuid))
+                    .collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            normalize_json_value(value, uuid_placeholders, next_uuid),
+                        )
+                    })
+                    .collect(),
+            ),
+            Value::String(value) => {
+                Value::String(normalize_string_value(value, uuid_placeholders, next_uuid))
+            }
+            other => other,
+        }
+    }
+
+    fn normalize_string_value(
+        value: String,
+        uuid_placeholders: &mut HashMap<String, String>,
+        next_uuid: &mut usize,
+    ) -> String {
+        if Uuid::parse_str(&value).is_ok() {
+            return uuid_placeholder(value, uuid_placeholders, next_uuid);
+        }
+        if DateTime::parse_from_rfc3339(&value).is_ok() {
+            return "<timestamp>".to_owned();
+        }
+        normalize_embedded_uuids(value, uuid_placeholders, next_uuid)
+    }
+
+    fn uuid_placeholder(
+        uuid: String,
+        uuid_placeholders: &mut HashMap<String, String>,
+        next_uuid: &mut usize,
+    ) -> String {
+        uuid_placeholders
+            .entry(uuid)
+            .or_insert_with(|| {
+                let placeholder = format!("<uuid-{next_uuid}>");
+                *next_uuid += 1;
+                placeholder
+            })
+            .clone()
+    }
+
+    fn normalize_embedded_uuids(
+        value: String,
+        uuid_placeholders: &mut HashMap<String, String>,
+        next_uuid: &mut usize,
+    ) -> String {
+        const UUID_LEN: usize = 36;
+        if value.len() < UUID_LEN {
+            return value;
+        }
+        let mut output = String::with_capacity(value.len());
+        let mut index = 0;
+        let mut changed = false;
+        while index < value.len() {
+            if index + UUID_LEN <= value.len() {
+                if let Some(candidate) = value.get(index..index + UUID_LEN) {
+                    if Uuid::parse_str(candidate).is_ok() {
+                        output.push_str(&uuid_placeholder(
+                            candidate.to_owned(),
+                            uuid_placeholders,
+                            next_uuid,
+                        ));
+                        index += UUID_LEN;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            let ch = value[index..]
+                .chars()
+                .next()
+                .expect("index is within string");
+            output.push(ch);
+            index += ch.len_utf8();
+        }
+        if changed { output } else { value }
+    }
+
+    fn assert_ui_protocol_golden(name: &str, frames: Vec<Value>) {
+        let normalized = normalize_ws_frames(frames);
+        let actual = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&normalized).expect("serialize golden frames")
+        );
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("ui_protocol_golden")
+            .join(format!("{name}.json"));
+        if std::env::var("OCTOS_BLESS_UI_PROTOCOL_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .expect("create golden fixture directory");
+            std::fs::write(&path, actual).expect("write golden fixture");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        assert_eq!(
+            actual,
+            expected,
+            "golden fixture drifted: {}",
+            path.display()
+        );
+    }
+
+    fn golden_diff_preview(session_id: &SessionKey, preview_id: PreviewId) -> DiffPreview {
+        DiffPreview {
+            session_id: session_id.clone(),
+            preview_id,
+            title: Some("Golden fixture diff".into()),
+            files: vec![DiffPreviewFile {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                status: DiffPreviewFileStatus::Modified,
+                hunks: vec![DiffPreviewHunk {
+                    header: "@@ -1,2 +1,2 @@".into(),
+                    lines: vec![
+                        DiffPreviewLine {
+                            kind: DiffPreviewLineKind::Context,
+                            content: " pub fn run() {".into(),
+                            old_line: Some(1),
+                            new_line: Some(1),
+                        },
+                        DiffPreviewLine {
+                            kind: DiffPreviewLineKind::Removed,
+                            content: "-    old();".into(),
+                            old_line: Some(2),
+                            new_line: None,
+                        },
+                        DiffPreviewLine {
+                            kind: DiffPreviewLineKind::Added,
+                            content: "+    new();".into(),
+                            old_line: None,
+                            new_line: Some(2),
+                        },
+                    ],
+                }],
+            }],
+        }
+    }
+
+    async fn seed_hydrate_messages(state: &Arc<AppState>, session_id: &SessionKey) {
+        let sessions = state.sessions.as_ref().expect("sessions state");
+        let mut sessions = sessions.lock().await;
+        let session = sessions.get_or_create(session_id).await;
+        session.messages.push(Message {
+            role: MessageRole::User,
+            content: "golden hydrate prompt".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: Some("client-message-1".into()),
+            thread_id: Some("client-message-1".into()),
+            timestamp: fixed_timestamp(0),
+        });
+        session.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: "golden hydrate answer".into(),
+            media: vec!["artifacts/answer.md".into()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some("client-message-1".into()),
+            timestamp: fixed_timestamp(1),
+        });
+    }
+
+    async fn golden_session_open_success() -> Vec<Value> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let approvals = PendingApprovalStore::default();
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &forwarders,
+            None,
+            ConnectionUiFeatures::default(),
+            "session-open-1".into(),
+            SessionOpenParams {
+                session_id: SessionKey("local:golden-session-open".into()),
+                profile_id: Some("coding".into()),
+                cwd: None,
+                after: None,
+            },
+        )
+        .await;
+
+        let frames = collect_ws_json_frames(&mut rx, 2).await;
+        abort_live_forwarders(&forwarders).await;
+        frames
+    }
+
+    async fn golden_session_open_profile_mismatch() -> Vec<Value> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let approvals = PendingApprovalStore::default();
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &forwarders,
+            Some("profile-a"),
+            ConnectionUiFeatures::default(),
+            "session-open-auth-fail".into(),
+            SessionOpenParams {
+                session_id: SessionKey::with_profile("profile-b", "web", "chat-1"),
+                profile_id: None,
+                cwd: None,
+                after: None,
+            },
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 1).await
+    }
+
+    async fn golden_turn_start_fast() -> Vec<Value> {
+        let session_id = SessionKey("local:golden-turn-start".into());
+        let turn_id = fixed_turn_id(0x10);
+        let request = UiCommand::TurnStart(TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "golden fast turn".into(),
+            }],
+        })
+        .into_rpc_request("turn-start-1")
+        .expect("turn/start request");
+        assert!(matches!(
+            route_rpc_command(request, ConnectionUiFeatures::default()).expect("route"),
+            UiCommand::TurnStart(_)
+        ));
+
+        let ledger = UiProtocolLedger::new(16);
+        let (ws, mut rx) = ws_connection_for_test(8);
+        send_rpc_result(&ws, "turn-start-1".into(), json!({ "accepted": true }))
+            .expect("turn/start ack");
+        send_notification_lifecycle(
+            &ws,
+            &ledger,
+            UiNotification::TurnStarted(octos_core::ui_protocol::TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: fixed_timestamp(0),
+            }),
+        )
+        .expect("turn/started");
+        send_notification_ephemeral(
+            &ws,
+            &ledger,
+            UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                text: "golden answer".into(),
+            }),
+        )
+        .expect("message/delta");
+        send_notification_lifecycle(
+            &ws,
+            &ledger,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id,
+                turn_id,
+                cursor: None,
+            }),
+        )
+        .expect("turn/completed");
+
+        collect_ws_json_frames(&mut rx, 4).await
+    }
+
+    async fn golden_turn_interrupt_terminal() -> Vec<Value> {
+        let session_id = SessionKey("local:golden-interrupt".into());
+        let turn_id = fixed_turn_id(0x20);
+        let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel::<()>(1);
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        let abort = task.abort_handle();
+        task.abort();
+        active_turns.lock().await.insert(
+            session_id.clone(),
+            ActiveTurn {
+                turn_id: turn_id.clone(),
+                state: Arc::new(TokioMutex::new(TurnState::Terminal(
+                    TerminalReason::Completed,
+                ))),
+                interrupt_tx: Arc::new(TokioMutex::new(Some(interrupt_tx))),
+                abort,
+            },
+        );
+
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let (ws, mut rx) = ws_connection_for_test(4);
+        handle_turn_interrupt(
+            &ws,
+            &ledger,
+            &active_turns,
+            &contracts,
+            "turn-interrupt-1".into(),
+            TurnInterruptParams {
+                session_id,
+                turn_id,
+            },
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 1).await
+    }
+
+    async fn golden_approval_respond_decided() -> Vec<Value> {
+        let session_id = SessionKey("local:golden-approval".into());
+        let turn_id = fixed_turn_id(0x30);
+        let approval_id = fixed_approval_id(0x31);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let state = Arc::new(AppState::empty_for_tests());
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        let request = ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            approval_id.clone(),
+            turn_id,
+            "shell",
+            "Approve golden command",
+            "printf golden",
+        );
+        let _runtime_rx = contracts.approvals.request_runtime(request.clone());
+        send_notification_durable(&ws, &ledger, UiNotification::ApprovalRequested(request))
+            .expect("approval/requested");
+        handle_approval_respond(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            None,
+            "approval-respond-1".into(),
+            ApprovalRespondParams::new(session_id, approval_id, ApprovalDecision::Approve),
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 3).await
+    }
+
+    async fn golden_diff_preview_get_ready() -> Vec<Value> {
+        let session_id = SessionKey("local:golden-diff".into());
+        let preview_id = fixed_preview_id(0x40);
+        let store = PendingDiffPreviewStore::default();
+        store.insert(golden_diff_preview(&session_id, preview_id.clone()));
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_diff_preview_get(
+            &ws,
+            &store,
+            None,
+            "diff-preview-1".into(),
+            DiffPreviewGetParams {
+                session_id,
+                preview_id,
+            },
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 1).await
+    }
+
+    async fn golden_task_list_running() -> Vec<Value> {
+        let session_id = SessionKey("local:golden-task-list".into());
+        let (state, _supervisor, _task_id) = appui_task_state_with_running_task(&session_id);
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_task_list(
+            &ws,
+            &state,
+            None,
+            "task-list-1".into(),
+            TaskListParams {
+                session_id,
+                topic: None,
+            },
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 1).await
+    }
+
+    async fn golden_task_output_read_snapshot() -> Vec<Value> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:golden-task-output".into());
+        let state = state_with_sessions(temp.path());
+        {
+            let sessions = state.sessions.as_ref().expect("sessions");
+            let mut sessions = sessions.lock().await;
+            sessions
+                .add_message(&session_id, Message::user("materialize session"))
+                .await
+                .expect("persist session");
+        }
+        let supervisor = octos_agent::TaskSupervisor::new();
+        supervisor
+            .enable_persistence(ui_protocol_task_output::task_state_path(
+                temp.path(),
+                &session_id,
+            ))
+            .expect("task persistence");
+        let task_id = supervisor.register("shell", "golden-task-output", Some(&session_id.0));
+        supervisor.mark_running(&task_id);
+        supervisor.mark_failed(
+            &task_id,
+            "golden stderr line one\ngolden stderr line two\n".into(),
+        );
+        let task_id = task_id.parse::<TaskId>().expect("task id");
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_task_output_read(
+            &ws,
+            &state,
+            None,
+            "task-output-1".into(),
+            TaskOutputReadParams {
+                session_id,
+                task_id,
+                cursor: Some(OutputCursor { offset: 0 }),
+                limit_bytes: Some(64),
+            },
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 1).await
+    }
+
+    async fn golden_session_hydrate_full() -> Vec<Value> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:golden-hydrate".into());
+        let state = state_with_sessions(temp.path());
+        seed_hydrate_messages(&state, &session_id).await;
+        let ledger = event_ledger(&state).await;
+        let approvals = PendingApprovalStore::default();
+        let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        handle_session_hydrate(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            ConnectionUiFeatures::default(),
+            "hydrate-1".into(),
+            SessionHydrateParams {
+                session_id,
+                after: None,
+                include: vec![],
+            },
+        )
+        .await;
+
+        collect_ws_json_frames(&mut rx, 1).await
+    }
+
+    async fn golden_durable_message_events() -> Vec<Value> {
+        let session_id = SessionKey("local:golden-durable-message".into());
+        let turn_id = fixed_turn_id(0x50);
+        let ledger = UiProtocolLedger::new(16);
+        let (ws, mut rx) = ws_connection_for_test(4);
+
+        send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::MessagePersisted(MessagePersistedEvent {
+                session_id: session_id.clone(),
+                turn_id: Some(turn_id.clone()),
+                thread_id: Some("client-message-1".into()),
+                seq: 1,
+                role: "assistant".into(),
+                message_id: "assistant-message-1".into(),
+                client_message_id: None,
+                source: MessagePersistedSource::Assistant,
+                cursor: UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                },
+                persisted_at: fixed_timestamp(0),
+                media: vec!["artifacts/assistant.md".into()],
+            }),
+        )
+        .expect("message/persisted");
+        send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+                session_id: session_id.clone(),
+                turn_id: Some(turn_id),
+                thread_id: Some("client-message-1".into()),
+                task_id: "spawn-task-1".into(),
+                response_to_client_message_id: Some("client-message-1".into()),
+                seq: 2,
+                message_id: "spawn-message-1".into(),
+                source: "background".into(),
+                cursor: UiCursor {
+                    stream: session_id.0,
+                    seq: 0,
+                },
+                persisted_at: fixed_timestamp(1),
+                content: "background result ready".into(),
+                media: vec!["research/report.md".into()],
+            }),
+        )
+        .expect("turn/spawn_complete");
+
+        collect_ws_json_frames(&mut rx, 2).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ui_protocol_golden_frame_order_matches_checked_in_fixtures() {
+        let scenarios = [
+            ("session_open_success", golden_session_open_success().await),
+            (
+                "session_open_profile_mismatch",
+                golden_session_open_profile_mismatch().await,
+            ),
+            ("turn_start_fast", golden_turn_start_fast().await),
+            (
+                "turn_interrupt_terminal",
+                golden_turn_interrupt_terminal().await,
+            ),
+            (
+                "approval_respond_decided",
+                golden_approval_respond_decided().await,
+            ),
+            (
+                "diff_preview_get_ready",
+                golden_diff_preview_get_ready().await,
+            ),
+            ("task_list_running", golden_task_list_running().await),
+            (
+                "task_output_read_snapshot",
+                golden_task_output_read_snapshot().await,
+            ),
+            ("session_hydrate_full", golden_session_hydrate_full().await),
+            (
+                "durable_message_events",
+                golden_durable_message_events().await,
+            ),
+        ];
+        for (name, frames) in scenarios {
+            assert_ui_protocol_golden(name, frames);
         }
     }
 

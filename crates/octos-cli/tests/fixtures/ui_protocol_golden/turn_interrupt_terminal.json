@@ -1,0 +1,10 @@
+[
+  {
+    "id": "turn-interrupt-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "interrupted": false,
+      "terminal_state": "completed"
+    }
+  }
+]

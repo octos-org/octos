@@ -1,0 +1,37 @@
+[
+  {
+    "id": "task-output-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "bytes_read": 64,
+      "complete": false,
+      "cursor": {
+        "offset": 0
+      },
+      "is_snapshot_projection": true,
+      "lifecycle_state": "failed",
+      "limitations": [
+        {
+          "code": "disk_output_unavailable",
+          "message": "No M8.7 disk-routed task stdout/stderr stream is discoverable in this runtime"
+        },
+        {
+          "code": "live_tail_unavailable",
+          "message": "task/output/read is served from a snapshot projection; live tail is available only from task/output/delta notifications emitted during active turns"
+        }
+      ],
+      "live_tail_supported": false,
+      "next_cursor": {
+        "offset": 64
+      },
+      "runtime_state": "failed",
+      "session_id": "local:golden-task-output",
+      "source": "runtime_projection",
+      "task_id": "<uuid-1>",
+      "task_status": "failed",
+      "text": "task_id: <uuid-1>\ntool_name: shell\nt",
+      "total_bytes": 365,
+      "truncated": true
+    }
+  }
+]

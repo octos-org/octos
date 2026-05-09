@@ -1,0 +1,39 @@
+[
+  {
+    "id": "turn-start-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "accepted": true
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "turn/started",
+    "params": {
+      "session_id": "local:golden-turn-start",
+      "timestamp": "<timestamp>",
+      "turn_id": "<uuid-1>"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "message/delta",
+    "params": {
+      "session_id": "local:golden-turn-start",
+      "text": "golden answer",
+      "turn_id": "<uuid-1>"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "turn/completed",
+    "params": {
+      "cursor": {
+        "seq": 2,
+        "stream": "local:golden-turn-start"
+      },
+      "session_id": "local:golden-turn-start",
+      "turn_id": "<uuid-1>"
+    }
+  }
+]
