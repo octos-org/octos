@@ -24,7 +24,6 @@ in
     programs.octos = {
       enable = mkEnableOption "octos CLI";
       package = mkPackageOption selfPackages "octos-minimal" { };
-      enableDashboard = mkEnableOption "octos web dashboard";
       enableExtraPackages = mkEnableOption ''
         Install optional runtime dependencies (chromium, nodejs, ffmpeg, libreoffice, poppler-utils).
 
@@ -65,7 +64,7 @@ in
       service = mkOption {
         type = submodule {
           options = {
-            enable = mkEnableOption "octos serve service";
+            enable = mkEnableOption "octos service (dashboard + gateway)";
             port = mkOption {
               type = int;
               default = 8080;
@@ -81,10 +80,9 @@ in
               default = "/var/lib/octos";
               description = "octos data directory";
             };
-            user = mkOption {
+            authToken = mkOption {
               type = str;
-              default = "octos";
-              description = "User to run octos serve as";
+              description = "Auth token for dashboard access (required)";
             };
           };
         };
