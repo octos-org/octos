@@ -42,9 +42,12 @@ in
           "email"
           "twilio"
           "wecom"
-          "browser"
         ]);
         default = [ ];
+        example = [
+          "telegram"
+          "discord"
+        ];
         description = "Cargo features to enable";
       };
 
