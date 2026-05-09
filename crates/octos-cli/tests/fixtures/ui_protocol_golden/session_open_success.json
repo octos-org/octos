@@ -1,0 +1,138 @@
+[
+  {
+    "id": "session-open-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "opened": {
+        "active_profile_id": "coding",
+        "capabilities": {
+          "capabilities_schema_version": 2,
+          "supported_features": [
+            "approval.typed.v1",
+            "pane.snapshots.v1",
+            "session.workspace_cwd.v1",
+            "harness.task_control.v1",
+            "state.session_hydrate.v1",
+            "state.thread_graph.v1",
+            "state.turn_state_get.v1",
+            "event.message_persisted.v1",
+            "event.spawn_complete.v1"
+          ],
+          "supported_methods": [
+            "session/open",
+            "turn/start",
+            "turn/interrupt",
+            "approval/respond",
+            "approval/scopes/list",
+            "diff/preview/get",
+            "task/list",
+            "task/cancel",
+            "task/restart_from_node",
+            "task/output/read",
+            "session/hydrate",
+            "thread/graph/get",
+            "turn/state/get"
+          ],
+          "supported_notifications": [
+            "session/open",
+            "turn/started",
+            "turn/completed",
+            "turn/error",
+            "message/delta",
+            "tool/started",
+            "tool/progress",
+            "tool/completed",
+            "approval/requested",
+            "approval/auto_resolved",
+            "approval/decided",
+            "approval/cancelled",
+            "task/updated",
+            "task/output/delta",
+            "progress/updated",
+            "warning",
+            "protocol/replay_lossy",
+            "message/persisted",
+            "turn/spawn_complete"
+          ],
+          "version": {
+            "jsonrpc": "2.0",
+            "protocol": "octos-ui/v1alpha1",
+            "schema_version": 1
+          }
+        },
+        "cursor": {
+          "seq": 1,
+          "stream": "local:golden-session-open"
+        },
+        "session_id": "local:golden-session-open"
+      }
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "session/open",
+    "params": {
+      "active_profile_id": "coding",
+      "capabilities": {
+        "capabilities_schema_version": 2,
+        "supported_features": [
+          "approval.typed.v1",
+          "pane.snapshots.v1",
+          "session.workspace_cwd.v1",
+          "harness.task_control.v1",
+          "state.session_hydrate.v1",
+          "state.thread_graph.v1",
+          "state.turn_state_get.v1",
+          "event.message_persisted.v1",
+          "event.spawn_complete.v1"
+        ],
+        "supported_methods": [
+          "session/open",
+          "turn/start",
+          "turn/interrupt",
+          "approval/respond",
+          "approval/scopes/list",
+          "diff/preview/get",
+          "task/list",
+          "task/cancel",
+          "task/restart_from_node",
+          "task/output/read",
+          "session/hydrate",
+          "thread/graph/get",
+          "turn/state/get"
+        ],
+        "supported_notifications": [
+          "session/open",
+          "turn/started",
+          "turn/completed",
+          "turn/error",
+          "message/delta",
+          "tool/started",
+          "tool/progress",
+          "tool/completed",
+          "approval/requested",
+          "approval/auto_resolved",
+          "approval/decided",
+          "approval/cancelled",
+          "task/updated",
+          "task/output/delta",
+          "progress/updated",
+          "warning",
+          "protocol/replay_lossy",
+          "message/persisted",
+          "turn/spawn_complete"
+        ],
+        "version": {
+          "jsonrpc": "2.0",
+          "protocol": "octos-ui/v1alpha1",
+          "schema_version": 1
+        }
+      },
+      "cursor": {
+        "seq": 1,
+        "stream": "local:golden-session-open"
+      },
+      "session_id": "local:golden-session-open"
+    }
+  }
+]

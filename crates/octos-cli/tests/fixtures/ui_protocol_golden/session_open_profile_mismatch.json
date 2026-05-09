@@ -1,0 +1,13 @@
+[
+  {
+    "error": {
+      "code": -32602,
+      "data": {
+        "expected_profile_id": "profile-a"
+      },
+      "message": "session_id must include the authenticated profile"
+    },
+    "id": "session-open-auth-fail",
+    "jsonrpc": "2.0"
+  }
+]

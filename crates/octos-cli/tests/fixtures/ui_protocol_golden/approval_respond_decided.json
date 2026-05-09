@@ -1,0 +1,37 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "method": "approval/requested",
+    "params": {
+      "approval_id": "<uuid-1>",
+      "body": "printf golden",
+      "session_id": "local:golden-approval",
+      "title": "Approve golden command",
+      "tool_name": "shell",
+      "turn_id": "<uuid-2>"
+    }
+  },
+  {
+    "id": "approval-respond-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "accepted": true,
+      "approval_id": "<uuid-1>",
+      "runtime_resumed": true,
+      "status": "accepted"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "approval/decided",
+    "params": {
+      "approval_id": "<uuid-1>",
+      "auto_resolved": false,
+      "decided_at": "<timestamp>",
+      "decided_by": "",
+      "decision": "approve",
+      "session_id": "local:golden-approval",
+      "turn_id": "<uuid-2>"
+    }
+  }
+]

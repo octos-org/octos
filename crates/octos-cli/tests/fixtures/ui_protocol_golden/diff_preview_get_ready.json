@@ -1,0 +1,44 @@
+[
+  {
+    "id": "diff-preview-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "preview": {
+        "files": [
+          {
+            "hunks": [
+              {
+                "header": "@@ -1,2 +1,2 @@",
+                "lines": [
+                  {
+                    "content": " pub fn run() {",
+                    "kind": "context",
+                    "new_line": 1,
+                    "old_line": 1
+                  },
+                  {
+                    "content": "-    old();",
+                    "kind": "removed",
+                    "old_line": 2
+                  },
+                  {
+                    "content": "+    new();",
+                    "kind": "added",
+                    "new_line": 2
+                  }
+                ]
+              }
+            ],
+            "path": "src/lib.rs",
+            "status": "modified"
+          }
+        ],
+        "preview_id": "<uuid-1>",
+        "session_id": "local:golden-diff",
+        "title": "Golden fixture diff"
+      },
+      "source": "pending_store",
+      "status": "ready"
+    }
+  }
+]

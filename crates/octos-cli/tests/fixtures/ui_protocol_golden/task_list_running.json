@@ -1,0 +1,25 @@
+[
+  {
+    "id": "task-list-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "session_id": "local:golden-task-list",
+      "tasks": [
+        {
+          "child_session_key": "local:golden-task-list#child-<uuid-1>",
+          "id": "<uuid-1>",
+          "lifecycle_state": "running",
+          "parent_session_key": "local:golden-task-list",
+          "runtime_state": "executing_tool",
+          "session_key": "local:golden-task-list",
+          "started_at": "<timestamp>",
+          "state": "running",
+          "status": "running",
+          "tool_call_id": "call-appui-task",
+          "tool_name": "run_pipeline",
+          "updated_at": "<timestamp>"
+        }
+      ]
+    }
+  }
+]

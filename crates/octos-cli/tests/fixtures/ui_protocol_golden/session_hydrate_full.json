@@ -1,0 +1,47 @@
+[
+  {
+    "id": "hydrate-1",
+    "jsonrpc": "2.0",
+    "result": {
+      "cursor": {
+        "seq": 0,
+        "stream": "local:golden-hydrate"
+      },
+      "messages": [
+        {
+          "client_message_id": "client-message-1",
+          "content": "golden hydrate prompt",
+          "persisted_at": "<timestamp>",
+          "role": "user",
+          "seq": 0,
+          "thread_id": "client-message-1"
+        },
+        {
+          "content": "golden hydrate answer",
+          "media": [
+            "artifacts/answer.md"
+          ],
+          "persisted_at": "<timestamp>",
+          "role": "assistant",
+          "seq": 1,
+          "thread_id": "client-message-1"
+        }
+      ],
+      "pending_approvals": [],
+      "session_id": "local:golden-hydrate",
+      "threads": [
+        {
+          "message_seqs": [
+            0,
+            1
+          ],
+          "root_client_message_id": "client-message-1",
+          "root_seq": 0,
+          "status": "unknown",
+          "thread_id": "client-message-1"
+        }
+      ],
+      "turns": []
+    }
+  }
+]

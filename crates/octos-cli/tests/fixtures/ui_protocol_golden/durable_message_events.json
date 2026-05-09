@@ -1,0 +1,46 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "method": "message/persisted",
+    "params": {
+      "cursor": {
+        "seq": 1,
+        "stream": "local:golden-durable-message"
+      },
+      "media": [
+        "artifacts/assistant.md"
+      ],
+      "message_id": "assistant-message-1",
+      "persisted_at": "<timestamp>",
+      "role": "assistant",
+      "seq": 1,
+      "session_id": "local:golden-durable-message",
+      "source": "assistant",
+      "thread_id": "client-message-1",
+      "turn_id": "<uuid-1>"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "method": "turn/spawn_complete",
+    "params": {
+      "content": "background result ready",
+      "cursor": {
+        "seq": 2,
+        "stream": "local:golden-durable-message"
+      },
+      "media": [
+        "research/report.md"
+      ],
+      "message_id": "spawn-message-1",
+      "persisted_at": "<timestamp>",
+      "response_to_client_message_id": "client-message-1",
+      "seq": 2,
+      "session_id": "local:golden-durable-message",
+      "source": "background",
+      "task_id": "spawn-task-1",
+      "thread_id": "client-message-1",
+      "turn_id": "<uuid-1>"
+    }
+  }
+]
