@@ -24,6 +24,10 @@
         );
     in
     {
+      nixosModules.default = import ./nix/modules/nixos.nix;
+      darwinModules.default = import ./nix/modules/darwin.nix;
+      homeModules.default = import ./nix/modules/home.nix;
+
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
         {
