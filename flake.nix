@@ -23,11 +23,26 @@
             pkgs = import inputs.nixpkgs { inherit system; };
           }
         );
+
+      mkModuleWithPackages =
+        modulePath:
+        { pkgs, lib, ... }:
+        let
+          inherit (pkgs.stdenv.hostPlatform) system;
+        in
+        {
+          imports = [
+            (lib.modules.importApply ./nix/modules/options.nix {
+              inherit (self.packages.${system}) octos-minimal octos-app-skills;
+            })
+            modulePath
+          ];
+        };
     in
     {
-      nixosModules.default = import ./nix/modules/nixos.nix;
-      darwinModules.default = import ./nix/modules/darwin.nix;
-      homeModules.default = import ./nix/modules/home.nix;
+      nixosModules.default = mkModuleWithPackages ./nix/modules/nixos.nix;
+      darwinModules.default = mkModuleWithPackages ./nix/modules/darwin.nix;
+      homeModules.default = mkModuleWithPackages ./nix/modules/home.nix;
 
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
