@@ -1,6 +1,7 @@
 {
   config,
   lib,
+  pkgs,
   ...
 }:
 
@@ -8,7 +9,7 @@ let
   cfg = config.programs.octos;
 
   finalFeatures =
-    if ((cfg.enableDashboard || cfg.skills.enable) && !builtins.elem "api" cfg.features) then
+    if !lib.elem "api" cfg.features && (cfg.enableDashboard || cfg.skills.enable) then
       cfg.features ++ [ "api" ]
     else
       cfg.features;
@@ -18,10 +19,19 @@ let
 in
 
 {
-
   config = lib.mkIf cfg.enable {
 
-    environment.systemPackages = [ finalPackage ] ++ lib.optional cfg.skills.enable cfg.skills.package;
-  };
+    environment.systemPackages = [
+      finalPackage
+    ]
+    ++ lib.optional cfg.skills.enable cfg.skills.package
+    ++ lib.optional cfg.enableExtraPackages [
+      pkgs.chromium
+      pkgs.ffmpeg
+      pkgs.libreoffice
+      pkgs.nodejs
+      pkgs.poppler_utils
+    ];
 
+  };
 }
