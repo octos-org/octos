@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use octos_agent::tools::robot_groups::{self, RobotToolRegistry};
 use octos_agent::tools::ConcurrencyClass;
+use octos_agent::tools::robot_groups::{self, RobotToolRegistry};
 use octos_agent::{SafetyTier, Tool, ToolResult};
 use serde::{Deserialize, Serialize};
 
@@ -130,9 +130,9 @@ impl Tool for DoraToolBridge {
     fn concurrency_class(&self) -> ConcurrencyClass {
         match self.mapping.safety_tier {
             SafetyTier::Observe => ConcurrencyClass::Safe,
-            SafetyTier::SafeMotion
-            | SafetyTier::FullActuation
-            | SafetyTier::EmergencyOverride => ConcurrencyClass::Exclusive,
+            SafetyTier::SafeMotion | SafetyTier::FullActuation | SafetyTier::EmergencyOverride => {
+                ConcurrencyClass::Exclusive
+            }
         }
     }
 
@@ -175,10 +175,7 @@ pub fn load_bridges(config: &BridgeConfig) -> Vec<DoraToolBridge> {
         .collect();
     robot_groups::with_registry_mut(|reg: &mut RobotToolRegistry| {
         for bridge in &bridges {
-            reg.insert(
-                bridge.mapping.tool_name.clone(),
-                bridge.mapping.safety_tier,
-            );
+            reg.insert(bridge.mapping.tool_name.clone(), bridge.mapping.safety_tier);
         }
     });
     bridges

@@ -13,14 +13,13 @@
 //!     every gate-outgoing edge needs an explicit `condition=` so routing
 //!     does not fall through to the executor's label-substring fallback.
 
-use octos_pipeline::{condition, parse_dot, DeadlineAction, HandlerKind};
+use octos_pipeline::{DeadlineAction, HandlerKind, condition, parse_dot};
 
 const DOT_PATH: &str = "../../examples/dora-bridge-config/inspection_mission.dot";
 
 #[test]
 fn should_parse_inspection_mission_dot_with_supported_handlers() {
-    let src = std::fs::read_to_string(DOT_PATH)
-        .unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
+    let src = std::fs::read_to_string(DOT_PATH).unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
     let graph = parse_dot(&src).expect("parse_dot must accept the example");
 
     for node in graph.nodes.values() {
@@ -57,8 +56,7 @@ fn should_wire_every_gate_node_with_an_executable_predicate() {
     // a `gate` node without a real prompt is a documentation lie. Codex
     // round-4 caught both `safety_gate` and `result_gate` in this state.
 
-    let src = std::fs::read_to_string(DOT_PATH)
-        .unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
+    let src = std::fs::read_to_string(DOT_PATH).unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
     let graph = parse_dot(&src).expect("parse_dot must accept the example");
 
     let gate_nodes: Vec<_> = graph
@@ -98,8 +96,7 @@ fn should_route_every_gate_outgoing_edge_via_explicit_condition() {
     // first unconditional edge erases the gate's branching intent. Every
     // gate-outgoing edge must therefore carry a real `condition=`.
 
-    let src = std::fs::read_to_string(DOT_PATH)
-        .unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
+    let src = std::fs::read_to_string(DOT_PATH).unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
     let graph = parse_dot(&src).expect("parse_dot must accept the example");
 
     let gate_ids: Vec<&str> = graph
@@ -110,11 +107,7 @@ fn should_route_every_gate_outgoing_edge_via_explicit_condition() {
         .collect();
 
     for gate_id in gate_ids {
-        let outgoing: Vec<_> = graph
-            .edges
-            .iter()
-            .filter(|e| e.source == gate_id)
-            .collect();
+        let outgoing: Vec<_> = graph.edges.iter().filter(|e| e.source == gate_id).collect();
         assert!(
             outgoing.len() >= 2,
             "gate {} should have at least two outgoing edges (pass/fail), found {}",
@@ -147,8 +140,7 @@ fn should_compile_every_gate_predicate_and_edge_condition_via_the_dsl() {
     // predicates is a runtime time-bomb. This test compiles every predicate
     // through the real DSL.
 
-    let src = std::fs::read_to_string(DOT_PATH)
-        .unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
+    let src = std::fs::read_to_string(DOT_PATH).unwrap_or_else(|e| panic!("read {DOT_PATH}: {e}"));
     let graph = parse_dot(&src).expect("parse_dot must accept the example");
 
     for node in graph.nodes.values() {
