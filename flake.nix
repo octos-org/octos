@@ -13,6 +13,7 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
+
       forEachSupportedSystem =
         f:
         inputs.nixpkgs.lib.genAttrs supportedSystems (
@@ -39,26 +40,26 @@
         { pkgs, system }:
         {
           default = self.packages.${system}.octos-minimal;
+          octos-app-skills = pkgs.callPackage ./nix/packages/app-skills.nix { };
           octos-minimal = pkgs.callPackage ./nix/packages/default.nix { };
           octos-full = pkgs.buildEnv {
             name = "octos-full";
             paths = [
-              (pkgs.callPackage ./nix/packages/default.nix {
-                features =
-                  # Full feature set — must match scripts/local-tenant-deploy.sh --full
-                  [
-                    "api"
-                    "telegram"
-                    "discord"
-                    "slack"
-                    "whatsapp"
-                    "feishu"
-                    "email"
-                    "twilio"
-                    "wecom"
-                  ];
+              self.packages.${system}.octos-app-skills
+
+              (self.packages.${system}.octos-minimal.override {
+                features = [
+                  "api"
+                  "telegram"
+                  "discord"
+                  "slack"
+                  "whatsapp"
+                  "feishu"
+                  "email"
+                  "twilio"
+                  "wecom"
+                ];
               })
-              (pkgs.callPackage ./nix/packages/app-skills.nix { })
             ];
           };
         }
