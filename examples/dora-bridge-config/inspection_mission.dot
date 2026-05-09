@@ -1,40 +1,70 @@
-// Valve inspection mission pipeline
-// Demonstrates HandlerKind variants, DeadlineAction, Invariant, and MissionCheckpoint
+// Valve inspection mission pipeline.
+//
+// IMPORTANT — what this example actually exercises today:
+//
+//   * The octos-pipeline DOT parser recognises a fixed set of handler kinds:
+//       codergen, shell, gate, noop, parallel, dynamic_parallel
+//     Higher-level robotics handlers (SensorCheck, Motion, SafetyGate) are
+//     described conceptually in the README but are not yet implemented; this
+//     graph stands them in with `codergen` (LLM-driven reasoning over the
+//     bridge tool list) and `gate` (boolean branch on a condition).
+//   * `deadline_action` accepts lowercase `abort`, `skip`, `escalate`, and
+//     `retry:<n>`. Anything else is silently dropped.
+//   * `invariant=...` / `on_violation=...` are not currently parsed; the
+//     `checkpoint="true"` attribute is.
+//
+// When dedicated robotics handler kinds land, swap each `codergen` node below
+// for the appropriate handler (e.g. `sensor_check`, `motion`, `safety_gate`)
+// and add the parser-side support in the same change.
 digraph inspection_mission {
     rankdir=LR;
 
-    // SensorCheck: verify robot is operational before starting
-    preflight [shape=octagon, label="Preflight\nSensorCheck", handler="SensorCheck",
-               invariant="battery_soc > 20", on_violation="Abort"];
+    // Stand-in for SensorCheck: LLM is asked to confirm preflight via the
+    // bridge's read_pressure_gauge / observe-tier sensor tools.
+    preflight [shape=octagon, label="Preflight\nSensor Check", handler="codergen",
+               prompt="Confirm battery_soc > 20 via the observe-tier sensor tools before continuing.",
+               tools="read_pressure_gauge"];
 
-    // Motion: navigate to the valve location
-    navigate [shape=pentagon, label="Navigate\nto Valve P1", handler="Motion",
-              deadline_secs="120", deadline_action="Abort",
+    // Stand-in for Motion: LLM drives the safe-motion bridge tool. Deadline
+    // fires `abort` if navigation hangs.
+    navigate [shape=pentagon, label="Navigate\nto Valve P1", handler="codergen",
+              prompt="Drive the robot to valve P1 using move_to_valve.",
+              tools="move_to_valve",
+              deadline_secs="120", deadline_action="abort",
               checkpoint="true"];
 
-    // SensorCheck: confirm arrival at target position
-    arrival_check [shape=octagon, label="Arrival\nSensorCheck", handler="SensorCheck",
-                   invariant="position_error_m < 0.01", on_violation="Abort"];
+    // Stand-in for arrival SensorCheck.
+    arrival_check [shape=octagon, label="Arrival\nSensor Check", handler="codergen",
+                   prompt="Confirm position_error_m < 0.01 using the observe-tier sensors.",
+                   tools="capture_valve_image"];
 
-    // SafetyGate: require force/torque within limits before manipulation
-    safety_gate [shape=doubleoctagon, label="Force/Torque\nSafetyGate", handler="SafetyGate",
-                 invariant="max_force_n < 50.0", on_violation="EmergencyStop"];
+    // Stand-in for SafetyGate: a boolean gate on whether force is within
+    // limits. The decision logic lives in `condition` (evaluated by the gate
+    // handler at runtime).
+    safety_gate [shape=doubleoctagon, label="Force/Torque\nSafety Gate", handler="gate"];
 
-    // Codergen: LLM-driven valve inspection with camera tool
-    inspect [shape=box, label="Inspect Valve\nCodergen", handler="Codergen",
-             deadline_secs="60", deadline_action="Skip",
+    // LLM-driven valve inspection.
+    inspect [shape=box, label="Inspect Valve\nCodergen", handler="codergen",
+             prompt="Inspect the valve using capture_valve_image and read_pressure_gauge; decide if it is anomalous.",
+             tools="capture_valve_image,read_pressure_gauge",
+             deadline_secs="60", deadline_action="skip",
              checkpoint="true"];
 
-    // Gate: evaluate inspection result
-    result_gate [shape=diamond, label="Anomaly\nDetected?", handler="Gate"];
+    // Gate: was an anomaly detected?
+    result_gate [shape=diamond, label="Anomaly\nDetected?", handler="gate"];
 
-    // Codergen: LLM plans corrective action if anomaly found
-    corrective [shape=box, label="Corrective\nAction", handler="Codergen",
-                deadline_secs="90", deadline_action="Abort"];
+    // Corrective action: LLM plans the response, may use the full-actuation
+    // turn_valve tool (gated upstream by RobotPermissionPolicy).
+    corrective [shape=box, label="Corrective\nAction", handler="codergen",
+                prompt="Plan and execute a corrective action using turn_valve if appropriate.",
+                tools="turn_valve",
+                deadline_secs="90", deadline_action="abort"];
 
-    // Motion: return to home position
-    return_home [shape=pentagon, label="Return\nHome", handler="Motion",
-                 deadline_secs="120", deadline_action="Skip"];
+    // Return to home: safe-motion tool again.
+    return_home [shape=pentagon, label="Return\nHome", handler="codergen",
+                 prompt="Drive back to the home pose using move_to_valve with the home waypoint.",
+                 tools="move_to_valve",
+                 deadline_secs="120", deadline_action="skip"];
 
     // Edges
     preflight -> navigate;

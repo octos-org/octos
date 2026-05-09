@@ -35,20 +35,32 @@ Each mapping declares:
 ### Mission Pipeline (`inspection_mission.dot`)
 
 A DOT graph that defines multi-step robot missions as a DAG with safety
-guarantees at each step. Each node has a `HandlerKind` that determines behavior:
+guarantees at each step. Each node has a `HandlerKind` that determines behavior.
 
-| Handler | Purpose | Example |
-|---------|---------|---------|
-| `SensorCheck` | Read sensor, evaluate condition | "Is battery > 20%?" |
-| `Motion` | Execute robot motion | "Navigate to valve P1" |
-| `SafetyGate` | Require safety condition | "Force < 50N before manipulation" |
-| `Codergen` | LLM-driven reasoning | "Inspect valve, decide action" |
-| `Gate` | Conditional branch | "Was anomaly detected?" |
+The current `octos-pipeline` DOT parser recognises this set of handlers:
 
-**Before:** One big LLM prompt. No checkpoints, no deadlines, no safety gates.
-**After:** Each step has deadlines, invariants, and checkpoints. If the LLM
-hangs on step 3, the deadline fires after 60s and skips to the next step. If
-force exceeds 50N at the safety gate, the mission triggers emergency stop.
+| Handler (parser keyword) | Purpose | Example use in this graph |
+|---|---|---|
+| `codergen` | LLM-driven reasoning over allowed tools | Inspect valve, plan corrective action |
+| `gate` | Conditional branch on a runtime condition | "Was anomaly detected?" |
+| `shell` | Run a shell command | (not used here) |
+| `noop` | Pass-through marker node | (not used here) |
+| `parallel` / `dynamic_parallel` | Fan-out across workers | (not used here) |
+
+Higher-level robotics handlers — `SensorCheck`, `Motion`, `SafetyGate` —
+appear in design discussions but are **not yet implemented in the parser /
+executor**. The example uses `codergen` as the stand-in: the LLM is given the
+appropriate observe-tier or safe-motion bridge tool and prompted to perform
+the check or motion. When the dedicated handlers land, swap the
+`handler="codergen"` attributes for `handler="sensor_check"` /
+`handler="motion"` / `handler="safety_gate"` (and add the parser keywords +
+handler implementations in the same change).
+
+**Before:** One big LLM prompt. No checkpoints, no deadlines, no separation
+of concerns.
+**After:** Each step is its own node with its own deadline + checkpoint, and
+restricted to a tier-appropriate subset of bridge tools. If the LLM hangs on
+inspection, the deadline fires after 60s and skips to the next step.
 
 ## Files
 
@@ -115,35 +127,44 @@ preflight --> navigate --> arrival_check --> safety_gate --> inspect --> result_
 
 ### Key attributes demonstrated
 
-**Deadlines** — prevent the mission from hanging forever:
+**Deadlines** — prevent the mission from hanging forever (parser-supported
+attributes + lowercase action keywords):
 ```dot
-navigate [handler="Motion", deadline_secs="120", deadline_action="Abort"];
-// If navigation takes > 120s, abort the mission (robot might be stuck)
+navigate [handler="codergen", deadline_secs="120", deadline_action="abort"];
+// If navigation takes > 120s, abort the mission (robot might be stuck).
 
-inspect [handler="Codergen", deadline_secs="60", deadline_action="Skip"];
-// If LLM inspection takes > 60s, skip to the next step (non-critical)
+inspect [handler="codergen", deadline_secs="60", deadline_action="skip"];
+// If LLM inspection takes > 60s, skip to the next step (non-critical).
 ```
 
-**Invariants** — safety conditions checked before proceeding:
+**Invariants / safety gates** — modelled here with the `gate` handler. The
+parser does not yet recognise `invariant=...` / `on_violation=...` as
+attributes, so safety conditions live in the gate's runtime condition
+rather than node attributes:
 ```dot
-preflight [handler="SensorCheck", invariant="battery_soc > 20", on_violation="Abort"];
-// Don't start the mission if battery is too low to complete it
-
-safety_gate [handler="SafetyGate", invariant="max_force_n < 50.0", on_violation="EmergencyStop"];
-// If force exceeds 50N, something is wrong — trigger e-stop immediately
+safety_gate [handler="gate"];
+// Branch on whether force/torque is within limits before manipulation.
 ```
 
 **Checkpoints** — resume a failed mission from where it left off:
 ```dot
-navigate [checkpoint="true"];
+navigate [handler="codergen", checkpoint="true"];
 // After arriving at the valve, save state. If the mission fails later,
 // restart from here instead of navigating again.
 ```
 
-### DeadlineAction options
+### deadline_action keywords
 
-| Action | When to use |
-|--------|-------------|
-| `Abort` | Critical step — mission cannot continue without it |
-| `Skip` | Non-critical step — log the timeout and move to next node |
-| `EmergencyStop` | Safety violation — halt all motion immediately |
+The parser accepts these lowercase values for `deadline_action`:
+
+| Keyword | When to use |
+|---|---|
+| `abort` | Critical step — mission cannot continue without it. |
+| `skip` | Non-critical step — log the timeout and move on. |
+| `escalate` | Hand the timeout to the parent / supervisor handler. |
+| `retry:<N>` | Retry the node up to N attempts (e.g. `retry:3`). |
+
+There is no `EmergencyStop` action keyword today; trigger e-stop semantics by
+routing through a `gate` handler whose `false` branch fires the appropriate
+emergency-tier bridge tool, or extend the parser with a new keyword in the
+same change that adds the executor support.
