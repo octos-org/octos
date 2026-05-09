@@ -25,7 +25,7 @@ in
       finalPackage
     ]
     ++ lib.optional cfg.skills.enable cfg.skills.package
-    ++ lib.optional cfg.enableExtraPackages [
+    ++ lib.optionals cfg.enableExtraPackages [
       pkgs.chromium
       pkgs.ffmpeg
       pkgs.libreoffice

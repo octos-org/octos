@@ -25,7 +25,11 @@ in
       enable = mkEnableOption "octos CLI";
       package = mkPackageOption selfPackages "octos-minimal" { };
       enableDashboard = mkEnableOption "octos web dashboard";
-      enableExtraPackages = mkEnableOption "Auto-install optional runtime deps based on features";
+      enableExtraPackages = mkEnableOption ''
+        Install optional runtime dependencies (chromium, nodejs, ffmpeg, libreoffice, poppler-utils).
+
+        See https://github.com/octos-org/octos/blob/main/book/src/installation.md#optional-dependencies
+      '';
 
       features = mkOption {
         type = listOf (enum [
@@ -119,6 +123,7 @@ in
         default = { };
         description = "frpc tunnel configuration for remote access — maps to services.frp.instances.octos";
       };
+
     };
   };
 }
