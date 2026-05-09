@@ -1,5 +1,8 @@
 //! UI Protocol v1 WebSocket transport.
 
+#[path = "ui_protocol_driver.rs"]
+mod ui_protocol_driver;
+
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -67,6 +70,7 @@ use super::ui_protocol_progress::{
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
 use super::ui_protocol_task_output;
+use ui_protocol_driver::UiProtocolDriver;
 
 const FRAME_TOO_LARGE: i64 = -32005;
 const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
@@ -1433,19 +1437,8 @@ async fn ui_protocol_connection(
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
     let writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
     let ws = WsConnection::new(writer_tx);
-    let active_turns = active_turns_registry();
-    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let contracts = contract_stores();
-    let ledger = event_ledger(&state).await;
-    // Force lazy init of the diff-preview store on this connection so
-    // its disk recovery + write-ahead path is wired up before any
-    // approval flow can `upsert_file_mutation`. Subsequent calls reuse
-    // the same `Arc`. Without `state.sessions` (headless smoke) this
-    // installs the ephemeral RAM-only fallback.
-    let _ = diff_preview_store(&state, contracts.as_ref()).await;
-    let connection_profile_id = connection_profile_id.as_deref();
-    let routed_profile_id = routed_profile_id.as_deref();
+    let driver =
+        UiProtocolDriver::new(state, connection_profile_id, routed_profile_id, features).await;
 
     while let Some(Ok(msg)) = ws_rx.next().await {
         let text = match msg {
@@ -1477,122 +1470,10 @@ async fn ui_protocol_connection(
             }
         };
 
-        match command {
-            UiCommand::SessionOpen(params) => {
-                handle_session_open(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &contracts.approvals,
-                    &live_forwarders,
-                    connection_profile_id,
-                    features,
-                    id,
-                    params,
-                )
-                .await;
-            }
-            UiCommand::TurnStart(params) => {
-                handle_turn_start(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &contracts,
-                    &active_turns,
-                    &connection_turns,
-                    connection_profile_id,
-                    routed_profile_id,
-                    features,
-                    id,
-                    params,
-                )
-                .await;
-            }
-            UiCommand::TurnInterrupt(params) => {
-                handle_turn_interrupt(&ws, &ledger, &active_turns, &contracts, id, params).await;
-            }
-            UiCommand::ApprovalRespond(params) => {
-                handle_approval_respond(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &contracts,
-                    connection_profile_id,
-                    id,
-                    params,
-                )
-                .await;
-            }
-            UiCommand::ApprovalScopesList(params) => {
-                handle_approval_scopes_list(
-                    &ws,
-                    &contracts.scopes,
-                    connection_profile_id,
-                    id,
-                    params,
-                )
-                .await;
-            }
-            UiCommand::DiffPreviewGet(params) => {
-                let store = diff_preview_store(&state, contracts.as_ref()).await;
-                handle_diff_preview_get(&ws, store.as_ref(), connection_profile_id, id, params)
-                    .await;
-            }
-            UiCommand::TaskOutputRead(params) => {
-                handle_task_output_read(&ws, &state, connection_profile_id, id, params).await;
-            }
-            UiCommand::TaskList(params) => {
-                handle_task_list(&ws, &state, connection_profile_id, id, params).await;
-            }
-            UiCommand::TaskCancel(params) => {
-                handle_task_cancel(&ws, &state, connection_profile_id, id, params).await;
-            }
-            UiCommand::TaskRestartFromNode(params) => {
-                handle_task_restart_from_node(&ws, &state, connection_profile_id, id, params).await;
-            }
-            UiCommand::SessionHydrate(params) => {
-                handle_session_hydrate(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &contracts.approvals,
-                    &active_turns,
-                    connection_profile_id,
-                    features,
-                    id,
-                    params,
-                )
-                .await;
-            }
-            UiCommand::ThreadGraphGet(params) => {
-                handle_thread_graph_get(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &active_turns,
-                    connection_profile_id,
-                    id,
-                    params,
-                )
-                .await;
-            }
-            UiCommand::TurnStateGet(params) => {
-                handle_turn_state_get(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &active_turns,
-                    connection_profile_id,
-                    id,
-                    params,
-                )
-                .await;
-            }
-        }
+        driver.handle_command(&ws, id, command).await;
     }
 
-    abort_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
-    abort_live_forwarders(&live_forwarders).await;
+    driver.shutdown().await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
