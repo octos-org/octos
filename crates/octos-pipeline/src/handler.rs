@@ -826,7 +826,12 @@ impl Handler for ShellHandler {
 
 /// Evaluate a condition without any LLM call.
 /// The node prompt is treated as a condition expression evaluated against
-/// the last completed node's outcome.
+/// the gate's predecessor outcome — sourced from `ctx.input`, the
+/// executor's deterministic concatenation of the node's direct
+/// predecessor contents (see `executor.rs` predecessor-input
+/// construction). Earlier revisions read `ctx.completed.values().last()`
+/// from a `HashMap`, which is unordered and produced nondeterministic
+/// branching once more than one node had completed (codex round-5 P2).
 pub struct GateHandler;
 
 #[async_trait]
@@ -834,32 +839,31 @@ impl Handler for GateHandler {
     async fn execute(&self, node: &PipelineNode, ctx: &HandlerContext) -> Result<NodeOutcome> {
         let cond_str = node.prompt.as_deref().unwrap_or("true");
 
-        // Find the last completed outcome to evaluate against
-        let last_outcome = ctx
-            .completed
-            .values()
-            .last()
-            .cloned()
-            .unwrap_or_else(|| NodeOutcome {
-                node_id: "none".into(),
-                status: OutcomeStatus::Pass,
-                content: ctx.input.clone(),
-                token_usage: TokenUsage::default(),
-                files_modified: vec![],
-            });
+        // The executor only schedules a node after its direct predecessors
+        // have completed without aborting the run; the predecessor content
+        // therefore comes from `ctx.input` and the gate's "incoming status"
+        // is `Pass` by construction. (A skipped predecessor produces a
+        // skipped/unreachable path that never reaches us.)
+        let predecessor_outcome = NodeOutcome {
+            node_id: format!("{}__predecessor", node.id),
+            status: OutcomeStatus::Pass,
+            content: ctx.input.clone(),
+            token_usage: TokenUsage::default(),
+            files_modified: vec![],
+        };
 
         if cond_str == "true" {
             return Ok(NodeOutcome {
                 node_id: node.id.clone(),
                 status: OutcomeStatus::Pass,
-                content: last_outcome.content,
+                content: predecessor_outcome.content,
                 token_usage: TokenUsage::default(),
                 files_modified: vec![],
             });
         }
 
         let expr = condition::parse_condition(cond_str)?;
-        let passed = condition::evaluate(&expr, &last_outcome);
+        let passed = condition::evaluate(&expr, &predecessor_outcome);
 
         Ok(NodeOutcome {
             node_id: node.id.clone(),
@@ -868,7 +872,7 @@ impl Handler for GateHandler {
             } else {
                 OutcomeStatus::Fail
             },
-            content: last_outcome.content,
+            content: predecessor_outcome.content,
             token_usage: TokenUsage::default(),
             files_modified: vec![],
         })
@@ -964,6 +968,144 @@ mod tests {
             forwarded.contains("320") && forwarded.contains("110"),
             "forwarded message should carry the per-node token totals; got {forwarded:?}"
         );
+    }
+
+    /// Codex round-5 P2: GateHandler must evaluate its predicate against
+    /// the executor-supplied `ctx.input` (the deterministic concatenation
+    /// of direct-predecessor outputs), NOT against
+    /// `ctx.completed.values().last()` whose order depends on `HashMap`
+    /// iteration. This test seeds `completed` with two unrelated outcomes
+    /// whose content would *match* the gate's `outcome.contains(...)`
+    /// predicate — and sets `ctx.input` to content that does NOT match —
+    /// then asserts the gate fails. Under the old implementation the gate
+    /// would match one of the unrelated entries (HashMap order) and pass
+    /// nondeterministically; the new implementation must read input only.
+    #[tokio::test]
+    async fn gate_handler_evaluates_against_ctx_input_not_completed_map() {
+        use crate::graph::{HandlerKind, PipelineNode};
+
+        let mut completed = HashMap::new();
+        // Both completed entries contain the sentinel — these are
+        // distractors. The gate must NOT see them.
+        completed.insert(
+            "earlier_a".to_string(),
+            NodeOutcome {
+                node_id: "earlier_a".to_string(),
+                status: OutcomeStatus::Pass,
+                content: "leftover anomaly_detected reading".to_string(),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            },
+        );
+        completed.insert(
+            "earlier_b".to_string(),
+            NodeOutcome {
+                node_id: "earlier_b".to_string(),
+                status: OutcomeStatus::Pass,
+                content: "another anomaly_detected note".to_string(),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            },
+        );
+
+        let ctx = HandlerContext {
+            // Direct-predecessor content has no sentinel — gate must Fail.
+            input: "fresh inspection: anomaly_clear".to_string(),
+            completed,
+            working_dir: std::env::temp_dir(),
+        };
+
+        let gate = PipelineNode {
+            id: "result_gate".to_string(),
+            handler: HandlerKind::Gate,
+            prompt: Some("outcome.contains(\"anomaly_detected\")".to_string()),
+            label: None,
+            model: None,
+            context_window: None,
+            max_output_tokens: None,
+            tools: vec![],
+            goal_gate: false,
+            max_retries: 0,
+            timeout_secs: None,
+            suggested_next: None,
+            converge: None,
+            worker_prompt: None,
+            planner_model: None,
+            max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: vec![],
+        };
+
+        let outcome = GateHandler
+            .execute(&gate, &ctx)
+            .await
+            .expect("gate execution must succeed");
+
+        assert_eq!(
+            outcome.status,
+            OutcomeStatus::Fail,
+            "gate must read predecessor content from ctx.input only; it must not pick up the `anomaly_detected` sentinel that lives in unrelated completed outcomes",
+        );
+        assert!(
+            outcome.content.contains("anomaly_clear"),
+            "gate outcome content must be the predecessor input, not a leftover completed outcome (got {:?})",
+            outcome.content,
+        );
+    }
+
+    /// Mirror of the above for the pass branch — the gate must also
+    /// recognise a sentinel that *is* present in `ctx.input` even when no
+    /// completed outcome contains it. Together with the fail-branch test
+    /// this pins both directions of the input-vs-completed-map fix.
+    #[tokio::test]
+    async fn gate_handler_passes_when_ctx_input_matches_predicate() {
+        use crate::graph::{HandlerKind, PipelineNode};
+
+        let mut completed = HashMap::new();
+        completed.insert(
+            "earlier".to_string(),
+            NodeOutcome {
+                node_id: "earlier".to_string(),
+                status: OutcomeStatus::Pass,
+                // Sentinel-free; would have made the gate Fail under the
+                // old `completed.last()` behaviour.
+                content: "boring earlier outcome".to_string(),
+                token_usage: TokenUsage::default(),
+                files_modified: vec![],
+            },
+        );
+
+        let ctx = HandlerContext {
+            input: "fresh inspection: anomaly_detected reading".to_string(),
+            completed,
+            working_dir: std::env::temp_dir(),
+        };
+
+        let gate = PipelineNode {
+            id: "result_gate".to_string(),
+            handler: HandlerKind::Gate,
+            prompt: Some("outcome.contains(\"anomaly_detected\")".to_string()),
+            label: None,
+            model: None,
+            context_window: None,
+            max_output_tokens: None,
+            tools: vec![],
+            goal_gate: false,
+            max_retries: 0,
+            timeout_secs: None,
+            suggested_next: None,
+            converge: None,
+            worker_prompt: None,
+            planner_model: None,
+            max_tasks: None,
+            deadline_secs: None,
+            deadline_action: None,
+            checkpoints: vec![],
+        };
+
+        let outcome = GateHandler.execute(&gate, &ctx).await.unwrap();
+        assert_eq!(outcome.status, OutcomeStatus::Pass);
     }
 
     /// Sanity check — the existing event arms still forward as before so
