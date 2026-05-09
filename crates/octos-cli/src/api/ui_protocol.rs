@@ -54,6 +54,8 @@ use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tracing::info;
 
+use crate::appui::codec::{AppUiCodec, AppUiFrame, CodecError, Framing};
+
 use super::AppState;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
@@ -1488,14 +1490,35 @@ async fn abort_live_forwarders(forwarders: &SharedLiveForwarders) {
 }
 
 fn parse_ws_text_frame(text: &str) -> Result<RpcRequest<Value>, RpcError> {
-    if text.len() > MAX_TEXT_FRAME_BYTES {
-        return Err(frame_too_large_error());
-    }
-    parse_rpc_request(text)
+    parse_rpc_request_with_limit(text, MAX_TEXT_FRAME_BYTES)
 }
 
+#[cfg(test)]
 fn parse_rpc_request(text: &str) -> Result<RpcRequest<Value>, RpcError> {
-    serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))
+    parse_rpc_request_with_limit(text, crate::appui::codec::DEFAULT_MAX_FRAME_BYTES)
+}
+
+fn parse_rpc_request_with_limit(
+    text: &str,
+    max_frame_bytes: usize,
+) -> Result<RpcRequest<Value>, RpcError> {
+    let codec = AppUiCodec::with_max_frame_bytes(Framing::Json, max_frame_bytes);
+    match codec.decode(text.as_bytes()) {
+        Ok(AppUiFrame::Request(request)) => Ok(request),
+        Ok(_) => Err(RpcError::invalid_request(
+            "expected JSON-RPC request frame for UI protocol command",
+        )),
+        Err(error) => Err(codec_error_to_rpc_error(error)),
+    }
+}
+
+fn codec_error_to_rpc_error(error: CodecError) -> RpcError {
+    match error {
+        CodecError::FrameTooLarge { limit, .. } => frame_too_large_error(limit),
+        CodecError::Parse(message) => RpcError::parse_error(message),
+        CodecError::InvalidFrame(message) => RpcError::invalid_request(message),
+        CodecError::Serialize(message) => RpcError::internal_error(message),
+    }
 }
 
 fn route_rpc_command(
@@ -1537,12 +1560,12 @@ fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
     octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec()
 }
 
-fn frame_too_large_error() -> RpcError {
+fn frame_too_large_error(limit_bytes: usize) -> RpcError {
     RpcError::new(
         FRAME_TOO_LARGE,
-        format!("WebSocket text frame exceeds {MAX_TEXT_FRAME_BYTES} bytes"),
+        format!("UI protocol frame exceeds {limit_bytes} bytes"),
     )
-    .with_data(json!({ "limit_bytes": MAX_TEXT_FRAME_BYTES }))
+    .with_data(json!({ "limit_bytes": limit_bytes }))
 }
 
 fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
@@ -5571,8 +5594,20 @@ async fn abort_connection_turns(
 /// the lifecycle-error counter on serialization failure (which only happens
 /// when a payload contains non-serializable data; treat as lifecycle).
 fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
-    match serde_json::to_string(value) {
-        Ok(text) => Some(WsMessage::text(text)),
+    let codec = AppUiCodec::new(Framing::Json);
+    match codec.encode(value) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Some(WsMessage::text(text)),
+            Err(error) => {
+                metrics::counter!("ws.send.error.lifecycle").increment(1);
+                tracing::warn!(
+                    target: "octos::ui_protocol::ws",
+                    error = %error,
+                    "encoded ws frame was not valid UTF-8"
+                );
+                None
+            }
+        },
         Err(error) => {
             metrics::counter!("ws.send.error.lifecycle").increment(1);
             tracing::warn!(

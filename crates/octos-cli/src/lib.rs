@@ -8,6 +8,8 @@
 pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
+#[cfg(feature = "api")]
+pub(crate) mod appui;
 pub mod auth;
 pub mod commands;
 pub mod compaction;
