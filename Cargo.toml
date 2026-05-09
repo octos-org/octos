@@ -22,6 +22,7 @@ members = [
     "crates/app-skills/harness-starter-audio",
     "crates/app-skills/harness-starter-coding",
     "crates/platform-skills/voice",
+    "crates/octos-dora-mcp",
     "crates/octos-pipeline",
     "crates/octos-plugin",
     "crates/octos-sandbox",
