@@ -561,6 +561,39 @@ impl ConnectionUiFeatures {
         }
     }
 
+    fn from_client_capabilities(capabilities: &[String]) -> Self {
+        Self {
+            typed_approvals: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1),
+            pane_snapshots: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1),
+            session_workspace_cwd: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
+            harness_task_control: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1),
+            session_hydrate: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
+            thread_graph: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
+            turn_state_get: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
+            message_persisted: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
+            spawn_complete: capabilities
+                .iter()
+                .any(|feature| feature == UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
+            header_present: true,
+        }
+    }
+
     /// Build the `UiProtocolCapabilities` payload to advertise on
     /// `SessionOpened` per UPCR-2026-007 § 4 capability negotiation. When
     /// the client sent no feature header at all, the server returns the
@@ -1464,7 +1497,8 @@ async fn ui_protocol_connection(
             }
         };
         let id = request.id.clone();
-        let command = match route_rpc_command(request, features) {
+        let route_features = driver.features().await;
+        let command = match route_rpc_command(request, route_features) {
             Ok(command) => command,
             Err(error) => {
                 let _ = send_rpc_error(&ws, Some(id), error);
@@ -5871,10 +5905,11 @@ mod tests {
     use super::*;
     use crate::user_store::UserRole;
     use octos_core::ui_protocol::{
-        ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
-        DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
-        DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-        TaskOutputReadParams, approval_scopes, methods, rpc_error_codes,
+        ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus,
+        ClientHelloParams, DiffPreview, DiffPreviewFile, DiffPreviewFileStatus,
+        DiffPreviewGetParams, DiffPreviewGetStatus, DiffPreviewHunk, DiffPreviewLine,
+        DiffPreviewLineKind, DiffPreviewSource, PreviewId, TaskOutputReadParams, approval_scopes,
+        methods, rpc_error_codes,
     };
     use uuid::Uuid;
 
@@ -5954,6 +5989,123 @@ mod tests {
 
         assert!(features.typed_approvals);
         assert!(features.pane_snapshots);
+    }
+
+    #[test]
+    fn client_hello_negotiates_features_without_http_headers() {
+        let features = ConnectionUiFeatures::from_client_capabilities(&[
+            UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1.to_owned(),
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1.to_owned(),
+            "unknown.future.v1".to_owned(),
+        ]);
+
+        assert!(features.header_present);
+        assert!(features.pane_snapshots);
+        assert!(features.harness_task_control);
+        assert!(!features.typed_approvals);
+
+        let capabilities = features.negotiated_capabilities();
+        assert_eq!(
+            capabilities.supported_features,
+            vec![
+                UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1.to_owned(),
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1.to_owned(),
+            ]
+        );
+        assert!(capabilities.supports_method(methods::TASK_LIST));
+        assert!(capabilities.supports_method(methods::TASK_CANCEL));
+    }
+
+    #[test]
+    fn client_hello_routes_before_feature_gates() {
+        let request = UiCommand::ClientHello(ClientHelloParams {
+            client_id: "octos-app".into(),
+            client_version: "0.1.0".into(),
+            capabilities: Vec::new(),
+        })
+        .into_rpc_request("hello-1")
+        .expect("request");
+
+        assert!(matches!(
+            route_rpc_command(request, ConnectionUiFeatures::from_client_capabilities(&[]))
+                .expect("client_hello routes"),
+            UiCommand::ClientHello(_)
+        ));
+    }
+
+    #[test]
+    fn client_hello_feature_set_gates_subsequent_methods() {
+        let task_list = RpcRequest::new(
+            "task-list-1",
+            methods::TASK_LIST,
+            json!({ "session_id": "local:test" }),
+        );
+        let error = route_rpc_command(
+            task_list,
+            ConnectionUiFeatures::from_client_capabilities(&[]),
+        )
+        .expect_err("task/list requires harness task control after client_hello");
+        assert_eq!(error.code, rpc_error_codes::METHOD_NOT_SUPPORTED);
+
+        let task_list = RpcRequest::new(
+            "task-list-2",
+            methods::TASK_LIST,
+            json!({ "session_id": "local:test" }),
+        );
+        assert!(matches!(
+            route_rpc_command(
+                task_list,
+                ConnectionUiFeatures::from_client_capabilities(&[
+                    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1.to_owned(),
+                ])
+            )
+            .expect("task/list routes after capability handshake"),
+            UiCommand::TaskList(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn client_hello_driver_updates_connection_features_and_replies() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let driver =
+            UiProtocolDriver::new(state, None, None, ConnectionUiFeatures::default()).await;
+
+        driver
+            .handle_command(
+                &ws,
+                "hello-1".into(),
+                UiCommand::ClientHello(ClientHelloParams {
+                    client_id: "octos-tui".into(),
+                    client_version: "0.1.0".into(),
+                    capabilities: vec![
+                        UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1.to_owned(),
+                        UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1.to_owned(),
+                    ],
+                }),
+            )
+            .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "hello-1");
+        assert_eq!(
+            frame["result"]["accepted_capabilities"],
+            json!([
+                UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+                UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+            ])
+        );
+        assert_eq!(
+            frame["result"]["server_capabilities"]["supported_features"],
+            json!([
+                UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+                UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+            ])
+        );
+        let features = driver.features().await;
+        assert!(features.header_present);
+        assert!(features.message_persisted);
+        assert!(features.spawn_complete);
     }
 
     #[test]
@@ -6458,7 +6610,16 @@ mod tests {
         let preview_id = PreviewId::new();
         let task_id = octos_core::TaskId::new();
 
-        for request in [
+        let requests = [
+            RpcRequest::new(
+                "client-hello",
+                methods::CLIENT_HELLO,
+                json!({
+                    "client_id": "octos-app-test",
+                    "client_version": "0.1.0",
+                    "capabilities": [],
+                }),
+            ),
             RpcRequest::new(
                 "session-open",
                 methods::SESSION_OPEN,
@@ -6491,19 +6652,18 @@ mod tests {
                 }),
             ),
             RpcRequest::new(
+                "approval-scopes-list",
+                methods::APPROVAL_SCOPES_LIST,
+                json!({
+                    "session_id": session_id.clone(),
+                }),
+            ),
+            RpcRequest::new(
                 "diff-preview",
                 methods::DIFF_PREVIEW_GET,
                 json!({
                     "session_id": session_id.clone(),
                     "preview_id": preview_id.clone(),
-                }),
-            ),
-            RpcRequest::new(
-                "task-output",
-                methods::TASK_OUTPUT_READ,
-                json!({
-                    "session_id": session_id.clone(),
-                    "task_id": task_id.clone(),
                 }),
             ),
             RpcRequest::new(
@@ -6530,10 +6690,52 @@ mod tests {
                     "node_id": "design",
                 }),
             ),
-        ] {
+            RpcRequest::new(
+                "task-output",
+                methods::TASK_OUTPUT_READ,
+                json!({
+                    "session_id": session_id.clone(),
+                    "task_id": task_id.clone(),
+                }),
+            ),
+            RpcRequest::new(
+                "session-hydrate",
+                methods::SESSION_HYDRATE,
+                json!({
+                    "session_id": session_id.clone(),
+                    "include": [],
+                }),
+            ),
+            RpcRequest::new(
+                "thread-graph",
+                methods::THREAD_GRAPH_GET,
+                json!({
+                    "session_id": session_id.clone(),
+                }),
+            ),
+            RpcRequest::new(
+                "turn-state",
+                methods::TURN_STATE_GET,
+                json!({
+                    "session_id": session_id.clone(),
+                    "turn_id": turn_id.clone(),
+                }),
+            ),
+        ];
+        let advertised = ui_protocol_server_supported_methods();
+        let covered: Vec<&str> = requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect();
+        assert_eq!(
+            covered, advertised,
+            "route-completeness test must cover every advertised server method in order"
+        );
+
+        for request in requests {
             let method = request.method.clone();
             assert!(
-                ui_protocol_server_supported_methods().contains(&method.as_str()),
+                advertised.contains(&method.as_str()),
                 "{method} should be advertised by the server slice"
             );
             let command = route_rpc_command(request, ConnectionUiFeatures::default())

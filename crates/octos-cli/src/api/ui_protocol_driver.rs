@@ -6,7 +6,8 @@
 
 use super::*;
 use octos_core::ui_protocol::{
-    ApprovalRespondParams, ApprovalScopesListParams, DiffPreviewGetParams, TaskOutputReadParams,
+    ApprovalRespondParams, ApprovalScopesListParams, ClientHelloParams, ClientHelloResult,
+    DiffPreviewGetParams, TaskOutputReadParams,
 };
 
 pub(super) struct UiProtocolDriver {
@@ -18,7 +19,7 @@ pub(super) struct UiProtocolDriver {
     ledger: Arc<UiProtocolLedger>,
     connection_profile_id: Option<String>,
     routed_profile_id: Option<String>,
-    features: ConnectionUiFeatures,
+    features: TokioMutex<ConnectionUiFeatures>,
 }
 
 impl UiProtocolDriver {
@@ -50,12 +51,17 @@ impl UiProtocolDriver {
             ledger,
             connection_profile_id,
             routed_profile_id,
-            features,
+            features: TokioMutex::new(features),
         }
+    }
+
+    pub(super) async fn features(&self) -> ConnectionUiFeatures {
+        *self.features.lock().await
     }
 
     pub(super) async fn handle_command(&self, ws: &WsConnection, id: String, command: UiCommand) {
         match command {
+            UiCommand::ClientHello(params) => self.handle_client_hello(ws, id, params).await,
             UiCommand::SessionOpen(params) => self.handle_session_open(ws, id, params).await,
             UiCommand::TurnStart(params) => self.handle_turn_start(ws, id, params).await,
             UiCommand::TurnInterrupt(params) => self.handle_turn_interrupt(ws, id, params).await,
@@ -92,7 +98,46 @@ impl UiProtocolDriver {
         abort_live_forwarders(&self.live_forwarders).await;
     }
 
+    async fn handle_client_hello(&self, ws: &WsConnection, id: String, params: ClientHelloParams) {
+        if params.client_id.trim().is_empty() {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params("client_id is required"),
+            );
+            return;
+        }
+        if params.client_version.trim().is_empty() {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params("client_version is required"),
+            );
+            return;
+        }
+
+        let negotiated = ConnectionUiFeatures::from_client_capabilities(&params.capabilities);
+        {
+            let mut features = self.features.lock().await;
+            *features = negotiated;
+        }
+
+        let server_capabilities = negotiated.negotiated_capabilities();
+        let accepted_capabilities = server_capabilities.supported_features.clone();
+        let result = ClientHelloResult::new(accepted_capabilities, server_capabilities);
+        let Ok(value) = serde_json::to_value(result) else {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error("failed to serialize client_hello result"),
+            );
+            return;
+        };
+        let _ = send_rpc_result(ws, id, value);
+    }
+
     async fn handle_session_open(&self, ws: &WsConnection, id: String, params: SessionOpenParams) {
+        let features = self.features().await;
         handle_session_open(
             ws,
             &self.state,
@@ -100,7 +145,7 @@ impl UiProtocolDriver {
             &self.contracts.approvals,
             &self.live_forwarders,
             self.connection_profile_id.as_deref(),
-            self.features,
+            features,
             id,
             params,
         )
@@ -108,6 +153,7 @@ impl UiProtocolDriver {
     }
 
     async fn handle_turn_start(&self, ws: &WsConnection, id: String, params: TurnStartParams) {
+        let features = self.features().await;
         handle_turn_start(
             ws,
             &self.state,
@@ -117,7 +163,7 @@ impl UiProtocolDriver {
             &self.connection_turns,
             self.connection_profile_id.as_deref(),
             self.routed_profile_id.as_deref(),
-            self.features,
+            features,
             id,
             params,
         )
@@ -252,6 +298,7 @@ impl UiProtocolDriver {
         id: String,
         params: SessionHydrateParams,
     ) {
+        let features = self.features().await;
         handle_session_hydrate(
             ws,
             &self.state,
@@ -259,7 +306,7 @@ impl UiProtocolDriver {
             &self.contracts.approvals,
             &self.active_turns,
             self.connection_profile_id.as_deref(),
-            self.features,
+            features,
             id,
             params,
         )

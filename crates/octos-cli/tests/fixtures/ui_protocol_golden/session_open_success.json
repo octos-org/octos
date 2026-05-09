@@ -19,6 +19,7 @@
             "event.spawn_complete.v1"
           ],
           "supported_methods": [
+            "client_hello",
             "session/open",
             "turn/start",
             "turn/interrupt",
@@ -87,6 +88,7 @@
           "event.spawn_complete.v1"
         ],
         "supported_methods": [
+          "client_hello",
           "session/open",
           "turn/start",
           "turn/interrupt",

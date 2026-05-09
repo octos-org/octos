@@ -626,6 +626,7 @@ where
 }
 
 pub mod methods {
+    pub const CLIENT_HELLO: &str = "client_hello";
     pub const SESSION_OPEN: &str = "session/open";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
@@ -686,6 +687,7 @@ pub mod approval_cancelled_reasons {
 
 /// All command methods defined by the v1alpha1 protocol model.
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
+    methods::CLIENT_HELLO,
     methods::SESSION_OPEN,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
@@ -726,6 +728,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
 
 /// Request methods currently handled by the first server/runtime slice.
 pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
+    methods::CLIENT_HELLO,
     methods::SESSION_OPEN,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
@@ -981,6 +984,7 @@ impl RpcError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiResultKind {
+    ClientHello,
     SessionOpen,
     TurnStart,
     TurnInterrupt,
@@ -999,6 +1003,7 @@ pub enum UiResultKind {
 
 pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind> {
     match method {
+        methods::CLIENT_HELLO => Some(UiResultKind::ClientHello),
         methods::SESSION_OPEN => Some(UiResultKind::SessionOpen),
         methods::TURN_START => Some(UiResultKind::TurnStart),
         methods::TURN_INTERRUPT => Some(UiResultKind::TurnInterrupt),
@@ -1855,6 +1860,7 @@ pub struct TurnSpawnCompleteEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiCommand {
+    ClientHello(ClientHelloParams),
     SessionOpen(SessionOpenParams),
     TurnStart(TurnStartParams),
     TurnInterrupt(TurnInterruptParams),
@@ -1873,6 +1879,7 @@ pub enum UiCommand {
 impl UiCommand {
     pub fn method(&self) -> &'static str {
         match self {
+            Self::ClientHello(_) => methods::CLIENT_HELLO,
             Self::SessionOpen(_) => methods::SESSION_OPEN,
             Self::TurnStart(_) => methods::TURN_START,
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
@@ -1895,6 +1902,7 @@ impl UiCommand {
     ) -> Result<RpcRequest<Value>, serde_json::Error> {
         let method = self.method();
         let params = match self {
+            Self::ClientHello(params) => serde_json::to_value(params),
             Self::SessionOpen(params) => serde_json::to_value(params),
             Self::TurnStart(params) => serde_json::to_value(params),
             Self::TurnInterrupt(params) => serde_json::to_value(params),
@@ -1927,6 +1935,7 @@ impl UiCommand {
 
     pub fn from_method_and_params(method: &str, params: Value) -> Result<Self, RpcError> {
         match method {
+            methods::CLIENT_HELLO => Ok(Self::ClientHello(decode_params(method, params)?)),
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_params(method, params)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_params(method, params)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_params(method, params)?)),
@@ -2095,6 +2104,34 @@ impl SessionOpenResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHelloParams {
+    pub client_id: String,
+    pub client_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHelloResult {
+    pub server_version: UiProtocolVersion,
+    pub accepted_capabilities: Vec<String>,
+    pub server_capabilities: UiProtocolCapabilities,
+}
+
+impl ClientHelloResult {
+    pub fn new(
+        accepted_capabilities: Vec<String>,
+        server_capabilities: UiProtocolCapabilities,
+    ) -> Self {
+        Self {
+            server_version: UiProtocolVersion::current(),
+            accepted_capabilities,
+            server_capabilities,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStartResult {
     pub accepted: bool,
@@ -2206,6 +2243,7 @@ impl TurnInterruptResult {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum UiRpcResult {
+    ClientHello(ClientHelloResult),
     SessionOpen(SessionOpenResult),
     TurnStart(TurnStartResult),
     TurnInterrupt(TurnInterruptResult),
@@ -2225,6 +2263,7 @@ pub enum UiRpcResult {
 impl UiRpcResult {
     pub fn kind(&self) -> UiResultKind {
         match self {
+            Self::ClientHello(_) => UiResultKind::ClientHello,
             Self::SessionOpen(_) => UiResultKind::SessionOpen,
             Self::TurnStart(_) => UiResultKind::TurnStart,
             Self::TurnInterrupt(_) => UiResultKind::TurnInterrupt,
@@ -2244,6 +2283,7 @@ impl UiRpcResult {
 
     pub fn method(&self) -> Option<&str> {
         match self {
+            Self::ClientHello(_) => Some(methods::CLIENT_HELLO),
             Self::SessionOpen(_) => Some(methods::SESSION_OPEN),
             Self::TurnStart(_) => Some(methods::TURN_START),
             Self::TurnInterrupt(_) => Some(methods::TURN_INTERRUPT),
@@ -2263,6 +2303,7 @@ impl UiRpcResult {
 
     pub fn into_result_value(self) -> Result<Value, serde_json::Error> {
         match self {
+            Self::ClientHello(result) => serde_json::to_value(result),
             Self::SessionOpen(result) => serde_json::to_value(result),
             Self::TurnStart(result) => serde_json::to_value(result),
             Self::TurnInterrupt(result) => serde_json::to_value(result),
@@ -2299,6 +2340,7 @@ impl UiRpcResult {
             return Ok(Self::UnsupportedCapability(parsed));
         }
         match method {
+            methods::CLIENT_HELLO => Ok(Self::ClientHello(decode_result(method, result)?)),
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_result(method, result)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_result(method, result)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_result(method, result)?)),
@@ -3136,6 +3178,7 @@ mod tests {
             capabilities.capabilities_schema_version,
             UI_PROTOCOL_CAPABILITIES_SCHEMA_VERSION
         );
+        assert!(capabilities.supports_method(methods::CLIENT_HELLO));
         assert!(capabilities.supports_method(methods::SESSION_OPEN));
         assert!(capabilities.supports_method(methods::TURN_START));
         assert!(capabilities.supports_method(methods::TURN_INTERRUPT));
@@ -3186,6 +3229,7 @@ mod tests {
     fn full_protocol_capabilities_advertise_harness_task_control() {
         let capabilities = UiProtocolCapabilities::full_protocol();
 
+        assert!(capabilities.supports_method(methods::CLIENT_HELLO));
         assert!(capabilities.supports_method(methods::TASK_LIST));
         assert!(capabilities.supports_method(methods::TASK_CANCEL));
         assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
@@ -3450,6 +3494,7 @@ mod tests {
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
             &[
+                "client_hello",
                 "session/open",
                 "turn/start",
                 "turn/interrupt",
@@ -3492,6 +3537,7 @@ mod tests {
         assert_eq!(
             UI_PROTOCOL_FIRST_SERVER_METHODS,
             &[
+                "client_hello",
                 "session/open",
                 "turn/start",
                 "turn/interrupt",
@@ -3528,6 +3574,7 @@ mod tests {
                 },
                 "capabilities_schema_version": 2,
                 "supported_methods": [
+                    "client_hello",
                     "session/open",
                     "turn/start",
                     "turn/interrupt",
