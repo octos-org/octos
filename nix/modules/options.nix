@@ -1,6 +1,11 @@
 selfPackages:
 
-{ lib, ... }:
+{
+  lib,
+  config,
+  pkgs,
+  ...
+}:
 
 let
   inherit (lib)
@@ -17,18 +22,33 @@ let
     str
     submodule
     ;
+
+  cfg = config.programs.octos;
 in
 
 {
+
   options = {
     programs.octos = {
       enable = mkEnableOption "octos CLI";
-      package = mkPackageOption selfPackages "octos-minimal" { };
-      enableExtraPackages = mkEnableOption ''
-        Install optional runtime dependencies (chromium, nodejs, ffmpeg, libreoffice, poppler-utils).
 
-        See https://github.com/octos-org/octos/blob/main/book/src/installation.md#optional-dependencies
-      '';
+      package = mkPackageOption selfPackages "octos-minimal" { } // {
+        apply = pkg: if cfg.features != [ ] then pkg.override { inherit (cfg) features; } else pkg;
+        description = ''
+          The octos package to use.
+
+          Features will be automatically applied based on the `features` option 
+          and whether skills or service are enabled.
+        '';
+      };
+
+      enableExtraPackages = mkEnableOption "extra runtime dependencies for octos" // {
+        description = ''
+          Whether to install optional runtime dependencies (chromium, nodejs, ffmpeg, libreoffice, poppler-utils).
+
+          See <https://github.com/octos-org/octos/blob/main/book/src/installation.md#optional-dependencies>
+        '';
+      };
 
       features = mkOption {
         type = listOf (enum [
@@ -48,6 +68,12 @@ in
           "discord"
         ];
         description = "Cargo features to enable";
+        apply =
+          features:
+          if !lib.elem "api" features && (cfg.skills.enable || cfg.service.enable) then
+            features ++ [ "api" ]
+          else
+            features;
       };
 
       skills = mkOption {
@@ -92,4 +118,21 @@ in
 
     };
   };
+
+  config = lib.mkIf cfg.enable {
+
+    environment.systemPackages = [
+      cfg.package
+    ]
+    ++ lib.optional cfg.skills.enable cfg.skills.package
+    ++ lib.optionals cfg.enableExtraPackages [
+      pkgs.chromium
+      pkgs.ffmpeg
+      pkgs.libreoffice
+      pkgs.nodejs
+      pkgs.poppler_utils
+    ];
+
+  };
+
 }
