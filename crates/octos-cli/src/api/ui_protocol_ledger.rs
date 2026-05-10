@@ -1496,6 +1496,8 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::ReplayLossy(event) => &event.session_id,
         UiNotification::MessagePersisted(event) => &event.session_id,
         UiNotification::TurnSpawnComplete(event) => &event.session_id,
+        UiNotification::FileAttached(event) => &event.session_id,
+        UiNotification::SessionEventBridged(event) => &event.session_id,
     }
 }
 
@@ -1636,6 +1638,9 @@ mod tests {
                 session_id,
                 turn_id,
                 cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
             }));
 
         assert!(matches!(

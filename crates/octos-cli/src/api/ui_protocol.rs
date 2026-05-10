@@ -917,9 +917,45 @@ struct PersistedMessageMeta {
     message_id: String,
 }
 
+/// M9-γ-7 (issue #844): the agent loop's iterative tool-calling pattern
+/// commits an Assistant `Message` per LLM iteration. When the LLM returns
+/// only `tool_calls` (no text content) and no media — the metadata-only
+/// shape that bracketed every `tool/started` → `tool/completed` cycle —
+/// the persisted row is invisible to the user but still triggers
+/// `MessageCommitObserver`. Pre-fix the ledger emitted N
+/// `message/persisted` envelopes per turn for an N-iteration loop, all
+/// carrying the same `thread_id`. The web reducer keyed off `thread_id`
+/// merged them into a "phantom" empty assistant bubble that briefly
+/// flickered into the chat pane (the 2026-05-09 phantom-bubble bug).
+///
+/// The defensive web-side fix in octos-web #92 hid those bubbles. The
+/// authoritative server-side fix is to suppress the `message/persisted`
+/// emit for these intermediate metadata-only assistant rows so the wire
+/// surface emits exactly one `message/persisted` per turn for the final
+/// user-visible assistant text.
+///
+/// Filter: skip emission when the row is `Assistant`, content is
+/// empty after `trim()`, and `media` is empty. Tool messages (role
+/// `Tool`) and assistant rows with text or media are unaffected. Once
+/// the SSE chat path is deleted (α-5/α-6) and the WS turn loop is sole
+/// transport, this filter remains correct because the filtering criteria
+/// describe a metadata-only row (no rendering surface) regardless of
+/// transport.
+fn is_metadata_only_assistant_row(message: &octos_core::Message) -> bool {
+    message.role == octos_core::MessageRole::Assistant
+        && message.content.trim().is_empty()
+        && message.media.is_empty()
+}
+
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
     let observer: octos_bus::MessageCommitObserver =
         Arc::new(move |session_key, message, committed_seq| {
+            // M9-γ-7: drop intermediate metadata-only assistant rows
+            // (LLM returned only `tool_calls`, no rendered text). See
+            // [`is_metadata_only_assistant_row`] for the rationale.
+            if is_metadata_only_assistant_row(message) {
+                return;
+            }
             let event = MessagePersistedEvent {
                 session_id: session_key.clone(),
                 // The `Message` struct does not yet carry a typed
@@ -4232,6 +4268,9 @@ async fn run_m9_fixture_turn(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         timestamp: Utc::now(),
+        // UPCR-2026-014 (M9-α-9): WS turn-start path has no topic in
+        // scope today; the SSE bridge in α-9 plumbs topic separately.
+        topic: None,
     });
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
         let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
@@ -4603,6 +4642,9 @@ async fn run_standalone_turn(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         timestamp: Utc::now(),
+        // UPCR-2026-014 (M9-α-9): legacy WS turn-start path; topic is
+        // not in scope here (the SSE bridge surfaces it via α-9).
+        topic: None,
     });
     // turn/started is lifecycle. If the client cannot receive it we may as
     // well stop now — the rest of the turn is wasted work. Per FIX-03,
@@ -5420,6 +5462,14 @@ async fn try_emit_terminal(
                     session_id: session_id.clone(),
                     turn_id: turn_id.clone(),
                     cursor: None,
+                    // UPCR-2026-014 (M9-α-9) addendum fields; the WS
+                    // lifecycle path doesn't have token usage /
+                    // session_result threaded yet — those land via the
+                    // SSE bridge in α-9. Leaving them None preserves
+                    // the pre-addendum wire shape for WS-driven turns.
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
                 }),
             );
         }
@@ -9252,6 +9302,7 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 timestamp: Utc::now(),
+                topic: None,
             }),
         );
         assert!(first.is_ok());
@@ -10139,12 +10190,16 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 timestamp: Utc::now(),
+                topic: None,
             },
         ));
         let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
         }));
 
         let (ws, mut rx) = ws_connection_for_test(8);
@@ -10675,6 +10730,206 @@ mod tests {
         );
 
         octos_bus::set_message_commit_observer(prev);
+    }
+
+    /// M9-γ-7 (issue #844): `is_metadata_only_assistant_row` is the
+    /// pure-function classifier the observer uses to drop intermediate
+    /// metadata-only assistant rows. Lock its truth table here so a
+    /// future refactor that "helpfully" widens the filter cannot drop
+    /// rows the wire surface needs.
+    #[test]
+    fn is_metadata_only_assistant_row_truth_table() {
+        // Empty assistant with no media: metadata-only -> drop.
+        let mut empty_assistant = Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(is_metadata_only_assistant_row(&empty_assistant));
+
+        // Whitespace-only counts as empty.
+        empty_assistant.content = "   \n\t".into();
+        assert!(is_metadata_only_assistant_row(&empty_assistant));
+
+        // Assistant with text: keep.
+        empty_assistant.content = "hello".into();
+        assert!(!is_metadata_only_assistant_row(&empty_assistant));
+
+        // Assistant with media but empty text: keep (image-only response).
+        empty_assistant.content = String::new();
+        empty_assistant.media = vec!["data:image/png;base64,abc".into()];
+        assert!(!is_metadata_only_assistant_row(&empty_assistant));
+
+        // Tool messages are never filtered.
+        let tool_message = Message {
+            role: MessageRole::Tool,
+            content: String::new(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("tc-1".into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(!is_metadata_only_assistant_row(&tool_message));
+
+        // User rows are never filtered.
+        let user_message = Message {
+            role: MessageRole::User,
+            content: String::new(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(!is_metadata_only_assistant_row(&user_message));
+    }
+
+    /// M9-γ-7 (issue #844): a 3-iteration agent loop that commits
+    /// (assistant tool-call only) -> tool result -> (assistant tool-call
+    /// only) -> tool result -> (assistant final text) MUST surface
+    /// EXACTLY ONE `message/persisted` envelope for the assistant turn
+    /// (the final text row), plus the per-tool rows, on the M9 ledger.
+    /// Pre-fix this emitted three assistant `message/persisted`
+    /// envelopes, all under the same `thread_id` — the phantom-bubble
+    /// shape the web reducer collapsed (octos-web #92).
+    #[tokio::test(flavor = "current_thread")]
+    async fn gamma_7_dedup_one_assistant_persisted_per_turn() {
+        use octos_core::ui_protocol::{MessagePersistedSource, methods};
+
+        let _guard = message_commit_observer_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Spin a fresh ledger + observer wired the same way the live
+        // server wires them on the first `event_ledger` call.
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        install_message_commit_observer(ledger.clone());
+
+        let session_id = SessionKey("local:gamma-7-dedup".into());
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut manager =
+            octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+
+        // Simulate the agent loop's commits: 2 metadata-only assistant
+        // rows (intermediate iterations whose only payload was
+        // tool_calls), interleaved with their tool results, then the
+        // final assistant text row.
+        let thread = "cmid-gamma-7".to_string();
+        let mk_assistant = |content: &str, with_tool_calls: bool| Message {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            media: vec![],
+            tool_calls: if with_tool_calls {
+                Some(vec![octos_core::ToolCall {
+                    id: format!("tc-{}", uuid::Uuid::now_v7()),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }])
+            } else {
+                None
+            },
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some(thread.clone()),
+            timestamp: Utc::now(),
+        };
+        let mk_tool = |out: &str, tc_id: &str| Message {
+            role: MessageRole::Tool,
+            content: out.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tc_id.into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some(thread.clone()),
+            timestamp: Utc::now(),
+        };
+
+        // Iteration 1: assistant returns only tool_calls (empty content).
+        manager
+            .add_message_with_seq(&session_id, mk_assistant("", true))
+            .await
+            .expect("commit it1 assistant");
+        manager
+            .add_message_with_seq(&session_id, mk_tool("ok", "tc-1"))
+            .await
+            .expect("commit it1 tool");
+        // Iteration 2: assistant returns only tool_calls again.
+        manager
+            .add_message_with_seq(&session_id, mk_assistant("", true))
+            .await
+            .expect("commit it2 assistant");
+        manager
+            .add_message_with_seq(&session_id, mk_tool("ok", "tc-2"))
+            .await
+            .expect("commit it2 tool");
+        // Iteration 3: final assistant text (the user-visible reply).
+        manager
+            .add_message_with_seq(&session_id, mk_assistant("here is your answer", false))
+            .await
+            .expect("commit it3 assistant");
+
+        // Drain the broadcast and bucket by role on the
+        // `MessagePersistedEvent` payload.
+        let mut assistant_persisted = Vec::new();
+        let mut tool_persisted = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+                &event.event
+            {
+                if ev.role == octos_core::MessageRole::Assistant.as_str() {
+                    assistant_persisted.push(ev.clone());
+                } else if ev.role == octos_core::MessageRole::Tool.as_str() {
+                    tool_persisted.push(ev.clone());
+                }
+            }
+        }
+
+        assert_eq!(
+            assistant_persisted.len(),
+            1,
+            "exactly ONE assistant message/persisted per turn (the final text); \
+             got {} envelopes (phantom-bubble regression)",
+            assistant_persisted.len(),
+        );
+        let final_envelope = &assistant_persisted[0];
+        assert_eq!(final_envelope.role, "assistant");
+        assert_eq!(
+            final_envelope.source,
+            MessagePersistedSource::Assistant,
+            "assistant rows carry source=assistant"
+        );
+        // Method name matches the wire spec.
+        assert_eq!(
+            UiNotification::MessagePersisted(final_envelope.clone()).method(),
+            methods::MESSAGE_PERSISTED,
+        );
+
+        // Tool rows are unaffected — both intermediate tool results land.
+        assert_eq!(
+            tool_persisted.len(),
+            2,
+            "tool rows must NOT be filtered (they always carry content)"
+        );
+
+        // Restore the global observer slot to None so subsequent tests
+        // see a clean state.
+        octos_bus::set_message_commit_observer(None);
     }
 
     /// PR F (M8.10 thread-binding chain `#649 → #740`): every progress

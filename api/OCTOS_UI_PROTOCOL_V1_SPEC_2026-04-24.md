@@ -707,6 +707,52 @@ Carries non-terminal operator-visible warnings without collapsing them into gene
 
 Marks the normal terminal event for a turn.
 
+Optional fields from accepted `UPCR-2026-014` (M9-α-9):
+
+- `tokens_in` / `tokens_out`
+  Aggregated input / output token counts for the completed turn.
+  Absent when the runtime did not surface usage to the wire.
+- `session_result`
+  Object carrying the final assistant row's durable identity:
+  `{ "committed_seq": u64, "message_id": "<session>:<seq>:<ts_ns>",
+  "client_message_id"?: string }`. Mirrors the SSE-only
+  `session_result` frame so a WS client can stamp authoritative seq
+  onto an optimistic bubble without an extra REST roundtrip. Absent
+  when the turn ended without a final assistant row.
+
+### `turn/started`
+
+Optional fields from accepted `UPCR-2026-014` (M9-α-9):
+
+- `topic`
+  Sub-topic suffix that scopes the turn within a session (mirrors the
+  `<session>#<topic>` shape carried on REST/SSE chat). Absent when the
+  turn is not topic-scoped.
+
+### `file/attached`
+
+Per-turn file attachment event introduced by `UPCR-2026-014` (M9-α-9).
+Mirrors the SSE `file:` frame the agent loop emits for tools that
+declare `files_to_send`. Payload fields:
+
+- `session_id`, `turn_id` — turn-scoping fields (required).
+- `path` — filesystem path or URL the tool produced.
+- `tool_call_id` — originating tool call (optional; omitted on
+  background-result paths that don't run inside a tool execution).
+- `mime` — MIME-type hint (optional; clients fall back to extension
+  sniffing when absent).
+
+### `session/event`
+
+Wrapper envelope introduced by `UPCR-2026-014` (M9-α-9) that bridges
+legacy `/api/sessions/:id/events/stream` SSE frames onto the unified
+WS surface during the α coexistence period. The legacy stream is
+free-form; this wrapper preserves the original `type` (as `kind`) plus
+the full frame body (as `payload`) so WS-only clients keep observing
+every signal SSE consumers see while each event kind gradually lifts
+onto a typed v1 envelope. Optional `topic` echoes the legacy frame's
+topic for client-side scoping.
+
 ### `turn/error`
 
 Marks the abnormal terminal event for a turn.
