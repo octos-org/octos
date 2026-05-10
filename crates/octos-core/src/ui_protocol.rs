@@ -28,6 +28,9 @@ pub const UI_PROTOCOL_CAPABILITIES_SCHEMA_VERSION: u32 = 2;
 /// JSON-RPC version used by UI protocol v1 wire envelopes.
 pub const JSON_RPC_VERSION: &str = "2.0";
 
+/// Maximum accepted JSON-RPC text frame size for UI transports.
+pub const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Feature flag for UPCR-2026-001 typed approval payloads.
 pub const UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1: &str = "approval.typed.v1";
 
@@ -67,6 +70,15 @@ pub const UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1: &str = "event.message_persis
 /// the message — only the wire event the connected client observes flips.
 pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1";
 
+/// Feature flag for UPCR-2026-014 M9-γ canonical projection envelope.
+///
+/// Capability-gated — servers advertise it only when they emit the
+/// canonical [`Envelope`] shape (see § 14 of the spec). Legacy
+/// `message/delta`, `message/persisted`, `tool/*`, and `turn/completed`
+/// notifications continue to flow on connections that do not negotiate
+/// this feature, until M9-γ-3 deletes them.
+pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelope.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -82,6 +94,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -631,6 +644,8 @@ pub mod methods {
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     pub const APPROVAL_RESPOND: &str = "approval/respond";
     pub const APPROVAL_SCOPES_LIST: &str = "approval/scopes/list";
+    pub const PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
+    pub const PERMISSION_PROFILE_SET: &str = "permission/profile/set";
     pub const DIFF_PREVIEW_GET: &str = "diff/preview/get";
     pub const TASK_LIST: &str = "task/list";
     pub const TASK_CANCEL: &str = "task/cancel";
@@ -675,6 +690,8 @@ pub mod methods {
     /// spawn-acknowledgement bubble. Gated by
     /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`].
     pub const TURN_SPAWN_COMPLETE: &str = "turn/spawn_complete";
+    pub const FILE_ATTACHED: &str = "file/attached";
+    pub const SESSION_EVENT: &str = "session/event";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -691,6 +708,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::PERMISSION_PROFILE_LIST,
+    methods::PERMISSION_PROFILE_SET,
     methods::DIFF_PREVIEW_GET,
     methods::TASK_LIST,
     methods::TASK_CANCEL,
@@ -722,6 +741,8 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::REPLAY_LOSSY,
     methods::MESSAGE_PERSISTED,
     methods::TURN_SPAWN_COMPLETE,
+    methods::FILE_ATTACHED,
+    methods::SESSION_EVENT,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -731,6 +752,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::TURN_INTERRUPT,
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
+    methods::PERMISSION_PROFILE_LIST,
+    methods::PERMISSION_PROFILE_SET,
     methods::DIFF_PREVIEW_GET,
     methods::TASK_LIST,
     methods::TASK_CANCEL,
@@ -986,6 +1009,8 @@ pub enum UiResultKind {
     TurnInterrupt,
     ApprovalRespond,
     ApprovalScopesList,
+    PermissionProfileList,
+    PermissionProfileSet,
     DiffPreviewGet,
     TaskList,
     TaskCancel,
@@ -1004,6 +1029,8 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TURN_INTERRUPT => Some(UiResultKind::TurnInterrupt),
         methods::APPROVAL_RESPOND => Some(UiResultKind::ApprovalRespond),
         methods::APPROVAL_SCOPES_LIST => Some(UiResultKind::ApprovalScopesList),
+        methods::PERMISSION_PROFILE_LIST => Some(UiResultKind::PermissionProfileList),
+        methods::PERMISSION_PROFILE_SET => Some(UiResultKind::PermissionProfileSet),
         methods::DIFF_PREVIEW_GET => Some(UiResultKind::DiffPreviewGet),
         methods::TASK_LIST => Some(UiResultKind::TaskList),
         methods::TASK_CANCEL => Some(UiResultKind::TaskCancel),
@@ -1193,6 +1220,109 @@ pub struct ApprovalScopeEntry {
     /// Bound `turn_id` for `turn`-scoped entries; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionProfileMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl PermissionProfileMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read Only",
+            Self::WorkspaceWrite => "Workspace Write",
+            Self::DangerFullAccess => "Full Access",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionNetworkPolicy {
+    Allow,
+    Deny,
+}
+
+impl PermissionNetworkPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "network allowed",
+            Self::Deny => "network blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionProfileSelection {
+    pub mode: PermissionProfileMode,
+    pub network: PermissionNetworkPolicy,
+}
+
+impl Default for PermissionProfileSelection {
+    fn default() -> Self {
+        Self {
+            mode: PermissionProfileMode::WorkspaceWrite,
+            network: PermissionNetworkPolicy::Deny,
+        }
+    }
+}
+
+impl PermissionProfileSelection {
+    pub fn normalized(self) -> Self {
+        self
+    }
+
+    pub fn summary(self) -> String {
+        format!("{}, {}", self.mode.label(), self.network.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PermissionProfileUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PermissionProfileMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<PermissionNetworkPolicy>,
+}
+
+impl PermissionProfileUpdate {
+    pub fn apply_to(self, previous: PermissionProfileSelection) -> PermissionProfileSelection {
+        PermissionProfileSelection {
+            mode: self.mode.unwrap_or(previous.mode),
+            network: self.network.unwrap_or(previous.network),
+        }
+        .normalized()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionProfileListParams {
+    pub session_id: SessionKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionProfileSetParams {
+    pub session_id: SessionKey,
+    pub update: PermissionProfileUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionProfileListResult {
+    pub session_id: SessionKey,
+    pub current: PermissionProfileSelection,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<PermissionProfileSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionProfileSetResult {
+    pub session_id: SessionKey,
+    pub current: PermissionProfileSelection,
+    pub applied: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1851,6 +1981,146 @@ pub struct TurnSpawnCompleteEvent {
     pub media: Vec<String>,
 }
 
+// ----- UPCR-2026-014 M9-γ projection envelope -----
+
+/// Token usage carried on `turn_completed` projection envelopes.
+///
+/// Mirrors [`crate::TokenUsage`] but is wire-stable for the M9-γ
+/// projection: all fields default to zero, and the field set is frozen
+/// for the v1 envelope. Future fields require a follow-up UPCR.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeTokenUsage {
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub input_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_write_tokens: u64,
+}
+
+#[inline]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Metadata carried on `assistant_persisted` projection envelopes.
+///
+/// The projection only needs the durable identity fields here — the
+/// committed `seq` already lives on the [`Envelope`] itself, so this
+/// struct carries the *row-level* identity (`message_id`) plus the
+/// wall-clock commit timestamp clients use for ordering displays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageMeta {
+    /// Server-assigned UUID of the durable row (mirrors
+    /// [`MessagePersistedEvent::message_id`]). Stable across replays.
+    pub message_id: String,
+    /// RFC 3339 wall-clock time the row committed.
+    pub persisted_at: DateTime<Utc>,
+    /// File attachments persisted with the message — typically a single
+    /// `.md` / `.mp3` / `.pptx` artefact emitted by `spawn_only` background
+    /// tools (`deep_search`, `mofa_*`, `fm_tts`) or an explicit `send_file`.
+    /// Empty for assistant rows that carry only text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
+}
+
+/// Status carried on `tool_end` projection envelopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeToolEndStatus {
+    Complete,
+    Error,
+}
+
+/// Sealed tagged union of payloads carried by the M9-γ projection
+/// envelope. Each variant carries everything the projection needs;
+/// the projection function is `(committed_log) → ChatViewModel` and
+/// MUST NOT consult any other source of truth.
+///
+/// Wire form: JSON with `"type"` discriminator and content under `"data"`.
+/// Variant names are snake_case to match the spec § 14 / TS shape.
+///
+/// **Hard barrier**: per the M9-γ ADR, [`Payload::TurnCompleted`] is the
+/// terminal payload for a `thread_id`. The server MUST NOT emit any
+/// further `assistant_*` / `tool_*` payloads on the same `thread_id`
+/// after the `turn_completed` envelope is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum Payload {
+    /// One streamed assistant text fragment. Multiple `assistant_delta`
+    /// envelopes for the same `thread_id` accumulate (concatenate by
+    /// `seq` order) into the live assistant bubble.
+    AssistantDelta { text: String },
+    /// Final assistant text persisted to the ledger after streaming
+    /// completes. Carries the durable [`MessageMeta`] so the projection
+    /// can finalize the bubble's identity and surface attachments.
+    AssistantPersisted { text: String, meta: MessageMeta },
+    /// Tool invocation begun. The projection opens a tool-call card
+    /// keyed on `tool_call_id`.
+    ToolStart { tool_call_id: String, name: String },
+    /// Tool emitted a progress message. Idempotent per `(tool_call_id,
+    /// seq)`; the projection appends in `seq` order.
+    ToolProgress {
+        tool_call_id: String,
+        message: String,
+    },
+    /// Tool invocation finished. `error` is set iff `status == "error"`.
+    ToolEnd {
+        tool_call_id: String,
+        status: EnvelopeToolEndStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// File attached to the current thread (e.g. `.md` report from
+    /// `deep_search` or `.mp3` from `fm_tts`). The projection adds the
+    /// attachment to the most-recent assistant bubble in `thread_id`.
+    FileAttached {
+        path: String,
+        mime: String,
+        size_bytes: u64,
+    },
+    /// Hard barrier — terminal payload for a turn within `thread_id`.
+    /// Per the M9-γ ADR, no further `assistant_*` or `tool_*` payloads
+    /// are valid on this `thread_id` after this envelope.
+    TurnCompleted { token_usage: EnvelopeTokenUsage },
+}
+
+/// Canonical M9-γ projection envelope.
+///
+/// Per UPCR-2026-014 and the M9-γ ADR, this is the single shape the
+/// web client's deterministic projection consumes. The committed
+/// envelope log is `Vec<Envelope>` indexed by `(thread_id, seq)`; the
+/// projection is a pure function from that log to `ChatViewModel`.
+///
+/// Identity collapses to `seq` — the only key the projection cares
+/// about. `client_message_id` lives ONLY on user-message-rooted
+/// envelopes so the optimistic `<GhostBubble>` overlay can match its
+/// server reflection and unmount; the projection itself NEVER consults
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope {
+    /// Multi-turn cluster identity — the chat thread this envelope
+    /// projects into. All envelopes for one logical conversation share
+    /// a `thread_id`.
+    pub thread_id: String,
+    /// Server-assigned strict total order WITHIN this `thread_id`.
+    /// Strictly monotonic; gaps are an error and trigger
+    /// rehydration. Identity for the projection.
+    pub seq: u64,
+    /// Present on user-message-rooted envelopes (the optimistic
+    /// `<GhostBubble>` overlay matches its server reflection here).
+    /// Absent on internal events (assistant deltas, tool events,
+    /// turn_completed). The projection MUST NOT consult this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    /// Tagged-union payload — see [`Payload`].
+    pub payload: Payload,
+}
+
 /// Draft command payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1860,6 +2130,8 @@ pub enum UiCommand {
     TurnInterrupt(TurnInterruptParams),
     ApprovalRespond(ApprovalRespondParams),
     ApprovalScopesList(ApprovalScopesListParams),
+    PermissionProfileList(PermissionProfileListParams),
+    PermissionProfileSet(PermissionProfileSetParams),
     DiffPreviewGet(DiffPreviewGetParams),
     TaskList(TaskListParams),
     TaskCancel(TaskCancelParams),
@@ -1878,6 +2150,8 @@ impl UiCommand {
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
             Self::ApprovalRespond(_) => methods::APPROVAL_RESPOND,
             Self::ApprovalScopesList(_) => methods::APPROVAL_SCOPES_LIST,
+            Self::PermissionProfileList(_) => methods::PERMISSION_PROFILE_LIST,
+            Self::PermissionProfileSet(_) => methods::PERMISSION_PROFILE_SET,
             Self::DiffPreviewGet(_) => methods::DIFF_PREVIEW_GET,
             Self::TaskList(_) => methods::TASK_LIST,
             Self::TaskCancel(_) => methods::TASK_CANCEL,
@@ -1900,6 +2174,8 @@ impl UiCommand {
             Self::TurnInterrupt(params) => serde_json::to_value(params),
             Self::ApprovalRespond(params) => serde_json::to_value(params),
             Self::ApprovalScopesList(params) => serde_json::to_value(params),
+            Self::PermissionProfileList(params) => serde_json::to_value(params),
+            Self::PermissionProfileSet(params) => serde_json::to_value(params),
             Self::DiffPreviewGet(params) => serde_json::to_value(params),
             Self::TaskList(params) => serde_json::to_value(params),
             Self::TaskCancel(params) => serde_json::to_value(params),
@@ -1933,6 +2209,12 @@ impl UiCommand {
             methods::APPROVAL_RESPOND => Ok(Self::ApprovalRespond(decode_params(method, params)?)),
             methods::APPROVAL_SCOPES_LIST => {
                 Ok(Self::ApprovalScopesList(decode_params(method, params)?))
+            }
+            methods::PERMISSION_PROFILE_LIST => {
+                Ok(Self::PermissionProfileList(decode_params(method, params)?))
+            }
+            methods::PERMISSION_PROFILE_SET => {
+                Ok(Self::PermissionProfileSet(decode_params(method, params)?))
             }
             methods::DIFF_PREVIEW_GET => Ok(Self::DiffPreviewGet(decode_params(method, params)?)),
             methods::TASK_LIST => Ok(Self::TaskList(decode_params(method, params)?)),
@@ -2211,6 +2493,8 @@ pub enum UiRpcResult {
     TurnInterrupt(TurnInterruptResult),
     ApprovalRespond(ApprovalRespondResult),
     ApprovalScopesList(ApprovalScopesListResult),
+    PermissionProfileList(PermissionProfileListResult),
+    PermissionProfileSet(PermissionProfileSetResult),
     DiffPreviewGet(DiffPreviewGetResult),
     TaskList(TaskListResult),
     TaskCancel(TaskCancelResult),
@@ -2230,6 +2514,8 @@ impl UiRpcResult {
             Self::TurnInterrupt(_) => UiResultKind::TurnInterrupt,
             Self::ApprovalRespond(_) => UiResultKind::ApprovalRespond,
             Self::ApprovalScopesList(_) => UiResultKind::ApprovalScopesList,
+            Self::PermissionProfileList(_) => UiResultKind::PermissionProfileList,
+            Self::PermissionProfileSet(_) => UiResultKind::PermissionProfileSet,
             Self::DiffPreviewGet(_) => UiResultKind::DiffPreviewGet,
             Self::TaskList(_) => UiResultKind::TaskList,
             Self::TaskCancel(_) => UiResultKind::TaskCancel,
@@ -2249,6 +2535,8 @@ impl UiRpcResult {
             Self::TurnInterrupt(_) => Some(methods::TURN_INTERRUPT),
             Self::ApprovalRespond(_) => Some(methods::APPROVAL_RESPOND),
             Self::ApprovalScopesList(_) => Some(methods::APPROVAL_SCOPES_LIST),
+            Self::PermissionProfileList(_) => Some(methods::PERMISSION_PROFILE_LIST),
+            Self::PermissionProfileSet(_) => Some(methods::PERMISSION_PROFILE_SET),
             Self::DiffPreviewGet(_) => Some(methods::DIFF_PREVIEW_GET),
             Self::TaskList(_) => Some(methods::TASK_LIST),
             Self::TaskCancel(_) => Some(methods::TASK_CANCEL),
@@ -2268,6 +2556,8 @@ impl UiRpcResult {
             Self::TurnInterrupt(result) => serde_json::to_value(result),
             Self::ApprovalRespond(result) => serde_json::to_value(result),
             Self::ApprovalScopesList(result) => serde_json::to_value(result),
+            Self::PermissionProfileList(result) => serde_json::to_value(result),
+            Self::PermissionProfileSet(result) => serde_json::to_value(result),
             Self::DiffPreviewGet(result) => serde_json::to_value(result),
             Self::TaskList(result) => serde_json::to_value(result),
             Self::TaskCancel(result) => serde_json::to_value(result),
@@ -2305,6 +2595,12 @@ impl UiRpcResult {
             methods::APPROVAL_RESPOND => Ok(Self::ApprovalRespond(decode_result(method, result)?)),
             methods::APPROVAL_SCOPES_LIST => {
                 Ok(Self::ApprovalScopesList(decode_result(method, result)?))
+            }
+            methods::PERMISSION_PROFILE_LIST => {
+                Ok(Self::PermissionProfileList(decode_result(method, result)?))
+            }
+            methods::PERMISSION_PROFILE_SET => {
+                Ok(Self::PermissionProfileSet(decode_result(method, result)?))
             }
             methods::DIFF_PREVIEW_GET => Ok(Self::DiffPreviewGet(decode_result(method, result)?)),
             methods::TASK_LIST => Ok(Self::TaskList(decode_result(method, result)?)),
@@ -2961,6 +3257,12 @@ pub struct TurnCompletedEvent {
     pub turn_id: TurnId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<UiCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_result: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2980,6 +3282,23 @@ pub struct ReplayLossyEvent {
     pub dropped_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_durable_cursor: Option<UiCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileAttachedEvent {
+    pub session_id: SessionKey,
+    pub turn_id: TurnId,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEventBridgedEvent {
+    pub session_id: SessionKey,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 
 /// Draft notification payloads for UI protocol v1.
@@ -3011,6 +3330,8 @@ pub enum UiNotification {
     /// the same row; per-connection capability filtering (the
     /// `event.spawn_complete.v1` flag) decides which one the client sees.
     TurnSpawnComplete(TurnSpawnCompleteEvent),
+    FileAttached(FileAttachedEvent),
+    SessionEventBridged(SessionEventBridgedEvent),
 }
 
 impl UiNotification {
@@ -3035,6 +3356,8 @@ impl UiNotification {
             Self::ReplayLossy(_) => methods::REPLAY_LOSSY,
             Self::MessagePersisted(_) => methods::MESSAGE_PERSISTED,
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
+            Self::FileAttached(_) => methods::FILE_ATTACHED,
+            Self::SessionEventBridged(_) => methods::SESSION_EVENT,
         }
     }
 
@@ -3060,6 +3383,8 @@ impl UiNotification {
             Self::ReplayLossy(params) => serde_json::to_value(params),
             Self::MessagePersisted(params) => serde_json::to_value(params),
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
+            Self::FileAttached(params) => serde_json::to_value(params),
+            Self::SessionEventBridged(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -3106,6 +3431,10 @@ impl UiNotification {
             }
             methods::TURN_SPAWN_COMPLETE => {
                 Ok(Self::TurnSpawnComplete(decode_params(method, params)?))
+            }
+            methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
+            methods::SESSION_EVENT => {
+                Ok(Self::SessionEventBridged(decode_params(method, params)?))
             }
             _ => Err(RpcError::method_not_found(method)),
         }
@@ -3446,6 +3775,10 @@ mod tests {
             UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             "event.message_persisted.v1"
         );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+            "projection.envelope.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -3572,7 +3905,8 @@ mod tests {
                     "state.thread_graph.v1",
                     "state.turn_state_get.v1",
                     "event.message_persisted.v1",
-                    "event.spawn_complete.v1"
+                    "event.spawn_complete.v1",
+                    "projection.envelope.v1"
                 ]
             })
         );
@@ -4693,6 +5027,9 @@ mod tests {
             session_id,
             turn_id: TurnId(Uuid::from_u128(9)),
             cursor: Some(completed_cursor),
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
         });
         let completed_wire = completed
             .clone()
@@ -5685,5 +6022,231 @@ mod tests {
         assert_eq!(rpc.method, methods::TURN_STATE_GET);
         let decoded = UiCommand::from_rpc_request(rpc).expect("decode state");
         assert_eq!(decoded, state);
+    }
+
+    // ===== UPCR-2026-014 M9-γ projection envelope golden tests =====
+
+    fn envelope(seq: u64, payload: Payload) -> Envelope {
+        Envelope {
+            thread_id: "thread-1".into(),
+            seq,
+            client_message_id: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn golden_envelope_assistant_delta_round_trips() {
+        let env = envelope(
+            1,
+            Payload::AssistantDelta {
+                text: "hello".into(),
+            },
+        );
+        let value = serde_json::to_value(&env).expect("serialize");
+        assert_eq!(value.get("thread_id"), Some(&json!("thread-1")));
+        assert_eq!(value.get("seq"), Some(&json!(1)));
+        assert!(
+            value.get("client_message_id").is_none(),
+            "client_message_id is absent on internal events"
+        );
+        let payload = value.get("payload").expect("payload");
+        assert_eq!(payload.get("type"), Some(&json!("assistant_delta")));
+        assert_eq!(
+            payload.get("data").and_then(|d| d.get("text")),
+            Some(&json!("hello"))
+        );
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_user_rooted_carries_client_message_id() {
+        // user-message-rooted envelopes (the FIRST assistant_delta that
+        // matches a send-click) carry the cmid so the optimistic
+        // <GhostBubble> overlay can match its server reflection. The
+        // projection itself MUST NOT consult the field.
+        let env = Envelope {
+            thread_id: "thread-1".into(),
+            seq: 2,
+            client_message_id: Some("cmid-abc".into()),
+            payload: Payload::AssistantDelta {
+                text: "Q1 answer…".into(),
+            },
+        };
+        let value = serde_json::to_value(&env).expect("serialize");
+        assert_eq!(value.get("client_message_id"), Some(&json!("cmid-abc")));
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_assistant_persisted_round_trips() {
+        let env = envelope(
+            3,
+            Payload::AssistantPersisted {
+                text: "final answer".into(),
+                meta: MessageMeta {
+                    message_id: "msg-7".into(),
+                    persisted_at: sample_persisted_at(),
+                    media: vec!["report.md".into()],
+                },
+            },
+        );
+        let value = serde_json::to_value(&env).expect("serialize");
+        let payload = value.get("payload").expect("payload");
+        assert_eq!(payload.get("type"), Some(&json!("assistant_persisted")));
+        let data = payload.get("data").expect("data");
+        assert_eq!(data.get("text"), Some(&json!("final answer")));
+        assert_eq!(
+            data.get("meta").and_then(|m| m.get("message_id")),
+            Some(&json!("msg-7"))
+        );
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_tool_start_progress_end_round_trip() {
+        let start = envelope(
+            4,
+            Payload::ToolStart {
+                tool_call_id: "tc-1".into(),
+                name: "shell".into(),
+            },
+        );
+        let progress = envelope(
+            5,
+            Payload::ToolProgress {
+                tool_call_id: "tc-1".into(),
+                message: "running…".into(),
+            },
+        );
+        let end_ok = envelope(
+            6,
+            Payload::ToolEnd {
+                tool_call_id: "tc-1".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+            },
+        );
+        let end_err = envelope(
+            7,
+            Payload::ToolEnd {
+                tool_call_id: "tc-2".into(),
+                status: EnvelopeToolEndStatus::Error,
+                error: Some("boom".into()),
+            },
+        );
+
+        for env in [&start, &progress, &end_ok, &end_err] {
+            let value = serde_json::to_value(env).expect("serialize");
+            let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+            assert_eq!(&parsed, env);
+        }
+
+        // Wire-form discriminator check.
+        let start_val = serde_json::to_value(&start).expect("serialize");
+        assert_eq!(
+            start_val.get("payload").and_then(|p| p.get("type")),
+            Some(&json!("tool_start"))
+        );
+        let end_err_val = serde_json::to_value(&end_err).expect("serialize");
+        assert_eq!(
+            end_err_val
+                .get("payload")
+                .and_then(|p| p.get("data"))
+                .and_then(|d| d.get("status")),
+            Some(&json!("error"))
+        );
+        // ToolEnd `error` field omitted when None.
+        let end_ok_val = serde_json::to_value(&end_ok).expect("serialize");
+        let end_ok_data = end_ok_val
+            .get("payload")
+            .and_then(|p| p.get("data"))
+            .expect("tool_end data");
+        assert!(end_ok_data.get("error").is_none());
+    }
+
+    #[test]
+    fn golden_envelope_file_attached_round_trips() {
+        let env = envelope(
+            8,
+            Payload::FileAttached {
+                path: "/tmp/report.md".into(),
+                mime: "text/markdown".into(),
+                size_bytes: 4096,
+            },
+        );
+        let value = serde_json::to_value(&env).expect("serialize");
+        assert_eq!(
+            value.get("payload").and_then(|p| p.get("type")),
+            Some(&json!("file_attached"))
+        );
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_turn_completed_round_trips() {
+        let env = envelope(
+            9,
+            Payload::TurnCompleted {
+                token_usage: EnvelopeTokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 250,
+                    reasoning_tokens: 0,
+                    cache_read_tokens: 80,
+                    cache_write_tokens: 0,
+                },
+            },
+        );
+        let value = serde_json::to_value(&env).expect("serialize");
+        assert_eq!(
+            value.get("payload").and_then(|p| p.get("type")),
+            Some(&json!("turn_completed"))
+        );
+        let usage = value
+            .get("payload")
+            .and_then(|p| p.get("data"))
+            .and_then(|d| d.get("token_usage"))
+            .expect("token_usage");
+        assert_eq!(usage.get("input_tokens"), Some(&json!(100)));
+        assert_eq!(usage.get("output_tokens"), Some(&json!(250)));
+        // Zero fields are omitted on the wire.
+        assert!(usage.get("reasoning_tokens").is_none());
+        assert!(usage.get("cache_write_tokens").is_none());
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_token_usage_zero_default_round_trips() {
+        // turn_completed with all-zero usage emits an empty `token_usage: {}`.
+        let env = envelope(
+            10,
+            Payload::TurnCompleted {
+                token_usage: EnvelopeTokenUsage::default(),
+            },
+        );
+        let value = serde_json::to_value(&env).expect("serialize");
+        let usage = value
+            .get("payload")
+            .and_then(|p| p.get("data"))
+            .and_then(|d| d.get("token_usage"))
+            .expect("token_usage");
+        assert!(usage.as_object().expect("object").is_empty());
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_capability_feature_flag_registered() {
+        // The projection feature flag must be in the known-features
+        // registry so capability negotiation honours it.
+        assert!(
+            UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
+            "projection.envelope.v1 must be registered for capability negotiation"
+        );
     }
 }
