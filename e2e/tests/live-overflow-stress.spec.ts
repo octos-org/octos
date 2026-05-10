@@ -325,6 +325,82 @@ const SCENARIOS: Scenario[] = [
     ],
     timeout_ms: 480_000,
   },
+  {
+    // Marathon stress: 30 rounds in one session with mixed pacing AND
+    // three long-running spawn_only background tasks (deep_research)
+    // dropped at turns 5, 15, 25 — i.e. each background task overlaps
+    // with ~10 fast follow-ups before it finalises. Catches:
+    //   - sticky-map / thread-binding drift across many rotations
+    //   - WebSocket envelope ordering when a foreground assistant
+    //     finalises while two-or-three background tasks are still
+    //     emitting `tool_progress` frames
+    //   - per-bubble auth/state drift if the OTP/admin token rotates
+    //     mid-session
+    //   - DOM bubble pairing across long bubble lists (>60 bubbles)
+    //   - context window pressure: 30 paired turns is enough rounds
+    //     that the server may compact mid-session (depending on the
+    //     model's window vs the running token total)
+    // Total wall time is dominated by the deep_research spawn_only's
+    // (each ~3-5 min). Fast turn gaps stay short (1-5s) so the 30
+    // user-sends complete in ~3 min — the trailing wait is the
+    // long-tail spawn_only finalisation.
+    name: 'marathon-thirty-messages',
+    messages: [
+      { gap_ms: 0, text: '1+1 = ?', expected_in_response: ['2', '两', '二'] },
+      { gap_ms: 1500, text: '2+2 = ?', expected_in_response: ['4', '四'] },
+      { gap_ms: 1500, text: '3+3 = ?', expected_in_response: ['6', '六'] },
+      { gap_ms: 1500, text: '今天日期是？', expected_in_response: ['2026', 'date', '日期', '月'] },
+      // Background #1 at turn 5 — deep_research runs while the next
+      // ~10 fast turns rotate the sticky-map underneath it.
+      {
+        gap_ms: 2000,
+        text: 'Use deep research to find latest Rust news. Run pipeline directly. One paragraph.',
+        expected_in_response: ['rust', 'language', 'news'],
+        is_spawn_only: true,
+      },
+      { gap_ms: 4000, text: '4+4 = ?', expected_in_response: ['8', '八'] },
+      { gap_ms: 1500, text: '5+5 = ?', expected_in_response: ['10', '十'] },
+      { gap_ms: 1500, text: '北京天气怎么样？', expected_in_response: ['beijing', '北京', 'weather', '天气', 'temperature'] },
+      { gap_ms: 2000, text: '6+6 = ?', expected_in_response: ['12', '十二'] },
+      { gap_ms: 1500, text: '7+7 = ?', expected_in_response: ['14', '十四'] },
+      { gap_ms: 1500, text: '你有哪些内置语音', expected_in_response: ['vivian', 'serena', 'voice', '语音', 'tts'] },
+      { gap_ms: 2000, text: '8+8 = ?', expected_in_response: ['16', '十六'] },
+      { gap_ms: 1500, text: '9+9 = ?', expected_in_response: ['18', '十八'] },
+      { gap_ms: 1500, text: '10+10 = ?', expected_in_response: ['20', '二十'] },
+      // Background #2 at turn 15 — second deep_research drop while
+      // background #1 is likely still in flight (timing-dependent).
+      {
+        gap_ms: 2000,
+        text: '深度搜索一下今天的天气情况 (deep search)',
+        expected_in_response: ['weather', '天气', 'temperature', '温度', 'forecast'],
+        is_spawn_only: true,
+      },
+      { gap_ms: 4000, text: '11+11 = ?', expected_in_response: ['22', '二十二'] },
+      { gap_ms: 1500, text: '12+12 = ?', expected_in_response: ['24', '二十四'] },
+      { gap_ms: 1500, text: '13+13 = ?', expected_in_response: ['26', '二十六'] },
+      { gap_ms: 1500, text: '14+14 = ?', expected_in_response: ['28', '二十八'] },
+      { gap_ms: 1500, text: '15+15 = ?', expected_in_response: ['30', '三十'] },
+      { gap_ms: 1500, text: '上海天气如何？', expected_in_response: ['shanghai', '上海', 'weather', '天气', 'temperature'] },
+      { gap_ms: 2000, text: '16+16 = ?', expected_in_response: ['32', '三十二'] },
+      { gap_ms: 1500, text: '17+17 = ?', expected_in_response: ['34', '三十四'] },
+      { gap_ms: 1500, text: '18+18 = ?', expected_in_response: ['36', '三十六'] },
+      // Background #3 at turn 25 — final deep_research drop. By now
+      // the sticky-map has rotated 20+ times and #1/#2 may or may not
+      // have finalised yet.
+      {
+        gap_ms: 2000,
+        text: 'Use deep research on AI assistant trends. Run pipeline directly. One paragraph.',
+        expected_in_response: ['ai', 'assistant', 'agent', 'llm'],
+        is_spawn_only: true,
+      },
+      { gap_ms: 4000, text: '19+19 = ?', expected_in_response: ['38', '三十八'] },
+      { gap_ms: 1500, text: '20+20 = ?', expected_in_response: ['40', '四十'] },
+      { gap_ms: 1500, text: '21+21 = ?', expected_in_response: ['42', '四十二'] },
+      { gap_ms: 1500, text: '22+22 = ?', expected_in_response: ['44', '四十四'] },
+      { gap_ms: 1500, text: '23+23 = ?', expected_in_response: ['46', '四十六'] },
+    ],
+    timeout_ms: 1_200_000,
+  },
 ];
 
 async function enableThreadStoreV2(page: Page) {
@@ -622,6 +698,26 @@ function assertPairing(
     const spawnAttestation =
       message.is_spawn_only === true && unionHrefs.length > 0;
     const matched = textMatched || hrefMatched || spawnAttestation;
+
+    // PHANTOM BUBBLE assertion (added 2026-05-09 after the
+    // `appendPersistedMessage` empty-late-event bug shipped under the
+    // old harness): if there are assistant bubbles in this turn region
+    // that contain NO text (after normalization) AND NO attachment
+    // hrefs, they are pure-orphan timestamp-only bubbles and constitute
+    // a real production UX defect — the user sees a phantom bubble
+    // appear after their question completes. The previous
+    // `bubbleHasRealContent` filter silently dropped these from the
+    // pairing logic, which let the bug ship for weeks. We surface them
+    // explicitly now so a regression here fails the gate.
+    const phantomBubbles = assistantsBetween.filter(
+      (b) =>
+        normalizeBubbleText(b.text).length === 0 && b.hrefs.length === 0,
+    );
+    if (phantomBubbles.length > 0) {
+      violations.push(
+        `User ${i} ("${userPrompt.slice(0, 30)}") [PHANTOM_BUBBLE]: ${phantomBubbles.length} empty assistant bubble(s) (timestamp-only, no text, no hrefs) appeared in this turn — UI ghost bubble bug`,
+      );
+    }
 
     if (!matched) {
       // Differentiate the failure modes for clearer triage:
