@@ -1,13 +1,16 @@
-//! M9-α-9 — bridge SSE-only events that α-7 e2e rewrite (PR #851)
-//! flagged as still-fixme'd onto the M9 WebSocket UI Protocol path.
+//! M9-α-9 — typed envelope helpers for α-7's once-SSE-only events.
 //!
 //! Per the M9-α (Sole Transport) ADR (`docs/M9-ALPHA-SOLE-TRANSPORT-ADR.md`)
-//! the WebSocket transport is migrating to be the sole chat transport.
-//! This module is the α-9 phase: while SSE is still alive (deletion lands
-//! in α-5/α-6 atomically with the web bundle), 5 events α-7 surfaced as
-//! SSE-only must ALSO land on the M9 ledger so any concurrently-connected
-//! WebSocket subscriber for the same `SessionKey` receives them. Without
-//! these bridges the corresponding α-7 specs cannot be un-fixme'd.
+//! the WebSocket transport is the sole chat transport. SSE has been
+//! deleted in α-5/α-6 (atomic with the web bundle). The 5 events α-7
+//! surfaced as previously-SSE-only have already been migrated to typed
+//! v1 envelopes; this module is the canonical home for the helpers
+//! that emit those envelopes (turn/started/completed addenda, file/
+//! attached, session/event-bridged).
+//!
+//! Post-α-5/α-6 the helpers are not yet wired into the new WS lifecycle
+//! handlers (that's a separate follow-up). They retain their unit tests
+//! and will be reused as-is when the lifecycle handlers re-emit them.
 //!
 //! **Scope per UPCR-2026-014** (the addendum landing in this PR):
 //!
@@ -36,9 +39,7 @@
 //!   committed_seq) so a client connected to both transports collapses
 //!   the duplicate into one logical update.
 //!
-//! When α-5/α-6 land and SSE is deleted, the bridge calls become the
-//! only path emitting these envelopes — they remain correct because
-//! they always hit the ledger first regardless of SSE state.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 

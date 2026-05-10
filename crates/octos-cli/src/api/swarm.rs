@@ -851,12 +851,12 @@ pub async fn submit_review(
 /// was discarded and `/api/events/harness?kinds=SwarmDispatch` never
 /// received a single frame. The M7.8 live gate expected these events.
 pub struct BroadcasterSwarmEventSink {
-    pub broadcaster: Arc<super::SseBroadcaster>,
+    pub broadcaster: Arc<super::EventBroadcaster>,
     pub sink_path: Option<String>,
 }
 
 impl BroadcasterSwarmEventSink {
-    pub fn new(broadcaster: Arc<super::SseBroadcaster>, sink_path: Option<String>) -> Self {
+    pub fn new(broadcaster: Arc<super::EventBroadcaster>, sink_path: Option<String>) -> Self {
         Self {
             broadcaster,
             sink_path,
@@ -901,7 +901,7 @@ pub async fn build_swarm_state(
     backend: Arc<dyn McpAgentBackend>,
     swarm_dir: impl Into<std::path::PathBuf>,
     cost_ledger: Arc<PersistentCostLedger>,
-    broadcaster: Arc<super::SseBroadcaster>,
+    broadcaster: Arc<super::EventBroadcaster>,
     sink_path: Option<String>,
     dispatch_policy: Option<octos_swarm::DispatchPolicy>,
 ) -> eyre::Result<SwarmState> {
@@ -949,7 +949,7 @@ pub async fn build_test_swarm_state(
 pub async fn build_test_swarm_state_with_broadcaster(
     swarm_dir: impl Into<std::path::PathBuf>,
     cost_ledger: Arc<PersistentCostLedger>,
-    broadcaster: Arc<super::SseBroadcaster>,
+    broadcaster: Arc<super::EventBroadcaster>,
     sink_path: Option<String>,
 ) -> eyre::Result<SwarmState> {
     let backend: Arc<dyn McpAgentBackend> = Arc::new(TestStubBackend::default());
@@ -1003,7 +1003,7 @@ impl McpAgentBackend for TestStubBackend {
 
 // ── SSE broadcaster helper ──────────────────────────────────────────
 
-impl super::SseBroadcaster {
+impl super::EventBroadcaster {
     /// Send a raw JSON-encoded frame through the broadcast channel. Used
     /// by the review endpoint to forward the typed
     /// [`HarnessEventPayload::SwarmReviewDecision`] event without
@@ -1774,7 +1774,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
-        let broadcaster = Arc::new(super::super::SseBroadcaster::new(16));
+        let broadcaster = Arc::new(super::super::EventBroadcaster::new(16));
         let mut rx = broadcaster.subscribe();
 
         let swarm_state = Arc::new(
@@ -1845,7 +1845,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let cost_ledger = Arc::new(PersistentCostLedger::open(dir.path()).await.unwrap());
-        let broadcaster = Arc::new(super::super::SseBroadcaster::new(16));
+        let broadcaster = Arc::new(super::super::EventBroadcaster::new(16));
         let sink_path = dir.path().join("swarm-events.jsonl");
 
         let swarm_state = Arc::new(

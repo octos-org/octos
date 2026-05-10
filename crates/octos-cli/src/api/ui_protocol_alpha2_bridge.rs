@@ -1,34 +1,20 @@
-//! M9-α-2 — bridge SSE-driven `tool_progress` (and friends) onto the M9
-//! WebSocket UI Protocol path.
+//! M9-α-2 — `tool_progress` ledger reporter (post-α-5/α-6).
 //!
 //! Per the M9-α (Sole Transport) ADR (`docs/M9-ALPHA-SOLE-TRANSPORT-ADR.md`)
-//! the WebSocket transport is migrating to be the sole chat transport.
-//! This module is the α-2 phase: while SSE is still alive (deletion lands
-//! in α-5/α-6 atomically with the web bundle), every `tool_progress`
-//! event the agent emits during a `POST /api/chat?stream=true` turn must
-//! ALSO be appended to the M9 ledger so any concurrently-connected
-//! WebSocket subscriber for the same `SessionKey` sees it through the
-//! live broadcast (`UiProtocolLedger::subscribe`).
+//! the WebSocket transport is the sole chat transport. SSE has been
+//! deleted in α-5/α-6 (atomic with the web bundle), so the
+//! `LedgerToolProgressReporter` defined here no longer has an SSE
+//! consumer to mirror — its inner `Arc<dyn ProgressReporter>` is now a
+//! pass-through (or no-op) and the ledger append is the only delivery
+//! path.
 //!
-//! Coexistence invariants:
-//! - SSE delivery is unchanged. The base reporter is invoked first.
-//! - Ledger appends are best-effort. A failure does not affect the SSE
-//!   path or the agent loop.
-//! - The web client's `MessageStore.appendToolProgressByCallId` reducer
-//!   dedupes by `(tool_call_id, message)`, so a client receiving the
-//!   same payload twice (once via SSE, once via WS) collapses it to a
-//!   single store entry. That is the explicit dedup contract for the
-//!   coexistence period.
-//!
-//! Out of scope for α-2 (deferred to α-3/α-4):
-//! - `tool_started` / `tool_completed` lifecycle envelopes — the spec
-//!   uses `tool/progress.v1` only here. α-3 covers tool lifecycle.
-//! - Session lifecycle (open/close/title/result).
-//! - Heartbeat / progress-gate.
-//!
-//! When α-5/α-6 land and SSE is deleted, this bridge becomes the
-//! straight-through reporter — its inner `Arc<dyn ProgressReporter>`
-//! collapses to a no-op and the ledger append is the only path.
+//! The struct is retained as a documented building block for the M9
+//! WebSocket lifecycle wiring (the unit tests pin its contract), and the
+//! `dead_code` allow keeps the module compiling until a future PR
+//! re-installs it as the canonical path inside the new `turn/start` WS
+//! handler.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -212,36 +198,26 @@ mod tests {
         // contract is "ToolProgress is the only mirror in α-2".
     }
 
-    /// α-2 acceptance gate: the same `ProgressEvent::ToolProgress`
-    /// must reach BOTH the SSE wire path AND the WS wire path during
-    /// coexistence. This exercises the full reporter chain that
-    /// `chat_streaming` builds:
-    ///
-    ///   ChannelReporter (SSE side)  ←──┐
-    ///                                  │
-    ///   LedgerToolProgressReporter ────┘ also appends to UiProtocolLedger,
-    ///                                    which broadcasts to WS subscribers.
+    /// α-2 acceptance gate (post-α-5/α-6): a `ProgressEvent::ToolProgress`
+    /// reaches the WS wire path through the `LedgerToolProgressReporter`
+    /// decorator, regardless of what the wrapped inner reporter does.
+    /// Pre-α-5/α-6 this test also asserted the SSE side; that branch is
+    /// gone now — the inner reporter is treated as opaque (here a no-op
+    /// stand-in for the legacy `/api/ws` channel reporter).
     #[test]
-    fn should_emit_tool_progress_on_both_sse_and_ws_during_coexistence() {
-        use crate::api::sse::{ChannelReporter, event_to_json};
-        use serde_json::Value;
+    fn should_emit_tool_progress_on_ws_via_ledger_reporter() {
+        struct SilentInner;
+        impl ProgressReporter for SilentInner {
+            fn report(&self, _event: ProgressEvent) {}
+        }
 
-        // SSE side: same channel reporter that handlers.rs::chat_streaming
-        // builds. Bind a thread_id matching the cmid path.
-        let (sse_tx, mut sse_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let sse_reporter: Arc<dyn ProgressReporter> =
-            Arc::new(ChannelReporter::new(sse_tx).with_thread_id(Some("cmid-alpha-2".into())));
-
-        // WS side: subscribe BEFORE emitting so the broadcast catches the
-        // event. The ledger is what `event_ledger(state)` returns in
-        // production (process-singleton); we instantiate fresh per-test.
         let ledger = Arc::new(UiProtocolLedger::new(64));
-        let session_id = SessionKey::new("api", "alpha2-coexistence");
+        let session_id = SessionKey::new("api", "alpha2-ws");
         let turn_id = TurnId::new();
         let mut ws_subscriber = ledger.subscribe(&session_id);
 
         let bridged: Arc<dyn ProgressReporter> = Arc::new(LedgerToolProgressReporter::new(
-            sse_reporter,
+            Arc::new(SilentInner),
             ledger.clone(),
             session_id.clone(),
             turn_id.clone(),
@@ -255,30 +231,6 @@ mod tests {
             message: "phase 2/4".into(),
         });
 
-        // ---- SSE assertion ----
-        // The channel reporter encoded a JSON payload matching the
-        // legacy SSE wire format consumed by sse-bridge.ts.
-        let sse_raw = sse_rx.try_recv().expect("SSE wire frame must arrive");
-        let sse_json: Value = serde_json::from_str(&sse_raw).unwrap();
-        assert_eq!(sse_json["type"], "tool_progress");
-        assert_eq!(sse_json["tool"], "deep_search");
-        assert_eq!(sse_json["tool_call_id"], "call_42");
-        assert_eq!(sse_json["message"], "phase 2/4");
-        assert_eq!(sse_json["thread_id"], "cmid-alpha-2");
-        // Sanity: confirm the SSE encoder is the canonical one used by
-        // chat_streaming. If `event_to_json` is ever bypassed, this
-        // assertion would need updating before the bridge change.
-        let canonical = event_to_json(
-            &ProgressEvent::ToolProgress {
-                name: "deep_search".into(),
-                tool_id: "call_42".into(),
-                message: "phase 2/4".into(),
-            },
-            Some("cmid-alpha-2"),
-        );
-        assert_eq!(canonical, sse_json);
-
-        // ---- WS assertion ----
         // The bridge appended a `tool/progress.v1` notification to the
         // ledger; the broadcast subscribed above has it ready.
         let ws_event = ws_subscriber
@@ -306,10 +258,7 @@ mod tests {
             .expect("notification serializes");
         assert_eq!(rpc.method, methods::TOOL_PROGRESS);
 
-        // Coexistence invariant: the inner SSE channel must NOT have
-        // received a duplicate frame, and the WS broadcast must NOT
-        // have replayed.
-        assert!(sse_rx.try_recv().is_err(), "SSE must emit exactly once");
+        // Single-emit invariant: the WS broadcast must NOT replay.
         assert!(
             ws_subscriber.try_recv().is_err(),
             "WS broadcast must emit exactly once"

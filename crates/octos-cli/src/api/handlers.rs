@@ -1,7 +1,6 @@
 //! API request handlers.
 
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Extension;
@@ -10,7 +9,6 @@ use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
 use octos_agent::{Agent, inspect_workspace_contract};
@@ -18,19 +16,25 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey};
+use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
+use super::events::ChannelReporter;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
-use super::sse::ChannelReporter;
 use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
-/// POST /api/chat -- send a message, get a response.
-/// When `stream: true`, returns SSE events. Otherwise returns JSON.
+/// POST /api/chat -- send a message, get a response (sync JSON only).
+///
+/// M9-α-5/α-6 (ADR PR #830): the SSE branch was deleted; `stream: true`
+/// now returns `410 Gone` and clients must use `/api/ui-protocol/ws`.
+/// `media` / `attach_only` / `client_message_id` are accepted for
+/// wire-compat with older clients but unused in the surviving sync
+/// path. The legacy `/api/ws` handler (`ws_standalone_agent`) reads
+/// the same struct and still consumes them.
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -42,17 +46,16 @@ pub struct ChatRequest {
     pub stream: bool,
     /// File paths from prior `/api/upload` call.
     #[serde(default)]
+    #[allow(dead_code)]
     pub media: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub attach_only: bool,
-    /// Web-generated correlation id. Forwarded to the gateway so the
-    /// eventual `_session_result.response_to_client_message_id` matches
-    /// the web reducer's optimistic bubble (FA-12f).
-    ///
-    /// Also propagated onto the persisted user `Message` so the matching
-    /// `session_result` event lets the web client stamp the authoritative
-    /// `historySeq` onto its optimistic bubble.
+    /// Web-generated correlation id. Used by the WS lifecycle handlers
+    /// downstream of `/api/ui-protocol/ws`. Pre-α-5/α-6 the streaming
+    /// HTTP path also threaded this through; that path is gone.
     #[serde(default)]
+    #[allow(dead_code)]
     pub client_message_id: Option<String>,
 }
 
@@ -315,37 +318,23 @@ pub async fn chat(
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    // If a gateway has an API channel running, proxy the request to it.
-    // The gateway's stream forwarder now sends discrete SSE events (thinking,
-    // tool_start, tool_progress, cost_update) via send_raw_sse alongside
-    // the text-based streaming updates.
-    if let Some((profile_id, port)) = resolve_api_port(&state, &headers).await {
-        return super::webhook_proxy::api_chat_proxy(
-            &state,
-            port,
-            Some(&profile_id),
-            &req.message,
-            req.session_id.as_deref(),
-            req.topic.as_deref(),
-            &req.media,
-            req.attach_only,
-            req.stream,
-            req.client_message_id.as_deref(),
+    // M9-α-5/α-6 (ADR PR #830 / audit issue #845): SSE chat is gone.
+    // `POST /api/chat` only supports the sync JSON path now — every
+    // streaming caller has migrated to `/api/ui-protocol/ws`. Fail
+    // closed when `stream=true` is requested so a stale client surfaces
+    // a clear error instead of a half-broken response.
+    if req.stream {
+        return (
+            StatusCode::GONE,
+            "POST /api/chat?stream=true was removed in M9-α-5/α-6 — \
+             use the WebSocket UI Protocol (/api/ui-protocol/ws) instead.",
         )
-        .await;
+            .into_response();
     }
 
-    // No gateway with API channel — use standalone agent
-    if req.stream {
-        match chat_streaming(state, headers, req).await {
-            Ok(sse) => sse.into_response(),
-            Err((status, msg)) => (status, msg).into_response(),
-        }
-    } else {
-        match chat_sync(state, headers, req).await {
-            Ok(json) => json.into_response(),
-            Err((status, msg)) => (status, msg).into_response(),
-        }
+    match chat_sync(state, headers, req).await {
+        Ok(json) => json.into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
     }
 }
 
@@ -466,461 +455,6 @@ async fn chat_sync(
     }))
 }
 
-async fn chat_streaming(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    req: ChatRequest,
-) -> Result<
-    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>,
-    (StatusCode, String),
-> {
-    let (base_agent, sessions) = validate_chat_request(&state, &req)?;
-
-    let session_id = req.session_id.clone().unwrap_or_else(|| "default".into());
-    tracing::info!(
-        session = %session_id,
-        msg_len = req.message.len(),
-        "chat: streaming message"
-    );
-
-    let session_key =
-        standalone_api_session_key_with_topic(&state, &headers, &session_id, req.topic.as_deref());
-
-    // Load history before spawning
-    let history: Vec<Message> = {
-        let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&session_key).await;
-        session.get_history(50).to_vec()
-    };
-
-    // Create per-request channel and reporter.
-    //
-    // M8.10 PR #2: bind the user message's `client_message_id` to the
-    // reporter so every emitted SSE payload carries `thread_id`. The
-    // standalone `serve` mode shares a single chat_id across turns, but
-    // each turn gets a fresh ChannelReporter scoped to its cmid.
-    //
-    // M9-α-2 (issue #831, ADR PR #830): the SSE chat path is migrating
-    // off SSE entirely (final delete in α-5/α-6). During the coexistence
-    // period, every emitted `tool_progress` event must ALSO be appended
-    // to the M9 ledger so a concurrently-connected WebSocket subscriber
-    // for the same `SessionKey` receives it. The web reducer dedupes by
-    // `(tool_call_id, message)` so a client connected to both transports
-    // collapses duplicates into a single store entry. SSE delivery is
-    // unchanged — the inner channel reporter sees every event first.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let client_message_id = req.client_message_id.clone();
-    let alpha_ledger = super::ui_protocol::event_ledger(&state).await;
-    let alpha_turn_id = octos_core::ui_protocol::TurnId::new();
-    let sse_chain: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
-        Arc::new(ChannelReporter::new(tx.clone()).with_thread_id(client_message_id.clone())),
-    ));
-    let alpha2_chain: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
-        super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
-            sse_chain,
-            alpha_ledger.clone(),
-            session_key.clone(),
-            alpha_turn_id.clone(),
-        ),
-    );
-
-    // M9-α-4 (issue #833, ADR PR #830): mirror `LlmStatus`,
-    // `StreamRetry`, `MaxIterationsReached`, `TokenBudgetExceeded`, and
-    // `ActivityTimeoutReached` onto the M9 ledger as `progress/updated`
-    // notifications so a concurrently-connected WebSocket subscriber
-    // observes the same status / progress-gate surface SSE consumers
-    // see. The decorator wraps the α-2 chain so events flow:
-    //   α-4 mirror -> α-2 mirror -> MetricsReporter -> ChannelReporter.
-    // α-4 emits ONLY for variants α-2 / α-3 do not own (see
-    // `ui_protocol_alpha4_bridge` for the full survey + invariants);
-    // it delegates everything else through unchanged so the inner SSE
-    // wire path is unaffected.
-    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
-        super::ui_protocol_alpha4_bridge::LedgerStatusGateReporter::new(
-            alpha2_chain,
-            alpha_ledger.clone(),
-            session_key.clone(),
-            alpha_turn_id.clone(),
-        ),
-    );
-
-    // M9-α-3 (issue #832, ADR PR #830): emit a `turn/started.v1`
-    // notification onto the M9 ledger BEFORE the agent loop runs.
-    // M9-α-9 (UPCR-2026-014): plumb `topic` onto the envelope so
-    // multi-topic specs can scope by sub-topic (the SSE chat path's
-    // `topic` query parameter previously had no WS counterpart). The
-    // `_with_topic` variant collapses empty topic to None so no-topic
-    // turns retain the pre-α-9 wire shape.
-    super::ui_protocol_alpha9_bridge::emit_turn_started_with_topic(
-        &alpha_ledger,
-        &session_key,
-        &alpha_turn_id,
-        req.topic.clone(),
-    );
-
-    // Build per-request agent sharing resources with the base agent
-    let mut request_agent = Agent::new_shared(
-        AgentId::new(format!("api-{}", uuid::Uuid::now_v7())),
-        base_agent.llm_provider(),
-        base_agent.tool_registry().clone(),
-        base_agent.memory_store(),
-    )
-    .with_config(base_agent.agent_config())
-    .with_system_prompt(base_agent.system_prompt_snapshot())
-    .with_reporter(reporter);
-
-    // M8 fix-first item 8 (gaps 1 + 2): `Agent::new_shared` zeroes the
-    // file-state cache and sub-agent router/generator. Per-request agents
-    // must inherit them from the base agent so chat requests land on the
-    // same M8 wiring the rest of the runtime sees.
-    if let Some(cache) = base_agent.file_state_cache() {
-        request_agent = request_agent.with_file_state_cache(cache.clone());
-    }
-    if let Some(router) = base_agent.subagent_output_router() {
-        request_agent = request_agent.with_subagent_output_router(router.clone());
-    }
-    if let Some(generator) = base_agent.subagent_summary_generator() {
-        request_agent = request_agent.with_subagent_summary_generator(generator.clone());
-    }
-
-    let message = req.message;
-    let media = req.media;
-    let topic_for_event = req.topic.clone();
-
-    // Spawn the agent task
-    let user_event_tx = tx.clone();
-    // M9-α-3: capture lifecycle bridge inputs for the spawn closure.
-    // These are cloned (not moved) because the lifecycle pair must
-    // bracket the SSE turn — `turn/started` was already emitted on the
-    // outer scope above, and `turn/completed` fires from inside the
-    // spawn AFTER the terminal SSE frame (`done` or `error`) is sent.
-    let lifecycle_ledger = alpha_ledger.clone();
-    let lifecycle_session_key = session_key.clone();
-    let lifecycle_turn_id = alpha_turn_id.clone();
-    tokio::spawn(async move {
-        // M9-α-9 (UPCR-2026-014): capture token usage + final-row
-        // identity into mutable bindings so the lifecycle emit at the
-        // bottom of this closure can stamp them onto the
-        // `turn/completed` envelope. Both default to None — failure
-        // paths leave the addendum fields absent on the wire.
-        let mut alpha9_tokens_in: Option<u32> = None;
-        let mut alpha9_tokens_out: Option<u32> = None;
-        let mut alpha9_session_result: Option<octos_core::ui_protocol::TurnSessionResult> = None;
-
-        let result = request_agent
-            .process_message(&message, &history, media)
-            .await;
-
-        match result {
-            Ok(response) => {
-                alpha9_tokens_in = Some(response.token_usage.input_tokens);
-                alpha9_tokens_out = Some(response.token_usage.output_tokens);
-                // M9-α-9 (UPCR-2026-014): mirror per-turn file
-                // attachments onto the WS surface so `file_attached`
-                // tests can observe them on the M9 ledger. The SSE
-                // chat path does not currently emit `file:` frames
-                // for `files_to_send` (those route through the
-                // gateway's `ApiChannel`), so this bridge is the
-                // sole path delivering them on the WS surface for a
-                // standalone `octos serve`. The `tool_call_id` is
-                // not threaded through `ConversationResponse` today
-                // — tools that emit files go through the per-tool
-                // execution path, not the per-turn aggregate. Leave
-                // it None so clients fall back to fuzzy matching by
-                // path; future work can plumb the originating tool
-                // call id through the response struct.
-                for path in &response.files_to_send {
-                    let path_str = path.to_string_lossy().to_string();
-                    super::ui_protocol_alpha9_bridge::emit_file_attached(
-                        &lifecycle_ledger,
-                        &lifecycle_session_key,
-                        &lifecycle_turn_id,
-                        path_str,
-                        None,
-                        None,
-                    );
-                }
-                tracing::info!(
-                    session = %session_id,
-                    input_tokens = response.token_usage.input_tokens,
-                    output_tokens = response.token_usage.output_tokens,
-                    "chat: streaming response complete"
-                );
-
-                // Save all conversation messages (user, assistant iterations,
-                // tool calls/results) through the canonical per-user JSONL.
-                // Pre-fix this funnelled through `SessionManager::add_message_with_seq`
-                // which wrote to the legacy flat layout — a standalone
-                // `octos serve` had no gateway-side `ApiChannel` to redirect,
-                // so messages landed in `sessions/<encoded_full_key>.jsonl`
-                // while the actor wrote to `users/.../<topic>.jsonl`.
-                //
-                // Also tag the first user message with the client-supplied
-                // `client_message_id` so the persisted row carries it through
-                // the JSONL round-trip and emit a user-message session_result
-                // event so the web client can stamp the authoritative seq onto
-                // its optimistic bubble (M8.10-A user-message counterpart).
-                //
-                // Capture the committed seq of the final assistant message
-                // so the SSE `done` event can thread it back to the web client
-                // (M8.10-A).
-                let mut user_message_seq_and_meta: Option<(usize, String, String)> = None;
-                let assistant_committed_seq: Option<u64> = {
-                    let mut last_assistant_seq: Option<u64> = None;
-                    let mut user_persisted = false;
-                    for msg in &response.messages {
-                        let mut to_save = msg.clone();
-                        if !user_persisted && msg.role == MessageRole::User {
-                            user_persisted = true;
-                            // PR A: stamp via the typed setter so callers
-                            // wired to a `ClientMessageId` can't pass the
-                            // wrong identity here. Bare-`String` overrides
-                            // remain available for inbound paths where the
-                            // cmid is already a `String` from the wire.
-                            if let Some(ref cmid) = client_message_id {
-                                if !cmid.is_empty() {
-                                    to_save = to_save.with_typed_client_message_id(
-                                        octos_core::ClientMessageId::new(cmid),
-                                    );
-                                }
-                            }
-                            let timestamp = to_save.timestamp.to_rfc3339();
-                            let content_for_event = to_save.content.clone();
-                            match persist_chat_message_through_canonical(
-                                &sessions,
-                                &session_key,
-                                to_save,
-                            )
-                            .await
-                            {
-                                Ok(seq) => {
-                                    user_message_seq_and_meta =
-                                        Some((seq, content_for_event, timestamp));
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %error,
-                                        "chat: failed to persist user message"
-                                    );
-                                }
-                            }
-                        } else {
-                            let is_assistant = msg.role == MessageRole::Assistant;
-                            // PR F (M8.10): pre-stamp `thread_id` on
-                            // Assistant/Tool rows so the canonical
-                            // persist's new-write fail-closed split
-                            // accepts them. Bind to the originating
-                            // `client_message_id` (the REST `chat`
-                            // endpoint requires it for proper threading).
-                            // When the request didn't supply one (legacy
-                            // clients), fall back to a UUIDv7 so the
-                            // persist still succeeds — these rows would
-                            // be invisible to per-thread routing
-                            // anyway, but at least they survive reload.
-                            if to_save.thread_id.is_none()
-                                && matches!(
-                                    to_save.role,
-                                    MessageRole::Assistant | MessageRole::Tool
-                                )
-                            {
-                                to_save.thread_id = Some(
-                                    client_message_id
-                                        .as_deref()
-                                        .filter(|s| !s.is_empty())
-                                        .map(str::to_string)
-                                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
-                                );
-                            }
-                            match persist_chat_message_through_canonical(
-                                &sessions,
-                                &session_key,
-                                to_save,
-                            )
-                            .await
-                            {
-                                Ok(seq) if is_assistant => {
-                                    last_assistant_seq = u64::try_from(seq).ok();
-                                }
-                                Ok(_) => {}
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    last_assistant_seq
-                };
-
-                // Emit a user-message session_result event so the web client
-                // can stamp the authoritative seq onto its optimistic bubble.
-                if let Some((seq, content, timestamp)) = user_message_seq_and_meta {
-                    let mut message_payload = serde_json::json!({
-                        "seq": seq,
-                        "role": "user",
-                        "content": content,
-                        "timestamp": timestamp,
-                    });
-                    if let Some(ref cmid) = client_message_id {
-                        if !cmid.is_empty() {
-                            message_payload
-                                .as_object_mut()
-                                .expect("json object")
-                                .insert(
-                                    "client_message_id".to_string(),
-                                    serde_json::Value::String(cmid.clone()),
-                                );
-                        }
-                    }
-                    let event = serde_json::json!({
-                        "type": "session_result",
-                        "topic": topic_for_event,
-                        "message": message_payload,
-                    });
-                    let _ = user_event_tx.send(event.to_string());
-                }
-
-                // Send final done event (field names match what octos-web expects)
-                let provider_metadata = response.provider_metadata.clone();
-                let model_id = provider_metadata
-                    .as_ref()
-                    .map(|meta| meta.model.clone())
-                    .or_else(|| {
-                        let provider = request_agent.llm_provider();
-                        let model = provider.model_id();
-                        if model.is_empty() {
-                            None
-                        } else {
-                            Some(model.to_string())
-                        }
-                    });
-                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
-                    pricing.cost(
-                        response.token_usage.input_tokens,
-                        response.token_usage.output_tokens,
-                    )
-                });
-                let mut done = serde_json::json!({
-                    "type": "done",
-                    "content": response.content,
-                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
-                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": model_id,
-                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
-                    "tokens_in": response.token_usage.input_tokens,
-                    "tokens_out": response.token_usage.output_tokens,
-                    "session_cost": session_cost,
-                });
-                if let Some(seq) = assistant_committed_seq {
-                    done["committed_seq"] = serde_json::Value::from(seq);
-                    // M9-α-9 (UPCR-2026-014): also surface the
-                    // committed identity onto the WS `turn/completed`
-                    // envelope via `session_result`. The `message_id`
-                    // here mirrors the
-                    // `MessageCommitObserver`-computed shape
-                    // (`session:seq:timestamp_ns`) but with timestamp
-                    // = 0 — the WS path's authoritative `message_id`
-                    // arrives separately on the parallel
-                    // `message/persisted` envelope; this addendum is
-                    // a hint that lets clients dedupe + stamp seq
-                    // without a REST roundtrip. Clients that need
-                    // the exact ns-precision id read it from the
-                    // persisted envelope.
-                    alpha9_session_result = Some(octos_core::ui_protocol::TurnSessionResult {
-                        committed_seq: seq,
-                        message_id: format!("{}:{seq}:0", session_key.0),
-                        client_message_id: client_message_id
-                            .as_ref()
-                            .filter(|s| !s.is_empty())
-                            .cloned(),
-                    });
-                }
-                // M8.10 PR #2: tag the done event with thread_id so the web
-                // client can route the committed_seq onto the right per-cmid
-                // bubble.
-                if let Some(ref tid) = client_message_id {
-                    if !tid.is_empty() {
-                        done["thread_id"] = serde_json::Value::String(tid.clone());
-                    }
-                }
-                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
-                // tool results' structured side-channel into the SSE done
-                // event so the dashboard CostBreakdown panel can render
-                // real per-node attribution from `run_pipeline` runs.
-                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
-                for (_tool_call_id, meta) in &response.tool_results {
-                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
-                        all_node_costs.extend(arr.iter().cloned());
-                    }
-                }
-                if !all_node_costs.is_empty() {
-                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
-                }
-                let _ = tx.send(done.to_string());
-            }
-            Err(e) => {
-                tracing::error!(session = %session_id, error = %e, "chat: streaming failed");
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": e.to_string(),
-                });
-                let _ = tx.send(err.to_string());
-            }
-        }
-        // M9-α-3 + α-9: emit `turn/completed.v1` to the ledger AFTER
-        // the terminal SSE frame (`done` or `error`) is sent. The
-        // α-9 variant carries the UPCR-2026-014 addendum fields
-        // (`tokens_in/out` + `session_result`) — None on error paths
-        // so a mid-turn-attached WS client still sees the lifecycle
-        // pair (started / completed) for SSE-driven turns regardless
-        // of outcome.
-        super::ui_protocol_alpha9_bridge::emit_turn_completed_full(
-            &lifecycle_ledger,
-            &lifecycle_session_key,
-            &lifecycle_turn_id,
-            alpha9_tokens_in,
-            alpha9_tokens_out,
-            alpha9_session_result,
-        );
-        // tx drops here, closing the stream
-    });
-
-    // Return SSE stream from receiver
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, std::convert::Infallible> =
-                    Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None,
-        }
-    });
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
-}
-
-/// GET /api/chat/stream -- SSE stream of progress events (legacy broadcast).
-pub async fn chat_stream(
-    State(state): State<Arc<AppState>>,
-) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let rx = state.broadcaster.subscribe();
-
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(data) => {
-                    let event: Result<Event, std::convert::Infallible> =
-                        Ok(Event::default().data(data));
-                    return Some((event, rx));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
 /// GET /api/sessions -- list sessions.
 #[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -1024,13 +558,10 @@ pub struct TopicQueryParams {
     pub topic: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct SessionEventStreamQueryParams {
-    #[serde(default)]
-    pub since_seq: Option<usize>,
-    #[serde(default)]
-    pub topic: Option<String>,
-}
+// `SessionEventStreamQueryParams` and the `/api/sessions/{id}/events/stream`
+// route it served were deleted in M9-α-5/α-6 (ADR PR #830 / audit issue
+// #845). Every session-event subscriber now consumes the
+// `session/event.v1` notification on `/api/ui-protocol/ws`.
 
 fn default_page_limit() -> usize {
     100
@@ -1057,6 +588,12 @@ fn append_topic_query(path: &mut String, topic: Option<&str>) {
     }
 }
 
+// `append_since_seq_query` previously served the deleted
+// `/api/sessions/{id}/events/stream` proxy. Kept here (and tested below)
+// because future WS-lifecycle replays may re-introduce a `since_seq`
+// query string when re-implementing the corresponding gateway-mode
+// proxy step.
+#[allow(dead_code)]
 fn append_since_seq_query(path: &mut String, since_seq: Option<usize>) {
     if let Some(since_seq) = since_seq {
         path.push_str(if path.contains('?') {
@@ -1231,52 +768,6 @@ pub async fn session_status(
         "active": false,
     }))
     .into_response()
-}
-
-/// GET /api/sessions/:id/events/stream -- subscribe to committed session events.
-pub async fn session_event_stream(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<SessionEventStreamQueryParams>,
-) -> Response {
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let encoded_id = encode_api_session_path_id(&id);
-        let mut path = format!("/sessions/{encoded_id}/events/stream");
-        append_since_seq_query(&mut path, params.since_seq);
-        append_topic_query(&mut path, params.topic.as_deref());
-        return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
-    }
-
-    let replay_complete_payload = serde_json::json!({
-        "type": "replay_complete",
-        "topic": params.topic,
-    });
-    // M9-α-9 (UPCR-2026-014): bridge the legacy SSE
-    // `/api/sessions/:id/events/stream` frame onto the WS surface as
-    // a `session/event.v1` envelope. Keeps WS-only clients (post-α-7)
-    // observing the same signal SSE consumers see during the
-    // coexistence period; once the gateway-mode forwarder also
-    // routes its frames through this bridge, every legacy event-
-    // stream frame is mirrored regardless of mode.
-    let session_key =
-        standalone_api_session_key_with_topic(&state, &headers, &id, params.topic.as_deref());
-    let alpha_ledger = super::ui_protocol::event_ledger(&state).await;
-    super::ui_protocol_alpha9_bridge::emit_session_event(
-        &alpha_ledger,
-        &session_key,
-        "replay_complete".to_string(),
-        replay_complete_payload.clone(),
-        params.topic.clone(),
-    );
-
-    let replay_complete = replay_complete_payload.to_string();
-    let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
-        Event::default().data(replay_complete),
-    )]);
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.

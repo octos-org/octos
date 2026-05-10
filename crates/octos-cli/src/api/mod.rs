@@ -1,17 +1,22 @@
-//! REST API and SSE streaming for octos.
+//! REST + WebSocket API surface for octos.
 //!
 //! Feature-gated behind `api`. Start with `octos serve [--port 50080]`.
+//!
+//! M9-α-5/α-6 (ADR PR #830 / audit issue #845): the chat SSE transport
+//! has been deleted — every chat client now talks to `/api/ui-protocol/ws`
+//! exclusively. The harness/admin and swarm event surfaces still use a
+//! process-wide [`EventBroadcaster`] over SSE (admin-only).
 
 pub mod admin;
 pub mod admin_setup;
 pub mod auth_handlers;
+mod events;
 mod events_harness;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;
 pub mod purge;
 mod router;
-mod sse;
 mod static_files;
 pub mod swarm;
 mod ui_protocol;
@@ -30,9 +35,9 @@ mod ui_protocol_task_output;
 pub mod user_admin;
 pub mod webhook_proxy;
 
+pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
-pub use sse::SseBroadcaster;
 pub use swarm::{
     BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
     SubtaskView, SwarmBudgetSpec, SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest,
@@ -107,8 +112,10 @@ pub struct AppState {
     pub agent: Option<Arc<octos_agent::Agent>>,
     /// Session manager for history.
     pub sessions: Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>>,
-    /// SSE broadcaster for streaming events.
-    pub broadcaster: Arc<SseBroadcaster>,
+    /// Process-wide event broadcaster for harness/admin + swarm SSE
+    /// surfaces. Chat traffic uses `/api/ui-protocol/ws` exclusively as
+    /// of M9-α-5/α-6.
+    pub broadcaster: Arc<EventBroadcaster>,
     /// Server start time.
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Bootstrap admin auth token from config/env (used only until the
@@ -172,8 +179,8 @@ pub struct AppState {
     pub swarm_state: Option<Arc<swarm::SwarmState>>,
     /// Optional path to the JSONL harness-event sink. When `Some`,
     /// typed harness events (e.g. `SwarmReviewDecision`) are appended
-    /// to the file in addition to being broadcast live to SSE
-    /// subscribers. When `None`, events are broadcast-only — so a
+    /// to the file in addition to being broadcast live to harness
+    /// SSE subscribers. When `None`, events are broadcast-only — so a
     /// decision made while no subscriber is connected is lost. Wired
     /// by `octos serve` from the `OCTOS_HARNESS_EVENT_SINK` env var.
     pub harness_event_sink_path: Option<String>,
@@ -225,7 +232,7 @@ impl AppState {
         Self {
             agent: None,
             sessions: None,
-            broadcaster: Arc::new(SseBroadcaster::new(16)),
+            broadcaster: Arc::new(EventBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
             auth_token: None,
             admin_token_store: Arc::new(AdminTokenStore::new(&tmp)),
