@@ -1879,9 +1879,20 @@ fn latest_tool_batch_index(messages: &[Message], target: &str) -> Option<usize> 
 /// raw LLM-instruction string. Strips the fixed prefix that
 /// `shell_retry_limit_message` prepends and wraps the latest shell
 /// output in a short user-readable framing.
+///
+/// Codex round-3 BLOCK: the prefix can NEST. After the Escalate splice
+/// overwrites a shell Tool's content with `[SHELL RETRY LIMIT] ... +
+/// original output`, a follow-up recovery wraps that already-prefixed
+/// content again, producing two layers of the system prefix. We strip
+/// recursively until no prefix remains so the user-facing assistant
+/// reply never leaks an inner `[SHELL RETRY LIMIT] ... Stop retrying
+/// shell ...` instruction.
 fn shell_retry_terminal_user_message(content: &str) -> String {
     const PREFIX: &str = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n";
-    let tail = content.strip_prefix(PREFIX).unwrap_or(content);
+    let mut tail = content;
+    while let Some(stripped) = tail.strip_prefix(PREFIX) {
+        tail = stripped;
+    }
     if tail.trim().is_empty() {
         "I tried multiple shell approaches but couldn't converge on an answer. Please rephrase or give me a more specific direction.".to_string()
     } else {
@@ -3763,6 +3774,31 @@ printf '{"output":"voice saved","success":true}\n'
         let raw = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n   ";
         let sanitized = shell_retry_terminal_user_message(raw);
         assert!(sanitized.contains("Please rephrase or give me a more specific direction"));
+    }
+
+    /// Codex round-3 BLOCK regression: after the Escalate splice
+    /// overwrites a shell Tool's content with `[SHELL RETRY LIMIT] ... +
+    /// original output`, a follow-up Exhausted recovery can wrap THAT
+    /// already-prefixed content again, producing nested prefixes. The
+    /// sanitizer must strip ALL of them — leaking even one inner
+    /// "Stop retrying shell and summarize the blocker" string into the
+    /// user-facing reply is wrong.
+    #[test]
+    fn shell_retry_terminal_user_message_unwraps_nested_prefix() {
+        let prefix = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n";
+        let inner = format!("{prefix}error: real shell output\n\nExit code: 101");
+        let outer = format!("{prefix}{inner}");
+        // Outer wrapping a wrapped string — two prefix layers.
+        let sanitized = shell_retry_terminal_user_message(&outer);
+        assert!(!sanitized.contains("[SHELL RETRY LIMIT]"));
+        assert!(!sanitized.contains("Stop retrying shell and summarize"));
+        assert!(sanitized.contains("error: real shell output"));
+
+        // Three-deep paranoia case: should still strip cleanly.
+        let triple = format!("{prefix}{outer}");
+        let sanitized3 = shell_retry_terminal_user_message(&triple);
+        assert!(!sanitized3.contains("[SHELL RETRY LIMIT]"));
+        assert!(sanitized3.contains("error: real shell output"));
     }
 
     /// Helper: builds a 4-call shell-streak with all failures, exactly the
