@@ -1072,7 +1072,7 @@ impl BoundedChannelReporter {
 
 impl octos_agent::ProgressReporter for BoundedChannelReporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
-        let json = match serde_json::to_string(&super::sse::event_to_json(
+        let json = match serde_json::to_string(&super::events::event_to_json(
             &event,
             self.thread_id.as_deref(),
         )) {
