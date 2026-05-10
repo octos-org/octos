@@ -46,7 +46,6 @@
     {
       nixosModules.default = mkModuleWithPackages ./nix/modules/nixos.nix;
       darwinModules.default = mkModuleWithPackages ./nix/modules/darwin.nix;
-      homeModules.default = mkModuleWithPackages ./nix/modules/home.nix;
 
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
@@ -58,9 +57,11 @@
       packages = forEachSupportedSystem (
         { pkgs, system }:
         {
-          default = self.packages.${system}.octos-minimal;
-          octos-app-skills = pkgs.callPackage ./nix/packages/app-skills.nix { };
           octos-minimal = pkgs.callPackage ./nix/packages/default.nix { };
+          octos-app-skills = pkgs.callPackage ./nix/packages/app-skills.nix { };
+
+          default = self.packages.${system}.octos-minimal;
+
           octos-full = pkgs.buildEnv {
             name = "octos-full";
             paths = [
