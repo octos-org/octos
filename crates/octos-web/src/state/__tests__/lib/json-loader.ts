@@ -78,6 +78,7 @@ const IGNORED_METHODS: Set<string> = new Set([
   'session/open',
   'session/opened',
   'session/closed',
+  'session/title-updated',
   'session/hydrate',
   'task/updated',
   'task/output/delta',

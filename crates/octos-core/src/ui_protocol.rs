@@ -698,6 +698,12 @@ pub mod methods {
     /// legacy `/api/sessions/:id/events/stream` SSE frames bridged onto
     /// the unified v1 surface.
     pub const SESSION_EVENT: &str = "session/event";
+    /// UPCR-2026-016 (M9-β-2) `session/closed` — session was deleted or
+    /// otherwise closed; matches the `session/open` lifecycle frame.
+    pub const SESSION_CLOSED: &str = "session/closed";
+    /// UPCR-2026-016 (M9-β-2) `session/title-updated` — display title
+    /// changed (REST PATCH or auto-titler).
+    pub const SESSION_TITLE_UPDATED: &str = "session/title-updated";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -749,6 +755,8 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
     methods::SESSION_EVENT,
+    methods::SESSION_CLOSED,
+    methods::SESSION_TITLE_UPDATED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -3422,6 +3430,65 @@ pub struct SessionEventBridgedEvent {
     pub topic: Option<String>,
 }
 
+/// UPCR-2026-016 (M9-β-2): emitted when a session is closed/deleted.
+///
+/// REST `DELETE /api/sessions/:id` is the canonical trigger; the
+/// handler appends this notification to the ledger so any concurrently-
+/// connected WS subscriber (the web sidebar in particular) reacts in
+/// real time without polling. The matching `session/opened`
+/// counterpart already exists as `SessionOpened` (emitted on the
+/// `session/open` RPC reply).
+///
+/// `cursor` is stamped by the ledger via
+/// [`UiProtocolLedgerEvent::with_cursor`] (server side) and is `None`
+/// at the call site. Older payloads decoded from disk default it to
+/// `None` for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionClosedEvent {
+    pub session_id: SessionKey,
+    /// Free-form reason describing why the session closed. The current
+    /// canonical value is `"deleted"` (REST DELETE). Future producers
+    /// can add `"expired"`, `"forked"`, etc.; clients should treat
+    /// unknown reasons as opaque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Wall-clock timestamp at the call site. Always emitted; older
+    /// payloads decoded with no value populate the current epoch.
+    #[serde(default = "default_epoch_zero")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Ledger cursor stamped by `with_cursor` server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<UiCursor>,
+}
+
+/// UPCR-2026-016 (M9-β-2): emitted when a session's display title
+/// changes.
+///
+/// Triggered by REST `PATCH /api/sessions/:id/title` (manual
+/// re-titling) and by the auto-titler (which writes through the same
+/// `update_title` path on the `SessionManager`). Clients that render
+/// session lists can update the row in place without polling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTitleUpdatedEvent {
+    pub session_id: SessionKey,
+    pub title: String,
+    /// Free-form reason. Canonical values: `"manual"` (REST PATCH),
+    /// `"auto"` (auto-titler). Clients should treat unknown values as
+    /// opaque so future producers can add e.g. `"bulk_rename"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Wall-clock timestamp at the call site.
+    #[serde(default = "default_epoch_zero")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Ledger cursor stamped by `with_cursor` server-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<UiCursor>,
+}
+
+fn default_epoch_zero() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now)
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -3457,6 +3524,14 @@ pub enum UiNotification {
     /// `/api/sessions/:id/events/stream` SSE frames bridged onto the
     /// unified v1 ledger.
     SessionEventBridged(SessionEventBridgedEvent),
+    /// UPCR-2026-016 (M9-β-2): session was closed (e.g. DELETE
+    /// `/api/sessions/:id`). Lets WS subscribers refresh sidebars
+    /// without polling.
+    SessionClosed(SessionClosedEvent),
+    /// UPCR-2026-016 (M9-β-2): session display title changed (manual
+    /// PATCH or auto-titler). Lets WS subscribers re-render the row
+    /// without polling.
+    SessionTitleUpdated(SessionTitleUpdatedEvent),
 }
 
 impl UiNotification {
@@ -3483,6 +3558,8 @@ impl UiNotification {
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
             Self::SessionEventBridged(_) => methods::SESSION_EVENT,
+            Self::SessionClosed(_) => methods::SESSION_CLOSED,
+            Self::SessionTitleUpdated(_) => methods::SESSION_TITLE_UPDATED,
         }
     }
 
@@ -3510,6 +3587,8 @@ impl UiNotification {
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
             Self::SessionEventBridged(params) => serde_json::to_value(params),
+            Self::SessionClosed(params) => serde_json::to_value(params),
+            Self::SessionTitleUpdated(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -3559,6 +3638,10 @@ impl UiNotification {
             }
             methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
             methods::SESSION_EVENT => Ok(Self::SessionEventBridged(decode_params(method, params)?)),
+            methods::SESSION_CLOSED => Ok(Self::SessionClosed(decode_params(method, params)?)),
+            methods::SESSION_TITLE_UPDATED => {
+                Ok(Self::SessionTitleUpdated(decode_params(method, params)?))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -3947,6 +4030,8 @@ mod tests {
                 "turn/spawn_complete",
                 "file/attached",
                 "session/event",
+                "session/closed",
+                "session/title-updated",
             ]
         );
         assert_eq!(
@@ -4027,7 +4112,9 @@ mod tests {
                     "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
-                    "session/event"
+                    "session/event",
+                    "session/closed",
+                    "session/title-updated"
                 ],
                 "supported_features": [
                     "approval.typed.v1",

@@ -180,6 +180,16 @@ impl UiProtocolLedgerEvent {
                 UiNotification::TurnSpawnComplete(spawn_complete) => {
                     spawn_complete.cursor = cursor;
                 }
+                // UPCR-2026-016 (M9-β-2): stamp the ledger cursor onto
+                // the new session-lifecycle envelopes so cursor-driven
+                // clients (the web sidebar reducer) can resume cleanly
+                // after reconnect.
+                UiNotification::SessionClosed(closed) => {
+                    closed.cursor = Some(cursor);
+                }
+                UiNotification::SessionTitleUpdated(updated) => {
+                    updated.cursor = Some(cursor);
+                }
                 _ => {}
             }
         }
@@ -1498,6 +1508,8 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::TurnSpawnComplete(event) => &event.session_id,
         UiNotification::FileAttached(event) => &event.session_id,
         UiNotification::SessionEventBridged(event) => &event.session_id,
+        UiNotification::SessionClosed(event) => &event.session_id,
+        UiNotification::SessionTitleUpdated(event) => &event.session_id,
     }
 }
 
@@ -1507,6 +1519,8 @@ fn notification_cursor_seq(notification: &UiNotification) -> Option<u64> {
         | UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => {
             cursor.as_ref().map(|c| c.seq)
         }
+        UiNotification::SessionClosed(event) => event.cursor.as_ref().map(|c| c.seq),
+        UiNotification::SessionTitleUpdated(event) => event.cursor.as_ref().map(|c| c.seq),
         _ => None,
     }
 }

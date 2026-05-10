@@ -1116,6 +1116,13 @@ pub async fn update_session_title(
     }
 
     let mut updated = false;
+    // M9-β-2 (UPCR-2026-016): collect every standalone-store SessionKey
+    // that actually applied the title, then emit `session/title-updated`
+    // onto the WS ledger so concurrent subscribers re-render the row in
+    // place without polling. Gateway-proxy keys are not emitted here —
+    // the gateway-side `SessionManager` is in a different process and
+    // owns its own ledger; that case stays a polling fallback today.
+    let mut emit_keys: Vec<SessionKey> = Vec::new();
 
     if let Some(sessions) = &state.sessions {
         let mut sess = sessions.lock().await;
@@ -1129,6 +1136,7 @@ pub async fn update_session_title(
                     );
                 } else {
                     updated = true;
+                    emit_keys.push(key);
                 }
             }
         }
@@ -1146,6 +1154,15 @@ pub async fn update_session_title(
         updated = true;
     }
 
+    if !emit_keys.is_empty() {
+        let ledger = super::ui_protocol::event_ledger(&state).await;
+        for key in &emit_keys {
+            super::ui_protocol_beta2_session_lifecycle::emit_session_title_updated(
+                &ledger, key, &title, "manual",
+            );
+        }
+    }
+
     if updated {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -1159,6 +1176,12 @@ pub async fn delete_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    // M9-β-2 (UPCR-2026-016): collect every key actually deleted from
+    // the standalone store, then emit `session/closed` envelopes after
+    // the persistence path runs so subscribers learn about real state
+    // transitions only.
+    let mut emit_keys: Vec<SessionKey> = Vec::new();
+
     // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
         let mut sess = sessions.lock().await;
@@ -1170,6 +1193,8 @@ pub async fn delete_session(
                         error = %e,
                         "delete session from standalone store failed"
                     );
+                } else {
+                    emit_keys.push(key);
                 }
             }
         }
@@ -1180,6 +1205,15 @@ pub async fn delete_session(
     if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
         let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
+    }
+
+    if !emit_keys.is_empty() {
+        let ledger = super::ui_protocol::event_ledger(&state).await;
+        for key in &emit_keys {
+            super::ui_protocol_beta2_session_lifecycle::emit_session_closed(
+                &ledger, key, "deleted",
+            );
+        }
     }
 
     StatusCode::NO_CONTENT.into_response()
