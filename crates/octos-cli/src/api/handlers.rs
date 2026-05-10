@@ -515,9 +515,29 @@ async fn chat_streaming(
     let sse_chain: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
         Arc::new(ChannelReporter::new(tx.clone()).with_thread_id(client_message_id.clone())),
     ));
-    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
+    let alpha2_chain: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
         super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
             sse_chain,
+            alpha_ledger.clone(),
+            session_key.clone(),
+            alpha_turn_id.clone(),
+        ),
+    );
+
+    // M9-α-4 (issue #833, ADR PR #830): mirror `LlmStatus`,
+    // `StreamRetry`, `MaxIterationsReached`, `TokenBudgetExceeded`, and
+    // `ActivityTimeoutReached` onto the M9 ledger as `progress/updated`
+    // notifications so a concurrently-connected WebSocket subscriber
+    // observes the same status / progress-gate surface SSE consumers
+    // see. The decorator wraps the α-2 chain so events flow:
+    //   α-4 mirror -> α-2 mirror -> MetricsReporter -> ChannelReporter.
+    // α-4 emits ONLY for variants α-2 / α-3 do not own (see
+    // `ui_protocol_alpha4_bridge` for the full survey + invariants);
+    // it delegates everything else through unchanged so the inner SSE
+    // wire path is unaffected.
+    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
+        super::ui_protocol_alpha4_bridge::LedgerStatusGateReporter::new(
+            alpha2_chain,
             alpha_ledger.clone(),
             session_key.clone(),
             alpha_turn_id.clone(),
