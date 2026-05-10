@@ -18,6 +18,7 @@ mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha3_bridge;
 mod ui_protocol_alpha4_bridge;
+mod ui_protocol_alpha9_bridge;
 mod ui_protocol_approvals;
 mod ui_protocol_audit;
 mod ui_protocol_diff;

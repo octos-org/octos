@@ -690,7 +690,13 @@ pub mod methods {
     /// spawn-acknowledgement bubble. Gated by
     /// [`UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1`].
     pub const TURN_SPAWN_COMPLETE: &str = "turn/spawn_complete";
+    /// UPCR-2026-014 (M9-α-9) `file/attached` — per-turn file attachment
+    /// event mirroring the SSE `file:` frame from `files_to_send` tool
+    /// surfaces.
     pub const FILE_ATTACHED: &str = "file/attached";
+    /// UPCR-2026-014 (M9-α-9) `session/event` — wrapper envelope for
+    /// legacy `/api/sessions/:id/events/stream` SSE frames bridged onto
+    /// the unified v1 surface.
     pub const SESSION_EVENT: &str = "session/event";
 }
 
@@ -2974,6 +2980,14 @@ pub struct TurnStartedEvent {
     pub session_id: SessionKey,
     pub turn_id: TurnId,
     pub timestamp: DateTime<Utc>,
+    /// UPCR-2026-014 (M9-α-9): optional sub-topic suffix that scopes the
+    /// turn within a session (mirrors the `<session>#<topic>` shape
+    /// carried on REST/SSE chat). Multi-topic specs need this to filter
+    /// `turn/started` envelopes by topic when observing the unified WS
+    /// surface — the addendum is purely additive (absent on legacy
+    /// turn-start envelopes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3332,12 +3346,30 @@ pub struct TurnCompletedEvent {
     pub turn_id: TurnId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<UiCursor>,
+    /// UPCR-2026-014 (M9-α-9): aggregated input-token count for the
+    /// completed turn (LLM-side prompt usage, summed across iterations).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens_in: Option<u64>,
+    pub tokens_in: Option<u32>,
+    /// UPCR-2026-014 (M9-α-9): aggregated output-token count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens_out: Option<u64>,
+    pub tokens_out: Option<u32>,
+    /// UPCR-2026-014 (M9-α-9): durable per-row identity for the final
+    /// assistant message that closed the turn. Mirrors the SSE
+    /// `session_result` frame's role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_result: Option<Value>,
+    pub session_result: Option<TurnSessionResult>,
+}
+
+/// UPCR-2026-014 (M9-α-9) `turn/completed.session_result` payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSessionResult {
+    /// Authoritative committed seq for the final assistant row.
+    pub committed_seq: u64,
+    /// Stable per-row id (`session:seq:timestamp_ns`).
+    pub message_id: String,
+    /// Originating user prompt's `client_message_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3359,21 +3391,35 @@ pub struct ReplayLossyEvent {
     pub last_durable_cursor: Option<UiCursor>,
 }
 
+/// UPCR-2026-014 (M9-α-9): per-turn `file_attached` envelope, mirrors
+/// the SSE-only `file:` frame the agent loop emits when a tool's
+/// `files_to_send` declares an artifact for the active turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileAttachedEvent {
     pub session_id: SessionKey,
     pub turn_id: TurnId,
+    /// Filesystem path or URL the tool produced.
     pub path: String,
+    /// Originating tool call (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional MIME-type hint surfaced by the tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
 }
 
+/// UPCR-2026-014 (M9-α-9): wrapper for legacy
+/// `/api/sessions/:id/events/stream` SSE frames bridged onto the WS
+/// surface. `kind` is the legacy SSE `type` field; `payload` is the
+/// full frame body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionEventBridgedEvent {
     pub session_id: SessionKey,
     pub kind: String,
+    pub payload: Value,
+    /// Echo of any `topic` field carried on the legacy frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Value>,
+    pub topic: Option<String>,
 }
 
 /// Draft notification payloads for UI protocol v1.
@@ -3405,7 +3451,11 @@ pub enum UiNotification {
     /// the same row; per-connection capability filtering (the
     /// `event.spawn_complete.v1` flag) decides which one the client sees.
     TurnSpawnComplete(TurnSpawnCompleteEvent),
+    /// UPCR-2026-014 (M9-α-9): per-turn file attachment event.
     FileAttached(FileAttachedEvent),
+    /// UPCR-2026-014 (M9-α-9): wrapper for legacy
+    /// `/api/sessions/:id/events/stream` SSE frames bridged onto the
+    /// unified v1 ledger.
     SessionEventBridged(SessionEventBridgedEvent),
 }
 
@@ -3508,9 +3558,7 @@ impl UiNotification {
                 Ok(Self::TurnSpawnComplete(decode_params(method, params)?))
             }
             methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
-            methods::SESSION_EVENT => {
-                Ok(Self::SessionEventBridged(decode_params(method, params)?))
-            }
+            methods::SESSION_EVENT => Ok(Self::SessionEventBridged(decode_params(method, params)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -3895,6 +3943,8 @@ mod tests {
                 "protocol/replay_lossy",
                 "message/persisted",
                 "turn/spawn_complete",
+                "file/attached",
+                "session/event",
             ]
         );
         assert_eq!(
@@ -3969,7 +4019,9 @@ mod tests {
                     "warning",
                     "protocol/replay_lossy",
                     "message/persisted",
-                    "turn/spawn_complete"
+                    "turn/spawn_complete",
+                    "file/attached",
+                    "session/event"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
