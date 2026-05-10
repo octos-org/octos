@@ -2760,8 +2760,34 @@ async fn handle_turn_start(
     routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
-    params: TurnStartParams,
+    mut params: TurnStartParams,
 ) {
+    // UPCR-2026-015 (M9-β-1): if the client carried a `topic` field
+    // alongside the session_id, fold it into the resolved SessionKey
+    // BEFORE scope validation. The rest of the turn pipeline keys
+    // exclusively off `params.session_id`, so adopting the topic-
+    // suffixed form here means history lookup, ledger appends, and
+    // `task/list` filtering all see the per-topic bucket
+    // automatically. Empty / whitespace-only topics fall through to
+    // the bare session shape (matching `SessionKey::with_topic`'s
+    // own empty-string short-circuit).
+    if let Some(topic) = params
+        .topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        // Replace the SessionKey with the topic-suffixed form. Splice
+        // any existing topic suffix away first so a client that sends
+        // both `session_id: "x:y#old"` and `topic: "new"` lands in a
+        // single, unambiguous bucket (`x:y#new`) rather than the
+        // double-suffixed garbage `x:y#old#new`. The base parser
+        // already handles `#`-stripped lookups, but we want the
+        // canonical form on the wire-trip back to clients.
+        let base = params.session_id.base_key().to_owned();
+        params.session_id = SessionKey(format!("{base}#{topic}"));
+    }
+
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         let _ = send_rpc_error(ws, Some(id), error);
         return;
@@ -5147,11 +5173,32 @@ async fn run_standalone_turn(
     // the WRONG sibling user under rapid-fire concurrent turns.
     let turn_thread_id_for_persist = turn_id.0.to_string();
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
+    // UPCR-2026-015 (M9-β-1): pull the pre-uploaded media paths off
+    // the params and feed them to the agent loop. `process_message`
+    // already accepts a `Vec<String>` of paths (used by the
+    // `octos chat` CLI and gateway-mode message handler) — wiring it
+    // here restores the legacy SSE chat handler's media delivery on
+    // the WS transport. The legacy `rewrite_for` field is logged at
+    // debug level for now; durable in-place rewrites land in a
+    // follow-up that touches the per-session ledger replace path.
+    let turn_media_paths: Vec<String> = params
+        .media
+        .iter()
+        .map(|file_ref| file_ref.path.clone())
+        .collect();
+    if let Some(rewrite_for) = params.rewrite_for.as_deref() {
+        tracing::debug!(
+            session = %session_id.0,
+            turn = %turn_id.0,
+            rewrite_for,
+            "turn/start carries rewrite_for; current build forwards the prompt without in-place ledger rewrite (β-1 advisory)"
+        );
+    }
     let agent_task = tokio::spawn(async move {
         let result = octos_agent::tools::TOOL_APPROVAL_CTX
             .scope(
                 approval_requester,
-                request_agent.process_message(&prompt, &history, Vec::new()),
+                request_agent.process_message(&prompt, &history, turn_media_paths),
             )
             .await;
 
@@ -6032,6 +6079,9 @@ mod tests {
             input: vec![InputItem::Text {
                 text: "hello".into(),
             }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         })
         .into_rpc_request("1")
         .expect("request");
@@ -6045,6 +6095,76 @@ mod tests {
             route_rpc_command(decoded, ConnectionUiFeatures::default()).expect("route"),
             UiCommand::TurnStart(_)
         ));
+    }
+
+    /// UPCR-2026-015 (M9-β-1): the WS turn/start handler accepts the
+    /// three new optional fields (`media`, `topic`, `rewrite_for`)
+    /// from a strict-additive wire shape. The legacy text-only form
+    /// continues to deserialize identically (back-compat sanity).
+    #[test]
+    fn parses_turn_start_rpc_request_with_beta1_fields() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-beta1",
+            "method": methods::TURN_START,
+            "params": {
+                "session_id": "local:test",
+                "turn_id": TurnId::new(),
+                "input": [{"kind": "text", "text": "look here"}],
+                "media": [
+                    {
+                        "path": "/tmp/chat-upload-deadbeef.png",
+                        "mime": "image/png",
+                        "size_bytes": 1234,
+                    }
+                ],
+                "topic": "research",
+                "rewrite_for": "cmid-original-1",
+            }
+        })
+        .to_string();
+
+        let decoded = parse_rpc_request(&raw).expect("parse");
+        let routed = route_rpc_command(decoded, ConnectionUiFeatures::default()).expect("route");
+        match routed {
+            UiCommand::TurnStart(params) => {
+                assert_eq!(params.media.len(), 1);
+                assert_eq!(params.media[0].path, "/tmp/chat-upload-deadbeef.png");
+                assert_eq!(params.media[0].mime, "image/png");
+                assert_eq!(params.media[0].size_bytes, 1234);
+                assert_eq!(params.topic.as_deref(), Some("research"));
+                assert_eq!(params.rewrite_for.as_deref(), Some("cmid-original-1"));
+            }
+            other => panic!("expected TurnStart, got {:?}", other),
+        }
+    }
+
+    /// UPCR-2026-015 (M9-β-1): bare turn/start (no β-1 fields)
+    /// continues to deserialize and round-trip with the new defaults.
+    #[test]
+    fn parses_legacy_turn_start_rpc_request_stays_back_compat() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-legacy",
+            "method": methods::TURN_START,
+            "params": {
+                "session_id": "local:test",
+                "turn_id": TurnId::new(),
+                "input": [{"kind": "text", "text": "hello"}],
+            }
+        })
+        .to_string();
+
+        let decoded = parse_rpc_request(&raw).expect("parse");
+        let routed = route_rpc_command(decoded, ConnectionUiFeatures::default()).expect("route");
+        match routed {
+            UiCommand::TurnStart(params) => {
+                assert!(params.media.is_empty());
+                assert!(params.topic.is_none());
+                assert!(params.rewrite_for.is_none());
+            }
+            other => panic!("expected TurnStart, got {:?}", other),
+        }
     }
 
     #[test]

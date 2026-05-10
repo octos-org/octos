@@ -263,6 +263,9 @@ mod tests {
             input: vec![AppUiInputItem::Text {
                 text: "hello".into(),
             }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         });
 
         assert_eq!(command.method(), methods::TURN_START);
