@@ -90,41 +90,6 @@ in
         description = "octos serve daemon configuration";
       };
 
-      remote = mkOption {
-        type = submodule {
-          options = {
-            enable = mkEnableOption "frpc tunnel for public access";
-            domain = mkOption {
-              type = str;
-              default = "";
-              description = "Base domain for tunnel (e.g. alice.octos-cloud.org)";
-            };
-            frpsServer = mkOption {
-              type = str;
-              default = "";
-              description = "frps server address";
-            };
-            frpsToken = mkOption {
-              type = str;
-              default = "";
-              description = "frps authentication token";
-            };
-            sshPort = mkOption {
-              type = int;
-              default = 6001;
-              description = "SSH tunnel remote port";
-            };
-            tenantName = mkOption {
-              type = str;
-              default = "";
-              description = "Tenant subdomain (e.g. 'alice' for alice.octos-cloud.org)";
-            };
-          };
-        };
-        default = { };
-        description = "frpc tunnel configuration for remote access — maps to services.frp.instances.octos";
-      };
-
     };
   };
 }
