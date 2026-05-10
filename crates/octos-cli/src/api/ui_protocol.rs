@@ -1624,6 +1624,19 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::PermissionProfileList(_) | UiCommand::PermissionProfileSet(_) => {
+                // `permission/profile/*` RPCs are declared in the core
+                // protocol type registry but not yet wired in the v1
+                // server slice. Reply with `method_not_supported` so
+                // clients negotiate around them rather than hang.
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::method_not_supported(
+                        "permission/profile/* not yet implemented in server",
+                    ),
+                );
+            }
         }
     }
 
