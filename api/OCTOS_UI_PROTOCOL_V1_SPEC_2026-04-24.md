@@ -818,9 +818,17 @@ deterministic projection consumes. The web client maintains an
 append-only `Vec<Envelope>` indexed by `(thread_id, seq)` and the
 projection function `(committed_log) → ChatViewModel` is pure,
 deterministic, and side-effect free. Identity collapses to `seq`;
-`client_message_id` lives ONLY on user-message-rooted envelopes for
-the optimistic `<GhostBubble>` overlay's match-and-unmount path (the
-projection MUST NOT consult it).
+`client_message_id` lives ONLY on `user_message` envelopes (see
+§ 14.2) for the optimistic `<GhostBubble>` overlay's match-and-unmount
+path (the projection MUST NOT consult it).
+
+**Turn shape** (locked by § 14.2): every chat turn begins with exactly
+one `user_message` envelope (server-mirrored from the client's send),
+followed by zero or more `assistant_delta` / `tool_*` / `file_attached`
+/ `assistant_persisted` envelopes, terminated by exactly one
+`turn_completed` envelope. A refresh-only projection reconstructs the
+`UserView` for the chat exclusively from `user_message` envelopes —
+`assistant_delta` and `assistant_persisted` alone are insufficient.
 
 ### 14.1 Envelope
 
@@ -842,11 +850,13 @@ Field contract:
 - `seq` (`u64`, required) — Server-assigned strict total order WITHIN
   this `thread_id`. Strictly monotonic; gaps are an error and trigger
   rehydration. Identity for the projection.
-- `client_message_id` (`string`, optional) — Present on
-  user-message-rooted envelopes (the optimistic `<GhostBubble>` matches
-  its server reflection here). Absent on internal events (assistant
-  deltas, tool events, `turn_completed`). The projection MUST NOT
-  consult this field.
+- `client_message_id` (`string`, optional) — Populated ONLY on
+  `user_message` envelopes (the optimistic `<GhostBubble>` overlay
+  matches its server reflection here). Absent on every other variant
+  (`assistant_delta`, `assistant_persisted`, `tool_*`, `file_attached`,
+  `turn_completed`). The projection MUST NOT consult this field. A
+  server emitting `client_message_id` on a non-`user_message` envelope
+  is a wire contract violation.
 - `payload` (object, required) — Sealed tagged union; see § 14.2.
 
 Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
@@ -859,10 +869,39 @@ Wire form: JSON with `"type"` discriminator and content under `"data"`
 (matches Rust `serde(tag = "type", content = "data", rename_all = "snake_case")`).
 Variants:
 
+#### `user_message`
+User-message turn root — server-mirrored from the client's send. Every
+chat turn begins with exactly one `user_message` envelope. The
+projection's `UserView` is reconstructed from these envelopes alone —
+a refresh-only projection cannot recover user bubbles from
+`assistant_delta` / `assistant_persisted`. The carrying envelope's
+`client_message_id` is populated here (and ONLY here) so the
+optimistic `<GhostBubble>` overlay can match its server reflection.
+
+```json
+{ "type": "user_message",
+  "data": {
+    "text": "<user prompt>",
+    "files": [
+      { "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
+    ]
+  } }
+```
+
+`files` is an array of [`FileRef`](#145-fileref) entries; omitted on
+the wire when empty.
+
 #### `assistant_delta`
 One streamed assistant text fragment. Multiple `assistant_delta`
 envelopes for the same `thread_id` accumulate (concatenate by `seq`
 order) into the live assistant bubble.
+
+**Reconciliation rule** — `assistant_delta.text` events APPEND
+(concatenate by ascending `seq`). When an `assistant_persisted`
+envelope arrives for the same `thread_id`, its `text` field REPLACES
+the accumulated streamed text (the persisted form is canonical). This
+avoids double-rendering the final body when both delta and persisted
+events project into the same view.
 
 ```json
 { "type": "assistant_delta", "data": { "text": "<fragment>" } }
@@ -871,7 +910,10 @@ order) into the live assistant bubble.
 #### `assistant_persisted`
 Final assistant text persisted to the ledger after streaming completes.
 Carries durable [`MessageMeta`](#143-messagemeta) so the projection can
-finalize the bubble's identity and surface attachments.
+finalize the bubble's identity and surface attachments. Per the
+`assistant_delta` reconciliation rule above, `text` REPLACES the
+concatenated streamed deltas for the same thread (canonical final
+form).
 
 ```json
 { "type": "assistant_persisted",
@@ -905,7 +947,9 @@ the projection appends in `seq` order.
 
 #### `tool_end`
 Tool invocation finished. `error` is set iff `status === "error"`;
-omitted on the wire when null.
+omitted on the wire when null. `reason` is an optional human-readable
+detail field, primarily populated for `skipped` and `aborted` outcomes
+(see below); omitted on the wire when null.
 
 ```json
 { "type": "tool_end",
@@ -917,8 +961,29 @@ omitted on the wire when null.
   "data": { "tool_call_id": "tc-2", "status": "error", "error": "…" } }
 ```
 
-`status` is a closed snake_case enum: `complete | error`. Future values
-require a follow-up UPCR.
+```json
+{ "type": "tool_end",
+  "data": { "tool_call_id": "tc-3", "status": "skipped",
+            "reason": "deadline elapsed before tool started" } }
+```
+
+```json
+{ "type": "tool_end",
+  "data": { "tool_call_id": "tc-4", "status": "aborted",
+            "reason": "user issued turn/interrupt" } }
+```
+
+`status` is a closed snake_case enum:
+
+- `complete` — tool ran to natural completion.
+- `error` — tool surfaced a failure (`error` carries the message).
+- `skipped` — tool was intentionally not run (deadline-skip,
+  pre-condition unmet). `reason` explains why.
+- `aborted` — tool execution was interrupted by an external signal
+  (user `turn/interrupt`, system cancellation). `reason` carries
+  detail.
+
+Future values require a follow-up UPCR.
 
 #### `file_attached`
 File attached to the current thread (e.g. `.md` report from
@@ -934,8 +999,10 @@ attachment to the most-recent assistant bubble in `thread_id`.
 
 #### `turn_completed`
 **Hard barrier** — terminal payload for a turn within `thread_id`. Per
-the M9-γ ADR, no further `assistant_*` or `tool_*` payloads are valid
-on this `thread_id` after this envelope. Carries
+the M9-γ ADR and § 14.6 below, any envelope arriving on the same
+`thread_id` AFTER this one is DROPPED by the projection (and counted
+in `octos_projection_post_completion_drop_total`). Threads are NOT
+reused — a new turn must use a NEW `thread_id`. Carries
 [`EnvelopeTokenUsage`](#144-envelopetokenusage); zero-valued fields are
 omitted on the wire.
 
@@ -981,25 +1048,47 @@ wire when zero (Rust `serde(skip_serializing_if = "is_zero_u64")`):
 
 Future fields require a follow-up UPCR.
 
-### 14.5 Hard barrier semantics
+### 14.5 `FileRef`
+
+```json
+{ "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
+```
+
+Wire-form file reference carried on `user_message` envelopes (and
+reused as the canonical attachment shape elsewhere — `file_attached`
+embeds the same triple inline). All three fields are required:
+
+- `path` (`string`) — Absolute path the server resolved for the file.
+- `mime` (`string`) — IANA media type (e.g. `image/png`,
+  `text/markdown`).
+- `size_bytes` (`u64`) — Byte size at upload/persist time.
+
+### 14.6 Hard barrier semantics
 
 Per the M9-γ ADR and the `Envelope` Rust doc-comment, the server MUST
-emit at most one `turn_completed` envelope per `(thread_id, turn)`. After
-that envelope:
+emit at most one `turn_completed` envelope per `(thread_id, turn)`.
+After that envelope, the projection enforces the barrier with a single
+deterministic rule:
 
-- No further `assistant_*` payloads are valid on the same `thread_id`
-  for the same turn.
-- No further `tool_*` payloads are valid on the same `thread_id` for
-  the same turn.
-- A subsequent `assistant_delta` on the same `thread_id` indicates a
-  NEW turn (the next user prompt starts at `turn_completed.seq + 1`).
+> After `turn_completed` for `thread_id` T, any subsequent envelope
+> with the same `thread_id` is **DROPPED** by the projection. The
+> projection records the drop in the
+> `octos_projection_post_completion_drop_total` metric. Threads are
+> **NOT reused** — a new turn MUST use a NEW `thread_id`.
 
-Clients that ingest a forbidden post-`turn_completed` payload MUST
-treat the connection as desynchronized and rehydrate via
-`session/hydrate` (UPCR-2026-009). This is the wire-level enforcement
-of the "phantom bubble" elimination that motivated M9-γ.
+This is the canonical wire-level enforcement of the "phantom bubble"
+elimination that motivated M9-γ. The drop is silent at the projection
+layer (the metric is the operational signal); clients do NOT
+rehydrate, restart, or treat the situation as a desync. The same
+behaviour is implemented by the M9-γ-2 projection
+([`octos-web` PR #93](https://github.com/octos-org/octos-web/pull/93)).
 
-### 14.6 Capability negotiation
+A server that needs to emit a follow-up assistant or tool event
+belonging to a logically separate turn MUST mint a new `thread_id` for
+that turn — the projection treats the new `thread_id` as a brand-new
+chat thread and projects it independently.
+
+### 14.7 Capability negotiation
 
 Clients request `projection.envelope.v1` via the `X-Octos-Ui-Features`
 header at `session/open` time. Servers advertise it through

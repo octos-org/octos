@@ -2029,11 +2029,41 @@ pub struct MessageMeta {
 }
 
 /// Status carried on `tool_end` projection envelopes.
+///
+/// Closed snake_case enum. The four variants distinguish the UX states
+/// the projection needs to render distinctly:
+///
+/// - `complete` — tool ran to natural completion, no error.
+/// - `error` — tool surfaced a failure (`error` field carries the
+///   message).
+/// - `skipped` — tool was intentionally not run (e.g. deadline-skip,
+///   pre-condition not met). The optional `reason` on the `tool_end`
+///   payload explains why.
+/// - `aborted` — tool execution was interrupted by an external signal
+///   (user `turn/interrupt`, system cancellation). The optional
+///   `reason` carries detail.
+///
+/// Future variants require a follow-up UPCR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeToolEndStatus {
     Complete,
     Error,
+    Skipped,
+    Aborted,
+}
+
+/// Wire-form file reference carried on `user_message` envelopes (and
+/// reused as the canonical attachment shape elsewhere in the protocol).
+///
+/// Mirrors the `file_attached` payload's identity triple so a client
+/// rendering a user upload and a server-attached file uses the same
+/// fields. All three are required on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub path: String,
+    pub mime: String,
+    pub size_bytes: u64,
 }
 
 /// Sealed tagged union of payloads carried by the M9-γ projection
@@ -2044,20 +2074,56 @@ pub enum EnvelopeToolEndStatus {
 /// Wire form: JSON with `"type"` discriminator and content under `"data"`.
 /// Variant names are snake_case to match the spec § 14 / TS shape.
 ///
-/// **Hard barrier**: per the M9-γ ADR, [`Payload::TurnCompleted`] is the
-/// terminal payload for a `thread_id`. The server MUST NOT emit any
-/// further `assistant_*` / `tool_*` payloads on the same `thread_id`
-/// after the `turn_completed` envelope is sent.
+/// **Turn shape**: every chat turn begins with exactly one
+/// [`Payload::UserMessage`] envelope (server-mirrored from the client's
+/// send), followed by zero or more `assistant_delta` / `tool_*` /
+/// `file_attached` / `assistant_persisted` envelopes, terminated by
+/// exactly one [`Payload::TurnCompleted`]. A refresh-only projection
+/// reconstructs the `UserView` for the chat exclusively from
+/// `user_message` envelopes — `assistant_delta` and `assistant_persisted`
+/// alone are insufficient.
+///
+/// **Streaming reconciliation rule** (locked by spec § 14.2):
+/// `assistant_delta.text` fragments APPEND to the live bubble in
+/// strict `seq` order (concatenate). When an `assistant_persisted`
+/// arrives for the same thread, its `text` field REPLACES the
+/// accumulated streamed text — the persisted form is canonical and
+/// avoids double-rendering the final body.
+///
+/// **Hard barrier**: per the M9-γ ADR and spec § 14.6,
+/// [`Payload::TurnCompleted`] is the terminal payload for a `thread_id`.
+/// Any envelope arriving on the same `thread_id` AFTER `turn_completed`
+/// is DROPPED by the projection and counted in the
+/// `octos_projection_post_completion_drop_total` metric. Threads are
+/// NOT reused — a new turn must use a NEW `thread_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Payload {
+    /// User-message turn root — server-mirrored from the client's send.
+    /// Every chat turn begins with exactly one `user_message` envelope,
+    /// and the projection's `UserView` is reconstructed from these
+    /// envelopes alone (a refresh-only projection cannot recover user
+    /// bubbles from `assistant_delta` / `assistant_persisted`).
+    ///
+    /// The carrying [`Envelope`] populates `client_message_id` here —
+    /// and ONLY here — so the optimistic `<GhostBubble>` overlay can
+    /// match its server reflection and unmount.
+    UserMessage {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<FileRef>,
+    },
     /// One streamed assistant text fragment. Multiple `assistant_delta`
     /// envelopes for the same `thread_id` accumulate (concatenate by
-    /// `seq` order) into the live assistant bubble.
+    /// `seq` order) into the live assistant bubble. An
+    /// `assistant_persisted` for the same thread REPLACES the
+    /// accumulated text.
     AssistantDelta { text: String },
     /// Final assistant text persisted to the ledger after streaming
     /// completes. Carries the durable [`MessageMeta`] so the projection
-    /// can finalize the bubble's identity and surface attachments.
+    /// can finalize the bubble's identity and surface attachments. Its
+    /// `text` field REPLACES the concatenated streamed deltas for the
+    /// same thread (canonical final form; avoids double-rendering).
     AssistantPersisted { text: String, meta: MessageMeta },
     /// Tool invocation begun. The projection opens a tool-call card
     /// keyed on `tool_call_id`.
@@ -2069,11 +2135,16 @@ pub enum Payload {
         message: String,
     },
     /// Tool invocation finished. `error` is set iff `status == "error"`.
+    /// `reason` carries optional human-readable detail for `skipped`
+    /// (deadline-skip, pre-condition unmet) and `aborted`
+    /// (user `turn/interrupt`, system cancellation) outcomes.
     ToolEnd {
         tool_call_id: String,
         status: EnvelopeToolEndStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// File attached to the current thread (e.g. `.md` report from
     /// `deep_search` or `.mp3` from `fm_tts`). The projection adds the
@@ -2084,8 +2155,10 @@ pub enum Payload {
         size_bytes: u64,
     },
     /// Hard barrier — terminal payload for a turn within `thread_id`.
-    /// Per the M9-γ ADR, no further `assistant_*` or `tool_*` payloads
-    /// are valid on this `thread_id` after this envelope.
+    /// Per the M9-γ ADR, any envelope arriving with the same
+    /// `thread_id` AFTER this one is DROPPED by the projection (and
+    /// counted in `octos_projection_post_completion_drop_total`).
+    /// Threads are not reused — a new turn must use a new `thread_id`.
     TurnCompleted { token_usage: EnvelopeTokenUsage },
 }
 
@@ -2097,10 +2170,11 @@ pub enum Payload {
 /// projection is a pure function from that log to `ChatViewModel`.
 ///
 /// Identity collapses to `seq` — the only key the projection cares
-/// about. `client_message_id` lives ONLY on user-message-rooted
-/// envelopes so the optimistic `<GhostBubble>` overlay can match its
-/// server reflection and unmount; the projection itself NEVER consults
-/// it.
+/// about. `client_message_id` is populated ONLY on
+/// [`Payload::UserMessage`] envelopes so the optimistic
+/// `<GhostBubble>` overlay can match its server reflection and unmount;
+/// the projection itself NEVER consults it. All other variants leave
+/// `client_message_id` at `None` (omitted on the wire).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     /// Multi-turn cluster identity — the chat thread this envelope
@@ -2111,10 +2185,11 @@ pub struct Envelope {
     /// Strictly monotonic; gaps are an error and trigger
     /// rehydration. Identity for the projection.
     pub seq: u64,
-    /// Present on user-message-rooted envelopes (the optimistic
-    /// `<GhostBubble>` overlay matches its server reflection here).
-    /// Absent on internal events (assistant deltas, tool events,
-    /// turn_completed). The projection MUST NOT consult this field.
+    /// Populated ONLY on [`Payload::UserMessage`] envelopes (the
+    /// optimistic `<GhostBubble>` overlay matches its server reflection
+    /// here). Absent on every other variant (assistant deltas /
+    /// persisted, tool events, file attached, turn_completed). The
+    /// projection MUST NOT consult this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     /// Tagged-union payload — see [`Payload`].
@@ -6061,23 +6136,83 @@ mod tests {
     }
 
     #[test]
-    fn golden_envelope_user_rooted_carries_client_message_id() {
-        // user-message-rooted envelopes (the FIRST assistant_delta that
-        // matches a send-click) carry the cmid so the optimistic
+    fn golden_envelope_user_message_round_trips() {
+        // user_message envelopes are the turn root — server-mirrored
+        // from the client send. They carry `client_message_id` (and
+        // ONLY they do, per UPCR-2026-014 § 14.1) so the optimistic
         // <GhostBubble> overlay can match its server reflection. The
         // projection itself MUST NOT consult the field.
         let env = Envelope {
             thread_id: "thread-1".into(),
-            seq: 2,
+            seq: 1,
             client_message_id: Some("cmid-abc".into()),
-            payload: Payload::AssistantDelta {
-                text: "Q1 answer…".into(),
+            payload: Payload::UserMessage {
+                text: "Q1 — what's 2+2?".into(),
+                files: vec![FileRef {
+                    path: "/tmp/upload.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 2048,
+                }],
             },
         };
         let value = serde_json::to_value(&env).expect("serialize");
         assert_eq!(value.get("client_message_id"), Some(&json!("cmid-abc")));
+        let payload = value.get("payload").expect("payload");
+        assert_eq!(payload.get("type"), Some(&json!("user_message")));
+        let data = payload.get("data").expect("data");
+        assert_eq!(data.get("text"), Some(&json!("Q1 — what's 2+2?")));
+        let files = data.get("files").and_then(|f| f.as_array()).expect("files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].get("path"), Some(&json!("/tmp/upload.png")));
+        assert_eq!(files[0].get("mime"), Some(&json!("image/png")));
+        assert_eq!(files[0].get("size_bytes"), Some(&json!(2048)));
         let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_user_message_omits_empty_files() {
+        // `files` is omitted on the wire when empty (matches the rest
+        // of the protocol's `Vec<_>` skip-empty convention).
+        let env = Envelope {
+            thread_id: "thread-1".into(),
+            seq: 1,
+            client_message_id: Some("cmid-1".into()),
+            payload: Payload::UserMessage {
+                text: "hi".into(),
+                files: vec![],
+            },
+        };
+        let value = serde_json::to_value(&env).expect("serialize");
+        let data = value
+            .get("payload")
+            .and_then(|p| p.get("data"))
+            .expect("data");
+        assert!(
+            data.get("files").is_none(),
+            "empty files array MUST be omitted on the wire"
+        );
+        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(parsed, env);
+    }
+
+    #[test]
+    fn golden_envelope_assistant_delta_omits_client_message_id_on_wire() {
+        // Per spec § 14.1 + Envelope doc: client_message_id is ONLY
+        // populated on user_message envelopes. Internal events
+        // (assistant_delta and friends) leave it None and the wire
+        // shape MUST omit the field entirely.
+        let env = envelope(
+            2,
+            Payload::AssistantDelta {
+                text: "Q1 answer…".into(),
+            },
+        );
+        let value = serde_json::to_value(&env).expect("serialize");
+        assert!(
+            value.get("client_message_id").is_none(),
+            "client_message_id is absent on non-user_message envelopes"
+        );
     }
 
     #[test]
@@ -6128,6 +6263,7 @@ mod tests {
                 tool_call_id: "tc-1".into(),
                 status: EnvelopeToolEndStatus::Complete,
                 error: None,
+                reason: None,
             },
         );
         let end_err = envelope(
@@ -6136,6 +6272,7 @@ mod tests {
                 tool_call_id: "tc-2".into(),
                 status: EnvelopeToolEndStatus::Error,
                 error: Some("boom".into()),
+                reason: None,
             },
         );
 
@@ -6159,13 +6296,55 @@ mod tests {
                 .and_then(|d| d.get("status")),
             Some(&json!("error"))
         );
-        // ToolEnd `error` field omitted when None.
+        // ToolEnd `error` and `reason` fields omitted when None.
         let end_ok_val = serde_json::to_value(&end_ok).expect("serialize");
         let end_ok_data = end_ok_val
             .get("payload")
             .and_then(|p| p.get("data"))
             .expect("tool_end data");
         assert!(end_ok_data.get("error").is_none());
+        assert!(end_ok_data.get("reason").is_none());
+    }
+
+    #[test]
+    fn golden_envelope_tool_end_skipped_and_aborted_round_trip() {
+        // Codex M9-γ-1 BLOCK 3: `complete | error` was too lossy. The
+        // sealed v1 union now also covers deadline-skip (`skipped`) and
+        // user/system-driven cancellation (`aborted`). Optional
+        // `reason` carries the human-readable detail.
+        let skipped = envelope(
+            10,
+            Payload::ToolEnd {
+                tool_call_id: "tc-3".into(),
+                status: EnvelopeToolEndStatus::Skipped,
+                error: None,
+                reason: Some("deadline elapsed before tool started".into()),
+            },
+        );
+        let aborted = envelope(
+            11,
+            Payload::ToolEnd {
+                tool_call_id: "tc-4".into(),
+                status: EnvelopeToolEndStatus::Aborted,
+                error: None,
+                reason: Some("user issued turn/interrupt".into()),
+            },
+        );
+        for (env, expected_status) in [(&skipped, "skipped"), (&aborted, "aborted")] {
+            let value = serde_json::to_value(env).expect("serialize");
+            let data = value
+                .get("payload")
+                .and_then(|p| p.get("data"))
+                .expect("tool_end data");
+            assert_eq!(data.get("status"), Some(&json!(expected_status)));
+            assert!(
+                data.get("reason").is_some(),
+                "reason populated for skipped/aborted"
+            );
+            assert!(data.get("error").is_none(), "error omitted when None");
+            let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
+            assert_eq!(&parsed, env);
+        }
     }
 
     #[test]

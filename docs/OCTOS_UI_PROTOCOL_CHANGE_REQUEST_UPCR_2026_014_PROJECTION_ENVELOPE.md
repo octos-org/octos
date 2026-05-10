@@ -22,9 +22,20 @@ the AppUi protocol. The web client's deterministic projection consumes
 an append-only `Vec<Envelope>` indexed by `(thread_id, seq)` and a pure
 projection function `(committed_log) → ChatViewModel` produces the
 rendered chat. Identity collapses to `seq` — the only key the projection
-cares about. `client_message_id` lives ONLY on user-message-rooted
-envelopes so the optimistic `<GhostBubble>` overlay can match its
-server reflection and unmount; the projection itself never consults it.
+cares about. `client_message_id` lives ONLY on `user_message` envelopes
+so the optimistic `<GhostBubble>` overlay can match its server
+reflection and unmount; the projection itself never consults it.
+
+The eight payload variants are: `user_message` (turn root,
+server-mirrored from the client's send), `assistant_delta` (streamed
+fragment — APPENDS in `seq` order), `assistant_persisted` (final text
+with durable `MessageMeta` — REPLACES the streamed deltas),
+`tool_start` / `tool_progress` / `tool_end` (with `complete | error |
+skipped | aborted` status and an optional `reason`), `file_attached`,
+and `turn_completed` (hard barrier — any later envelope on the same
+`thread_id` is DROPPED by the projection and counted in the
+`octos_projection_post_completion_drop_total` metric; threads are not
+reused).
 
 The change is strictly additive: no existing notification, command,
 payload, enum variant, or capability flag is modified. The legacy
@@ -69,7 +80,7 @@ Affected wire surface — strictly additive:
 - Wire envelope shape: `Envelope` (new, see § 14 of the spec)
 - Wire payload tagged union: `Payload` (new, see § 14.2 of the spec)
 - Supporting types: `MessageMeta`, `EnvelopeTokenUsage`,
-  `EnvelopeToolEndStatus`
+  `EnvelopeToolEndStatus`, `FileRef`
 
 Spec section: § 14 "M9-γ Envelope" of
 `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md`.
@@ -94,9 +105,10 @@ Required fields:
 
 Optional fields:
 
-- `client_message_id` (`string`) — Present on user-message-rooted
-  envelopes ONLY. The projection MUST NOT consult this field; it
-  exists for the optimistic overlay's match-and-unmount.
+- `client_message_id` (`string`) — Populated ONLY on `user_message`
+  envelopes. Absent on every other variant. The projection MUST NOT
+  consult this field; it exists for the optimistic overlay's
+  match-and-unmount.
 
 ### `Payload` variants
 
@@ -104,30 +116,57 @@ Wire form: `{ "type": <snake_case>, "data": <variant-specific> }`.
 Mirrors Rust `serde(tag = "type", content = "data", rename_all =
 "snake_case")`.
 
+- `user_message { text: string, files: FileRef[] }` — Turn root,
+  server-mirrored from the client's send. The carrying envelope's
+  `client_message_id` is populated here (and ONLY here). `files` is
+  omitted on the wire when empty.
 - `assistant_delta { text: string }` — One streamed text fragment.
+  APPENDS to the live bubble in `seq` order.
 - `assistant_persisted { text: string, meta: MessageMeta }` — Final
-  text + durable identity. See § 14.3 of spec.
+  text + durable identity. **REPLACES** the accumulated streamed
+  deltas for the same `thread_id` (canonical final form). See § 14.3.
 - `tool_start { tool_call_id: string, name: string }` — Tool invocation
   begun.
 - `tool_progress { tool_call_id: string, message: string }` — Tool
   progress update.
-- `tool_end { tool_call_id: string, status: "complete"|"error",
-  error?: string }` — Tool finished. `error` set iff `status ===
-  "error"`.
+- `tool_end { tool_call_id: string, status: "complete" | "error" |
+  "skipped" | "aborted", error?: string, reason?: string }` — Tool
+  finished. `error` set iff `status === "error"`. `reason` is
+  optional human-readable detail (primary use: `skipped` /
+  `aborted`).
 - `file_attached { path: string, mime: string, size_bytes: u64 }` —
-  File attached to current thread.
+  File attached to current thread. Embeds the same triple as `FileRef`.
 - `turn_completed { token_usage: EnvelopeTokenUsage }` — **Hard
-  barrier**; see § 14.5 of spec.
+  barrier**; see § 14.6 of spec.
 
 Future variants must be registered via UPCR.
 
-### Hard barrier semantics
+### Turn shape and reconciliation rule
 
-Per the M9-γ ADR and § 14.5 of the spec, the server MUST emit at most
-one `turn_completed` envelope per `(thread_id, turn)`. After it, no
-further `assistant_*` or `tool_*` payloads are valid on the same
-`thread_id` for the same turn. This is the wire-level enforcement of
-the phantom-bubble elimination that motivated M9-γ.
+- Every chat turn begins with exactly one `user_message` envelope, and
+  the projection's `UserView` is reconstructed from `user_message`
+  envelopes alone. `assistant_delta` / `assistant_persisted` cannot
+  rebuild the user side of the chat on a refresh-only projection.
+- `assistant_delta.text` events APPEND to the live bubble in strict
+  `seq` order. When an `assistant_persisted` envelope arrives for the
+  same `thread_id`, its `text` field REPLACES the accumulated
+  streamed text — the persisted form is canonical and avoids
+  double-rendering the final body.
+
+### Hard barrier semantics (drop-with-metric)
+
+Per the M9-γ ADR and § 14.6 of the spec, the server MUST emit at most
+one `turn_completed` envelope per `(thread_id, turn)`. After it:
+
+> Any envelope arriving on the same `thread_id` is DROPPED by the
+> projection (and counted in
+> `octos_projection_post_completion_drop_total`). Threads are NOT
+> reused — a new turn must use a NEW `thread_id`.
+
+The drop is silent at the projection layer. Clients do NOT rehydrate
+or treat the situation as a desync. The M9-γ-2 projection
+([`octos-web` PR #93](https://github.com/octos-org/octos-web/pull/93))
+implements the same behaviour and is the canonical reference.
 
 ### Identity model
 
@@ -174,9 +213,12 @@ Capability feature: `projection.envelope.v1`
 
 - Golden tests in `crates/octos-core/src/ui_protocol.rs::tests`:
   - `golden_envelope_assistant_delta_round_trips`
-  - `golden_envelope_user_rooted_carries_client_message_id`
+  - `golden_envelope_user_message_round_trips`
+  - `golden_envelope_user_message_omits_empty_files`
+  - `golden_envelope_assistant_delta_omits_client_message_id_on_wire`
   - `golden_envelope_assistant_persisted_round_trips`
   - `golden_envelope_tool_start_progress_end_round_trip`
+  - `golden_envelope_tool_end_skipped_and_aborted_round_trip`
   - `golden_envelope_file_attached_round_trips`
   - `golden_envelope_turn_completed_round_trips`
   - `golden_envelope_token_usage_zero_default_round_trips`
@@ -184,7 +226,9 @@ Capability feature: `projection.envelope.v1`
 
   These lock the wire shape: `serde_json` round-trip, snake_case
   discriminator presence, optional-field omission on the wire
-  (`client_message_id`, `error`, zero `token_usage` fields).
+  (`client_message_id` on non-`user_message` envelopes, `files` when
+  empty, `error`, `reason`, zero `token_usage` fields), and the
+  closed-union extension of `EnvelopeToolEndStatus` to four variants.
 
 ### Client-side
 
@@ -223,9 +267,9 @@ Each step is gated behind 7-day soak green per ADR.
 |---|---|---|
 | Wire size: each envelope is bigger than today's `message/delta` because of the `payload` wrapper | Low | The `payload` wrapper adds ~30 bytes/event vs the legacy flat shape. WS per-frame compression already in place; payload size is negligible at chat bandwidth scales. |
 | `client_message_id` leak into projection code | Medium | Spec § 14.1 + ADR explicitly forbid it. The projection's TS type narrows on `payload.type` exclusively; tests in γ-2 will assert via `grep` that the projection module never reads `client_message_id`. |
-| Hard-barrier violation on the server side | Medium | Server emitter (γ-7) emits exactly N+1 envelopes per turn; the existing turn-lifecycle plumbing already serializes terminal events. A unit test on the emitter will assert the invariant. |
+| Hard-barrier violation on the server side | Medium | Server emitter (γ-7) emits exactly N+1 envelopes per turn; the existing turn-lifecycle plumbing already serializes terminal events. A unit test on the emitter will assert the invariant. The projection itself drops post-`turn_completed` envelopes silently and counts the drop in `octos_projection_post_completion_drop_total` (see § 14.6 of the spec); operators alert on the metric rather than rehydrating clients. |
 | Forward-compat of `Payload` enum | Low | `Payload` is closed in v1 (sealed). Adding a variant is a wire contract change requiring a follow-up UPCR. Clients MUST treat unknown `type` discriminators as a desync signal and rehydrate. |
-| Cross-cancel: a cancelled turn's `turn_completed` still fires | Low | The `turn_completed` envelope IS emitted for cancelled turns (spec § 14.5). The lifecycle truth (cancelled vs completed) lives in legacy `turn/error` / `turn/interrupted` notifications until M10 unifies them. |
+| Cross-cancel: a cancelled turn's `turn_completed` still fires | Low | The `turn_completed` envelope IS emitted for cancelled turns (spec § 14.6). The lifecycle truth (cancelled vs completed) lives in legacy `turn/error` / `turn/interrupted` notifications until M10 unifies them. |
 
 ## Open Questions
 
@@ -237,9 +281,11 @@ Each step is gated behind 7-day soak green per ADR.
   the cursor index already covers.
 - Should `tool_end.status` be an open snake_case enum (matching
   `MessagePersistedSource`) or closed (matching `DiffPreviewLineKind`)?
-  **Decision**: closed for v1 — the ADR specifies exactly two
-  outcomes and a future `cancelled` variant would be a coordinated
-  contract change requiring a UPCR.
+  **Decision**: closed for v1, and codex M9-γ-1 review extended the
+  set from `complete | error` to `complete | error | skipped | aborted`
+  (with optional `reason` carrying detail) so deadline-skip and
+  user/system-driven cancellation are first-class wire states. Future
+  variants still require a follow-up UPCR.
 - Should `assistant_persisted` ALSO carry the `cursor` from the
   underlying `MessagePersistedEvent`? **Decision**: no for v1 — the
   `cursor` is for resumable replay over the existing notification
@@ -254,15 +300,19 @@ Each step is gated behind 7-day soak green per ADR.
 - [x] § 4.1 governance entry references this UPCR.
 - [x] § 5.1 documents the identity-model collapse and the legacy
       `message_id` deprecation note.
-- [x] Rust `Envelope`, `Payload`, `MessageMeta`, `EnvelopeTokenUsage`,
-      `EnvelopeToolEndStatus` land in
+- [x] Rust `Envelope`, `Payload` (with `UserMessage` variant),
+      `MessageMeta`, `EnvelopeTokenUsage`, `EnvelopeToolEndStatus`
+      (`complete | error | skipped | aborted`), and `FileRef` land in
       `crates/octos-core/src/ui_protocol.rs` with serde
       `tag = "type", content = "data", rename_all = "snake_case"`.
 - [x] TS counterparts land in
       `crates/octos-web/src/runtime/ui-protocol-types.ts` and pass
       `tsc --noEmit`.
-- [x] Eight golden round-trip tests in `octos-core::ui_protocol::tests`
-      pass (`cargo test -p octos-core`).
+- [x] Golden round-trip tests in `octos-core::ui_protocol::tests`
+      pass (`cargo test -p octos-core`), including coverage for
+      `user_message` (with and without files), `assistant_delta`
+      omitting `client_message_id`, and `tool_end` with `skipped` /
+      `aborted` status.
 - [x] Capability flag `projection.envelope.v1` registered in
       `UI_PROTOCOL_KNOWN_FEATURES`.
 - [x] No existing tests broken by the additive change (full

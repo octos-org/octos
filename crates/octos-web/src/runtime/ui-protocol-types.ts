@@ -78,8 +78,29 @@ export interface MessageMeta {
 // ── Tool end status ──────────────────────────────────────────────────────
 
 /** Status carried on `tool_end` payloads. Mirrors `EnvelopeToolEndStatus`
- *  (snake_case wire form) in the Rust types. */
-export type EnvelopeToolEndStatus = 'complete' | 'error';
+ *  (snake_case wire form) in the Rust types. Closed v1 union; future
+ *  variants require a follow-up UPCR.
+ *
+ *  - `complete` — tool ran to natural completion.
+ *  - `error` — tool surfaced a failure (`error` field carries the message).
+ *  - `skipped` — tool was intentionally not run (deadline-skip,
+ *    pre-condition unmet). The optional `reason` field on the payload
+ *    explains why.
+ *  - `aborted` — tool execution was interrupted by an external signal
+ *    (user `turn/interrupt`, system cancellation). Optional `reason`
+ *    carries detail. */
+export type EnvelopeToolEndStatus = 'complete' | 'error' | 'skipped' | 'aborted';
+
+// ── File reference ───────────────────────────────────────────────────────
+
+/** Wire-form file reference carried on `user_message` envelopes (and
+ *  reused as the canonical attachment shape elsewhere). Mirrors
+ *  `FileRef` in the Rust types. All three fields are required. */
+export interface FileRef {
+  path: string;
+  mime: string;
+  size_bytes: number;
+}
 
 // ── Payload variants (sealed tagged union) ───────────────────────────────
 //
@@ -90,6 +111,25 @@ export type EnvelopeToolEndStatus = 'complete' | 'error';
 //
 // The TS shape mirrors this exactly. Adding a new variant is a wire
 // contract change and requires a follow-up UPCR.
+
+/** User-message turn root — server-mirrored from the client's send.
+ *  Every chat turn begins with exactly one `user_message` envelope, and
+ *  the projection's `UserView` is reconstructed from these envelopes
+ *  alone (a refresh-only projection cannot recover user bubbles from
+ *  `assistant_delta` / `assistant_persisted`).
+ *
+ *  The carrying envelope populates `client_message_id` here — and ONLY
+ *  here — so the optimistic <GhostBubble> overlay can match its server
+ *  reflection and unmount. */
+interface UserMessagePayload {
+  type: 'user_message';
+  data: {
+    text: string;
+    /** Omitted on the wire when empty (matches Rust serde
+     *  `skip_serializing_if = "Vec::is_empty"`). */
+    files?: FileRef[];
+  };
+}
 
 interface AssistantDeltaPayload {
   type: 'assistant_delta';
@@ -118,6 +158,11 @@ interface ToolEndPayload {
     status: EnvelopeToolEndStatus;
     /** Set iff `status === 'error'`. Omitted on the wire when null. */
     error?: string;
+    /** Optional human-readable detail. Populated for `skipped`
+     *  (deadline-skip, pre-condition unmet) and `aborted`
+     *  (user `turn/interrupt`, system cancellation) outcomes. Omitted
+     *  on the wire when null. */
+    reason?: string;
   };
 }
 
@@ -135,6 +180,7 @@ interface TurnCompletedPayload {
  *  envelope. The discriminator is `type`; payload data lives under
  *  `data`. Variant names are snake_case to match the wire / Rust shape. */
 export type Payload =
+  | UserMessagePayload
   | AssistantDeltaPayload
   | AssistantPersistedPayload
   | ToolStartPayload
@@ -153,17 +199,31 @@ export type Payload =
  *  projection is a pure function from that log to `ChatViewModel`.
  *
  *  Identity collapses to `seq` — the only key the projection cares
- *  about. `client_message_id` lives ONLY on user-message-rooted
+ *  about. `client_message_id` is populated ONLY on `user_message`
  *  envelopes so the optimistic `<GhostBubble>` overlay can match its
  *  server reflection and unmount; the projection itself NEVER consults
- *  it. */
+ *  it. All other variants leave `client_message_id` undefined.
+ *
+ *  **Streaming reconciliation rule** (locked by spec § 14.2):
+ *  `assistant_delta.text` fragments APPEND to the live bubble in
+ *  strict `seq` order (concatenate). When an `assistant_persisted`
+ *  arrives for the same thread, its `text` field REPLACES the
+ *  accumulated streamed text — the persisted form is canonical and
+ *  avoids double-rendering the final body.
+ *
+ *  **Hard barrier** (spec § 14.6): after a `turn_completed` envelope
+ *  for `thread_id` T, any subsequent envelope with the same `thread_id`
+ *  is DROPPED by the projection (and counted in the
+ *  `octos_projection_post_completion_drop_total` metric). Threads are
+ *  NOT reused — a new turn must use a NEW `thread_id`. */
 export interface Envelope {
   thread_id: ThreadId;
   seq: Seq;
-  /** Present on user-message-rooted envelopes (the optimistic
+  /** Populated ONLY on `user_message` envelopes (the optimistic
    *  `<GhostBubble>` overlay matches its server reflection here).
-   *  Absent on internal events (assistant deltas, tool events,
-   *  turn_completed). The projection MUST NOT consult this field. */
+   *  Absent on every other variant (assistant deltas / persisted, tool
+   *  events, file attached, turn_completed). The projection MUST NOT
+   *  consult this field. */
   client_message_id?: ClientMessageId;
   payload: Payload;
 }
@@ -182,6 +242,10 @@ export const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1 = 'projection.envelope.v
 // rely on TS's discriminated-union narrowing. These helpers exist for
 // callers that need a runtime check (e.g. a debug overlay rendering a
 // raw envelope).
+
+export function isUserMessage(p: Payload): p is UserMessagePayload {
+  return p.type === 'user_message';
+}
 
 export function isAssistantDelta(p: Payload): p is AssistantDeltaPayload {
   return p.type === 'assistant_delta';
