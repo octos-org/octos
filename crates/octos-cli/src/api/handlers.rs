@@ -510,18 +510,32 @@ async fn chat_streaming(
     // unchanged — the inner channel reporter sees every event first.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let client_message_id = req.client_message_id.clone();
-    let alpha2_ledger = super::ui_protocol::event_ledger(&state).await;
-    let alpha2_turn_id = octos_core::ui_protocol::TurnId::new();
+    let alpha_ledger = super::ui_protocol::event_ledger(&state).await;
+    let alpha_turn_id = octos_core::ui_protocol::TurnId::new();
     let sse_chain: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
         Arc::new(ChannelReporter::new(tx.clone()).with_thread_id(client_message_id.clone())),
     ));
     let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
         super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
             sse_chain,
-            alpha2_ledger,
+            alpha_ledger.clone(),
             session_key.clone(),
-            alpha2_turn_id,
+            alpha_turn_id.clone(),
         ),
+    );
+
+    // M9-α-3 (issue #832, ADR PR #830): emit a `turn/started.v1`
+    // notification onto the M9 ledger BEFORE the agent loop runs. The
+    // SSE chat path's "turn started" is an implicit consequence of the
+    // Sse stream opening — there is no SSE wire frame for it. Without
+    // this bridge call a WebSocket subscriber that connects mid-turn
+    // sees no turn-start signal for the SSE-driven turn, breaking the
+    // pane-state contract every WS reducer assumes. See
+    // `ui_protocol_alpha3_bridge` for the full survey + invariants.
+    super::ui_protocol_alpha3_bridge::emit_turn_started(
+        &alpha_ledger,
+        &session_key,
+        &alpha_turn_id,
     );
 
     // Build per-request agent sharing resources with the base agent
@@ -555,6 +569,14 @@ async fn chat_streaming(
 
     // Spawn the agent task
     let user_event_tx = tx.clone();
+    // M9-α-3: capture lifecycle bridge inputs for the spawn closure.
+    // These are cloned (not moved) because the lifecycle pair must
+    // bracket the SSE turn — `turn/started` was already emitted on the
+    // outer scope above, and `turn/completed` fires from inside the
+    // spawn AFTER the terminal SSE frame (`done` or `error`) is sent.
+    let lifecycle_ledger = alpha_ledger.clone();
+    let lifecycle_session_key = session_key.clone();
+    let lifecycle_turn_id = alpha_turn_id.clone();
     tokio::spawn(async move {
         let result = request_agent
             .process_message(&message, &history, media)
@@ -766,6 +788,20 @@ async fn chat_streaming(
                 let _ = tx.send(err.to_string());
             }
         }
+        // M9-α-3: emit `turn/completed.v1` to the ledger AFTER the
+        // terminal SSE frame (`done` or `error`) is sent. Order is
+        // intentional — the SSE wire frame is what closes the SSE
+        // turn from the user's POV; the WS lifecycle envelope mirrors
+        // that close so a WebSocket subscriber sees the same
+        // before/after relationship the SSE consumer does. We emit
+        // the same envelope regardless of success/error so a
+        // mid-turn-attached WS client always sees the turn's lifecycle
+        // pair (started / completed) for SSE-driven turns.
+        super::ui_protocol_alpha3_bridge::emit_turn_completed(
+            &lifecycle_ledger,
+            &lifecycle_session_key,
+            &lifecycle_turn_id,
+        );
         // tx drops here, closing the stream
     });
 
