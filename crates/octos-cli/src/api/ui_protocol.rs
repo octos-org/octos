@@ -710,7 +710,7 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
 ///
 /// Subsequent calls return the same `Arc`, regardless of what the new
 /// caller passes — by design, the ledger is process-singleton.
-async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
+pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
     static EVENT_LEDGER: OnceLock<Arc<UiProtocolLedger>> = OnceLock::new();
     if let Some(existing) = EVENT_LEDGER.get() {
         return existing.clone();

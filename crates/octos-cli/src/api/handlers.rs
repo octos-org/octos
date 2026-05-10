@@ -499,11 +499,30 @@ async fn chat_streaming(
     // reporter so every emitted SSE payload carries `thread_id`. The
     // standalone `serve` mode shares a single chat_id across turns, but
     // each turn gets a fresh ChannelReporter scoped to its cmid.
+    //
+    // M9-α-2 (issue #831, ADR PR #830): the SSE chat path is migrating
+    // off SSE entirely (final delete in α-5/α-6). During the coexistence
+    // period, every emitted `tool_progress` event must ALSO be appended
+    // to the M9 ledger so a concurrently-connected WebSocket subscriber
+    // for the same `SessionKey` receives it. The web reducer dedupes by
+    // `(tool_call_id, message)` so a client connected to both transports
+    // collapses duplicates into a single store entry. SSE delivery is
+    // unchanged — the inner channel reporter sees every event first.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let client_message_id = req.client_message_id.clone();
-    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
+    let alpha2_ledger = super::ui_protocol::event_ledger(&state).await;
+    let alpha2_turn_id = octos_core::ui_protocol::TurnId::new();
+    let sse_chain: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
         Arc::new(ChannelReporter::new(tx.clone()).with_thread_id(client_message_id.clone())),
     ));
+    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
+        super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
+            sse_chain,
+            alpha2_ledger,
+            session_key.clone(),
+            alpha2_turn_id,
+        ),
+    );
 
     // Build per-request agent sharing resources with the base agent
     let mut request_agent = Agent::new_shared(
