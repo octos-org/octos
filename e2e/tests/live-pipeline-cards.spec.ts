@@ -32,59 +32,25 @@ const PROFILE = process.env.OCTOS_PROFILE || 'dspfac';
 
 test.setTimeout(180_000);
 
-interface SseEvent {
-  type: string;
-  [key: string]: unknown;
-}
+import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
 
-async function chatSSE(message: string, sessionId: string, maxWait = 150_000) {
-  const resp = await fetch(`${BASE}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${TOKEN}`,
-      'X-Profile-Id': PROFILE,
-    },
-    body: JSON.stringify({ message, session_id: sessionId, stream: true }),
+type SseEvent = ChatWsEvent;
+
+/**
+ * M9-α-7 (#836): chat helper now drives the M9 WebSocket UI Protocol.
+ * The whole describe block below is currently `.skip`'d (run_pipeline is
+ * spawn_only post-#688) but we still migrate the helper so the file does
+ * not depend on `/api/chat` once SSE is deleted in α-5/α-6.
+ */
+async function chatViaWs(message: string, sessionId: string, maxWait = 150_000): Promise<SseEvent[]> {
+  const { events } = await chatWS({
+    baseUrl: BASE,
+    token: TOKEN,
+    profileId: PROFILE,
+    message,
+    sessionId,
+    maxWait,
   });
-  expect(resp.ok, `chat POST status: ${resp.status}`).toBeTruthy();
-  if (!resp.body) throw new Error('empty response body');
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const events: SseEvent[] = [];
-  const start = Date.now();
-  try {
-    while (Date.now() - start < maxWait) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx = buffer.indexOf('\n\n');
-      while (idx >= 0) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        idx = buffer.indexOf('\n\n');
-        const dataLines = block
-          .split('\n')
-          .filter((l) => l.startsWith('data:'))
-          .map((l) => l.slice(5).trim())
-          .filter(Boolean);
-        for (const line of dataLines) {
-          try {
-            const evt = JSON.parse(line) as SseEvent;
-            events.push(evt);
-            if (evt.type === 'done' || evt.type === 'error') {
-              return events;
-            }
-          } catch {
-            // skip non-JSON keepalive lines
-          }
-        }
-      }
-    }
-  } finally {
-    try { reader.releaseLock(); } catch { /* ignore */ }
-  }
   return events;
 }
 
@@ -111,7 +77,7 @@ test.describe.skip('W1.G1 — pipeline node card SSE invariants', () => {
       'summary [handler="codergen", prompt="Summarise the topics in two sentences.", tools=""] ' +
       'plan -> summary }';
 
-    const events = await chatSSE(prompt, sessionId);
+    const events = await chatViaWs(prompt, sessionId);
 
     const progressEvents = events.filter(
       (e) => e.type === 'tool_progress' && e.tool === 'run_pipeline',

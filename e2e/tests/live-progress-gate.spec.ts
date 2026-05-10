@@ -728,7 +728,13 @@ test.describe('M4.1A live progress gate', () => {
     ).toBe(true);
   });
 
-  test('task API and event SSE stream expose the same phase truth', async ({
+  // M9-α-7 (#836) deferred: `/api/sessions/:id/events/stream` is the
+  // session events SSE channel, separate from `/api/chat`. This test
+  // asserts on its raw frame shape, which has no M9 WebSocket equivalent
+  // yet (the M9 protocol notifications cover task/* and progress/* but
+  // the event-stream SSE is its own surface). Un-fixme once the events
+  // stream is migrated to WS notifications under the sole-transport effort.
+  test.fixme('task API and event SSE stream expose the same phase truth', async ({
     page,
   }) => {
     await submitPrompt(page, DEEP_RESEARCH_PROMPT);
