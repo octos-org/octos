@@ -1080,6 +1080,36 @@ pub struct TurnStartParams {
     pub session_id: SessionKey,
     pub turn_id: TurnId,
     pub input: Vec<InputItem>,
+    /// UPCR-2026-015 (M9-β-1): pre-uploaded media references the user
+    /// attached to this send. Each entry mirrors the `FileRef` shape
+    /// already used on `Payload::UserMessage` envelopes (γ-1, PR #848)
+    /// — `path` is the durable filesystem handle returned from
+    /// `POST /api/upload`; `mime` and `size_bytes` are populated at
+    /// upload time. Empty / absent on text-only sends.
+    ///
+    /// **Wire**: serialised as `media: [...]` (omitted entirely when
+    /// empty). The legacy SSE `chatSSE()` path carried the same shape
+    /// in its body before α-5/α-6 deleted that transport; this field
+    /// restores attachment delivery on the WS path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<FileRef>,
+    /// UPCR-2026-015 (M9-β-1): optional sub-topic suffix that scopes
+    /// this send to a per-topic session bucket (`<session>#<topic>`
+    /// shape). Mirrors the legacy SSE `topic` query/body field. The
+    /// server folds this into the resolved `SessionKey` before
+    /// validating scope and looking up history. Empty / absent for
+    /// the default-topic case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// UPCR-2026-015 (M9-β-1): when set, the server treats this turn
+    /// as a rewrite of an existing queued user message identified by
+    /// its `client_message_id` rather than appending a new turn. Used
+    /// by the SPA's `/queue` slash-command flow where the user edits a
+    /// queued prompt before it dispatches. The legacy SSE path
+    /// supported the same field; β-1 restores it on the WS shape.
+    /// Absent on regular sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_for: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4050,6 +4080,9 @@ mod tests {
             input: vec![InputItem::Text {
                 text: "hello".into(),
             }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         })
         .into_rpc_request("req-turn-start")
         .expect("serialize turn/start");
@@ -4515,6 +4548,9 @@ mod tests {
             input: vec![InputItem::Text {
                 text: "hello".into(),
             }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         });
 
         let request = command
@@ -4531,11 +4567,195 @@ mod tests {
         assert_eq!(wire["params"]["session_id"], json!("local:demo"));
         assert_eq!(wire["params"]["input"][0]["kind"], json!("text"));
         assert!(wire["params"].get("kind").is_none());
+        // UPCR-2026-015 (M9-β-1): the three new optional fields are
+        // ABSENT on the wire when at their default (empty / None).
+        // This locks the back-compat shape — pre-β-1 servers and
+        // clients see exactly the bytes they used to.
+        assert!(
+            wire["params"].get("media").is_none(),
+            "empty media MUST be omitted on the wire"
+        );
+        assert!(
+            wire["params"].get("topic").is_none(),
+            "absent topic MUST be omitted on the wire"
+        );
+        assert!(
+            wire["params"].get("rewrite_for").is_none(),
+            "absent rewrite_for MUST be omitted on the wire"
+        );
 
         let decoded_request: RpcRequest<Value> =
             serde_json::from_value(wire).expect("deserialize request");
         let decoded = UiCommand::from_rpc_request(decoded_request).expect("parse request params");
 
+        assert_eq!(decoded, command);
+    }
+
+    /// UPCR-2026-015 (M9-β-1): a `turn/start` carrying media references
+    /// round-trips bit-for-bit. The `FileRef` shape mirrors
+    /// `Payload::UserMessage.files` (γ-1 PR #848 / UPCR-2026-014).
+    #[test]
+    fn turn_start_round_trips_with_media_field() {
+        let command = UiCommand::TurnStart(TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId(Uuid::from_u128(2)),
+            input: vec![InputItem::Text {
+                text: "look at this".into(),
+            }],
+            media: vec![
+                FileRef {
+                    path: "/tmp/upload-1.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 4096,
+                },
+                FileRef {
+                    path: "/tmp/voice.mp3".into(),
+                    mime: "audio/mpeg".into(),
+                    size_bytes: 32_768,
+                },
+            ],
+            topic: None,
+            rewrite_for: None,
+        });
+
+        let wire = serde_json::to_value(
+            command
+                .clone()
+                .into_rpc_request("req-media")
+                .expect("serialize"),
+        )
+        .expect("to_value");
+
+        let media = wire["params"]
+            .get("media")
+            .and_then(|v| v.as_array())
+            .expect("media array on the wire");
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0].get("path"), Some(&json!("/tmp/upload-1.png")));
+        assert_eq!(media[0].get("mime"), Some(&json!("image/png")));
+        assert_eq!(media[0].get("size_bytes"), Some(&json!(4096)));
+        assert_eq!(media[1].get("path"), Some(&json!("/tmp/voice.mp3")));
+
+        let decoded_request: RpcRequest<Value> = serde_json::from_value(wire).expect("deserialize");
+        let decoded = UiCommand::from_rpc_request(decoded_request).expect("parse");
+        assert_eq!(decoded, command);
+    }
+
+    /// UPCR-2026-015 (M9-β-1): `topic` field surfaces as a flat string
+    /// on the wire (parallel to `task/list.topic`). The server folds
+    /// it into the resolved `SessionKey` before scope validation.
+    #[test]
+    fn turn_start_round_trips_with_topic_field() {
+        let command = UiCommand::TurnStart(TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId(Uuid::from_u128(3)),
+            input: vec![InputItem::Text {
+                text: "build me a deck".into(),
+            }],
+            media: Vec::new(),
+            topic: Some("slides".into()),
+            rewrite_for: None,
+        });
+
+        let wire = serde_json::to_value(
+            command
+                .clone()
+                .into_rpc_request("req-topic")
+                .expect("serialize"),
+        )
+        .expect("to_value");
+
+        assert_eq!(wire["params"]["topic"], json!("slides"));
+        assert!(
+            wire["params"].get("media").is_none(),
+            "empty media stays omitted"
+        );
+        assert!(
+            wire["params"].get("rewrite_for").is_none(),
+            "absent rewrite_for stays omitted"
+        );
+
+        let decoded_request: RpcRequest<Value> = serde_json::from_value(wire).expect("deserialize");
+        let decoded = UiCommand::from_rpc_request(decoded_request).expect("parse");
+        assert_eq!(decoded, command);
+    }
+
+    /// UPCR-2026-015 (M9-β-1): `rewrite_for` carries the
+    /// `client_message_id` of an existing queued user message that
+    /// this turn replaces in place (the `/queue` slash-command flow).
+    #[test]
+    fn turn_start_round_trips_with_rewrite_for_field() {
+        let command = UiCommand::TurnStart(TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId(Uuid::from_u128(4)),
+            input: vec![InputItem::Text {
+                text: "edited prompt".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: Some("cmid-queued-original".into()),
+        });
+
+        let wire = serde_json::to_value(
+            command
+                .clone()
+                .into_rpc_request("req-rewrite")
+                .expect("serialize"),
+        )
+        .expect("to_value");
+
+        assert_eq!(wire["params"]["rewrite_for"], json!("cmid-queued-original"));
+        assert!(
+            wire["params"].get("media").is_none(),
+            "empty media stays omitted"
+        );
+        assert!(
+            wire["params"].get("topic").is_none(),
+            "absent topic stays omitted"
+        );
+
+        let decoded_request: RpcRequest<Value> = serde_json::from_value(wire).expect("deserialize");
+        let decoded = UiCommand::from_rpc_request(decoded_request).expect("parse");
+        assert_eq!(decoded, command);
+    }
+
+    /// UPCR-2026-015 (M9-β-1): the three β-1 fields can co-exist on
+    /// one envelope (e.g. a `/queue` rewrite that swaps in new media
+    /// and lands under a topic-scoped session). All three round-trip
+    /// together.
+    #[test]
+    fn turn_start_round_trips_with_all_beta1_fields() {
+        let command = UiCommand::TurnStart(TurnStartParams {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: TurnId(Uuid::from_u128(5)),
+            input: vec![InputItem::Text {
+                text: "redo with this image".into(),
+            }],
+            media: vec![FileRef {
+                path: "/tmp/replacement.png".into(),
+                mime: "image/png".into(),
+                size_bytes: 8192,
+            }],
+            topic: Some("research".into()),
+            rewrite_for: Some("cmid-original".into()),
+        });
+
+        let wire = serde_json::to_value(
+            command
+                .clone()
+                .into_rpc_request("req-all")
+                .expect("serialize"),
+        )
+        .expect("to_value");
+
+        assert_eq!(wire["params"]["topic"], json!("research"));
+        assert_eq!(wire["params"]["rewrite_for"], json!("cmid-original"));
+        let media = wire["params"]["media"].as_array().expect("media");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["path"], json!("/tmp/replacement.png"));
+
+        let decoded_request: RpcRequest<Value> = serde_json::from_value(wire).expect("deserialize");
+        let decoded = UiCommand::from_rpc_request(decoded_request).expect("parse");
         assert_eq!(decoded, command);
     }
 
