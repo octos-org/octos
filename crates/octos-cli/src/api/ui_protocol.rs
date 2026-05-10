@@ -25,7 +25,8 @@ use octos_core::ui_protocol::{
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, HydratedMessage, HydratedTurn, InputItem,
     MessageDeltaEvent, MessagePersistedEvent, MessagePersistedSource, OutputCursor,
-    ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    PermissionProfileListParams, PermissionProfileSetParams, ReplayLossyEvent, RpcError,
+    RpcErrorResponse, RpcRequest, RpcResponse,
     SESSION_HYDRATE_INCLUDE_MAX, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
     SessionOpenResult, SessionOpened, TaskCancelParams, TaskCancelResult, TaskListEntry,
     TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
@@ -61,6 +62,7 @@ use super::ui_protocol_ledger::{
     ConnectionId, LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
     spawn_eviction_task,
 };
+use super::ui_protocol_permission_profile::PermissionProfileStore;
 use super::ui_protocol_progress::{
     ProgressMappingContext, UiProgressMapping, background_task_to_progress_json, map_progress_json,
 };
@@ -338,6 +340,13 @@ struct UiProtocolContractStores {
     /// `<data_dir>/audit/approvals-<epoch>.log`; subsequent decisions reuse
     /// the same writer.
     audit: OnceLock<Arc<ApprovalsAuditLog>>,
+    /// Per-session permission profile selection store. M9-β-2: backs
+    /// `permission/profile/list` and `permission/profile/set` (see
+    /// `ui_protocol_permission_profile.rs`). RAM-only by design — a
+    /// daemon restart resets every session's selection to the safe
+    /// default rather than silently outliving the server it was chosen
+    /// against.
+    permission_profiles: PermissionProfileStore,
 }
 
 impl UiProtocolContractStores {
@@ -1624,18 +1633,11 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
-            UiCommand::PermissionProfileList(_) | UiCommand::PermissionProfileSet(_) => {
-                // `permission/profile/*` RPCs are declared in the core
-                // protocol type registry but not yet wired in the v1
-                // server slice. Reply with `method_not_supported` so
-                // clients negotiate around them rather than hang.
-                let _ = send_rpc_error(
-                    &ws,
-                    Some(id),
-                    RpcError::method_not_supported(
-                        "permission/profile/* not yet implemented in server",
-                    ),
-                );
+            UiCommand::PermissionProfileList(params) => {
+                handle_permission_profile_list(&ws, &contracts.permission_profiles, id, params);
+            }
+            UiCommand::PermissionProfileSet(params) => {
+                handle_permission_profile_set(&ws, &contracts.permission_profiles, id, params);
             }
         }
     }
@@ -3146,6 +3148,65 @@ async fn handle_approval_scopes_list(
                 Some(id),
                 RpcError::internal_error(format!(
                     "failed to serialize approval/scopes/list result: {error}"
+                )),
+            );
+        }
+    }
+}
+
+/// M9-β-2: handler for `permission/profile/list`.
+///
+/// Looks up the session's stored selection (or the safe default if none)
+/// and returns it alongside the canonical preset list. Pure read — no
+/// scope/permission gating beyond the standard wire-shape validation
+/// the caller already performed via `route_rpc_command`. See
+/// `ui_protocol_permission_profile.rs` for the storage contract.
+fn handle_permission_profile_list(
+    ws: &WsConnection,
+    store: &PermissionProfileStore,
+    id: String,
+    params: PermissionProfileListParams,
+) {
+    let result = super::ui_protocol_permission_profile::handle_list(store, params);
+    match serde_json::to_value(result) {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, result);
+        }
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!(
+                    "failed to serialize permission/profile/list result: {error}"
+                )),
+            );
+        }
+    }
+}
+
+/// M9-β-2: handler for `permission/profile/set`.
+///
+/// Applies the partial `update` to the session's stored selection and
+/// reports the post-update value plus an `applied` flag (`true` when
+/// the value actually changed; `false` for idempotent retries). The
+/// store is RAM-only — see `ui_protocol_permission_profile.rs`.
+fn handle_permission_profile_set(
+    ws: &WsConnection,
+    store: &PermissionProfileStore,
+    id: String,
+    params: PermissionProfileSetParams,
+) {
+    let result = super::ui_protocol_permission_profile::handle_set(store, params);
+    match serde_json::to_value(result) {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, result);
+        }
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!(
+                    "failed to serialize permission/profile/set result: {error}"
                 )),
             );
         }

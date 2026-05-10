@@ -28,6 +28,7 @@ mod ui_protocol_approvals;
 mod ui_protocol_audit;
 mod ui_protocol_diff;
 mod ui_protocol_ledger;
+mod ui_protocol_permission_profile;
 pub(crate) mod ui_protocol_progress;
 mod ui_protocol_sanitize;
 mod ui_protocol_scope;
