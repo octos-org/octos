@@ -29,6 +29,7 @@
 
 import { test, expect } from '@playwright/test';
 import { execSync } from 'node:child_process';
+import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
 
 const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.bot.ominix.io';
 const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
@@ -61,10 +62,7 @@ const REMOTE_DATA_DIR = `~/.octos/profiles/${PROFILE}/data`;
 
 test.setTimeout(900_000);
 
-interface SseEvent {
-  type: string;
-  [key: string]: unknown;
-}
+type SseEvent = ChatWsEvent;
 
 interface BackgroundTaskRow {
   id?: string;
@@ -83,64 +81,24 @@ interface BackgroundTaskRow {
   updated_at?: string;
 }
 
-async function chatSSE(
+/**
+ * M9-α-7 (#836): chat helper now drives the M9 WebSocket UI Protocol.
+ * Returns the same `{ events, content, doneEvent }` shape the SSE helper
+ * exposed so call sites stay unchanged.
+ */
+async function chatViaWs(
   message: string,
   sessionId: string,
   maxWait = 60_000,
 ): Promise<{ events: SseEvent[]; content: string; doneEvent?: SseEvent }> {
-  const resp = await fetch(`${BASE}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${TOKEN}`,
-      'X-Profile-Id': PROFILE,
-    },
-    body: JSON.stringify({ message, session_id: sessionId, stream: true }),
+  return chatWS({
+    baseUrl: BASE,
+    token: TOKEN,
+    profileId: PROFILE,
+    message,
+    sessionId,
+    maxWait,
   });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    if (resp.status === 502 || resp.status === 504) {
-      return { events: [], content: body || '(proxy timeout)' };
-    }
-    throw new Error(`Chat failed: ${resp.status} ${body.slice(0, 200)}`);
-  }
-  if (!resp.body) return { events: [], content: '' };
-  const events: SseEvent[] = [];
-  let content = '';
-  let doneEvent: SseEvent | undefined;
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const start = Date.now();
-  try {
-    while (Date.now() - start < maxWait) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop()!;
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const event: SseEvent = JSON.parse(data);
-          events.push(event);
-          if (event.type === 'replace' && typeof event.text === 'string') content = event.text;
-          if (event.type === 'done') {
-            doneEvent = event;
-            if (typeof event.content === 'string' && event.content) content = event.content;
-            return { events, content, doneEvent };
-          }
-        } catch {
-          /* skip malformed */
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return { events, content, doneEvent };
 }
 
 async function getMessages(sessionId: string): Promise<unknown[]> {
@@ -221,12 +179,12 @@ test.describe('M8 spawn end-to-end (slides)', () => {
     const slug = `m8-spawn-slides-${Date.now().toString(36)}`;
     const sid = `m8-spawn-slides-sid-${Date.now()}`;
 
-    await chatSSE(`/new slides ${slug}`, sid, 90_000);
+    await chatViaWs(`/new slides ${slug}`, sid, 90_000);
     const designPrompt =
       'Design a 2-slide deck about M8 runtime parity. Slide 1 cover, slide 2 ' +
       'one-bullet summary. Use style nb-pro. Show outline only, do not generate yet.';
-    await chatSSE(designPrompt, sid, 120_000);
-    const { doneEvent, events } = await chatSSE('go', sid, 600_000);
+    await chatViaWs(designPrompt, sid, 120_000);
+    const { doneEvent, events } = await chatViaWs('go', sid, 600_000);
     expect(doneEvent).toBeTruthy();
 
     // Find the spawn-driven mofa_slides task from the events stream.
@@ -282,9 +240,9 @@ test.describe('M8 spawn end-to-end (slides)', () => {
     const slug = `m8-spawn-cancel-${Date.now().toString(36)}`;
     const sid = `m8-spawn-cancel-sid-${Date.now()}`;
 
-    await chatSSE(`/new slides ${slug}`, sid, 60_000);
+    await chatViaWs(`/new slides ${slug}`, sid, 60_000);
     // Kick off generation; do not wait for done.
-    const longGen = chatSSE(
+    const longGen = chatViaWs(
       'Design and generate a 12-slide deck about every public agentic-AI ' +
         'system from 2018 to 2026. Use nb-pro. Generate now.',
       sid,
@@ -372,7 +330,7 @@ test.describe('M8 spawn end-to-end (slides)', () => {
       `直接调用 fm_tts，把 voice 参数精确设为 ` +
       `definitely_not_a_real_voice_${Date.now().toString(36)}，` +
       `文本只说：m8 恢复测试。不要先检查声音，也不要解释。`;
-    const { doneEvent } = await chatSSE(prompt, sid, 120_000);
+    const { doneEvent } = await chatViaWs(prompt, sid, 120_000);
     expect(doneEvent).toBeTruthy();
 
     // Wait for the recovery prompt to land as a system-internal user message
@@ -428,7 +386,7 @@ test.describe('M8 spawn end-to-end (slides)', () => {
     const prompt =
       `直接调用 fm_tts，把 voice 参数精确设为 vivian，` +
       `文本只说：m8 路由测试。不要先检查声音，也不要解释。`;
-    const { doneEvent } = await chatSSE(prompt, sid, 90_000);
+    const { doneEvent } = await chatViaWs(prompt, sid, 90_000);
     expect(doneEvent, 'expected SSE done').toBeTruthy();
 
     let foundPath = '';
