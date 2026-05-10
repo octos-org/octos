@@ -24,6 +24,7 @@
 
 import { test, expect } from '@playwright/test';
 import { execSync } from 'node:child_process';
+import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
 
 const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.ocean.ominix.io';
 const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'e2e-test-2026';
@@ -58,69 +59,26 @@ const SSH_HOST =
   })();
 const REMOTE_DATA_DIR = `~/.octos/profiles/${PROFILE}/data`;
 
-interface SseEvent {
-  type: string;
-  [key: string]: unknown;
-}
+type SseEvent = ChatWsEvent;
 
-/** Minimal SSE chat helper, mirrored from runtime-regression.spec.ts. */
-async function chatSSE(
+/**
+ * M9-α-7 (#836): chat helper now drives the M9 WebSocket UI Protocol.
+ * Returns the same `{ events, content, doneEvent }` shape the SSE helper
+ * used so call sites stay unchanged.
+ */
+async function chatViaWs(
   message: string,
   sessionId: string,
   maxWait = 60_000,
 ): Promise<{ events: SseEvent[]; content: string; doneEvent?: SseEvent }> {
-  const resp = await fetch(`${BASE}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${TOKEN}`,
-      'X-Profile-Id': PROFILE,
-    },
-    body: JSON.stringify({ message, session_id: sessionId, stream: true }),
+  return chatWS({
+    baseUrl: BASE,
+    token: TOKEN,
+    profileId: PROFILE,
+    message,
+    sessionId,
+    maxWait,
   });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    if (resp.status === 502 || resp.status === 504) {
-      return { events: [], content: body || '(proxy timeout)' };
-    }
-    throw new Error(`Chat failed: ${resp.status} ${body.slice(0, 200)}`);
-  }
-  if (!resp.body) return { events: [], content: '' };
-
-  const events: SseEvent[] = [];
-  let content = '';
-  let doneEvent: SseEvent | undefined;
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const start = Date.now();
-  try {
-    while (Date.now() - start < maxWait) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop()!;
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const event: SseEvent = JSON.parse(data);
-          events.push(event);
-          if (event.type === 'replace' && typeof event.text === 'string') content = event.text;
-          if (event.type === 'done') {
-            doneEvent = event;
-            if (typeof event.content === 'string' && event.content) content = event.content;
-            return { events, content, doneEvent };
-          }
-        } catch { /* skip malformed */ }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return { events, content, doneEvent };
 }
 
 async function getMessages(sessionId: string): Promise<any[]> {
@@ -170,7 +128,7 @@ test.describe('M8.4 FileStateCache short-circuit', () => {
     // (e.g. bot's ~40 active tools) the first turn pays for the entire LLM
     // tool-spec inventory, so the 45s cap previously misfired here despite
     // FileStateCache wiring being correct end-to-end.
-    const probe = await chatSSE(
+    const probe = await chatViaWs(
       'List up to 10 files in your current working directory using the list_dir tool. Return only the names.',
       sid,
       90_000,
@@ -210,7 +168,7 @@ test.describe('M8.4 FileStateCache short-circuit', () => {
     ].join(' ');
 
     const t0 = Date.now();
-    const { content, doneEvent } = await chatSSE(prompt, sid, 90_000);
+    const { content, doneEvent } = await chatViaWs(prompt, sid, 90_000);
     const elapsed = Date.now() - t0;
 
     expect(doneEvent, 'expected SSE done').toBeTruthy();
@@ -274,7 +232,7 @@ test.describe('M8.6 Resume sanitizer worktree-missing refusal', () => {
     // 1. Trigger something that materialises a workspace under the
     //    user-session dir. A shell write_file is the cheapest way.
     const sentinel = `m8-6-${Date.now().toString(36)}.txt`;
-    const create = await chatSSE(
+    const create = await chatViaWs(
       `Use the write_file tool to write the file ./${sentinel} with the contents "marker". Then describe what you did.`,
       sid,
       60_000,
@@ -358,7 +316,7 @@ test.describe('M8.6 Resume sanitizer worktree-missing refusal', () => {
       // denies `rm -rf`, so we use `find -delete` (allowed) and pin the
       // path to one that contains the session id (defensive).
       const evictSid = `m8-6-evict-${Date.now()}`;
-      await chatSSE(
+      await chatViaWs(
         `Use the shell tool to run exactly: find ${wsRel} -mindepth 1 -delete && rmdir ${wsRel} && echo CONFIRMED_GONE`,
         evictSid,
         45_000,
@@ -382,7 +340,7 @@ test.describe('M8.6 Resume sanitizer worktree-missing refusal', () => {
     }
 
     // 4. Send a follow-up that depends on the workspace.
-    const followup = await chatSSE(
+    const followup = await chatViaWs(
       `Use read_file to read ./${sentinel} and tell me its contents.`,
       sid,
       60_000,
@@ -444,9 +402,11 @@ test.describe('M8.7 SubAgentOutputRouter on-disk write', () => {
       `直接调用 fm_tts，把 voice 参数精确设为 yangmi（不要使用 clone:yangmi 或任何 clone: 前缀），` +
       `文本只说：m8七路由测试。不要先检查声音，也不要解释。`;
     const t0 = Date.now();
-    const { doneEvent } = await chatSSE(prompt, sid, 90_000);
-    expect(doneEvent, 'expected SSE done event').toBeTruthy();
-    expect((doneEvent as any).has_bg_tasks).toBe(true);
+    const { doneEvent } = await chatViaWs(prompt, sid, 90_000);
+    expect(doneEvent, 'expected WS turn/completed terminal').toBeTruthy();
+    // Deferred (γ-3): WS `turn/completed` does not yet carry `has_bg_tasks`.
+    // The disk-side router check below remains the authoritative invariant.
+    // expect((doneEvent as any).has_bg_tasks).toBe(true);
 
     // Wait for the spawn to actually fire. The router seeds a startup line
     // synchronously, so the file appears within a few seconds.
@@ -502,7 +462,7 @@ test.describe('M8.9 Runtime failure recovery', () => {
     const prompt =
       `直接调用 fm_tts，把 voice 参数精确设为 definitely_not_a_real_voice_2026，` +
       `文本只说：m8九恢复测试。不要先检查声音，也不要解释。`;
-    const { doneEvent } = await chatSSE(prompt, sid, 90_000);
+    const { doneEvent } = await chatViaWs(prompt, sid, 90_000);
     expect(doneEvent).toBeTruthy();
 
     // Wait up to ~90s for the spawn to terminate and the failure

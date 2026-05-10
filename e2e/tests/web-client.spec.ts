@@ -1,24 +1,26 @@
 /**
- * Web client tests for SSE streaming, UTF-8 handling, and file delivery.
+ * Web client tests for chat streaming, UTF-8 handling, and file delivery.
  *
- * Tests the gateway API channel (POST /chat → SSE response) which is
- * used by the octos-web chat client.
+ * M9-α-7 (#836): rewritten to drive the chat turn through the M9 WebSocket
+ * UI Protocol via `chatWS()` instead of the legacy `/api/chat` SSE endpoint.
+ * The original SSE assertions on UTF-8 byte integrity are preserved by
+ * inspecting the cumulative `content` produced from `message/delta`
+ * notifications — the JSON-RPC frame layer carries text losslessly so any
+ * encoding bug regressing in the LLM provider chain still surfaces.
  *
  * Run against a live octos-serve instance:
  *   OCTOS_TEST_URL=http://localhost:3000 npx playwright test web-client
- *
- * These tests target the dspfac profile's API channel, proxied through
- * the dashboard at /api/admin/profiles/{id}/proxy/chat.
  */
 import { test, expect } from '@playwright/test';
+import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
 
 test.setTimeout(240_000);
 
-/**
- * Auth token (optional). If not set, tests use the profile subdomain
- * (e.g. dspfac.crew.ominix.io) where Caddy injects X-Profile-Id.
- */
-const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || '';
+const AUTH_TOKEN =
+  process.env.OCTOS_AUTH_TOKEN ||
+  process.env.OCTOS_LIVE_TOKEN ||
+  process.env.OCTOS_TEST_TOKEN ||
+  '';
 
 function headers() {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -26,98 +28,22 @@ function headers() {
   return h;
 }
 
-/**
- * POST /chat and collect all SSE events until the stream closes.
- * Returns parsed JSON events.
- *
- * The /api/chat endpoint accepts a message and returns an SSE stream.
- * Profile is resolved from X-Profile-Id header or auth token.
- */
-async function chatSSE(
-  _request: any,
+async function chatViaWs(
   baseURL: string,
   message: string,
   sessionId?: string,
   timeoutMs = 120_000,
-): Promise<{ events: any[]; raw: string }> {
-  const sid = sessionId || `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-  // Use a real streaming reader for SSE. Playwright's request.post buffers the
-  // full body and can time out on longer streams before the server closes it.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const res = await fetch(`${baseURL}/api/chat`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({
-        message,
-        session_id: attempt === 0 ? sid : `${sid}-r`,
-        stream: true,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      clearTimeout(timeout);
-      const body = await res.text().catch(() => '');
-      throw new Error(`chat failed: ${res.status} ${body.slice(0, 200)}`);
-    }
-
-    if (!res.body) {
-      clearTimeout(timeout);
-      if (attempt === 1) {
-        return { events: [], raw: '' };
-      }
-      continue;
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let raw = '';
-    let buffer = '';
-    const events: any[] = [];
-    let sawDone = false;
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        raw += chunk;
-        buffer += chunk;
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const json = trimmed.slice(5).trim();
-          if (!json || json === '[DONE]') continue;
-          try {
-            const event = JSON.parse(json);
-            events.push(event);
-            if (event?.type === 'done') {
-              sawDone = true;
-              return { events, raw };
-            }
-          } catch {
-            // skip non-JSON lines
-          }
-        }
-      }
-    } finally {
-      clearTimeout(timeout);
-      reader.releaseLock();
-    }
-
-    if (sawDone || events.length > 0 || attempt === 1) {
-      return { events, raw };
-    }
-    // Empty response — wait briefly and retry with fresh session
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-
-  return { events: [], raw: '' };
+): Promise<{ events: ChatWsEvent[]; content: string; doneEvent?: ChatWsEvent }> {
+  const sid =
+    sessionId ||
+    `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return chatWS({
+    baseUrl: baseURL,
+    token: AUTH_TOKEN,
+    message,
+    sessionId: sid,
+    maxWait: timeoutMs,
+  });
 }
 
 async function getSessionMessages(
@@ -140,121 +66,113 @@ async function getSessionMessages(
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: SSE stream returns valid UTF-8 for CJK characters
+// Test 1: WS chat preserves UTF-8 for CJK characters
 //
-// Bug: SSE parser used String::from_utf8_lossy on each HTTP chunk.
-// Multi-byte CJK characters split across chunks became U+FFFD (�).
-// Fix: f4b27b9 — byte-buffer SSE parser.
+// Historical bug (SSE-era): the SSE parser used String::from_utf8_lossy on
+// each HTTP chunk and multi-byte CJK split across chunks became U+FFFD.
+// Fix: f4b27b9 (byte-buffer SSE parser). The chat path now runs over
+// JSON-RPC frames on WebSocket, so this regression is structurally
+// impossible at the transport layer; we keep an equivalent assertion
+// against the cumulative `content` string so any *upstream* (LLM provider)
+// regression would still surface.
 // ---------------------------------------------------------------------------
-test('SSE response preserves CJK characters without corruption', async ({
-  request,
+test('WS chat preserves CJK characters without corruption', async ({
   baseURL,
 }) => {
 
-  const { events, raw } = await chatSSE(
-    request,
+  const { events, content } = await chatViaWs(
     baseURL!,
     '用中文回复：你好世界。只回复这四个字，不要多说。',
   );
 
-  // The raw SSE response should not contain U+FFFD replacement characters
-  expect(raw).not.toContain('\uFFFD');
-  expect(raw).not.toContain('�');
+  // The synthesized chat content should be free of replacement characters.
+  expect(content).not.toContain('�');
 
   // Should have received at least some events
   expect(events.length).toBeGreaterThan(0);
 
   // Check all text-bearing events for CJK content
   const allContent = events
-    .map((e) => e.text || e.content || '')
+    .map((e) =>
+      (typeof e.text === 'string' ? e.text : '') ||
+      (typeof e.content === 'string' ? e.content : ''),
+    )
     .join('');
-  expect(allContent).toMatch(/[\u4e00-\u9fff]/); // Contains CJK characters
+  expect(allContent).toMatch(/[一-鿿]/); // Contains CJK characters
 });
 
 // ---------------------------------------------------------------------------
-// Test 2: SSE stream handles multi-byte characters in longer responses
+// Test 2: WS chat handles multi-byte characters in longer responses
 //
-// Longer responses are more likely to trigger chunk-boundary splits.
+// Longer responses surface chunk-boundary handling bugs. Same protective
+// assertion as test 1, scaled up.
 // ---------------------------------------------------------------------------
-test('SSE handles long CJK response without garbling', async ({
-  request,
+test('WS chat handles long CJK response without garbling', async ({
   baseURL,
 }) => {
 
-  const { events, raw } = await chatSSE(
-    request,
+  const { content } = await chatViaWs(
     baseURL!,
     '列出5个中国城市的名字，每个城市一行，只要城市名不要其他内容。',
     undefined,
     120_000,
   );
 
-  // No replacement characters anywhere in the stream
-  expect(raw).not.toContain('\uFFFD');
+  // No replacement characters anywhere in the assistant content stream.
+  expect(content).not.toContain('�');
 
   // The final streamed content should still contain substantial CJK text.
-  const finalContent = events
-    .filter((e) => e.type === 'replace' || e.type === 'done')
-    .map((e) => e.text || e.content || '')
-    .filter((text) => typeof text === 'string' && text.length > 0)
-    .pop() || '';
-  const cjkChars = finalContent.match(/[\u4e00-\u9fff]/g) || [];
+  const cjkChars = content.match(/[一-鿿]/g) || [];
   expect(cjkChars.length).toBeGreaterThan(8);
 });
 
 // ---------------------------------------------------------------------------
-// Test 3: SSE stream completes with a done event
+// Test 3: WS chat completes with a turn/completed -> synthesized done
 //
-// Verifies the basic SSE lifecycle: events flow, stream terminates with
-// a "done" event containing token usage metadata.
+// Verifies the basic chat lifecycle terminates with a `done` event
+// synthesized from `turn/completed`.
+//
+// NOTE on token counts: The legacy SSE `done` event carried `tokens_in` /
+// `tokens_out`. The M9 `turn/completed` notification does NOT yet carry
+// them (deferred follow-up — α-3 punted token usage to γ-3). For now this
+// test asserts on the lifecycle terminal only; the cost-tracking spec
+// covers token math via the REST /api/sessions/:id/tasks snapshot.
 // ---------------------------------------------------------------------------
-test('SSE stream completes with done event and token counts', async ({
-  request,
+test('WS chat completes with terminal done event', async ({
   baseURL,
 }) => {
 
-  const { events } = await chatSSE(
-    request,
+  const { events, doneEvent } = await chatViaWs(
     baseURL!,
     'Say "hello" and nothing else.',
   );
 
   expect(events.length).toBeGreaterThan(0);
 
-  // Last meaningful event should be "done"
+  // Exactly one synthesized `done` event from `turn/completed`.
   const doneEvents = events.filter((e) => e.type === 'done');
   expect(doneEvents.length).toBe(1);
-
-  const done = doneEvents[0];
-  expect(done.tokens_in).toBeGreaterThan(0);
-  expect(done.tokens_out).toBeGreaterThan(0);
+  expect(doneEvent).toBeTruthy();
 });
 
 // ---------------------------------------------------------------------------
 // Test 4: Chat session persistence — messages survive across requests
 //
 // Verifies that sending two messages with the same session_id maintains
-// conversation context.
+// conversation context (the persistence guarantee is independent of the
+// streaming transport — REST `/api/sessions/:id/messages` is the source
+// of truth, the WS path just drives the live turn).
 // ---------------------------------------------------------------------------
 test('session persists across requests', async ({ request, baseURL }) => {
 
   const sid = `test-persist-${Date.now()}`;
 
-  // Send via the SSE chat API, then verify the same session is readable via
-  // the messages API. This proves persistence across requests without relying
-  // on a second live-model recall turn.
-  const { events } = await chatSSE(
-    request,
+  const { content } = await chatViaWs(
     baseURL!,
     'Say "OK" and nothing else.',
     sid,
     180_000,
   );
-
-  const content = events
-    .filter((e) => e.type === 'replace' || e.type === 'done')
-    .map((e) => e.text || e.content || '')
-    .join('');
 
   expect(content.toUpperCase()).toContain('OK');
 
@@ -271,49 +189,49 @@ test('session persists across requests', async ({ request, baseURL }) => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 5: File event is delivered via SSE when tool produces a file
+// Test 5: File event is delivered when tool produces a file
 //
-// Verifies that tools returning files_to_send get delivered as SSE
-// "file" events with path and filename.
+// SSE-era this test asserted on `type === 'file'` events and on
+// `session_result.message.media`. The M9 WS protocol has NO equivalent
+// notification yet — `session_result` is on the α-3 deferred set
+// (UPCR-2026-012 / γ-3 follow-up) and per-turn file events have not been
+// promoted to a typed UI notification at all. We mark the test as fixme;
+// once the WS variant lands, the body can use the same REST fallback path
+// it already uses for has_bg_tasks turns.
 // ---------------------------------------------------------------------------
-test('file delivery is visible via SSE or committed session result', async ({ request, baseURL }) => {
+test.fixme('file delivery is visible via WS or committed session result', async ({ request, baseURL }) => {
   test.slow();
   const sid = `test-file-${Date.now()}`;
   const fileDir = `octos-web-file-${Date.now()}`;
   const filePath = `./${fileDir}/octos_e2e_test.txt`;
 
-  const { events } = await chatSSE(
-    request,
+  const { events, doneEvent } = await chatViaWs(
     baseURL!,
     `Use write_file to create ${filePath} with exactly this content: test123. Then use send_file to send ${filePath} to me. Do not use shell.`,
     sid,
     180_000,
   );
 
-  // Look for a file event in the SSE stream
+  // Look for a file event (deferred per α-3) or session_result media.
   const fileEvents = events.filter((e) => e.type === 'file');
   const sessionResultMediaEvents = events.filter(
-    (e) => e.type === 'session_result' && Array.isArray(e.message?.media) && e.message.media.length > 0,
+    (e) =>
+      e.type === 'session_result' &&
+      Array.isArray((e as any).message?.media) &&
+      (e as any).message.media.length > 0,
   );
-  const doneEvent = events.find((e) => e.type === 'done');
 
-  // If the agent successfully created and sent the file, we should see a file event
   if (fileEvents.length > 0 || sessionResultMediaEvents.length > 0) {
     if (fileEvents.length > 0) {
-      expect(fileEvents[0].filename).toBeTruthy();
-      expect(fileEvents[0].path).toBeTruthy();
+      expect((fileEvents[0] as any).filename).toBeTruthy();
+      expect((fileEvents[0] as any).path).toBeTruthy();
     } else {
-      expect(sessionResultMediaEvents[0].message.media[0]).toBeTruthy();
+      expect((sessionResultMediaEvents[0] as any).message.media[0]).toBeTruthy();
     }
     return;
   }
 
-  const content = events
-    .filter((e) => e.type === 'replace' || e.type === 'done')
-    .map((e) => e.text || e.content || '')
-    .join('');
-
-  if (doneEvent?.has_bg_tasks) {
+  if ((doneEvent as any)?.has_bg_tasks) {
     const deadline = Date.now() + 90_000;
     let latestMessages: any[] = [];
     while (Date.now() < deadline) {
@@ -344,39 +262,32 @@ test('file delivery is visible via SSE or committed session result', async ({ re
     return;
   }
 
-  // Agent might not have used send_file — check that the response at least
-  // mentions the file was created (acceptable fallback)
-  expect(content).toMatch(/test.*file|created|written/i);
+  // Acceptable fallback: the agent at least mentions creation.
+  const synthContent = events
+    .filter((e) => e.type === 'token' || e.type === 'done')
+    .map((e) => (typeof e.text === 'string' ? e.text : '') || (typeof e.content === 'string' ? e.content : ''))
+    .join('');
+  expect(synthContent).toMatch(/test.*file|created|written/i);
 });
 
 // ---------------------------------------------------------------------------
 // Test 6: Concurrent sessions don't cross-contaminate
 //
-// Two simultaneous requests with different session IDs should get
-// independent responses.
+// Two simultaneous chat turns with different session IDs should get
+// independent responses on independent WS connections.
 // ---------------------------------------------------------------------------
-test('concurrent sessions are isolated', async ({ request, baseURL }) => {
+test('concurrent sessions are isolated', async ({ baseURL }) => {
 
   const sidA = `test-iso-a-${Date.now()}`;
   const sidB = `test-iso-b-${Date.now()}`;
 
   const [resultA, resultB] = await Promise.all([
-    chatSSE(request, baseURL!, 'Reply with exactly: ALPHA', sidA),
-    chatSSE(request, baseURL!, 'Reply with exactly: BRAVO', sidB),
+    chatViaWs(baseURL!, 'Reply with exactly: ALPHA', sidA),
+    chatViaWs(baseURL!, 'Reply with exactly: BRAVO', sidB),
   ]);
 
-  const contentA = resultA.events
-    .filter((e) => e.type === 'replace' || e.type === 'done')
-    .map((e) => e.text || e.content || '')
-    .join('');
-
-  const contentB = resultB.events
-    .filter((e) => e.type === 'replace' || e.type === 'done')
-    .map((e) => e.text || e.content || '')
-    .join('');
-
-  expect(contentA.toUpperCase()).toContain('ALPHA');
-  expect(contentB.toUpperCase()).toContain('BRAVO');
+  expect(resultA.content.toUpperCase()).toContain('ALPHA');
+  expect(resultB.content.toUpperCase()).toContain('BRAVO');
 });
 
 // ---------------------------------------------------------------------------
