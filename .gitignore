@@ -89,6 +89,10 @@ scripts/deploy.sh
 !docs/OCTOS_HARNESS_ENGINEERING_REQUIREMENTS_M6_M9.md
 !docs/OCTOS_HARNESS_AUDIT_M6_M9_2026-04-30.md
 !docs/HANDOFF_BUILD_AND_E2E_SOAK_2026-04-30.md
+!docs/M9-FIX-11-16-SUPERVISION-PLAN.md
+!docs/M9-LEDGER-DURABILITY-ADR.md
+!docs/M9-ALPHA-SOLE-TRANSPORT-ADR.md
+!docs/M9-GAMMA-SERVER-PROJECTION-ADR.md
 # Canonical product/engineering spec docs under api/. The UI Protocol v1
 # spec (api/OCTOS_UI_PROTOCOL_V1_SPEC_*.md) was tracked manually before
 # this rule existed; the server/app/tui feature-requirement specs added
