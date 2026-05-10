@@ -88,6 +88,13 @@ use super::ui_protocol_ledger::UiProtocolLedger;
 /// Failure mode: ledger append failures are logged inside the ledger
 /// and do not propagate. SSE delivery continues unaffected — that is
 /// the explicit α-3 coexistence invariant.
+// `emit_turn_started` was the no-topic helper for the α-3 bridge.
+// Once `chat_streaming` migrated to `ui_protocol_alpha9_bridge::
+// emit_turn_started_with_topic`, this helper became unused on the
+// production path but is retained because the α-3 unit tests (and
+// future no-topic call sites) still target it. The `#[allow(dead_code)]`
+// suppresses the dead-code warning without deleting test coverage.
+#[allow(dead_code)]
 pub(super) fn emit_turn_started(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -97,6 +104,11 @@ pub(super) fn emit_turn_started(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         timestamp: Utc::now(),
+        // UPCR-2026-014 (M9-α-9) addendum field; α-3's no-topic helper
+        // collapses it to None so the wire shape stays identical to the
+        // pre-addendum goldens. Topic-aware callers go through
+        // `ui_protocol_alpha9_bridge::emit_turn_started_with_topic`.
+        topic: None,
     });
     let _ = ledger.append_notification(notification);
 }
@@ -112,6 +124,13 @@ pub(super) fn emit_turn_started(
 ///
 /// Failure mode: same as [`emit_turn_started`] — ledger errors are
 /// non-fatal for SSE.
+// `emit_turn_completed` was the no-token-no-session-result helper for
+// the α-3 bridge. Once `chat_streaming` migrated to
+// `ui_protocol_alpha9_bridge::emit_turn_completed_full`, this helper
+// became unused on the production path but is retained for the α-3
+// unit tests + any no-addendum callers. `#[allow(dead_code)]` keeps
+// the dead-code warning silent without deleting the test coverage.
+#[allow(dead_code)]
 pub(super) fn emit_turn_completed(
     ledger: &Arc<UiProtocolLedger>,
     session_id: &SessionKey,
@@ -121,6 +140,14 @@ pub(super) fn emit_turn_completed(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         cursor: None,
+        // UPCR-2026-014 (M9-α-9) addendum fields; the α-3 helper does
+        // not have token usage / session_result in scope (these come
+        // from the SSE chat handler's `ConversationResponse`). Callers
+        // that have them go through
+        // `ui_protocol_alpha9_bridge::emit_turn_completed_full`.
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
     });
     let _ = ledger.append_notification(notification);
 }

@@ -545,17 +545,17 @@ async fn chat_streaming(
     );
 
     // M9-α-3 (issue #832, ADR PR #830): emit a `turn/started.v1`
-    // notification onto the M9 ledger BEFORE the agent loop runs. The
-    // SSE chat path's "turn started" is an implicit consequence of the
-    // Sse stream opening — there is no SSE wire frame for it. Without
-    // this bridge call a WebSocket subscriber that connects mid-turn
-    // sees no turn-start signal for the SSE-driven turn, breaking the
-    // pane-state contract every WS reducer assumes. See
-    // `ui_protocol_alpha3_bridge` for the full survey + invariants.
-    super::ui_protocol_alpha3_bridge::emit_turn_started(
+    // notification onto the M9 ledger BEFORE the agent loop runs.
+    // M9-α-9 (UPCR-2026-014): plumb `topic` onto the envelope so
+    // multi-topic specs can scope by sub-topic (the SSE chat path's
+    // `topic` query parameter previously had no WS counterpart). The
+    // `_with_topic` variant collapses empty topic to None so no-topic
+    // turns retain the pre-α-9 wire shape.
+    super::ui_protocol_alpha9_bridge::emit_turn_started_with_topic(
         &alpha_ledger,
         &session_key,
         &alpha_turn_id,
+        req.topic.clone(),
     );
 
     // Build per-request agent sharing resources with the base agent
@@ -598,12 +598,48 @@ async fn chat_streaming(
     let lifecycle_session_key = session_key.clone();
     let lifecycle_turn_id = alpha_turn_id.clone();
     tokio::spawn(async move {
+        // M9-α-9 (UPCR-2026-014): capture token usage + final-row
+        // identity into mutable bindings so the lifecycle emit at the
+        // bottom of this closure can stamp them onto the
+        // `turn/completed` envelope. Both default to None — failure
+        // paths leave the addendum fields absent on the wire.
+        let mut alpha9_tokens_in: Option<u32> = None;
+        let mut alpha9_tokens_out: Option<u32> = None;
+        let mut alpha9_session_result: Option<octos_core::ui_protocol::TurnSessionResult> = None;
+
         let result = request_agent
             .process_message(&message, &history, media)
             .await;
 
         match result {
             Ok(response) => {
+                alpha9_tokens_in = Some(response.token_usage.input_tokens);
+                alpha9_tokens_out = Some(response.token_usage.output_tokens);
+                // M9-α-9 (UPCR-2026-014): mirror per-turn file
+                // attachments onto the WS surface so `file_attached`
+                // tests can observe them on the M9 ledger. The SSE
+                // chat path does not currently emit `file:` frames
+                // for `files_to_send` (those route through the
+                // gateway's `ApiChannel`), so this bridge is the
+                // sole path delivering them on the WS surface for a
+                // standalone `octos serve`. The `tool_call_id` is
+                // not threaded through `ConversationResponse` today
+                // — tools that emit files go through the per-tool
+                // execution path, not the per-turn aggregate. Leave
+                // it None so clients fall back to fuzzy matching by
+                // path; future work can plumb the originating tool
+                // call id through the response struct.
+                for path in &response.files_to_send {
+                    let path_str = path.to_string_lossy().to_string();
+                    super::ui_protocol_alpha9_bridge::emit_file_attached(
+                        &lifecycle_ledger,
+                        &lifecycle_session_key,
+                        &lifecycle_turn_id,
+                        path_str,
+                        None,
+                        None,
+                    );
+                }
                 tracing::info!(
                     session = %session_id,
                     input_tokens = response.token_usage.input_tokens,
@@ -775,6 +811,27 @@ async fn chat_streaming(
                 });
                 if let Some(seq) = assistant_committed_seq {
                     done["committed_seq"] = serde_json::Value::from(seq);
+                    // M9-α-9 (UPCR-2026-014): also surface the
+                    // committed identity onto the WS `turn/completed`
+                    // envelope via `session_result`. The `message_id`
+                    // here mirrors the
+                    // `MessageCommitObserver`-computed shape
+                    // (`session:seq:timestamp_ns`) but with timestamp
+                    // = 0 — the WS path's authoritative `message_id`
+                    // arrives separately on the parallel
+                    // `message/persisted` envelope; this addendum is
+                    // a hint that lets clients dedupe + stamp seq
+                    // without a REST roundtrip. Clients that need
+                    // the exact ns-precision id read it from the
+                    // persisted envelope.
+                    alpha9_session_result = Some(octos_core::ui_protocol::TurnSessionResult {
+                        committed_seq: seq,
+                        message_id: format!("{}:{seq}:0", session_key.0),
+                        client_message_id: client_message_id
+                            .as_ref()
+                            .filter(|s| !s.is_empty())
+                            .cloned(),
+                    });
                 }
                 // M8.10 PR #2: tag the done event with thread_id so the web
                 // client can route the committed_seq onto the right per-cmid
@@ -808,19 +865,20 @@ async fn chat_streaming(
                 let _ = tx.send(err.to_string());
             }
         }
-        // M9-α-3: emit `turn/completed.v1` to the ledger AFTER the
-        // terminal SSE frame (`done` or `error`) is sent. Order is
-        // intentional — the SSE wire frame is what closes the SSE
-        // turn from the user's POV; the WS lifecycle envelope mirrors
-        // that close so a WebSocket subscriber sees the same
-        // before/after relationship the SSE consumer does. We emit
-        // the same envelope regardless of success/error so a
-        // mid-turn-attached WS client always sees the turn's lifecycle
-        // pair (started / completed) for SSE-driven turns.
-        super::ui_protocol_alpha3_bridge::emit_turn_completed(
+        // M9-α-3 + α-9: emit `turn/completed.v1` to the ledger AFTER
+        // the terminal SSE frame (`done` or `error`) is sent. The
+        // α-9 variant carries the UPCR-2026-014 addendum fields
+        // (`tokens_in/out` + `session_result`) — None on error paths
+        // so a mid-turn-attached WS client still sees the lifecycle
+        // pair (started / completed) for SSE-driven turns regardless
+        // of outcome.
+        super::ui_protocol_alpha9_bridge::emit_turn_completed_full(
             &lifecycle_ledger,
             &lifecycle_session_key,
             &lifecycle_turn_id,
+            alpha9_tokens_in,
+            alpha9_tokens_out,
+            alpha9_session_result,
         );
         // tx drops here, closing the stream
     });
@@ -1190,11 +1248,29 @@ pub async fn session_event_stream(
         return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
     }
 
-    let replay_complete = serde_json::json!({
+    let replay_complete_payload = serde_json::json!({
         "type": "replay_complete",
         "topic": params.topic,
-    })
-    .to_string();
+    });
+    // M9-α-9 (UPCR-2026-014): bridge the legacy SSE
+    // `/api/sessions/:id/events/stream` frame onto the WS surface as
+    // a `session/event.v1` envelope. Keeps WS-only clients (post-α-7)
+    // observing the same signal SSE consumers see during the
+    // coexistence period; once the gateway-mode forwarder also
+    // routes its frames through this bridge, every legacy event-
+    // stream frame is mirrored regardless of mode.
+    let session_key =
+        standalone_api_session_key_with_topic(&state, &headers, &id, params.topic.as_deref());
+    let alpha_ledger = super::ui_protocol::event_ledger(&state).await;
+    super::ui_protocol_alpha9_bridge::emit_session_event(
+        &alpha_ledger,
+        &session_key,
+        "replay_complete".to_string(),
+        replay_complete_payload.clone(),
+        params.topic.clone(),
+    );
+
+    let replay_complete = replay_complete_payload.to_string();
     let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
         Event::default().data(replay_complete),
     )]);
