@@ -241,6 +241,23 @@ impl Agent {
         retry_state: &mut LoopRetryState,
         iteration: u32,
     ) -> Option<String> {
+        // Fix #1 (2026-05-10): only fire when the iteration that just
+        // completed actually called `shell`. The previous unconditional
+        // dispatch scanned the entire session message history, so once a
+        // session accumulated a 4-call shell streak with failures the
+        // detector kept re-firing on every subsequent turn — even when the
+        // new turn's tool was `read_file` / `get_weather` / `glob` /
+        // anything else. The whole turn would silently end with
+        // "ending turn after repeated shell attempts" and the user got no
+        // assistant reply. Empirically reproduced 2026-05-10 on mini1: a
+        // session that ran shell a few times early in the day had every
+        // subsequent turn force-ended for hours after, regardless of which
+        // tool was actually used. The detector's intent is intra-turn
+        // ("the LLM keeps shelling and failing this turn"), so gating on
+        // the latest tool call's name restores that scope.
+        if latest_completed_tool_name(messages) != Some("shell") {
+            return None;
+        }
         let recovery = recover_shell_retry(messages, SHELL_RETRY_RECOVERY_THRESHOLD)?;
         let decision = retry_state.observe_shell_spiral();
         tracing::warn!(
@@ -877,8 +894,27 @@ impl Agent {
                                             spiral_iteration,
                                         )
                                     {
+                                        // Fix #2 (2026-05-10): inject recovery
+                                        // notice into the latest Tool message
+                                        // (from the prior iteration's shell)
+                                        // and continue, so the LLM produces a
+                                        // real user-facing summary on its next
+                                        // turn instead of us shipping a
+                                        // system-shaped instruction string as
+                                        // the assistant's reply.
+                                        if let Some(last_tool_msg) = messages
+                                            .iter_mut()
+                                            .rev()
+                                            .find(|m| m.role == MessageRole::Tool)
+                                        {
+                                            last_tool_msg.content = recovered_content;
+                                            warn!(
+                                                "shell spiral fired pre-execution; injected recovery notice and continuing for LLM summary"
+                                            );
+                                            continue;
+                                        }
                                         warn!(
-                                            "loop detected after repeated shell attempts; returning recovered shell output"
+                                            "shell spiral fired but no Tool message to inject into; falling back to ending turn with recovered output"
                                         );
                                         self.emit_cost_update(turn.total_usage(), &response.usage);
                                         return Ok(ConversationResponse {
@@ -950,8 +986,40 @@ impl Agent {
                                 &mut retry_state,
                                 spiral_iteration,
                             ) {
+                                // Fix #2 (2026-05-10): instead of shipping
+                                // `recovered_content` as the assistant's
+                                // user-facing reply, splice it into the most
+                                // recent Tool message and let the LLM run one
+                                // more iteration to produce a real summary.
+                                //
+                                // `recovered_content` is system-shaped — for
+                                // the `RetryLimit` kind it begins with
+                                // "[SHELL RETRY LIMIT] Repeated shell repair
+                                // attempts did not converge. Stop retrying
+                                // shell and summarize the blocker." That's an
+                                // instruction TO the LLM, not output FROM it,
+                                // so returning it directly as the assistant's
+                                // content gave users either nothing visible or
+                                // a confusing system-prompt-shaped string.
+                                // Putting it in the Tool slot lets the LLM see
+                                // "stop and summarize" on its next turn and
+                                // emit a proper EndTurn answer for the user.
+                                if let Some(last_tool_msg) = messages
+                                    .iter_mut()
+                                    .rev()
+                                    .find(|m| m.role == MessageRole::Tool)
+                                {
+                                    last_tool_msg.content = recovered_content;
+                                    warn!(
+                                        "shell spiral fired post-execution; injected recovery notice into latest Tool message and continuing for LLM summary"
+                                    );
+                                    continue;
+                                }
+                                // Defensive fallback: no Tool message to
+                                // splice into — keep the original behaviour
+                                // so the loop still terminates cleanly.
                                 warn!(
-                                    "ending turn after repeated shell attempts with recovered shell output"
+                                    "shell spiral fired but no Tool message to inject into; falling back to ending turn with recovered output"
                                 );
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
                                 return Ok(ConversationResponse {
@@ -1672,6 +1740,19 @@ fn resolve_tool_name(messages: &[Message], tool_msg_index: usize) -> Option<&str
                 .map(|tool_call| tool_call.name.as_str())
         })
     })
+}
+
+/// Name of the tool whose result is the most recent Tool message in
+/// `messages`, or `None` if there is no trailing Tool message. Used by
+/// `dispatch_shell_retry_recovery` so the spiral detector only fires when
+/// the iteration that just completed actually invoked `shell`.
+fn latest_completed_tool_name(messages: &[Message]) -> Option<&str> {
+    let last_tool_idx = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, msg)| (msg.role == MessageRole::Tool).then_some(idx))?;
+    resolve_tool_name(messages, last_tool_idx)
 }
 
 fn is_useful_shell_output(content: &str) -> bool {
@@ -3220,6 +3301,180 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::RetryLimit);
         assert!(recovered.content.contains("[SHELL RETRY LIMIT]"));
         assert!(recovered.content.contains("could not find Cargo.toml"));
+    }
+
+    // ── Fix #1 (2026-05-10): spiral detector intra-turn scoping ─────────────
+
+    /// `latest_completed_tool_name` returns the name attached to the most
+    /// recent Tool message. Used by `dispatch_shell_retry_recovery` to gate
+    /// firing on the iteration that just completed.
+    #[test]
+    fn latest_completed_tool_name_returns_most_recent_tool() {
+        let messages = vec![
+            Message::user("hi"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_old".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "stale shell output".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_old".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_read_file".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "manifest.json"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "{ \"name\": \"mofa-fm\" }".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_read_file".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert_eq!(latest_completed_tool_name(&messages), Some("read_file"));
+    }
+
+    #[test]
+    fn latest_completed_tool_name_returns_none_when_no_tool_messages() {
+        let messages = vec![
+            Message::user("hi"),
+            Message {
+                role: MessageRole::Assistant,
+                content: "ack".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert_eq!(latest_completed_tool_name(&messages), None);
+    }
+
+    /// Regression for the 2026-05-10 mini1 incident. A session that
+    /// accumulated a 4-call shell streak with failures earlier in the day
+    /// must NOT have its later turns force-ended when the new turn ran a
+    /// non-shell tool. `recover_shell_retry` (the message-history scan) on
+    /// its own still matches the stale streak and would return Some — that's
+    /// fine, since the gate at the dispatcher layer (Fix #1) is what stops
+    /// the false fire. This test pins the gate on `latest_completed_tool_name`.
+    #[test]
+    fn latest_completed_tool_distinguishes_stale_shell_history_from_current_read_file() {
+        let mut messages = stale_shell_failure_streak("call_shell");
+        // Now the LLM ran read_file in the current turn — that's what fixed
+        // the user-facing payload, not yet another shell call.
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: "call_read_now".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "manifest.json"}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: "{ ... 6kb manifest ... }".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("call_read_now".into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        // The pure scan still matches the stale streak — the spiral fact
+        // remains in history forever — but the dispatcher gate sees the
+        // current-iteration tool is read_file and short-circuits without
+        // firing.
+        assert!(recover_shell_retry(&messages, 4).is_some());
+        assert_eq!(latest_completed_tool_name(&messages), Some("read_file"));
+    }
+
+    /// Helper: builds a 4-call shell-streak with all failures, exactly the
+    /// shape the live mini1 session had at 19:35–19:36 PDT on 2026-05-10
+    /// before the user asked unrelated questions.
+    fn stale_shell_failure_streak(id_prefix: &str) -> Vec<Message> {
+        let mut out = vec![Message::user("repair the repo")];
+        for i in 1..=4 {
+            let id = format!("{id_prefix}_{i}");
+            out.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+            out.push(Message {
+                role: MessageRole::Tool,
+                content: "error: could not find Cargo.toml\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        out
     }
 
     // ── is_productive_tool_message (M6.2) ───────────────────────────────
