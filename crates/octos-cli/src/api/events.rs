@@ -1,14 +1,33 @@
-//! SSE broadcaster for streaming progress events.
+//! Process-wide event broadcaster + per-request channel reporter for the
+//! API surface.
+//!
+//! Originally the SSE wire format module (M9-α-5/α-6 deleted the chat
+//! SSE transport entirely — see ADR PR #830 / audit issue #845). After
+//! the atomic delete the JSON shape produced by [`event_to_json`] is
+//! still consumed by:
+//!
+//! * the legacy `/api/ws` text-frame handler (`ws_standalone_agent`),
+//!   which forwards each frame to the WebSocket client verbatim,
+//! * the harness/admin `/api/events/harness` endpoint (subscribes to
+//!   the broadcaster for M7.6 swarm-dashboard live frames),
+//! * the swarm dispatch / cost-attribution typed event publishers in
+//!   `crate::api::swarm`.
+//!
+//! No SSE wire path remains in the chat transport — every chat client
+//! talks to `/api/ui-protocol/ws` exclusively.
 
 use octos_agent::{ProgressEvent, ProgressReporter};
 use tokio::sync::broadcast;
 
-/// Broadcasts progress events to SSE subscribers.
-pub struct SseBroadcaster {
+/// Process-wide broadcaster of progress events, used by the harness +
+/// swarm event surfaces. Publishes pre-serialized JSON frames so
+/// downstream subscribers (admin dashboard, M7.8 live gate) can forward
+/// them verbatim.
+pub struct EventBroadcaster {
     tx: broadcast::Sender<String>,
 }
 
-impl SseBroadcaster {
+impl EventBroadcaster {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         Self { tx }
@@ -20,7 +39,7 @@ impl SseBroadcaster {
     }
 
     /// Send a raw pre-encoded JSON frame. Used by typed endpoints
-    /// (M7.6 swarm review decision) that construct the SSE body
+    /// (M7.6 swarm review decision) that construct the JSON body
     /// directly instead of routing through a [`ProgressEvent`].
     /// Returns the number of receivers the frame reached (0 when no
     /// subscribers are connected — the send silently drops, matching
@@ -30,7 +49,7 @@ impl SseBroadcaster {
     }
 }
 
-impl ProgressReporter for SseBroadcaster {
+impl ProgressReporter for EventBroadcaster {
     fn report(&self, event: ProgressEvent) {
         // Broadcaster is process-wide and not turn-scoped, so it cannot
         // resolve a thread_id without further plumbing. Per-request
@@ -46,11 +65,13 @@ impl ProgressReporter for SseBroadcaster {
     }
 }
 
-/// Per-request reporter that sends serialized SSE events through an mpsc channel.
-/// Used by the streaming POST /api/chat handler to isolate events per request.
+/// Per-request reporter that serializes [`ProgressEvent`]s to JSON and
+/// pushes them through an mpsc channel. Used by the legacy `/api/ws`
+/// handler to isolate events per request. (The previous SSE chat path
+/// also used this — deleted in M9-α-5/α-6.)
 ///
 /// M8.10 PR #2: optionally carries a `thread_id` (the user message's
-/// `client_message_id`) so every emitted SSE payload is tagged with the
+/// `client_message_id`) so every emitted payload is tagged with the
 /// thread it belongs to. When unset, the field is omitted (legacy clients
 /// continue to ignore it).
 pub(crate) struct ChannelReporter {
@@ -67,6 +88,13 @@ impl ChannelReporter {
     }
 
     /// Bind a `thread_id` to every payload this reporter emits.
+    ///
+    /// Pre-α-5/α-6 this was used by the streaming HTTP chat path. Post
+    /// delete the legacy `/api/ws` handler does not bind a thread_id
+    /// (it has no `client_message_id` on its inbound frame today), so
+    /// this constructor is held in reserve for the upcoming WS lifecycle
+    /// rewire — kept here so the bridge unit tests continue to exercise it.
+    #[allow(dead_code)]
     pub fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
         self.thread_id = thread_id.filter(|s| !s.is_empty());
         self
@@ -83,8 +111,8 @@ impl ProgressReporter for ChannelReporter {
     }
 }
 
-/// Serialize a [`ProgressEvent`] to a JSON SSE payload. When `thread_id` is
-/// `Some`, every payload is tagged with the thread it belongs to.
+/// Serialize a [`ProgressEvent`] to a JSON wire payload. When `thread_id`
+/// is `Some`, every payload is tagged with the thread it belongs to.
 ///
 /// M8.10 PR #2: strictly additive — clients that don't know `thread_id`
 /// silently ignore the field. When `thread_id` is `None`, the field is
@@ -367,7 +395,7 @@ mod tests {
         assert_eq!(json["task_id"], "abc");
     }
 
-    /// M8.10 PR #2: every SSE payload tagged with the bound thread_id so
+    /// M8.10 PR #2: every payload tagged with the bound thread_id so
     /// the web client can route to the right per-cmid thread bubble.
     #[test]
     fn event_to_json_includes_thread_id_when_provided() {
@@ -534,7 +562,7 @@ mod tests {
 
     #[test]
     fn broadcaster_subscribe_receives_events() {
-        let broadcaster = SseBroadcaster::new(16);
+        let broadcaster = EventBroadcaster::new(16);
         let mut rx = broadcaster.subscribe();
 
         broadcaster.report(ProgressEvent::Thinking { iteration: 1 });

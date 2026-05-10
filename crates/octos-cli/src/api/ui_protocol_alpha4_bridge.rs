@@ -1,18 +1,17 @@
-//! M9-α-4 — bridge SSE-driven status / progress-gate progress events onto
-//! the M9 WebSocket UI Protocol path.
+//! M9-α-4 — status / progress-gate ledger reporter (post-α-5/α-6).
 //!
 //! Per the M9-α (Sole Transport) ADR (`docs/M9-ALPHA-SOLE-TRANSPORT-ADR.md`)
-//! the WebSocket transport is migrating to be the sole chat transport.
-//! This module is the α-4 phase: while SSE is still alive (deletion
-//! lands in α-5/α-6 atomically with the web bundle), the SSE chat path's
-//! status frames and progress-gate (terminal-budget) frames must ALSO
-//! be appended to the M9 ledger so any concurrently-connected
-//! WebSocket subscriber for the same `SessionKey` sees them through the
-//! live broadcast (`UiProtocolLedger::subscribe`).
+//! the WebSocket transport is the sole chat transport. SSE has been
+//! deleted in α-5/α-6 (atomic with the web bundle), so the
+//! `LedgerStatusGateReporter` defined here no longer has an SSE
+//! consumer to mirror — its inner `Arc<dyn ProgressReporter>` is now a
+//! pass-through (or no-op) and the ledger append is the only delivery
+//! path. The struct is retained as a documented building block for the
+//! M9 WebSocket lifecycle wiring (the unit tests pin its contract).
 //!
-//! **Survey of status / heartbeat / progress-gate SSE events** (issue
+//! **Survey of status / heartbeat / progress-gate progress events** (issue
 //! #833, audit-lock #845). Source-of-truth for the wire payloads is
-//! `crates/octos-cli/src/api/sse.rs::event_to_json` plus the
+//! `crates/octos-cli/src/api/events.rs::event_to_json` plus the
 //! `ProgressEvent` enum in `crates/octos-agent/src/progress.rs`. Events
 //! that already have a WS counterpart through α-2 (`tool_progress`),
 //! α-3 (turn lifecycle), or `MessageCommitObserver` (`session_result`)
@@ -56,8 +55,11 @@
 //! - The web reducer routes `progress/updated` by metadata.kind; clients
 //!   on both transports collapse the duplicate into one logical update.
 //!
-//! When α-5/α-6 land and SSE is deleted, this bridge becomes the
-//! straight-through reporter for these events.
+//! Post-α-5/α-6 the SSE side has been removed; the bridge now exists
+//! solely as a forward-compatible building block for the WS lifecycle
+//! wiring.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -452,28 +454,25 @@ mod tests {
         );
     }
 
-    /// α-4 acceptance gate (E): coexistence — the same status event
-    /// reaches BOTH the SSE wire path AND the WS wire path during the
-    /// coexistence period. Mirrors α-2's flagship coexistence test but
-    /// for a `LlmStatus` frame, which is the canonical α-4 surface a WS
-    /// client expects to route to its `progress/updated` reducer when
-    /// the SSE web bundle is still live.
+    /// α-4 acceptance gate (E, post-α-5/α-6): a `LlmStatus` event reaches
+    /// the WS wire path through `LedgerStatusGateReporter`, regardless of
+    /// what the wrapped inner reporter does. Pre-α-5/α-6 this test also
+    /// asserted the SSE side; that branch is gone now (the inner reporter
+    /// is opaque).
     #[test]
-    fn should_emit_status_on_both_sse_and_ws_during_coexistence() {
-        use crate::api::sse::{ChannelReporter, event_to_json};
-        use serde_json::Value;
-
-        let (sse_tx, mut sse_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let sse_reporter: Arc<dyn ProgressReporter> =
-            Arc::new(ChannelReporter::new(sse_tx).with_thread_id(Some("cmid-alpha-4".into())));
+    fn should_emit_status_on_ws_via_ledger_reporter() {
+        struct SilentInner;
+        impl ProgressReporter for SilentInner {
+            fn report(&self, _event: ProgressEvent) {}
+        }
 
         let ledger = Arc::new(UiProtocolLedger::new(64));
-        let session_id = SessionKey::new("api", "alpha4-coexistence");
+        let session_id = SessionKey::new("api", "alpha4-ws");
         let turn_id = TurnId::new();
         let mut ws_subscriber = ledger.subscribe(&session_id);
 
         let bridged: Arc<dyn ProgressReporter> = Arc::new(LedgerStatusGateReporter::new(
-            sse_reporter,
+            Arc::new(SilentInner),
             ledger.clone(),
             session_id.clone(),
             turn_id.clone(),
@@ -484,26 +483,6 @@ mod tests {
             iteration: 7,
         });
 
-        // ---- SSE assertion ----
-        let sse_raw = sse_rx.try_recv().expect("SSE wire frame must arrive");
-        let sse_json: Value = serde_json::from_str(&sse_raw).unwrap();
-        assert_eq!(sse_json["type"], "llm_status");
-        assert_eq!(sse_json["message"], "retrying after rate limit");
-        assert_eq!(sse_json["iteration"], 7);
-        assert_eq!(sse_json["thread_id"], "cmid-alpha-4");
-        // Sanity: confirm the canonical SSE encoder is what the channel
-        // reporter actually used. If `event_to_json` ever changes shape,
-        // the bridge mapping must be re-evaluated to stay in sync.
-        let canonical = event_to_json(
-            &ProgressEvent::LlmStatus {
-                message: "retrying after rate limit".into(),
-                iteration: 7,
-            },
-            Some("cmid-alpha-4"),
-        );
-        assert_eq!(canonical, sse_json);
-
-        // ---- WS assertion ----
         let ws_event = ws_subscriber
             .try_recv()
             .expect("WS broadcast must carry progress/updated envelope");
@@ -529,8 +508,7 @@ mod tests {
             .expect("notification serializes");
         assert_eq!(rpc.method, methods::PROGRESS_UPDATED);
 
-        // Coexistence invariant: each transport emits exactly once per event.
-        assert!(sse_rx.try_recv().is_err(), "SSE must emit exactly once");
+        // Single-emit invariant: the WS broadcast must NOT replay.
         assert!(
             ws_subscriber.try_recv().is_err(),
             "WS broadcast must emit exactly once"

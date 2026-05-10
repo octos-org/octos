@@ -15,7 +15,7 @@ use octos_memory::{EpisodeStore, MemoryStore};
 use super::Executable;
 use super::chat::create_provider;
 use crate::api::metrics::MetricsReporter;
-use crate::api::{AppState, SseBroadcaster, build_router, init_metrics};
+use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
 
 fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
@@ -300,7 +300,7 @@ impl ServeCommand {
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
-        let broadcaster = Arc::new(SseBroadcaster::new(256));
+        let broadcaster = Arc::new(EventBroadcaster::new(256));
 
         // Try to create the LLM provider + agent, but don't fail if no API key.
         // The admin dashboard works without it.
@@ -830,7 +830,7 @@ impl ServeCommand {
         config: &Config,
         cwd: &std::path::Path,
         data_dir: &std::path::Path,
-        broadcaster: Arc<crate::api::SseBroadcaster>,
+        broadcaster: Arc<crate::api::EventBroadcaster>,
     ) -> Result<(Agent, Arc<tokio::sync::Mutex<SessionManager>>)> {
         let model = self.model.clone().or(config.model.clone());
         let base_url = config.base_url.clone();
@@ -1111,7 +1111,7 @@ impl ServeCommand {
         swarm_backend_cmd: Option<&str>,
         swarm_backend_url: Option<&str>,
         data_dir: &std::path::Path,
-        broadcaster: Arc<crate::api::SseBroadcaster>,
+        broadcaster: Arc<crate::api::EventBroadcaster>,
         harness_sink: Option<String>,
         tool_policy: Option<octos_agent::ToolPolicy>,
     ) -> Result<Option<Arc<crate::api::SwarmState>>> {
@@ -1464,7 +1464,7 @@ mod tests {
     #[tokio::test]
     async fn should_return_none_when_swarm_backend_not_configured() {
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let state = ServeCommand::build_swarm_state_from_flags(
             None,
             None,
@@ -1490,7 +1490,7 @@ mod tests {
     #[tokio::test]
     async fn should_populate_swarm_state_when_backend_configured() {
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
@@ -1514,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_stdio_backend_without_cmd() {
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             None,
@@ -1541,7 +1541,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_http_backend_without_url() {
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("http"),
             None,
@@ -1568,7 +1568,7 @@ mod tests {
     #[tokio::test]
     async fn should_reject_unknown_swarm_backend_kind() {
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let result = ServeCommand::build_swarm_state_from_flags(
             Some("ouija"),
             None,
@@ -1603,7 +1603,7 @@ mod tests {
         use std::num::NonZeroUsize;
 
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let tool_policy = octos_agent::ToolPolicy {
             deny: vec!["dangerous_tool".into()],
             ..Default::default()
@@ -1669,7 +1669,7 @@ mod tests {
         use std::num::NonZeroUsize;
 
         let dir = tempfile::tempdir().unwrap();
-        let broadcaster = Arc::new(SseBroadcaster::new(16));
+        let broadcaster = Arc::new(EventBroadcaster::new(16));
         let state = ServeCommand::build_swarm_state_from_flags(
             Some("stdio"),
             Some("/bin/cat"),
