@@ -1,3 +1,11 @@
+// The per-field doc blocks on `ProfileRuntime` / `SessionRuntime` use
+// multi-paragraph bullet items by design — they're the contract M11-B
+// and M11-C implement against, and collapsing to single-line bullets
+// would lose the rationale. `cargo doc` renders them correctly; the
+// continuation-indent lints would otherwise force a rewrite that
+// trades readability for lint silence.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
+
 //! Runtime types for the M11 ProfileRuntime / SessionRuntime model.
 //!
 //! M11 replaces `octos serve`'s embedded server-wide `Agent` with two
