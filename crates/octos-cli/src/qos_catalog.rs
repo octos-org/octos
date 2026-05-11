@@ -28,6 +28,19 @@ pub(crate) struct AdaptiveProviderBundle {
     pub runtime_qos_catalog: Option<QosCatalog>,
 }
 
+/// Whether [`build_adaptive_provider_chain`] should spawn the periodic
+/// `model_catalog.json` exporter. Production callers want `Spawn`; tests
+/// want `Disabled` to avoid leaking tokio tasks past the test scope.
+///
+/// Typed so production call sites can't accidentally pass `false` — the
+/// 30s exporter is what keeps the persisted catalog in lockstep with
+/// the running router's lane scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExporterMode {
+    Spawn,
+    Disabled,
+}
+
 /// Build the LLM provider chain with full QoS adaptive wiring.
 ///
 /// Mirrors what `gateway_runtime.rs` used to do inline so that
@@ -51,17 +64,17 @@ pub(crate) struct AdaptiveProviderBundle {
 ///    `octos_llm::context::seed_from_catalog` +
 ///    `octos_llm::pricing::seed_pricing_catalog`.
 /// 6. Persists `model_catalog.json` next to `data_dir`.
-/// 7. When `spawn_exporter` is true and an `AdaptiveRouter` exists,
-///    spawns a tokio task that re-writes `model_catalog.json` every
-///    30s from the router's live export. Tests should pass
-///    `spawn_exporter=false` to keep the test free of leaked tokio
+/// 7. When `exporter == ExporterMode::Spawn` and an `AdaptiveRouter`
+///    exists, spawns a tokio task that re-writes `model_catalog.json`
+///    every 30s from the router's live export. Tests should pass
+///    `ExporterMode::Disabled` to keep the test free of leaked tokio
 ///    tasks.
 pub(crate) fn build_adaptive_provider_chain(
     base_provider: Arc<dyn LlmProvider>,
     config: &Config,
     data_dir: &Path,
     no_retry: bool,
-    spawn_exporter: bool,
+    exporter: ExporterMode,
 ) -> AdaptiveProviderBundle {
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
 
@@ -74,13 +87,15 @@ pub(crate) fn build_adaptive_provider_chain(
             vec![Arc::new(RetryProvider::new(base_provider))];
         let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
         for fb in &config.fallback_models {
-            let fb_config = if fb.api_key_env.is_some() {
-                let mut c = config.clone();
-                c.api_key_env = fb.api_key_env.clone();
-                c
-            } else {
-                config.clone()
-            };
+            // Always swap in this fallback's own `api_key_env`. When the
+            // fallback omits it (None), we clear the primary's value so
+            // `Config::get_api_key` falls back to the provider registry
+            // default for the fallback's family — otherwise a
+            // cross-provider fallback (e.g. deepseek behind moonshot)
+            // would inherit the primary's AUTODL_API_KEY instead of
+            // using DEEPSEEK_API_KEY.
+            let mut fb_config = config.clone();
+            fb_config.api_key_env = fb.api_key_env.clone();
             match create_provider_with_api_type(
                 &fb.provider,
                 &fb_config,
@@ -201,7 +216,7 @@ pub(crate) fn build_adaptive_provider_chain(
         persist_qos_catalog(&catalog_path, catalog);
     }
 
-    if spawn_exporter {
+    if exporter == ExporterMode::Spawn {
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
             let exporter_path = catalog_path.clone();
@@ -383,25 +398,31 @@ mod tests {
         assert!(materialized.models.iter().all(|entry| entry.score > 0.0));
     }
 
-    /// End-to-end exercise of `build_adaptive_provider_chain`: a fake
-    /// stub provider stands in for the real LLM client, one valid
-    /// fallback gets layered in (a second fallback fails to construct
-    /// and gets skipped via `warn!`). With `spawn_exporter=false` we
-    /// don't leak a tokio task. We assert:
-    ///   (a) the bundle exposes an `AdaptiveRouter` when >1 provider
-    ///       was built;
-    ///   (b) `runtime_qos_catalog` is materialized when a seed
-    ///       `model_catalog.json` is present on disk;
-    ///   (c) no panic when `provider_baseline.json` is absent (the
-    ///       cold-start info path).
+    /// End-to-end exercise of `build_adaptive_provider_chain` that
+    /// covers the QoS plumbing surface, not just smoke survival:
+    ///   (a) `AdaptiveRouter` is built when >1 provider survives;
+    ///   (b) the seed catalog is actually consumed — we use entries
+    ///       keyed by `ollama/llama3.2` so they line up with the
+    ///       router lane the helper just built, then assert the
+    ///       persisted catalog carries those seeded fields (cost_in,
+    ///       context_window, model_type) instead of bare defaults;
+    ///   (c) `provider_baseline.json` is loaded from `data_dir` when
+    ///       present (non-cold-start path), and the latency/stability
+    ///       values it carries show up in `octos_llm::context` /
+    ///       `octos_llm::pricing` seeding through the exported
+    ///       catalog;
+    ///   (d) a deliberately-broken third fallback gets skipped via
+    ///       `warn!` without taking the helper down;
+    ///   (e) `model_catalog.json` on disk after the helper runs is
+    ///       different from the cold seed — i.e. persistence wrote
+    ///       new state, not just left the seed file untouched.
     #[test]
-    fn build_adaptive_provider_chain_seeds_qos_without_baseline_file() {
+    fn build_adaptive_provider_chain_seeds_qos_plumbing_end_to_end() {
         use crate::config::{AdaptiveRoutingConfig, Config, FallbackModel};
         use octos_core::Message;
         use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
         use std::sync::Arc;
 
-        // Minimal stub provider — never actually invoked by the helper.
         struct StubProvider;
         #[async_trait::async_trait]
         impl LlmProvider for StubProvider {
@@ -423,20 +444,18 @@ mod tests {
 
         let temp = tempdir().unwrap();
         let data_dir = temp.path().to_path_buf();
-        // Drop a seed `model_catalog.json` so the helper has something
-        // to materialize without ever calling the live router export.
-        std::fs::write(
-            data_dir.join("model_catalog.json"),
-            serde_json::to_string_pretty(&sample_catalog([0.0, 0.0])).unwrap(),
-        )
-        .unwrap();
+
+        // We don't know the exact AdaptiveRouter lane labels up front
+        // (the OpenAI-flavored providers tag their label with the
+        // host suffix when a non-default base_url is set, e.g.
+        // `ollama@localhost:11434/llama3.2`). Do a discovery pass
+        // first to learn the real lane keys, then rebuild the seed
+        // catalog + baseline so the helper's seed_catalog/seed_baseline
+        // attaches them to the right slots when we re-run.
 
         let mut config = Config::default();
         config.provider = Some("stub".into());
         config.fallback_models = vec![
-            // `ollama` doesn't require an API key, model, or base_url,
-            // so the helper can build it offline without touching the
-            // filesystem or network — gives us a real second provider.
             FallbackModel {
                 provider: "ollama".into(),
                 model: Some("llama3.2".into()),
@@ -447,8 +466,8 @@ mod tests {
                 cost_per_m: Some(0.5),
                 strong: true,
             },
-            // This fallback should fail to build (unknown provider)
-            // and be skipped via `warn!`.
+            // Deliberately-broken third fallback — must be skipped via
+            // `warn!` without taking the helper down.
             FallbackModel {
                 provider: "nope-not-a-real-provider".into(),
                 model: None,
@@ -462,24 +481,156 @@ mod tests {
         ];
         config.adaptive_routing = Some(AdaptiveRoutingConfig::default());
 
+        // ─── Discovery pass: learn the real lane keys ───
         let base: Arc<dyn LlmProvider> = Arc::new(StubProvider);
-        let bundle = build_adaptive_provider_chain(base, &config, &data_dir, false, false);
+        let discovery = build_adaptive_provider_chain(
+            base.clone(),
+            &config,
+            &data_dir,
+            false,
+            ExporterMode::Disabled,
+        );
+        let discovery_runtime = discovery
+            .runtime_qos_catalog
+            .as_ref()
+            .expect("discovery pass should produce a runtime catalog");
+        let lane_keys: Vec<String> = discovery_runtime
+            .models
+            .iter()
+            .map(|m| m.provider.clone())
+            .collect();
+        // (d) The broken third fallback was skipped via `warn!` — only
+        // 2 lanes should survive.
+        assert_eq!(
+            lane_keys.len(),
+            2,
+            "broken fallback should be skipped via warn!, leaving 2 lanes; got {:?}",
+            lane_keys
+        );
+        let stub_key = lane_keys
+            .iter()
+            .find(|k| k.starts_with("stub/"))
+            .expect("primary stub lane must exist")
+            .clone();
+        let ollama_key = lane_keys
+            .iter()
+            .find(|k| k.starts_with("ollama") && k.ends_with("/llama3.2"))
+            .expect("ollama fallback lane must exist")
+            .clone();
 
-        // (a) `AdaptiveRouter` is built when >1 provider survives.
+        // ─── Real pass: seed catalog + baseline with the discovered
+        // lane keys, then re-run the helper and assert the seed values
+        // propagate into the persisted catalog. ───
+        let matched_seed = QosCatalog {
+            updated_at: "2026-04-11T00:00:00Z".to_string(),
+            models: vec![
+                ModelCatalogEntry {
+                    provider: stub_key.clone(),
+                    model_type: ModelType::Fast,
+                    stability: 0.95,
+                    tool_avg_ms: 700,
+                    p95_ms: 1100,
+                    score: 0.0,
+                    cost_in: 0.4,
+                    cost_out: 1.6,
+                    ds_output: 1000,
+                    context_window: 64_000,
+                    max_output: 4_096,
+                },
+                ModelCatalogEntry {
+                    provider: ollama_key.clone(),
+                    model_type: ModelType::Strong,
+                    stability: 0.88,
+                    tool_avg_ms: 1800,
+                    p95_ms: 3200,
+                    score: 0.0,
+                    cost_in: 0.0,
+                    cost_out: 0.0,
+                    ds_output: 600,
+                    context_window: 128_000,
+                    max_output: 8_192,
+                },
+            ],
+        };
+        std::fs::write(
+            data_dir.join("model_catalog.json"),
+            serde_json::to_string_pretty(&matched_seed).unwrap(),
+        )
+        .unwrap();
+        let baseline = serde_json::json!([
+            {
+                "provider": stub_key,
+                "p95_ms": 1100,
+                "tool_avg_ms": 700,
+                "stability": 0.95
+            },
+            {
+                "provider": ollama_key,
+                "p95_ms": 3200,
+                "tool_avg_ms": 1800,
+                "stability": 0.88
+            }
+        ]);
+        std::fs::write(
+            data_dir.join("provider_baseline.json"),
+            serde_json::to_string_pretty(&baseline).unwrap(),
+        )
+        .unwrap();
+
+        let bundle =
+            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled);
+
+        // (a) AdaptiveRouter built.
         assert!(
             bundle.adaptive_router.is_some(),
             "AdaptiveRouter should be present when fallback build succeeds"
         );
-        // (b) runtime catalog materialized from the seed.
-        assert!(
-            bundle.runtime_qos_catalog.is_some(),
-            "seed catalog should produce a runtime catalog"
-        );
-        // (c) cold-start info path didn't panic: helper returned cleanly.
-        // (Implicit: the test reached this line.)
 
-        // model_catalog.json was rewritten with the materialized catalog.
-        let persisted_path = data_dir.join("model_catalog.json");
-        assert!(persisted_path.exists());
+        // (b) seed fields propagated into the runtime catalog via
+        //     seed_catalog → router.export_model_catalog.
+        let runtime = bundle
+            .runtime_qos_catalog
+            .as_ref()
+            .expect("seed catalog should produce a runtime catalog");
+        let ollama_entry = runtime
+            .models
+            .iter()
+            .find(|m| m.provider == ollama_key)
+            .expect("ollama lane should be present in runtime catalog");
+        assert_eq!(
+            ollama_entry.context_window, 128_000,
+            "context_window from seed should survive into runtime export"
+        );
+        assert_eq!(
+            ollama_entry.max_output, 8_192,
+            "max_output from seed should survive into runtime export"
+        );
+        assert_eq!(
+            ollama_entry.model_type,
+            ModelType::Strong,
+            "model_type from seed should survive into runtime export"
+        );
+
+        // (c) baseline loaded — without any live observations the
+        //     EMA blend weight is 0, so seeded stability round-trips
+        //     unchanged through the router export.
+        assert!(
+            (ollama_entry.stability - 0.88).abs() < 0.001,
+            "baseline stability should round-trip through router export; got {}",
+            ollama_entry.stability
+        );
+
+        // (e) persisted file reflects the runtime, not just the cold
+        //     seed (catalog gets rewritten with router-derived data).
+        let persisted_json = std::fs::read_to_string(data_dir.join("model_catalog.json"))
+            .expect("persisted catalog readable");
+        let persisted: QosCatalog = serde_json::from_str(&persisted_json).unwrap();
+        let persisted_ollama = persisted
+            .models
+            .iter()
+            .find(|m| m.provider == ollama_key)
+            .expect("ollama lane should be in persisted catalog");
+        assert_eq!(persisted_ollama.context_window, 128_000);
+        assert_eq!(persisted_ollama.max_output, 8_192);
     }
 }

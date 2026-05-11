@@ -17,7 +17,7 @@ use super::chat::create_provider;
 use crate::api::metrics::MetricsReporter;
 use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
-use crate::qos_catalog::build_adaptive_provider_chain;
+use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 
 fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
     if !email.provider.eq_ignore_ascii_case("smtp") {
@@ -1038,8 +1038,13 @@ impl ServeCommand {
         //     `octos_llm::context` / `octos_llm::pricing` tables,
         //   - spawns the 30s periodic metrics exporter when an
         //     `AdaptiveRouter` is in play.
-        let bundle =
-            build_adaptive_provider_chain(base_provider, config, data_dir, self.no_retry, true);
+        let bundle = build_adaptive_provider_chain(
+            base_provider,
+            config,
+            data_dir,
+            self.no_retry,
+            ExporterMode::Spawn,
+        );
         let llm: Arc<dyn LlmProvider> = bundle.llm;
 
         let memory = Arc::new(

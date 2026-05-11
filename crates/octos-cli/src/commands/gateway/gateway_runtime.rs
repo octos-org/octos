@@ -38,7 +38,7 @@ use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::profiles::UserProfile;
-use crate::qos_catalog::build_adaptive_provider_chain;
+use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
@@ -295,7 +295,7 @@ impl GatewayRuntime {
             &config,
             &data_dir,
             cmd.no_retry,
-            true, // spawn the periodic metrics exporter
+            ExporterMode::Spawn,
         );
         let adaptive_router_ref: Option<Arc<AdaptiveRouter>> = bundle.adaptive_router;
         let runtime_qos_catalog = bundle.runtime_qos_catalog;
