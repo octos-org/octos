@@ -38,6 +38,10 @@ pub(crate) struct AdaptiveProviderBundle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExporterMode {
     Spawn,
+    /// Test-only — keeps the helper from leaking a tokio task past
+    /// the test scope. Allow dead_code in production builds where
+    /// only `Spawn` is ever constructed.
+    #[allow(dead_code)]
     Disabled,
 }
 
@@ -453,33 +457,35 @@ mod tests {
         // catalog + baseline so the helper's seed_catalog/seed_baseline
         // attaches them to the right slots when we re-run.
 
-        let mut config = Config::default();
-        config.provider = Some("stub".into());
-        config.fallback_models = vec![
-            FallbackModel {
-                provider: "ollama".into(),
-                model: Some("llama3.2".into()),
-                base_url: None,
-                api_key_env: None,
-                model_hints: None,
-                api_type: None,
-                cost_per_m: Some(0.5),
-                strong: true,
-            },
-            // Deliberately-broken third fallback — must be skipped via
-            // `warn!` without taking the helper down.
-            FallbackModel {
-                provider: "nope-not-a-real-provider".into(),
-                model: None,
-                base_url: None,
-                api_key_env: None,
-                model_hints: None,
-                api_type: None,
-                cost_per_m: None,
-                strong: true,
-            },
-        ];
-        config.adaptive_routing = Some(AdaptiveRoutingConfig::default());
+        let config = Config {
+            provider: Some("stub".into()),
+            fallback_models: vec![
+                FallbackModel {
+                    provider: "ollama".into(),
+                    model: Some("llama3.2".into()),
+                    base_url: None,
+                    api_key_env: None,
+                    model_hints: None,
+                    api_type: None,
+                    cost_per_m: Some(0.5),
+                    strong: true,
+                },
+                // Deliberately-broken third fallback — must be skipped
+                // via `warn!` without taking the helper down.
+                FallbackModel {
+                    provider: "nope-not-a-real-provider".into(),
+                    model: None,
+                    base_url: None,
+                    api_key_env: None,
+                    model_hints: None,
+                    api_type: None,
+                    cost_per_m: None,
+                    strong: true,
+                },
+            ],
+            adaptive_routing: Some(AdaptiveRoutingConfig::default()),
+            ..Default::default()
+        };
 
         // ─── Discovery pass: learn the real lane keys ───
         let base: Arc<dyn LlmProvider> = Arc::new(StubProvider);
