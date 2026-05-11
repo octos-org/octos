@@ -272,6 +272,17 @@ impl SessionRuntime {
             save_episodes: true,
             ..Default::default()
         })
+        // M11-F regression fix (#891): propagate the pre-assembled
+        // profile-scope system prompt onto the per-session agent. The
+        // profile assembled it once during `ProfileRuntime::bootstrap`
+        // via `build_system_prompt` + the SKILL.md fragment-append
+        // loop, so every session for the profile inherits the same
+        // skill-aware guidance (the mofa-fm "call fm_tts directly"
+        // note, future skill-injected guidance, etc.). Without this
+        // line, the agent's prompt would fall back to the
+        // `Agent::new_shared` default and the LLM would lose its
+        // skill-aware routing.
+        .with_system_prompt(profile.system_prompt.clone())
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -445,6 +456,13 @@ mod tests {
     }
 
     async fn make_profile(data_dir: PathBuf) -> Arc<ProfileRuntime> {
+        make_profile_with_prompt(data_dir, "test-system-prompt".to_string()).await
+    }
+
+    async fn make_profile_with_prompt(
+        data_dir: PathBuf,
+        system_prompt: String,
+    ) -> Arc<ProfileRuntime> {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
@@ -470,6 +488,7 @@ mod tests {
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
+            system_prompt,
             memory,
             memory_store,
             tool_config,
@@ -574,6 +593,34 @@ mod tests {
             "policy file was overwritten; expected sentinel preserved"
         );
         assert_eq!(after, edited);
+    }
+
+    /// M11 regression fix (#891): `SessionRuntime::bootstrap` must
+    /// propagate the parent profile's pre-assembled `system_prompt`
+    /// onto the per-session `Agent`. Without this, `/api/chat` and the
+    /// UI Protocol WS path miss SKILL.md prompt fragments and the
+    /// kimi-k2.5 LLM falls back to a "fm_voice_list precheck" pattern
+    /// instead of going straight to `fm_tts`.
+    #[tokio::test]
+    async fn session_runtime_agent_receives_system_prompt_from_profile() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile_with_prompt(
+            data_dir.clone(),
+            "DISTINCTIVE-PROFILE-PROMPT-789".to_string(),
+        )
+        .await;
+
+        let key = SessionKey::new("api", "system-prompt-probe");
+        let rt = SessionRuntime::bootstrap(&profile, key, None)
+            .await
+            .expect("bootstrap");
+
+        let snapshot = rt.agent.system_prompt_snapshot();
+        assert!(
+            snapshot.contains("DISTINCTIVE-PROFILE-PROMPT-789"),
+            "agent system prompt should inherit the profile-level prompt; got: {snapshot}",
+        );
     }
 
     #[tokio::test]
