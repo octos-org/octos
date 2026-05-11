@@ -39,6 +39,7 @@ use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::profiles::UserProfile;
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
+use crate::runtime::ProfileRuntime;
 use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
@@ -249,41 +250,6 @@ impl GatewayRuntime {
         eprintln!("[gateway] provider={provider_name}");
         println!("{}: {}", "Provider".green(), provider_name);
 
-        // Create LLM provider (reuses the shared create_provider from chat.rs)
-        let base_provider = chat::create_provider(&provider_name, &config, model, base_url)?;
-        eprintln!(
-            "[gateway] LLM provider created, model={}",
-            base_provider.model_id()
-        );
-
-        // Capture the base provider's model_id *before* the adaptive
-        // / retry / swappable wrapping below. Gateway uses this for
-        // `resolve_provider_policy(..., model_id)` and as the
-        // primary key in the sub-provider router. The wrapped
-        // chain's `model_id()` can dispatch through
-        // `AdaptiveRouter::model_id()`, which performs lane selection
-        // and may return a fallback model's id — so we stash the
-        // primary's id here before wrapping.
-        let model_id = base_provider.model_id().to_string();
-
-        // Build the full LLM provider chain + QoS adaptive wiring via
-        // the shared helper. Keep `adaptive_router_ref` typed so we can
-        // hand it to `ActorFactory` further below (and so the helper
-        // can spawn its 30s metrics exporter against it).
-        let bundle = build_adaptive_provider_chain(
-            base_provider,
-            &config,
-            &data_dir,
-            cmd.no_retry,
-            ExporterMode::Spawn,
-        );
-        let adaptive_router_ref: Option<Arc<AdaptiveRouter>> = bundle.adaptive_router;
-        let runtime_qos_catalog = bundle.runtime_qos_catalog;
-
-        // Wrap LLM in SwappableProvider for runtime model switching
-        let swappable = Arc::new(SwappableProvider::new(bundle.llm));
-        let llm: Arc<dyn LlmProvider> = swappable.clone();
-
         // Open ProfileStore for /account commands and bot management.
         // Derive octos_home from: --octos-home flag > data_dir (which already
         // resolves --data-dir > $OCTOS_HOME > ~/.octos).
@@ -298,22 +264,144 @@ impl GatewayRuntime {
 
         let voice_config = config.voice.clone();
 
-        eprintln!("[gateway] opening episode store at {}", data_dir.display());
-        let memory = Arc::new(
-            EpisodeStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open episode store")?,
-        );
-        eprintln!("[gateway] episode store opened");
+        // M11-F gateway consolidation: when the gateway runs in
+        // profile-mode (a `UserProfile` is supplied via `--profile`)
+        // AND no CLI override was passed (`--model` / `--provider` /
+        // `--base-url`), bootstrap a `ProfileRuntime` FIRST and reuse
+        // its LLM provider chain + per-profile state (memory,
+        // memory_store, tool_config). Gateway-specific composition
+        // (`SwappableProvider`, `provider_router`, `SwitchModelTool`,
+        // admin tools, auto-defer, `pipeline_factory`, gateway's full
+        // tool-registry layering) stays as composition on top below.
+        //
+        // Bootstrap must run BEFORE `chat::create_provider` /
+        // `build_adaptive_provider_chain` so we do not build the LLM
+        // chain twice. When bootstrap succeeds, the gateway-side LLM
+        // creation is skipped entirely — `swappable` wraps
+        // `profile_runtime.llm` (already chain-wrapped by bootstrap).
+        // When the inline path runs (no profile, or CLI override),
+        // gateway creates the chain inline as before.
+        //
+        // The non-profile paths (config.json-only / CLI overrides)
+        // can't call `ProfileRuntime::bootstrap` because the bootstrap
+        // is profile-driven by design. Those fall through to the
+        // existing inline LLM assembly.
+        let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
+            resolved_profile.as_ref().filter(|_| !cli_llm_override)
+        {
+            match ProfileRuntime::bootstrap(profile, &data_dir, Some(&effective_octos_home)).await {
+                Ok(rt) => {
+                    info!(
+                        profile_id = %profile.id,
+                        provider = %rt.provider_name,
+                        model = %rt.primary_model_id,
+                        "gateway: using ProfileRuntime::bootstrap for per-profile state",
+                    );
+                    Some(rt)
+                }
+                Err(error) => {
+                    warn!(
+                        profile_id = %profile.id,
+                        %error,
+                        "ProfileRuntime::bootstrap failed; gateway falling back to inline assembly",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        // Initialize memory store
-        eprintln!("[gateway] opening memory store");
-        let memory_store = Arc::new(
-            MemoryStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open memory store")?,
-        );
-        eprintln!("[gateway] memory store opened");
+        // LLM provider chain. Profile-mode (bootstrap succeeded)
+        // reuses `profile_runtime.llm` + `profile_runtime.adaptive_router` +
+        // `profile_runtime.runtime_qos_catalog` — single source of
+        // truth, no second chain built. Non-profile paths construct
+        // the chain inline (the legacy behavior).
+        let (model_id, adaptive_router_ref, runtime_qos_catalog, swappable, llm) = if let Some(rt) =
+            profile_runtime.as_ref()
+        {
+            let swappable = Arc::new(SwappableProvider::new(rt.llm.clone()));
+            let llm: Arc<dyn LlmProvider> = swappable.clone();
+            eprintln!(
+                "[gateway] LLM provider sourced from ProfileRuntime, model={}",
+                rt.primary_model_id,
+            );
+            (
+                rt.primary_model_id.clone(),
+                rt.adaptive_router.clone(),
+                rt.runtime_qos_catalog.clone(),
+                swappable,
+                llm,
+            )
+        } else {
+            // Create LLM provider (reuses the shared create_provider from chat.rs)
+            let base_provider = chat::create_provider(&provider_name, &config, model, base_url)?;
+            eprintln!(
+                "[gateway] LLM provider created, model={}",
+                base_provider.model_id()
+            );
+
+            // Capture the base provider's model_id *before* the adaptive
+            // / retry / swappable wrapping below. Gateway uses this for
+            // `resolve_provider_policy(..., model_id)` and as the
+            // primary key in the sub-provider router. The wrapped
+            // chain's `model_id()` can dispatch through
+            // `AdaptiveRouter::model_id()`, which performs lane selection
+            // and may return a fallback model's id — so we stash the
+            // primary's id here before wrapping.
+            let model_id = base_provider.model_id().to_string();
+
+            // Build the full LLM provider chain + QoS adaptive wiring via
+            // the shared helper. Keep `adaptive_router_ref` typed so we can
+            // hand it to `ActorFactory` further below (and so the helper
+            // can spawn its 30s metrics exporter against it).
+            let bundle = build_adaptive_provider_chain(
+                base_provider,
+                &config,
+                &data_dir,
+                cmd.no_retry,
+                ExporterMode::Spawn,
+            );
+            let adaptive_router_ref: Option<Arc<AdaptiveRouter>> = bundle.adaptive_router;
+            let runtime_qos_catalog = bundle.runtime_qos_catalog;
+
+            // Wrap LLM in SwappableProvider for runtime model switching
+            let swappable = Arc::new(SwappableProvider::new(bundle.llm));
+            let llm: Arc<dyn LlmProvider> = swappable.clone();
+            (
+                model_id,
+                adaptive_router_ref,
+                runtime_qos_catalog,
+                swappable,
+                llm,
+            )
+        };
+
+        let memory: Arc<EpisodeStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.memory.clone()
+        } else {
+            eprintln!("[gateway] opening episode store at {}", data_dir.display());
+            let store = Arc::new(
+                EpisodeStore::open(&data_dir)
+                    .await
+                    .wrap_err("failed to open episode store")?,
+            );
+            eprintln!("[gateway] episode store opened");
+            store
+        };
+
+        let memory_store: Arc<MemoryStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.memory_store.clone()
+        } else {
+            eprintln!("[gateway] opening memory store");
+            let store = Arc::new(
+                MemoryStore::open(&data_dir)
+                    .await
+                    .wrap_err("failed to open memory store")?,
+            );
+            eprintln!("[gateway] memory store opened");
+            store
+        };
 
         // Derive project_dir from octos_home (when launched by process_manager)
         // or fall back to cwd/.octos (standalone octos gateway / octos chat mode).
@@ -351,41 +439,33 @@ impl GatewayRuntime {
             };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // M11-D Part 2 scope deferral: the supervisor's mandate was to
-        // delete gateway's inline assembly and replace it with a single
-        // `ProfileRuntime::bootstrap` call. Two structural blockers
-        // forced a smaller scope:
+        // M11-F gateway consolidation note:
         //
-        //   1. Gateway holds open the per-profile `EpisodeStore` /
-        //      `MemoryStore` / `ToolConfigStore` (redb locks). Calling
-        //      bootstrap here AND running the surviving inline assembly
-        //      would lock-conflict on the same redb file.
-        //   2. Gateway's tool registry layers `SwappableProvider` +
-        //      `provider_router` + `SwitchModelTool` + admin tools +
-        //      auto-defer + a custom base-tool pin set + `run_pipeline`
-        //      synthesis config + per-session pipeline_factory on top
-        //      of the profile-floor registry. Threading these through a
-        //      `snapshot_excluding(&[])` clone of bootstrap's
-        //      `Arc<ToolRegistry>` is mechanically straightforward but
-        //      bumps the diff well past the 1k-line budget, since every
-        //      downstream consumer (ActorFactory, profile_factory_builder,
-        //      DefaultPipelineToolFactory) reads gateway-only locals
-        //      that have to be re-derived from `profile_runtime.*` fields.
+        // Profile-mode (above) replaces gateway's per-profile assembly
+        // with `ProfileRuntime::bootstrap` outputs:
+        //   - LLM chain reused from `profile_runtime.llm`; no second
+        //     `chat::create_provider` + `build_adaptive_provider_chain`.
+        //   - redb stores (`EpisodeStore` / `MemoryStore` /
+        //     `ToolConfigStore`) reused as `Arc`s.
+        //   - Base `ToolRegistry` snapshotted from
+        //     `profile_runtime.tool_specs.snapshot_excluding(&[])` and
+        //     cwd-rebound (so plugins are NOT re-loaded by gateway).
+        //   - `plugin_result` is synthesized from `profile_runtime`
+        //     fields (`plugin_tool_names`, `plugin_hooks`,
+        //     `plugin_prompt_fragments`) so downstream wiring sees
+        //     the same shape as the inline path.
         //
-        // Decision: ship Part 1 (self-contained bootstrap) + Part 3
-        // (AppState refactor — the supervisor's primary deliverable
-        // since it's what unblocks yangmi via `SessionRuntime::bootstrap`)
-        // in this PR. Gateway's inline assembly stays; a follow-up PR
-        // wires `ProfileRuntime::bootstrap` through gateway by carrying
-        // the `Arc<ProfileRuntime>` into the factory builder and
-        // collapsing the duplicate work. The byte-identical constraint
-        // is honored as a side-effect — gateway's startup logs and
-        // observable behavior do not change.
+        // Gateway-specific composition stacks ON TOP — gateway
+        // architecture, not redundant assembly: `SwappableProvider`,
+        // `provider_router`, `SwitchModelTool`, gateway top-level MCP,
+        // admin tools, auto-defer, `pipeline_factory`,
+        // `ManageSkillsTool`, `SynthesizeResearchTool`,
+        // `ActivateToolsTool`, base-tool pin extension for gateway-
+        // only tools.
         //
-        // The `cli_llm_override` local is consumed below by the inline
-        // assembly's provider-name resolution; suppress the unused
-        // warning explicitly so the deferral is documented in-tree.
-        let _ = cli_llm_override;
+        // Non-profile paths (config.json-only / CLI overrides) keep
+        // the existing inline assembly because `ProfileRuntime::bootstrap`
+        // is profile-driven by design.
 
         // Customer-installed skills are strictly account-scoped.
         let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
@@ -414,12 +494,20 @@ impl GatewayRuntime {
         ));
         heartbeat_service.start();
 
-        // Build tool registry — admin mode gets only admin API tools + messaging
-        let tool_config = Arc::new(
-            octos_agent::ToolConfigStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open tool config store")?,
-        );
+        // M11-F: reuse the `ToolConfigStore` opened by
+        // `ProfileRuntime::bootstrap` when profile-mode took the
+        // bootstrap path; otherwise (config-mode / CLI-override path)
+        // open it inline as before.
+        let tool_config: Arc<octos_agent::ToolConfigStore> =
+            if let Some(rt) = profile_runtime.as_ref() {
+                rt.tool_config.clone()
+            } else {
+                Arc::new(
+                    octos_agent::ToolConfigStore::open(&data_dir)
+                        .await
+                        .wrap_err("failed to open tool config store")?,
+                )
+            };
         let profile_search_keys = resolved_profile
             .as_ref()
             .map(profile_search_provider_keys)
@@ -467,85 +555,152 @@ impl GatewayRuntime {
         let mut sandbox_config = config.sandbox.clone();
         let plugin_dirs_for_spawn: Vec<std::path::PathBuf>;
         {
-            // Full tool registration for all modes.
-            // Populate read_allow_paths so the shell sandbox restricts reads to
-            // this profile's data_dir (via cwd) + shared octos home (project_dir).
-            // Without this, macOS SBPL defaults to (allow file-read*) which lets
-            // the shell read any file on disk, including other profiles' data.
             if sandbox_config.read_allow_paths.is_empty() {
                 sandbox_config
                     .read_allow_paths
                     .push(project_dir.to_string_lossy().into_owned());
             }
-            let sandbox = octos_agent::create_sandbox(&sandbox_config);
-            tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
-            tools.set_output_dir_hint(data_dir.join("skill-output").to_string_lossy().to_string());
-            tools.inject_tool_config(tool_config.clone());
-            if !profile_search_keys.is_empty() {
-                tools.register(
-                    octos_agent::WebSearchTool::new()
-                        .with_config(tool_config.clone())
-                        .with_provider_keys(profile_search_keys.clone()),
-                );
-            }
 
-            // Override browser tool with configured timeout (replaces default 300s)
-            if let Some(secs) = gw_config.browser_timeout_secs {
-                tools.register(
-                    octos_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
+            if let Some(rt) = profile_runtime.as_ref() {
+                // M11-F profile-mode consolidation: snapshot the base
+                // ToolRegistry from `ProfileRuntime::tool_specs` (which
+                // already has builtins + profile WebSearch keys + browser
+                // timeout + MCP + plugins + memory bank tools + base-tool
+                // pin + profile tool_policy applied). Gateway-specific
+                // layers (provider_router, ManageSkillsTool,
+                // SynthesizeResearchTool, SwitchModelTool, run_pipeline
+                // factory, admin tools, auto-defer) stack ON TOP — they
+                // are NOT duplicated inside `ProfileRuntime::bootstrap`.
+                //
+                // Plugin discovery (`PluginLoader::load_into_with_options`)
+                // is intentionally NOT re-run here — bootstrap already
+                // ran it once and surfaced the results on
+                // `rt.plugin_tool_names` / `rt.plugin_prompt_fragments` /
+                // `rt.plugin_hooks` / `rt.plugin_dirs`. The skill MCP
+                // servers were also started by bootstrap, and the
+                // gateway-specific `config.mcp_servers` MCP servers are
+                // started inline below. Re-running PluginLoader here
+                // would double-spawn plugin processes and double-register
+                // tool entries — codex BLOCK round 1 fix.
+                tools = rt.tool_specs.snapshot_excluding(&[]);
+                // Rebind cwd onto the snapshotted registry — bootstrap
+                // builds against `data_dir`, gateway runs against `cwd`.
+                let sandbox_for_rebind = octos_agent::create_sandbox(&sandbox_config);
+                tools = tools.rebind_cwd(&cwd, sandbox_for_rebind);
+                tools.set_output_dir_hint(
+                    data_dir.join("skill-output").to_string_lossy().to_string(),
+                );
+                tools.inject_tool_config(tool_config.clone());
+
+                // Override browser tool with gateway-configured timeout
+                // (bootstrap wires it from `profile.config.gateway.browser_timeout_secs`,
+                // so this branch only re-runs when `gw_config` carries an
+                // override; the no-op case is harmless).
+                if let Some(secs) = gw_config.browser_timeout_secs {
+                    tools.register(
+                        octos_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(
+                            secs,
+                        ))
                         .with_config(tool_config.clone()),
+                    );
+                }
+
+                // Gateway-specific top-level MCP servers (separate from
+                // the per-profile / skill MCP servers bootstrap already
+                // started against the profile's data dir).
+                if !config.mcp_servers.is_empty() {
+                    match octos_agent::McpClient::start(&config.mcp_servers).await {
+                        Ok(client) => client.register_tools(&mut tools),
+                        Err(e) => warn!("gateway MCP initialization failed: {e}"),
+                    }
+                }
+
+                // Synthesize `plugin_result` from the bootstrap's
+                // recorded outputs so downstream gateway wiring (system
+                // prompt fragments, hook executor merge, base-tool pin
+                // set extension) sees the same shape it always did.
+                plugin_result = octos_agent::PluginLoadResult {
+                    tool_count: rt.plugin_tool_names.len(),
+                    tool_names: rt.plugin_tool_names.clone(),
+                    mcp_servers: Vec::new(),
+                    hooks: rt.plugin_hooks.clone(),
+                    prompt_fragments: rt.plugin_prompt_fragments.clone(),
+                };
+                plugin_dirs_for_spawn = rt.plugin_dirs.clone();
+            } else {
+                // Non-profile / CLI-override path: full inline assembly
+                // as before. Bootstrap can't run here (no UserProfile),
+                // so gateway is the sole owner of the registry build.
+                let sandbox = octos_agent::create_sandbox(&sandbox_config);
+                tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+                tools.set_output_dir_hint(
+                    data_dir.join("skill-output").to_string_lossy().to_string(),
                 );
-            }
-
-            // Register MCP tools
-            if !config.mcp_servers.is_empty() {
-                match octos_agent::McpClient::start(&config.mcp_servers).await {
-                    Ok(client) => client.register_tools(&mut tools),
-                    Err(e) => warn!("MCP initialization failed: {e}"),
+                tools.inject_tool_config(tool_config.clone());
+                if !profile_search_keys.is_empty() {
+                    tools.register(
+                        octos_agent::WebSearchTool::new()
+                            .with_config(tool_config.clone())
+                            .with_provider_keys(profile_search_keys.clone()),
+                    );
                 }
-            }
 
-            // Load plugins with a dedicated work directory for output files
-            let plugin_work_dir = data_dir.join("skill-output");
-            let mut plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
-            // Include bundled app-skills and platform skills (bootstrapped into project_dir)
-            let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
-            if bundled_dir.exists() && !plugin_dirs.contains(&bundled_dir) {
-                plugin_dirs.push(bundled_dir);
-            }
-            let platform_dir = project_dir.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
-            if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
-                plugin_dirs.push(platform_dir);
-            }
-            plugin_result = octos_agent::PluginLoadResult::default();
-            if !plugin_dirs.is_empty() {
-                // S2 plumbing: pass the agent's current provider config so
-                // plugins like deep_search can synthesize via host-injected
-                // args instead of the operator's plist `EnvironmentVariables`.
-                let synthesis_config = build_synthesis_config(&config, &provider_name);
-                match octos_agent::PluginLoader::load_into_with_options(
-                    &mut tools,
-                    &plugin_dirs,
-                    &plugin_env,
-                    octos_agent::PluginLoadOptions {
-                        work_dir: Some(&plugin_work_dir),
-                        synthesis_config,
-                    },
-                ) {
-                    Ok(result) => plugin_result = result,
-                    Err(e) => warn!("plugin loading failed: {e}"),
+                if let Some(secs) = gw_config.browser_timeout_secs {
+                    tools.register(
+                        octos_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(
+                            secs,
+                        ))
+                        .with_config(tool_config.clone()),
+                    );
                 }
-            }
 
-            // Start MCP servers declared in skill manifests
-            if !plugin_result.mcp_servers.is_empty() {
-                match octos_agent::McpClient::start(&plugin_result.mcp_servers).await {
-                    Ok(client) => client.register_tools(&mut tools),
-                    Err(e) => warn!("skill MCP initialization failed: {e}"),
+                if !config.mcp_servers.is_empty() {
+                    match octos_agent::McpClient::start(&config.mcp_servers).await {
+                        Ok(client) => client.register_tools(&mut tools),
+                        Err(e) => warn!("MCP initialization failed: {e}"),
+                    }
                 }
+
+                let plugin_work_dir = data_dir.join("skill-output");
+                let mut plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
+                let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+                if bundled_dir.exists() && !plugin_dirs.contains(&bundled_dir) {
+                    plugin_dirs.push(bundled_dir);
+                }
+                let platform_dir = project_dir.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
+                if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
+                    plugin_dirs.push(platform_dir);
+                }
+                plugin_result = octos_agent::PluginLoadResult::default();
+                if !plugin_dirs.is_empty() {
+                    let synthesis_config = build_synthesis_config(&config, &provider_name);
+                    match octos_agent::PluginLoader::load_into_with_options(
+                        &mut tools,
+                        &plugin_dirs,
+                        &plugin_env,
+                        octos_agent::PluginLoadOptions {
+                            work_dir: Some(&plugin_work_dir),
+                            synthesis_config,
+                        },
+                    ) {
+                        Ok(result) => plugin_result = result,
+                        Err(e) => warn!("plugin loading failed: {e}"),
+                    }
+                }
+
+                if !plugin_result.mcp_servers.is_empty() {
+                    match octos_agent::McpClient::start(&plugin_result.mcp_servers).await {
+                        Ok(client) => client.register_tools(&mut tools),
+                        Err(e) => warn!("skill MCP initialization failed: {e}"),
+                    }
+                }
+                plugin_dirs_for_spawn = plugin_dirs;
             }
 
-            // Apply tool policy from config
+            // Apply tool policy from config (idempotent — bootstrap
+            // already ran this on the profile path; re-applying here
+            // catches new tools registered by gateway-only branches
+            // above e.g. the browser timeout override).
             if let Some(ref policy) = config.tool_policy {
                 tools.apply_policy(policy);
             }
@@ -723,7 +878,7 @@ impl GatewayRuntime {
                 let mem_c = memory.clone();
                 let data_c = data_dir.clone();
                 let policy_c = tools.provider_policy().cloned();
-                let plugins_c = plugin_dirs.clone();
+                let plugins_c = plugin_dirs_for_spawn.clone();
                 let router_c = provider_router.clone();
                 let octos_home_c = cmd.octos_home.clone();
 
@@ -781,7 +936,6 @@ impl GatewayRuntime {
                 config.clone(),
                 cmd.profile.clone(),
             ));
-            plugin_dirs_for_spawn = plugin_dirs;
         }
 
         // admin_mode adds admin API tools on top of the full tool set

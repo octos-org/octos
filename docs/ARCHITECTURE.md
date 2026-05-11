@@ -1275,15 +1275,15 @@ Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summari
 
 ### Runtime Types: ProfileRuntime / SessionRuntime (M11)
 
-Status: **PROPOSED** as of 2026-05-10. See `docs/M11-PROFILE-SESSION-RUNTIME-ADR.md` and `workstreams/M11-runtime-unification.md`. This subsection documents the target shape; the legacy `state.agent: Option<Arc<Agent>>` path is removed during M11-D / M11-F.
+Status: **LANDED** as of 2026-05-11 (M11-A → M11-F). See `docs/M11-PROFILE-SESSION-RUNTIME-ADR.md` and `workstreams/M11-runtime-unification.md`. The legacy server-wide embedded `Agent` and the transient `Config` overlay it depended on were deleted in M11-F.
 
 Two first-class runtime types make profile scope and session scope explicit:
 
 | Type | Cardinality | Owns |
 |---|---|---|
-| `ProfileRuntime` | One per profile per host process | `llm`, `adaptive_router`, `credentials`, `skills_dir`, `plugin_env_template`, `tool_policy`, `default_sandbox`, `tool_specs` (base, no workspace), `memory`, `memory_store` |
+| `ProfileRuntime` | One per profile per host process | `llm`, `adaptive_router`, `credentials`, `skills_dir`, `plugin_env_template`, `tool_policy`, `default_sandbox`, `tool_specs` (base, no workspace), `memory`, `memory_store`, `tool_config` |
 | `SessionRuntime` | One per `(profile_id, session_key)` | `profile: Arc<ProfileRuntime>`, `workspace_root`, `plugin_work_dir`, `sandbox` (override), `tools` (cloned + workspace-bound + policy-filtered), `agent`, `sessions: SessionManager` |
-| `SessionRuntimeCache` | One per host process | TTL/LRU `HashMap<(String, SessionKey), Arc<SessionRuntime>>` |
+| `SessionRuntimeCache` | One per host process | TTL/LRU + single-flight `HashMap<(String, SessionKey), Arc<SessionRuntime>>` |
 
 **Scope contract.** Anything that varies between two chats opened by the same logged-in user is session-scope. Anything that's an account property is profile-scope.
 
@@ -1299,21 +1299,27 @@ Two first-class runtime types make profile scope and session scope explicit:
 | Agent instance | Session | `SessionRuntime.agent` |
 | Conversation history | Session | `SessionRuntime.sessions` (per-session `SessionManager`) |
 
+**Workspace cwd resolution order (Tier-1 / Tier-2 / Tier-3).** On `session.open` the UI Protocol dispatcher resolves the per-session workspace in this order, passing the winning value as `workspace_hint` into `SessionRuntimeCache::get_or_init`:
+
+1. **Tier-1** — client-supplied `cwd` from the `session.workspace_cwd.v1` capability. Validated via `validate_session_workspace_allowed` (banned system roots; profile must be registered).
+2. **Tier-2** — operator-configured `appui.default_session_cwd` (mirrored on `AppState::appui_default_session_cwd`). Honored when the client did not advertise the v1 capability or did not send a cwd. Re-introduced in M11-F (M11-E's `clone_session_tools` deletion temporarily took it out).
+3. **Tier-3** — `SessionRuntime::bootstrap`'s own default: `<profile.data_dir>/users/<encoded session base>/workspace/`. Always applies when neither Tier-1 nor Tier-2 produced a hint.
+
 **Bootstrap chain.** On first message in a session:
-1. `state.profiles[profile_id]` resolves the `Arc<ProfileRuntime>`.
-2. `state.sessions.get_or_init(profile, session_key, workspace_hint)`:
+1. `state.profiles[profile_id]` resolves the `Arc<ProfileRuntime>`. An unregistered profile returns 503 — there is no longer a server-wide fallback.
+2. `state.session_cache.get_or_init(profile, session_key, workspace_hint)`:
    - Cache miss → `SessionRuntime::bootstrap`:
-     1. Resolve `workspace_root` from hint or auto-derive `<profile.data_dir>/users/<key>/workspace/`.
+     1. Resolve `workspace_root` from `workspace_hint` (Tier-1/Tier-2, validated) or auto-derive Tier-3.
      2. Write default `WorkspacePolicy::for_session()` to `<workspace_root>/.octos-workspace.toml` if missing (idempotent).
      3. Compute `plugin_work_dir = <workspace_root>/skill-output`.
-     4. Clone `profile.tool_specs`; apply `set_workspace_root` + `set_output_dir_hint` + per-session policy filter.
+     4. Clone `profile.tool_specs`; rebind `cwd` + `set_output_dir_hint` + per-session policy filter.
      5. Build `Agent` from `profile.llm` + cloned tools.
      6. Open per-session `SessionManager` at `<profile.data_dir>/users/<key>/`.
    - Cache hit → return existing `Arc<SessionRuntime>`.
 
-**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and each `ProcessManager`-spawned gateway subprocess call `ProfileRuntime::bootstrap`. The gateway's bus loop continues to use the returned `ProfileRuntime`'s fields for per-channel session actors.
+**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and the `ProcessManager`-spawned `octos gateway` subprocess call `ProfileRuntime::bootstrap` for per-profile state (memory, memory_store, tool_config, credentials, plugin env). Gateway-specific composition (`SwappableProvider`, `provider_router`, `SwitchModelTool`, admin tools, auto-defer, `pipeline_factory`, gateway tool-registry layering) stays as composition ON TOP of the profile runtime — nothing duplicates the LLM/credentials/skills/plugin assembly the runtime owns.
 
-**Why this exists.** Before M11, `octos serve` ran a server-wide embedded `Agent` constructed by `commands/serve.rs::try_create_agent`. The agent had no notion of profile or session scope. A series of PRs (#866 / #867 / #868 / #869, all 2026-05-10) retrofitted profile awareness one transient `Config` field at a time. The pattern was clearly leaking architecture; M11 replaces the embedded agent with the two-scope model. See the ADR for the full incident trail.
+**Why this exists.** Before M11, `octos serve` ran a server-wide embedded `Agent` constructed by a no-longer-present `try_create_agent`. The agent had no notion of profile or session scope. A series of PRs (#866 / #867 / #868 / #869, all 2026-05-10) retrofitted profile awareness one transient `Config` field at a time. M11 replaced the embedded agent with the two-scope model and M11-F deleted the last of the overlay machinery. See the ADR for the full incident trail.
 
 ---
 

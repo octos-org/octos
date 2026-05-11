@@ -11,12 +11,12 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
-use octos_agent::{Agent, inspect_workspace_contract};
+use octos_agent::inspect_workspace_contract;
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, SessionKey};
+use octos_core::{MAIN_PROFILE_ID, Message, SessionKey};
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
@@ -338,36 +338,6 @@ pub async fn chat(
     }
 }
 
-fn validate_chat_request(
-    state: &AppState,
-    req: &ChatRequest,
-) -> Result<
-    (
-        Arc<Agent>,
-        Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
-    ),
-    (StatusCode, String),
-> {
-    let agent = state.agent.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "No LLM provider configured. Set up a profile with an API key first.".into(),
-    ))?;
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-
-    if req.message.len() > MAX_MESSAGE_LEN {
-        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
-        ));
-    }
-
-    Ok((agent.clone(), sessions.clone()))
-}
-
 /// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
 /// invalidate the `SessionManager` LRU cache for the key.
 ///
@@ -429,63 +399,34 @@ async fn chat_sync(
         "chat: processing message"
     );
 
-    // M11-D: prefer the new per-profile `ProfileRuntime` +
-    // `SessionRuntime` path so the agent dispatches against this
-    // session's workspace-bound tool registry (with the
-    // per-session `.octos-workspace.toml` bootstrapped by
-    // `SessionRuntime::bootstrap`). Falls back to the legacy
-    // server-wide `state.agent` when no profile is registered for
-    // the routed id — the dashboard-only / setup-wizard flow when
-    // no profile has a usable LLM selection yet.
-    if let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() {
-        return chat_sync_via_session_runtime(state, profile_runtime, session_key, req).await;
-    }
-
-    // Legacy server-wide path. M11-E migrates the remaining UI-Protocol
-    // dispatchers; once that lands the legacy agent / sessions fields
-    // can be removed alongside `try_create_agent`.
-    let (agent, sessions) = validate_chat_request(&state, &req)?;
-
-    let history: Vec<Message> = {
-        let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&session_key).await;
-        session.get_history(50).to_vec()
+    // M11-F: every read path resolves through `state.profiles` +
+    // `state.session_cache`. An unregistered profile is a configuration
+    // bug, not a runtime fallback — `octos serve` bootstraps every
+    // profile in `ProfileStore::list()` at startup, so if a profile id
+    // arrives at `/api/chat` that the catalog doesn't know about, it
+    // means the request routed against a profile that failed (or never
+    // had) bootstrap. Fail closed with 503 rather than silently fall
+    // through to a server-wide agent (which M11-F removed).
+    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "No LLM provider configured for profile '{profile_id}'. \
+                 Set up the profile with an API key in the dashboard.",
+            ),
+        ));
     };
-
-    let response = agent
-        .process_message(&req.message, &history, vec![])
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "chat: LLM processing failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    tracing::info!(
-        input_tokens = response.token_usage.input_tokens,
-        output_tokens = response.token_usage.output_tokens,
-        "chat: response generated"
-    );
-
-    // Save all conversation messages to the canonical per-user JSONL.
-    for msg in &response.messages {
-        let _ = persist_chat_message_through_canonical(&sessions, &session_key, msg.clone()).await;
-    }
-
-    Ok(Json(ChatResponse {
-        content: response.content,
-        input_tokens: response.token_usage.input_tokens,
-        output_tokens: response.token_usage.output_tokens,
-    }))
+    chat_sync_via_session_runtime(state, profile_runtime, session_key, req).await
 }
 
-/// M11-D `/api/chat` dispatcher: resolves the per-session
+/// `/api/chat` dispatcher: resolves the per-session
 /// [`crate::runtime::SessionRuntime`] from the cache (constructing it
 /// on first use), runs the agent against the session-bound workspace,
 /// and persists the response through the canonical per-user JSONL.
 ///
-/// Splitting this out keeps the legacy fallback in `chat_sync`
-/// readable; both paths end up calling the same
-/// `persist_chat_message_through_canonical` helper.
+/// M11-F: the only `/api/chat` path. The legacy server-wide
+/// `state.agent` fallback was removed; unregistered profile → 503 in
+/// the caller.
 async fn chat_sync_via_session_runtime(
     state: Arc<AppState>,
     profile_runtime: Arc<crate::runtime::ProfileRuntime>,
@@ -2657,11 +2598,13 @@ pub struct StatusResponse {
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
-    let (model, provider) = match &state.agent {
-        Some(agent) => (
-            agent.model_id().to_string(),
-            agent.provider_name().to_string(),
-        ),
+    // M11-F: surface a profile-aware status. The legacy server-wide
+    // `state.agent` was removed; report the canonical "_main" profile
+    // when present, falling back to "none" so the dashboard can still
+    // render an unconfigured-server placeholder.
+    let main_runtime = state.profiles.get(octos_core::MAIN_PROFILE_ID).cloned();
+    let (model, provider) = match &main_runtime {
+        Some(rt) => (rt.primary_model_id.clone(), rt.provider_name.clone()),
         None => ("none".to_string(), "none".to_string()),
     };
     let base_domain = state
@@ -2673,7 +2616,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         model,
         provider,
         uptime_secs: uptime.num_seconds(),
-        agent_configured: state.agent.is_some(),
+        agent_configured: main_runtime.is_some() || !state.profiles.is_empty(),
         base_domain,
     })
 }
@@ -2811,32 +2754,52 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else if let Ok((agent, sessions)) = validate_chat_request(
-                    &state,
-                    &ChatRequest {
-                        message: content.clone(),
-                        session_id: Some(session_id.clone()),
-                        topic: None,
-                        stream: true,
-                        media: media.clone(),
-                        attach_only: false,
-                        client_message_id: None,
-                    },
-                ) {
-                    // Standalone agent mode — run the agent directly.
+                } else {
+                    // M11-F: standalone (non-gateway) mode now routes through
+                    // the per-profile `ProfileRuntime` + per-session
+                    // `SessionRuntime` cache instead of the deleted
+                    // `state.agent` legacy field. We resolve the profile id
+                    // from the request headers (matching what `chat_sync`
+                    // does), pull the `ProfileRuntime` out of `state.profiles`,
+                    // and ask the cache for the per-session view.
+                    let profile_id = api_profile_id_from_headers(&state, &headers);
+                    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": format!(
+                                "No LLM provider configured for profile '{profile_id}'. \
+                                 Set up the profile with an API key in the dashboard.",
+                            ),
+                        });
+                        let _ = send_ws(&ws_tx, &err.to_string()).await;
+                        continue;
+                    };
+                    let session_key =
+                        SessionKey::with_profile(&profile_runtime.profile_id, "api", &session_id);
+                    let session_runtime = match state
+                        .session_cache
+                        .get_or_init(&profile_runtime, session_key.clone(), None)
+                        .await
+                    {
+                        Ok(rt) => rt,
+                        Err(error) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": format!(
+                                    "failed to bootstrap session runtime: {error}"
+                                ),
+                            });
+                            let _ = send_ws(&ws_tx, &err.to_string()).await;
+                            continue;
+                        }
+                    };
                     let ws_tx2 = ws_tx.clone();
                     let _abort_ref = abort_handle.clone();
                     let handle = tokio::spawn(async move {
-                        ws_standalone_agent(ws_tx2, agent, sessions, &session_id, &content, media)
+                        ws_standalone_agent(ws_tx2, session_runtime, &session_id, &content, media)
                             .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": "No LLM provider configured",
-                    });
-                    let _ = send_ws(&ws_tx, &err.to_string()).await;
                 }
             }
             WsClientMsg::Abort => {
@@ -2935,15 +2898,22 @@ async fn ws_proxy_to_gateway(
 }
 
 /// Run the standalone agent for a WebSocket request and stream events back.
+///
+/// M11-F: takes a `SessionRuntime` (sourced from `state.session_cache`)
+/// instead of the deleted server-wide `state.agent`. The runtime carries
+/// the per-session workspace-bound tool registry, the profile's LLM, the
+/// agent's config/system-prompt snapshot, and the per-session
+/// `SessionManager`.
 async fn ws_standalone_agent(
     ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
-    base_agent: Arc<Agent>,
-    sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session_runtime: Arc<crate::runtime::SessionRuntime>,
     session_id: &str,
     message: &str,
     media: Vec<String>,
 ) {
-    let session_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id);
+    let profile_id = session_runtime.profile.profile_id.clone();
+    let session_key = SessionKey::with_profile(&profile_id, "api", session_id);
+    let sessions = session_runtime.sessions.clone();
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -2957,8 +2927,9 @@ async fn ws_standalone_agent(
         Arc::new(ChannelReporter::new(tx.clone())),
     ));
 
-    let request_agent = Agent::new_shared(
-        AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
+    let base_agent = session_runtime.agent.clone();
+    let request_agent = octos_agent::Agent::new_shared(
+        octos_core::AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
         base_agent.llm_provider(),
         base_agent.tool_registry().clone(),
         base_agent.memory_store(),
@@ -2969,7 +2940,7 @@ async fn ws_standalone_agent(
 
     let message = message.to_string();
     let session_id = session_id.to_string();
-    let session_key2 = SessionKey::with_profile(MAIN_PROFILE_ID, "api", &session_id);
+    let session_key2 = SessionKey::with_profile(&profile_id, "api", &session_id);
 
     // Spawn the agent task
     tokio::spawn(async move {
@@ -4530,6 +4501,7 @@ mod tests {
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
             memory,
             memory_store,
             tool_config,
@@ -4598,13 +4570,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_falls_back_to_legacy_agent_when_profile_not_registered() {
-        // Symmetric verification: when the routed profile is NOT in
-        // `state.profiles`, `chat_sync` must use the legacy
-        // `validate_chat_request` path. We exercise this by leaving
-        // `state.agent` unset — the handler must return 503 SERVICE
-        // UNAVAILABLE instead of panicking or routing through the
-        // empty profile catalog.
+    async fn chat_returns_503_when_routed_profile_not_registered() {
+        // M11-F: the legacy `state.agent` fallback was deleted; an
+        // unregistered profile is a configuration bug, not a runtime
+        // fallback. `octos serve` bootstraps every profile in
+        // `ProfileStore::list()` at startup, so a request that lands on
+        // a profile id missing from `state.profiles` must fail closed
+        // with 503 SERVICE UNAVAILABLE (and a body that names the
+        // offending profile so operators can investigate).
         let state = Arc::new(AppState::empty_for_tests());
         let req = ChatRequest {
             message: "ping".to_string(),
@@ -4617,9 +4590,16 @@ mod tests {
         };
 
         let result = chat_sync(state, HeaderMap::new(), req).await;
-        let (status, _msg) = result
+        let (status, msg) = result
             .err()
-            .expect("expected 503 when no agent + no profiles");
+            .expect("expected 503 when profile not registered");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The error must name the missing profile so the operator log
+        // surfaces the misrouted-request shape (not an opaque "no
+        // provider" message that pre-M11-F's legacy path returned).
+        assert!(
+            msg.contains(MAIN_PROFILE_ID),
+            "503 message must name the unregistered profile (got: {msg})",
+        );
     }
 }

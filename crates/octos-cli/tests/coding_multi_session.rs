@@ -206,6 +206,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         plugin_tool_names: Vec::new(),
         plugin_dirs: Vec::new(),
         plugin_prompt_fragments: Vec::new(),
+        plugin_hooks: Vec::new(),
         memory,
         memory_store,
         tool_config,

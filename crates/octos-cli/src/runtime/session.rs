@@ -141,11 +141,12 @@ impl SessionRuntime {
     /// 5. Resolve `sandbox` from `profile.default_sandbox` (M11
     ///    default; per-session overrides are a future workstream).
     /// 6. Build the per-session [`Agent`] from `profile.llm` plus
-    ///    the cloned tools. Mirrors the `Agent::new(...)` + `.with_*`
-    ///    chain in `commands/serve.rs::try_create_agent` for the
-    ///    parts that do not require AppState-derived plumbing
-    ///    (broadcaster/MetricsReporter/HookExecutor/system prompt
-    ///    fragments live in M11-D).
+    ///    the cloned tools. The `Agent::new(...)` + `.with_*` chain
+    ///    here is the only per-session agent constructor — the
+    ///    pre-M11-F serve-side server-wide agent was deleted.
+    ///    AppState-derived plumbing (broadcaster/MetricsReporter/
+    ///    HookExecutor/system prompt fragments) layers on at the
+    ///    dispatcher (UI Protocol / `/api/chat`).
     /// 7. Open the [`SessionManager`] via
     ///    `SessionManager::open(&profile.data_dir)` — the canonical
     ///    JSONL session store namespaces on-disk files by
@@ -234,11 +235,13 @@ impl SessionRuntime {
 
         let tools = Arc::new(tools);
 
-        // Step 5: build the per-session Agent. The pieces here mirror
-        // the M11-equivalent slice of `try_create_agent`. AppState-
-        // derived wiring (broadcaster-backed MetricsReporter, hooks,
-        // skill prompt fragments) is layered on in M11-D when the
-        // dispatcher resolves the SessionRuntime per request.
+        // Step 5: build the per-session Agent. This is the only
+        // per-session agent constructor (M11-F deleted the legacy
+        // serve-side server-wide agent). AppState-derived wiring
+        // (broadcaster-backed MetricsReporter, hooks, skill prompt
+        // fragments) layers on at the dispatcher (UI Protocol /
+        // `/api/chat`) when it resolves the SessionRuntime per
+        // request.
         //
         // Crucially, we hand the agent the SAME `Arc<ToolRegistry>`
         // the SessionRuntime holds (via `Agent::new_shared`). This is
@@ -466,6 +469,7 @@ mod tests {
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
             memory,
             memory_store,
             tool_config,

@@ -33,30 +33,25 @@
 //! coding-agent N-isolated-sessions, multi-TUI, gateway subprocess),
 //! and the end-state acceptance checklist.
 //!
-//! # What this replaces
+//! # Consolidation history
 //!
-//! When fully landed (M11-B/M11-C/M11-D), these types subsume:
+//! M11-F finished the single-agent → profile-aware consolidation.
+//! The pre-M11 entry points each ran their own ad-hoc per-profile
+//! assembly; both `octos serve` and `octos gateway` now call
+//! [`ProfileRuntime::bootstrap`] as the single per-profile
+//! assembler. Per-session state — workspace_root, the workspace-
+//! bound tool registry, the per-session Agent, the per-session
+//! SessionManager — lives on [`SessionRuntime`] and is materialized
+//! on demand via [`SessionRuntimeCache::get_or_init`].
 //!
-//! - `crate::commands::serve::try_create_agent` — the embedded
-//!   server-wide agent constructor. Becomes
-//!   [`SessionRuntime::bootstrap`].
-//! - `crate::commands::serve::overlay_profile_llm` (+ the companion
-//!   `populate_profile_credentials`) — the transient per-request
-//!   `Config` overlay that retrofits profile awareness onto a globally
-//!   scoped `Agent`. Becomes [`ProfileRuntime::bootstrap`].
-//! - The per-profile bootstrap block in
-//!   `crate::commands::gateway::gateway_runtime::run` (today roughly
-//!   the LLM/QoS/credentials/skills/plugin/registry assembly between
-//!   the bus startup and the actor-factory wiring). Becomes
-//!   [`ProfileRuntime::bootstrap`] — gateway calls the same helper
-//!   serve calls.
-//!
-//! # M11-A scope (this commit)
-//!
-//! Type signatures only. Function bodies are `todo!("M11-B implements
-//! this")` or `todo!("M11-C implements this")`. Downstream workers
-//! implement against the doc comments, not the bodies. The skeleton
-//! must `cargo check` clean but makes no runtime decisions.
+//! Every `/api/chat` and UI Protocol turn dispatcher resolves
+//! through `state.profiles` + `state.session_cache` and fails
+//! closed (503) on an unregistered profile — there is no server-
+//! wide agent fallback. Gateway layers its gateway-specific
+//! composition (`SwappableProvider`, `provider_router`,
+//! `SwitchModelTool`, admin tools, auto-defer, `pipeline_factory`)
+//! on top of the profile runtime; nothing duplicates the LLM/
+//! credentials/skills/plugin/registry assembly the runtime owns.
 
 pub mod cache;
 pub mod profile;

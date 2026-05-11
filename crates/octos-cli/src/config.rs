@@ -181,62 +181,17 @@ pub struct Config {
     #[serde(default)]
     pub content_routing: Option<octos_llm::RoutingConfig>,
 
-    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by the
-    /// API agent inside `octos serve`. Operators can anchor every AppUi
-    /// session that does not advertise the `session.workspace_cwd.v1`
-    /// capability to a chosen folder via `appui.default_session_cwd`,
-    /// so clients like octos-app — which sends `cwd: None` — get a
-    /// useful workspace root transparently. Capability-gated client-sent
-    /// cwds (Tier-1 of `session_tool_registry`) still take precedence.
+    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by
+    /// `octos serve`. Operators can anchor every AppUi session that
+    /// does not advertise the `session.workspace_cwd.v1` capability to
+    /// a chosen folder via `appui.default_session_cwd` — the Tier-2
+    /// fallback consulted by the UI Protocol dispatcher when no
+    /// client-supplied cwd is present and before
+    /// `SessionRuntime::bootstrap`'s Tier-3 profile-default workspace
+    /// root. Capability-gated client-sent cwds (Tier-1) still take
+    /// precedence.
     #[serde(default)]
     pub appui: AppUiConfig,
-
-    /// Resolved credentials keyed by env-var name. Populated at runtime
-    /// from per-profile `env_vars` (e.g. by `octos serve`'s LLM
-    /// overlay) so providers can resolve API keys without depending on
-    /// the process environment. `Config::get_api_key` checks this map
-    /// before falling back to `std::env`.
-    ///
-    /// Not serialized — this is a runtime-only map, never persisted to
-    /// `config.json`. Lives on `Config` instead of being passed
-    /// alongside it so the existing `create_provider` /
-    /// `Config::get_api_key` call sites need no signature changes.
-    #[serde(default, skip)]
-    pub credentials: std::collections::HashMap<String, String>,
-
-    /// Per-profile skill package directory the active runtime should
-    /// scan in addition to the project-scoped `plugin_dirs_from_project`
-    /// list. Populated at runtime by `octos serve`'s overlay so that
-    /// dashboard-installed customer skills (e.g. `mofa-fm` at
-    /// `~/.octos/profiles/<id>/data/skills/`) become visible to the web
-    /// `/chat` agent.
-    ///
-    /// On single-tenant hosts (the current fleet, where each mini hosts
-    /// one customer profile) this is sufficient. On multi-tenant hosts
-    /// the resulting tools land on the server-wide base `ToolRegistry`
-    /// shared by every WS session — see the `SCOPE NOTE` at the wiring
-    /// site in `commands/serve.rs::run_async` for the multi-tenant
-    /// caveat and the follow-up plan (per-session tool scoping by
-    /// `routed_profile_id`).
-    ///
-    /// Not serialized. Mirrors `credentials`: a transient runtime
-    /// channel from `run_async` startup through to `try_create_agent`'s
-    /// plugin discovery.
-    #[serde(default, skip)]
-    pub profile_skills_dir: Option<PathBuf>,
-
-    /// Per-profile environment passed to dashboard-installed skills at
-    /// spawn time (`OCTOS_DATA_DIR`, `OCTOS_HOME`, `OCTOS_PROFILE_ID`,
-    /// `OCTOS_VOICE_DIR`, `OMINIX_API_URL`). Built by
-    /// `skills_scope::push_runtime_plugin_env`, the same helper the
-    /// gateway path uses, so `mofa-fm` / `fm_tts` can locate voice
-    /// profiles and reach the local TTS inference server.
-    ///
-    /// Not serialized — transient, same pattern as `profile_skills_dir`
-    /// and `credentials`. Empty by default; ignored when no profile is
-    /// selected.
-    #[serde(default, skip)]
-    pub profile_plugin_env: Vec<(String, String)>,
 }
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
@@ -1007,14 +962,12 @@ impl Config {
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
 
-        // Check the runtime credentials map first — used by `octos serve`
-        // to surface per-profile API keys without mutating the parent
-        // process environment.
-        if let Some(value) = self.credentials.get(&env_var) {
-            return Ok(value.clone());
-        }
-
-        // Fall back to environment variable.
+        // M11-F: per-profile API keys live on
+        // `ProfileRuntime::credentials`; consumers that need them
+        // read off the profile runtime directly. `Config::get_api_key`
+        // falls straight through to the process environment, which
+        // matches every non-serve entry point (`octos chat`,
+        // `octos gateway`).
         std::env::var(&env_var).wrap_err_with(|| {
             format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
         })
