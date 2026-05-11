@@ -11918,6 +11918,7 @@ mod tests {
             plugin_tool_names: Vec::new(),
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
             memory,
             memory_store,
             tool_config,

@@ -190,6 +190,15 @@ pub struct ProfileRuntime {
     /// session agent.
     pub plugin_prompt_fragments: Vec<String>,
 
+    /// Hook configurations contributed by loaded plugins (skill
+    /// manifests can declare `before_tool_call` / `after_tool_call` /
+    /// `before_llm_call` / `after_llm_call` hooks). Gateway merges
+    /// these with `config.hooks` to build its `HookExecutor`. Captured
+    /// alongside `plugin_tool_names` / `plugin_prompt_fragments` so
+    /// gateway can reuse the bootstrap's `PluginLoadResult` without
+    /// re-running plugin discovery.
+    pub plugin_hooks: Vec<octos_agent::HookConfig>,
+
     /// Long-lived [`EpisodeStore`] for this profile (redb at
     /// `<data_dir>/episodes.redb`). Shared across all sessions of
     /// the profile so task summaries written in one session are
@@ -509,6 +518,7 @@ impl ProfileRuntime {
             plugin_tool_names: plugin_result.tool_names.clone(),
             plugin_dirs,
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
+            plugin_hooks: plugin_result.hooks.clone(),
             memory,
             memory_store,
             tool_config,
