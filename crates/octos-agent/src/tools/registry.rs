@@ -72,7 +72,27 @@ pub struct ToolRegistry {
     lifecycle: std::sync::Mutex<ToolLifecycle>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
     plugin_tools: HashSet<String>,
-    /// Tools that are permanently deferred (spawn_only) -- cannot be activated by activate_tools.
+    /// Tools whose execution is auto-redirected to a background tokio task
+    /// in the execution loop (see `is_spawn_only` + the spawn_only branch
+    /// in `agent/execution.rs`). These tools ARE visible in `specs()` and
+    /// callable by the LLM — the LLM's tool call is intercepted at execute
+    /// time and converted into a background spawn that returns immediately.
+    ///
+    /// Fix #3a (2026-05-10): spawn_only tools are protected from LRU
+    /// eviction in `auto_evict()` so they stay visible to the LLM for the
+    /// life of the session. The previous behaviour (eviction after
+    /// `idle_threshold` idle iterations) hid them from `specs()` and the
+    /// LLM correctly reported "I don't have that tool available" — see
+    /// the live mini1 incident on 2026-05-10 where `fm_tts` got LRU-pruned
+    /// and the agent fell back to shell-investigation.
+    ///
+    /// Note: a tool can be in `spawn_only` AND `deferred` simultaneously
+    /// if it was manually deferred via `defer()` / `defer_group()` (e.g.
+    /// an operator hiding it, or a group-level deferral that happens to
+    /// include some spawn_only members). The standard `activate_tools`
+    /// flow can re-activate such a tool — the `spawn_only` marker only
+    /// changes how the call is EXECUTED (auto-redirected to a background
+    /// task), not whether it is VISIBLE in `specs()`.
     spawn_only: HashSet<String>,
     /// Custom messages for spawn_only tools returned to the LLM after auto-backgrounding.
     spawn_only_messages: HashMap<String, String>,
@@ -385,13 +405,32 @@ impl ToolRegistry {
     /// the LLM can actually call `read_task_output` before it advertises
     /// the new `task_handle` envelope.
     pub fn is_tool_visible(&self, name: &str) -> bool {
-        let Some(tool) = self.tools.get(name) else {
-            return false;
-        };
         let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         if deferred.contains(name) {
             return false;
         }
+        drop(deferred);
+        self.is_tool_visible_post_activation(name)
+    }
+
+    /// Same as [`is_tool_visible`] but skips the `deferred` check. Used by
+    /// `activate_tools` to predict which deferred names would actually
+    /// become callable after a successful `activate()`: removing from
+    /// `deferred` doesn't help if `provider_policy` or `context_filter`
+    /// still hide the tool.
+    ///
+    /// Codex round-2 BLOCK (PR #865): the activate_tools output paths
+    /// (no-args listing and activated_now / already_active formatting)
+    /// printed raw deferred names without applying the same visibility
+    /// checks that `specs()` would apply post-activation. That advertised
+    /// policy-denied or context-hidden tools as "available to load" or
+    /// "Loaded …", even though calling `activate()` on them would leave
+    /// them still invisible. Filter both paths through this predicate so
+    /// the LLM never sees a name it can't actually call.
+    pub fn is_tool_visible_post_activation(&self, name: &str) -> bool {
+        let Some(tool) = self.tools.get(name) else {
+            return false;
+        };
         if let Some(ref policy) = self.provider_policy {
             if !policy.is_allowed_with_tags(name, tool.tags()) {
                 return false;
@@ -431,10 +470,68 @@ impl ToolRegistry {
                         || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
                 })
             })
-            .map(|t| ToolSpec {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                input_schema: t.input_schema(),
+            .map(|t| {
+                let mut description = t.description().to_string();
+                // Fix #3c (2026-05-10, codex round-2): surface the list of
+                // currently deferred tools in the `activate_tools` spec
+                // description so the LLM has explicit discovery info
+                // instead of guessing names. Without this, after the LRU
+                // evicted (or the loader manually deferred) some tools,
+                // the LLM saw only that the tool was gone and reported
+                // "I don't have <tool> available", with no hint that
+                // calling `activate_tools(["<tool>"])` would bring it
+                // back.
+                //
+                // Codex round-1 BLOCK: filter the displayed names
+                // through the same `provider_policy` + `context_filter`
+                // visibility checks that the post-activation `specs()`
+                // would apply. Without this, a deferred tool that is
+                // also policy-denied or context-hidden would be falsely
+                // advertised as "available to load" — calling
+                // `activate_tools` on it would remove it from
+                // `deferred` but it would still be invisible/
+                // unexecutable because of the other filters, leaving
+                // the LLM with no recourse.
+                //
+                // `auto_evict()` / `defer()` / `defer_group()` /
+                // `activate()` / `retain()` / `execute_with_context()`
+                // all invalidate the cached specs, so the next call to
+                // `specs()` rebuilds this list freshly.
+                if t.name() == "activate_tools" && !deferred.is_empty() {
+                    let mut visible: Vec<String> = deferred
+                        .iter()
+                        .filter_map(|name| {
+                            let tool = self.tools.get(name)?;
+                            if let Some(ref policy) = self.provider_policy {
+                                if !policy.is_allowed_with_tags(name, tool.tags()) {
+                                    return None;
+                                }
+                            }
+                            if let Some(ref tags) = self.context_filter {
+                                let tool_tags = tool.tags();
+                                if !tool_tags.is_empty()
+                                    && !tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
+                                {
+                                    return None;
+                                }
+                            }
+                            Some(name.clone())
+                        })
+                        .collect();
+                    if !visible.is_empty() {
+                        visible.sort();
+                        description.push_str(&format!(
+                            "\n\nCurrently deferred tools available to load: {}. \
+                             Call this tool with `tools: [\"<name>\"]` to load them.",
+                            visible.join(", ")
+                        ));
+                    }
+                }
+                ToolSpec {
+                    name: t.name().to_string(),
+                    description,
+                    input_schema: t.input_schema(),
+                }
             })
             .collect();
 
@@ -766,7 +863,25 @@ impl ToolRegistry {
     /// Lock ordering: lifecycle -> deferred (consistent with record_usage
     /// which only takes lifecycle, never both).
     pub fn auto_evict(&self) -> Vec<String> {
-        // 1. Compute eviction candidates (lifecycle lock only)
+        // 1. Compute eviction candidates (lifecycle lock only).
+        //
+        // Fix #3a (2026-05-10): exclude spawn_only tools from the active
+        // set passed to `find_evictable`. CLAUDE.md documents
+        // "spawn_only tools cannot be evicted" as the design invariant,
+        // but the underlying lifecycle filter only checks `base_tools`,
+        // not `spawn_only`. Because the plugin loader pushes only
+        // non-spawn_only plugin names into `result.tool_names` (the
+        // pinning input for `add_base_tools`), spawn_only plugin tools
+        // (e.g. `fm_tts`, `fm_voice_save`, `fm_voice_list`) end up
+        // outside `base_tools` and become LRU-evictable after
+        // `idle_threshold` iterations of disuse. The deployed symptom
+        // was the chat agent reporting "I don't have fm_tts available"
+        // on iteration 6+ because the LRU had silently moved it into
+        // `deferred`. The eviction also defeats the
+        // execution-loop's auto-redirect-to-background mechanism: once
+        // the tool is hidden from `specs()`, the LLM can no longer
+        // emit a tool-call that the interceptor could pick up. Filter
+        // them out here so the documented invariant holds.
         let to_evict = {
             let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
@@ -774,6 +889,7 @@ impl ToolRegistry {
                 .tools
                 .keys()
                 .filter(|n| !deferred.contains(n.as_str()))
+                .filter(|n| !self.spawn_only.contains(n.as_str()))
                 .map(|n| n.as_str())
                 .collect();
             lifecycle.find_evictable(&active)
@@ -1395,6 +1511,67 @@ mod lifecycle_tests {
                 "base tool {name} must never be evicted"
             );
         }
+    }
+
+    /// Fix #3a (2026-05-10) regression: a tool marked `spawn_only` must NOT
+    /// be LRU-evicted even when it has never been used and is well past the
+    /// `idle_threshold`. CLAUDE.md states "spawn_only tools cannot be
+    /// evicted" as a design invariant; before this fix the LRU only
+    /// checked `base_tools` and silently pruned spawn_only plugin tools
+    /// (e.g. `fm_tts`) after a few idle iterations, making the LLM
+    /// correctly report "I don't have that tool available" — observed
+    /// live mini1 2026-05-10.
+    ///
+    /// We use `glob` (an already-registered builtin) as the stand-in for a
+    /// spawn_only plugin tool — `mark_spawn_only` only touches the
+    /// `spawn_only` HashSet, so the test focuses on the eviction filter
+    /// rather than the loader plumbing. No base_tools are set, so without
+    /// the spawn_only filter the LRU would evict `glob` after the first
+    /// idle iteration past `idle_threshold`.
+    #[test]
+    fn spawn_only_tools_never_evicted_even_when_idle() {
+        let mut reg = make_registry(2, 1);
+        // No base tools — only the spawn_only marker should protect this
+        // tool from eviction.
+        reg.mark_spawn_only("glob", None);
+
+        // Advance many iterations without touching `glob`. Without the
+        // Fix #3a filter, `glob` would become idle past the threshold
+        // and the LRU would push it into `deferred`.
+        for _ in 0..10 {
+            reg.tick();
+        }
+
+        let evicted = reg.auto_evict();
+        println!("Evicted: {evicted:?}");
+
+        assert!(
+            !evicted.contains(&"glob".to_string()),
+            "spawn_only tool glob must never be evicted per CLAUDE.md invariant. \
+             Evicted set was: {evicted:?}"
+        );
+    }
+
+    /// Companion: a spawn_only tool stays visible in `specs()` after many
+    /// idle iterations + an `auto_evict()` sweep. Verifies the practical
+    /// consequence: the LLM still sees the tool in its function-call menu
+    /// after long stretches of disuse, so it can still emit a tool-call
+    /// that the execution loop intercepts for background spawning.
+    #[test]
+    fn spawn_only_tools_stay_visible_in_specs_after_eviction_sweep() {
+        let mut reg = make_registry(2, 1);
+        reg.mark_spawn_only("glob", None);
+
+        for _ in 0..10 {
+            reg.tick();
+        }
+        let _ = reg.auto_evict();
+
+        let names: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
+        assert!(
+            names.contains(&"glob".to_string()),
+            "spawn_only tool glob must remain in specs() after eviction sweep; specs were: {names:?}"
+        );
     }
 
     #[test]
