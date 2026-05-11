@@ -2291,7 +2291,15 @@ mod tests {
     }
 
     #[test]
-    fn get_api_key_prefers_credentials_map_over_env() {
+    fn get_api_key_returns_value_from_credentials_map() {
+        // Verifies that `Config::get_api_key` short-circuits on the
+        // `credentials` map before consulting the process env. This
+        // test deliberately uses a unique env-var name that no
+        // ambient shell exports, so the lookup would otherwise fail.
+        // The priority of credentials-map over env is also locked in
+        // structurally: `get_api_key` returns from
+        // `if let Some(value) = self.credentials.get(&env_var)` before
+        // reaching the `std::env::var` branch.
         let mut config = Config {
             provider: Some("moonshot".into()),
             api_key_env: Some("OCTOS_TEST_API_KEY_PRIORITY".into()),
