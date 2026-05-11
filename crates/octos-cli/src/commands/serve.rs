@@ -9,11 +9,11 @@ use eyre::{Result, WrapErr};
 use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
 use octos_core::AgentId;
-use octos_llm::{LlmProvider, RetryProvider};
+use octos_llm::{AdaptiveConfig, AdaptiveRouter, LlmProvider, ProviderChain, RetryProvider};
 use octos_memory::{EpisodeStore, MemoryStore};
 
 use super::Executable;
-use super::chat::create_provider;
+use super::chat::{create_provider, create_provider_with_api_type};
 use crate::api::metrics::MetricsReporter;
 use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
@@ -209,6 +209,45 @@ fn resolve_dashboard_auth_smtp_password(
     None
 }
 
+/// Returns true when the profile is a viable server-wide LLM source: it's
+/// enabled, is not a sub-account (sub-accounts inherit their parent's LLM
+/// contract), and has both `family_id` and `model_id` set on `llm.primary`.
+fn profile_has_active_primary_llm(profile: &crate::profiles::UserProfile) -> bool {
+    if !profile.enabled || profile.parent_id.is_some() {
+        return false;
+    }
+    profile
+        .config
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.primary.as_ref())
+        .is_some_and(|sel| sel.family_id.is_some() && sel.model_id.is_some())
+}
+
+/// Picks the server-wide LLM profile from a sorted profile list.
+///
+/// Selection precedence:
+///   1. The canonical admin profile (`ADMIN_PROFILE_ID`), if it has an active
+///      primary — keeps the host's "main" tenant deterministic.
+///   2. Otherwise the first non-sub-account enabled profile with an active
+///      primary, in `ProfileStore::list()` order (which sorts by name).
+///
+/// Sub-accounts (`parent_id.is_some()`) are excluded by design: per
+/// `UserProfile::parent_id` docs they inherit the parent's LLM contract,
+/// so they should never drive the server-wide agent on their own.
+fn select_serve_profile(
+    profiles: &[crate::profiles::UserProfile],
+) -> Option<&crate::profiles::UserProfile> {
+    if let Some(admin) = profiles
+        .iter()
+        .find(|p| p.id == crate::api::auth_handlers::ADMIN_PROFILE_ID)
+        && profile_has_active_primary_llm(admin)
+    {
+        return Some(admin);
+    }
+    profiles.iter().find(|p| profile_has_active_primary_llm(p))
+}
+
 /// Overlay per-profile `cfg.llm` selection onto the top-level [`Config`].
 ///
 /// The serve agent historically only read `~/.octos/config.json`'s flat
@@ -219,21 +258,15 @@ fn resolve_dashboard_auth_smtp_password(
 /// used the bare top-level provider even when the dashboard had moonshot
 /// or minimax configured.
 ///
-/// This helper picks the first profile that is `enabled` and has a fully
-/// populated `llm.primary` (family + model), reuses `config_from_profile`
-/// to produce a profile-derived [`Config`], and overlays the LLM-shaped
-/// fields onto the loaded top-level config. Non-LLM fields (auth, hosts,
-/// dashboard auth, hooks) are left untouched.
+/// When a viable profile is selected (see [`select_serve_profile`]),
+/// every LLM-scoped field is replaced **as a unit** from the
+/// profile-derived [`Config`] — even when the profile leaves a sub-field
+/// blank. This prevents stale top-level values (e.g. a `deepseek`
+/// `base_url` or `OPENAI_API_KEY`) from contaminating a freshly-selected
+/// `moonshot` model. Non-LLM fields (auth tokens, hosts, dashboard auth,
+/// hooks, mode, swarm budgets) are left untouched.
 fn overlay_profile_llm(config: &mut Config, profiles: &[crate::profiles::UserProfile]) {
-    let active = profiles.iter().find(|p| {
-        p.enabled
-            && p.config
-                .llm
-                .as_ref()
-                .and_then(|llm| llm.primary.as_ref())
-                .is_some_and(|sel| sel.family_id.is_some() && sel.model_id.is_some())
-    });
-    let Some(profile) = active else {
+    let Some(profile) = select_serve_profile(profiles) else {
         tracing::debug!("no enabled profile with primary LLM selection — keeping top-level config");
         return;
     };
@@ -246,33 +279,23 @@ fn overlay_profile_llm(config: &mut Config, profiles: &[crate::profiles::UserPro
         base_url = ?profile_config.base_url,
         api_key_env = ?profile_config.api_key_env,
         fallback_models = profile_config.fallback_models.len(),
+        content_routing = profile_config.content_routing.is_some(),
         "overlaying per-profile LLM config onto top-level config for serve agent"
     );
 
-    if let Some(p) = profile_config.provider {
-        config.provider = Some(p);
-    }
-    if let Some(m) = profile_config.model {
-        config.model = Some(m);
-    }
-    if let Some(b) = profile_config.base_url {
-        config.base_url = Some(b);
-    }
-    if let Some(k) = profile_config.api_key_env {
-        config.api_key_env = Some(k);
-    }
-    if let Some(t) = profile_config.api_type {
-        config.api_type = Some(t);
-    }
-    if profile_config.model_hints.is_some() {
-        config.model_hints = profile_config.model_hints;
-    }
-    if !profile_config.fallback_models.is_empty() {
-        config.fallback_models = profile_config.fallback_models;
-    }
-    if profile_config.adaptive_routing.is_some() {
-        config.adaptive_routing = profile_config.adaptive_routing;
-    }
+    // Replace the LLM-scoped fields atomically — including clearing stale
+    // values when the profile leaves a sub-field unset. Mixing a profile
+    // model with a leftover top-level base_url / api_key_env is worse
+    // than missing the field outright.
+    config.provider = profile_config.provider;
+    config.model = profile_config.model;
+    config.base_url = profile_config.base_url;
+    config.api_key_env = profile_config.api_key_env;
+    config.api_type = profile_config.api_type;
+    config.model_hints = profile_config.model_hints;
+    config.fallback_models = profile_config.fallback_models;
+    config.adaptive_routing = profile_config.adaptive_routing;
+    config.content_routing = profile_config.content_routing;
 }
 
 /// Start the REST API server.
@@ -936,10 +959,58 @@ impl ServeCommand {
         let base_provider: Arc<dyn LlmProvider> =
             create_provider(&provider_name, config, model, base_url)?;
 
+        // Build the provider chain. Match the `chat` command's behavior:
+        // wrap the primary in `RetryProvider`, then layer in any
+        // `config.fallback_models` so per-profile fallbacks configured
+        // through the dashboard (e.g. minimax + deepseek behind
+        // moonshot/kimi) actually take effect on `/chat`. Without this
+        // the overlaid `fallback_models` would be inert here.
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
             base_provider
-        } else {
+        } else if config.fallback_models.is_empty() {
             Arc::new(RetryProvider::new(base_provider))
+        } else {
+            let mut providers: Vec<Arc<dyn LlmProvider>> =
+                vec![Arc::new(RetryProvider::new(base_provider))];
+            for fb in &config.fallback_models {
+                let fb_config = if fb.api_key_env.is_some() {
+                    let mut c = config.clone();
+                    c.api_key_env = fb.api_key_env.clone();
+                    c
+                } else {
+                    config.clone()
+                };
+                match create_provider_with_api_type(
+                    &fb.provider,
+                    &fb_config,
+                    fb.model.clone(),
+                    fb.base_url.clone(),
+                    fb.api_type.as_deref(),
+                ) {
+                    Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = %fb.provider,
+                            error = %e,
+                            "skipping fallback provider in serve agent"
+                        );
+                    }
+                }
+            }
+            if providers.len() > 1 {
+                let adaptive_config = config
+                    .adaptive_routing
+                    .as_ref()
+                    .map(AdaptiveConfig::from)
+                    .unwrap_or_default();
+                tracing::info!(
+                    "serve adaptive routing enabled ({} providers)",
+                    providers.len()
+                );
+                Arc::new(AdaptiveRouter::new(providers, &[], adaptive_config))
+            } else {
+                Arc::new(ProviderChain::new(providers))
+            }
         };
 
         let memory = Arc::new(
@@ -1940,5 +2011,160 @@ mod tests {
 
         assert_eq!(config.provider.as_deref(), Some("deepseek"));
         assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn overlay_profile_llm_clears_stale_top_level_llm_fields() {
+        // Top-level config has a deepseek stack with leftover base_url
+        // and api_key_env. The selected profile has a `moonshot` primary
+        // without a `base_url` set on its route. The overlay must NOT
+        // leave the stale deepseek base_url in place — otherwise we'd
+        // call moonshot against a deepseek endpoint.
+        let mut config = Config {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-chat".into()),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            api_type: Some("openai".into()),
+            fallback_models: vec![crate::config::FallbackModel {
+                provider: "leftover".into(),
+                model: Some("leftover-model".into()),
+                base_url: None,
+                api_key_env: None,
+                model_hints: None,
+                api_type: None,
+                cost_per_m: None,
+                strong: true,
+            }],
+            ..Default::default()
+        };
+
+        let profile = crate::profiles::UserProfile {
+            id: "dspfac".into(),
+            name: "dspfac".into(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("moonshot".into()),
+                        model_id: Some("kimi-k2.5".into()),
+                        // route omitted — no base_url / api_key_env
+                        route: None,
+                        model_hints: None,
+                        cost_per_m: None,
+                        strong: None,
+                    }),
+                    fallbacks: vec![],
+                }),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        overlay_profile_llm(&mut config, &[profile]);
+
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
+        assert!(
+            config.base_url.is_none(),
+            "stale deepseek base_url must be cleared, got {:?}",
+            config.base_url
+        );
+        assert!(
+            config.api_key_env.is_none(),
+            "stale deepseek api_key_env must be cleared, got {:?}",
+            config.api_key_env
+        );
+        assert!(
+            config.api_type.is_none(),
+            "stale api_type must be cleared, got {:?}",
+            config.api_type
+        );
+        assert!(
+            config.fallback_models.is_empty(),
+            "stale top-level fallbacks must be cleared, got {} entries",
+            config.fallback_models.len()
+        );
+    }
+
+    #[test]
+    fn overlay_profile_llm_prefers_admin_profile_when_present() {
+        // When both the admin profile and a tenant profile have viable
+        // primaries, admin wins regardless of alphabetical order.
+        let mut config = Config::default();
+        let admin = make_profile_with_llm(
+            crate::api::auth_handlers::ADMIN_PROFILE_ID,
+            true,
+            "openai",
+            "gpt-5.2",
+            "anthropic",
+            "claude-opus-4-7",
+        );
+        let tenant = make_profile_with_llm(
+            "alpha-tenant",
+            true,
+            "moonshot",
+            "kimi-k2.5",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        );
+        // List() sorts by name, so tenant ("alpha-tenant") sorts before
+        // admin ("admin")? No — "admin" < "alpha-tenant" alphabetically.
+        // Use a name that would sort first to make the test meaningful.
+        let tenant2 = make_profile_with_llm(
+            "a-first-tenant",
+            true,
+            "deepseek",
+            "deepseek-chat",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        );
+
+        overlay_profile_llm(&mut config, &[tenant2, admin, tenant]);
+
+        assert_eq!(
+            config.provider.as_deref(),
+            Some("openai"),
+            "admin profile must win over alphabetically-earlier tenant"
+        );
+        assert_eq!(config.model.as_deref(), Some("gpt-5.2"));
+    }
+
+    #[test]
+    fn overlay_profile_llm_skips_sub_accounts() {
+        // Sub-accounts (parent_id.is_some()) inherit their parent's LLM
+        // contract — they must not drive the server-wide agent on their
+        // own. The fallback should still find the top-level profile.
+        let mut config = Config::default();
+        let mut sub_account = make_profile_with_llm(
+            "sub-1",
+            true,
+            "rogue-provider",
+            "rogue-model",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        );
+        sub_account.parent_id = Some("parent-tenant".into());
+
+        let top_level = make_profile_with_llm(
+            "main-tenant",
+            true,
+            "moonshot",
+            "kimi-k2.5",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        );
+
+        overlay_profile_llm(&mut config, &[sub_account, top_level]);
+
+        assert_eq!(
+            config.provider.as_deref(),
+            Some("moonshot"),
+            "sub-account must be skipped in favor of top-level profile"
+        );
     }
 }
