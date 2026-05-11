@@ -88,7 +88,13 @@ impl Tool for ActivateToolsTool {
         let group = args.get("group").and_then(|v| v.as_str()).unwrap_or("");
 
         if tool_names.is_empty() && group.is_empty() {
-            // List available deferred tools (flat list, not groups)
+            // List available deferred tools (flat list, not groups).
+            //
+            // Codex round-2 BLOCK (PR #865): filter through
+            // `is_tool_visible_post_activation` so we don't advertise
+            // names that are policy-denied or context-hidden — calling
+            // `activate()` on them would remove from `deferred` but
+            // leave them invisible.
             let groups = registry.deferred_groups();
             if groups.is_empty() {
                 return Ok(ToolResult {
@@ -102,9 +108,22 @@ impl Tool for ActivateToolsTool {
             for (name, _desc, _count) in &groups {
                 if let Some(info) = super::policy::TOOL_GROUPS.iter().find(|g| g.name == *name) {
                     for t in info.tools {
-                        tools.push((*t).to_string());
+                        if registry.is_tool_visible_post_activation(t) {
+                            tools.push((*t).to_string());
+                        }
                     }
+                } else if registry.is_tool_visible_post_activation(name) {
+                    // Group name was the individual deferred tool name
+                    // itself (plugin tool not in any policy group).
+                    tools.push(name.clone());
                 }
+            }
+            if tools.is_empty() {
+                return Ok(ToolResult {
+                    output: "All tools are already active.".to_string(),
+                    success: true,
+                    ..Default::default()
+                });
             }
             return Ok(ToolResult {
                 output: format!(
@@ -176,6 +195,16 @@ impl Tool for ActivateToolsTool {
         activated_now.dedup();
         already_active.sort();
         already_active.dedup();
+
+        // Codex round-2 BLOCK (PR #865): filter the output lists through
+        // post-activation visibility. After `activate()` removes a name
+        // from `deferred`, the tool may still be invisible because of
+        // `provider_policy` or `context_filter`. We must not advertise
+        // such names as "Loaded …" — the LLM would try to call them and
+        // get back the same "tool not available" the BLOCK was supposed
+        // to fix.
+        activated_now.retain(|n| registry.is_tool_visible_post_activation(n));
+        already_active.retain(|n| registry.is_tool_visible_post_activation(n));
 
         if activated_now.is_empty() && already_active.is_empty() {
             Ok(ToolResult {
@@ -292,6 +321,66 @@ mod tests {
             !activate_spec.description.contains("web_search"),
             "policy-denied deferred tool must NOT be listed in activate_tools suffix; got: {}",
             activate_spec.description
+        );
+    }
+
+    /// Codex round-2 (PR #865) BLOCK regression: when the LLM calls
+    /// `activate_tools(["web_fetch"])`, the code maps web_fetch to the
+    /// group:web group and activates the whole group. The returned
+    /// `activated_now` list previously included `web_search` (also in
+    /// group:web) even when `web_search` was denied by provider_policy.
+    /// Output formatting then printed both names, advertising a
+    /// policy-denied tool as "Loaded".
+    ///
+    /// Also covers the no-arg listing path: when no args are passed,
+    /// `activate_tools` lists deferred-group members. Policy-denied
+    /// members must be filtered out of that list too.
+    #[tokio::test]
+    async fn activate_tools_execute_output_filters_policy_denied_group_members() {
+        use crate::tools::policy::ToolPolicy;
+        let mut registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        // Defer both web tools (simulates LRU eviction of the web group).
+        registry.defer_group("group:web");
+        // Deny web_search via provider policy; web_fetch stays allowed.
+        let mut policy = ToolPolicy::default();
+        policy.deny.push("web_search".to_string());
+        registry.set_provider_policy(policy);
+        let registry = Arc::new(registry);
+
+        let tool = ActivateToolsTool::new();
+        tool.set_registry(Arc::downgrade(&registry));
+
+        // (1) No-arg listing must not advertise web_search.
+        let list = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(list.success);
+        assert!(
+            list.output.contains("web_fetch"),
+            "policy-allowed deferred tool web_fetch must be listed; got: {}",
+            list.output
+        );
+        assert!(
+            !list.output.contains("web_search"),
+            "policy-denied deferred tool web_search must NOT be listed; got: {}",
+            list.output
+        );
+
+        // (2) Activating web_fetch (which maps to group:web) must not
+        // advertise web_search as "Loaded" even though
+        // `registry.activate("group:web")` returns both names.
+        let loaded = tool
+            .execute(&serde_json::json!({"tools": ["web_fetch"]}))
+            .await
+            .unwrap();
+        assert!(loaded.success);
+        assert!(
+            loaded.output.contains("web_fetch"),
+            "web_fetch should be advertised as loaded; got: {}",
+            loaded.output
+        );
+        assert!(
+            !loaded.output.contains("web_search"),
+            "policy-denied web_search must NOT appear in execute output; got: {}",
+            loaded.output
         );
     }
 

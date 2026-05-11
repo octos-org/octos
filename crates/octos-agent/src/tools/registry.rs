@@ -405,13 +405,32 @@ impl ToolRegistry {
     /// the LLM can actually call `read_task_output` before it advertises
     /// the new `task_handle` envelope.
     pub fn is_tool_visible(&self, name: &str) -> bool {
-        let Some(tool) = self.tools.get(name) else {
-            return false;
-        };
         let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         if deferred.contains(name) {
             return false;
         }
+        drop(deferred);
+        self.is_tool_visible_post_activation(name)
+    }
+
+    /// Same as [`is_tool_visible`] but skips the `deferred` check. Used by
+    /// `activate_tools` to predict which deferred names would actually
+    /// become callable after a successful `activate()`: removing from
+    /// `deferred` doesn't help if `provider_policy` or `context_filter`
+    /// still hide the tool.
+    ///
+    /// Codex round-2 BLOCK (PR #865): the activate_tools output paths
+    /// (no-args listing and activated_now / already_active formatting)
+    /// printed raw deferred names without applying the same visibility
+    /// checks that `specs()` would apply post-activation. That advertised
+    /// policy-denied or context-hidden tools as "available to load" or
+    /// "Loaded …", even though calling `activate()` on them would leave
+    /// them still invisible. Filter both paths through this predicate so
+    /// the LLM never sees a name it can't actually call.
+    pub fn is_tool_visible_post_activation(&self, name: &str) -> bool {
+        let Some(tool) = self.tools.get(name) else {
+            return false;
+        };
         if let Some(ref policy) = self.provider_policy {
             if !policy.is_allowed_with_tags(name, tool.tags()) {
                 return false;
