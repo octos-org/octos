@@ -209,6 +209,72 @@ fn resolve_dashboard_auth_smtp_password(
     None
 }
 
+/// Overlay per-profile `cfg.llm` selection onto the top-level [`Config`].
+///
+/// The serve agent historically only read `~/.octos/config.json`'s flat
+/// `provider`/`model` fields, ignoring the structured `llm.primary` +
+/// `llm.fallbacks` that the dashboard writes into per-profile JSON. The
+/// `gateway` command goes through [`crate::profiles::config_from_profile`]
+/// to honor those — `serve` did not, so the web `/chat` endpoint always
+/// used the bare top-level provider even when the dashboard had moonshot
+/// or minimax configured.
+///
+/// This helper picks the first profile that is `enabled` and has a fully
+/// populated `llm.primary` (family + model), reuses `config_from_profile`
+/// to produce a profile-derived [`Config`], and overlays the LLM-shaped
+/// fields onto the loaded top-level config. Non-LLM fields (auth, hosts,
+/// dashboard auth, hooks) are left untouched.
+fn overlay_profile_llm(config: &mut Config, profiles: &[crate::profiles::UserProfile]) {
+    let active = profiles.iter().find(|p| {
+        p.enabled
+            && p.config
+                .llm
+                .as_ref()
+                .and_then(|llm| llm.primary.as_ref())
+                .is_some_and(|sel| sel.family_id.is_some() && sel.model_id.is_some())
+    });
+    let Some(profile) = active else {
+        tracing::debug!("no enabled profile with primary LLM selection — keeping top-level config");
+        return;
+    };
+
+    let profile_config = crate::profiles::config_from_profile(profile, None, None);
+    tracing::info!(
+        profile_id = %profile.id,
+        provider = ?profile_config.provider,
+        model = ?profile_config.model,
+        base_url = ?profile_config.base_url,
+        api_key_env = ?profile_config.api_key_env,
+        fallback_models = profile_config.fallback_models.len(),
+        "overlaying per-profile LLM config onto top-level config for serve agent"
+    );
+
+    if let Some(p) = profile_config.provider {
+        config.provider = Some(p);
+    }
+    if let Some(m) = profile_config.model {
+        config.model = Some(m);
+    }
+    if let Some(b) = profile_config.base_url {
+        config.base_url = Some(b);
+    }
+    if let Some(k) = profile_config.api_key_env {
+        config.api_key_env = Some(k);
+    }
+    if let Some(t) = profile_config.api_type {
+        config.api_type = Some(t);
+    }
+    if profile_config.model_hints.is_some() {
+        config.model_hints = profile_config.model_hints;
+    }
+    if !profile_config.fallback_models.is_empty() {
+        config.fallback_models = profile_config.fallback_models;
+    }
+    if profile_config.adaptive_routing.is_some() {
+        config.adaptive_routing = profile_config.adaptive_routing;
+    }
+}
+
 /// Start the REST API server.
 #[derive(Debug, Args)]
 pub struct ServeCommand {
@@ -292,13 +358,30 @@ impl ServeCommand {
         // runtime state and config unless an explicit --config path is given.
         let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
 
-        let (config, resolved_config_path) = if let Some(config_path) = &self.config {
+        let (mut config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
             Config::load_with_path(&cwd, &data_dir)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
+
+        // Overlay per-profile LLM config onto the top-level Config so the
+        // serve agent uses the dashboard-configured providers, not the bare
+        // `provider`/`model` fallback in `~/.octos/config.json`.
+        // See `overlay_profile_llm` for the rationale and contract.
+        match crate::profiles::ProfileStore::open(&data_dir) {
+            Ok(store) => {
+                let profiles = store.list().unwrap_or_default();
+                overlay_profile_llm(&mut config, &profiles);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to open profile store for LLM overlay — falling back to top-level config"
+                );
+            }
+        }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
@@ -1713,5 +1796,149 @@ mod tests {
              outcome was: {:?}",
             outcome.per_task_outcomes[0]
         );
+    }
+
+    fn make_profile_with_llm(
+        id: &str,
+        enabled: bool,
+        primary_family: &str,
+        primary_model: &str,
+        fallback_family: &str,
+        fallback_model: &str,
+    ) -> crate::profiles::UserProfile {
+        crate::profiles::UserProfile {
+            id: id.into(),
+            name: id.into(),
+            public_subdomain: None,
+            enabled,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some(primary_family.into()),
+                        model_id: Some(primary_model.into()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: Some("https://primary.example.com/v1".into()),
+                            api_key_env: Some("PRIMARY_KEY".into()),
+                            api_type: None,
+                        }),
+                        model_hints: None,
+                        cost_per_m: None,
+                        strong: None,
+                    }),
+                    fallbacks: vec![crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some(fallback_family.into()),
+                        model_id: Some(fallback_model.into()),
+                        route: Some(crate::profiles::LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: Some("https://fallback.example.com/v1".into()),
+                            api_key_env: Some("FALLBACK_KEY".into()),
+                            api_type: None,
+                        }),
+                        model_hints: None,
+                        cost_per_m: None,
+                        strong: Some(true),
+                    }],
+                }),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn overlay_profile_llm_applies_enabled_profile_primary_and_fallbacks() {
+        let mut config = Config {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-chat".into()),
+            ..Default::default()
+        };
+        let profiles = vec![make_profile_with_llm(
+            "dspfac",
+            true,
+            "moonshot",
+            "kimi-k2.5",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        )];
+
+        overlay_profile_llm(&mut config, &profiles);
+
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://primary.example.com/v1")
+        );
+        assert_eq!(config.api_key_env.as_deref(), Some("PRIMARY_KEY"));
+        assert_eq!(config.fallback_models.len(), 1);
+        assert_eq!(config.fallback_models[0].provider, "minimax");
+        assert_eq!(
+            config.fallback_models[0].model.as_deref(),
+            Some("MiniMax-M2.5-highspeed")
+        );
+    }
+
+    #[test]
+    fn overlay_profile_llm_keeps_top_level_when_no_enabled_profile() {
+        let mut config = Config {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-chat".into()),
+            ..Default::default()
+        };
+        let profiles = vec![make_profile_with_llm(
+            "dspfac",
+            false, // disabled
+            "moonshot",
+            "kimi-k2.5",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        )];
+
+        overlay_profile_llm(&mut config, &profiles);
+
+        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
+        assert!(config.fallback_models.is_empty());
+    }
+
+    #[test]
+    fn overlay_profile_llm_skips_profiles_missing_primary_model() {
+        let mut config = Config {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-chat".into()),
+            ..Default::default()
+        };
+        let incomplete = crate::profiles::UserProfile {
+            id: "partial".into(),
+            name: "partial".into(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig {
+                llm: Some(crate::profiles::LlmProfileConfig {
+                    primary: Some(crate::profiles::LlmModelSelectionConfig {
+                        family_id: Some("moonshot".into()),
+                        model_id: None, // missing
+                        ..Default::default()
+                    }),
+                    fallbacks: vec![],
+                }),
+                ..Default::default()
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        overlay_profile_llm(&mut config, &[incomplete]);
+
+        assert_eq!(config.provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
     }
 }
