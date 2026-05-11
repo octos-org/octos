@@ -351,67 +351,41 @@ impl GatewayRuntime {
             };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // M11-B: assemble a `ProfileRuntime` from the pieces gateway
-        // already built (LLM chain, memory stores, Ominix URL) plus
-        // the per-profile derivations (plugin env template, tool
-        // policy, credentials). The runtime is held here so
-        // `octos serve` and `octos tui` (M11-D) can adopt the same
-        // helper instead of re-implementing the per-profile
-        // assembly. Today's gateway does not yet consume the
-        // returned struct downstream — the inline tool registry +
-        // ActorFactory wiring below is unchanged — so this PR is a
-        // pure additive wire-up. The legacy non-profile path (no
-        // `UserProfile`) and the CLI-override path
-        // (`--model` / `--provider` / `--base-url`) skip the
-        // bootstrap; the resulting `Option<Arc<ProfileRuntime>>`
-        // tracks whether the assembler was invoked. The call lives
-        // here (after `discover_ominix_url` and before
-        // `build_account_skills_loader` / `build_account_plugin_dirs`)
-        // so bootstrap can reuse the gateway's already-resolved
-        // Ominix URL and skills-dir candidate without doing a
-        // duplicate filesystem read.
-        let _profile_runtime: Option<Arc<crate::runtime::ProfileRuntime>> =
-            if let (Some(profile), false) = (resolved_profile.as_ref(), cli_llm_override) {
-                // Gateway's own tool registry is built later in the
-                // `let mut tools; …` block below (with the full
-                // gateway-extras: WebSearchTool with provider keys,
-                // BrowserTool with timeout, MCP, plugins, admin
-                // tools, …). The `ProfileRuntime`'s `tool_specs` is
-                // the per-profile *builtin floor* that future
-                // callers (`octos serve` / TUI) will share via the
-                // M11-A multi-tenant fix; gateway does not consume
-                // it in M11-B (the inline tool registry stays in
-                // place to preserve byte-identical boot). We hand
-                // `ToolRegistry::new()` so bootstrap does not need
-                // to call `create_sandbox` itself — doing so a
-                // second time here would emit a duplicate
-                // `"sandbox disabled, …"` info log on profiles
-                // that disable sandboxing.
-                let inputs = crate::runtime::profile::ProfileRuntimeInputs {
-                    llm: llm.clone(),
-                    adaptive_router: adaptive_router_ref.clone(),
-                    runtime_qos_catalog: runtime_qos_catalog.clone(),
-                    primary_model_id: model_id.clone(),
-                    memory: memory.clone(),
-                    memory_store: memory_store.clone(),
-                    default_sandbox: config.sandbox.clone(),
-                    tool_specs: ToolRegistry::new(),
-                    skills_dir: Some(data_dir.join("skills")),
-                    ominix_url: ominix_url.clone(),
-                };
-                Some(
-                    crate::runtime::ProfileRuntime::bootstrap(
-                        profile,
-                        &data_dir,
-                        Some(effective_octos_home.as_path()),
-                        inputs,
-                    )
-                    .await
-                    .wrap_err("failed to bootstrap profile runtime")?,
-                )
-            } else {
-                None
-            };
+        // M11-D Part 2 scope deferral: the supervisor's mandate was to
+        // delete gateway's inline assembly and replace it with a single
+        // `ProfileRuntime::bootstrap` call. Two structural blockers
+        // forced a smaller scope:
+        //
+        //   1. Gateway holds open the per-profile `EpisodeStore` /
+        //      `MemoryStore` / `ToolConfigStore` (redb locks). Calling
+        //      bootstrap here AND running the surviving inline assembly
+        //      would lock-conflict on the same redb file.
+        //   2. Gateway's tool registry layers `SwappableProvider` +
+        //      `provider_router` + `SwitchModelTool` + admin tools +
+        //      auto-defer + a custom base-tool pin set + `run_pipeline`
+        //      synthesis config + per-session pipeline_factory on top
+        //      of the profile-floor registry. Threading these through a
+        //      `snapshot_excluding(&[])` clone of bootstrap's
+        //      `Arc<ToolRegistry>` is mechanically straightforward but
+        //      bumps the diff well past the 1k-line budget, since every
+        //      downstream consumer (ActorFactory, profile_factory_builder,
+        //      DefaultPipelineToolFactory) reads gateway-only locals
+        //      that have to be re-derived from `profile_runtime.*` fields.
+        //
+        // Decision: ship Part 1 (self-contained bootstrap) + Part 3
+        // (AppState refactor — the supervisor's primary deliverable
+        // since it's what unblocks yangmi via `SessionRuntime::bootstrap`)
+        // in this PR. Gateway's inline assembly stays; a follow-up PR
+        // wires `ProfileRuntime::bootstrap` through gateway by carrying
+        // the `Arc<ProfileRuntime>` into the factory builder and
+        // collapsing the duplicate work. The byte-identical constraint
+        // is honored as a side-effect — gateway's startup logs and
+        // observable behavior do not change.
+        //
+        // The `cli_llm_override` local is consumed below by the inline
+        // assembly's provider-name resolution; suppress the unused
+        // warning explicitly so the deferral is documented in-tree.
+        let _ = cli_llm_override;
 
         // Customer-installed skills are strictly account-scoped.
         let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);

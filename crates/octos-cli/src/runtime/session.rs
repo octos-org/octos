@@ -445,6 +445,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
@@ -453,14 +454,21 @@ mod tests {
             data_dir,
             llm: Arc::new(StubLlm),
             adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "stub-model".to_string(),
+            provider_name: "stub".to_string(),
             credentials: HashMap::new(),
             skills_dir: None,
             plugin_env_template: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
             tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
             memory,
             memory_store,
+            tool_config,
         })
     }
 

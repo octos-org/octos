@@ -57,6 +57,7 @@ use crate::login_allowlist::LoginAllowlistStore;
 use crate::otp::AuthManager;
 use crate::process_manager::ProcessManager;
 use crate::profiles::ProfileStore;
+use crate::runtime::{ProfileRuntime, SessionRuntimeCache};
 use crate::setup_state_store::SetupStateStore;
 use crate::tenant::TenantStore;
 use crate::user_store::UserStore;
@@ -108,9 +109,31 @@ impl RunIdCache {
 
 /// Shared application state for API handlers.
 pub struct AppState {
-    /// Agent for processing messages (None if no LLM provider configured).
+    /// M11-D: per-profile runtime catalog. Built at startup from
+    /// `ProfileStore::list()` — one [`ProfileRuntime`] per enabled
+    /// profile with an active primary LLM. The `/api/chat` handler
+    /// resolves the request's profile here, then asks
+    /// [`Self::session_cache`] to materialize the matching
+    /// `SessionRuntime` on demand.
+    ///
+    /// Empty when no profiles have a usable LLM selection — handlers
+    /// fall back to the legacy `[Self::agent]` field (kept for
+    /// backward compatibility with the UI Protocol surface that
+    /// M11-E migrates separately).
+    pub profiles: HashMap<String, Arc<ProfileRuntime>>,
+    /// M11-D: TTL/LRU cache of per-session runtimes keyed by
+    /// `(profile_id, session_key)`. Built once at startup;
+    /// `/api/chat` and other dispatchers call `get_or_init` to
+    /// materialize an `Arc<SessionRuntime>` per turn.
+    pub session_cache: Arc<SessionRuntimeCache>,
+    /// Legacy agent for processing messages (None if no LLM provider
+    /// configured). M11-D wires `/api/chat` through
+    /// [`Self::profiles`] + [`Self::session_cache`] instead; this
+    /// field stays for the UI Protocol surface (`api/ui_protocol*`)
+    /// which M11-E migrates separately.
     pub agent: Option<Arc<octos_agent::Agent>>,
-    /// Session manager for history.
+    /// Legacy session manager for history. Same M11-E scope note as
+    /// [`Self::agent`].
     pub sessions: Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>>,
     /// Process-wide event broadcaster for harness/admin + swarm SSE
     /// surfaces. Chat traffic uses `/api/ui-protocol/ws` exclusively as
@@ -230,6 +253,11 @@ impl AppState {
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).ok();
         Self {
+            profiles: HashMap::new(),
+            session_cache: Arc::new(SessionRuntimeCache::new(
+                64,
+                std::time::Duration::from_secs(1800),
+            )),
             agent: None,
             sessions: None,
             broadcaster: Arc::new(EventBroadcaster::new(16)),
