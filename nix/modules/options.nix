@@ -10,20 +10,36 @@ selfPackages:
 let
   inherit (lib)
     mkEnableOption
+    mkIf
     mkOption
     mkPackageOption
+    optional
+    optionals
     types
+    unique
     ;
 
   inherit (types)
     enum
     int
     listOf
+    package
     str
     submodule
     ;
 
   cfg = config.programs.octos;
+
+  allChannels = [
+    "discord"
+    "email"
+    "feishu"
+    "slack"
+    "telegram"
+    "twilio"
+    "wecom"
+    "whatsapp"
+  ];
 in
 
 {
@@ -32,15 +48,32 @@ in
     programs.octos = {
       enable = mkEnableOption "octos CLI";
 
-      package = mkPackageOption selfPackages "octos-minimal" { } // {
-        apply = pkg: if cfg.features != [ ] then pkg.override { inherit (cfg) features; } else pkg;
-        description = ''
-          The octos package to use.
+      package = mkPackageOption selfPackages "octos" { };
 
-          Features will be automatically applied based on the `features` option 
-          and whether skills or service are enabled.
-        '';
+      finalFeatures = mkOption {
+        type = listOf str;
+        internal = true;
+        visible = false;
+        default = unique (
+          cfg.channels
+          ++ optionals cfg.enableAllChannels allChannels
+          ++ optional (cfg.channels != [ ] || cfg.enableAllChannels || cfg.service.enable) "api"
+        );
       };
+
+      finalPackage = mkOption {
+        type = package;
+        internal = true;
+        visible = false;
+        default = cfg.package.override {
+          features = cfg.finalFeatures;
+          inherit (cfg) enableAppSkills;
+        };
+      };
+
+      enableAllChannels = mkEnableOption "all channels (telegram,discord,slack,whatsapp,feishu,email,twilio,wecom)";
+
+      enableAppSkills = mkEnableOption "app-skills (news, weather, etc.)";
 
       enableExtraPackages = mkEnableOption "extra runtime dependencies for octos" // {
         description = ''
@@ -50,47 +83,24 @@ in
         '';
       };
 
-      features = mkOption {
-        type = listOf (enum [
-          "api"
-          "telegram"
-          "discord"
-          "slack"
-          "whatsapp"
-          "feishu"
-          "email"
-          "twilio"
-          "wecom"
-        ]);
+      channels = mkOption {
+        type = listOf (enum allChannels);
         default = [ ];
         example = [
           "telegram"
           "discord"
         ];
-        description = "Cargo features to enable";
-        apply =
-          features:
-          if !lib.elem "api" features && (cfg.skills.enable || cfg.service.enable) then
-            features ++ [ "api" ]
-          else
-            features;
-      };
+        description = ''
+          Communication channels to enable. Each channel will be compiled into the octos binary as a Cargo feature.
 
-      skills = mkOption {
-        type = submodule {
-          options = {
-            enable = mkEnableOption "Install app-skills (news, weather, etc.). Requires features containing api.";
-            package = mkPackageOption selfPackages "octos-app-skills" { };
-          };
-        };
-        default = { };
-        description = "App Skills configuration";
+          See <https://github.com/octos-org/octos/blob/main/book/src/channels.md>
+        '';
       };
 
       service = mkOption {
         type = submodule {
           options = {
-            enable = mkEnableOption "octos service (dashboard + gateway)";
+            enable = mkEnableOption "octos serve (dashboard + gateway)";
             port = mkOption {
               type = int;
               default = 8080;
@@ -119,13 +129,12 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = mkIf cfg.enable {
 
     environment.systemPackages = [
-      cfg.package
+      cfg.finalPackage
     ]
-    ++ lib.optional cfg.skills.enable cfg.skills.package
-    ++ lib.optionals cfg.enableExtraPackages [
+    ++ optionals cfg.enableExtraPackages [
       pkgs.chromium
       pkgs.ffmpeg
       pkgs.libreoffice

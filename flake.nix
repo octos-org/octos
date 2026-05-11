@@ -37,7 +37,7 @@
         {
           imports = [
             (lib.modules.importApply ./nix/modules/options.nix {
-              inherit (self.packages.${system}) octos-minimal octos-app-skills;
+              inherit (self.packages.${system}) octos;
             })
             modulePath
           ];
@@ -55,32 +55,17 @@
       );
 
       packages = forEachSupportedSystem (
-        { pkgs, system }:
+        { pkgs, ... }:
+        let
+          octos = pkgs.callPackage ./nix/packages/default.nix { };
+        in
         {
-          octos-minimal = pkgs.callPackage ./nix/packages/default.nix { };
-          octos-app-skills = pkgs.callPackage ./nix/packages/app-skills.nix { };
-
-          default = self.packages.${system}.octos-minimal;
-
-          octos-full = pkgs.buildEnv {
-            name = "octos-full";
-            paths = [
-              self.packages.${system}.octos-app-skills
-
-              (self.packages.${system}.octos-minimal.override {
-                features = [
-                  "api"
-                  "telegram"
-                  "discord"
-                  "slack"
-                  "whatsapp"
-                  "feishu"
-                  "email"
-                  "twilio"
-                  "wecom"
-                ];
-              })
-            ];
+          inherit octos;
+          default = octos;
+          octos-minimal = octos;
+          octos-full = octos.override {
+            enableAllFeatures = true;
+            enableAppSkills = true;
           };
         }
       );

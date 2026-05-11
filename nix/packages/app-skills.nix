@@ -51,4 +51,3 @@ rustPlatform.buildRustPackage {
     runHook postInstall
   '';
 }
-
