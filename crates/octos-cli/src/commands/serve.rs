@@ -267,10 +267,13 @@ fn select_serve_profile(
 /// `base_url` or `OPENAI_API_KEY`) from contaminating a freshly-selected
 /// `moonshot` model. Non-LLM fields (auth tokens, hosts, dashboard auth,
 /// hooks, mode, swarm budgets) are left untouched.
-fn overlay_profile_llm(config: &mut Config, profiles: &[crate::profiles::UserProfile]) {
+fn overlay_profile_llm<'a>(
+    config: &mut Config,
+    profiles: &'a [crate::profiles::UserProfile],
+) -> Option<&'a crate::profiles::UserProfile> {
     let Some(profile) = select_serve_profile(profiles) else {
         tracing::debug!("no enabled profile with primary LLM selection — keeping top-level config");
-        return;
+        return None;
     };
 
     let profile_config = crate::profiles::config_from_profile(profile, None, None);
@@ -309,6 +312,7 @@ fn overlay_profile_llm(config: &mut Config, profiles: &[crate::profiles::UserPro
     // the agent's `Config` and let `Config::get_api_key` consult them
     // before falling back to `std::env::var`.
     populate_profile_credentials(profile, config);
+    Some(profile)
 }
 
 /// Resolve the API-key env-var values the selected profile expects (via
@@ -460,7 +464,27 @@ impl ServeCommand {
         match crate::profiles::ProfileStore::open(&data_dir) {
             Ok(store) => {
                 let profiles = store.list().unwrap_or_default();
-                overlay_profile_llm(&mut config, &profiles);
+                let selected = overlay_profile_llm(&mut config, &profiles);
+                // Wire per-profile customer skills into the agent's
+                // plugin search path. Without this, dashboard-installed
+                // skills like `mofa-fm` (at
+                // `~/.octos/profiles/<id>/data/skills/`) are invisible
+                // to the web `/chat` agent — `Config::plugin_dirs_from_project`
+                // only scans cwd-local and `~/.octos/{plugins,skills}/`.
+                // Gateway already does this via
+                // `skills_scope::build_account_plugin_dirs`; serve was
+                // the odd one out.
+                if let Some(profile) = selected {
+                    let skills_dir = store.resolve_data_dir(profile).join("skills");
+                    if skills_dir.exists() {
+                        tracing::info!(
+                            profile_id = %profile.id,
+                            skills_dir = %skills_dir.display(),
+                            "wiring per-profile skills dir for serve agent"
+                        );
+                        config.profile_skills_dir = Some(skills_dir);
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(
@@ -1105,6 +1129,24 @@ impl ServeCommand {
         let platform_dir = octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
         if platform_dir.exists() {
             plugin_dirs.push(platform_dir);
+        }
+        // Per-profile customer skills (e.g. `mofa-fm`) installed by the
+        // dashboard under `~/.octos/profiles/<id>/data/skills/`. Wired
+        // by `run_async` via `Config::profile_skills_dir` once the
+        // overlay picks an active profile. Without this the web
+        // `/chat` agent only sees globally-installed skills and loses
+        // visibility of dashboard-installed ones (e.g. `fm_tts`).
+        // Gateway already does the equivalent via
+        // `skills_scope::build_account_plugin_dirs` — this keeps the
+        // two paths in lockstep.
+        if let Some(ref dir) = config.profile_skills_dir {
+            if dir.exists() {
+                tracing::info!(
+                    dir = %dir.display(),
+                    "scanning per-profile skills dir for serve plugin loader"
+                );
+                plugin_dirs.push(dir.clone());
+            }
         }
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
@@ -2284,5 +2326,42 @@ mod tests {
             .get_api_key("moonshot")
             .expect("credentials map must satisfy the lookup without the env var being set");
         assert_eq!(resolved, "from-credentials-map");
+    }
+
+    #[test]
+    fn overlay_profile_llm_returns_selected_profile_for_skills_dir_wiring() {
+        // The overlay must return the picked profile so `run_async`
+        // can resolve its data dir + populate `profile_skills_dir`.
+        // Without this return value, serve's plugin loader would
+        // never scan per-profile skill dirs (the exact gap that
+        // hides dashboard-installed skills like `mofa-fm` from the
+        // web /chat agent).
+        let mut config = Config::default();
+        let profiles = vec![make_profile_with_llm(
+            "dspfac",
+            true,
+            "moonshot",
+            "kimi-k2.5",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        )];
+
+        let selected = overlay_profile_llm(&mut config, &profiles);
+        let selected = selected.expect("overlay should pick dspfac");
+        assert_eq!(selected.id, "dspfac");
+
+        // When no profile qualifies, the overlay returns None — the
+        // caller in `run_async` then skips the skills-dir wiring
+        // entirely, preserving the old behavior.
+        let mut config2 = Config::default();
+        let no_selectable = vec![make_profile_with_llm(
+            "disabled",
+            false, // disabled — skipped by select_serve_profile
+            "moonshot",
+            "kimi-k2.5",
+            "minimax",
+            "MiniMax-M2.5-highspeed",
+        )];
+        assert!(overlay_profile_llm(&mut config2, &no_selectable).is_none());
     }
 }

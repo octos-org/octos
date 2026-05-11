@@ -203,6 +203,20 @@ pub struct Config {
     /// `Config::get_api_key` call sites need no signature changes.
     #[serde(default, skip)]
     pub credentials: std::collections::HashMap<String, String>,
+
+    /// Per-profile skill package directory the active runtime should
+    /// scan in addition to the project-scoped `plugin_dirs_from_project`
+    /// list. Populated at runtime by `octos serve`'s overlay so that
+    /// dashboard-installed customer skills (e.g. `mofa-fm` at
+    /// `~/.octos/profiles/<id>/data/skills/`) become visible to the web
+    /// `/chat` agent — without leaking them across other profiles on
+    /// the same host.
+    ///
+    /// Not serialized. Mirrors `credentials`: a transient runtime
+    /// channel from `run_async` startup through to `try_create_agent`'s
+    /// plugin discovery.
+    #[serde(default, skip)]
+    pub profile_skills_dir: Option<PathBuf>,
 }
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
