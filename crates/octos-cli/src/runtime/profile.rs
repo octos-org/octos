@@ -21,9 +21,7 @@ use octos_memory::{EpisodeStore, MemoryStore};
 use tracing::{info, warn};
 
 use crate::commands::chat;
-use crate::commands::gateway::profile_factory::{
-    profile_plugin_env, profile_search_provider_keys,
-};
+use crate::commands::gateway::profile_factory::{profile_plugin_env, profile_search_provider_keys};
 use crate::profiles::{UserProfile, config_from_profile};
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
@@ -269,10 +267,7 @@ impl ProfileRuntime {
                     .map(String::from)
             })
             .ok_or_else(|| {
-                eyre::eyre!(
-                    "profile '{}' has no LLM provider configured",
-                    profile.id
-                )
+                eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
             })?;
 
         // Step 3: build the LLM provider chain.
@@ -293,29 +288,20 @@ impl ProfileRuntime {
         let runtime_qos_catalog = bundle.runtime_qos_catalog.clone();
 
         // Step 4: open the memory stores.
-        let memory = Arc::new(
-            EpisodeStore::open(data_dir)
-                .await
-                .wrap_err_with(|| {
-                    format!("failed to open episode store for profile '{}'", profile.id)
-                })?,
-        );
-        let memory_store = Arc::new(
-            MemoryStore::open(data_dir)
-                .await
-                .wrap_err_with(|| {
-                    format!("failed to open memory store for profile '{}'", profile.id)
-                })?,
-        );
+        let memory = Arc::new(EpisodeStore::open(data_dir).await.wrap_err_with(|| {
+            format!("failed to open episode store for profile '{}'", profile.id)
+        })?);
+        let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
+            format!("failed to open memory store for profile '{}'", profile.id)
+        })?);
 
         // Step 5: tool config store.
-        let tool_config = Arc::new(
-            ToolConfigStore::open(data_dir)
-                .await
-                .wrap_err_with(|| {
-                    format!("failed to open tool config store for profile '{}'", profile.id)
-                })?,
-        );
+        let tool_config = Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
+            format!(
+                "failed to open tool config store for profile '{}'",
+                profile.id
+            )
+        })?);
 
         // Step 6: resolve credentials from the profile's declared env
         // vars (keychain-aware). Used by MCP, plugin spawns, and the
@@ -324,7 +310,9 @@ impl ProfileRuntime {
 
         // Step 7: discover the per-profile skills dir (if any).
         let skills_dir_candidate = data_dir.join("skills");
-        let skills_dir = skills_dir_candidate.exists().then_some(skills_dir_candidate);
+        let skills_dir = skills_dir_candidate
+            .exists()
+            .then_some(skills_dir_candidate);
 
         // Step 8: build the plugin env template — `OCTOS_DATA_DIR`,
         // `OCTOS_HOME`, `OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, and
@@ -362,12 +350,7 @@ impl ProfileRuntime {
         // root — sessions rebind cwd via `SessionRuntime::bootstrap`
         // before any actual tool call runs.
         let mut tools = ToolRegistry::with_builtins_and_sandbox(data_dir, sandbox);
-        tools.set_output_dir_hint(
-            data_dir
-                .join("skill-output")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        tools.set_output_dir_hint(data_dir.join("skill-output").to_string_lossy().into_owned());
         tools.inject_tool_config(tool_config.clone());
 
         // Step 10: WebSearchTool with the profile's search provider
@@ -411,8 +394,7 @@ impl ProfileRuntime {
         if let Some(ref dir) = skills_dir {
             plugin_dirs.push(dir.clone());
         }
-        let bundled_dir =
-            effective_octos_home.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+        let bundled_dir = effective_octos_home.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
         if bundled_dir.exists() && !plugin_dirs.contains(&bundled_dir) {
             plugin_dirs.push(bundled_dir);
         }

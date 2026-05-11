@@ -529,8 +529,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
-        let tool_config =
-            Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));

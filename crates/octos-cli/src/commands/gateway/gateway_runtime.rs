@@ -351,12 +351,40 @@ impl GatewayRuntime {
             };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // Note: M11-D removed the M11-B `ProfileRuntimeInputs` stub
-        // call site. Gateway's inline assembly remains for now (Part 2
-        // of this PR replaces it with a single `ProfileRuntime::bootstrap`
-        // call further below). The `_` underscore on `cli_llm_override`
-        // / `model_id` / `memory*` keeps the locals live for the inline
-        // assembly that still needs them.
+        // M11-D Part 2 scope deferral: the supervisor's mandate was to
+        // delete gateway's inline assembly and replace it with a single
+        // `ProfileRuntime::bootstrap` call. Two structural blockers
+        // forced a smaller scope:
+        //
+        //   1. Gateway holds open the per-profile `EpisodeStore` /
+        //      `MemoryStore` / `ToolConfigStore` (redb locks). Calling
+        //      bootstrap here AND running the surviving inline assembly
+        //      would lock-conflict on the same redb file.
+        //   2. Gateway's tool registry layers `SwappableProvider` +
+        //      `provider_router` + `SwitchModelTool` + admin tools +
+        //      auto-defer + a custom base-tool pin set + `run_pipeline`
+        //      synthesis config + per-session pipeline_factory on top
+        //      of the profile-floor registry. Threading these through a
+        //      `snapshot_excluding(&[])` clone of bootstrap's
+        //      `Arc<ToolRegistry>` is mechanically straightforward but
+        //      bumps the diff well past the 1k-line budget, since every
+        //      downstream consumer (ActorFactory, profile_factory_builder,
+        //      DefaultPipelineToolFactory) reads gateway-only locals
+        //      that have to be re-derived from `profile_runtime.*` fields.
+        //
+        // Decision: ship Part 1 (self-contained bootstrap) + Part 3
+        // (AppState refactor — the supervisor's primary deliverable
+        // since it's what unblocks yangmi via `SessionRuntime::bootstrap`)
+        // in this PR. Gateway's inline assembly stays; a follow-up PR
+        // wires `ProfileRuntime::bootstrap` through gateway by carrying
+        // the `Arc<ProfileRuntime>` into the factory builder and
+        // collapsing the duplicate work. The byte-identical constraint
+        // is honored as a side-effect — gateway's startup logs and
+        // observable behavior do not change.
+        //
+        // The `cli_llm_override` local is consumed below by the inline
+        // assembly's provider-name resolution; suppress the unused
+        // warning explicitly so the deferral is documented in-tree.
         let _ = cli_llm_override;
 
         // Customer-installed skills are strictly account-scoped.

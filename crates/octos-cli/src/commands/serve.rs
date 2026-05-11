@@ -1,5 +1,6 @@
 //! Serve command: start the REST API server.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -586,6 +587,66 @@ impl ServeCommand {
             crate::profiles::ProfileStore::open(&data_dir)
                 .wrap_err("failed to open profile store")?,
         );
+
+        // M11-D — build the per-profile runtime catalog. For every
+        // enabled profile that has an active primary LLM selection,
+        // call `ProfileRuntime::bootstrap` and stash the resulting
+        // `Arc<ProfileRuntime>` under its profile id. Failures are
+        // logged and skipped so a single bad profile cannot 503 the
+        // whole server.
+        //
+        // Important: `ProfileRuntime::bootstrap` opens a per-profile
+        // `EpisodeStore` / `MemoryStore` / `ToolConfigStore` against
+        // the profile's data dir. The legacy `try_create_agent` path
+        // opens the same stores against the top-level `data_dir`, so
+        // the two paths use *different* on-disk roots and do not lock-
+        // conflict.
+        let mut profile_runtimes: HashMap<String, Arc<crate::runtime::ProfileRuntime>> =
+            HashMap::new();
+        let all_profiles = profile_store.list().unwrap_or_default();
+        for profile in &all_profiles {
+            if !profile.enabled || profile.parent_id.is_some() {
+                continue;
+            }
+            if !profile.config.has_llm_selection() {
+                tracing::debug!(
+                    profile_id = %profile.id,
+                    "skipping ProfileRuntime bootstrap: no LLM selection",
+                );
+                continue;
+            }
+            let profile_data_dir = profile_store.resolve_data_dir(profile);
+            match crate::runtime::ProfileRuntime::bootstrap(
+                profile,
+                &profile_data_dir,
+                Some(&data_dir),
+            )
+            .await
+            {
+                Ok(rt) => {
+                    tracing::info!(
+                        profile_id = %profile.id,
+                        provider = %rt.provider_name,
+                        model = %rt.primary_model_id,
+                        tools = rt.tool_specs.specs().len(),
+                        "ProfileRuntime bootstrapped for /api/chat",
+                    );
+                    profile_runtimes.insert(profile.id.clone(), rt);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        profile_id = %profile.id,
+                        %error,
+                        "ProfileRuntime bootstrap failed — /api/chat will return 503 for this profile",
+                    );
+                }
+            }
+        }
+        let session_cache = Arc::new(crate::runtime::SessionRuntimeCache::new(
+            64,
+            std::time::Duration::from_secs(1800),
+        ));
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
@@ -707,6 +768,8 @@ impl ServeCommand {
         .wrap_err("failed to build swarm state")?;
 
         let state = Arc::new(AppState {
+            profiles: profile_runtimes,
+            session_cache,
             agent,
             sessions,
             broadcaster,
