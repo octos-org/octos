@@ -35,9 +35,11 @@ use super::ProfileRuntime;
 ///   the M11 fix for the `"workspace policy not found"` failure on
 ///   yangmi voice clone.
 /// - **`plugin_work_dir`** — the per-session scratch space plugins
-///   are allowed to write into. Distinct from `workspace_root` so a
-///   plugin can drop intermediate artifacts without polluting the
-///   session's main workspace.
+///   are allowed to write into. Conventionally
+///   `workspace_root.join("skill-output")`; lives under the
+///   workspace root so artifacts remain visible to the user but
+///   are namespaced away from the session's main work tree. Wired
+///   into the tool registry via `set_output_dir_hint`.
 /// - **`sandbox`** — the effective sandbox config for this session.
 ///   Falls back to [`ProfileRuntime::default_sandbox`] unless the
 ///   session explicitly overrides (e.g. a slides-builder room
@@ -116,31 +118,34 @@ impl SessionRuntime {
     /// # Contract (filled in by M11-C)
     ///
     /// 1. Resolve `workspace_root`:
-    ///    - If `workspace_hint` is `Some`, validate it via
-    ///      `validate_session_workspace_allowed` and use it as-is
-    ///      (coding-agent flow).
+    ///    - If `workspace_hint` is `Some(path)` and
+    ///      `validate_session_workspace_allowed(state, path)`
+    ///      accepts, use it as-is (coding-agent flow).
     ///    - Otherwise default to
-    ///      `<profile.data_dir>/users/<session_key>/workspace/`
-    ///      and create the directory if missing.
-    /// 2. Resolve `plugin_work_dir` to
-    ///    `<profile.data_dir>/users/<session_key>/plugin_work/`,
-    ///    creating it if missing.
-    /// 3. If `<workspace_root>/.octos-workspace.toml` is missing,
-    ///    write a default one via
+    ///      `profile.data_dir.join("users").join(encode(session_key)).join("workspace")`
+    ///      and `create_dir_all` it.
+    /// 2. If `<workspace_root>/.octos-workspace.toml` is missing,
+    ///    write `WorkspacePolicy::for_session()` to it via
     ///    `octos_agent::workspace_policy::write_workspace_policy`.
     ///    This is the M11 fix for the
     ///    `"workspace policy not found"` failure.
-    /// 4. Derive the effective `sandbox`: profile default unless
-    ///    the session has an override (forthcoming session-config
-    ///    field; not in M11-A).
-    /// 5. Clone `profile.tool_specs`, bind it to `workspace_root`
-    ///    via `with_workspace_root`, filter through
-    ///    `profile.tool_policy`, return as `Arc<ToolRegistry>`.
-    /// 6. Build the per-session [`Agent`] from `profile.llm`, the
-    ///    session tool registry, the profile's memory stores, and
-    ///    the standard agent config.
-    /// 7. Open / load the [`SessionManager`] for `session_key`
-    ///    (JSONL persistence with the existing on-disk layout).
+    /// 3. Compute
+    ///    `plugin_work_dir = workspace_root.join("skill-output")`
+    ///    and `create_dir_all` it.
+    /// 4. Clone `profile.tool_specs` via
+    ///    `ToolRegistry::snapshot_excluding(&[])` and apply:
+    ///    - `set_workspace_root(workspace_root.clone())`
+    ///    - `set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned())`
+    ///    - per-session policy filter (no-op default for M11).
+    /// 5. Resolve `sandbox`: [`ProfileRuntime::default_sandbox`]
+    ///    is fine for M11; an explicit per-session override hook
+    ///    is left for a future workstream.
+    /// 6. Build the per-session [`Agent`] from `profile.llm` plus
+    ///    the cloned tools. Today's `Agent::new(...) + .with_*`
+    ///    chain in `commands/serve.rs::try_create_agent` relocates
+    ///    here verbatim.
+    /// 7. Open the per-session [`SessionManager`] against
+    ///    `profile.data_dir.join("users").join(session_key.user_key())`.
     /// 8. Return `Arc<Self>`.
     ///
     /// # Parameters
@@ -163,12 +168,12 @@ impl SessionRuntime {
     /// agent construction fails, or session-manager load fails.
     /// A partially constructed [`SessionRuntime`] is never
     /// returned.
+    #[allow(unused_variables)]
     pub async fn bootstrap(
         profile: &Arc<ProfileRuntime>,
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
-        let _ = (profile, session_key, workspace_hint);
         todo!("M11-C implements this")
     }
 }

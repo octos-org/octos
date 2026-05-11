@@ -218,12 +218,12 @@ impl ProfileRuntime {
     /// construction, keychain resolution, skills loading, redb open,
     /// or tool-registry build. The bootstrap is fail-fast — a
     /// partially constructed [`ProfileRuntime`] is never returned.
+    #[allow(unused_variables)]
     pub async fn bootstrap(
         profile: &UserProfile,
         store: &ProfileStore,
         data_dir: &Path,
     ) -> Result<Arc<Self>> {
-        let _ = (profile, store, data_dir);
         todo!("M11-B implements this")
     }
 }

@@ -106,24 +106,31 @@ impl SessionRuntimeCache {
     ///    `(profile.profile_id.clone(), session_key.clone())`.
     /// 2. On hit: update `last_used` and return the cached
     ///    `Arc<SessionRuntime>`.
-    /// 3. On miss: drop the read lock, call
-    ///    [`SessionRuntime::bootstrap(profile, session_key, workspace_hint)`](SessionRuntime::bootstrap),
-    ///    take the write lock, and insert. Use a "check-again
-    ///    under write lock" pattern so two concurrent misses
-    ///    don't both run bootstrap.
+    /// 3. On miss:
+    ///    a. Drop the read lock.
+    ///    b. Take the **write** lock first.
+    ///    c. Re-check the map under the write lock — if another
+    ///       task inserted the entry while we were upgrading,
+    ///       return that entry.
+    ///    d. Only then call
+    ///       [`SessionRuntime::bootstrap(profile, session_key, workspace_hint)`](SessionRuntime::bootstrap),
+    ///       insert, and return. The check-twice ordering is
+    ///       load-bearing: it's what stops two concurrent misses
+    ///       from both running `bootstrap` (which would build two
+    ///       agents, two session managers, etc.).
     /// 4. If the post-insert map size exceeds `max_size`, evict
     ///    the least-recently-used entry.
     ///
     /// # Errors
     ///
     /// Propagates any error from [`SessionRuntime::bootstrap`].
+    #[allow(unused_variables)]
     pub async fn get_or_init(
         &self,
         profile: &Arc<ProfileRuntime>,
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<SessionRuntime>> {
-        let _ = (profile, session_key, workspace_hint);
         todo!("M11-C implements this")
     }
 
