@@ -6,7 +6,6 @@ use std::sync::Arc;
 use clap::Args;
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use octos_agent::sandbox::BLOCKED_ENV_VARS;
 use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
 use octos_core::AgentId;
@@ -299,47 +298,44 @@ fn overlay_profile_llm(config: &mut Config, profiles: &[crate::profiles::UserPro
     config.adaptive_routing = profile_config.adaptive_routing;
     config.content_routing = profile_config.content_routing;
 
-    // Inject the credentials the selected profile expects so
-    // `Config::get_api_key` can resolve them. The gateway path gets
-    // these via `ProcessManager` spawning a child with `cmd.env(...)`;
-    // the serve agent runs in-process and has no such hook, so without
-    // this step the overlay would still leave `/chat` with the wrong
-    // API key (e.g. profile says AUTODL_API_KEY but the serve parent
-    // process only has DEEPSEEK_API_KEY exported).
-    inject_profile_api_key_env(profile);
+    // Pre-resolve the credentials the selected profile expects and
+    // stash them on `Config::credentials`. The gateway path gets these
+    // via `ProcessManager` spawning a child with `cmd.env(...)`; the
+    // serve agent runs in-process. Rather than mutate the shared
+    // parent-process environment (racy under the multi-threaded tokio
+    // runtime, and a privilege-escalation surface if a profile field
+    // names PATH/OCTOS_AUTH_TOKEN/etc.), we keep the secrets local to
+    // the agent's `Config` and let `Config::get_api_key` consult them
+    // before falling back to `std::env::var`.
+    populate_profile_credentials(profile, config);
 }
 
-/// Set the API-key env vars referenced by the selected profile's primary
-/// + fallback routes from `profile.config.env_vars` into the current
-/// process environment, resolving any `keychain:` markers.
-///
-/// Only the env-var names actually referenced by `api_key_env` on the
-/// selected primary / fallbacks are injected — we don't shovel the
-/// entire `env_vars` map into the parent process. The set is bounded by
-/// the LLM contract and won't include unrelated channel/email/tool
-/// secrets.
-#[allow(unsafe_code)]
-fn inject_profile_api_key_env(profile: &crate::profiles::UserProfile) {
+/// Resolve the API-key env-var values the selected profile expects (via
+/// `keychain::resolve_env_vars` to expand `keychain:` markers) and
+/// stash them on `Config::credentials`. Only env-var names explicitly
+/// listed on the profile's `llm.primary.route.api_key_env` or any
+/// `llm.fallbacks[].route.api_key_env` are pulled across — we never
+/// flood `Config::credentials` with the entire `profile.env_vars` map.
+fn populate_profile_credentials(profile: &crate::profiles::UserProfile, config: &mut Config) {
     use std::collections::HashSet;
 
-    let llm = match profile.config.llm.as_ref() {
-        Some(llm) => llm,
-        None => return,
+    let Some(llm) = profile.config.llm.as_ref() else {
+        return;
     };
 
-    let mut wanted: HashSet<&str> = HashSet::new();
+    let mut wanted: HashSet<String> = HashSet::new();
     if let Some(primary) = llm.primary.as_ref() {
         if let Some(env) = primary
             .route
             .as_ref()
             .and_then(|r| r.api_key_env.as_deref())
         {
-            wanted.insert(env);
+            wanted.insert(env.to_string());
         }
     }
     for fb in &llm.fallbacks {
         if let Some(env) = fb.route.as_ref().and_then(|r| r.api_key_env.as_deref()) {
-            wanted.insert(env);
+            wanted.insert(env.to_string());
         }
     }
     if wanted.is_empty() {
@@ -348,10 +344,7 @@ fn inject_profile_api_key_env(profile: &crate::profiles::UserProfile) {
 
     let resolved = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
     for env_name in wanted {
-        let Some(value) = resolved.get(env_name) else {
-            // Profile references this env var but didn't store it. Leave
-            // the parent process env as-is; `Config::get_api_key` will
-            // surface a clear error at first use.
+        let Some(value) = resolved.get(&env_name) else {
             tracing::debug!(
                 profile_id = %profile.id,
                 env_name,
@@ -359,30 +352,11 @@ fn inject_profile_api_key_env(profile: &crate::profiles::UserProfile) {
             );
             continue;
         };
-        if BLOCKED_ENV_VARS
-            .iter()
-            .any(|blocked| env_name.eq_ignore_ascii_case(blocked))
-        {
-            tracing::warn!(
-                profile_id = %profile.id,
-                env_name,
-                "skipping blocked env var injection from profile"
-            );
-            continue;
-        }
-        // SAFETY: serve runs this overlay during startup, before any
-        // tokio worker threads are spawned, so the process is still
-        // effectively single-threaded for env mutation purposes. We
-        // only inject env vars explicitly referenced by the profile's
-        // LLM routes (bounded set), and block the known-dangerous
-        // names via `BLOCKED_ENV_VARS`.
-        unsafe {
-            std::env::set_var(env_name, value);
-        }
+        config.credentials.insert(env_name.clone(), value.clone());
         tracing::info!(
             profile_id = %profile.id,
-            env_name,
-            "injected profile-scoped API-key env var into serve process"
+            env_name = %env_name,
+            "stashed profile-scoped credential on Config::credentials"
         );
     }
 }
@@ -1062,13 +1036,14 @@ impl ServeCommand {
             let mut providers: Vec<Arc<dyn LlmProvider>> =
                 vec![Arc::new(RetryProvider::new(base_provider))];
             for fb in &config.fallback_models {
-                let fb_config = if fb.api_key_env.is_some() {
-                    let mut c = config.clone();
-                    c.api_key_env = fb.api_key_env.clone();
-                    c
-                } else {
-                    config.clone()
-                };
+                // Clone the config but always swap in this fallback's
+                // own `api_key_env`. When the fallback omits it, we
+                // clear the primary's `api_key_env` so the registry
+                // default kicks in — otherwise a cross-provider
+                // fallback (e.g. deepseek behind moonshot) would try
+                // to use the primary's AUTODL_API_KEY for DeepSeek.
+                let mut fb_config = config.clone();
+                fb_config.api_key_env = fb.api_key_env.clone();
                 match create_provider_with_api_type(
                     &fb.provider,
                     &fb_config,
@@ -2257,24 +2232,8 @@ mod tests {
         );
     }
 
-    /// Mutex serializing env-mutation tests in this module so concurrent
-    /// `cargo test` workers don't race the parent process env.
-    fn env_inject_lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     #[test]
-    #[allow(unsafe_code)]
-    fn overlay_profile_llm_injects_profile_api_key_env_into_process() {
-        let _guard = env_inject_lock().lock().unwrap();
-        const ENV_NAME: &str = "OCTOS_TEST_PROFILE_LLM_INJECTION";
-        // SAFETY: serialized via `env_inject_lock`.
-        unsafe {
-            std::env::remove_var(ENV_NAME);
-        }
-
+    fn overlay_profile_llm_stashes_profile_api_key_into_config_credentials() {
         let mut config = Config::default();
         let mut profile = make_profile_with_llm(
             "dspfac",
@@ -2284,29 +2243,68 @@ mod tests {
             "minimax",
             "MiniMax-M2.5-highspeed",
         );
-        // Point the primary route at our unique env name and store the
-        // literal value in profile.env_vars.
         if let Some(llm) = profile.config.llm.as_mut() {
             if let Some(primary) = llm.primary.as_mut() {
                 if let Some(route) = primary.route.as_mut() {
-                    route.api_key_env = Some(ENV_NAME.into());
+                    route.api_key_env = Some("PRIMARY_KEY".into());
+                }
+            }
+            if let Some(fb) = llm.fallbacks.first_mut() {
+                if let Some(route) = fb.route.as_mut() {
+                    route.api_key_env = Some("FALLBACK_KEY".into());
                 }
             }
         }
         profile
             .config
             .env_vars
-            .insert(ENV_NAME.into(), "sk-from-profile".into());
+            .insert("PRIMARY_KEY".into(), "sk-from-profile-primary".into());
+        profile
+            .config
+            .env_vars
+            .insert("FALLBACK_KEY".into(), "sk-from-profile-fallback".into());
+        // An unrelated env var that the LLM contract does NOT
+        // reference — must not be copied into Config::credentials.
+        profile
+            .config
+            .env_vars
+            .insert("TELEGRAM_BOT_TOKEN".into(), "should-not-leak".into());
 
         overlay_profile_llm(&mut config, &[profile]);
 
-        let injected = std::env::var(ENV_NAME)
-            .expect("overlay must inject the profile's api_key_env into the process env");
-        assert_eq!(injected, "sk-from-profile");
+        assert_eq!(
+            config.credentials.get("PRIMARY_KEY").map(String::as_str),
+            Some("sk-from-profile-primary"),
+            "primary route credential must be stashed on Config::credentials"
+        );
+        assert_eq!(
+            config.credentials.get("FALLBACK_KEY").map(String::as_str),
+            Some("sk-from-profile-fallback"),
+            "fallback route credential must be stashed on Config::credentials"
+        );
+        assert!(
+            !config.credentials.contains_key("TELEGRAM_BOT_TOKEN"),
+            "unrelated profile env vars must NOT bleed into credentials, \
+             got keys: {:?}",
+            config.credentials.keys().collect::<Vec<_>>()
+        );
+    }
 
-        // SAFETY: serialized via `env_inject_lock`; cleanup.
-        unsafe {
-            std::env::remove_var(ENV_NAME);
-        }
+    #[test]
+    fn get_api_key_prefers_credentials_map_over_env() {
+        let mut config = Config {
+            provider: Some("moonshot".into()),
+            api_key_env: Some("OCTOS_TEST_API_KEY_PRIORITY".into()),
+            ..Default::default()
+        };
+        config.credentials.insert(
+            "OCTOS_TEST_API_KEY_PRIORITY".into(),
+            "from-credentials-map".into(),
+        );
+
+        let resolved = config
+            .get_api_key("moonshot")
+            .expect("credentials map must satisfy the lookup without the env var being set");
+        assert_eq!(resolved, "from-credentials-map");
     }
 }
