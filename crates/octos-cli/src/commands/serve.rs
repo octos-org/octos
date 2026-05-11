@@ -7,18 +7,11 @@ use std::sync::Arc;
 use clap::Args;
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
-use octos_core::AgentId;
-use octos_llm::LlmProvider;
-use octos_memory::{EpisodeStore, MemoryStore};
 
 use super::Executable;
-use super::chat::create_provider;
-use crate::api::metrics::MetricsReporter;
 use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
-use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 
 fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
     if !email.provider.eq_ignore_ascii_case("smtp") {
@@ -211,162 +204,6 @@ fn resolve_dashboard_auth_smtp_password(
     None
 }
 
-/// Returns true when the profile is a viable server-wide LLM source: it's
-/// enabled, is not a sub-account (sub-accounts inherit their parent's LLM
-/// contract), and has both `family_id` and `model_id` set on `llm.primary`.
-fn profile_has_active_primary_llm(profile: &crate::profiles::UserProfile) -> bool {
-    if !profile.enabled || profile.parent_id.is_some() {
-        return false;
-    }
-    profile
-        .config
-        .llm
-        .as_ref()
-        .and_then(|llm| llm.primary.as_ref())
-        .is_some_and(|sel| sel.family_id.is_some() && sel.model_id.is_some())
-}
-
-/// Picks the server-wide LLM profile from a sorted profile list.
-///
-/// Selection precedence:
-///   1. The canonical admin profile (`ADMIN_PROFILE_ID`), if it has an active
-///      primary — keeps the host's "main" tenant deterministic.
-///   2. Otherwise the first non-sub-account enabled profile with an active
-///      primary, in `ProfileStore::list()` order (which sorts by name).
-///
-/// Sub-accounts (`parent_id.is_some()`) are excluded by design: per
-/// `UserProfile::parent_id` docs they inherit the parent's LLM contract,
-/// so they should never drive the server-wide agent on their own.
-fn select_serve_profile(
-    profiles: &[crate::profiles::UserProfile],
-) -> Option<&crate::profiles::UserProfile> {
-    if let Some(admin) = profiles
-        .iter()
-        .find(|p| p.id == crate::api::auth_handlers::ADMIN_PROFILE_ID)
-    {
-        if profile_has_active_primary_llm(admin) {
-            return Some(admin);
-        }
-    }
-    profiles.iter().find(|p| profile_has_active_primary_llm(p))
-}
-
-/// Overlay per-profile `cfg.llm` selection onto the top-level [`Config`].
-///
-/// The serve agent historically only read `~/.octos/config.json`'s flat
-/// `provider`/`model` fields, ignoring the structured `llm.primary` +
-/// `llm.fallbacks` that the dashboard writes into per-profile JSON. The
-/// `gateway` command goes through [`crate::profiles::config_from_profile`]
-/// to honor those — `serve` did not, so the web `/chat` endpoint always
-/// used the bare top-level provider even when the dashboard had moonshot
-/// or minimax configured.
-///
-/// When a viable profile is selected (see [`select_serve_profile`]),
-/// every LLM-scoped field is replaced **as a unit** from the
-/// profile-derived [`Config`] — even when the profile leaves a sub-field
-/// blank. This prevents stale top-level values (e.g. a `deepseek`
-/// `base_url` or `OPENAI_API_KEY`) from contaminating a freshly-selected
-/// `moonshot` model. Non-LLM fields (auth tokens, hosts, dashboard auth,
-/// hooks, mode, swarm budgets) are left untouched.
-fn overlay_profile_llm<'a>(
-    config: &mut Config,
-    profiles: &'a [crate::profiles::UserProfile],
-) -> Option<&'a crate::profiles::UserProfile> {
-    let Some(profile) = select_serve_profile(profiles) else {
-        tracing::debug!("no enabled profile with primary LLM selection — keeping top-level config");
-        return None;
-    };
-
-    let profile_config = crate::profiles::config_from_profile(profile, None, None);
-    tracing::info!(
-        profile_id = %profile.id,
-        provider = ?profile_config.provider,
-        model = ?profile_config.model,
-        base_url = ?profile_config.base_url,
-        api_key_env = ?profile_config.api_key_env,
-        fallback_models = profile_config.fallback_models.len(),
-        content_routing = profile_config.content_routing.is_some(),
-        "overlaying per-profile LLM config onto top-level config for serve agent"
-    );
-
-    // Replace the LLM-scoped fields atomically — including clearing stale
-    // values when the profile leaves a sub-field unset. Mixing a profile
-    // model with a leftover top-level base_url / api_key_env is worse
-    // than missing the field outright.
-    config.provider = profile_config.provider;
-    config.model = profile_config.model;
-    config.base_url = profile_config.base_url;
-    config.api_key_env = profile_config.api_key_env;
-    config.api_type = profile_config.api_type;
-    config.model_hints = profile_config.model_hints;
-    config.fallback_models = profile_config.fallback_models;
-    config.adaptive_routing = profile_config.adaptive_routing;
-    config.content_routing = profile_config.content_routing;
-
-    // Pre-resolve the credentials the selected profile expects and
-    // stash them on `Config::credentials`. The gateway path gets these
-    // via `ProcessManager` spawning a child with `cmd.env(...)`; the
-    // serve agent runs in-process. Rather than mutate the shared
-    // parent-process environment (racy under the multi-threaded tokio
-    // runtime, and a privilege-escalation surface if a profile field
-    // names PATH/OCTOS_AUTH_TOKEN/etc.), we keep the secrets local to
-    // the agent's `Config` and let `Config::get_api_key` consult them
-    // before falling back to `std::env::var`.
-    populate_profile_credentials(profile, config);
-    Some(profile)
-}
-
-/// Resolve the API-key env-var values the selected profile expects (via
-/// `keychain::resolve_env_vars` to expand `keychain:` markers) and
-/// stash them on `Config::credentials`. Only env-var names explicitly
-/// listed on the profile's `llm.primary.route.api_key_env` or any
-/// `llm.fallbacks[].route.api_key_env` are pulled across — we never
-/// flood `Config::credentials` with the entire `profile.env_vars` map.
-fn populate_profile_credentials(profile: &crate::profiles::UserProfile, config: &mut Config) {
-    use std::collections::HashSet;
-
-    let Some(llm) = profile.config.llm.as_ref() else {
-        return;
-    };
-
-    let mut wanted: HashSet<String> = HashSet::new();
-    if let Some(primary) = llm.primary.as_ref() {
-        if let Some(env) = primary
-            .route
-            .as_ref()
-            .and_then(|r| r.api_key_env.as_deref())
-        {
-            wanted.insert(env.to_string());
-        }
-    }
-    for fb in &llm.fallbacks {
-        if let Some(env) = fb.route.as_ref().and_then(|r| r.api_key_env.as_deref()) {
-            wanted.insert(env.to_string());
-        }
-    }
-    if wanted.is_empty() {
-        return;
-    }
-
-    let resolved = crate::auth::keychain::resolve_env_vars(&profile.config.env_vars);
-    for env_name in wanted {
-        let Some(value) = resolved.get(&env_name) else {
-            tracing::debug!(
-                profile_id = %profile.id,
-                env_name,
-                "profile route references env var but no value in profile.env_vars"
-            );
-            continue;
-        };
-        config.credentials.insert(env_name.clone(), value.clone());
-        tracing::info!(
-            profile_id = %profile.id,
-            env_name = %env_name,
-            "stashed profile-scoped credential on Config::credentials"
-        );
-    }
-}
-
 /// Start the REST API server.
 #[derive(Debug, Args)]
 pub struct ServeCommand {
@@ -450,7 +287,7 @@ impl ServeCommand {
         // runtime state and config unless an explicit --config path is given.
         let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
 
-        let (mut config, resolved_config_path) = if let Some(config_path) = &self.config {
+        let (config, resolved_config_path) = if let Some(config_path) = &self.config {
             tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
@@ -458,93 +295,31 @@ impl ServeCommand {
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
-        // Overlay per-profile LLM config onto the top-level Config so the
-        // serve agent uses the dashboard-configured providers, not the bare
-        // `provider`/`model` fallback in `~/.octos/config.json`.
-        // See `overlay_profile_llm` for the rationale and contract.
-        match crate::profiles::ProfileStore::open(&data_dir) {
-            Ok(store) => {
-                let profiles = store.list().unwrap_or_default();
-                let selected = overlay_profile_llm(&mut config, &profiles);
-                // Wire per-profile customer skills into the agent's
-                // plugin search path. Without this, dashboard-installed
-                // skills like `mofa-fm` (at
-                // `~/.octos/profiles/<id>/data/skills/`) are invisible
-                // to the web `/chat` agent — `Config::plugin_dirs_from_project`
-                // only scans cwd-local and `~/.octos/{plugins,skills}/`.
-                // Gateway already does this via
-                // `skills_scope::build_account_plugin_dirs`; serve was
-                // the odd one out.
-                // SCOPE NOTE — multi-tenant leak:
-                //   This wiring loads the SELECTED profile's skills into
-                //   the single base `ToolRegistry` shared by every
-                //   incoming WS session. On hosts that serve only one
-                //   customer profile (the current fleet — mini1, mini2,
-                //   mini3 each host one tenant), there is nothing to
-                //   leak. On a multi-tenant host where the dashboard
-                //   routes different subdomains to different profiles,
-                //   tools registered here are visible to all of them
-                //   via the cloned tool registry in
-                //   `api/ui_protocol.rs::clone_session_tools`. Fixing
-                //   that requires per-session tool scoping (clone from
-                //   base + filter by `routed_profile_id`) — tracked
-                //   separately as a follow-up. This PR closes the
-                //   single-tenant gap that's blocking yangmi-voice
-                //   end-to-end on production today.
-                if let Some(profile) = selected {
-                    let profile_data_dir = store.resolve_data_dir(profile);
-                    let skills_dir = profile_data_dir.join("skills");
-                    if skills_dir.exists() {
-                        tracing::info!(
-                            profile_id = %profile.id,
-                            skills_dir = %skills_dir.display(),
-                            "wiring per-profile skills dir for serve agent"
-                        );
-                        config.profile_skills_dir = Some(skills_dir);
-                    }
-                    // Build the per-profile env that dashboard-installed
-                    // skills (`mofa-fm`, etc.) expect at spawn time. Without
-                    // OCTOS_VOICE_DIR + OMINIX_API_URL + OCTOS_PROFILE_ID
-                    // the `fm_tts` binary can't locate voice profiles or
-                    // reach the local TTS server even when the manifest is
-                    // visible to the LLM. Uses the same helper the gateway
-                    // path calls at `gateway_runtime.rs:435`. `data_dir`
-                    // here matches gateway's `effective_octos_home` (the
-                    // top-level `~/.octos`).
-                    let ominix_url = crate::skills_scope::discover_ominix_url();
-                    crate::skills_scope::push_runtime_plugin_env(
-                        &mut config.profile_plugin_env,
-                        &profile_data_dir,
-                        &data_dir,
-                        Some(&profile.id),
-                        ominix_url.as_deref(),
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "failed to open profile store for LLM overlay — falling back to top-level config"
-                );
-            }
-        }
-
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 
-        // Try to create the LLM provider + agent, but don't fail if no API key.
-        // The admin dashboard works without it.
-        let agent_and_sessions = self
-            .try_create_agent(&config, &cwd, &data_dir, broadcaster.clone())
-            .await;
-
-        let (agent, sessions) = match agent_and_sessions {
-            Ok((a, s)) => (Some(Arc::new(a)), Some(s)),
-            Err(e) => {
-                tracing::warn!("LLM agent not available: {e}");
-                tracing::info!("Admin dashboard will still work. Configure profiles via /admin/");
-                (None, None)
-            }
-        };
+        // M11-F: per-profile LLM, credentials, tool registry, plugins,
+        // MCP, and memory are built once per profile below via
+        // `ProfileRuntime::bootstrap`. There is no longer a
+        // server-wide agent; an unregistered profile returns 503 at
+        // the handler.
+        //
+        // We still open a process-wide `SessionManager` against the
+        // top-level data dir so the read-only REST endpoints
+        // (`/api/sessions`, `/api/sessions/:id/messages`, …) and the UI
+        // Protocol audit writer have a single shared handle for the
+        // canonical JSONL store.
+        let sessions: Option<Arc<tokio::sync::Mutex<SessionManager>>> =
+            match SessionManager::open(&data_dir) {
+                Ok(mgr) => Some(Arc::new(tokio::sync::Mutex::new(mgr))),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "failed to open process-wide SessionManager; \
+                         REST session listing endpoints will return empty"
+                    );
+                    None
+                }
+            };
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
@@ -595,12 +370,12 @@ impl ServeCommand {
         // logged and skipped so a single bad profile cannot 503 the
         // whole server.
         //
-        // Important: `ProfileRuntime::bootstrap` opens a per-profile
+        // `ProfileRuntime::bootstrap` opens a per-profile
         // `EpisodeStore` / `MemoryStore` / `ToolConfigStore` against
-        // the profile's data dir. The legacy `try_create_agent` path
-        // opens the same stores against the top-level `data_dir`, so
-        // the two paths use *different* on-disk roots and do not lock-
-        // conflict.
+        // the profile's data dir. M11-F removed the legacy
+        // server-wide `Agent`, so these are now the only redb opens
+        // against the profile data dir from `octos serve` — no lock
+        // contention.
         let mut profile_runtimes: HashMap<String, Arc<crate::runtime::ProfileRuntime>> =
             HashMap::new();
         let all_profiles = profile_store.list().unwrap_or_default();
@@ -770,7 +545,6 @@ impl ServeCommand {
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
-            agent,
             sessions,
             broadcaster,
             started_at: chrono::Utc::now(),
@@ -1115,311 +889,6 @@ impl ServeCommand {
         std::process::exit(0);
     }
 
-    /// Try to create an Agent + SessionManager. Returns Err if API key is missing etc.
-    async fn try_create_agent(
-        &self,
-        config: &Config,
-        cwd: &std::path::Path,
-        data_dir: &std::path::Path,
-        broadcaster: Arc<crate::api::EventBroadcaster>,
-    ) -> Result<(Agent, Arc<tokio::sync::Mutex<SessionManager>>)> {
-        let model = self.model.clone().or(config.model.clone());
-        let base_url = config.base_url.clone();
-        let provider_name = self
-            .provider
-            .clone()
-            .or(config.provider.clone())
-            .or_else(|| {
-                model
-                    .as_deref()
-                    .and_then(crate::config::detect_provider)
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "no LLM provider configured. Run `octos init` or set provider in config.json"
-                )
-            })?;
-
-        let base_provider: Arc<dyn LlmProvider> =
-            create_provider(&provider_name, config, model, base_url)?;
-
-        // Build the provider chain via the shared helper so serve
-        // stays in lockstep with gateway. This:
-        //   - wraps the primary in `RetryProvider`,
-        //   - layers each `config.fallback_models` entry on top
-        //     (so per-profile fallbacks configured through the
-        //     dashboard, e.g. minimax + deepseek behind kimi,
-        //     actually take effect on `/chat`),
-        //   - builds an `AdaptiveRouter` with `.with_adaptive_config`
-        //     when >1 provider survives, otherwise `ProviderChain`,
-        //   - seeds the router with `provider_baseline.json` and the
-        //     QoS catalog,
-        //   - exports + persists `model_catalog.json` and seeds the
-        //     `octos_llm::context` / `octos_llm::pricing` tables,
-        //   - spawns the 30s periodic metrics exporter when an
-        //     `AdaptiveRouter` is in play.
-        let bundle = build_adaptive_provider_chain(
-            base_provider,
-            config,
-            data_dir,
-            self.no_retry,
-            ExporterMode::Spawn,
-        );
-        let llm: Arc<dyn LlmProvider> = bundle.llm;
-
-        let memory = Arc::new(
-            EpisodeStore::open(data_dir)
-                .await
-                .wrap_err("failed to open episode store")?,
-        );
-
-        let memory_store = Arc::new(
-            MemoryStore::open(data_dir)
-                .await
-                .wrap_err("failed to open memory store")?,
-        );
-
-        let sandbox = octos_agent::create_sandbox(&config.sandbox);
-        let mut tools = ToolRegistry::with_builtins_and_sandbox(cwd, sandbox);
-
-        // Open tool config store for user-customizable tool defaults
-        let tool_config = std::sync::Arc::new(
-            octos_agent::ToolConfigStore::open(data_dir)
-                .await
-                .wrap_err("failed to open tool config store")?,
-        );
-        tools.inject_tool_config(tool_config);
-
-        // Memory bank tools
-        tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
-        tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
-
-        // Cron service — jobs persist to cron.json but fire through the API channel.
-        // The inbound_tx is a dummy sender; actual cron firing requires gateway mode.
-        // This still enables cron CRUD (create/list/delete) for later execution.
-        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-        let cron_service = Arc::new(octos_bus::CronService::new(
-            data_dir.join("cron.json"),
-            cron_tx,
-        ));
-        cron_service.start();
-        let cron_tool = crate::cron_tool::CronTool::with_context(cron_service.clone(), "api", "");
-        tools.register(cron_tool);
-
-        // MCP tools
-        if !config.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&config.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => tracing::warn!("MCP initialization failed: {e}"),
-            }
-        }
-
-        // Bootstrap bundled app-skills and platform skills
-        let octos_home = cwd.join(".octos");
-        octos_agent::bootstrap::bootstrap_bundled_skills(&octos_home);
-        octos_agent::bootstrap::bootstrap_platform_skills(&octos_home);
-
-        // Plugins (includes bootstrapped skills from bundled-app-skills/)
-        let mut plugin_dirs = Config::plugin_dirs_from_project(&octos_home);
-        // Platform skills are admin-only — add them here (not in Config::plugin_dirs_from_project)
-        let platform_dir = octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
-        if platform_dir.exists() {
-            plugin_dirs.push(platform_dir);
-        }
-        // Per-profile customer skills (e.g. `mofa-fm`) installed by the
-        // dashboard under `~/.octos/profiles/<id>/data/skills/`. Wired
-        // by `run_async` via `Config::profile_skills_dir` once the
-        // overlay picks an active profile. Without this the web
-        // `/chat` agent only sees globally-installed skills and loses
-        // visibility of dashboard-installed ones (e.g. `fm_tts`).
-        // Gateway already does the equivalent via
-        // `skills_scope::build_account_plugin_dirs` — this keeps the
-        // two paths in lockstep.
-        if let Some(ref dir) = config.profile_skills_dir {
-            if dir.exists() {
-                tracing::info!(
-                    dir = %dir.display(),
-                    "scanning per-profile skills dir for serve plugin loader"
-                );
-                plugin_dirs.push(dir.clone());
-            }
-        }
-        let mut plugin_result = octos_agent::PluginLoadResult::default();
-        if !plugin_dirs.is_empty() {
-            // Use the options-bearing loader (same call shape as gateway
-            // at `gateway_runtime.rs:510`) so dashboard-installed skills
-            // receive the per-profile env they expect
-            // (`OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, `OMINIX_API_URL`, …).
-            // The env is empty when no profile is selected, leaving the
-            // legacy single-tenant behavior unchanged.
-            let plugin_work_dir = data_dir.join("skill-output");
-            match octos_agent::PluginLoader::load_into_with_options(
-                &mut tools,
-                &plugin_dirs,
-                &config.profile_plugin_env,
-                octos_agent::PluginLoadOptions {
-                    work_dir: Some(&plugin_work_dir),
-                    synthesis_config: None,
-                },
-            ) {
-                Ok(result) => plugin_result = result,
-                Err(e) => tracing::warn!("plugin loading failed: {e}"),
-            }
-        }
-
-        // Start MCP servers declared in skill manifests
-        if !plugin_result.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&plugin_result.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => tracing::warn!("skill MCP initialization failed: {e}"),
-            }
-        }
-
-        // Pin core builtins + plugin tools as base so the LRU evictor in
-        // `auto_evict()` does not remove them after a few unused iterations.
-        // `ToolRegistry::with_builtins_and_sandbox()` registers core tools but
-        // does NOT seed `base_tools`, so without this call every core tool
-        // (shell, file ops, web_*, browser, workspace_*) is evictable. Mirrors
-        // gateway's `set_base_tools(...)` + `add_base_tools(plugin tool names)`
-        // pair at `gateway_runtime.rs:1002` and `:1022`. Only includes tools
-        // actually registered in the api/serve path — `run_pipeline`, `spawn`,
-        // `send_file`, `message`, `activate_tools` are gateway-only and live
-        // in a follow-up PR.
-        let mut base_tools: Vec<&str> = vec![
-            "shell",
-            "read_file",
-            "write_file",
-            "edit_file",
-            "diff_edit",
-            "glob",
-            "grep",
-            "list_dir",
-            "web_search",
-            "web_fetch",
-            "browser",
-            "check_workspace_contract",
-            "workspace_log",
-            "workspace_show",
-            "workspace_diff",
-        ];
-        if cfg!(feature = "git") {
-            base_tools.push("git");
-        }
-        if cfg!(feature = "ast") {
-            base_tools.push("code_structure");
-        }
-        tools.set_base_tools(base_tools);
-        if !plugin_result.tool_names.is_empty() {
-            tools.add_base_tools(plugin_result.tool_names.iter().map(|s| s.as_str()));
-        }
-
-        // #713 codex finding (Medium): apply `config.tool_policy` to the
-        // api-mode `ToolRegistry`, mirroring the chat path
-        // (`commands/chat.rs::297`). Without this, the swarm dispatch
-        // policy (which now inherits `config.tool_policy` per #713) is
-        // strictly stricter than the native server's tool registry,
-        // breaking the parity claim. Runs AFTER MCP + plugin tools are
-        // registered so a `deny: ["dangerous_tool"]` entry catches
-        // both built-in and skill-declared tools. `apply_policy` is a
-        // no-op when `config.tool_policy` is `None`/empty, preserving
-        // legacy behaviour for operators who never set the field.
-        if let Some(ref policy) = config.tool_policy {
-            tools.apply_policy(policy);
-        }
-
-        let reporter: Arc<dyn octos_agent::ProgressReporter> =
-            Arc::new(MetricsReporter::new(broadcaster));
-
-        // M8 fix-first item 8 (gap 1): give the api agent a real
-        // FileStateCache so file tools short-circuit on repeat reads.
-        // Mirrors the chat path so behaviour is identical across CLI
-        // entry points.
-        let file_state_cache = Arc::new(octos_agent::FileStateCache::new());
-
-        // M8 fix-first item 8 (gap 2): wire the M8.7 SubAgentOutputRouter
-        // and AgentSummaryGenerator so the spawn_only background branch
-        // routes output to disk and starts/stops the periodic summary
-        // watcher per task. The router is rooted under the data dir so
-        // dashboards can read the per-task tail files.
-        let subagent_output_root = data_dir.join("subagent-outputs");
-        let subagent_output_router =
-            Arc::new(octos_agent::SubAgentOutputRouter::new(subagent_output_root));
-        let supervisor_for_summary = (*tools.supervisor()).clone();
-        let subagent_summary_generator = Arc::new(octos_agent::AgentSummaryGenerator::new(
-            llm.clone(),
-            subagent_output_router.clone(),
-            supervisor_for_summary,
-        ));
-
-        let mut agent = Agent::new(AgentId::new("api"), llm, tools, memory)
-            .with_config(AgentConfig {
-                max_iterations: 20,
-                save_episodes: true,
-                chat_max_tokens: config.gateway.as_ref().and_then(|g| g.max_output_tokens),
-                ..Default::default()
-            })
-            .with_reporter(reporter)
-            .with_file_state_cache(file_state_cache)
-            .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator)
-            // M9 review fix (HIGH #1): record the effective sandbox config so
-            // the AppUi `session_tool_registry` rebind path inherits the
-            // running server's sandbox policy when re-creating the per-session
-            // ShellTool sandbox, instead of silently dropping back to
-            // `SandboxConfig::default()` (which disables network and overrides
-            // read paths).
-            .with_sandbox_config(config.sandbox.clone());
-
-        // Tier-2 of the AppUi `session_tool_registry` fallback chain: when
-        // operators set `appui.default_session_cwd` in `config.json`, anchor
-        // the API agent's tool registry to that path so clients without the
-        // `session.workspace_cwd.v1` capability (e.g. octos-app, which sends
-        // `cwd: None`) inherit the folder transparently. Tier-1
-        // (capability-gated client-sent cwds) still wins for clients that
-        // do advertise it, e.g. octos-tui.
-        //
-        // We do not canonicalize here — the path is recorded as-is on the
-        // tool registry and reused verbatim by `session_tool_registry`'s
-        // rebind path. Operators must use absolute paths; tilde (`~`) is
-        // not expanded. A `warn!` log on a missing/non-directory path
-        // surfaces config drift early without aborting startup, since the
-        // path may be created later (or may live under a network mount
-        // that mounts asynchronously).
-        if let Some(cwd) = config.appui.default_session_cwd.as_ref() {
-            if !cwd.is_dir() {
-                tracing::warn!(
-                    cwd = %cwd.display(),
-                    "appui.default_session_cwd does not point at an existing directory; \
-                     sessions will fail authorization until it is created",
-                );
-            }
-            agent = agent.with_workspace_root(cwd.clone());
-            tracing::info!(
-                cwd = %cwd.display(),
-                "appui: anchoring api agent to operator-configured default cwd",
-            );
-        }
-
-        // Inject skill prompt fragments
-        for fragment in &plugin_result.prompt_fragments {
-            agent.append_system_prompt(fragment);
-        }
-
-        // Merge config hooks with skill-declared hooks
-        let mut all_hooks = config.hooks.clone();
-        all_hooks.extend(plugin_result.hooks);
-        if !all_hooks.is_empty() {
-            agent = agent.with_hooks(Arc::new(HookExecutor::new(all_hooks)));
-        }
-
-        let sessions = Arc::new(tokio::sync::Mutex::new(
-            SessionManager::open(data_dir).wrap_err("failed to open session manager")?,
-        ));
-
-        Ok((agent, sessions))
-    }
-
     /// F-010: construct an `Option<Arc<SwarmState>>` from the
     /// `--swarm-backend*` CLI flags. Returns `Ok(None)` when no
     /// `--swarm-backend` is set (legacy opt-out — handlers return 503).
@@ -1437,8 +906,8 @@ impl ServeCommand {
     /// the native side already applies:
     ///
     /// - **tool-name policy** — same `config.tool_policy` value the
-    ///   api agent's `ToolRegistry` is filtered with (see
-    ///   `try_create_agent`).
+    ///   per-profile `ProfileRuntime::tool_specs` registry is
+    ///   filtered with at bootstrap.
     /// - **injection-env denylist** — the workspace-shared
     ///   [`octos_agent::sandbox::BLOCKED_ENV_VARS`] set the agent's
     ///   sandbox + MCP subprocess paths use to scrub child env.
@@ -1516,9 +985,8 @@ impl ServeCommand {
         //
         // - `tool_policy`: cloned from `config.tool_policy` upstream so
         //   a `deny: ["dangerous_tool"]` entry blocks both the native
-        //   registry execution (re-applied at the api agent registry,
-        //   see the `tools.apply_policy(...)` call earlier in
-        //   `try_create_agent`) AND swarm dispatch.
+        //   registry execution (applied per-profile by
+        //   `ProfileRuntime::bootstrap`) AND swarm dispatch.
         // - `block_injection_env_vars: true`: adds `LD_PRELOAD`,
         //   `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, ... to the env
         //   denylist so a contract carrying those keys fails closed
@@ -2055,425 +1523,5 @@ mod tests {
              outcome was: {:?}",
             outcome.per_task_outcomes[0]
         );
-    }
-
-    fn make_profile_with_llm(
-        id: &str,
-        enabled: bool,
-        primary_family: &str,
-        primary_model: &str,
-        fallback_family: &str,
-        fallback_model: &str,
-    ) -> crate::profiles::UserProfile {
-        crate::profiles::UserProfile {
-            id: id.into(),
-            name: id.into(),
-            public_subdomain: None,
-            enabled,
-            data_dir: None,
-            parent_id: None,
-            config: crate::profiles::ProfileConfig {
-                llm: Some(crate::profiles::LlmProfileConfig {
-                    primary: Some(crate::profiles::LlmModelSelectionConfig {
-                        family_id: Some(primary_family.into()),
-                        model_id: Some(primary_model.into()),
-                        route: Some(crate::profiles::LlmRouteConfig {
-                            route_id: None,
-                            label: None,
-                            base_url: Some("https://primary.example.com/v1".into()),
-                            api_key_env: Some("PRIMARY_KEY".into()),
-                            api_type: None,
-                        }),
-                        model_hints: None,
-                        cost_per_m: None,
-                        strong: None,
-                    }),
-                    fallbacks: vec![crate::profiles::LlmModelSelectionConfig {
-                        family_id: Some(fallback_family.into()),
-                        model_id: Some(fallback_model.into()),
-                        route: Some(crate::profiles::LlmRouteConfig {
-                            route_id: None,
-                            label: None,
-                            base_url: Some("https://fallback.example.com/v1".into()),
-                            api_key_env: Some("FALLBACK_KEY".into()),
-                            api_type: None,
-                        }),
-                        model_hints: None,
-                        cost_per_m: None,
-                        strong: Some(true),
-                    }],
-                }),
-                ..Default::default()
-            },
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn overlay_profile_llm_applies_enabled_profile_primary_and_fallbacks() {
-        let mut config = Config {
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            ..Default::default()
-        };
-        let profiles = vec![make_profile_with_llm(
-            "dspfac",
-            true,
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        )];
-
-        overlay_profile_llm(&mut config, &profiles);
-
-        assert_eq!(config.provider.as_deref(), Some("moonshot"));
-        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
-        assert_eq!(
-            config.base_url.as_deref(),
-            Some("https://primary.example.com/v1")
-        );
-        assert_eq!(config.api_key_env.as_deref(), Some("PRIMARY_KEY"));
-        assert_eq!(config.fallback_models.len(), 1);
-        assert_eq!(config.fallback_models[0].provider, "minimax");
-        assert_eq!(
-            config.fallback_models[0].model.as_deref(),
-            Some("MiniMax-M2.5-highspeed")
-        );
-    }
-
-    #[test]
-    fn overlay_profile_llm_keeps_top_level_when_no_enabled_profile() {
-        let mut config = Config {
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            ..Default::default()
-        };
-        let profiles = vec![make_profile_with_llm(
-            "dspfac",
-            false, // disabled
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        )];
-
-        overlay_profile_llm(&mut config, &profiles);
-
-        assert_eq!(config.provider.as_deref(), Some("deepseek"));
-        assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
-        assert!(config.fallback_models.is_empty());
-    }
-
-    #[test]
-    fn overlay_profile_llm_skips_profiles_missing_primary_model() {
-        let mut config = Config {
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            ..Default::default()
-        };
-        let incomplete = crate::profiles::UserProfile {
-            id: "partial".into(),
-            name: "partial".into(),
-            public_subdomain: None,
-            enabled: true,
-            data_dir: None,
-            parent_id: None,
-            config: crate::profiles::ProfileConfig {
-                llm: Some(crate::profiles::LlmProfileConfig {
-                    primary: Some(crate::profiles::LlmModelSelectionConfig {
-                        family_id: Some("moonshot".into()),
-                        model_id: None, // missing
-                        ..Default::default()
-                    }),
-                    fallbacks: vec![],
-                }),
-                ..Default::default()
-            },
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        overlay_profile_llm(&mut config, &[incomplete]);
-
-        assert_eq!(config.provider.as_deref(), Some("deepseek"));
-        assert_eq!(config.model.as_deref(), Some("deepseek-chat"));
-    }
-
-    #[test]
-    fn overlay_profile_llm_clears_stale_top_level_llm_fields() {
-        // Top-level config has a deepseek stack with leftover base_url
-        // and api_key_env. The selected profile has a `moonshot` primary
-        // without a `base_url` set on its route. The overlay must NOT
-        // leave the stale deepseek base_url in place — otherwise we'd
-        // call moonshot against a deepseek endpoint.
-        let mut config = Config {
-            provider: Some("deepseek".into()),
-            model: Some("deepseek-chat".into()),
-            base_url: Some("https://api.deepseek.com/v1".into()),
-            api_key_env: Some("DEEPSEEK_API_KEY".into()),
-            api_type: Some("openai".into()),
-            fallback_models: vec![crate::config::FallbackModel {
-                provider: "leftover".into(),
-                model: Some("leftover-model".into()),
-                base_url: None,
-                api_key_env: None,
-                model_hints: None,
-                api_type: None,
-                cost_per_m: None,
-                strong: true,
-            }],
-            ..Default::default()
-        };
-
-        let profile = crate::profiles::UserProfile {
-            id: "dspfac".into(),
-            name: "dspfac".into(),
-            public_subdomain: None,
-            enabled: true,
-            data_dir: None,
-            parent_id: None,
-            config: crate::profiles::ProfileConfig {
-                llm: Some(crate::profiles::LlmProfileConfig {
-                    primary: Some(crate::profiles::LlmModelSelectionConfig {
-                        family_id: Some("moonshot".into()),
-                        model_id: Some("kimi-k2.5".into()),
-                        // route omitted — no base_url / api_key_env
-                        route: None,
-                        model_hints: None,
-                        cost_per_m: None,
-                        strong: None,
-                    }),
-                    fallbacks: vec![],
-                }),
-                ..Default::default()
-            },
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        overlay_profile_llm(&mut config, &[profile]);
-
-        assert_eq!(config.provider.as_deref(), Some("moonshot"));
-        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
-        assert!(
-            config.base_url.is_none(),
-            "stale deepseek base_url must be cleared, got {:?}",
-            config.base_url
-        );
-        assert!(
-            config.api_key_env.is_none(),
-            "stale deepseek api_key_env must be cleared, got {:?}",
-            config.api_key_env
-        );
-        assert!(
-            config.api_type.is_none(),
-            "stale api_type must be cleared, got {:?}",
-            config.api_type
-        );
-        assert!(
-            config.fallback_models.is_empty(),
-            "stale top-level fallbacks must be cleared, got {} entries",
-            config.fallback_models.len()
-        );
-    }
-
-    #[test]
-    fn overlay_profile_llm_prefers_admin_profile_when_present() {
-        // When both the admin profile and a tenant profile have viable
-        // primaries, admin wins regardless of alphabetical order.
-        let mut config = Config::default();
-        let admin = make_profile_with_llm(
-            crate::api::auth_handlers::ADMIN_PROFILE_ID,
-            true,
-            "openai",
-            "gpt-5.2",
-            "anthropic",
-            "claude-opus-4-7",
-        );
-        let tenant = make_profile_with_llm(
-            "alpha-tenant",
-            true,
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        );
-        // List() sorts by name, so tenant ("alpha-tenant") sorts before
-        // admin ("admin")? No — "admin" < "alpha-tenant" alphabetically.
-        // Use a name that would sort first to make the test meaningful.
-        let tenant2 = make_profile_with_llm(
-            "a-first-tenant",
-            true,
-            "deepseek",
-            "deepseek-chat",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        );
-
-        overlay_profile_llm(&mut config, &[tenant2, admin, tenant]);
-
-        assert_eq!(
-            config.provider.as_deref(),
-            Some("openai"),
-            "admin profile must win over alphabetically-earlier tenant"
-        );
-        assert_eq!(config.model.as_deref(), Some("gpt-5.2"));
-    }
-
-    #[test]
-    fn overlay_profile_llm_skips_sub_accounts() {
-        // Sub-accounts (parent_id.is_some()) inherit their parent's LLM
-        // contract — they must not drive the server-wide agent on their
-        // own. The fallback should still find the top-level profile.
-        let mut config = Config::default();
-        let mut sub_account = make_profile_with_llm(
-            "sub-1",
-            true,
-            "rogue-provider",
-            "rogue-model",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        );
-        sub_account.parent_id = Some("parent-tenant".into());
-
-        let top_level = make_profile_with_llm(
-            "main-tenant",
-            true,
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        );
-
-        overlay_profile_llm(&mut config, &[sub_account, top_level]);
-
-        assert_eq!(
-            config.provider.as_deref(),
-            Some("moonshot"),
-            "sub-account must be skipped in favor of top-level profile"
-        );
-    }
-
-    #[test]
-    fn overlay_profile_llm_stashes_profile_api_key_into_config_credentials() {
-        let mut config = Config::default();
-        let mut profile = make_profile_with_llm(
-            "dspfac",
-            true,
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        );
-        if let Some(llm) = profile.config.llm.as_mut() {
-            if let Some(primary) = llm.primary.as_mut() {
-                if let Some(route) = primary.route.as_mut() {
-                    route.api_key_env = Some("PRIMARY_KEY".into());
-                }
-            }
-            if let Some(fb) = llm.fallbacks.first_mut() {
-                if let Some(route) = fb.route.as_mut() {
-                    route.api_key_env = Some("FALLBACK_KEY".into());
-                }
-            }
-        }
-        profile
-            .config
-            .env_vars
-            .insert("PRIMARY_KEY".into(), "sk-from-profile-primary".into());
-        profile
-            .config
-            .env_vars
-            .insert("FALLBACK_KEY".into(), "sk-from-profile-fallback".into());
-        // An unrelated env var that the LLM contract does NOT
-        // reference — must not be copied into Config::credentials.
-        profile
-            .config
-            .env_vars
-            .insert("TELEGRAM_BOT_TOKEN".into(), "should-not-leak".into());
-
-        overlay_profile_llm(&mut config, &[profile]);
-
-        assert_eq!(
-            config.credentials.get("PRIMARY_KEY").map(String::as_str),
-            Some("sk-from-profile-primary"),
-            "primary route credential must be stashed on Config::credentials"
-        );
-        assert_eq!(
-            config.credentials.get("FALLBACK_KEY").map(String::as_str),
-            Some("sk-from-profile-fallback"),
-            "fallback route credential must be stashed on Config::credentials"
-        );
-        assert!(
-            !config.credentials.contains_key("TELEGRAM_BOT_TOKEN"),
-            "unrelated profile env vars must NOT bleed into credentials, \
-             got keys: {:?}",
-            config.credentials.keys().collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn get_api_key_returns_value_from_credentials_map() {
-        // Verifies that `Config::get_api_key` short-circuits on the
-        // `credentials` map before consulting the process env. This
-        // test deliberately uses a unique env-var name that no
-        // ambient shell exports, so the lookup would otherwise fail.
-        // The priority of credentials-map over env is also locked in
-        // structurally: `get_api_key` returns from
-        // `if let Some(value) = self.credentials.get(&env_var)` before
-        // reaching the `std::env::var` branch.
-        let mut config = Config {
-            provider: Some("moonshot".into()),
-            api_key_env: Some("OCTOS_TEST_API_KEY_PRIORITY".into()),
-            ..Default::default()
-        };
-        config.credentials.insert(
-            "OCTOS_TEST_API_KEY_PRIORITY".into(),
-            "from-credentials-map".into(),
-        );
-
-        let resolved = config
-            .get_api_key("moonshot")
-            .expect("credentials map must satisfy the lookup without the env var being set");
-        assert_eq!(resolved, "from-credentials-map");
-    }
-
-    #[test]
-    fn overlay_profile_llm_returns_selected_profile_for_skills_dir_wiring() {
-        // The overlay must return the picked profile so `run_async`
-        // can resolve its data dir + populate `profile_skills_dir`.
-        // Without this return value, serve's plugin loader would
-        // never scan per-profile skill dirs (the exact gap that
-        // hides dashboard-installed skills like `mofa-fm` from the
-        // web /chat agent).
-        let mut config = Config::default();
-        let profiles = vec![make_profile_with_llm(
-            "dspfac",
-            true,
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        )];
-
-        let selected = overlay_profile_llm(&mut config, &profiles);
-        let selected = selected.expect("overlay should pick dspfac");
-        assert_eq!(selected.id, "dspfac");
-
-        // When no profile qualifies, the overlay returns None — the
-        // caller in `run_async` then skips the skills-dir wiring
-        // entirely, preserving the old behavior.
-        let mut config2 = Config::default();
-        let no_selectable = vec![make_profile_with_llm(
-            "disabled",
-            false, // disabled — skipped by select_serve_profile
-            "moonshot",
-            "kimi-k2.5",
-            "minimax",
-            "MiniMax-M2.5-highspeed",
-        )];
-        assert!(overlay_profile_llm(&mut config2, &no_selectable).is_none());
     }
 }

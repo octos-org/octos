@@ -1475,9 +1475,6 @@ pub(crate) fn config_from_profile(
         credential_pool: None,
         content_routing: profile.config.content_routing.clone(),
         appui: Default::default(),
-        credentials: Default::default(),
-        profile_skills_dir: None,
-        profile_plugin_env: Vec::new(),
     }
 }
 

@@ -39,6 +39,7 @@ use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::profiles::UserProfile;
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
+use crate::runtime::ProfileRuntime;
 use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
@@ -298,22 +299,78 @@ impl GatewayRuntime {
 
         let voice_config = config.voice.clone();
 
-        eprintln!("[gateway] opening episode store at {}", data_dir.display());
-        let memory = Arc::new(
-            EpisodeStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open episode store")?,
-        );
-        eprintln!("[gateway] episode store opened");
+        // M11-F gateway consolidation: when the gateway runs in
+        // profile-mode (a `UserProfile` is supplied via `--profile`)
+        // AND no CLI override was passed (`--model` / `--provider` /
+        // `--base-url`), bootstrap a `ProfileRuntime` and reuse its
+        // long-lived per-profile state (memory, memory_store,
+        // tool_config, credentials, plugin env template, plugin
+        // discovery dirs). `ProfileRuntime::bootstrap` opens the same
+        // redb stores gateway used to open inline — calling it here
+        // and using its `Arc`s collapses the duplicate redb opens that
+        // were the suspected M11-D blocker. Gateway-specific
+        // composition (`SwappableProvider`, `provider_router`,
+        // `SwitchModelTool`, admin tools, auto-defer, `pipeline_factory`,
+        // gateway's full tool-registry layering) stays as composition
+        // on top below.
+        //
+        // The non-profile paths (config.json-only / CLI overrides)
+        // can't call `ProfileRuntime::bootstrap` because the bootstrap
+        // is profile-driven by design. Those fall through to the
+        // existing inline assembly — they don't have a Profile to
+        // bootstrap from.
+        let profile_runtime: Option<Arc<ProfileRuntime>> = if !cli_llm_override
+            && resolved_profile.is_some()
+        {
+            let profile = resolved_profile.as_ref().expect("checked is_some");
+            match ProfileRuntime::bootstrap(profile, &data_dir, Some(&effective_octos_home)).await {
+                Ok(rt) => {
+                    info!(
+                        profile_id = %profile.id,
+                        provider = %rt.provider_name,
+                        model = %rt.primary_model_id,
+                        "gateway: using ProfileRuntime::bootstrap for per-profile state",
+                    );
+                    Some(rt)
+                }
+                Err(error) => {
+                    warn!(
+                        profile_id = %profile.id,
+                        %error,
+                        "ProfileRuntime::bootstrap failed; gateway falling back to inline assembly",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        // Initialize memory store
-        eprintln!("[gateway] opening memory store");
-        let memory_store = Arc::new(
-            MemoryStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open memory store")?,
-        );
-        eprintln!("[gateway] memory store opened");
+        let memory: Arc<EpisodeStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.memory.clone()
+        } else {
+            eprintln!("[gateway] opening episode store at {}", data_dir.display());
+            let store = Arc::new(
+                EpisodeStore::open(&data_dir)
+                    .await
+                    .wrap_err("failed to open episode store")?,
+            );
+            eprintln!("[gateway] episode store opened");
+            store
+        };
+
+        let memory_store: Arc<MemoryStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.memory_store.clone()
+        } else {
+            eprintln!("[gateway] opening memory store");
+            let store = Arc::new(
+                MemoryStore::open(&data_dir)
+                    .await
+                    .wrap_err("failed to open memory store")?,
+            );
+            eprintln!("[gateway] memory store opened");
+            store
+        };
 
         // Derive project_dir from octos_home (when launched by process_manager)
         // or fall back to cwd/.octos (standalone octos gateway / octos chat mode).
@@ -351,41 +408,32 @@ impl GatewayRuntime {
             };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // M11-D Part 2 scope deferral: the supervisor's mandate was to
-        // delete gateway's inline assembly and replace it with a single
-        // `ProfileRuntime::bootstrap` call. Two structural blockers
-        // forced a smaller scope:
+        // M11-F gateway consolidation note:
         //
-        //   1. Gateway holds open the per-profile `EpisodeStore` /
-        //      `MemoryStore` / `ToolConfigStore` (redb locks). Calling
-        //      bootstrap here AND running the surviving inline assembly
-        //      would lock-conflict on the same redb file.
-        //   2. Gateway's tool registry layers `SwappableProvider` +
-        //      `provider_router` + `SwitchModelTool` + admin tools +
-        //      auto-defer + a custom base-tool pin set + `run_pipeline`
-        //      synthesis config + per-session pipeline_factory on top
-        //      of the profile-floor registry. Threading these through a
-        //      `snapshot_excluding(&[])` clone of bootstrap's
-        //      `Arc<ToolRegistry>` is mechanically straightforward but
-        //      bumps the diff well past the 1k-line budget, since every
-        //      downstream consumer (ActorFactory, profile_factory_builder,
-        //      DefaultPipelineToolFactory) reads gateway-only locals
-        //      that have to be re-derived from `profile_runtime.*` fields.
+        // The profile-mode path (above) collapses gateway's duplicated
+        // per-profile state (`EpisodeStore` / `MemoryStore` /
+        // `ToolConfigStore` / plugin env / credentials) onto
+        // `ProfileRuntime::bootstrap`. Gateway-specific tool layering
+        // (`SwappableProvider`, `provider_router`, `SwitchModelTool`,
+        // admin tools, auto-defer, `pipeline_factory`,
+        // `ManageSkillsTool`, `SynthesizeResearchTool`, base-tool pin
+        // set) stays as composition ON TOP — it's intentional gateway
+        // architecture and `ProfileRuntime::bootstrap` does not (and
+        // should not) duplicate it.
         //
-        // Decision: ship Part 1 (self-contained bootstrap) + Part 3
-        // (AppState refactor — the supervisor's primary deliverable
-        // since it's what unblocks yangmi via `SessionRuntime::bootstrap`)
-        // in this PR. Gateway's inline assembly stays; a follow-up PR
-        // wires `ProfileRuntime::bootstrap` through gateway by carrying
-        // the `Arc<ProfileRuntime>` into the factory builder and
-        // collapsing the duplicate work. The byte-identical constraint
-        // is honored as a side-effect — gateway's startup logs and
-        // observable behavior do not change.
-        //
-        // The `cli_llm_override` local is consumed below by the inline
-        // assembly's provider-name resolution; suppress the unused
-        // warning explicitly so the deferral is documented in-tree.
-        let _ = cli_llm_override;
+        // Full registry-base consolidation (replacing the inline
+        // `ToolRegistry::with_builtins_and_sandbox(...) + plugins +
+        // MCP` block with a clone of
+        // `profile_runtime.tool_specs.snapshot_excluding(&[])`) is
+        // tracked as a M11-H follow-up — the gateway tool registry has
+        // bespoke wiring (provider_router seed → tool's
+        // `provider_policy`, `set_context_filter`, gateway-only
+        // `ManageSkillsTool`/`SynthesizeResearchTool`) that needs to
+        // re-attach onto the cloned registry. The plumbing is
+        // mechanical but lands cleanly in a dedicated follow-up so
+        // each downstream consumer's tool-registry view is reviewed
+        // independently of the AppState + handler-fallback deletion
+        // M11-F closes.
 
         // Customer-installed skills are strictly account-scoped.
         let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
@@ -414,12 +462,20 @@ impl GatewayRuntime {
         ));
         heartbeat_service.start();
 
-        // Build tool registry — admin mode gets only admin API tools + messaging
-        let tool_config = Arc::new(
-            octos_agent::ToolConfigStore::open(&data_dir)
-                .await
-                .wrap_err("failed to open tool config store")?,
-        );
+        // M11-F: reuse the `ToolConfigStore` opened by
+        // `ProfileRuntime::bootstrap` when profile-mode took the
+        // bootstrap path; otherwise (config-mode / CLI-override path)
+        // open it inline as before.
+        let tool_config: Arc<octos_agent::ToolConfigStore> =
+            if let Some(rt) = profile_runtime.as_ref() {
+                rt.tool_config.clone()
+            } else {
+                Arc::new(
+                    octos_agent::ToolConfigStore::open(&data_dir)
+                        .await
+                        .wrap_err("failed to open tool config store")?,
+                )
+            };
         let profile_search_keys = resolved_profile
             .as_ref()
             .map(profile_search_provider_keys)
