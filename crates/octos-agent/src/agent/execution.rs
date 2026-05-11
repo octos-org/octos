@@ -597,13 +597,63 @@ impl Agent {
                                     }
 
                                     if r.files_to_send.is_empty() {
+                                        // spawn_only tool finished without
+                                        // file outputs. Two sub-cases:
+                                        //
+                                        //   (a) Informational tool (e.g.
+                                        //       `fm_voice_list`) — produced
+                                        //       a textual result on stdout
+                                        //       but has nothing to attach.
+                                        //       Treat as success and deliver
+                                        //       the text as a Notification.
+                                        //   (b) Genuinely-failed tool — no
+                                        //       text either. Mark failed
+                                        //       with the legacy error.
+                                        //
+                                        // The strict "no output files
+                                        // produced" failure was too sharp
+                                        // for skills with mixed sync/async
+                                        // tool families (e.g. mofa-fm marks
+                                        // its list/delete tools spawn_only
+                                        // for uniformity with the
+                                        // file-producing fm_tts/fm_voice_save).
+                                        let trimmed_output = r.output.trim();
+                                        if !trimmed_output.is_empty() {
+                                            tracing::info!(
+                                                tool = %bg_name,
+                                                output_len = trimmed_output.len(),
+                                                "spawn_only tool produced text-only result"
+                                            );
+                                            bg_supervisor.mark_completed(&task_id, Vec::new());
+                                            if let Some(ref sender) = bg_sender {
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: r.output.clone(),
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: vec![],
+                                                    envelope_media: vec![],
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
+                                                    task_id: Some(task_id.clone()),
+                                                })
+                                                .await;
+                                            }
+                                            if let Some(ref router) = bg_output_router {
+                                                router.mark_terminal(&task_id);
+                                            }
+                                            if let Some(ref summary_gen) = bg_summary_generator {
+                                                summary_gen.stop_watcher(&task_id);
+                                            }
+                                            return;
+                                        }
+
                                         let err_msg = format!(
                                             "completed with no output (stdout: {})",
                                             r.output.chars().take(200).collect::<String>()
                                         );
                                         tracing::warn!(
                                             tool = %bg_name,
-                                            "spawn_only tool produced no files"
+                                            "spawn_only tool produced no files and no text"
                                         );
                                         bg_supervisor.mark_failed(&task_id, err_msg);
                                         if let Some(ref sender) = bg_sender {
