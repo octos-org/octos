@@ -52,46 +52,9 @@ use super::matrix_integration::*;
 
 const PROFILE_PROMPT_CACHE_CAP: usize = 128;
 
-fn discover_ominix_url() -> Option<String> {
-    std::env::var("OMINIX_API_URL").ok().or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
-        std::fs::read_to_string(discovery)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
-}
-
-fn push_runtime_plugin_env(
-    plugin_env: &mut Vec<(String, String)>,
-    data_dir: &std::path::Path,
-    octos_home: &std::path::Path,
-    profile_id: Option<&str>,
-    ominix_url: Option<&str>,
-) {
-    plugin_env.push((
-        "OCTOS_DATA_DIR".to_string(),
-        data_dir.to_string_lossy().to_string(),
-    ));
-    plugin_env.push((
-        "OCTOS_HOME".to_string(),
-        octos_home.to_string_lossy().to_string(),
-    ));
-    if let Some(profile_id) = profile_id {
-        plugin_env.push(("OCTOS_PROFILE_ID".to_string(), profile_id.to_string()));
-    }
-    plugin_env.push((
-        "OCTOS_VOICE_DIR".to_string(),
-        data_dir
-            .join("voice_profiles")
-            .to_string_lossy()
-            .to_string(),
-    ));
-    if let Some(ominix_url) = ominix_url {
-        plugin_env.push(("OMINIX_API_URL".to_string(), ominix_url.to_string()));
-    }
-}
+// `discover_ominix_url` and `push_runtime_plugin_env` live in
+// `crate::skills_scope` so the `serve` plugin loader can reuse them.
+use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
 
 async fn apply_profile_runtime_contracts(
     profile: &UserProfile,

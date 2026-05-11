@@ -203,6 +203,40 @@ pub struct Config {
     /// `Config::get_api_key` call sites need no signature changes.
     #[serde(default, skip)]
     pub credentials: std::collections::HashMap<String, String>,
+
+    /// Per-profile skill package directory the active runtime should
+    /// scan in addition to the project-scoped `plugin_dirs_from_project`
+    /// list. Populated at runtime by `octos serve`'s overlay so that
+    /// dashboard-installed customer skills (e.g. `mofa-fm` at
+    /// `~/.octos/profiles/<id>/data/skills/`) become visible to the web
+    /// `/chat` agent.
+    ///
+    /// On single-tenant hosts (the current fleet, where each mini hosts
+    /// one customer profile) this is sufficient. On multi-tenant hosts
+    /// the resulting tools land on the server-wide base `ToolRegistry`
+    /// shared by every WS session — see the `SCOPE NOTE` at the wiring
+    /// site in `commands/serve.rs::run_async` for the multi-tenant
+    /// caveat and the follow-up plan (per-session tool scoping by
+    /// `routed_profile_id`).
+    ///
+    /// Not serialized. Mirrors `credentials`: a transient runtime
+    /// channel from `run_async` startup through to `try_create_agent`'s
+    /// plugin discovery.
+    #[serde(default, skip)]
+    pub profile_skills_dir: Option<PathBuf>,
+
+    /// Per-profile environment passed to dashboard-installed skills at
+    /// spawn time (`OCTOS_DATA_DIR`, `OCTOS_HOME`, `OCTOS_PROFILE_ID`,
+    /// `OCTOS_VOICE_DIR`, `OMINIX_API_URL`). Built by
+    /// `skills_scope::push_runtime_plugin_env`, the same helper the
+    /// gateway path uses, so `mofa-fm` / `fm_tts` can locate voice
+    /// profiles and reach the local TTS inference server.
+    ///
+    /// Not serialized — transient, same pattern as `profile_skills_dir`
+    /// and `credentials`. Empty by default; ignored when no profile is
+    /// selected.
+    #[serde(default, skip)]
+    pub profile_plugin_env: Vec<(String, String)>,
 }
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
