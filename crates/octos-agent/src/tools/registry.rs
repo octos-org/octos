@@ -510,9 +510,7 @@ impl ToolRegistry {
                             if let Some(ref tags) = self.context_filter {
                                 let tool_tags = tool.tags();
                                 if !tool_tags.is_empty()
-                                    && !tool_tags
-                                        .iter()
-                                        .any(|tag| tags.contains(&tag.to_string()))
+                                    && !tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
                                 {
                                     return None;
                                 }
