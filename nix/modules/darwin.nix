@@ -16,7 +16,7 @@ in
 
     launchd.daemons.${serviceName} = lib.mkIf serviceCfg.enable {
       script = ''
-        exec ${cfg.package}/bin/octos serve \
+        exec ${cfg.finalPackage}/bin/octos serve \
           --port ${toString serviceCfg.port} \
           --host ${lib.escapeShellArg serviceCfg.host}
       '';
@@ -38,4 +38,3 @@ in
 
   };
 }
-

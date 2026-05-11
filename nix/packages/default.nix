@@ -1,52 +1,45 @@
 {
+  pkgs,
   lib,
-  stdenv,
-  callPackage,
-  rustPlatform,
-  pkg-config,
-  openssl,
-  features ? [ ],
+  enableAllFeatures ? false,
+  enableAppSkills ? false,
+  features ? null,
 }:
+
 let
-  cargoFeaturesString = builtins.concatStringsSep "," features;
-  dashboardPkg = callPackage ./dashboard.nix { };
-  rustTarget = stdenv.hostPlatform.rust.rustcTarget;
+  defaultFeatures = {
+    minimal = [ ];
+    full = [
+      "api"
+      "telegram"
+      "discord"
+      "slack"
+      "whatsapp"
+      "feishu"
+      "email"
+      "twilio"
+      "wecom"
+    ];
+  };
+
+  actualFeatures =
+    if features != null then
+      features
+    else if enableAllFeatures then
+      defaultFeatures.full
+    else
+      defaultFeatures.minimal;
+
+  octos-cli = pkgs.callPackage ./cli.nix { features = actualFeatures; };
+  octos-app-skills = pkgs.callPackage ./app-skills.nix { };
 in
-rustPlatform.buildRustPackage {
-  pname = "octos-cli";
-  version = "0.1.1";
-  src = lib.cleanSource ../../.;
 
-  cargoLock.lockFile = ../../Cargo.lock;
-
-  doCheck = false;
-
-  nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ openssl ];
-
-  cargoBuildFlags = [
-    "-p"
-    "octos-cli"
-  ]
-  ++ lib.optionals (features != [ ]) [
-    "--features"
-    cargoFeaturesString
-  ];
-
-  preBuild = lib.optionalString (builtins.elem "api" features) ''
-    mkdir -p crates/octos-cli/static/admin
-    cp -r ${dashboardPkg}/admin/* crates/octos-cli/static/admin/
-  '';
-
-  installPhase = ''
-    runHook preInstall
-    mkdir -p $out/bin
-    install -Dm755 ./target/${rustTarget}/release/octos $out/bin/octos
-    runHook postInstall
-  '';
+pkgs.buildEnv {
+  name = "octos";
+  paths = [ octos-cli ] ++ lib.optionals enableAppSkills [ octos-app-skills ];
 
   meta = with lib; {
-    description = "CLI interface for octos - Agentic OS";
+    description = "Octos - Agentic OS";
     homepage = "https://github.com/octos-org/octos";
     license = licenses.asl20;
     maintainers = [ ];
