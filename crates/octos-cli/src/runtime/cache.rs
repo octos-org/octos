@@ -99,14 +99,6 @@ pub struct SessionRuntimeCache {
     sweep_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Outcome of probing the single-flight inflight map for a key.
-/// Either we found an existing inflight `Notify` to wait on, or we
-/// installed our own and now own the bootstrap responsibility.
-enum InflightClaim {
-    Wait(Arc<Notify>),
-    Own(Arc<Notify>),
-}
-
 /// Internal cache entry. Pairs the cached [`SessionRuntime`] with
 /// the timestamp of its most recent access for LRU bookkeeping.
 struct CacheEntry {
@@ -213,55 +205,57 @@ impl SessionRuntimeCache {
 
             // Miss: claim or join the single-flight inflight slot.
             // We hold the `inflight` mutex only for the duration of
-            // a HashMap lookup/insert; the actual bootstrap runs
-            // outside any cache lock so different keys remain
-            // concurrent.
-            let claim = {
-                let mut inflight = self.inflight.lock().await;
-                if let Some(existing) = inflight.get(&key) {
-                    InflightClaim::Wait(Arc::clone(existing))
-                } else {
-                    let notify = Arc::new(Notify::new());
-                    inflight.insert(key.clone(), Arc::clone(&notify));
-                    InflightClaim::Own(notify)
-                }
-            };
+            // a HashMap lookup/insert (plus, on the wait path, the
+            // `Notified::enable()` registration); the actual
+            // bootstrap runs outside any cache lock so different
+            // keys remain concurrent.
+            //
+            // The wait path uses `Notified::enable()` *while still
+            // holding the inflight lock* to register the waiter on
+            // the `Notify`'s wait queue before dropping the lock.
+            // Without this, a lost-wake race is possible: the owner
+            // could call `notify_waiters()` between our lock release
+            // and our `.await`, and tokio does not buffer wake-ups
+            // for futures that haven't been polled/enabled yet. See
+            // the `Notified::enable` docs for the canonical mpmc
+            // recipe this mirrors.
+            let mut inflight = self.inflight.lock().await;
+            if let Some(existing) = inflight.get(&key) {
+                let notify = Arc::clone(existing);
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // Register as a waiter atomically with respect to
+                // any future `notify_waiters()` calls. From this
+                // point on, even if the owner notifies before our
+                // `.await`, our future is guaranteed to observe
+                // the wake.
+                notified.as_mut().enable();
+                drop(inflight);
+                notified.await;
+                continue;
+            }
 
-            match claim {
-                InflightClaim::Wait(notify) => {
-                    // Another task is bootstrapping; wait for its
-                    // notification, then loop back to the fast path
-                    // to pick up its insert. If that task failed,
-                    // we will re-observe the miss and (this time)
-                    // claim the slot ourselves.
-                    notify.notified().await;
-                    continue;
-                }
-                InflightClaim::Own(notify) => {
-                    // We own the slot. Bootstrap, insert, then
-                    // release. We unconditionally remove our
-                    // inflight marker + notify waiters on both
-                    // success and failure so a failed bootstrap
-                    // doesn't strand same-key callers.
-                    let result =
-                        SessionRuntime::bootstrap(profile, session_key.clone(), workspace_hint)
-                            .await;
+            // We own the slot. Bootstrap, insert, then release. We
+            // unconditionally remove our inflight marker + notify
+            // waiters on both success and failure so a failed
+            // bootstrap doesn't strand same-key callers.
+            let notify = Arc::new(Notify::new());
+            inflight.insert(key.clone(), Arc::clone(&notify));
+            drop(inflight);
 
-                    match result {
-                        Ok(runtime) => {
-                            // Insert under the write lock with
-                            // LRU-cap enforcement, then release the
-                            // inflight slot.
-                            self.insert_with_eviction(key.clone(), Arc::clone(&runtime))
-                                .await;
-                            self.release_inflight(&key, &notify).await;
-                            return Ok(runtime);
-                        }
-                        Err(error) => {
-                            self.release_inflight(&key, &notify).await;
-                            return Err(error);
-                        }
-                    }
+            let result =
+                SessionRuntime::bootstrap(profile, session_key.clone(), workspace_hint).await;
+
+            match result {
+                Ok(runtime) => {
+                    self.insert_with_eviction(key.clone(), Arc::clone(&runtime))
+                        .await;
+                    self.release_inflight(&key, &notify).await;
+                    return Ok(runtime);
+                }
+                Err(error) => {
+                    self.release_inflight(&key, &notify).await;
+                    return Err(error);
                 }
             }
         }
