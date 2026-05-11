@@ -792,4 +792,104 @@ mod tests {
             "plugin_prompt_fragments should still surface the fragment for gateway",
         );
     }
+
+    /// Regression test for the M11-F production crashloop tracked in
+    /// `octos-org/octos#899`:
+    ///
+    /// `octos serve` and `octos gateway` are separate OS processes,
+    /// both calling `ProfileRuntime::bootstrap` against the same
+    /// per-profile data dir. Before this fix the second bootstrap
+    /// crashed inside `EpisodeStore::open` with
+    /// `redb::DatabaseError::DatabaseAlreadyOpen`, gateway exited,
+    /// launchd auto-restarted it, and every profile crashlooped every
+    /// ~2 seconds. Now the second bootstrap must succeed with the
+    /// EpisodeStore in degraded mode.
+    ///
+    /// We simulate the cross-process race by bootstrapping the same
+    /// profile twice in a row in the same test — the first handle on
+    /// `rt_owner.memory` keeps the redb lock held while the second
+    /// `ProfileRuntime::bootstrap` call runs, exercising the same
+    /// `DatabaseAlreadyOpen` path the gateway subprocess hits in
+    /// production.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn bootstrap_succeeds_when_redb_already_owned_by_sibling_process() {
+        const KEY_NAME: &str = "OCTOS_GH899_TEST_API_KEY";
+        // SAFETY: env var name is unique to this test.
+        unsafe {
+            std::env::set_var(KEY_NAME, "test-key-sk-fake");
+        }
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: see set_var above.
+                unsafe {
+                    std::env::remove_var(KEY_NAME);
+                }
+            }
+        }
+        let _guard = EnvGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("gh899").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let profile = UserProfile {
+            id: "gh899".to_string(),
+            name: "GH899".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some(KEY_NAME.to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Simulates `octos serve`: bootstraps first, takes the redb
+        // lock. `rt_owner` stays live for the whole test so the lock
+        // remains held.
+        let rt_owner = ProfileRuntime::bootstrap(&profile, &data_dir, None)
+            .await
+            .expect("first bootstrap (owner) should succeed");
+        assert!(
+            !rt_owner.memory.is_degraded(),
+            "first bootstrap should hold the canonical redb",
+        );
+
+        // Simulates `octos gateway` running as a subprocess of serve:
+        // hits the lock contention. Before #899 this returned
+        // `Err(failed to open episode store ... Database already open)`.
+        // Now it must succeed; the resulting handle's EpisodeStore
+        // operates in degraded mode.
+        let rt_sibling = ProfileRuntime::bootstrap(&profile, &data_dir, None)
+            .await
+            .expect(
+                "second bootstrap (sibling process) should succeed even \
+                 when redb is already locked — this is the crashloop \
+                 fix from issue #899",
+            );
+        assert!(
+            rt_sibling.memory.is_degraded(),
+            "second bootstrap's episode store must be degraded",
+        );
+    }
 }
