@@ -679,8 +679,13 @@ mod tests {
 
         // Step 1+2: hand-construct a guard the way `get_or_init`
         // would, then drop it. This is the same `InflightGuard`
-        // shape — Drop runs the cleanup path.
-        {
+        // shape — Drop runs the cleanup path. We keep a separate
+        // `Arc<Semaphore>` reference alive past the drop so the
+        // post-drop assertions can verify the close took effect
+        // (catches a regression that removed the map entry but
+        // forgot to close the semaphore — which would strand any
+        // waiter already parked on `acquire().await`).
+        let observed_semaphore = {
             let semaphore = Arc::new(Semaphore::new(0));
             {
                 let mut inflight = cache.inflight.lock().unwrap_or_else(|p| p.into_inner());
@@ -701,11 +706,16 @@ mod tests {
                     .contains_key(&cache_key),
             );
             drop(guard);
-        }
+            semaphore
+        };
 
-        // After Drop: the map entry is gone and the semaphore is
-        // closed. (Closed-ness is sticky; any future
-        // `acquire().await` would return Err immediately.)
+        // After Drop: BOTH invariants must hold —
+        //   - the map entry is gone (so the next caller can
+        //     claim a fresh slot), and
+        //   - the semaphore is closed (so any waiter already
+        //     parked on `acquire().await` wakes with `Err`).
+        // Asserting `is_closed()` directly catches a regression
+        // that removed the slot but skipped `Semaphore::close()`.
         assert!(
             cache
                 .inflight
@@ -713,6 +723,10 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty(),
             "InflightGuard::drop did not remove the slot",
+        );
+        assert!(
+            observed_semaphore.is_closed(),
+            "InflightGuard::drop did not close the inflight semaphore",
         );
 
         // Step 3: a fresh same-key call must complete — wrapped
