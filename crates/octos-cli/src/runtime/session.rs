@@ -144,8 +144,18 @@ impl SessionRuntime {
     ///    the cloned tools. Today's `Agent::new(...) + .with_*`
     ///    chain in `commands/serve.rs::try_create_agent` relocates
     ///    here verbatim.
-    /// 7. Open the per-session [`SessionManager`] against
-    ///    `profile.data_dir.join("users").join(session_key.user_key())`.
+    /// 7. Open the [`SessionManager`] via
+    ///    `SessionManager::open(&profile.data_dir)` — the canonical
+    ///    JSONL session store already namespaces on-disk files by
+    ///    [`SessionKey`] under `data_dir/sessions/`, so the
+    ///    profile data dir is the correct root. The
+    ///    `SessionManager` is shared across sessions of the same
+    ///    profile (wrapped in [`tokio::sync::Mutex`]); M11-C may
+    ///    choose to surface the existing profile-scoped manager
+    ///    via [`ProfileRuntime`] instead of opening a new one per
+    ///    session — either way the on-disk layout matches today's
+    ///    `commands/gateway/gateway_runtime.rs` and
+    ///    `commands/serve.rs` call sites.
     /// 8. Return `Arc<Self>`.
     ///
     /// # Parameters
