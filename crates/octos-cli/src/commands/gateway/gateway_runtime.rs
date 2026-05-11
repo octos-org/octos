@@ -286,10 +286,9 @@ impl GatewayRuntime {
         // can't call `ProfileRuntime::bootstrap` because the bootstrap
         // is profile-driven by design. Those fall through to the
         // existing inline LLM assembly.
-        let profile_runtime: Option<Arc<ProfileRuntime>> = if !cli_llm_override
-            && resolved_profile.is_some()
+        let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
+            resolved_profile.as_ref().filter(|_| !cli_llm_override)
         {
-            let profile = resolved_profile.as_ref().expect("checked is_some");
             match ProfileRuntime::bootstrap(profile, &data_dir, Some(&effective_octos_home)).await {
                 Ok(rt) => {
                     info!(
