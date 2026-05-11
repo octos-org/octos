@@ -31,6 +31,22 @@ use super::{ProfileRuntime, SessionRuntime};
 /// sweep cadence is fixed.
 const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Cache key shared by every storage map in this module. Pairs the
+/// profile id (from [`ProfileRuntime::profile_id`]) with the session
+/// key half so a profile reload only invalidates entries belonging
+/// to that profile.
+type CacheKey = (String, SessionKey);
+
+/// Storage shape for the main cache: `(profile_id, session_key) ->
+/// CacheEntry`. Factored into a `type` alias because clippy flags
+/// the inline triple-nested generic as `clippy::type_complexity`.
+type CacheStorage = Arc<tokio::sync::RwLock<HashMap<CacheKey, CacheEntry>>>;
+
+/// Storage shape for the per-key single-flight inflight map.
+/// Factored into a `type` alias for the same reason as
+/// [`CacheStorage`].
+type InflightStorage = Arc<tokio::sync::Mutex<HashMap<CacheKey, Arc<Notify>>>>;
+
 /// In-memory cache mapping `(profile_id, session_key)` to an
 /// `Arc<SessionRuntime>`.
 ///
@@ -59,7 +75,16 @@ const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// to await [`SessionRuntime::bootstrap`] under contention; using
 /// the async lock keeps the runtime futures `Send`.
 pub struct SessionRuntimeCache {
-    inner: Arc<tokio::sync::RwLock<HashMap<(String, SessionKey), CacheEntry>>>,
+    inner: CacheStorage,
+    /// Per-key single-flight inflight markers. A `Notify` parked here
+    /// while a `bootstrap` is running for that key; subsequent
+    /// `get_or_init` callers for the same key wait on the notify
+    /// rather than running their own `bootstrap`. This is the M11-C
+    /// fix codex flagged on the initial PR: without it, two
+    /// concurrent same-key misses could both fall into the bootstrap
+    /// path under the prior "drop write lock, bootstrap, retake
+    /// write lock" pattern.
+    inflight: InflightStorage,
     max_size: usize,
     idle_ttl: Duration,
     /// Cancellation signal for the background sweep task. Notified
@@ -72,6 +97,14 @@ pub struct SessionRuntimeCache {
     /// runtime that's already mid-tear-down, the `notify` may not
     /// reach the task before the executor stops polling it.
     sweep_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Outcome of probing the single-flight inflight map for a key.
+/// Either we found an existing inflight `Notify` to wait on, or we
+/// installed our own and now own the bootstrap responsibility.
+enum InflightClaim {
+    Wait(Arc<Notify>),
+    Own(Arc<Notify>),
 }
 
 /// Internal cache entry. Pairs the cached [`SessionRuntime`] with
@@ -113,6 +146,7 @@ impl SessionRuntimeCache {
 
         Self {
             inner,
+            inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             max_size,
             idle_ttl,
             shutdown,
@@ -156,55 +190,96 @@ impl SessionRuntimeCache {
     ) -> Result<Arc<SessionRuntime>> {
         let key = (profile.profile_id.clone(), session_key.clone());
 
-        // Fast path: read lock + last_used bump on hit.
-        {
-            let guard = self.inner.read().await;
-            if let Some(entry) = guard.get(&key) {
-                let runtime = Arc::clone(&entry.runtime);
-                drop(guard);
-                // Re-take the write lock just to bump the timestamp.
-                // The read-then-write pattern is acceptable here: the
-                // worst case is that two concurrent hits race on the
-                // timestamp update, which is benign (LRU bookkeeping
-                // is not load-bearing for correctness).
-                let mut guard = self.inner.write().await;
-                if let Some(entry) = guard.get_mut(&key) {
-                    entry.last_used = Instant::now();
+        loop {
+            // Fast path: read lock + last_used bump on hit.
+            {
+                let guard = self.inner.read().await;
+                if let Some(entry) = guard.get(&key) {
+                    let runtime = Arc::clone(&entry.runtime);
+                    drop(guard);
+                    // Re-take the write lock just to bump the
+                    // timestamp. The read-then-write pattern is
+                    // acceptable here: the worst case is that two
+                    // concurrent hits race on the timestamp update,
+                    // which is benign (LRU bookkeeping is not
+                    // load-bearing for correctness).
+                    let mut guard = self.inner.write().await;
+                    if let Some(entry) = guard.get_mut(&key) {
+                        entry.last_used = Instant::now();
+                    }
+                    return Ok(runtime);
                 }
-                return Ok(runtime);
+            }
+
+            // Miss: claim or join the single-flight inflight slot.
+            // We hold the `inflight` mutex only for the duration of
+            // a HashMap lookup/insert; the actual bootstrap runs
+            // outside any cache lock so different keys remain
+            // concurrent.
+            let claim = {
+                let mut inflight = self.inflight.lock().await;
+                if let Some(existing) = inflight.get(&key) {
+                    InflightClaim::Wait(Arc::clone(existing))
+                } else {
+                    let notify = Arc::new(Notify::new());
+                    inflight.insert(key.clone(), Arc::clone(&notify));
+                    InflightClaim::Own(notify)
+                }
+            };
+
+            match claim {
+                InflightClaim::Wait(notify) => {
+                    // Another task is bootstrapping; wait for its
+                    // notification, then loop back to the fast path
+                    // to pick up its insert. If that task failed,
+                    // we will re-observe the miss and (this time)
+                    // claim the slot ourselves.
+                    notify.notified().await;
+                    continue;
+                }
+                InflightClaim::Own(notify) => {
+                    // We own the slot. Bootstrap, insert, then
+                    // release. We unconditionally remove our
+                    // inflight marker + notify waiters on both
+                    // success and failure so a failed bootstrap
+                    // doesn't strand same-key callers.
+                    let result =
+                        SessionRuntime::bootstrap(profile, session_key.clone(), workspace_hint)
+                            .await;
+
+                    match result {
+                        Ok(runtime) => {
+                            // Insert under the write lock with
+                            // LRU-cap enforcement, then release the
+                            // inflight slot.
+                            self.insert_with_eviction(key.clone(), Arc::clone(&runtime))
+                                .await;
+                            self.release_inflight(&key, &notify).await;
+                            return Ok(runtime);
+                        }
+                        Err(error) => {
+                            self.release_inflight(&key, &notify).await;
+                            return Err(error);
+                        }
+                    }
+                }
             }
         }
+    }
 
-        // Miss path: take the write lock first, double-check under
-        // it, then bootstrap on a confirmed miss. This is what stops
-        // two concurrent get_or_init calls from both running
-        // bootstrap (which would build two Agents, two
-        // SessionManagers, etc.).
+    /// Insert `runtime` under `key`, applying the LRU soft cap so
+    /// the cache size never exceeds `max_size`. Internal helper for
+    /// [`Self::get_or_init`].
+    async fn insert_with_eviction(&self, key: CacheKey, runtime: Arc<SessionRuntime>) {
         let mut guard = self.inner.write().await;
+
+        // If the key was inserted by someone else between when we
+        // claimed the inflight slot and now (e.g. a different code
+        // path bypassed get_or_init — unlikely but defensive), bump
+        // its timestamp and drop ours; both are valid runtimes.
         if let Some(entry) = guard.get_mut(&key) {
             entry.last_used = Instant::now();
-            return Ok(Arc::clone(&entry.runtime));
-        }
-
-        // Drop the lock while bootstrapping so other keys can make
-        // progress; another task may insert our key during this
-        // window, in which case we'll observe its entry on the next
-        // re-check below. Releasing the lock around bootstrap is
-        // safe because bootstrap is purely a function of (profile,
-        // session_key, workspace_hint) — two concurrent bootstraps
-        // for the same key produce equivalent runtimes; only one
-        // will survive insertion.
-        drop(guard);
-        let runtime =
-            SessionRuntime::bootstrap(profile, session_key.clone(), workspace_hint).await?;
-
-        let mut guard = self.inner.write().await;
-        // Re-check once more: another task may have inserted while
-        // we were bootstrapping. If so, return that one and drop
-        // ours — both are valid runtimes for the same key.
-        if let Some(entry) = guard.get_mut(&key) {
-            entry.last_used = Instant::now();
-            return Ok(Arc::clone(&entry.runtime));
+            return;
         }
 
         // Soft-cap eviction: if we're at capacity, drop the LRU
@@ -223,11 +298,28 @@ impl SessionRuntimeCache {
         guard.insert(
             key,
             CacheEntry {
-                runtime: Arc::clone(&runtime),
+                runtime,
                 last_used: Instant::now(),
             },
         );
-        Ok(runtime)
+    }
+
+    /// Remove the inflight slot for `key` and notify every waiter
+    /// parked on its `Notify`. Idempotent: a release with no
+    /// matching inflight entry is a no-op.
+    async fn release_inflight(&self, key: &CacheKey, notify: &Arc<Notify>) {
+        {
+            let mut inflight = self.inflight.lock().await;
+            // Only remove the slot if it's still ours — defensive
+            // against an unlikely race where the cache was wiped
+            // between our claim and now.
+            if let Some(existing) = inflight.get(key) {
+                if Arc::ptr_eq(existing, notify) {
+                    inflight.remove(key);
+                }
+            }
+        }
+        notify.notify_waiters();
     }
 
     /// Drop the entry for `key` if present. Used by M11-D's
@@ -277,11 +369,7 @@ impl Drop for SessionRuntimeCache {
     }
 }
 
-async fn background_sweep_loop(
-    inner: Arc<tokio::sync::RwLock<HashMap<(String, SessionKey), CacheEntry>>>,
-    idle_ttl: Duration,
-    shutdown: Arc<Notify>,
-) {
+async fn background_sweep_loop(inner: CacheStorage, idle_ttl: Duration, shutdown: Arc<Notify>) {
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -426,5 +514,53 @@ mod tests {
 
         // Idempotent.
         cache.invalidate(&(profile.profile_id.clone(), key)).await;
+    }
+
+    #[tokio::test]
+    async fn get_or_init_is_single_flight_under_concurrent_misses() {
+        // Codex's BLOCK on the first PR: two concurrent same-key
+        // get_or_init calls must observe a single
+        // `SessionRuntime::bootstrap`. The single-flight inflight
+        // map guarantees this: the second caller waits on the
+        // first's `Notify` instead of running its own bootstrap.
+        // We verify by:
+        //   - racing N parallel `get_or_init`s for the same key,
+        //   - asserting all of them return the same `Arc`
+        //     (`Arc::ptr_eq`),
+        //   - asserting the cache holds exactly one entry.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+
+        let cache = Arc::new(SessionRuntimeCache::new(8, Duration::from_secs(60)));
+        let key = SessionKey::new("api", "single-flight");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let profile = Arc::clone(&profile);
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                cache.get_or_init(&profile, key, None).await.unwrap()
+            }));
+        }
+
+        let mut runtimes = Vec::new();
+        for handle in handles {
+            runtimes.push(handle.await.unwrap());
+        }
+
+        // All clones point at the same Arc.
+        let first = Arc::clone(&runtimes[0]);
+        for (i, rt) in runtimes.iter().enumerate().skip(1) {
+            assert!(
+                Arc::ptr_eq(&first, rt),
+                "runtime #{i} differs from #0 — single-flight violated"
+            );
+        }
+        // Only one entry materialized in the cache.
+        assert_eq!(cache.len().await, 1);
+        // Inflight slot is released.
+        assert!(cache.inflight.lock().await.is_empty());
     }
 }

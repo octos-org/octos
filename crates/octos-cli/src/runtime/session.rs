@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eyre::{Result, WrapErr};
-use octos_agent::workspace_policy::{
-    WORKSPACE_POLICY_FILE, WorkspacePolicy, write_workspace_policy,
-};
+use octos_agent::sandbox::create_sandbox;
+use octos_agent::workspace_policy::{WorkspacePolicy, write_workspace_policy_if_absent};
 use octos_agent::{
     Agent, AgentConfig, AgentSummaryGenerator, FileStateCache, SandboxConfig, SubAgentOutputRouter,
     ToolRegistry,
@@ -185,15 +184,15 @@ impl SessionRuntime {
             format!("create workspace root failed: {}", workspace_root.display())
         })?;
 
-        // Step 2: idempotent policy write. Never overwrite an existing
-        // `.octos-workspace.toml` — operators (or earlier sessions)
-        // may have hand-edited it.
-        let policy_path = workspace_root.join(WORKSPACE_POLICY_FILE);
-        if !policy_path.exists() {
-            let policy = WorkspacePolicy::for_session();
-            write_workspace_policy(&workspace_root, &policy)
-                .wrap_err("failed to bootstrap session workspace policy")?;
-        }
+        // Step 2: idempotent, atomic policy write. We never overwrite
+        // an existing `.octos-workspace.toml` — operators (or earlier
+        // sessions) may have hand-edited it. Using
+        // `OpenOptions::create_new` is a single atomic syscall that
+        // fails with `AlreadyExists` if anything got there first,
+        // closing the TOCTOU window an `if !exists() { write }`
+        // pattern would leave open under concurrent bootstrap or
+        // operator edit. `AlreadyExists` is treated as success.
+        bootstrap_session_policy(&workspace_root)?;
 
         // Step 3: plugin work dir.
         let plugin_work_dir = workspace_root.join("skill-output");
@@ -204,30 +203,51 @@ impl SessionRuntime {
             )
         })?;
 
-        // Step 4: clone the profile tool registry and bind to this
-        // session's workspace + output-dir hint. The snapshot is a
-        // distinct Arc<ToolRegistry> so workspace state cannot leak
-        // across sessions of the same profile (M11 fix for the
-        // multi-tenant base-registry leak codex flagged on PR #868).
-        let mut tools = profile.tool_specs.snapshot_excluding(&[]);
-        tools.set_workspace_root(workspace_root.clone());
+        // Step 4: clone the profile tool registry and ACTUALLY rebind
+        // it to this session's workspace. `set_workspace_root` only
+        // updates registry metadata; `rebind_cwd` re-registers every
+        // cwd-bound tool (`shell`, `read_file`, `write_file`, …) with
+        // the new workspace path AND a fresh sandbox bound to the
+        // session, so the agent's tool calls operate on this
+        // session's tree instead of the profile-template `cwd` that
+        // happened to be on `profile.tool_specs` at bootstrap. The
+        // snapshot is a distinct `Arc<ToolRegistry>` so workspace
+        // state cannot leak across sessions of the same profile (M11
+        // fix for the multi-tenant base-registry leak codex flagged
+        // on PR #868).
+        //
+        // We also rebind plugin work dirs in the same step so
+        // `fm_tts` and friends emit into this session's
+        // `<workspace>/skill-output/` rather than the profile-template
+        // path.
+        let sandbox = profile.default_sandbox.clone();
+        let mut tools = profile
+            .tool_specs
+            .rebind_cwd(&workspace_root, create_sandbox(&sandbox));
         tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
+        tools.rebind_plugin_work_dirs(&plugin_work_dir);
         // Per-session policy filter is a no-op for M11; future work
         // may add session-level policy overrides on top of
         // `profile.tool_policy`. The profile-level policy itself is
         // applied at registry-build time by `ProfileRuntime::bootstrap`
-        // (M11-B), so the snapshot already inherits it.
+        // (M11-B), so the rebound registry already inherits it.
 
         let tools = Arc::new(tools);
 
-        // Step 5: sandbox — profile default for M11.
-        let sandbox = profile.default_sandbox.clone();
-
-        // Step 6: build the per-session Agent. The pieces here mirror
+        // Step 5: build the per-session Agent. The pieces here mirror
         // the M11-equivalent slice of `try_create_agent`. AppState-
         // derived wiring (broadcaster-backed MetricsReporter, hooks,
         // skill prompt fragments) is layered on in M11-D when the
         // dispatcher resolves the SessionRuntime per request.
+        //
+        // Crucially, we hand the agent the SAME `Arc<ToolRegistry>`
+        // the SessionRuntime holds (via `Agent::new_shared`). This is
+        // what makes `enforce_spawn_task_contract(&rt.tools, ...)`
+        // and the agent's actual tool calls observe the same
+        // workspace, supervisor, task lifecycle state, and
+        // background-result sender. Building a second registry via
+        // `snapshot_excluding` would mint a fresh `TaskSupervisor`
+        // and split per-session tool state across the two views.
         let subagent_output_root = profile.data_dir.join("subagent-outputs");
         let subagent_output_router = Arc::new(SubAgentOutputRouter::new(subagent_output_root));
         let supervisor_for_summary = (*tools.supervisor()).clone();
@@ -238,25 +258,10 @@ impl SessionRuntime {
         ));
         let file_state_cache = Arc::new(FileStateCache::new());
 
-        // `Agent::new` takes `ToolRegistry` by value; we have it
-        // wrapped in an Arc that the SessionRuntime holds onto.
-        // Clone the inner registry via `snapshot_excluding(&[])` to
-        // get a fresh `ToolRegistry` for the Agent without breaking
-        // the Arc invariant — the Agent ends up with its own
-        // Arc<ToolRegistry>. The session's `tools` field still points
-        // at the workspace-bound snapshot above, so contract checks
-        // (which read `tools.workspace_root()`) see the correct path.
-        let agent_tools = (*tools).snapshot_excluding(&[]);
-        // Re-bind workspace + output dir on the agent's copy so it
-        // matches the SessionRuntime view exactly.
-        let mut agent_tools = agent_tools;
-        agent_tools.set_workspace_root(workspace_root.clone());
-        agent_tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
-
-        let agent = Agent::new(
+        let agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
-            agent_tools,
+            Arc::clone(&tools),
             profile.memory.clone(),
         )
         .with_config(AgentConfig {
@@ -272,7 +277,7 @@ impl SessionRuntime {
 
         let agent = Arc::new(agent);
 
-        // Step 7: open the per-profile SessionManager. The on-disk
+        // Step 6: open the per-profile SessionManager. The on-disk
         // layout (`<data_dir>/sessions/`) already namespaces by
         // SessionKey via `encode_path_component`, so the profile
         // data_dir is the correct root. Sharing one SessionManager
@@ -293,6 +298,28 @@ impl SessionRuntime {
             sessions,
         }))
     }
+}
+
+/// Write `WorkspacePolicy::for_session()` to
+/// `<workspace_root>/.octos-workspace.toml` atomically, treating an
+/// already-present policy file as success.
+///
+/// The atomicity matters under concurrent bootstrap or operator
+/// edit: the M11-A doc-comment contract is "never overwrites a
+/// manual edit". An `if !exists() { write }` pattern would leave a
+/// TOCTOU window where two same-key bootstraps both see the file as
+/// absent and both call `write_workspace_policy` — the second
+/// truncates the first via `std::fs::write`. We delegate to
+/// `octos_agent::workspace_policy::write_workspace_policy_if_absent`,
+/// which uses `OpenOptions::create_new` — a single
+/// `open(O_CREAT|O_EXCL)` syscall on Unix and the equivalent on
+/// Windows — so it fails closed with `AlreadyExists` instead of
+/// clobbering. M11-C added that helper alongside the existing
+/// `write_workspace_policy` (no semantic change to the legacy
+/// function).
+fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
+    write_workspace_policy_if_absent(workspace_root, &WorkspacePolicy::for_session())
+        .wrap_err("failed to bootstrap session workspace policy")
 }
 
 /// Resolve a per-session workspace root.
