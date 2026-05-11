@@ -541,64 +541,70 @@ impl Agent {
                                         false
                                     };
 
-                                    // Issue #896: append a produced-files
-                                    // notification on the workspace-contract
-                                    // success path too. Same rationale as the
-                                    // legacy `NotConfigured` path below — the
-                                    // LLM needs workspace-relative paths to
-                                    // reference the outputs on its next turn.
                                     if result_persisted {
-                                        if let Some(ref sender) = bg_sender {
-                                            if let Some(produced_msg) =
-                                                build_spawn_only_produced_files_message(
-                                                    &bg_name,
-                                                    &output_files,
-                                                    bg_tools.workspace_root(),
-                                                )
-                                            {
-                                                let _ = sender(BackgroundResultPayload {
-                                                    task_label: bg_name.clone(),
-                                                    content: produced_msg,
-                                                    kind: BackgroundResultKind::Notification,
-                                                    media: vec![],
-                                                    envelope_media: vec![],
-                                                    originating_thread_id: bg_originating_thread_id
-                                                        .clone(),
-                                                    task_id: Some(task_id.clone()),
-                                                })
-                                                .await;
+                                        // Issue #896: emit the produced-files
+                                        // notification ONLY after the supervisor
+                                        // validation passes. Codex review on
+                                        // PR #898 flagged the original ordering
+                                        // (notification before validation) as
+                                        // user-confusing — a success-looking
+                                        // paths block could land in chat right
+                                        // before a `✗ failed` notification if
+                                        // `mark_completed_with_validation`
+                                        // rejected the outputs. Matches the
+                                        // safer ordering used on the
+                                        // `NotConfigured` path below.
+                                        match bg_supervisor.mark_completed_with_validation(
+                                            &task_id,
+                                            output_files.clone(),
+                                        ) {
+                                            Ok(()) => {
+                                                if let Some(ref sender) = bg_sender {
+                                                    if let Some(produced_msg) =
+                                                        build_spawn_only_produced_files_message(
+                                                            &bg_name,
+                                                            &output_files,
+                                                            bg_tools.workspace_root(),
+                                                        )
+                                                    {
+                                                        let _ = sender(BackgroundResultPayload {
+                                                            task_label: bg_name.clone(),
+                                                            content: produced_msg,
+                                                            kind:
+                                                                BackgroundResultKind::Notification,
+                                                            media: vec![],
+                                                            envelope_media: vec![],
+                                                            originating_thread_id:
+                                                                bg_originating_thread_id.clone(),
+                                                            task_id: Some(task_id.clone()),
+                                                        })
+                                                        .await;
+                                                    }
+                                                }
                                             }
-                                        }
-                                    }
-
-                                    if result_persisted {
-                                        if let Err(validation_error) = bg_supervisor
-                                            .mark_completed_with_validation(
-                                                &task_id,
-                                                output_files.clone(),
-                                            )
-                                        {
-                                            tracing::warn!(
-                                                tool = %bg_name,
-                                                files = ?output_files,
-                                                error = %validation_error,
-                                                "workspace contract satisfied but supervisor artifact validation rejected outputs"
-                                            );
-                                            if let Some(ref sender) = bg_sender {
-                                                let _ = sender(BackgroundResultPayload {
-                                                    task_label: bg_name.clone(),
-                                                    content: format!(
-                                                        "✗ {} failed: {}",
-                                                        bg_name, validation_error
-                                                    ),
-                                                    kind: BackgroundResultKind::Notification,
-                                                    media: vec![],
-                                                    envelope_media: vec![],
-                                                    originating_thread_id: bg_originating_thread_id
-                                                        .clone(),
-                                                    task_id: Some(task_id.clone()),
-                                                })
-                                                .await;
+                                            Err(validation_error) => {
+                                                tracing::warn!(
+                                                    tool = %bg_name,
+                                                    files = ?output_files,
+                                                    error = %validation_error,
+                                                    "workspace contract satisfied but supervisor artifact validation rejected outputs"
+                                                );
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: {}",
+                                                            bg_name, validation_error
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                        media: vec![],
+                                                        envelope_media: vec![],
+                                                        originating_thread_id:
+                                                            bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
+                                                    })
+                                                    .await;
+                                                }
                                             }
                                         }
                                     } else {

@@ -2225,6 +2225,13 @@ fn research_dir(slug: &str) -> PathBuf {
 /// `01_*.md`, …) keep their leading-`_`/index prefix shapes so a
 /// directory listing groups by run.
 ///
+/// **The leading `_` prefix is load-bearing** —
+/// `octos_agent::tools::research_utils::read_sources` excludes
+/// `_`-prefixed files when collecting "source" inputs for the
+/// `synthesize_research` map-reduce. Without the prefix, the new
+/// topic-named report would be re-ingested as a source on the next
+/// synthesis run (codex review on PR #898).
+///
 /// Falls back to `_report.md` only if the slug is empty (degenerate
 /// query). Keeps the file extension uniformly `.md`.
 fn report_filename(slug: &str) -> String {
@@ -2232,7 +2239,7 @@ fn report_filename(slug: &str) -> String {
     if trimmed.is_empty() {
         "_report.md".to_string()
     } else {
-        format!("{trimmed}.md")
+        format!("_{trimmed}.md")
     }
 }
 
@@ -2949,18 +2956,27 @@ mod tests {
         // the topic slug so it is self-describing when downloaded or
         // attached, and so the LLM has a stable name to read back on the
         // next turn (sister issue #896).
+        //
+        // The leading `_` prefix is preserved (load-bearing — keeps the
+        // file out of `read_sources`' source-ingestion path; see the
+        // doc comment on `report_filename` for the full rationale).
         assert_eq!(
             report_filename("rust-async-runtimes-2026"),
-            "rust-async-runtimes-2026.md"
+            "_rust-async-runtimes-2026.md"
         );
         assert_eq!(
             report_filename("top-AI-startups-2025"),
-            "top-AI-startups-2025.md"
+            "_top-AI-startups-2025.md"
         );
         // CJK preserved (slugify keeps unicode > U+007F).
-        assert_eq!(report_filename("中美关系-的影响"), "中美关系-的影响.md");
-        // The legacy literal must never reappear for a real slug.
-        assert!(!report_filename("foo-bar").starts_with('_'));
+        assert_eq!(report_filename("中美关系-的影响"), "_中美关系-的影响.md");
+        // The `_`-prefix invariant: every real slug yields a filename
+        // that `research_utils::read_sources` will skip. This guard
+        // catches the regression codex flagged on PR #898 — without
+        // the prefix, the report would be re-ingested as a source on
+        // the next `synthesize_research` run.
+        assert!(report_filename("foo-bar").starts_with('_'));
+        assert!(report_filename("中美关系").starts_with('_'));
     }
 
     #[test]
@@ -3575,7 +3591,7 @@ A second paragraph elaborates on alternatives [2]."
         // Trailer with report path stays for v1 host compatibility,
         // but now references the topic-named filename (issue #897).
         assert!(
-            report.contains("Report saved to: /tmp/research/topic/topic.md"),
+            report.contains("Report saved to: /tmp/research/topic/_topic.md"),
             "expected topic-named report path in trailer: {report}"
         );
         // Belt-and-suspenders: the legacy literal must NOT leak back in.
@@ -3620,7 +3636,7 @@ A second paragraph elaborates on alternatives [2]."
         assert!(!report.contains("## Synthesis"));
         // Trailer must reference the topic-named file.
         assert!(
-            report.contains("Report saved to: /tmp/research/topic/topic.md"),
+            report.contains("Report saved to: /tmp/research/topic/_topic.md"),
             "expected topic-named trailer: {report}"
         );
     }
@@ -3657,7 +3673,7 @@ A second paragraph elaborates on alternatives [2]."
         assert!(report.contains("raw initial"));
         // Trailer references the topic-named filename.
         assert!(
-            report.contains("Report saved to: /tmp/topic.md"),
+            report.contains("Report saved to: /tmp/_topic.md"),
             "expected topic-named trailer in fallback path: {report}"
         );
     }
