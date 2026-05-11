@@ -255,6 +255,46 @@ mod tests {
         );
     }
 
+    /// Codex round-1 (PR #865) BLOCK regression: when a tool is BOTH
+    /// deferred AND policy-denied, the activate_tools suffix must NOT
+    /// list it — calling `activate_tools` on a policy-denied name only
+    /// removes it from `deferred`, leaving it still invisible because
+    /// of the policy filter. Advertising it as "available to load"
+    /// would mislead the LLM.
+    #[tokio::test]
+    async fn activate_tools_spec_description_filters_policy_denied_deferred_names() {
+        use crate::tools::policy::ToolPolicy;
+        let mut registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        registry.register(ActivateToolsTool::new());
+        registry.defer(["web_search".to_string(), "web_fetch".to_string()]);
+        // Deny `web_search` via provider policy. Even after activation
+        // it would stay invisible — so it should NOT appear in the
+        // activate_tools suffix.
+        let mut policy = ToolPolicy::default();
+        policy.deny.push("web_search".to_string());
+        registry.set_provider_policy(policy);
+        let registry = Arc::new(registry);
+
+        let specs = registry.specs();
+        let activate_spec = specs
+            .iter()
+            .find(|s| s.name == "activate_tools")
+            .expect("activate_tools registered above");
+
+        // web_fetch is deferred but still policy-allowed → must appear.
+        assert!(
+            activate_spec.description.contains("web_fetch"),
+            "policy-allowed deferred tool should be listed; got: {}",
+            activate_spec.description
+        );
+        // web_search is deferred AND policy-denied → must NOT appear.
+        assert!(
+            !activate_spec.description.contains("web_search"),
+            "policy-denied deferred tool must NOT be listed in activate_tools suffix; got: {}",
+            activate_spec.description
+        );
+    }
+
     #[tokio::test]
     async fn activate_tools_spec_description_unchanged_when_nothing_deferred() {
         let mut registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));

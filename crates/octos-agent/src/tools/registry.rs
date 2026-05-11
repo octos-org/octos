@@ -87,10 +87,12 @@ pub struct ToolRegistry {
     /// and the agent fell back to shell-investigation.
     ///
     /// Note: a tool can be in `spawn_only` AND `deferred` simultaneously
-    /// only if it was manually deferred via `defer()` (e.g. an operator
-    /// hiding it). The standard `activate_tools` flow can re-activate
-    /// such a tool — the `spawn_only` marker only changes how the call is
-    /// EXECUTED, not whether it is VISIBLE.
+    /// if it was manually deferred via `defer()` / `defer_group()` (e.g.
+    /// an operator hiding it, or a group-level deferral that happens to
+    /// include some spawn_only members). The standard `activate_tools`
+    /// flow can re-activate such a tool — the `spawn_only` marker only
+    /// changes how the call is EXECUTED (auto-redirected to a background
+    /// task), not whether it is VISIBLE in `specs()`.
     spawn_only: HashSet<String>,
     /// Custom messages for spawn_only tools returned to the LLM after auto-backgrounding.
     spawn_only_messages: HashMap<String, String>,
@@ -451,26 +453,62 @@ impl ToolRegistry {
             })
             .map(|t| {
                 let mut description = t.description().to_string();
-                // Fix #3c (2026-05-10): surface the list of currently
-                // deferred tools in the `activate_tools` spec description
-                // so the LLM has explicit discovery info instead of
-                // guessing names. Without this, after the LRU evicted
-                // (or the loader manually deferred) some tools, the LLM
-                // saw only that the tool was gone and reported
+                // Fix #3c (2026-05-10, codex round-2): surface the list of
+                // currently deferred tools in the `activate_tools` spec
+                // description so the LLM has explicit discovery info
+                // instead of guessing names. Without this, after the LRU
+                // evicted (or the loader manually deferred) some tools,
+                // the LLM saw only that the tool was gone and reported
                 // "I don't have <tool> available", with no hint that
                 // calling `activate_tools(["<tool>"])` would bring it
-                // back. `auto_evict()` / `defer()` / `activate()` all
-                // invalidate the cached specs, so the next call to
+                // back.
+                //
+                // Codex round-1 BLOCK: filter the displayed names
+                // through the same `provider_policy` + `context_filter`
+                // visibility checks that the post-activation `specs()`
+                // would apply. Without this, a deferred tool that is
+                // also policy-denied or context-hidden would be falsely
+                // advertised as "available to load" — calling
+                // `activate_tools` on it would remove it from
+                // `deferred` but it would still be invisible/
+                // unexecutable because of the other filters, leaving
+                // the LLM with no recourse.
+                //
+                // `auto_evict()` / `defer()` / `defer_group()` /
+                // `activate()` / `retain()` / `execute_with_context()`
+                // all invalidate the cached specs, so the next call to
                 // `specs()` rebuilds this list freshly.
                 if t.name() == "activate_tools" && !deferred.is_empty() {
-                    let mut names: Vec<&str> =
-                        deferred.iter().map(|s| s.as_str()).collect();
-                    names.sort();
-                    description.push_str(&format!(
-                        "\n\nCurrently deferred tools available to load: {}. \
-                         Call this tool with `tools: [\"<name>\"]` to load them.",
-                        names.join(", ")
-                    ));
+                    let mut visible: Vec<String> = deferred
+                        .iter()
+                        .filter_map(|name| {
+                            let tool = self.tools.get(name)?;
+                            if let Some(ref policy) = self.provider_policy {
+                                if !policy.is_allowed_with_tags(name, tool.tags()) {
+                                    return None;
+                                }
+                            }
+                            if let Some(ref tags) = self.context_filter {
+                                let tool_tags = tool.tags();
+                                if !tool_tags.is_empty()
+                                    && !tool_tags
+                                        .iter()
+                                        .any(|tag| tags.contains(&tag.to_string()))
+                                {
+                                    return None;
+                                }
+                            }
+                            Some(name.clone())
+                        })
+                        .collect();
+                    if !visible.is_empty() {
+                        visible.sort();
+                        description.push_str(&format!(
+                            "\n\nCurrently deferred tools available to load: {}. \
+                             Call this tool with `tools: [\"<name>\"]` to load them.",
+                            visible.join(", ")
+                        ));
+                    }
                 }
                 ToolSpec {
                     name: t.name().to_string(),
