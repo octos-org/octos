@@ -351,67 +351,13 @@ impl GatewayRuntime {
             };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // M11-B: assemble a `ProfileRuntime` from the pieces gateway
-        // already built (LLM chain, memory stores, Ominix URL) plus
-        // the per-profile derivations (plugin env template, tool
-        // policy, credentials). The runtime is held here so
-        // `octos serve` and `octos tui` (M11-D) can adopt the same
-        // helper instead of re-implementing the per-profile
-        // assembly. Today's gateway does not yet consume the
-        // returned struct downstream — the inline tool registry +
-        // ActorFactory wiring below is unchanged — so this PR is a
-        // pure additive wire-up. The legacy non-profile path (no
-        // `UserProfile`) and the CLI-override path
-        // (`--model` / `--provider` / `--base-url`) skip the
-        // bootstrap; the resulting `Option<Arc<ProfileRuntime>>`
-        // tracks whether the assembler was invoked. The call lives
-        // here (after `discover_ominix_url` and before
-        // `build_account_skills_loader` / `build_account_plugin_dirs`)
-        // so bootstrap can reuse the gateway's already-resolved
-        // Ominix URL and skills-dir candidate without doing a
-        // duplicate filesystem read.
-        let _profile_runtime: Option<Arc<crate::runtime::ProfileRuntime>> =
-            if let (Some(profile), false) = (resolved_profile.as_ref(), cli_llm_override) {
-                // Gateway's own tool registry is built later in the
-                // `let mut tools; …` block below (with the full
-                // gateway-extras: WebSearchTool with provider keys,
-                // BrowserTool with timeout, MCP, plugins, admin
-                // tools, …). The `ProfileRuntime`'s `tool_specs` is
-                // the per-profile *builtin floor* that future
-                // callers (`octos serve` / TUI) will share via the
-                // M11-A multi-tenant fix; gateway does not consume
-                // it in M11-B (the inline tool registry stays in
-                // place to preserve byte-identical boot). We hand
-                // `ToolRegistry::new()` so bootstrap does not need
-                // to call `create_sandbox` itself — doing so a
-                // second time here would emit a duplicate
-                // `"sandbox disabled, …"` info log on profiles
-                // that disable sandboxing.
-                let inputs = crate::runtime::profile::ProfileRuntimeInputs {
-                    llm: llm.clone(),
-                    adaptive_router: adaptive_router_ref.clone(),
-                    runtime_qos_catalog: runtime_qos_catalog.clone(),
-                    primary_model_id: model_id.clone(),
-                    memory: memory.clone(),
-                    memory_store: memory_store.clone(),
-                    default_sandbox: config.sandbox.clone(),
-                    tool_specs: ToolRegistry::new(),
-                    skills_dir: Some(data_dir.join("skills")),
-                    ominix_url: ominix_url.clone(),
-                };
-                Some(
-                    crate::runtime::ProfileRuntime::bootstrap(
-                        profile,
-                        &data_dir,
-                        Some(effective_octos_home.as_path()),
-                        inputs,
-                    )
-                    .await
-                    .wrap_err("failed to bootstrap profile runtime")?,
-                )
-            } else {
-                None
-            };
+        // Note: M11-D removed the M11-B `ProfileRuntimeInputs` stub
+        // call site. Gateway's inline assembly remains for now (Part 2
+        // of this PR replaces it with a single `ProfileRuntime::bootstrap`
+        // call further below). The `_` underscore on `cli_llm_override`
+        // / `model_id` / `memory*` keeps the locals live for the inline
+        // assembly that still needs them.
+        let _ = cli_llm_override;
 
         // Customer-installed skills are strictly account-scoped.
         let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
