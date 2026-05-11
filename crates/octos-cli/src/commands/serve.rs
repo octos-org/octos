@@ -474,8 +474,25 @@ impl ServeCommand {
                 // Gateway already does this via
                 // `skills_scope::build_account_plugin_dirs`; serve was
                 // the odd one out.
+                // SCOPE NOTE — multi-tenant leak:
+                //   This wiring loads the SELECTED profile's skills into
+                //   the single base `ToolRegistry` shared by every
+                //   incoming WS session. On hosts that serve only one
+                //   customer profile (the current fleet — mini1, mini2,
+                //   mini3 each host one tenant), there is nothing to
+                //   leak. On a multi-tenant host where the dashboard
+                //   routes different subdomains to different profiles,
+                //   tools registered here are visible to all of them
+                //   via the cloned tool registry in
+                //   `api/ui_protocol.rs::clone_session_tools`. Fixing
+                //   that requires per-session tool scoping (clone from
+                //   base + filter by `routed_profile_id`) — tracked
+                //   separately as a follow-up. This PR closes the
+                //   single-tenant gap that's blocking yangmi-voice
+                //   end-to-end on production today.
                 if let Some(profile) = selected {
-                    let skills_dir = store.resolve_data_dir(profile).join("skills");
+                    let profile_data_dir = store.resolve_data_dir(profile);
+                    let skills_dir = profile_data_dir.join("skills");
                     if skills_dir.exists() {
                         tracing::info!(
                             profile_id = %profile.id,
@@ -484,6 +501,23 @@ impl ServeCommand {
                         );
                         config.profile_skills_dir = Some(skills_dir);
                     }
+                    // Build the per-profile env that dashboard-installed
+                    // skills (`mofa-fm`, etc.) expect at spawn time. Without
+                    // OCTOS_VOICE_DIR + OMINIX_API_URL + OCTOS_PROFILE_ID
+                    // the `fm_tts` binary can't locate voice profiles or
+                    // reach the local TTS server even when the manifest is
+                    // visible to the LLM. Uses the same helper the gateway
+                    // path calls at `gateway_runtime.rs:435`. `data_dir`
+                    // here matches gateway's `effective_octos_home` (the
+                    // top-level `~/.octos`).
+                    let ominix_url = crate::skills_scope::discover_ominix_url();
+                    crate::skills_scope::push_runtime_plugin_env(
+                        &mut config.profile_plugin_env,
+                        &profile_data_dir,
+                        &data_dir,
+                        Some(&profile.id),
+                        ominix_url.as_deref(),
+                    );
                 }
             }
             Err(error) => {
@@ -1150,9 +1184,24 @@ impl ServeCommand {
         }
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            if let Ok(result) = octos_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[])
-            {
-                plugin_result = result;
+            // Use the options-bearing loader (same call shape as gateway
+            // at `gateway_runtime.rs:510`) so dashboard-installed skills
+            // receive the per-profile env they expect
+            // (`OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, `OMINIX_API_URL`, …).
+            // The env is empty when no profile is selected, leaving the
+            // legacy single-tenant behavior unchanged.
+            let plugin_work_dir = data_dir.join("skill-output");
+            match octos_agent::PluginLoader::load_into_with_options(
+                &mut tools,
+                &plugin_dirs,
+                &config.profile_plugin_env,
+                octos_agent::PluginLoadOptions {
+                    work_dir: Some(&plugin_work_dir),
+                    synthesis_config: None,
+                },
+            ) {
+                Ok(result) => plugin_result = result,
+                Err(e) => tracing::warn!("plugin loading failed: {e}"),
             }
         }
 

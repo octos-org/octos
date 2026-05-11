@@ -217,6 +217,19 @@ pub struct Config {
     /// plugin discovery.
     #[serde(default, skip)]
     pub profile_skills_dir: Option<PathBuf>,
+
+    /// Per-profile environment passed to dashboard-installed skills at
+    /// spawn time (`OCTOS_DATA_DIR`, `OCTOS_HOME`, `OCTOS_PROFILE_ID`,
+    /// `OCTOS_VOICE_DIR`, `OMINIX_API_URL`). Built by
+    /// `skills_scope::push_runtime_plugin_env`, the same helper the
+    /// gateway path uses, so `mofa-fm` / `fm_tts` can locate voice
+    /// profiles and reach the local TTS inference server.
+    ///
+    /// Not serialized — transient, same pattern as `profile_skills_dir`
+    /// and `credentials`. Empty by default; ignored when no profile is
+    /// selected.
+    #[serde(default, skip)]
+    pub profile_plugin_env: Vec<(String, String)>,
 }
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
