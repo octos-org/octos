@@ -190,6 +190,19 @@ pub struct Config {
     /// cwds (Tier-1 of `session_tool_registry`) still take precedence.
     #[serde(default)]
     pub appui: AppUiConfig,
+
+    /// Resolved credentials keyed by env-var name. Populated at runtime
+    /// from per-profile `env_vars` (e.g. by `octos serve`'s LLM
+    /// overlay) so providers can resolve API keys without depending on
+    /// the process environment. `Config::get_api_key` checks this map
+    /// before falling back to `std::env`.
+    ///
+    /// Not serialized — this is a runtime-only map, never persisted to
+    /// `config.json`. Lives on `Config` instead of being passed
+    /// alongside it so the existing `create_provider` /
+    /// `Config::get_api_key` call sites need no signature changes.
+    #[serde(default, skip)]
+    pub credentials: std::collections::HashMap<String, String>,
 }
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
@@ -952,7 +965,7 @@ impl Config {
             }
         }
 
-        // Fall back to environment variable.
+        // Resolve the env var name we expect to hold this provider's key.
         let env_var = self.api_key_env.clone().unwrap_or_else(|| {
             octos_llm::registry::lookup(provider)
                 .and_then(|e| e.api_key_env)
@@ -960,6 +973,14 @@ impl Config {
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
 
+        // Check the runtime credentials map first — used by `octos serve`
+        // to surface per-profile API keys without mutating the parent
+        // process environment.
+        if let Some(value) = self.credentials.get(&env_var) {
+            return Ok(value.clone());
+        }
+
+        // Fall back to environment variable.
         std::env::var(&env_var).wrap_err_with(|| {
             format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
         })
