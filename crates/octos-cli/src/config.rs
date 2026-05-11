@@ -209,8 +209,15 @@ pub struct Config {
     /// list. Populated at runtime by `octos serve`'s overlay so that
     /// dashboard-installed customer skills (e.g. `mofa-fm` at
     /// `~/.octos/profiles/<id>/data/skills/`) become visible to the web
-    /// `/chat` agent — without leaking them across other profiles on
-    /// the same host.
+    /// `/chat` agent.
+    ///
+    /// On single-tenant hosts (the current fleet, where each mini hosts
+    /// one customer profile) this is sufficient. On multi-tenant hosts
+    /// the resulting tools land on the server-wide base `ToolRegistry`
+    /// shared by every WS session — see the `SCOPE NOTE` at the wiring
+    /// site in `commands/serve.rs::run_async` for the multi-tenant
+    /// caveat and the follow-up plan (per-session tool scoping by
+    /// `routed_profile_id`).
     ///
     /// Not serialized. Mirrors `credentials`: a transient runtime
     /// channel from `run_async` startup through to `try_create_agent`'s
