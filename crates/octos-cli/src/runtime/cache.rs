@@ -346,10 +346,23 @@ impl SessionRuntimeCache {
                             .await;
                     match result {
                         Ok(runtime) => {
-                            self.insert_with_eviction(key.clone(), Arc::clone(&runtime))
-                                .await;
+                            // `insert_with_eviction` returns the
+                            // canonical `Arc<SessionRuntime>` for
+                            // this key — either the one we just
+                            // built, or the one another task
+                            // already inserted (e.g. a prior
+                            // single-flight era completed and
+                            // dropped its slot in the window
+                            // between our fast-path miss and our
+                            // own slot claim). Returning the
+                            // canonical Arc is what makes
+                            // single-flight a true "one cached
+                            // runtime per key" invariant rather
+                            // than a "one bootstrap per inflight
+                            // era" invariant.
+                            let canonical = self.insert_with_eviction(key.clone(), runtime).await;
                             drop(guard);
-                            return Ok(runtime);
+                            return Ok(canonical);
                         }
                         Err(error) => {
                             drop(guard);
@@ -362,18 +375,35 @@ impl SessionRuntimeCache {
     }
 
     /// Insert `runtime` under `key`, applying the LRU soft cap so
-    /// the cache size never exceeds `max_size`. Internal helper for
-    /// [`Self::get_or_init`].
-    async fn insert_with_eviction(&self, key: CacheKey, runtime: Arc<SessionRuntime>) {
+    /// the cache size never exceeds `max_size`. Returns the
+    /// canonical `Arc<SessionRuntime>` for the key — either the
+    /// `runtime` we just inserted, or an existing entry's runtime
+    /// if the cache already had one under this key.
+    ///
+    /// The "canonical Arc" return value is load-bearing for the
+    /// single-flight invariant: if a prior single-flight era for
+    /// the same key completed and dropped its slot between the
+    /// current caller's fast-path miss and its own slot claim,
+    /// the current caller would otherwise return its own freshly
+    /// bootstrapped runtime to its caller, leaving two distinct
+    /// `Arc<SessionRuntime>`s for the same `(profile_id,
+    /// session_key)` pair in flight. Returning the cached entry's
+    /// runtime collapses both back onto the canonical Arc.
+    async fn insert_with_eviction(
+        &self,
+        key: CacheKey,
+        runtime: Arc<SessionRuntime>,
+    ) -> Arc<SessionRuntime> {
         let mut guard = self.inner.write().await;
 
-        // If the key was inserted by someone else between when we
-        // claimed the inflight slot and now (e.g. a different code
-        // path bypassed get_or_init — unlikely but defensive), bump
-        // its timestamp and drop ours; both are valid runtimes.
+        // If a runtime is already present (e.g. another task
+        // bootstrapped in a prior single-flight era and inserted
+        // before our claim), bump its timestamp and return its
+        // `Arc` — the caller will hand THAT Arc back, not the
+        // redundant one we built.
         if let Some(entry) = guard.get_mut(&key) {
             entry.last_used = Instant::now();
-            return;
+            return Arc::clone(&entry.runtime);
         }
 
         // Soft-cap eviction: if we're at capacity, drop the LRU
@@ -389,6 +419,7 @@ impl SessionRuntimeCache {
             }
         }
 
+        let canonical = Arc::clone(&runtime);
         guard.insert(
             key,
             CacheEntry {
@@ -396,6 +427,7 @@ impl SessionRuntimeCache {
                 last_used: Instant::now(),
             },
         );
+        canonical
     }
 
     /// Drop the entry for `key` if present. Used by M11-D's
@@ -644,6 +676,70 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty(),
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_init_returns_canonical_arc_when_a_prior_era_already_inserted() {
+        // Codex BLOCK round 4 (HIGH): the bootstrap-and-return
+        // path could hand a fresh `Arc<SessionRuntime>` back even
+        // when an earlier single-flight era for the same key
+        // already inserted a cached entry. Scenario:
+        //   1. Era 1: task A claims slot, bootstraps, inserts,
+        //      drops guard. Cache holds runtime A.
+        //   2. Task B's `get_or_init` runs: fast-path read finds
+        //      the entry — fine, returns runtime A. (This is
+        //      the easy case; we exercise the harder one below.)
+        //
+        // The HARDER case is when B's fast-path read misses the
+        // entry. We simulate it by pre-inserting an entry into
+        // the cache directly, then running a fresh
+        // `get_or_init`. The path under test:
+        //   - B's read lock sees the entry — fast path hit.
+        // OR:
+        //   - We manually nudge the path by clearing the cache
+        //     just before B's read. (Not deterministic to set
+        //     up.)
+        //
+        // The deterministic regression test we CAN write is:
+        // verify that `insert_with_eviction` returns the
+        // canonical `Arc` (not the input) when an entry exists
+        // already. This is the load-bearing piece of the round-5
+        // fix; if it regresses, B's bootstrap path would return
+        // its own redundant runtime instead.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir).await;
+
+        let cache = SessionRuntimeCache::new(8, Duration::from_secs(60));
+        let key = SessionKey::new("api", "canonical-arc");
+
+        // Pre-seed the cache with an "original" runtime via the
+        // public `get_or_init` so the canonical Arc is the one
+        // sitting in the cache.
+        let original = cache
+            .get_or_init(&profile, key.clone(), None)
+            .await
+            .expect("seed");
+
+        // Now build a redundant runtime out-of-band and pass it
+        // to `insert_with_eviction`. The helper must NOT
+        // overwrite the original — it must return the original
+        // Arc.
+        let redundant = SessionRuntime::bootstrap(&profile, key.clone(), None)
+            .await
+            .expect("redundant bootstrap");
+        assert!(
+            !Arc::ptr_eq(&original, &redundant),
+            "test setup requires the two bootstraps to produce distinct Arcs",
+        );
+
+        let canonical = cache
+            .insert_with_eviction((profile.profile_id.clone(), key.clone()), redundant)
+            .await;
+        assert!(
+            Arc::ptr_eq(&canonical, &original),
+            "insert_with_eviction must return the cached Arc, not the input",
         );
     }
 
