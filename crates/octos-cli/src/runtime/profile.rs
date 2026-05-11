@@ -11,13 +11,12 @@ use std::sync::Arc;
 
 use eyre::{Result, WrapErr};
 use octos_agent::{SandboxConfig, ToolPolicy, ToolRegistry};
-use octos_llm::{AdaptiveRouter, LlmProvider};
+use octos_llm::{AdaptiveRouter, LlmProvider, QosCatalog};
 use octos_memory::{EpisodeStore, MemoryStore};
 
-use crate::auth::keychain;
 use crate::commands::chat;
 use crate::config::detect_provider;
-use crate::profiles::{ProfileStore, UserProfile, config_from_profile};
+use crate::profiles::{UserProfile, config_from_profile};
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
 
@@ -115,6 +114,16 @@ pub struct ProfileRuntime {
     /// reader don't have to downcast the `dyn LlmProvider`.
     pub adaptive_router: Option<Arc<AdaptiveRouter>>,
 
+    /// Materialized runtime QoS catalog produced alongside the
+    /// adaptive chain. Populated even when [`Self::adaptive_router`]
+    /// is `None` — `build_adaptive_provider_chain` derives a
+    /// cold-start catalog from `model_catalog.json` for single-
+    /// provider profiles too, and the downstream sub-provider
+    /// router needs that seed for fallback ranking. Held here so
+    /// gateway's `provider_router.seed_qos_scores` path stays
+    /// byte-identical with the pre-M11-B inline assembly.
+    pub runtime_qos_catalog: Option<QosCatalog>,
+
     /// Resolved credentials for this profile, keyed by env-var name
     /// (e.g. `OPENAI_API_KEY`, `AUTODL_API_KEY`). Populated from
     /// `profile.config.env_vars` via the keychain resolver. Sessions
@@ -182,28 +191,33 @@ impl ProfileRuntime {
     /// # Steps (per workstreams/M11-runtime-unification.md § M11-B)
     ///
     /// 1. Derive a per-profile `Config` via
-    ///    [`crate::profiles::config_from_profile`] with `None, None`
+    ///    `crate::profiles::config_from_profile` with `None, None`
     ///    (preserves the per-profile LLM contract PR #866
     ///    introduced).
     /// 2. Wrap the primary LLM via
-    ///    [`build_adaptive_provider_chain`] with
-    ///    [`ExporterMode::Spawn`] (PR #867's shared helper). Stores
+    ///    `crate::qos_catalog::build_adaptive_provider_chain` with
+    ///    `ExporterMode::Spawn` (PR #867's shared helper). Stores
     ///    both `llm` and `adaptive_router` on the returned struct.
-    /// 3. Resolve `credentials` from `profile.config.env_vars` via
-    ///    [`keychain::resolve_env_vars`].
+    /// 3. Surface `profile.config.env_vars` as a pass-through copy
+    ///    under `credentials`. Keychain resolution stays at the
+    ///    downstream call sites (`profile_plugin_env`,
+    ///    `profile_search_provider_keys`) for M11-B so warnings are
+    ///    not duplicated; M11-D will unify both onto a single
+    ///    resolution.
     /// 4. Resolve `skills_dir = data_dir.join("skills")` when the
     ///    directory exists (PR #868's logic).
     /// 5. Build `plugin_env_template` via
-    ///    [`push_runtime_plugin_env`] (PR #868's helper).
+    ///    `crate::skills_scope::push_runtime_plugin_env` (PR #868's
+    ///    helper).
     /// 6. Construct the base [`ToolRegistry`] via
-    ///    [`ToolRegistry::with_builtins_and_sandbox`] — gateway's
+    ///    `ToolRegistry::with_builtins_and_sandbox` — gateway's
     ///    full registration sequence (browser, web_search, MCP,
     ///    plugins, ...) is layered on top of this base by the caller
     ///    so cmd-flag-dependent tools (`SwitchModelTool`,
     ///    `SwappableProvider`, admin tools, etc.) can still be
     ///    wired without leaking into the profile-scope abstraction.
     /// 7. Plugin loading + LRU pinning happen on the caller's copy of
-    ///    the registry (see [`ToolRegistry::snapshot_excluding`]) so
+    ///    the registry (see `ToolRegistry::snapshot_excluding`) so
     ///    `ProfileRuntime::bootstrap` stays signature-stable across
     ///    callers — gateway today and `octos serve` / TUI tomorrow.
     /// 8. Open [`EpisodeStore`] and [`MemoryStore`] against
@@ -212,17 +226,14 @@ impl ProfileRuntime {
     ///
     /// # Parameters
     ///
-    /// - `profile` — the parsed [`UserProfile`] from the
-    ///   [`ProfileStore`]; carries the on-disk config that drives
-    ///   the bootstrap.
-    /// - `store` — the [`ProfileStore`] the profile came from;
-    ///   needed for lookups (admin/sub-account resolution) the
-    ///   bootstrap performs.
+    /// - `profile` — the parsed [`UserProfile`] from the profile
+    ///   store; carries the on-disk config that drives the
+    ///   bootstrap.
     /// - `data_dir` — the resolved per-profile data dir, typically
     ///   `~/.octos/profiles/<id>/data`. The bootstrap creates it if
     ///   missing.
     /// - `no_retry` — when `true`, skip the `RetryProvider` wrapping.
-    ///   Plumbed through to [`build_adaptive_provider_chain`] so the
+    ///   Plumbed through to `build_adaptive_provider_chain` so the
     ///   gateway `--no-retry` flag still inhibits retries when the
     ///   gateway delegates here.
     /// - `octos_home` — the host's `~/.octos` (or `--octos-home`
@@ -231,15 +242,24 @@ impl ProfileRuntime {
     ///   so call sites without the flag stay in lockstep with
     ///   gateway's current `effective_octos_home` fallback.
     ///
+    /// **Note on the missing `store` parameter:** the M11-A skeleton
+    /// listed `store: &ProfileStore` for "admin/sub-account
+    /// resolution" but M11-B's body has no such lookup — gateway's
+    /// admin/sub-account logic lives downstream of bootstrap and
+    /// stays there. Dropping the parameter lets the gateway keep
+    /// its `ProfileStore::open` at its original position in the
+    /// init sequence (preserving filesystem-side-effect timing).
+    /// Re-introducing the parameter when M11-C/D actually needs it
+    /// is a one-line API change.
+    ///
     /// # Errors
     ///
     /// Returns an error if any of the steps above fail: provider
-    /// construction, keychain resolution, redb open, or tool-registry
-    /// build. The bootstrap is fail-fast — a partially constructed
+    /// construction, redb open, or tool-registry build. The
+    /// bootstrap is fail-fast — a partially constructed
     /// [`ProfileRuntime`] is never returned.
     pub async fn bootstrap(
         profile: &UserProfile,
-        _store: &ProfileStore,
         data_dir: &Path,
         no_retry: bool,
         octos_home: Option<&Path>,
@@ -274,10 +294,20 @@ impl ProfileRuntime {
         );
         let llm = bundle.llm;
         let adaptive_router = bundle.adaptive_router;
+        let runtime_qos_catalog = bundle.runtime_qos_catalog;
 
-        // Step 3: resolve secrets from the profile's env_vars map
-        // (handles `"keychain:"` markers transparently).
-        let credentials = keychain::resolve_env_vars(&profile.config.env_vars);
+        // Step 3: surface the profile's declared env vars under
+        // `credentials` as a pass-through copy. Keychain resolution
+        // is deferred to the gateway / serve helpers that already
+        // call `keychain::resolve_env_vars` downstream (today via
+        // `profile_plugin_env` and `profile_search_provider_keys`).
+        // Doing the resolution here too would duplicate any
+        // failure-path keychain warnings the downstream helpers
+        // already emit, which violates the byte-identical gateway
+        // boot invariant. M11-D will move both call sites onto a
+        // single shared resolution and lift the resolved map into
+        // this field.
+        let credentials: HashMap<String, String> = profile.config.env_vars.clone();
 
         // Step 4: derive skills_dir as Some(...) only when the
         // directory exists (mirrors `build_account_plugin_dirs`).
@@ -349,6 +379,7 @@ impl ProfileRuntime {
             data_dir: data_dir.to_path_buf(),
             llm,
             adaptive_router,
+            runtime_qos_catalog,
             credentials,
             skills_dir,
             plugin_env_template,
@@ -380,18 +411,34 @@ mod tests {
         format!("M11B_BOOTSTRAP_TEST_{}_{}", std::process::id(), suffix)
     }
 
+    /// Process-wide mutex that serializes env-var mutation across
+    /// every test in this module. Mirrors the pattern in
+    /// `commands/gateway/profile_factory.rs::tests::synthesis_env_lock`
+    /// — `std::env::set_var` / `remove_var` are not thread-safe even
+    /// with unique key names because they mutate the process-wide
+    /// environment, so all env-mutating tests in the binary need to
+    /// share a single lock to be sound.
+    fn bootstrap_env_lock() -> &'static std::sync::Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[tokio::test]
     async fn bootstrap_populates_tool_specs_and_credentials() {
+        let _env_guard = bootstrap_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
         // The provider chain needs a resolvable API key to construct
         // the base LLM. We point `api_key_env` at a process-local env
         // var we set ourselves so the test doesn't touch the OS
         // keychain or require a real provider key.
         let env_key = unique_env_key("API_KEY");
-        // SAFETY: writing a process-unique env var inside a `#[test]`
-        // is the established pattern in this crate (see
-        // `commands/gateway/profile_factory.rs::tests`). The key is
-        // unique per process+test so no concurrent reader observes
-        // a partially mutated state.
+        // SAFETY: serialized by `bootstrap_env_lock`; the env-var
+        // mutation happens under the module-wide mutex so no other
+        // env-mutating test in this binary reads or writes the
+        // process environment concurrently with this block.
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var(&env_key, "synthetic-key");
@@ -400,9 +447,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("profiles").join("test").join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let store_dir = tmp.path().join("octos_home");
-        std::fs::create_dir_all(&store_dir).unwrap();
-        let store = ProfileStore::open(&store_dir).unwrap();
 
         let mut env_vars = HashMap::new();
         env_vars.insert("CREDENTIAL_PROBE".to_string(), "probe-value".to_string());
@@ -435,7 +479,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let runtime = ProfileRuntime::bootstrap(&profile, &store, &data_dir, false, None)
+        let runtime = ProfileRuntime::bootstrap(&profile, &data_dir, false, None)
             .await
             .expect("bootstrap should succeed with a synthetic profile");
 
@@ -475,7 +519,23 @@ mod tests {
         assert!(env_map.contains_key("OCTOS_DATA_DIR"));
         assert!(env_map.contains_key("OCTOS_VOICE_DIR"));
 
+        // M11-B codex review fix: the QoS runtime catalog is
+        // materialized for single-provider profiles too (cold-start
+        // derivation from the seed catalog), so it must survive
+        // bootstrap and remain available for the gateway's
+        // sub-provider router seeding. We don't assert the exact
+        // shape (it depends on the seed catalog on disk) but the
+        // field is observably exposed as `Option<QosCatalog>` — the
+        // sub-provider-router seeding path skips when `None`, which
+        // is the correct behavior when no catalog is reachable.
+        // The struct-shape check below is enough to wedge a
+        // regression test against any future refactor that drops
+        // the field again.
+        let _: &Option<octos_llm::QosCatalog> = &runtime.runtime_qos_catalog;
+
         // Cleanup — leave the process env clean for other tests.
+        // SAFETY: still under the `_env_guard` lock acquired at the
+        // top of the test.
         #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var(&env_key);

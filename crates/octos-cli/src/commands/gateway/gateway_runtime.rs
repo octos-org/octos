@@ -249,14 +249,11 @@ impl GatewayRuntime {
         eprintln!("[gateway] provider={provider_name}");
         println!("{}: {}", "Provider".green(), provider_name);
 
-        // Open ProfileStore for /account commands and bot management.
         // Derive octos_home from: --octos-home flag > data_dir (which already
-        // resolves --data-dir > $OCTOS_HOME > ~/.octos).
+        // resolves --data-dir > $OCTOS_HOME > ~/.octos). Resolved here so
+        // both the bootstrap helper (for `OCTOS_HOME` in plugin env) and
+        // the `ProfileStore::open` further down agree on the path.
         let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
-        let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
-            crate::profiles::ProfileStore::open(&effective_octos_home)
-                .ok()
-                .map(Arc::new);
 
         // M11-B: when this gateway invocation is driven by a profile,
         // delegate the per-profile bootstrap (LLM chain + QoS routing
@@ -269,15 +266,10 @@ impl GatewayRuntime {
         // single-tenant boot stays byte-identical until it is
         // retired.
         let profile_runtime: Option<Arc<crate::runtime::ProfileRuntime>> =
-            if let (Some(profile), Some(store), false) = (
-                resolved_profile.as_ref(),
-                profile_store.as_ref(),
-                cli_llm_override,
-            ) {
+            if let (Some(profile), false) = (resolved_profile.as_ref(), cli_llm_override) {
                 Some(
                     crate::runtime::ProfileRuntime::bootstrap(
                         profile,
-                        store,
                         &data_dir,
                         cmd.no_retry,
                         Some(effective_octos_home.as_path()),
@@ -302,21 +294,19 @@ impl GatewayRuntime {
         let model_id: String;
         if let Some(ref pr) = profile_runtime {
             // Bootstrap already wired the QoS-aware adaptive chain
-            // (including the model_catalog.json exporter) via the
-            // shared helper. Re-export the live catalog from the
-            // adaptive router so the downstream sub-provider router
-            // can seed QoS scores for fallback ranking — matching
-            // the legacy single-tenant path's behavior even though
-            // the chain construction now lives behind
-            // `ProfileRuntime::bootstrap`.
+            // (including the model_catalog.json exporter and the
+            // cold-start QoS catalog for single-provider profiles)
+            // via the shared helper. Reuse its `runtime_qos_catalog`
+            // directly so the downstream sub-provider router
+            // receives the same seed entries the legacy inline path
+            // would have built — including the cold-start derivation
+            // when `adaptive_router` is `None` (single provider, no
+            // failover).
             swappable = Arc::new(SwappableProvider::new(pr.llm.clone()));
             llm = swappable.clone();
             model_id = swappable.current().model_id().to_string();
             eprintln!("[gateway] LLM provider created, model={model_id}");
-            runtime_qos_catalog = pr
-                .adaptive_router
-                .as_ref()
-                .map(|router| router.export_model_catalog());
+            runtime_qos_catalog = pr.runtime_qos_catalog.clone();
             adaptive_router_ref = pr.adaptive_router.clone();
         } else {
             // Legacy single-tenant path — config.json or
@@ -341,6 +331,19 @@ impl GatewayRuntime {
             adaptive_router_ref = bundle.adaptive_router;
             runtime_qos_catalog = bundle.runtime_qos_catalog;
         }
+
+        // Open ProfileStore for /account commands and bot management.
+        // Kept here (after the LLM chain construction above) to
+        // preserve the pre-M11-B filesystem-side-effect timing —
+        // `ProfileStore::open` creates `<octos_home>/profiles/`, and
+        // moving that ahead of provider/chain construction would
+        // create the directory even on profiles whose
+        // `create_provider` would otherwise fail before any
+        // filesystem write.
+        let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
+            crate::profiles::ProfileStore::open(&effective_octos_home)
+                .ok()
+                .map(Arc::new);
 
         #[allow(unused_variables)] // used by feature-gated channel registration
         let media_dir = data_dir.join("media");
