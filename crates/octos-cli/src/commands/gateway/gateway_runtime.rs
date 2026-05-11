@@ -249,97 +249,45 @@ impl GatewayRuntime {
         eprintln!("[gateway] provider={provider_name}");
         println!("{}: {}", "Provider".green(), provider_name);
 
-        // Derive octos_home from: --octos-home flag > data_dir (which already
-        // resolves --data-dir > $OCTOS_HOME > ~/.octos). Resolved here so
-        // both the bootstrap helper (for `OCTOS_HOME` in plugin env) and
-        // the `ProfileStore::open` further down agree on the path.
-        let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
+        // Create LLM provider (reuses the shared create_provider from chat.rs)
+        let base_provider = chat::create_provider(&provider_name, &config, model, base_url)?;
+        eprintln!(
+            "[gateway] LLM provider created, model={}",
+            base_provider.model_id()
+        );
 
-        // M11-B: when this gateway invocation is driven by a profile,
-        // delegate the per-profile bootstrap (LLM chain + QoS routing
-        // + memory stores + credentials + plugin env template) to the
-        // shared helper. The helper is what `octos serve` and
-        // `octos tui` will adopt in M11-D so every host process
-        // builds the per-profile state through the same path. The
-        // legacy non-profile path (running with a flat `config.json`
-        // and no `UserProfile`) keeps the inline code so the
-        // single-tenant boot stays byte-identical until it is
-        // retired.
-        let profile_runtime: Option<Arc<crate::runtime::ProfileRuntime>> =
-            if let (Some(profile), false) = (resolved_profile.as_ref(), cli_llm_override) {
-                Some(
-                    crate::runtime::ProfileRuntime::bootstrap(
-                        profile,
-                        &data_dir,
-                        cmd.no_retry,
-                        Some(effective_octos_home.as_path()),
-                    )
-                    .await
-                    .wrap_err("failed to bootstrap profile runtime")?,
-                )
-            } else {
-                None
-            };
+        // Capture the base provider's model_id *before* the adaptive
+        // / retry / swappable wrapping below. Gateway uses this for
+        // `resolve_provider_policy(..., model_id)` and as the
+        // primary key in the sub-provider router. The wrapped
+        // chain's `model_id()` can dispatch through
+        // `AdaptiveRouter::model_id()`, which performs lane selection
+        // and may return a fallback model's id — so we stash the
+        // primary's id here before wrapping.
+        let model_id = base_provider.model_id().to_string();
 
-        // LLM chain + QoS adaptive wiring. When the profile-driven
-        // bootstrap above ran, reuse its outputs; otherwise fall back
-        // to the inline construction used by the legacy
-        // single-tenant gateway path. Either way the downstream code
-        // sees the same `(adaptive_router_ref, runtime_qos_catalog,
-        // swappable, llm)` quadruple.
-        let adaptive_router_ref: Option<Arc<AdaptiveRouter>>;
-        let runtime_qos_catalog: Option<octos_llm::QosCatalog>;
-        let swappable: Arc<SwappableProvider>;
-        let llm: Arc<dyn LlmProvider>;
-        let model_id: String;
-        if let Some(ref pr) = profile_runtime {
-            // Bootstrap already wired the QoS-aware adaptive chain
-            // (including the model_catalog.json exporter and the
-            // cold-start QoS catalog for single-provider profiles)
-            // via the shared helper. Reuse its `runtime_qos_catalog`
-            // directly so the downstream sub-provider router
-            // receives the same seed entries the legacy inline path
-            // would have built — including the cold-start derivation
-            // when `adaptive_router` is `None` (single provider, no
-            // failover).
-            swappable = Arc::new(SwappableProvider::new(pr.llm.clone()));
-            llm = swappable.clone();
-            model_id = swappable.current().model_id().to_string();
-            eprintln!("[gateway] LLM provider created, model={model_id}");
-            runtime_qos_catalog = pr.runtime_qos_catalog.clone();
-            adaptive_router_ref = pr.adaptive_router.clone();
-        } else {
-            // Legacy single-tenant path — config.json or
-            // Config::load, no UserProfile, no ProfileRuntime. Keep
-            // the inline assembly byte-identical with pre-M11-B
-            // behavior.
-            let base_provider = chat::create_provider(&provider_name, &config, model, base_url)?;
-            eprintln!(
-                "[gateway] LLM provider created, model={}",
-                base_provider.model_id()
-            );
-            model_id = base_provider.model_id().to_string();
-            let bundle = build_adaptive_provider_chain(
-                base_provider,
-                &config,
-                &data_dir,
-                cmd.no_retry,
-                ExporterMode::Spawn,
-            );
-            swappable = Arc::new(SwappableProvider::new(bundle.llm));
-            llm = swappable.clone();
-            adaptive_router_ref = bundle.adaptive_router;
-            runtime_qos_catalog = bundle.runtime_qos_catalog;
-        }
+        // Build the full LLM provider chain + QoS adaptive wiring via
+        // the shared helper. Keep `adaptive_router_ref` typed so we can
+        // hand it to `ActorFactory` further below (and so the helper
+        // can spawn its 30s metrics exporter against it).
+        let bundle = build_adaptive_provider_chain(
+            base_provider,
+            &config,
+            &data_dir,
+            cmd.no_retry,
+            ExporterMode::Spawn,
+        );
+        let adaptive_router_ref: Option<Arc<AdaptiveRouter>> = bundle.adaptive_router;
+        let runtime_qos_catalog = bundle.runtime_qos_catalog;
+
+        // Wrap LLM in SwappableProvider for runtime model switching
+        let swappable = Arc::new(SwappableProvider::new(bundle.llm));
+        let llm: Arc<dyn LlmProvider> = swappable.clone();
 
         // Open ProfileStore for /account commands and bot management.
-        // Kept here (after the LLM chain construction above) to
-        // preserve the pre-M11-B filesystem-side-effect timing —
-        // `ProfileStore::open` creates `<octos_home>/profiles/`, and
-        // moving that ahead of provider/chain construction would
-        // create the directory even on profiles whose
-        // `create_provider` would otherwise fail before any
-        // filesystem write.
+        // Derive octos_home from: --octos-home flag > data_dir (which already
+        // resolves --data-dir > $OCTOS_HOME > ~/.octos).
+        let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
             crate::profiles::ProfileStore::open(&effective_octos_home)
                 .ok()
@@ -350,36 +298,77 @@ impl GatewayRuntime {
 
         let voice_config = config.voice.clone();
 
-        // Episode + memory stores: opened by the profile bootstrap
-        // when one ran; otherwise fall back to the inline opens used
-        // by the legacy single-tenant path. The eprintln pairs
-        // surround the actual open so downstream readers see the
-        // same `opening / opened` stderr framing the gateway has
-        // always emitted.
         eprintln!("[gateway] opening episode store at {}", data_dir.display());
-        let memory = if let Some(ref pr) = profile_runtime {
-            pr.memory.clone()
-        } else {
-            Arc::new(
-                EpisodeStore::open(&data_dir)
-                    .await
-                    .wrap_err("failed to open episode store")?,
-            )
-        };
+        let memory = Arc::new(
+            EpisodeStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open episode store")?,
+        );
         eprintln!("[gateway] episode store opened");
 
         // Initialize memory store
         eprintln!("[gateway] opening memory store");
-        let memory_store = if let Some(ref pr) = profile_runtime {
-            pr.memory_store.clone()
-        } else {
-            Arc::new(
-                MemoryStore::open(&data_dir)
-                    .await
-                    .wrap_err("failed to open memory store")?,
-            )
-        };
+        let memory_store = Arc::new(
+            MemoryStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open memory store")?,
+        );
         eprintln!("[gateway] memory store opened");
+
+        // M11-B: assemble a `ProfileRuntime` from the pieces gateway
+        // already built (LLM chain, memory stores) plus the
+        // per-profile derivations (plugin env template, skills_dir,
+        // credentials, tool_specs floor). The runtime is held here
+        // so `octos serve` and `octos tui` (M11-D) can adopt the
+        // same helper instead of re-implementing the per-profile
+        // assembly. Today's gateway does not yet consume the
+        // returned struct downstream — the inline tool registry +
+        // ActorFactory wiring below is unchanged — so this PR is a
+        // pure additive wire-up. The legacy non-profile path (no
+        // `UserProfile`) and the CLI-override path
+        // (`--model` / `--provider` / `--base-url`) skip the
+        // bootstrap; the resulting `Option<Arc<ProfileRuntime>>`
+        // tracks whether the assembler was invoked.
+        let _profile_runtime: Option<Arc<crate::runtime::ProfileRuntime>> =
+            if let (Some(profile), false) = (resolved_profile.as_ref(), cli_llm_override) {
+                // Gateway's own tool registry is built later in the
+                // `let mut tools; …` block below (with the full
+                // gateway-extras: WebSearchTool with provider keys,
+                // BrowserTool with timeout, MCP, plugins, admin
+                // tools, …). The `ProfileRuntime`'s
+                // `tool_specs` is the per-profile *builtin floor*
+                // that future callers (`octos serve` / TUI) will
+                // share via the M11-A multi-tenant fix; gateway
+                // does not consume it in M11-B (the inline tool
+                // registry stays in place to preserve byte-identical
+                // boot). We hand `ToolRegistry::new()` so bootstrap
+                // does not need to call `create_sandbox` itself —
+                // doing so a second time here would emit a duplicate
+                // `"sandbox disabled, …"` info log on profiles that
+                // disable sandboxing.
+                let inputs = crate::runtime::profile::ProfileRuntimeInputs {
+                    llm: llm.clone(),
+                    adaptive_router: adaptive_router_ref.clone(),
+                    runtime_qos_catalog: runtime_qos_catalog.clone(),
+                    primary_model_id: model_id.clone(),
+                    memory: memory.clone(),
+                    memory_store: memory_store.clone(),
+                    default_sandbox: config.sandbox.clone(),
+                    tool_specs: ToolRegistry::new(),
+                };
+                Some(
+                    crate::runtime::ProfileRuntime::bootstrap(
+                        profile,
+                        &data_dir,
+                        Some(effective_octos_home.as_path()),
+                        inputs,
+                    )
+                    .await
+                    .wrap_err("failed to bootstrap profile runtime")?,
+                )
+            } else {
+                None
+            };
 
         // Derive project_dir from octos_home (when launched by process_manager)
         // or fall back to cwd/.octos (standalone octos gateway / octos chat mode).
