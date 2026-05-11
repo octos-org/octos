@@ -15,7 +15,7 @@ use octos_llm::{AdaptiveRouter, LlmProvider, QosCatalog};
 use octos_memory::{EpisodeStore, MemoryStore};
 
 use crate::profiles::{UserProfile, config_from_profile};
-use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
+use crate::skills_scope::push_runtime_plugin_env;
 
 /// All long-lived state that belongs to a single profile within the
 /// current host process.
@@ -252,6 +252,24 @@ pub struct ProfileRuntimeInputs {
     /// gateway's tool-registry construction is fully unified with
     /// serve's.
     pub tool_specs: ToolRegistry,
+
+    /// The per-profile skills dir candidate path, or `None` when
+    /// the caller knows the profile has no installed skills. The
+    /// caller decides whether to do the existence check; bootstrap
+    /// does NOT stat the filesystem here so the helper does not
+    /// add an observable filesystem read outside the pre-PR
+    /// sequence. Gateway hands in
+    /// `Some(data_dir.join("skills"))` when the caller would
+    /// otherwise check existence — the read happens later inside
+    /// `build_account_plugin_dirs` exactly as pre-PR.
+    pub skills_dir: Option<PathBuf>,
+
+    /// Pre-computed Ominix discovery URL. Caller resolves it once
+    /// via `crate::skills_scope::discover_ominix_url` (gateway
+    /// already does this for its voice / ASR plumbing) and hands
+    /// the result to bootstrap so we do not read
+    /// `~/.ominix/api_url` a second time on profile boot.
+    pub ominix_url: Option<String>,
 }
 
 impl ProfileRuntime {
@@ -334,23 +352,20 @@ impl ProfileRuntime {
         // this field.
         let credentials: HashMap<String, String> = profile.config.env_vars.clone();
 
-        // Step 2: derive skills_dir as Some(...) only when the
-        // directory exists (mirrors `build_account_plugin_dirs`).
-        let candidate_skills_dir = data_dir.join("skills");
-        let skills_dir = if candidate_skills_dir.exists() {
-            Some(candidate_skills_dir)
-        } else {
-            None
-        };
+        // Step 2: take the pre-computed `skills_dir` from the
+        // caller. We deliberately do not stat
+        // `data_dir.join("skills")` here — gateway already performs
+        // the same check via `build_account_plugin_dirs` further
+        // down, and doing it twice would add an observable
+        // filesystem read outside the pre-PR sequence.
+        let skills_dir = inputs.skills_dir;
 
-        // Step 3: build the per-profile plugin env template. Only
-        // the runtime envs (`OCTOS_DATA_DIR`, `OCTOS_HOME`,
-        // `OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, `OMINIX_API_URL`)
-        // belong here — provider-API-key envs (`build_plugin_env`,
-        // `profile_plugin_env`) stay on the caller until M11-D
-        // unifies the call sites.
+        // Step 3: build the per-profile plugin env template using
+        // the caller's pre-resolved Ominix URL. Gateway already
+        // calls `discover_ominix_url()` once for its voice / ASR
+        // plumbing and hands the result to bootstrap so we do not
+        // read `~/.ominix/api_url` a second time on profile boot.
         let mut plugin_env_template: Vec<(String, String)> = Vec::new();
-        let ominix_url = discover_ominix_url();
         let effective_octos_home = octos_home
             .map(Path::to_path_buf)
             .unwrap_or_else(|| data_dir.to_path_buf());
@@ -359,7 +374,7 @@ impl ProfileRuntime {
             data_dir,
             &effective_octos_home,
             Some(profile.id.as_str()),
-            ominix_url.as_deref(),
+            inputs.ominix_url.as_deref(),
         );
 
         // Step 4: wrap the caller-built tool registry in `Arc` so
@@ -525,6 +540,11 @@ mod tests {
             memory_store,
             default_sandbox: sandbox_config,
             tool_specs: tools,
+            // The test does not care whether the synthetic
+            // `<data_dir>/skills` path exists on disk — bootstrap
+            // does not stat it, by contract.
+            skills_dir: Some(data_dir.join("skills")),
+            ominix_url: None,
         };
 
         let runtime = ProfileRuntime::bootstrap(&profile, &data_dir, None, inputs)
