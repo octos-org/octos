@@ -422,9 +422,12 @@ impl EpisodeStore {
 
     /// Store an embedding for an episode.
     ///
-    /// In degraded mode the disk write is skipped; the in-memory
-    /// hybrid index is still updated so within-process embedding
-    /// search keeps working for this handle's lifetime.
+    /// In degraded mode the disk write is skipped and the call
+    /// returns `Ok(())`. The in-memory hybrid index is updated with
+    /// the embedding, but the public read methods still return
+    /// empty for the same reason as [`Self::store`] — they need
+    /// disk-backed bodies. Follows the same "writes accepted, reads
+    /// empty" contract.
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
         // Degraded fallback: skip the disk write, update the in-memory
         // embedding entry only, return success.

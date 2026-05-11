@@ -387,13 +387,22 @@ impl GatewayRuntime {
         let memory: Arc<EpisodeStore> = if let Some(rt) = profile_runtime.as_ref() {
             rt.memory.clone()
         } else {
+            // Non-profile / CLI-override inline path. This is still
+            // an `octos gateway` host process, so it shares the same
+            // role expectation as the profile-mode branch above: if a
+            // sibling `octos serve` daemon already owns the redb
+            // lock on this `data_dir`, fall back to a degraded store
+            // instead of crashlooping. (Issue #899.)
             eprintln!("[gateway] opening episode store at {}", data_dir.display());
             let store = Arc::new(
-                EpisodeStore::open(&data_dir)
+                EpisodeStore::open_or_degraded(&data_dir)
                     .await
                     .wrap_err("failed to open episode store")?,
             );
-            eprintln!("[gateway] episode store opened");
+            eprintln!(
+                "[gateway] episode store opened (degraded={})",
+                store.is_degraded(),
+            );
             store
         };
 
