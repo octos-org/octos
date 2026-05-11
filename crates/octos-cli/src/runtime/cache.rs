@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use eyre::Result;
 use octos_core::SessionKey;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use super::{ProfileRuntime, SessionRuntime};
@@ -46,9 +46,17 @@ type CacheStorage = Arc<tokio::sync::RwLock<HashMap<CacheKey, CacheEntry>>>;
 /// Uses [`std::sync::Mutex`] (not [`tokio::sync::Mutex`]) so the
 /// owner-side cleanup `Drop` impl can synchronously remove its slot
 /// on panic/cancellation. The lock is held only for HashMap
-/// insert/remove and a synchronous `Notified::enable()` — never
-/// across an `.await`.
-type InflightStorage = Arc<std::sync::Mutex<HashMap<CacheKey, Arc<Notify>>>>;
+/// insert/remove — never across an `.await`.
+///
+/// The inflight value is a [`tokio::sync::Semaphore`] starting with
+/// zero permits. The owner calls `close()` on completion (success,
+/// error, panic, future cancellation), at which point every parked
+/// waiter's `acquire().await` returns `Err(AcquireError)` and a
+/// freshly-issued `acquire().await` on the already-closed
+/// semaphore returns `Err` on first poll. The "closed" state is
+/// sticky, so there is no lost-wake race regardless of whether the
+/// waiter registers before or after the close call.
+type InflightStorage = Arc<std::sync::Mutex<HashMap<CacheKey, Arc<Semaphore>>>>;
 
 /// In-memory cache mapping `(profile_id, session_key)` to an
 /// `Arc<SessionRuntime>`.
@@ -79,14 +87,15 @@ type InflightStorage = Arc<std::sync::Mutex<HashMap<CacheKey, Arc<Notify>>>>;
 /// the async lock keeps the runtime futures `Send`.
 pub struct SessionRuntimeCache {
     inner: CacheStorage,
-    /// Per-key single-flight inflight markers. A `Notify` parked here
-    /// while a `bootstrap` is running for that key; subsequent
-    /// `get_or_init` callers for the same key wait on the notify
-    /// rather than running their own `bootstrap`. This is the M11-C
-    /// fix codex flagged on the initial PR: without it, two
-    /// concurrent same-key misses could both fall into the bootstrap
-    /// path under the prior "drop write lock, bootstrap, retake
-    /// write lock" pattern.
+    /// Per-key single-flight inflight slots. A `Semaphore` parked
+    /// here while a `bootstrap` is running for that key; subsequent
+    /// `get_or_init` callers for the same key `acquire().await`
+    /// against it rather than running their own `bootstrap`. The
+    /// owner's `InflightGuard::drop` closes the semaphore (waking
+    /// every parked waiter with `Err(AcquireError)`) on every exit
+    /// path, including panic and future cancellation — see the
+    /// [`InflightStorage`] type alias for the lost-wake-race
+    /// reasoning behind picking `Semaphore` over `Notify`.
     inflight: InflightStorage,
     max_size: usize,
     idle_ttl: Duration,
@@ -119,34 +128,37 @@ struct CacheEntry {
 /// off the `.await` path (otherwise the returned future would not
 /// be `Send`).
 enum InflightOutcome {
-    /// Another task is already bootstrapping this key. The cloned
-    /// `Arc<Notify>` is what we'll park on via
-    /// `Notified::enable() + .await`.
-    WaitOn(Arc<Notify>),
+    /// Another task is already bootstrapping this key. We cloned
+    /// the slot's [`Semaphore`] under the lock; when the owner
+    /// finishes (or its guard drops), it calls `close()` on the
+    /// semaphore. Our `acquire().await` then returns `Err`
+    /// regardless of whether registration happens before or after
+    /// the close call — see the `Semaphore::close` docs for the
+    /// sticky-closed semantics this relies on.
+    WaitOn(Arc<Semaphore>),
     /// We just installed the inflight slot ourselves. The guard
     /// owns the slot and drops it on every exit path of the
     /// bootstrap (success, error, panic, future cancellation).
     OwnGuard(InflightGuard),
 }
 
-/// RAII guard that removes its inflight slot and wakes every parked
-/// waiter on `Drop`. This is the single-flight cleanup primitive —
-/// without it, an owner-task panic or future cancellation between
-/// inflight insertion and bootstrap completion would strand the
-/// slot and same-key callers would park on a `Notify` no owner
-/// ever signals.
+/// RAII guard that removes its inflight slot and closes the slot's
+/// semaphore (waking every parked waiter) on `Drop`. This is the
+/// single-flight cleanup primitive — without it, an owner-task
+/// panic or future cancellation between inflight insertion and
+/// bootstrap completion would strand the slot and same-key callers
+/// would park on a semaphore no owner ever closes.
 ///
 /// Synchronous `Drop` is the entire reason the inflight map uses
 /// `std::sync::Mutex` rather than `tokio::sync::Mutex`: async
 /// `Drop` is not yet a thing in stable Rust, but we still need
 /// cleanup on panic and on aborted futures. The std mutex is held
-/// only across HashMap insert/remove and a synchronous
-/// `Notified::enable` call — never across `.await` — so there is
-/// no risk of blocking the executor.
+/// only across HashMap insert/remove — never across `.await` — so
+/// there is no risk of blocking the executor.
 struct InflightGuard {
     storage: InflightStorage,
     key: CacheKey,
-    notify: Arc<Notify>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl Drop for InflightGuard {
@@ -160,16 +172,17 @@ impl Drop for InflightGuard {
             // against an unlikely race where the cache was wiped
             // between our claim and now.
             if let Some(existing) = inflight.get(&self.key) {
-                if Arc::ptr_eq(existing, &self.notify) {
+                if Arc::ptr_eq(existing, &self.semaphore) {
                     inflight.remove(&self.key);
                 }
             }
         }
-        // Wake every parked waiter on this `Notify`. Waiters that
-        // have already been `enable()`d are guaranteed to observe
-        // this signal (lost-wake race is closed by the
-        // enable-under-lock pattern in `get_or_init`).
-        self.notify.notify_waiters();
+        // Close the semaphore. Every parked `acquire` future
+        // (and every future `acquire` call on this Arc) returns
+        // `Err(AcquireError)` from this point on. The closed
+        // state is sticky, so there is no lost-wake race even if
+        // a waiter registered after we returned from this Drop.
+        self.semaphore.close();
     }
 }
 
@@ -267,34 +280,30 @@ impl SessionRuntimeCache {
             }
 
             // Miss: claim or join the single-flight inflight slot.
-            // We hold the `inflight` mutex only for the duration of
-            // a HashMap lookup/insert (plus, on the wait path, the
-            // `Notified::enable()` registration); the actual
-            // bootstrap runs outside any cache lock so different
-            // keys remain concurrent.
+            // We hold the `inflight` std mutex only for the
+            // duration of a HashMap lookup/insert; the actual
+            // bootstrap (and `acquire().await` on the wait path)
+            // runs outside the lock so different keys remain
+            // concurrent.
             //
-            // The wait path uses `Notified::enable()` *while still
-            // holding the inflight lock* to register the waiter on
-            // the `Notify`'s wait queue before dropping the lock.
-            // Without this, a lost-wake race is possible: the owner
-            // could call `notify_waiters()` between our lock release
-            // and our `.await`, and tokio does not buffer wake-ups
-            // for futures that haven't been polled/enabled yet. See
-            // the `Notified::enable` docs for the canonical mpmc
-            // recipe this mirrors.
-            // Probe + (own-or-clone) under the inflight mutex.
-            // We deliberately keep the `std::sync::MutexGuard`
-            // scope tight: it never escapes this block. The two
+            // Probe + (own-or-clone) under the inflight mutex. The
+            // `std::sync::MutexGuard` scope is tight: it never
+            // escapes this block, so it never spans an `.await`
+            // and the returned future remains `Send`. The two
             // possible outcomes are
-            //   - `WaitOn(Arc<Notify>)` when another task owns the
-            //     slot — we then build/enable a `Notified` future
-            //     against that notify and `.await` it outside the
-            //     lock,
+            //   - `WaitOn(Arc<Semaphore>)` when another task owns
+            //     the slot — we await `acquire()`, which returns
+            //     `Err(AcquireError)` once the owner closes the
+            //     semaphore. Tokio's `Semaphore::close` semantics
+            //     are sticky, so a `close()` that happened before
+            //     our registration still fails the next poll —
+            //     no lost-wake race.
             //   - `OwnGuard(InflightGuard)` when we just installed
             //     a fresh slot — we then proceed with `bootstrap`
-            //     and the guard's `Drop` cleans up the slot on
-            //     every exit path (success, error, panic, future
-            //     cancellation).
+            //     and the guard's `Drop` cleans up the slot
+            //     (closes the semaphore + removes the map entry)
+            //     on every exit path: success, error, panic, or
+            //     future cancellation.
             let outcome = {
                 let mut inflight = self
                     .inflight
@@ -303,12 +312,12 @@ impl SessionRuntimeCache {
                 if let Some(existing) = inflight.get(&key) {
                     InflightOutcome::WaitOn(Arc::clone(existing))
                 } else {
-                    let notify = Arc::new(Notify::new());
-                    inflight.insert(key.clone(), Arc::clone(&notify));
+                    let semaphore = Arc::new(Semaphore::new(0));
+                    inflight.insert(key.clone(), Arc::clone(&semaphore));
                     InflightOutcome::OwnGuard(InflightGuard {
                         storage: Arc::clone(&self.inflight),
                         key: key.clone(),
-                        notify,
+                        semaphore,
                     })
                 }
                 // `inflight` (the MutexGuard) is dropped here at
@@ -319,20 +328,16 @@ impl SessionRuntimeCache {
             };
 
             match outcome {
-                InflightOutcome::WaitOn(notify) => {
-                    let notified = notify.notified();
-                    tokio::pin!(notified);
-                    // Register as a waiter atomically with respect
-                    // to any future `notify_waiters()` calls. Even
-                    // if the owner had already finished and
-                    // notified between our claim above and the
-                    // following `.await`, the `enable` call below
-                    // would observe the prior notify_waiters call
-                    // via the `Notified` state machine (see the
-                    // canonical recipe in the `Notified::enable`
-                    // docs).
-                    notified.as_mut().enable();
-                    notified.await;
+                InflightOutcome::WaitOn(semaphore) => {
+                    // We expect `acquire()` to return `Err` once
+                    // the owner closes the semaphore (on success,
+                    // error, panic, or future cancellation). The
+                    // error arm is the only arm we care about —
+                    // either way we loop back to the fast-path
+                    // read and pick up the inserted runtime (if
+                    // bootstrap succeeded) or re-attempt the
+                    // bootstrap ourselves (if it failed).
+                    let _ = semaphore.acquire().await;
                     continue;
                 }
                 InflightOutcome::OwnGuard(guard) => {
@@ -643,68 +648,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_or_init_releases_inflight_slot_on_aborted_owner_future() {
+    async fn get_or_init_releases_inflight_slot_when_owner_future_is_dropped() {
         // Codex BLOCK round 2 (HIGH): if the owner's `get_or_init`
-        // future is cancelled (or its task panics) between
-        // inflight insertion and bootstrap completion, the
-        // inflight slot must NOT be stranded — otherwise future
-        // same-key callers park forever. The `InflightGuard` RAII
-        // makes this work by removing the slot + waking waiters
+        // future is cancelled (or its task panics) AFTER inflight
+        // insertion but BEFORE bootstrap completion, the inflight
+        // slot must NOT be stranded — otherwise future same-key
+        // callers park forever. The `InflightGuard` RAII makes
+        // this work by removing the slot + closing the semaphore
         // on `Drop`.
         //
-        // We simulate cancellation by spawning a `get_or_init`
-        // task and aborting it immediately, then issuing a fresh
-        // `get_or_init` for the same key on this task and
-        // asserting it completes. (If the slot were stranded the
-        // second call would park forever; a `tokio::time::timeout`
-        // turns "park forever" into a test failure.)
+        // To exercise the guarded state directly (rather than
+        // hoping that a `tokio::spawn` + `abort()` lands the
+        // cancellation between the right two points), we:
+        //   1. Manually install an inflight slot via
+        //      `InflightGuard` (the exact shape `get_or_init`
+        //      constructs internally).
+        //   2. Drop the guard explicitly — this is what would
+        //      happen if the owner's future were cancelled
+        //      mid-bootstrap.
+        //   3. Verify the slot is gone from the map and that a
+        //      fresh same-key `get_or_init` completes within a
+        //      bounded timeout.
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("profile-data");
         let profile = make_profile(data_dir).await;
 
         let cache = Arc::new(SessionRuntimeCache::new(8, Duration::from_secs(60)));
         let key = SessionKey::new("api", "owner-cancelled");
+        let cache_key = (profile.profile_id.clone(), key.clone());
 
-        // Spawn an owner that yields before completing. We grab
-        // its `JoinHandle` so we can `abort()` it mid-flight.
-        let task_cache = Arc::clone(&cache);
-        let task_profile = Arc::clone(&profile);
-        let task_key = key.clone();
-        let handle = tokio::spawn(async move {
-            // Yield several times to make sure the abort lands
-            // while the future is suspended somewhere inside
-            // `get_or_init`/`bootstrap`. Bootstrap itself does
-            // synchronous filesystem work, so most yields land
-            // before/after that work — that's fine for the
-            // cancellation-safety property.
-            let fut = task_cache.get_or_init(&task_profile, task_key, None);
-            tokio::pin!(fut);
-            for _ in 0..32 {
-                tokio::task::yield_now().await;
+        // Step 1+2: hand-construct a guard the way `get_or_init`
+        // would, then drop it. This is the same `InflightGuard`
+        // shape — Drop runs the cleanup path.
+        {
+            let semaphore = Arc::new(Semaphore::new(0));
+            {
+                let mut inflight = cache.inflight.lock().unwrap_or_else(|p| p.into_inner());
+                inflight.insert(cache_key.clone(), Arc::clone(&semaphore));
             }
-            (&mut fut).await
-        });
-        // Give the owner a tick to claim the inflight slot, then
-        // abort it. The abort drops the `get_or_init` future,
-        // which drops the `InflightGuard`, which removes the slot
-        // and wakes any waiter.
-        tokio::task::yield_now().await;
-        handle.abort();
-        let _ = handle.await; // Drain JoinError.
+            let guard = InflightGuard {
+                storage: Arc::clone(&cache.inflight),
+                key: cache_key.clone(),
+                semaphore: Arc::clone(&semaphore),
+            };
+            // Sanity check: slot is present *before* the guard
+            // drops.
+            assert!(
+                cache
+                    .inflight
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&cache_key),
+            );
+            drop(guard);
+        }
 
-        // A fresh same-key call must complete — wrapped in a
-        // timeout so a regression to the stranded-slot bug fails
-        // the test fast rather than hanging CI.
+        // After Drop: the map entry is gone and the semaphore is
+        // closed. (Closed-ness is sticky; any future
+        // `acquire().await` would return Err immediately.)
+        assert!(
+            cache
+                .inflight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "InflightGuard::drop did not remove the slot",
+        );
+
+        // Step 3: a fresh same-key call must complete — wrapped
+        // in a timeout so a regression to the stranded-slot bug
+        // fails the test fast rather than hanging CI.
         let rt = tokio::time::timeout(
             Duration::from_secs(5),
             cache.get_or_init(&profile, key, None),
         )
         .await
-        .expect("get_or_init must not park after owner cancellation")
+        .expect("get_or_init must not park after the simulated cancellation")
         .expect("bootstrap must succeed");
         assert_eq!(cache.len().await, 1);
-        // The inflight slot must be released after the second
-        // owner completes.
+        // The inflight slot must be released after `get_or_init`
+        // completes too — the guard from inside `get_or_init`
+        // dropped on its way out.
         assert!(
             cache
                 .inflight
