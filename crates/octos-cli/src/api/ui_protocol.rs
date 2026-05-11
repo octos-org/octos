@@ -2068,9 +2068,63 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let requested_workspace = validate_requested_session_cwd(state, features, &params)?;
-    if let Some(workspace_root) = requested_workspace {
-        session_workspaces().set(params.session_id.clone(), workspace_root);
+    let requested_workspace =
+        validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
+    // M11-E: when a profile is registered for this session, materialize
+    // the `SessionRuntime` against the validated workspace hint NOW so
+    // the subsequent `turn/start` (and any cached read of
+    // `session_runtime.workspace_root`) observes the supplied cwd.
+    //
+    // The cache's `get_or_init` is single-flight: a same-key hit returns
+    // the EXISTING `Arc<SessionRuntime>` and IGNORES the new
+    // `workspace_hint`. That means a client cannot silently change a
+    // running session's cwd by re-opening with a different `cwd`
+    // parameter; the first cwd wins until the runtime is evicted (LRU,
+    // idle TTL, explicit `invalidate`). The `SessionOpened` reply is
+    // sourced from the cached runtime's `workspace_root` (not the
+    // requested hint) so the wire response truthfully reflects which
+    // workspace the next turn will use — closing the cache/wire
+    // divergence codex flagged on PR #884 follow-up.
+    //
+    // The `session_workspaces()` map is kept as a thin read-through
+    // view for the legacy WS dispatcher fallback (no profile registered
+    // — setup wizard / single-agent serve) and for pane snapshots that
+    // need a sync read of the workspace root. We always write the
+    // *effective* workspace root (the runtime's, when present) so the
+    // map cannot drift out of sync with the cache.
+    let mut effective_workspace_root: Option<PathBuf> = None;
+    if let Some(profile_runtime) =
+        resolve_session_profile_runtime(state, active_profile_id.as_deref())
+    {
+        let hint = requested_workspace.clone();
+        match state
+            .session_cache
+            .get_or_init(&profile_runtime, params.session_id.clone(), hint)
+            .await
+        {
+            Ok(runtime) => {
+                effective_workspace_root = Some(runtime.workspace_root.clone());
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    profile_id = %profile_runtime.profile_id,
+                    session = %params.session_id,
+                    "session/open: SessionRuntime::bootstrap failed",
+                );
+                return Err(runtime_unavailable_error(format!(
+                    "failed to bootstrap session runtime: {error}"
+                )));
+            }
+        }
+    } else if let Some(workspace_root) = requested_workspace.as_ref() {
+        // No profile registered (legacy single-agent serve). Stash the
+        // client-supplied cwd in the read-through map so the legacy
+        // dispatcher's pane-snapshot path can pick it up.
+        effective_workspace_root = Some(workspace_root.clone());
+    }
+    if let Some(root) = effective_workspace_root.as_ref() {
+        session_workspaces().set(params.session_id.clone(), root.clone());
     }
     let (replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
@@ -2099,7 +2153,11 @@ async fn open_session_result(
         sessions.data_dir()
     };
 
-    let workspace_root = session_workspace_root_for_state(state, &params.session_id);
+    // The cached SessionRuntime's `workspace_root` is the source of truth
+    // for the wire response when present. Fall back to the legacy lookup
+    // when no SessionRuntime was materialized (no profile registered).
+    let workspace_root = effective_workspace_root
+        .or_else(|| session_workspace_root_for_state(state, &params.session_id));
     let panes = features
         .pane_snapshots
         .then(|| build_pane_snapshot(&data_dir, &params.session_id, workspace_root.as_deref()));
@@ -2138,6 +2196,7 @@ async fn open_session_result(
 fn validate_requested_session_cwd(
     state: &AppState,
     features: ConnectionUiFeatures,
+    active_profile_id: Option<&str>,
     params: &SessionOpenParams,
 ) -> Result<Option<PathBuf>, RpcError> {
     let Some(cwd) = params
@@ -2160,7 +2219,7 @@ fn validate_requested_session_cwd(
     }
 
     let workspace_root = canonical_existing_dir(cwd)?;
-    validate_session_workspace_allowed(state, &workspace_root)?;
+    validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
     Ok(Some(workspace_root))
 }
 
@@ -2201,50 +2260,115 @@ fn expand_home_path(path: &str) -> PathBuf {
 
 fn validate_session_workspace_allowed(
     state: &AppState,
+    active_profile_id: Option<&str>,
     workspace_root: &Path,
 ) -> Result<(), RpcError> {
-    let Some(agent) = &state.agent else {
+    // M11-E: per-session cwd is only honored on the profile-aware
+    // dispatch path (`SessionRuntime` materialized via
+    // `SessionRuntimeCache`). The legacy single-agent fallback —
+    // `state.agent` only, no `ProfileRuntime` registered for the
+    // routed profile — does NOT rebind the per-session tool registry
+    // to a client-supplied cwd (matching `chat_sync`'s legacy
+    // `validate_chat_request` fallback, which never accepted a cwd in
+    // the first place). Pre-M11-E this was wired via the now-deleted
+    // `session_tool_registry`; that path is gone, so accepting a `cwd`
+    // in legacy mode would leave the wire reply
+    // (`SessionOpened.workspace_root = requested_cwd`) diverging from
+    // the turn dispatcher's actual cwd (the daemon root).
+    //
+    // We check the SPECIFIC routed profile, not just "any profile is
+    // registered" — a multi-profile deployment may have profiles A, B,
+    // and a request that routes to profile C should still get the
+    // `cwd_runtime_unavailable` rejection (codex round-3 fix). Reject
+    // early so the client sees a typed error instead of a silent
+    // wire/turn mismatch.
+    //
+    // For profile mode (the M11-aware production flow) we apply the
+    // same path-safety check `SessionRuntime::bootstrap` enforces
+    // (`validate_workspace_hint`): the cwd must canonicalize and must
+    // not be rooted under a banned system path (`/etc`, `/usr`,
+    // `/sbin`, …). Cross-session containment is intentionally NOT
+    // checked here — coding-agent UIs point sessions at arbitrary
+    // repos. Session-scope access control belongs in the auth /
+    // connection-profile gate (`validate_session_scope`), not the cwd
+    // validator.
+    if resolve_session_profile_runtime(state, active_profile_id).is_none() {
         return Err(RpcError::invalid_params(
-            "session/open cwd requires a configured coding runtime",
+            "session/open cwd requires a configured profile runtime",
         )
         .with_data(json!({
             "kind": "cwd_runtime_unavailable",
             "cwd": workspace_root.to_string_lossy(),
-        })));
-    };
-
-    let tools = agent.tool_registry();
-    session_filesystem_profile_for_workspace(tools.as_ref(), workspace_root)
-}
-
-fn session_filesystem_profile_for_workspace(
-    tools: &octos_agent::ToolRegistry,
-    workspace_root: &Path,
-) -> Result<(), RpcError> {
-    if let Some(root) = tools.workspace_root() {
-        if path_is_under_root(workspace_root, root) {
-            return Ok(());
-        }
-        return Err(RpcError::invalid_params(
-            "session/open cwd is outside the server workspace root",
-        )
-        .with_data(json!({
-            "kind": "cwd_outside_workspace_root",
-            "cwd": workspace_root.to_string_lossy(),
-            "workspace_root": root.to_string_lossy(),
+            "active_profile_id": active_profile_id,
         })));
     }
 
-    Err(
-        RpcError::invalid_params("session/open cwd cannot be authorized by this runtime")
-            .with_data(json!({
-                "kind": "cwd_authorization_unavailable",
-                "cwd": workspace_root.to_string_lossy(),
-            })),
-    )
+    validate_session_workspace_path_safety(workspace_root)
+}
+
+/// Path-safety gate for multi-profile session cwds.
+///
+/// Mirrors the banned-system-path list in
+/// `crate::runtime::session::validate_workspace_hint`. The two paths
+/// must stay in lockstep; the duplicate exists because
+/// `SessionRuntime::bootstrap` does not see `AppState` and cannot call
+/// back into this module. TODO(post-M11): collapse to a shared helper.
+fn validate_session_workspace_path_safety(workspace_root: &Path) -> Result<(), RpcError> {
+    // `validate_requested_session_cwd` already canonicalized the path
+    // and verified it is a directory, so we only need to guard against
+    // banned system roots here.
+    let mut components = workspace_root.components();
+    let _root = components.next();
+    if let Some(first) = components.next() {
+        let first = first.as_os_str();
+        const BANNED: &[&str] = &[
+            "etc", "sbin", "bin", "boot", "dev", "proc", "sys", "usr", "var", "root",
+        ];
+        for entry in BANNED {
+            if first == std::ffi::OsStr::new(entry) {
+                return Err(RpcError::invalid_params(format!(
+                    "session/open cwd is rooted under a system path /{entry}"
+                ))
+                .with_data(json!({
+                    "kind": "cwd_system_path_banned",
+                    "cwd": workspace_root.to_string_lossy(),
+                    "banned_root": entry,
+                })));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the `ProfileRuntime` for the routed session, mirroring
+/// `chat_sync`'s `state.profiles.get(profile_id)` lookup.
+///
+/// `active_profile_id` is the profile id `validate_session_scope`
+/// produced for this session/open. It may be `None` when the legacy
+/// no-profile flow is in use (single-agent serve, no connection-level
+/// profile identity). Falls back to `MAIN_PROFILE_ID` so the
+/// canonical "_main" profile in standalone deployments still resolves.
+fn resolve_session_profile_runtime(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+) -> Option<Arc<crate::runtime::ProfileRuntime>> {
+    let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
+    state.profiles.get(candidate).cloned()
 }
 
 fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -> Option<PathBuf> {
+    // Read-through view: prefer the live `session_workspaces()` entry the
+    // most recent `session/open` recorded, fall back to the legacy
+    // server-wide agent's workspace_root for single-agent serve. The
+    // cached `SessionRuntime.workspace_root` is the source of truth on
+    // a successful open; we keep the in-memory map for `session/open`'s
+    // pane-snapshot path which fires BEFORE the SessionRuntime is held
+    // long enough to consult the cache (the cache load is async and the
+    // pane snapshot is computed synchronously). After M11-E the map is
+    // only WRITTEN by `open_session_result` and READ here + by the WS
+    // turn dispatcher's hint forwarding — a thin redundant view of the
+    // cache's per-key `workspace_root` rather than the legacy
+    // process-global tier-1 store it used to be.
     session_workspaces().get(session_id).or_else(|| {
         state
             .agent
@@ -2255,108 +2379,14 @@ fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -
     })
 }
 
-fn session_tool_registry(
-    base_agent: &Agent,
-    session_id: &SessionKey,
-    data_dir: &Path,
-    operator_default_cwd: Option<&Path>,
-) -> Result<(octos_agent::ToolRegistry, Option<PathBuf>), String> {
-    let base_tools = base_agent.tool_registry();
-
-    // Plugin tools (deep_search, mofa_*, fm_tts, …) emit their artefacts
-    // through `OCTOS_WORK_DIR`. Without an explicit work_dir they inherit
-    // the serve process's CWD (typically `~` under launchd), and the
-    // resulting absolute paths fall outside the profile root — so
-    // `MessagePersistedEvent.media` gets fetched via
-    // `/api/files/<encoded-abs-path>` and `resolve_legacy_file_request`
-    // 403s the response.
-    //
-    // `<data_dir>/skill-output` is the gateway convention
-    // (`gateway/profile_factory.rs:581`, `gateway/gateway_runtime.rs:643`)
-    // and is a starts_with prefix of profile_root for
-    // `resolve_legacy_file_request`, so emitted paths round-trip cleanly
-    // through `/api/files/...`. We canonicalise to keep the work_dir
-    // absolute even when `--data-dir` is relative; pre-create the directory
-    // so canonicalize succeeds on first boot.
-    let plugin_default_dir = {
-        let candidate = data_dir.join("skill-output");
-        std::fs::create_dir_all(&candidate).ok();
-        std::fs::canonicalize(&candidate).unwrap_or(candidate)
-    };
-
-    let Some(workspace_root) = session_workspaces()
-        .get(session_id)
-        .or_else(|| base_tools.workspace_root().map(Path::to_path_buf))
-    else {
-        // β: snapshot the base registry rather than re-Arc'ing the shared
-        // pointer so callers can install a per-session
-        // `BackgroundResultSender` without contending for `Arc::get_mut`.
-        // `snapshot_excluding(&[])` is the existing primitive for owning a
-        // copy with shared `Arc<dyn Tool>` instances.
-        let mut snapshot = base_tools.snapshot_excluding(&[]);
-        snapshot.rebind_plugin_work_dirs(&plugin_default_dir);
-        return Ok((snapshot, None));
-    };
-
-    session_filesystem_profile_for_workspace(base_tools.as_ref(), &workspace_root)
-        .map_err(|error| error.message)?;
-    // M9 review fix (HIGH #1): inherit the effective sandbox config from
-    // `base_agent` so per-session shell tools keep the running server's
-    // sandbox policy (mode, network, read-allow paths, profile) instead of
-    // silently falling back to `SandboxConfig::default()` which disables
-    // network and overrides read paths — that fallback was the root cause
-    // of "backend cannot install npm" reports on AppUi sessions.
-    // Falls back to `SandboxConfig::default()` only when the agent was built
-    // without recording its sandbox config (legacy/test paths).
-    let sandbox_config = base_agent
-        .sandbox_config()
-        .unwrap_or_else(octos_agent::SandboxConfig::default);
-    let sandbox = octos_agent::sandbox::create_sandbox(&sandbox_config);
-    let mut rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
-    // β: mirror gateway's `session_actor.rs:2116` — rebind plugin tool
-    // work_dirs so skills materialise files INSIDE a directory that
-    // round-trips through `/api/files/...`.
-    //
-    //  • Tier-1 (`session_workspaces().get(session_id).is_some()`):
-    //    client-sent cwd. Use it directly — that's the user's explicit
-    //    request and where they expect outputs to land.
-    //  • Tier-2 (operator set `appui.default_session_cwd` and the
-    //    workspace_root we resolved matches it): respect the operator's
-    //    choice and rebind plugins to that dir, matching the existing
-    //    shell/file-tool cwd binding.
-    //  • Tier-3 (boot fallback from `with_builtins_and_sandbox(serve_cwd)`,
-    //    which under launchd is `~` outside the profile root): fall back
-    //    to `<data_dir>/skill-output` so spawn_only artefacts resolve
-    //    through the file API instead of 403'ing.
-    let plugin_target = if session_workspaces().get(session_id).is_some()
-        || matches_operator_default(operator_default_cwd, &workspace_root)
-    {
-        &workspace_root
-    } else {
-        &plugin_default_dir
-    };
-    rebound.rebind_plugin_work_dirs(plugin_target);
-
-    Ok((rebound, Some(workspace_root)))
-}
-
-/// Returns true when `workspace_root` resolves to the same canonical path
-/// as the operator-configured `appui.default_session_cwd`. We canonicalise
-/// both sides so a config that uses a symlinked or relative path still
-/// matches the registry's recorded root.
-fn matches_operator_default(operator_default: Option<&Path>, workspace_root: &Path) -> bool {
-    let Some(default) = operator_default else {
-        return false;
-    };
-    let canonical_default =
-        std::fs::canonicalize(default).unwrap_or_else(|_| default.to_path_buf());
-    let canonical_root =
-        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
-    canonical_default == canonical_root
-}
-
-fn session_system_prompt(base_agent: &Agent, workspace_root: Option<&Path>) -> String {
-    let mut prompt = base_agent.system_prompt_snapshot();
+/// Append the per-session workspace-root hint to the system prompt.
+///
+/// M11-E: the base prompt comes from either the SessionRuntime's agent
+/// or the legacy `state.agent`, so this helper takes the resolved
+/// `String` rather than an `Agent` reference. The text appended is
+/// identical to the pre-M11-E `session_system_prompt` wording — the
+/// SPA's reducer matches on it heuristically and must not change.
+fn append_workspace_root_hint(mut prompt: String, workspace_root: Option<&Path>) -> String {
     if let Some(workspace_root) = workspace_root {
         prompt.push_str("\n\nAppUi session workspace root: ");
         prompt.push_str(&workspace_root.to_string_lossy());
@@ -2365,16 +2395,6 @@ fn session_system_prompt(base_agent: &Agent, workspace_root: Option<&Path>) -> S
         );
     }
     prompt
-}
-
-fn path_is_under_root(path: &Path, root: &Path) -> bool {
-    let path = canonical_or_original(path);
-    let root = canonical_or_original(root);
-    path == root || path.starts_with(root)
-}
-
-fn canonical_or_original(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 const MAX_PANE_WORKSPACE_ENTRIES: usize = 200;
@@ -4695,26 +4715,124 @@ async fn run_standalone_turn(
         return;
     }
 
-    let (base_agent, sessions) = match validate_runtime(&state) {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Errored,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                Some(("runtime_unavailable", error.as_str())),
-            )
-            .await;
-            // FIX-06: a turn that ends — for any reason — must drop its
-            // `approve_for_turn` policy entries so a subsequent turn can't
-            // reuse them.
-            contracts.scopes.evict_turn(&session_id, &turn_id);
-            return;
+    // M11-E: resolve the per-session view. When a `ProfileRuntime` is
+    // registered for the routed profile, the cache materializes the
+    // `SessionRuntime` (which writes the per-session
+    // `.octos-workspace.toml`, binds the tool registry to the per-session
+    // workspace, and shares the spawn-task supervisor with the agent).
+    // When no profile is registered (legacy single-agent serve / setup
+    // wizard), we fall back to `state.agent` exactly as `chat_sync` does.
+    let active_profile_id = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or(routed_profile_id);
+    let session_runtime: Option<Arc<crate::runtime::SessionRuntime>> = {
+        let profile = resolve_session_profile_runtime(&state, active_profile_id.as_deref());
+        if let Some(profile) = profile {
+            // Read-through view: when `session.open` previously stashed a
+            // client-supplied cwd in `session_workspaces()`, use that as
+            // the `workspace_hint`. Otherwise the bootstrap default
+            // (`<profile_data_dir>/users/.../workspace`) wins.
+            let hint = session_workspaces().get(&session_id);
+            match state
+                .session_cache
+                .get_or_init(&profile, session_id.clone(), hint)
+                .await
+            {
+                Ok(rt) => Some(rt),
+                Err(error) => {
+                    try_emit_terminal(
+                        &turn_state,
+                        TerminalReason::Errored,
+                        &ws,
+                        &ledger,
+                        &session_id,
+                        &turn_id,
+                        Some(("runtime_unavailable", &error.to_string())),
+                    )
+                    .await;
+                    contracts.scopes.evict_turn(&session_id, &turn_id);
+                    return;
+                }
+            }
+        } else {
+            None
         }
     };
+
+    // The legacy `state.agent` / `state.sessions` pair is required only
+    // when there is no registered profile (single-agent serve). When a
+    // SessionRuntime is in play we route through it instead — including
+    // the per-session `SessionManager` (`session_runtime.sessions`),
+    // which is where the per-profile JSONL store lives.
+    let legacy_runtime = if session_runtime.is_some() {
+        None
+    } else {
+        match validate_runtime(&state) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("runtime_unavailable", error.as_str())),
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        }
+    };
+
+    // Source the per-session primitives from either the SessionRuntime
+    // (preferred) or the legacy agent. The agent build below sources its
+    // LLM, memory, sandbox, and system prompt from these locals.
+    //
+    // `tool_registry` is an OWNED `ToolRegistry` we mutate per-turn
+    // (`set_background_result_sender`, `register(send_file_tool)`,
+    // `supervisor().set_on_change`). For the SessionRuntime path we
+    // snapshot from the shared `Arc<ToolRegistry>` so per-turn mutation
+    // does not race with the cached SessionRuntime; for the legacy path
+    // we snapshot from `base_agent.tool_registry()` as-is — no cwd
+    // rebind, matching `chat_sync`'s legacy fallback.
+    let sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>;
+    let mut tool_registry: octos_agent::ToolRegistry;
+    let workspace_root: Option<PathBuf>;
+    let llm_provider: Arc<dyn octos_llm::LlmProvider>;
+    let memory_store: Arc<octos_memory::EpisodeStore>;
+    let agent_config: octos_agent::AgentConfig;
+    let system_prompt_base: String;
+    if let Some(rt) = &session_runtime {
+        sessions = rt.sessions.clone();
+        tool_registry = rt.tools.snapshot_excluding(&[]);
+        workspace_root = Some(rt.workspace_root.clone());
+        llm_provider = rt.profile.llm.clone();
+        memory_store = rt.profile.memory.clone();
+        agent_config = rt.agent.agent_config();
+        system_prompt_base = rt.agent.system_prompt_snapshot();
+    } else {
+        let (base_agent, legacy_sessions) =
+            legacy_runtime.as_ref().expect("legacy runtime present");
+        sessions = legacy_sessions.clone();
+        // Legacy fallback: no cwd rebind. The pre-M11-E
+        // `session_tool_registry` rebound the workspace from the global
+        // `session_workspaces()` map; M11-E moves that rebind into
+        // `SessionRuntime::bootstrap`. Single-agent serve installations
+        // see the daemon-cwd-bound registry unchanged, mirroring
+        // `chat_sync`'s legacy `validate_chat_request` fallback.
+        tool_registry = base_agent.tool_registry().snapshot_excluding(&[]);
+        workspace_root = base_agent
+            .tool_registry()
+            .workspace_root()
+            .map(Path::to_path_buf);
+        llm_provider = base_agent.llm_provider();
+        memory_store = base_agent.memory_store();
+        agent_config = base_agent.agent_config();
+        system_prompt_base = base_agent.system_prompt_snapshot();
+    }
 
     let (history, runtime_data_dir): (Vec<Message>, PathBuf) = {
         let mut sessions = sessions.lock().await;
@@ -4737,51 +4855,28 @@ async fn run_standalone_turn(
     //   2. `routed_profile_id` — derived from the connection's `Host`
     //      header during WS handshake. Hosted admin-token requests land
     //      here; the SPA at `dspfac.crew.ominix.io` matches.
+    //   3. The registered `ProfileRuntime`'s `data_dir` when M11-E
+    //      materialized the SessionRuntime.
     // Falls back to the server-wide data dir for local sessions / dev.
-    let active_profile_id = session_id
-        .profile_id()
-        .map(ToOwned::to_owned)
-        .or(routed_profile_id);
-    let plugin_root_dir = active_profile_id
-        .as_deref()
-        .and_then(|profile_id| {
-            state
-                .profile_store
-                .as_ref()
-                .and_then(|store| store.get(profile_id).ok().flatten())
-                .map(|profile| {
-                    state
-                        .profile_store
-                        .as_ref()
-                        .map(|store| store.resolve_data_dir(&profile))
-                        .unwrap_or_else(|| runtime_data_dir.clone())
-                })
+    let plugin_root_dir = session_runtime
+        .as_ref()
+        .map(|rt| rt.profile.data_dir.clone())
+        .or_else(|| {
+            active_profile_id.as_deref().and_then(|profile_id| {
+                state
+                    .profile_store
+                    .as_ref()
+                    .and_then(|store| store.get(profile_id).ok().flatten())
+                    .map(|profile| {
+                        state
+                            .profile_store
+                            .as_ref()
+                            .map(|store| store.resolve_data_dir(&profile))
+                            .unwrap_or_else(|| runtime_data_dir.clone())
+                    })
+            })
         })
         .unwrap_or_else(|| runtime_data_dir.clone());
-
-    let (mut tool_registry, workspace_root) = match session_tool_registry(
-        base_agent.as_ref(),
-        &session_id,
-        &plugin_root_dir,
-        state.appui_default_session_cwd.as_deref(),
-    ) {
-        Ok(registry) => registry,
-        Err(error) => {
-            // FIX-03 pattern: terminal emission + state transition is atomic.
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Errored,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                Some(("cwd_binding_failed", error.as_str())),
-            )
-            .await;
-            contracts.scopes.evict_turn(&session_id, &turn_id);
-            return;
-        }
-    };
 
     // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
     // completions and explicit `send_file` calls persist as assistant
@@ -5141,15 +5236,19 @@ async fn run_standalone_turn(
         forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
     });
     drop(progress_tx);
+    // M11-E: the agent is built per-turn (so per-turn callbacks layer in
+    // without mutating shared session state), but its LLM, memory,
+    // sandbox, and base system prompt come from the SessionRuntime
+    // (preferred) or the legacy `state.agent`.
     let request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
-        base_agent.llm_provider(),
+        llm_provider.clone(),
         Arc::new(tool_registry),
-        base_agent.memory_store(),
+        memory_store.clone(),
     )
-    .with_config(base_agent.agent_config())
-    .with_system_prompt(session_system_prompt(
-        base_agent.as_ref(),
+    .with_config(agent_config.clone())
+    .with_system_prompt(append_workspace_root_hint(
+        system_prompt_base.clone(),
         workspace_root.as_deref(),
     ))
     .with_reporter(reporter);
@@ -8070,158 +8169,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_workspace_authorizes_approved_subdir() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).expect("project dir");
-        let tools = octos_agent::ToolRegistry::with_builtins(temp.path());
+    // M11-E: `session_filesystem_profile_for_workspace` was deleted
+    // alongside `session_tool_registry`. Its server-wide containment
+    // semantics (cwd must live under the legacy agent's workspace_root)
+    // are obsolete in the multi-profile world — coding-agent UIs
+    // legitimately point sessions at arbitrary repos OUTSIDE the
+    // profile data_dir. The replacement gate is the path-safety check
+    // in `validate_session_workspace_path_safety` + the bootstrap-time
+    // re-check inside `SessionRuntime::bootstrap`. The
+    // `session_workspace_authorizes_approved_subdir` /
+    // `session_workspace_rejects_outside_root` tests that locked the
+    // old containment behavior in place are removed with the helper;
+    // the new path-safety check is covered by the M11-E acceptance
+    // tests below + the bootstrap-side coverage in
+    // `crate::runtime::session::tests`.
 
-        session_filesystem_profile_for_workspace(&tools, &project).expect("subdir is approved");
-    }
-
-    #[test]
-    fn session_workspace_rejects_outside_root() {
-        let allowed = tempfile::tempdir().expect("allowed dir");
-        let outside = tempfile::tempdir().expect("outside dir");
-        let tools = octos_agent::ToolRegistry::with_builtins(allowed.path());
-
-        let error = session_filesystem_profile_for_workspace(&tools, outside.path())
-            .expect_err("outside workspace should be rejected");
-
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("kind")),
-            Some(&json!("cwd_outside_workspace_root"))
-        );
-    }
-
-    /// Minimal stub LLM provider for tests that build an `Agent` but never
-    /// actually call out to a model. `session_tool_registry` only inspects
-    /// the agent's tool registry and sandbox config — it never drives the
-    /// LLM — so a `chat` panic guard is enough.
-    struct StubLlm;
-
-    #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for StubLlm {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> eyre::Result<octos_llm::ChatResponse> {
-            unreachable!("StubLlm should not be invoked by session_tool_registry tests")
-        }
-
-        fn context_window(&self) -> u32 {
-            128_000
-        }
-
-        fn model_id(&self) -> &str {
-            "stub"
-        }
-
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-    }
-
-    /// Tier-2 of the AppUi `session_tool_registry` fallback chain: when a
-    /// session has no entry in `session_workspaces()` and the operator
-    /// configured `appui.default_session_cwd`, the API agent's recorded
-    /// `workspace_root` is used. This locks down the behavior added by
-    /// `Agent::with_workspace_root` + `serve.rs` wire-up.
-    #[tokio::test]
-    async fn session_tool_registry_uses_agent_workspace_root_as_tier2_fallback() {
-        let workspace = tempfile::tempdir().expect("workspace dir");
-        let memory_dir = tempfile::tempdir().expect("memory dir");
-        let memory = Arc::new(
-            octos_memory::EpisodeStore::open(memory_dir.path())
-                .await
-                .expect("open memory"),
-        );
-        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(StubLlm);
-        let tools = octos_agent::ToolRegistry::with_builtins(workspace.path());
-
-        let agent = octos_agent::Agent::new(AgentId::new("api-test"), llm, tools, memory)
-            .with_workspace_root(workspace.path().to_path_buf());
-
-        // Use a unique session_id so we don't collide with other tests on
-        // the process-global `session_workspaces()` store.
-        let session_id = SessionKey("local:tier2-fallback-test".into());
-
-        let runtime_data_dir = tempfile::tempdir().expect("runtime data dir");
-        let (registry, root) = session_tool_registry(
-            &agent,
-            &session_id,
-            runtime_data_dir.path(),
-            // Mirror the operator-default cwd so the Tier-2 branch
-            // recognises the workspace_root as user-meaningful and binds
-            // plugin work_dirs to it rather than to `skill-output`.
-            Some(workspace.path()),
-        )
-        .expect("session_tool_registry");
-
-        let root = root.expect("Tier-2 must populate workspace_root");
-        assert_eq!(
-            std::fs::canonicalize(&root).expect("canonicalize"),
-            std::fs::canonicalize(workspace.path()).expect("canonicalize"),
-            "Tier-2 fallback should pick up the agent's recorded workspace_root"
-        );
-        assert!(
-            registry.workspace_root().is_some(),
-            "rebound registry must record the workspace_root"
-        );
-    }
-
-    /// Tier-1 (capability-gated client-sent cwd via `session_workspaces`)
-    /// MUST take precedence over Tier-2 (operator default). This prevents
-    /// the operator default from clobbering octos-tui's per-session picker.
-    ///
-    /// `session_filesystem_profile_for_workspace` requires the requested
-    /// cwd to live under `tools.workspace_root()`. Since
-    /// `with_workspace_root` overwrites the registry's recorded root, we
-    /// anchor the agent at the operator-default folder (Tier-2) and put
-    /// the client-sent cwd as a subdir of it. If Tier-1 wins, the
-    /// resulting workspace_root is the subdir, not the parent.
-    #[tokio::test]
-    async fn session_tool_registry_tier1_wins_over_tier2_default() {
-        let tier2_default = tempfile::tempdir().expect("tier2 default dir");
-        let tier1_subdir = tier2_default.path().join("tier1-client-cwd");
-        std::fs::create_dir_all(&tier1_subdir).expect("tier1 subdir");
-
-        let memory_dir = tempfile::tempdir().expect("memory dir");
-        let memory = Arc::new(
-            octos_memory::EpisodeStore::open(memory_dir.path())
-                .await
-                .expect("open memory"),
-        );
-        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(StubLlm);
-        let tools = octos_agent::ToolRegistry::with_builtins(tier2_default.path());
-
-        let agent = octos_agent::Agent::new(AgentId::new("api-test"), llm, tools, memory)
-            // Tier-2: operator-configured default cwd.
-            .with_workspace_root(tier2_default.path().to_path_buf());
-
-        // Tier-1: client-sent cwd recorded in `session_workspaces`.
-        let session_id = SessionKey("local:tier1-wins-test".into());
-        session_workspaces().set(session_id.clone(), tier1_subdir.clone());
-
-        let runtime_data_dir = tempfile::tempdir().expect("runtime data dir");
-        let (_registry, root) = session_tool_registry(
-            &agent,
-            &session_id,
-            runtime_data_dir.path(),
-            Some(tier2_default.path()),
-        )
-        .expect("session_tool_registry");
-
-        let root = root.expect("workspace_root must be set");
-        assert_eq!(
-            std::fs::canonicalize(&root).expect("canonicalize"),
-            std::fs::canonicalize(&tier1_subdir).expect("canonicalize"),
-            "Tier-1 (client-sent cwd) must win over Tier-2 (operator default)"
-        );
-    }
+    // M11-E: `session_tool_registry` and its Tier-1 / Tier-2 fallback
+    // helpers were deleted. The same Tier-1 invariant ("client-supplied
+    // cwd wins over the bootstrap default") now lives on
+    // `SessionRuntime::bootstrap`, exercised by
+    // `crate::runtime::session::tests::bootstrap_with_two_hints_yields_distinct_workspaces`
+    // and the M11-E acceptance tests
+    // `appui_session_with_custom_cwd_reads_supplied_workspace` +
+    // `two_appui_sessions_on_same_profile_with_different_cwds_isolated`
+    // below. Tier-2 (operator-default `appui.default_session_cwd`) is
+    // a known follow-up: the new `SessionRuntime::bootstrap` resolves
+    // workspace_hint at the per-session layer and does not yet honor a
+    // profile-scope operator default. Tracked alongside the M11
+    // shared-`validate_session_workspace_allowed`-helper TODO in
+    // `crate::runtime::session::validate_workspace_hint`.
 
     #[test]
     fn pane_snapshot_prefers_approved_session_workspace_root() {
@@ -11911,5 +11887,626 @@ mod tests {
         );
 
         abort_live_forwarders(&forwarders).await;
+    }
+
+    // ----- M11-E: UI Protocol per-session workspace wiring -----------------
+
+    /// Stub `LlmProvider` for M11-E tests. The acceptance scenarios drive
+    /// `open_session_result` + the session cache wiring — they never call
+    /// out to a real model. Mirrors `handlers::make_m11d_profile`'s
+    /// `EchoLlm` but does not bother encoding a reply since these tests
+    /// only inspect the per-session `ToolRegistry` and `workspace_root`.
+    struct M11EStubLlm;
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for M11EStubLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("M11EStubLlm should not be invoked from M11-E acceptance tests")
+        }
+
+        fn model_id(&self) -> &str {
+            "m11e-stub"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    async fn make_m11e_profile(
+        profile_id: &str,
+        data_dir: &std::path::Path,
+    ) -> Arc<crate::runtime::ProfileRuntime> {
+        std::fs::create_dir_all(data_dir).expect("profile data dir");
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(data_dir)
+                .await
+                .expect("episode store"),
+        );
+        let memory_store = Arc::new(
+            octos_memory::MemoryStore::open(data_dir)
+                .await
+                .expect("memory store"),
+        );
+        let tool_config = Arc::new(
+            octos_agent::ToolConfigStore::open(data_dir)
+                .await
+                .expect("tool config store"),
+        );
+        let sandbox = octos_agent::SandboxConfig::default();
+        let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            data_dir,
+            octos_agent::create_sandbox(&sandbox),
+        );
+        Arc::new(crate::runtime::ProfileRuntime {
+            profile_id: profile_id.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            llm: Arc::new(M11EStubLlm),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "m11e-stub".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            memory,
+            memory_store,
+            tool_config,
+        })
+    }
+
+    /// AppState for M11-E tests: legacy `agent`/`sessions` plumbing AND a
+    /// registered `ProfileRuntime`, so `validate_session_workspace_allowed`
+    /// has a runtime to authorize against AND `open_session_result` can
+    /// resolve the profile when threading the workspace hint into
+    /// `SessionRuntimeCache::get_or_init`.
+    async fn state_with_profile(
+        data_dir: &std::path::Path,
+        profile_id: &str,
+    ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+        std::fs::create_dir_all(data_dir).expect("data dir");
+
+        // Legacy server-wide agent — its `tool_registry().workspace_root()`
+        // is the gate `validate_session_workspace_allowed` checks. Pinning
+        // it to `data_dir` keeps the validation accepting any subdir
+        // (the M11-E acceptance tests pass cwds that are subdirs of
+        // `data_dir`).
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(data_dir)
+                .await
+                .expect("episode store"),
+        );
+        let llm_legacy: Arc<dyn octos_llm::LlmProvider> = Arc::new(M11EStubLlm);
+        let base_tools = octos_agent::ToolRegistry::with_builtins(data_dir);
+        let agent = Arc::new(
+            octos_agent::Agent::new(AgentId::new("api-m11e"), llm_legacy, base_tools, memory)
+                .with_workspace_root(data_dir.to_path_buf()),
+        );
+
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir).expect("session manager"),
+        ));
+
+        let profile_data_dir = data_dir.join("profiles").join(profile_id).join("data");
+        let profile_runtime = make_m11e_profile(profile_id, &profile_data_dir).await;
+
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.to_string(), profile_runtime.clone());
+
+        let state = Arc::new(AppState {
+            profiles,
+            agent: Some(agent),
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        (state, profile_runtime)
+    }
+
+    /// M11-E acceptance §1: a session opened with a custom `cwd` materializes
+    /// a `SessionRuntime` whose `workspace_root` IS that cwd, and the
+    /// session's `ReadFileTool` reads files from that cwd. This is the
+    /// "supplied workspace, not the daemon cwd" invariant from the issue
+    /// — the legacy `clone_session_tools` path could only honor it
+    /// indirectly through the global `session_workspaces()` map.
+    #[tokio::test]
+    async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile(temp.path(), "m11e-custom-cwd").await;
+
+        // Pre-seed the supplied workspace with a sentinel file the session
+        // is expected to read back.
+        let supplied_cwd = temp.path().join("supplied-workspace");
+        std::fs::create_dir_all(&supplied_cwd).expect("create supplied cwd");
+        let sentinel = supplied_cwd.join("hello.txt");
+        std::fs::write(&sentinel, "session-A reads its own workspace\n").expect("seed sentinel");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        let session_id = SessionKey::with_profile("m11e-custom-cwd", "api", "custom-cwd-session");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-custom-cwd"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11e-custom-cwd".into()),
+                cwd: Some(supplied_cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session/open with supplied cwd must succeed");
+
+        // The wire response carries the canonical workspace_root so dashboard
+        // clients render the right cwd on reconnect.
+        let opened_root = outcome
+            .result
+            .opened
+            .workspace_root
+            .as_ref()
+            .expect("opened workspace_root populated");
+        assert_eq!(
+            std::fs::canonicalize(opened_root).expect("canonicalize opened root"),
+            std::fs::canonicalize(&supplied_cwd).expect("canonicalize supplied cwd"),
+        );
+
+        // The session cache must hold a SessionRuntime materialized from
+        // THIS supplied cwd — that's the wiring the issue tracks.
+        let session_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_id.clone(), None)
+            .await
+            .expect("cached session runtime");
+        assert_eq!(
+            std::fs::canonicalize(&session_runtime.workspace_root).expect("canonicalize root"),
+            std::fs::canonicalize(&supplied_cwd).expect("canonicalize supplied cwd"),
+            "SessionRuntime.workspace_root must be the client-supplied cwd"
+        );
+
+        // The session's read_file tool sees the supplied workspace, not
+        // the daemon cwd / the profile data_dir.
+        let result = session_runtime
+            .tools
+            .execute("read_file", &json!({ "path": "hello.txt" }))
+            .await
+            .expect("read_file via session tools");
+        assert!(result.success, "read_file must succeed: {}", result.output);
+        assert!(
+            result.output.contains("session-A reads its own workspace"),
+            "expected session A's sentinel content, got: {}",
+            result.output
+        );
+    }
+
+    /// M11-E acceptance §2: two AppUI sessions opened on the SAME profile
+    /// with DIFFERENT cwds must not see each other's files. This is the
+    /// multi-tenant scope invariant codex flagged on PR #868 — pre-M11
+    /// the per-session view was cloned off a single `base_agent`-bound
+    /// registry, leaving the workspace_root vulnerable to cross-session
+    /// leakage if any caller forgot to rebind. With `SessionRuntime.tools`
+    /// the only path, two sessions hold two distinct `Arc<ToolRegistry>`
+    /// instances each pinned at bootstrap time.
+    #[tokio::test]
+    async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile(temp.path(), "m11e-multi-cwd").await;
+
+        let cwd_a = temp.path().join("session-a");
+        let cwd_b = temp.path().join("session-b");
+        std::fs::create_dir_all(&cwd_a).expect("create cwd-a");
+        std::fs::create_dir_all(&cwd_b).expect("create cwd-b");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        let session_a = SessionKey::with_profile("m11e-multi-cwd", "api", "session-a");
+        let session_b = SessionKey::with_profile("m11e-multi-cwd", "api", "session-b");
+
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        // Open session A with cwd_a.
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-multi-cwd"),
+            features,
+            SessionOpenParams {
+                session_id: session_a.clone(),
+                profile_id: Some("m11e-multi-cwd".into()),
+                cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session A open");
+
+        // Open session B with cwd_b.
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-multi-cwd"),
+            features,
+            SessionOpenParams {
+                session_id: session_b.clone(),
+                profile_id: Some("m11e-multi-cwd".into()),
+                cwd: Some(cwd_b.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session B open");
+
+        let rt_a = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_a.clone(), None)
+            .await
+            .expect("session A runtime");
+        let rt_b = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_b.clone(), None)
+            .await
+            .expect("session B runtime");
+
+        // Two sessions on the same profile must hold distinct
+        // `Arc<ToolRegistry>` instances (codex multi-tenant scope note).
+        assert!(
+            !Arc::ptr_eq(&rt_a.tools, &rt_b.tools),
+            "per-session tool registries must be distinct Arcs"
+        );
+        assert_ne!(rt_a.workspace_root, rt_b.workspace_root);
+
+        // Session A writes a.txt under cwd_a; session B writes b.txt under cwd_b.
+        rt_a.tools
+            .execute(
+                "write_file",
+                &json!({ "path": "a.txt", "content": "from session A\n" }),
+            )
+            .await
+            .expect("write_file under session A's workspace");
+        rt_b.tools
+            .execute(
+                "write_file",
+                &json!({ "path": "b.txt", "content": "from session B\n" }),
+            )
+            .await
+            .expect("write_file under session B's workspace");
+
+        // Cross-read MUST fail: session B cannot see a.txt; session A
+        // cannot see b.txt. Per-session isolation enforced by the
+        // workspace-bound registries built at SessionRuntime::bootstrap.
+        let a_reads_a = rt_a
+            .tools
+            .execute("read_file", &json!({ "path": "a.txt" }))
+            .await
+            .expect("session A reads its own a.txt");
+        assert!(a_reads_a.success, "{}", a_reads_a.output);
+        assert!(a_reads_a.output.contains("from session A"));
+
+        let b_reads_b = rt_b
+            .tools
+            .execute("read_file", &json!({ "path": "b.txt" }))
+            .await
+            .expect("session B reads its own b.txt");
+        assert!(b_reads_b.success, "{}", b_reads_b.output);
+        assert!(b_reads_b.output.contains("from session B"));
+
+        // Cross-read MUST fail or return error output: session A cannot
+        // see b.txt; session B cannot see a.txt. Per-session isolation
+        // enforced by the workspace-bound registries built at
+        // SessionRuntime::bootstrap.
+        let a_cross = rt_a
+            .tools
+            .execute("read_file", &json!({ "path": "b.txt" }))
+            .await
+            .expect("read_file always returns a ToolResult");
+        let a_cross_lower = a_cross.output.to_lowercase();
+        assert!(
+            !a_cross.success
+                || a_cross_lower.contains("not found")
+                || a_cross_lower.contains("no such")
+                || a_cross_lower.contains("error"),
+            "session A must NOT be able to read session B's b.txt; got: success={} output={}",
+            a_cross.success,
+            a_cross.output
+        );
+
+        let b_cross = rt_b
+            .tools
+            .execute("read_file", &json!({ "path": "a.txt" }))
+            .await
+            .expect("read_file always returns a ToolResult");
+        let b_cross_lower = b_cross.output.to_lowercase();
+        assert!(
+            !b_cross.success
+                || b_cross_lower.contains("not found")
+                || b_cross_lower.contains("no such")
+                || b_cross_lower.contains("error"),
+            "session B must NOT be able to read session A's a.txt; got: success={} output={}",
+            b_cross.success,
+            b_cross.output
+        );
+
+        // Filesystem invariant: a.txt physically lives under cwd_a, b.txt
+        // physically lives under cwd_b. Catches a regression where the
+        // per-session tool somehow wrote to the legacy
+        // `session_workspaces()`-resolved path instead of the workspace
+        // the SessionRuntime was bootstrapped against.
+        assert!(cwd_a.join("a.txt").exists());
+        assert!(cwd_b.join("b.txt").exists());
+        assert!(!cwd_a.join("b.txt").exists());
+        assert!(!cwd_b.join("a.txt").exists());
+    }
+
+    /// M11-E codex round-1 MEDIUM: a second `session/open` for the same
+    /// session_id but a DIFFERENT cwd must NOT silently rebind a
+    /// running session's workspace. The cache's `get_or_init` is
+    /// single-flight per key; a same-key hit returns the cached
+    /// `Arc<SessionRuntime>` and ignores the new `workspace_hint`.
+    /// The `SessionOpened.workspace_root` reply MUST reflect the
+    /// CACHED runtime (not the just-requested cwd) — otherwise the
+    /// SPA renders one cwd while the next turn uses another, which is
+    /// exactly the wire/state divergence codex flagged.
+    #[tokio::test]
+    async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, _profile_runtime) =
+            state_with_profile(temp.path(), "m11e-rebind-attempt").await;
+
+        let first_cwd = temp.path().join("first");
+        let second_cwd = temp.path().join("second");
+        std::fs::create_dir_all(&first_cwd).expect("create first");
+        std::fs::create_dir_all(&second_cwd).expect("create second");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let session_id = SessionKey::with_profile("m11e-rebind-attempt", "api", "single-key");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let first_open = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-rebind-attempt"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11e-rebind-attempt".into()),
+                cwd: Some(first_cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("first open");
+
+        let second_open = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-rebind-attempt"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11e-rebind-attempt".into()),
+                // Different cwd — must NOT take effect; cache is sticky.
+                cwd: Some(second_cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("second open");
+
+        let first_root = first_open
+            .result
+            .opened
+            .workspace_root
+            .expect("first workspace_root populated");
+        let second_root = second_open
+            .result
+            .opened
+            .workspace_root
+            .expect("second workspace_root populated");
+        assert_eq!(
+            std::fs::canonicalize(&first_root).expect("canonicalize first"),
+            std::fs::canonicalize(&second_root).expect("canonicalize second"),
+            "second open of the same session must report the cached \
+             workspace_root, not the just-requested cwd",
+        );
+        assert_eq!(
+            std::fs::canonicalize(&second_root).expect("canonicalize"),
+            std::fs::canonicalize(&first_cwd).expect("canonicalize"),
+            "cached workspace_root must equal the FIRST open's cwd",
+        );
+    }
+
+    /// M11-E codex round-3 HIGH: when `state.profiles` is non-empty but
+    /// the ROUTED profile is not in it, `validate_session_workspace_allowed`
+    /// must still reject the cwd with `cwd_runtime_unavailable`.
+    /// Otherwise the wire reply would advertise the requested
+    /// workspace_root while the turn dispatcher's legacy fallback uses
+    /// `base_agent`'s root — exactly the divergence the prior round
+    /// closed for the empty-profiles case. The fix routes the active
+    /// profile id into the validator so it can resolve the SPECIFIC
+    /// runtime rather than checking the map non-empty.
+    #[tokio::test]
+    async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, _profile_runtime) = state_with_profile(temp.path(), "m11e-registered").await;
+
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        // Build a SessionKey under a profile id that is NOT in
+        // `state.profiles` so the active profile resolution misses.
+        let session_id = SessionKey::with_profile("m11e-not-registered", "api", "x");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let error = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            // No connection identity so the routed id falls to the
+            // session-id-embedded "m11e-not-registered".
+            None,
+            features,
+            SessionOpenParams {
+                session_id,
+                profile_id: None,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect_err("cwd for unregistered profile must reject");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("cwd_runtime_unavailable")),
+            "unregistered profile must surface cwd_runtime_unavailable; \
+             got error data {:?}",
+            error.data,
+        );
+    }
+
+    /// M11-E codex round-1 HIGH (filed against octos-agent, not blocking
+    /// M11-E): symlink-based directory escape is an octos-agent
+    /// `resolve_path` + `read_no_follow`/`write_no_follow` property,
+    /// not a UI-Protocol property. M11-E binds each session's tools to
+    /// its own workspace_root via `SessionRuntime::bootstrap`; the
+    /// remaining gap is that the tool layer follows directory
+    /// symlinks (only the final path component is checked).
+    ///
+    /// This test pins the CURRENT octos-agent behavior so a future
+    /// `read_no_follow`/`write_no_follow` hardening flips it green
+    /// automatically. We document the gap in the PR body and propose
+    /// it as a follow-up octos-agent issue (NOT a downstream M11
+    /// ticket — the tool layer is the right home).
+    ///
+    /// Marking `#[ignore]` rather than failing the suite: the gap is
+    /// pre-existing, M11-E neither introduces nor fixes it, and a
+    /// failing test here would block landing M11-E for a problem
+    /// that lives in a different crate.
+    #[tokio::test]
+    #[ignore = "octos-agent gap: directory symlinks escape per-session workspace; tracked as follow-up issue, NOT blocking M11-E"]
+    async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile(temp.path(), "m11e-symlink").await;
+
+        let cwd_a = temp.path().join("session-a");
+        let cwd_b = temp.path().join("session-b");
+        std::fs::create_dir_all(&cwd_a).expect("create cwd-a");
+        std::fs::create_dir_all(&cwd_b).expect("create cwd-b");
+        std::fs::write(cwd_b.join("secret.txt"), "B's private data\n").expect("seed b");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let session_a = SessionKey::with_profile("m11e-symlink", "api", "session-a");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-symlink"),
+            features,
+            SessionOpenParams {
+                session_id: session_a.clone(),
+                profile_id: Some("m11e-symlink".into()),
+                cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session A open");
+
+        // Plant a directory symlink inside session A's workspace
+        // pointing at session B's workspace. The path-normalize check
+        // in `resolve_path` and the O_NOFOLLOW guard in
+        // `read_no_follow` both pass — only the FINAL path component is
+        // checked for the symlink-rejection invariant.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&cwd_b, cwd_a.join("escape")).expect("plant symlink");
+        }
+        #[cfg(not(unix))]
+        {
+            // The gap is Unix-specific (Windows tool fallback uses a
+            // separate symlink-check pattern). Skip the planting on
+            // non-Unix.
+            return;
+        }
+
+        let rt_a = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_a.clone(), None)
+            .await
+            .expect("cached session A runtime");
+
+        let result = rt_a
+            .tools
+            .execute("read_file", &json!({ "path": "escape/secret.txt" }))
+            .await
+            .expect("read_file returns a ToolResult");
+
+        // CURRENT BEHAVIOR (M11-E lock-in): octos-agent follows the
+        // parent directory symlink and reads B's file. The
+        // `#[ignore]` keeps this from failing CI while we file the
+        // octos-agent issue; flip to `assert!(!result.success)` when
+        // the tool-layer fix lands.
+        assert!(
+            result.success && result.output.contains("B's private data"),
+            "octos-agent should currently follow the directory symlink \
+             (M11-E gap documentation); got success={} output={}",
+            result.success,
+            result.output
+        );
     }
 }
