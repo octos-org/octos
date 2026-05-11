@@ -493,6 +493,50 @@ pub fn write_workspace_policy(project_root: &Path, policy: &WorkspacePolicy) -> 
     Ok(())
 }
 
+/// Variant of [`write_workspace_policy`] that fails closed when a
+/// policy file is already present at `project_root`.
+///
+/// Implemented via a single `open(O_CREAT|O_EXCL)`-equivalent syscall
+/// (`std::fs::OpenOptions::write(true).create_new(true)`) so two
+/// concurrent callers — or a caller racing an operator hand-edit —
+/// can never overwrite an existing `.octos-workspace.toml`.
+/// `AlreadyExists` is treated as success, matching the "bootstrap
+/// only if absent" idempotency contract M11-C relies on for the
+/// per-session workspace policy.
+///
+/// This is intentionally a separate function from
+/// [`write_workspace_policy`] so the legacy caller (which expects
+/// truncate-on-write semantics for explicit policy edits) is
+/// unchanged.
+pub fn write_workspace_policy_if_absent(
+    project_root: &Path,
+    policy: &WorkspacePolicy,
+) -> Result<()> {
+    use std::io::Write;
+
+    std::fs::create_dir_all(project_root)
+        .wrap_err_with(|| format!("create project dir failed: {}", project_root.display()))?;
+    let path = workspace_policy_path(project_root);
+    let rendered = toml::to_string_pretty(policy)
+        .wrap_err_with(|| format!("serialize workspace policy failed: {}", path.display()))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => file
+            .write_all(rendered.as_bytes())
+            .wrap_err_with(|| format!("write workspace policy failed: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).wrap_err_with(|| {
+            format!(
+                "open workspace policy for create-new failed: {}",
+                path.display()
+            )
+        }),
+    }
+}
+
 pub fn upgrade_workspace_policy_if_legacy(
     policy: &WorkspacePolicy,
     kind: WorkspaceProjectKind,
@@ -860,5 +904,35 @@ ignore = []
         assert!(parsed.required, "required defaults to true");
         assert_eq!(parsed.phase, ValidatorPhaseKind::Completion);
         assert!(parsed.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn write_workspace_policy_if_absent_creates_file_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = WorkspacePolicy::for_session();
+
+        write_workspace_policy_if_absent(temp.path(), &policy).unwrap();
+
+        let path = workspace_policy_path(temp.path());
+        assert!(path.is_file());
+        let roundtrip = read_workspace_policy(temp.path()).unwrap().unwrap();
+        assert_eq!(roundtrip, policy);
+    }
+
+    #[test]
+    fn write_workspace_policy_if_absent_preserves_existing_file() {
+        // This is the M11-C contract: under concurrent bootstrap or
+        // operator edit, a pre-existing `.octos-workspace.toml` is
+        // never clobbered. Equivalent to `OpenOptions::create_new`
+        // failing closed on `AlreadyExists`.
+        let temp = tempfile::tempdir().unwrap();
+        let path = workspace_policy_path(temp.path());
+        let sentinel = "# operator hand-edit do not overwrite\n";
+        std::fs::write(&path, sentinel).unwrap();
+
+        // Should succeed (idempotent) but NOT overwrite.
+        write_workspace_policy_if_absent(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, sentinel);
     }
 }
