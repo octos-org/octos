@@ -557,18 +557,23 @@ mod tests {
             serde_json::to_string_pretty(&matched_seed).unwrap(),
         )
         .unwrap();
+        // Use the exact field names BaselineEntry deserializes
+        // (`avg_latency_ms` / `p95_latency_ms`) — and use a stability
+        // value that DIFFERS from the seed catalog's, so we can tell
+        // whether `seed_baseline` actually ran from the EMA-blended
+        // result.
         let baseline = serde_json::json!([
             {
                 "provider": stub_key,
-                "p95_ms": 1100,
-                "tool_avg_ms": 700,
-                "stability": 0.95
+                "avg_latency_ms": 700,
+                "p95_latency_ms": 1100,
+                "stability": 0.6
             },
             {
                 "provider": ollama_key,
-                "p95_ms": 3200,
-                "tool_avg_ms": 1800,
-                "stability": 0.88
+                "avg_latency_ms": 1800,
+                "p95_latency_ms": 3200,
+                "stability": 0.6
             }
         ]);
         std::fs::write(
@@ -611,12 +616,22 @@ mod tests {
             "model_type from seed should survive into runtime export"
         );
 
-        // (c) baseline loaded — without any live observations the
-        //     EMA blend weight is 0, so seeded stability round-trips
-        //     unchanged through the router export.
+        // (c) `seed_baseline` actually ran. We know because:
+        //     - seed_catalog set baseline_stability = 0.88;
+        //     - seed_baseline set success/failure counts that imply
+        //       live_stab ≈ 0.6 (the value in the baseline fixture)
+        //       and pushed total_requests to 10, giving the EMA
+        //       blender weight = min(0.5, 10/20) = 0.5;
+        //     - exported stability = 0.88 * 0.5 + ~0.6 * 0.5 ≈ 0.74.
+        //     If seed_baseline had silently failed to load (e.g.
+        //     wrong JSON field names took the warn path), total
+        //     would be 0, weight 0, and the exported stability
+        //     would round-trip 0.88 unchanged. Asserting strict
+        //     inequality with both extremes catches that regression.
         assert!(
-            (ollama_entry.stability - 0.88).abs() < 0.001,
-            "baseline stability should round-trip through router export; got {}",
+            ollama_entry.stability < 0.85 && ollama_entry.stability > 0.65,
+            "blended stability must be strictly between baseline (0.6) and \
+             seed-catalog (0.88), proving seed_baseline ran — got {}",
             ollama_entry.stability
         );
 
