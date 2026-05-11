@@ -139,7 +139,7 @@ in
       pkgs.ffmpeg
       pkgs.libreoffice
       pkgs.nodejs
-      pkgs.poppler_utils
+      pkgs.poppler-utils
     ];
 
   };

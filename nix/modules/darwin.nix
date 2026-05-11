@@ -3,7 +3,7 @@ let
   cfg = config.programs.octos;
   serviceCfg = cfg.service;
 
-  serviceName = "org.octos.gateway";
+  serviceName = "org.octos.serve";
 in
 {
   config = lib.mkIf cfg.enable {

@@ -10,7 +10,7 @@ in
       "d ${serviceCfg.dataDir} 0770 root root -"
     ];
 
-    systemd.services.octos-gateway = lib.mkIf serviceCfg.enable {
+    systemd.services.octos-serve = lib.mkIf serviceCfg.enable {
       script = ''
         exec ${cfg.finalPackage}/bin/octos serve \
           --port ${toString serviceCfg.port} \
@@ -33,7 +33,7 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      description = "octos gateway service";
+      description = "octos serve";
     };
 
   };
