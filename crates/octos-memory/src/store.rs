@@ -39,15 +39,27 @@ const DEFAULT_DIMENSION: usize = 1536;
 /// repeated every ~2 seconds.
 ///
 /// To prevent that crashloop without sacrificing serve-mode
-/// persistence, [`EpisodeStore::open`] now falls back to a
+/// persistence, [`EpisodeStore::open_or_degraded`] falls back to a
 /// **degraded** in-memory store when the redb file is already locked:
 /// `db` is `None`, all mutating operations silently no-op, and all
-/// read operations return empty. Callers that need to observe the
-/// degradation (logging, metrics) can read [`Self::is_degraded`].
+/// public read operations return empty. Callers that need to observe
+/// the degradation (logging, metrics) can read [`Self::is_degraded`].
 ///
-/// This is the correct degradation for the gateway: the gateway
-/// subprocess does not own the canonical EpisodeStore — `octos serve`
-/// does. Episode reads on the gateway path are best-effort already
+/// Two opener entry points formalize the role split:
+/// - [`Self::open`] (strict) — fails when the lock is already held.
+///   The right choice for the process that *must* own the canonical
+///   store (`octos serve`, `octos chat`, the test suite). Surfaces
+///   deployment misconfigurations as errors instead of silently
+///   degrading the canonical writer.
+/// - [`Self::open_or_degraded`] — falls back to the degraded handle
+///   on lock contention. The right choice for `octos gateway`
+///   subprocesses (and other companion processes) that should keep
+///   going when the canonical store is owned elsewhere.
+///
+/// This split prevents the gateway-starts-first dev workflow from
+/// flipping canonical ownership to gateway and degrading serve.
+///
+/// Episode reads on the gateway path are best-effort already
 /// (memory-bank recall happens through the in-process `MemoryStore`,
 /// not `EpisodeStore`), and episode writes from a sub-agent are
 /// completion-summary persistence that serve will redo on
@@ -65,11 +77,43 @@ pub struct EpisodeStore {
 impl EpisodeStore {
     /// Open or create an episode store at the given path.
     ///
-    /// Falls back to a degraded in-memory store when the redb file
-    /// lock is already held by another process (see the type-level
-    /// docs on [`EpisodeStore`]). All other errors propagate.
+    /// **Strict mode** — fails if the redb file lock is already held
+    /// by another process. This is the right entry point for the
+    /// process that *must* own the canonical store (`octos serve`,
+    /// `octos chat`, the agent test suite). If the lock is held, the
+    /// caller likely has a deployment misconfiguration and should
+    /// surface the error rather than silently degrading.
+    ///
+    /// For the `octos gateway` subprocess (and anywhere else that
+    /// runs alongside an existing serve daemon and should keep going
+    /// when the canonical store is owned elsewhere), use
+    /// [`Self::open_or_degraded`].
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let data_dir = data_dir.as_ref().to_path_buf();
+        Self::open_inner(data_dir.as_ref(), false).await
+    }
+
+    /// Open or create an episode store at the given path, falling
+    /// back to a degraded in-memory store when the redb file lock is
+    /// already held by another process.
+    ///
+    /// This is the right entry point for the `octos gateway`
+    /// subprocess: `octos serve` always wins the lock in production
+    /// (process_manager spawns gateway after `ProfileRuntime` has
+    /// already bootstrapped every profile), so gateway always gets a
+    /// degraded handle when serve is the parent daemon. Writes on a
+    /// degraded handle silently no-op; reads return empty. See the
+    /// type-level docs on [`EpisodeStore`].
+    ///
+    /// **Other failure modes still bubble up.** Only the typed
+    /// `redb::DatabaseError::DatabaseAlreadyOpen` triggers the
+    /// degraded fallback; corruption / I/O / permission errors are
+    /// returned as `Err`.
+    pub async fn open_or_degraded(data_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(data_dir.as_ref(), true).await
+    }
+
+    async fn open_inner(data_dir: &Path, allow_degraded: bool) -> Result<Self> {
+        let data_dir = data_dir.to_path_buf();
         tokio::fs::create_dir_all(&data_dir)
             .await
             .wrap_err("failed to create data directory")?;
@@ -79,9 +123,10 @@ impl EpisodeStore {
 
         // redb is sync, so we spawn_blocking for the initial open + table init + index rebuild.
         //
-        // Return `Ok(None)` for the typed `DatabaseAlreadyOpen` case so the
-        // outer task can install a degraded store without crashing the
-        // process; bubble up every other error verbatim.
+        // We surface the `DatabaseAlreadyOpen` case as a typed sentinel
+        // (`Ok(None)`) so the outer task can decide whether to install
+        // the degraded fallback (gateway) or propagate the error
+        // (serve). Every other error bubbles up verbatim.
         let result: Result<Option<(Database, HybridIndex)>> =
             tokio::task::spawn_blocking(move || {
                 let db = match Database::create(&db_path) {
@@ -132,7 +177,7 @@ impl EpisodeStore {
                 db: Some(Arc::new(db)),
                 index: RwLock::new(index),
             }),
-            None => {
+            None if allow_degraded => {
                 warn!(
                     path = %db_path_for_log.display(),
                     "redb episode store already held by another process; \
@@ -146,14 +191,22 @@ impl EpisodeStore {
                     index: RwLock::new(HybridIndex::new(DEFAULT_DIMENSION)),
                 })
             }
+            None => Err(eyre::eyre!(
+                "failed to open redb database at {}: \
+                 Database already open. Cannot acquire lock. \
+                 (Strict `EpisodeStore::open` was used — if this is the \
+                 `octos gateway` subprocess, call `open_or_degraded` \
+                 instead.)",
+                db_path_for_log.display(),
+            )),
         }
     }
 
     /// `true` when this store is operating in the degraded in-memory
     /// fallback mode described on the type-level docs (the redb file
-    /// lock was already held when [`Self::open`] ran). Callers can
-    /// use this for diagnostics, metrics, or to skip persistence-
-    /// dependent codepaths.
+    /// lock was already held when [`Self::open_or_degraded`] ran).
+    /// Callers can use this for diagnostics, metrics, or to skip
+    /// persistence-dependent codepaths.
     pub fn is_degraded(&self) -> bool {
         self.db.is_none()
     }
@@ -161,9 +214,14 @@ impl EpisodeStore {
     /// Store an episode.
     ///
     /// In degraded mode ([`Self::is_degraded`]) the disk write is
-    /// skipped; the in-memory hybrid index is still updated so
-    /// callers that store-then-recall within the same process see
-    /// the entry. Returns `Ok(())` either way.
+    /// skipped and the call returns `Ok(())`. The in-memory hybrid
+    /// index is updated with the summary so [`Self::find_relevant_hybrid`]
+    /// (which is index-only when populated) can match it for ranking,
+    /// but full episode bodies come from disk — so the public read
+    /// methods ([`Self::find_relevant`], [`Self::find_relevant_hybrid`])
+    /// still return empty on a degraded handle because there is no
+    /// DB to fetch bodies from. The intent is "writes accepted, reads
+    /// empty," not in-memory persistence.
     pub async fn store(&self, episode: Episode) -> Result<()> {
         let episode_id = episode.id.clone();
         let episode_id_for_index = episode_id.clone();
@@ -767,16 +825,17 @@ mod tests {
     /// (PR #888 / M11-F gateway consolidation).
     ///
     /// `octos serve` and `octos gateway` run as separate processes;
-    /// both call `EpisodeStore::open` against the same per-profile
+    /// both call `EpisodeStore::open*` against the same per-profile
     /// data dir. The second open used to crash with
     /// `redb::DatabaseError::DatabaseAlreadyOpen` because redb is a
     /// single-writer-single-process embedded database. This test
-    /// pins the new contract: the second opener gets a degraded
+    /// pins the new contract: `open_or_degraded` returns a degraded
     /// in-memory fallback handle instead of an error.
     #[tokio::test]
     async fn should_return_degraded_store_when_redb_already_held_by_another_handle() {
         let dir = tempfile::tempdir().unwrap();
-        // Owner: behaves like `octos serve` holding the lock.
+        // Owner: behaves like `octos serve` holding the lock. Strict
+        // `open` is used so misconfigurations would still surface.
         let owner = EpisodeStore::open(dir.path()).await.unwrap();
         assert!(
             !owner.is_degraded(),
@@ -784,12 +843,13 @@ mod tests {
         );
 
         // Second opener: behaves like an `octos gateway` subprocess.
+        // It opts into the degraded fallback via `open_or_degraded`.
         // Before the fix this returned `Err(... DatabaseAlreadyOpen ...)`;
         // now it must succeed with a degraded fallback.
-        let degraded = EpisodeStore::open(dir.path()).await.unwrap();
+        let degraded = EpisodeStore::open_or_degraded(dir.path()).await.unwrap();
         assert!(
             degraded.is_degraded(),
-            "second opener must return a degraded in-memory fallback",
+            "open_or_degraded must return a degraded in-memory fallback",
         );
 
         // The degraded handle accepts writes (silent no-op on disk)
@@ -815,6 +875,43 @@ mod tests {
         assert!(
             owner_view.is_empty(),
             "degraded writes must not surface to the owner; got {owner_view:?}",
+        );
+
+        // The degraded handle's own reads also return empty: the
+        // hybrid index can match the summary for ranking, but
+        // `find_relevant` / `find_relevant_hybrid` fetch full episode
+        // bodies from disk, and the degraded handle has no disk
+        // backing. This is the "writes accepted, reads empty"
+        // contract — anything stricter would be incorrect because
+        // the canonical store is owned elsewhere.
+        let degraded_view = degraded
+            .find_relevant(Path::new("/proj"), "recorded", 10)
+            .await
+            .unwrap();
+        assert!(
+            degraded_view.is_empty(),
+            "degraded reads must return empty; got {degraded_view:?}",
+        );
+    }
+
+    /// Strict `open` must fail (not silently degrade) when the redb
+    /// file lock is already held. This locks down the contract that
+    /// codex's round-1 review of #899 called out: a second
+    /// `Serve`-role bootstrap should never quietly flip canonical
+    /// ownership.
+    #[tokio::test]
+    async fn should_error_on_strict_open_when_redb_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let _owner = EpisodeStore::open(dir.path()).await.unwrap();
+
+        let err = EpisodeStore::open(dir.path())
+            .await
+            .err()
+            .expect("strict open must error when lock is held");
+        let msg = err.to_string() + " " + &format!("{err:?}");
+        assert!(
+            msg.contains("Database already open") || msg.contains("Cannot acquire lock"),
+            "strict open error must surface the lock contention; got: {err:?}",
         );
     }
 }

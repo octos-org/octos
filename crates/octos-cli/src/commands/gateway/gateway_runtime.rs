@@ -289,7 +289,14 @@ impl GatewayRuntime {
         let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
             resolved_profile.as_ref().filter(|_| !cli_llm_override)
         {
-            match ProfileRuntime::bootstrap(profile, &data_dir, Some(&effective_octos_home)).await {
+            match ProfileRuntime::bootstrap(
+                profile,
+                &data_dir,
+                Some(&effective_octos_home),
+                crate::runtime::BootstrapRole::Gateway,
+            )
+            .await
+            {
                 Ok(rt) => {
                     info!(
                         profile_id = %profile.id,
