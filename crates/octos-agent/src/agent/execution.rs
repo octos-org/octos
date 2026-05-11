@@ -67,6 +67,60 @@ fn should_auto_send_tool_files(
     !(suppress_auto_send_files || explicit_send_file_requested && tool_name != "send_file")
 }
 
+/// Issue #896 — spawn_only filename propagation (Layer 1).
+///
+/// Build a short follow-up notification that lists the workspace-relative
+/// paths a spawn_only tool produced, so the LLM has stable filenames to
+/// reference on its next turn. Without this, the LLM only sees the
+/// `task_handle` envelope from `spawn_only_handle_message` (which carries
+/// `output_dir` but not the actual filename), and tends to hallucinate
+/// slugs (see live dspfac trace 2026-05-11).
+///
+/// Returns `None` when `files` is empty — the caller MUST suppress the
+/// follow-up notification in that case so we never persist an empty
+/// "produced files:" stub. Token-budget invariant (M10 Phase 4): paths
+/// only, never file contents.
+///
+/// `workspace_root`, when supplied, is used to convert absolute paths
+/// under the workspace into workspace-relative form (e.g.
+/// `/Users/foo/.octos/profiles/p1/workspace/research/x/x.md` →
+/// `research/x/x.md`) so the LLM can pass the path straight to
+/// `read_file({path: "research/x/x.md"})`. Paths outside the workspace
+/// (or when `workspace_root` is `None`) are kept verbatim.
+fn build_spawn_only_produced_files_message(
+    tool_name: &str,
+    files: &[String],
+    workspace_root: Option<&std::path::Path>,
+) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut out = format!("`{tool_name}` produced files:");
+    for path in files {
+        out.push_str("\n- ");
+        out.push_str(&relativize_workspace_path(path, workspace_root));
+    }
+    Some(out)
+}
+
+/// Strip the workspace prefix from an absolute path, returning a
+/// workspace-relative path string. Falls back to the original path if it
+/// cannot be relativised (already-relative input, different root, or no
+/// `workspace_root` configured).
+///
+/// Pure helper so we can unit-test the relativisation logic without
+/// standing up an Agent.
+fn relativize_workspace_path(path: &str, workspace_root: Option<&std::path::Path>) -> String {
+    let Some(root) = workspace_root else {
+        return path.to_string();
+    };
+    let abs = std::path::Path::new(path);
+    match abs.strip_prefix(root) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
+    }
+}
+
 /// Produce the composite system-prompt text (worker prompt + realtime sensor
 /// summary) used at the top of every agent turn. Centralizing this in
 /// `execution.rs` keeps the message-building policy in a single location so
@@ -488,33 +542,69 @@ impl Agent {
                                     };
 
                                     if result_persisted {
-                                        if let Err(validation_error) = bg_supervisor
-                                            .mark_completed_with_validation(
-                                                &task_id,
-                                                output_files.clone(),
-                                            )
-                                        {
-                                            tracing::warn!(
-                                                tool = %bg_name,
-                                                files = ?output_files,
-                                                error = %validation_error,
-                                                "workspace contract satisfied but supervisor artifact validation rejected outputs"
-                                            );
-                                            if let Some(ref sender) = bg_sender {
-                                                let _ = sender(BackgroundResultPayload {
-                                                    task_label: bg_name.clone(),
-                                                    content: format!(
-                                                        "✗ {} failed: {}",
-                                                        bg_name, validation_error
-                                                    ),
-                                                    kind: BackgroundResultKind::Notification,
-                                                    media: vec![],
-                                                    envelope_media: vec![],
-                                                    originating_thread_id: bg_originating_thread_id
-                                                        .clone(),
-                                                    task_id: Some(task_id.clone()),
-                                                })
-                                                .await;
+                                        // Issue #896: emit the produced-files
+                                        // notification ONLY after the supervisor
+                                        // validation passes. Codex review on
+                                        // PR #898 flagged the original ordering
+                                        // (notification before validation) as
+                                        // user-confusing — a success-looking
+                                        // paths block could land in chat right
+                                        // before a `✗ failed` notification if
+                                        // `mark_completed_with_validation`
+                                        // rejected the outputs. Matches the
+                                        // safer ordering used on the
+                                        // `NotConfigured` path below.
+                                        match bg_supervisor.mark_completed_with_validation(
+                                            &task_id,
+                                            output_files.clone(),
+                                        ) {
+                                            Ok(()) => {
+                                                if let Some(ref sender) = bg_sender {
+                                                    if let Some(produced_msg) =
+                                                        build_spawn_only_produced_files_message(
+                                                            &bg_name,
+                                                            &output_files,
+                                                            bg_tools.workspace_root(),
+                                                        )
+                                                    {
+                                                        let _ = sender(BackgroundResultPayload {
+                                                            task_label: bg_name.clone(),
+                                                            content: produced_msg,
+                                                            kind:
+                                                                BackgroundResultKind::Notification,
+                                                            media: vec![],
+                                                            envelope_media: vec![],
+                                                            originating_thread_id:
+                                                                bg_originating_thread_id.clone(),
+                                                            task_id: Some(task_id.clone()),
+                                                        })
+                                                        .await;
+                                                    }
+                                                }
+                                            }
+                                            Err(validation_error) => {
+                                                tracing::warn!(
+                                                    tool = %bg_name,
+                                                    files = ?output_files,
+                                                    error = %validation_error,
+                                                    "workspace contract satisfied but supervisor artifact validation rejected outputs"
+                                                );
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: {}",
+                                                            bg_name, validation_error
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                        media: vec![],
+                                                        envelope_media: vec![],
+                                                        originating_thread_id:
+                                                            bg_originating_thread_id.clone(),
+                                                        task_id: Some(task_id.clone()),
+                                                    })
+                                                    .await;
+                                                }
                                             }
                                         }
                                     } else {
@@ -875,6 +965,52 @@ impl Agent {
                                                         task_id: Some(task_id.clone()),
                                                     })
                                                     .await;
+
+                                                    // Issue #896: append an
+                                                    // additional notification
+                                                    // listing the produced file
+                                                    // paths (workspace-relative
+                                                    // when possible) so the
+                                                    // LLM has stable filenames
+                                                    // to reference on its next
+                                                    // turn. The legacy "✓
+                                                    // completed (basenames)"
+                                                    // bubble above only shows
+                                                    // basenames in parentheses
+                                                    // — enough to display in
+                                                    // the chat UI, but not
+                                                    // enough for the LLM to
+                                                    // pass to `read_file({path:
+                                                    // ...})` on the next turn.
+                                                    // Token-budget invariant
+                                                    // (M10 Phase 4): paths
+                                                    // only, never file
+                                                    // contents. Emitted only
+                                                    // on success and only when
+                                                    // `sent_files` is
+                                                    // non-empty (the helper
+                                                    // returns None and we
+                                                    // skip otherwise).
+                                                    if let Some(produced_msg) =
+                                                        build_spawn_only_produced_files_message(
+                                                            &bg_name,
+                                                            &sent_files,
+                                                            bg_tools.workspace_root(),
+                                                        )
+                                                    {
+                                                        let _ = sender(BackgroundResultPayload {
+                                                            task_label: bg_name.clone(),
+                                                            content: produced_msg,
+                                                            kind:
+                                                                BackgroundResultKind::Notification,
+                                                            media: vec![],
+                                                            envelope_media: vec![],
+                                                            originating_thread_id:
+                                                                bg_originating_thread_id.clone(),
+                                                            task_id: Some(task_id.clone()),
+                                                        })
+                                                        .await;
+                                                    }
                                                 }
                                             }
                                             Err(validation_error) => {
@@ -1550,7 +1686,10 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 
 #[cfg(test)]
 mod tests {
-    use super::should_auto_send_tool_files;
+    use super::{
+        build_spawn_only_produced_files_message, relativize_workspace_path,
+        should_auto_send_tool_files,
+    };
 
     #[test]
     fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
@@ -1561,5 +1700,106 @@ mod tests {
     #[test]
     fn auto_send_respects_global_suppression_flag() {
         assert!(!should_auto_send_tool_files(true, false, "mofa_slides"));
+    }
+
+    #[test]
+    fn should_emit_produced_files_block_when_files_present() {
+        // Issue #896: spawn_only completion appends an additional message
+        // listing produced file paths so the LLM has a stable
+        // workspace-relative reference for its next turn.
+        let root = std::path::PathBuf::from("/tmp/ws");
+        let files = vec![
+            "/tmp/ws/research/x/x.md".to_string(),
+            "/tmp/ws/research/x/_search_results.md".to_string(),
+        ];
+        let msg = build_spawn_only_produced_files_message("deep_search", &files, Some(&root))
+            .expect("non-empty file list must yield Some(message)");
+
+        // Format pinning: header + bulleted workspace-relative paths.
+        assert!(
+            msg.starts_with("`deep_search` produced files:"),
+            "expected header line, got: {msg}"
+        );
+        assert!(
+            msg.contains("\n- research/x/x.md"),
+            "expected workspace-relative bullet, got: {msg}"
+        );
+        assert!(
+            msg.contains("\n- research/x/_search_results.md"),
+            "expected second workspace-relative bullet, got: {msg}"
+        );
+        // No absolute paths leak through.
+        assert!(
+            !msg.contains("/tmp/ws/"),
+            "absolute workspace prefix must be stripped: {msg}"
+        );
+    }
+
+    #[test]
+    fn should_suppress_produced_files_block_when_no_files() {
+        // Token-budget invariant: never persist a stub message when the
+        // tool produced no files (e.g. failed run, text-only result).
+        assert!(
+            build_spawn_only_produced_files_message("deep_search", &[], None).is_none(),
+            "empty files must return None so caller suppresses follow-up"
+        );
+    }
+
+    #[test]
+    fn should_keep_absolute_path_when_outside_workspace() {
+        // Defensive: if a spawn_only tool produces a file outside the
+        // workspace root (e.g. /tmp/foo.mp3), keep it verbatim rather
+        // than producing a misleading relative path.
+        let root = std::path::PathBuf::from("/tmp/ws");
+        let files = vec!["/var/tmp/external.bin".to_string()];
+        let msg =
+            build_spawn_only_produced_files_message("foo", &files, Some(&root)).expect("non-empty");
+        assert!(msg.contains("- /var/tmp/external.bin"), "got: {msg}");
+    }
+
+    #[test]
+    fn produced_files_block_never_contains_file_contents() {
+        // Token-budget invariant (M10 Phase 4): the produced-files block
+        // is a list of PATHS only — file contents are NEVER inlined,
+        // regardless of how many files were produced.
+        let root = std::path::PathBuf::from("/tmp/ws");
+        let files: Vec<String> = (1..=10)
+            .map(|i| format!("/tmp/ws/research/topic/{i:02}_source.md"))
+            .collect();
+        let msg = build_spawn_only_produced_files_message("deep_search", &files, Some(&root))
+            .expect("non-empty");
+        // Stays small: 10 paths × ~40 chars + header ≈ ~500 bytes.
+        assert!(
+            msg.len() < 2048,
+            "produced-files block grew unexpectedly: {} bytes",
+            msg.len()
+        );
+        // No file content sentinels.
+        assert!(!msg.contains("LLM synthesis"));
+        assert!(!msg.contains("# Deep Research:"));
+    }
+
+    #[test]
+    fn relativize_strips_workspace_prefix() {
+        let root = std::path::PathBuf::from("/u/me/ws");
+        assert_eq!(
+            relativize_workspace_path("/u/me/ws/skill-output/a.md", Some(&root)),
+            "skill-output/a.md"
+        );
+        // Path not under workspace stays verbatim.
+        assert_eq!(
+            relativize_workspace_path("/other/a.md", Some(&root)),
+            "/other/a.md"
+        );
+        // Already-relative input stays verbatim.
+        assert_eq!(
+            relativize_workspace_path("skill-output/a.md", Some(&root)),
+            "skill-output/a.md"
+        );
+        // None workspace → verbatim.
+        assert_eq!(
+            relativize_workspace_path("/u/me/ws/a.md", None),
+            "/u/me/ws/a.md"
+        );
     }
 }
