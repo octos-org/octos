@@ -81,7 +81,7 @@ struct Output {
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<ResultCost>,
     /// Files the host should auto-deliver to chat. Mirrors v1
-    /// behavior; we name the synthesized topic-named report (`<slug>.md`,
+    /// behavior; we name the synthesized topic-named report (`_<slug>.md`,
     /// see `report_filename`) here so the chat UI shows the canonical
     /// report file, not the search-engine dump.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -593,8 +593,8 @@ async fn run_deep_search(
         Some(0.95),
     );
 
-    // Issue #897: canonical report filename derives from the topic slug
-    // (`<slug>.md`) instead of the hardcoded `_report.md`. The wrapper
+    // Issue #897: canonical report filename derives from the topic slug with `_` prefix
+    // (`_<slug>.md`) instead of the hardcoded `_report.md`. The wrapper
     // directory is unchanged; intermediate sidecars (`_search_results.md`,
     // `01_*.md`, …) keep their existing shapes. The topic-named filename
     // gives the chat UI a self-describing attachment and gives the LLM a
