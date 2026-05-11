@@ -9,14 +9,15 @@ use eyre::{Result, WrapErr};
 use octos_agent::{Agent, AgentConfig, HookExecutor, ToolRegistry};
 use octos_bus::SessionManager;
 use octos_core::AgentId;
-use octos_llm::{AdaptiveConfig, AdaptiveRouter, LlmProvider, ProviderChain, RetryProvider};
+use octos_llm::LlmProvider;
 use octos_memory::{EpisodeStore, MemoryStore};
 
 use super::Executable;
-use super::chat::{create_provider, create_provider_with_api_type};
+use super::chat::create_provider;
 use crate::api::metrics::MetricsReporter;
 use crate::api::{AppState, EventBroadcaster, build_router, init_metrics};
 use crate::config::Config;
+use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 
 fn smtp_email_is_usable(email: &crate::profiles::EmailSettings) -> bool {
     if !email.provider.eq_ignore_ascii_case("smtp") {
@@ -1022,60 +1023,29 @@ impl ServeCommand {
         let base_provider: Arc<dyn LlmProvider> =
             create_provider(&provider_name, config, model, base_url)?;
 
-        // Build the provider chain. Match the `chat` command's behavior:
-        // wrap the primary in `RetryProvider`, then layer in any
-        // `config.fallback_models` so per-profile fallbacks configured
-        // through the dashboard (e.g. minimax + deepseek behind
-        // moonshot/kimi) actually take effect on `/chat`. Without this
-        // the overlaid `fallback_models` would be inert here.
-        let llm: Arc<dyn LlmProvider> = if self.no_retry {
-            base_provider
-        } else if config.fallback_models.is_empty() {
-            Arc::new(RetryProvider::new(base_provider))
-        } else {
-            let mut providers: Vec<Arc<dyn LlmProvider>> =
-                vec![Arc::new(RetryProvider::new(base_provider))];
-            for fb in &config.fallback_models {
-                // Clone the config but always swap in this fallback's
-                // own `api_key_env`. When the fallback omits it, we
-                // clear the primary's `api_key_env` so the registry
-                // default kicks in — otherwise a cross-provider
-                // fallback (e.g. deepseek behind moonshot) would try
-                // to use the primary's AUTODL_API_KEY for DeepSeek.
-                let mut fb_config = config.clone();
-                fb_config.api_key_env = fb.api_key_env.clone();
-                match create_provider_with_api_type(
-                    &fb.provider,
-                    &fb_config,
-                    fb.model.clone(),
-                    fb.base_url.clone(),
-                    fb.api_type.as_deref(),
-                ) {
-                    Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
-                    Err(e) => {
-                        tracing::warn!(
-                            provider = %fb.provider,
-                            error = %e,
-                            "skipping fallback provider in serve agent"
-                        );
-                    }
-                }
-            }
-            if providers.len() > 1 {
-                let adaptive_config = config
-                    .adaptive_routing
-                    .as_ref()
-                    .map(AdaptiveConfig::from)
-                    .unwrap_or_default();
-                tracing::info!(
-                    "serve adaptive routing enabled ({} providers)",
-                    providers.len()
-                );
-                Arc::new(AdaptiveRouter::new(providers, &[], adaptive_config))
-            } else {
-                Arc::new(ProviderChain::new(providers))
-            }
-        };
+        // Build the provider chain via the shared helper so serve
+        // stays in lockstep with gateway. This:
+        //   - wraps the primary in `RetryProvider`,
+        //   - layers each `config.fallback_models` entry on top
+        //     (so per-profile fallbacks configured through the
+        //     dashboard, e.g. minimax + deepseek behind kimi,
+        //     actually take effect on `/chat`),
+        //   - builds an `AdaptiveRouter` with `.with_adaptive_config`
+        //     when >1 provider survives, otherwise `ProviderChain`,
+        //   - seeds the router with `provider_baseline.json` and the
+        //     QoS catalog,
+        //   - exports + persists `model_catalog.json` and seeds the
+        //     `octos_llm::context` / `octos_llm::pricing` tables,
+        //   - spawns the 30s periodic metrics exporter when an
+        //     `AdaptiveRouter` is in play.
+        let bundle = build_adaptive_provider_chain(
+            base_provider,
+            config,
+            data_dir,
+            self.no_retry,
+            ExporterMode::Spawn,
+        );
+        let llm: Arc<dyn LlmProvider> = bundle.llm;
 
         let memory = Arc::new(
             EpisodeStore::open(data_dir)

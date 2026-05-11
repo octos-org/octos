@@ -19,10 +19,7 @@ use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
-use octos_llm::{
-    AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
-    QosCatalog, RetryProvider, SwappableProvider,
-};
+use octos_llm::{AdaptiveRouter, LlmProvider, ProviderRouter, RetryProvider, SwappableProvider};
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tracing::{info, warn};
@@ -41,9 +38,7 @@ use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
 use crate::profiles::UserProfile;
-use crate::qos_catalog::{
-    load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
-};
+use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
@@ -291,151 +286,23 @@ impl GatewayRuntime {
 
         let model_id = base_provider.model_id().to_string();
 
-        // Build provider chain, keeping a typed reference to AdaptiveRouter
-        // (if created) for responsiveness feedback from session actors.
-        let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
-
-        let llm: Arc<dyn LlmProvider> = if cmd.no_retry {
-            base_provider
-        } else if config.fallback_models.is_empty() {
-            Arc::new(RetryProvider::new(base_provider))
-        } else {
-            let mut providers: Vec<Arc<dyn LlmProvider>> =
-                vec![Arc::new(RetryProvider::new(base_provider))];
-            let mut costs: Vec<f64> = vec![0.0]; // primary cost unknown
-            for fb in &config.fallback_models {
-                let fb_config = if fb.api_key_env.is_some() {
-                    let mut c = config.clone();
-                    c.api_key_env = fb.api_key_env.clone();
-                    c
-                } else {
-                    config.clone()
-                };
-                match chat::create_provider_with_api_type(
-                    &fb.provider,
-                    &fb_config,
-                    fb.model.clone(),
-                    fb.base_url.clone(),
-                    fb.api_type.as_deref(),
-                ) {
-                    Ok(p) => {
-                        providers.push(Arc::new(RetryProvider::new(p)));
-                        costs.push(fb.cost_per_m.unwrap_or(0.0));
-                    }
-                    Err(e) => {
-                        warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
-                    }
-                }
-            }
-            // Auto-enable adaptive routing when multiple providers exist
-            if providers.len() > 1 {
-                let adaptive_config = config
-                    .adaptive_routing
-                    .as_ref()
-                    .map(AdaptiveConfig::from)
-                    .unwrap_or_default();
-                let ar_config = config.adaptive_routing.as_ref();
-                info!("adaptive routing enabled ({} providers)", providers.len());
-                let mode = ar_config
-                    .map(|c| c.mode.into())
-                    .unwrap_or(octos_llm::AdaptiveMode::Lane);
-                let qos = ar_config.map(|c| c.qos_ranking).unwrap_or(true);
-                let router = Arc::new(
-                    AdaptiveRouter::new(providers, &costs, adaptive_config)
-                        .with_adaptive_config(mode, qos),
-                );
-                adaptive_router_ref = Some(router.clone());
-                router
-            } else {
-                Arc::new(ProviderChain::new(providers))
-            }
-        };
+        // Build the full LLM provider chain + QoS adaptive wiring via
+        // the shared helper. Keep `adaptive_router_ref` typed so we can
+        // hand it to `ActorFactory` further below (and so the helper
+        // can spawn its 30s metrics exporter against it).
+        let bundle = build_adaptive_provider_chain(
+            base_provider,
+            &config,
+            &data_dir,
+            cmd.no_retry,
+            ExporterMode::Spawn,
+        );
+        let adaptive_router_ref: Option<Arc<AdaptiveRouter>> = bundle.adaptive_router;
+        let runtime_qos_catalog = bundle.runtime_qos_catalog;
 
         // Wrap LLM in SwappableProvider for runtime model switching
-        let swappable = Arc::new(SwappableProvider::new(llm));
+        let swappable = Arc::new(SwappableProvider::new(bundle.llm));
         let llm: Arc<dyn LlmProvider> = swappable.clone();
-        let catalog_path = data_dir.join("model_catalog.json");
-        let qos_scoring_config = config
-            .adaptive_routing
-            .as_ref()
-            .map(AdaptiveConfig::from)
-            .unwrap_or_default();
-        let qos_ranking_enabled = config
-            .adaptive_routing
-            .as_ref()
-            .map(|cfg| cfg.qos_ranking)
-            .unwrap_or(true);
-        let seed_catalog = load_seed_qos_catalog(&data_dir);
-        let runtime_qos_catalog: Option<QosCatalog>;
-
-        // Seed adaptive router with baseline benchmark data (if available)
-        if let Some(ref router) = adaptive_router_ref {
-            // Look in data_dir first, then fall back to ~/.octos/ (shared across profiles)
-            let baseline_candidates = [
-                data_dir.join("provider_baseline.json"),
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".octos/provider_baseline.json"),
-            ];
-            let mut baseline_loaded = false;
-            for baseline_path in &baseline_candidates {
-                if let Ok(json) = std::fs::read_to_string(baseline_path) {
-                    match serde_json::from_str::<Vec<BaselineEntry>>(&json) {
-                        Ok(entries) => {
-                            router.seed_baseline(&entries);
-                            info!(
-                                path = %baseline_path.display(),
-                                entries = entries.len(),
-                                "loaded provider baseline"
-                            );
-                            baseline_loaded = true;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, path = %baseline_path.display(), "failed to parse provider_baseline.json")
-                        }
-                    }
-                }
-            }
-            if !baseline_loaded {
-                info!("no provider_baseline.json found, using cold-start scoring");
-            }
-
-            if let Some(ref catalog) = seed_catalog {
-                router.seed_catalog(&catalog.models);
-                info!(models = catalog.models.len(), "loaded model catalog");
-            }
-
-            runtime_qos_catalog = materialize_runtime_qos_catalog(
-                seed_catalog.as_ref(),
-                Some(router.export_model_catalog()),
-                &qos_scoring_config,
-                qos_ranking_enabled,
-            );
-        } else {
-            runtime_qos_catalog = materialize_runtime_qos_catalog(
-                seed_catalog.as_ref(),
-                None,
-                &qos_scoring_config,
-                qos_ranking_enabled,
-            );
-        }
-
-        if let Some(ref catalog) = runtime_qos_catalog {
-            let ctx_entries: Vec<(String, u64, u64)> = catalog
-                .models
-                .iter()
-                .map(|m| (m.provider.clone(), m.context_window, m.max_output))
-                .collect();
-            octos_llm::context::seed_from_catalog(&ctx_entries);
-            let price_entries: Vec<(String, f64, f64)> = catalog
-                .models
-                .iter()
-                .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
-                .collect();
-            octos_llm::pricing::seed_pricing_catalog(&price_entries);
-            persist_qos_catalog(&catalog_path, catalog);
-        }
 
         // Open ProfileStore for /account commands and bot management.
         // Derive octos_home from: --octos-home flag > data_dir (which already
@@ -445,23 +312,6 @@ impl GatewayRuntime {
             crate::profiles::ProfileStore::open(&effective_octos_home)
                 .ok()
                 .map(Arc::new);
-
-        // Spawn periodic metrics exporter (writes model_catalog.json every 30s)
-        if let Some(ref router) = adaptive_router_ref {
-            let metrics_router = router.clone();
-            let catalog_path = catalog_path.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-                    if let Ok(json) =
-                        serde_json::to_string_pretty(&metrics_router.export_model_catalog())
-                    {
-                        let _ = tokio::fs::write(&catalog_path, &json).await;
-                    }
-                }
-            });
-        }
 
         #[allow(unused_variables)] // used by feature-gated channel registration
         let media_dir = data_dir.join("media");
