@@ -1273,6 +1273,48 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 Triggered when message count > 40 (threshold). Keeps 10 recent messages. Summarizes older messages via LLM to <500 words. Rewrites JSONL session file.
 
+### Runtime Types: ProfileRuntime / SessionRuntime (M11)
+
+Status: **PROPOSED** as of 2026-05-10. See `docs/M11-PROFILE-SESSION-RUNTIME-ADR.md` and `workstreams/M11-runtime-unification.md`. This subsection documents the target shape; the legacy `state.agent: Option<Arc<Agent>>` path is removed during M11-D / M11-F.
+
+Two first-class runtime types make profile scope and session scope explicit:
+
+| Type | Cardinality | Owns |
+|---|---|---|
+| `ProfileRuntime` | One per profile per host process | `llm`, `adaptive_router`, `credentials`, `skills_dir`, `plugin_env_template`, `tool_policy`, `default_sandbox`, `tool_specs` (base, no workspace), `memory`, `memory_store` |
+| `SessionRuntime` | One per `(profile_id, session_key)` | `profile: Arc<ProfileRuntime>`, `workspace_root`, `plugin_work_dir`, `sandbox` (override), `tools` (cloned + workspace-bound + policy-filtered), `agent`, `sessions: SessionManager` |
+| `SessionRuntimeCache` | One per host process | TTL/LRU `HashMap<(String, SessionKey), Arc<SessionRuntime>>` |
+
+**Scope contract.** Anything that varies between two chats opened by the same logged-in user is session-scope. Anything that's an account property is profile-scope.
+
+| Concern | Scope | Lives on |
+|---|---|---|
+| LLM provider + adaptive router | Profile | `ProfileRuntime.llm`, `ProfileRuntime.adaptive_router` |
+| API key credentials | Profile | `ProfileRuntime.credentials` |
+| Installed skills + plugin env template | Profile | `ProfileRuntime.skills_dir`, `ProfileRuntime.plugin_env_template`, `ProfileRuntime.tool_specs` |
+| Tool policy default | Profile | `ProfileRuntime.tool_policy` |
+| Workspace root + plugin work dir | Session | `SessionRuntime.workspace_root`, `SessionRuntime.plugin_work_dir` |
+| Tool registry view (workspace-bound, policy-filtered) | Session | `SessionRuntime.tools` (clone of `profile.tool_specs`) |
+| Sandbox config (with optional session override) | Session | `SessionRuntime.sandbox` |
+| Agent instance | Session | `SessionRuntime.agent` |
+| Conversation history | Session | `SessionRuntime.sessions` (per-session `SessionManager`) |
+
+**Bootstrap chain.** On first message in a session:
+1. `state.profiles[profile_id]` resolves the `Arc<ProfileRuntime>`.
+2. `state.sessions.get_or_init(profile, session_key, workspace_hint)`:
+   - Cache miss → `SessionRuntime::bootstrap`:
+     1. Resolve `workspace_root` from hint or auto-derive `<profile.data_dir>/users/<key>/workspace/`.
+     2. Write default `WorkspacePolicy::for_session()` to `<workspace_root>/.octos-workspace.toml` if missing (idempotent).
+     3. Compute `plugin_work_dir = <workspace_root>/skill-output`.
+     4. Clone `profile.tool_specs`; apply `set_workspace_root` + `set_output_dir_hint` + per-session policy filter.
+     5. Build `Agent` from `profile.llm` + cloned tools.
+     6. Open per-session `SessionManager` at `<profile.data_dir>/users/<key>/`.
+   - Cache hit → return existing `Arc<SessionRuntime>`.
+
+**Bootstrap path is shared between serve and gateway.** Both `commands/serve.rs::run_async` and each `ProcessManager`-spawned gateway subprocess call `ProfileRuntime::bootstrap`. The gateway's bus loop continues to use the returned `ProfileRuntime`'s fields for per-channel session actors.
+
+**Why this exists.** Before M11, `octos serve` ran a server-wide embedded `Agent` constructed by `commands/serve.rs::try_create_agent`. The agent had no notion of profile or session scope. A series of PRs (#866 / #867 / #868 / #869, all 2026-05-10) retrofitted profile awareness one transient `Config` field at a time. The pattern was clearly leaking architecture; M11 replaces the embedded agent with the two-scope model. See the ADR for the full incident trail.
+
 ---
 
 ## octos-plugin — Plugin SDK
