@@ -215,6 +215,63 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    /// Fix #3c (2026-05-10): `specs()` enriches the `activate_tools`
+    /// description with the list of currently deferred tools so the LLM
+    /// has explicit discovery info. Before this fix, after the LRU
+    /// evicted (or the loader deferred) tools, the LLM saw a static
+    /// description with no hint that those tools could be reloaded —
+    /// it would report "I don't have <tool> available" and shell-fish
+    /// for workarounds.
+    #[tokio::test]
+    async fn activate_tools_spec_description_surfaces_deferred_names() {
+        let mut registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        // ActivateToolsTool is wired separately by the agent setup, not by
+        // with_builtins — register it explicitly here so the spec is
+        // visible in the test.
+        registry.register(ActivateToolsTool::new());
+        registry.defer(["web_search".to_string(), "web_fetch".to_string()]);
+        let registry = Arc::new(registry);
+
+        let specs = registry.specs();
+        let activate_spec = specs
+            .iter()
+            .find(|s| s.name == "activate_tools")
+            .expect("activate_tools registered above");
+
+        assert!(
+            activate_spec.description.contains("Load additional tools"),
+            "base description should remain; got: {}",
+            activate_spec.description
+        );
+        assert!(
+            activate_spec.description.contains("web_search"),
+            "deferred tool web_search should appear in description; got: {}",
+            activate_spec.description
+        );
+        assert!(
+            activate_spec.description.contains("web_fetch"),
+            "deferred tool web_fetch should appear in description; got: {}",
+            activate_spec.description
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_tools_spec_description_unchanged_when_nothing_deferred() {
+        let mut registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
+        registry.register(ActivateToolsTool::new());
+        let registry = Arc::new(registry);
+        let specs = registry.specs();
+        let activate_spec = specs
+            .iter()
+            .find(|s| s.name == "activate_tools")
+            .expect("activate_tools registered above");
+        assert!(
+            !activate_spec.description.contains("Currently deferred"),
+            "no enrichment suffix when nothing deferred; got: {}",
+            activate_spec.description
+        );
+    }
+
     #[tokio::test]
     async fn should_list_deferred_groups_when_no_args() {
         let mut registry = ToolRegistry::with_builtins(PathBuf::from("/tmp"));
