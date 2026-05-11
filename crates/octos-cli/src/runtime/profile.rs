@@ -21,10 +21,13 @@ use octos_memory::{EpisodeStore, MemoryStore};
 use tracing::{info, warn};
 
 use crate::commands::chat;
+use crate::commands::gateway::build_system_prompt;
 use crate::commands::gateway::profile_factory::{profile_plugin_env, profile_search_provider_keys};
 use crate::profiles::{UserProfile, config_from_profile};
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
-use crate::skills_scope::{discover_ominix_url, push_runtime_plugin_env};
+use crate::skills_scope::{
+    build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
+};
 
 /// All long-lived state that belongs to a single profile within the
 /// current host process.
@@ -189,6 +192,25 @@ pub struct ProfileRuntime {
     /// gateway-built system prompt; serve appends them to the per-
     /// session agent.
     pub plugin_prompt_fragments: Vec<String>,
+
+    /// Fully pre-assembled system prompt for this profile. Built once
+    /// at bootstrap by calling [`build_system_prompt`] (the gateway's
+    /// canonical assembler) and then appending every fragment in
+    /// [`Self::plugin_prompt_fragments`]. Every [`super::SessionRuntime`]
+    /// bootstrapped from this profile copies the value onto its
+    /// per-session [`octos_agent::Agent`] via
+    /// [`octos_agent::Agent::with_system_prompt`]. This is the M11-F
+    /// regression fix (#891) — the previous serve-mode
+    /// `try_create_agent` helper called the same build + append loop
+    /// inline, but M11-F deleted that helper and routed everything
+    /// through [`super::SessionRuntime::bootstrap`], which never
+    /// re-derived the prompt. The result was that SKILL.md auto-
+    /// injected guidance (e.g. the mofa-fm "call fm_tts directly"
+    /// note) never reached the LLM on `/api/chat` or the UI Protocol
+    /// WebSocket path. Pre-assembling once on `ProfileRuntime` keeps
+    /// the heavy work (memory context, skills summary, bootstrap
+    /// files) off the per-request hot path.
+    pub system_prompt: String,
 
     /// Hook configurations contributed by loaded plugins (skill
     /// manifests can declare `before_tool_call` / `after_tool_call` /
@@ -492,12 +514,55 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
 
+        // Step 18: pre-assemble the profile-scope system prompt.
+        //
+        // This is the M11-F regression fix (#891). Before M11-F, serve
+        // mode's `try_create_agent` helper called `build_system_prompt`
+        // + the fragment-append loop inline, so every per-request agent
+        // observed the SKILL.md guidance. M11-F deleted that helper and
+        // routed everything through `SessionRuntime::bootstrap`, which
+        // never re-derived the prompt — meaning `/api/chat` and the UI
+        // Protocol WS path lost the mofa-fm "call fm_tts directly"
+        // teaching (and any future skill-injected guidance).
+        //
+        // We assemble once per profile and stash it on the runtime so
+        // every `SessionRuntime` bootstrapped from this profile inherits
+        // the same prompt onto its per-session `Agent`. The gateway path
+        // is unaffected — `profile_factory::build` continues to call
+        // `build_system_prompt` itself for child-bot sub-agents, and
+        // `plugin_prompt_fragments` is still populated for that path.
+        //
+        // `project_dir` is `data_dir` in serve mode. The bootstrap-files
+        // assembly (`load_bootstrap_files`) reads AGENTS.md / SOUL.md /
+        // USER.md from this dir — gateway uses its `--cwd` / project
+        // dir, but serve mode has no project_dir concept, and the
+        // per-profile data dir is the only profile-scoped directory we
+        // can hand to the helper. Operators who want per-profile
+        // bootstrap files drop them in `<data_dir>/`, which matches the
+        // pre-M11-F serve-mode behavior.
+        let skills_loader = build_account_skills_loader(data_dir);
+        let mut system_prompt = build_system_prompt(
+            profile.config.gateway.system_prompt.as_deref(),
+            data_dir,
+            data_dir,
+            &memory_store,
+            &skills_loader,
+            &tool_config,
+        )
+        .await;
+        for fragment in &plugin_result.prompt_fragments {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(fragment);
+        }
+
         info!(
             profile_id = %profile.id,
             provider = %provider_name,
             model = %primary_model_id,
             plugin_count = plugin_result.tool_names.len(),
             tool_count = tools.specs().len(),
+            system_prompt_len = system_prompt.len(),
+            prompt_fragment_count = plugin_result.prompt_fragments.len(),
             "ProfileRuntime: bootstrapped"
         );
 
@@ -519,6 +584,7 @@ impl ProfileRuntime {
             plugin_dirs,
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
+            system_prompt,
             memory,
             memory_store,
             tool_config,
@@ -529,7 +595,9 @@ impl ProfileRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::{GatewaySettings, ProfileConfig};
+    use crate::profiles::{
+        GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
+    };
     use chrono::Utc;
     use octos_agent::SandboxConfig;
     use std::collections::HashMap;
@@ -607,6 +675,121 @@ mod tests {
         assert!(
             err.to_string().contains("named-err"),
             "error should mention profile id: {err}",
+        );
+    }
+
+    /// M11 regression fix (#891): `ProfileRuntime::bootstrap` must
+    /// pre-assemble the full system prompt so every `SessionRuntime`
+    /// built from it observes the SKILL.md prompt fragments. Without
+    /// this, `/api/chat` and the UI Protocol WS path miss the
+    /// mofa-fm SKILL.md (and any future skill-injected guidance) and
+    /// the LLM falls back to its prior over the bare tool list.
+    ///
+    /// Fixture: a single skill (no executable required — the loader's
+    /// "extras-only" path handles manifests with empty tools) that
+    /// declares `prompts.include = ["SKILL.md"]` and ships a SKILL.md
+    /// with a recognizable token. We then bootstrap a profile pointing
+    /// at this skills dir and assert the token surfaces on
+    /// `ProfileRuntime::system_prompt`.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn profile_runtime_bootstrap_includes_skill_prompt_fragments() {
+        // Uniquely-named env var to avoid contention with other tests.
+        const KEY_NAME: &str = "OCTOS_M11_891_TEST_API_KEY";
+        // SAFETY: this env var name is unique to this test; nothing
+        // else in the test suite reads or writes it. We also unset it
+        // on the way out via the guard below.
+        unsafe {
+            std::env::set_var(KEY_NAME, "test-key-sk-fake");
+        }
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: see set_var above.
+                unsafe {
+                    std::env::remove_var(KEY_NAME);
+                }
+            }
+        }
+        let _guard = EnvGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("test").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Plant a fixture skill with a recognizable token in SKILL.md.
+        let skills_dir = data_dir.join("skills").join("test-fragment-skill");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("manifest.json"),
+            r#"{
+                "name": "test-fragment-skill",
+                "version": "1.0.0",
+                "tools": [],
+                "prompts": { "include": ["SKILL.md"] }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("SKILL.md"),
+            "## Test Fragment Skill\n\nMARKER-FRAGMENT-XYZ — call fm_tts directly.\n",
+        )
+        .unwrap();
+
+        let profile = UserProfile {
+            id: "with-skill".to_string(),
+            name: "With Skill".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some(KEY_NAME.to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None)
+            .await
+            .expect("bootstrap should succeed with a valid provider config");
+
+        assert!(
+            rt.system_prompt.contains("MARKER-FRAGMENT-XYZ"),
+            "system_prompt should contain SKILL.md fragment; got: {}",
+            rt.system_prompt
+        );
+        // Sanity: it's not _only_ the fragment — base prompt content
+        // (e.g. the date marker injected by `build_system_prompt`)
+        // should also be present.
+        assert!(
+            rt.system_prompt.contains("Current date:"),
+            "system_prompt should also contain the base prompt body; got: {}",
+            rt.system_prompt
+        );
+        // The plugin_prompt_fragments field also still carries the
+        // raw fragment (gateway path consumers depend on it).
+        assert!(
+            rt.plugin_prompt_fragments
+                .iter()
+                .any(|f| f.contains("MARKER-FRAGMENT-XYZ")),
+            "plugin_prompt_fragments should still surface the fragment for gateway",
         );
     }
 }

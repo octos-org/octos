@@ -551,6 +551,7 @@ mod tests {
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
             tool_config,
