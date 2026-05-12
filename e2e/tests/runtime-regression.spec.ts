@@ -22,7 +22,14 @@
  */
 
 import { test, expect } from '@playwright/test';
-import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
+import {
+  chatWS,
+  deleteSessionWs,
+  fetchSessionList,
+  fetchSessionMessages,
+  fetchSessionTasks,
+  type ChatWsEvent,
+} from '../lib/m9-ws-client';
 
 const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.crew.ominix.io';
 const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'e2e-test-2026';
@@ -58,22 +65,91 @@ async function chatViaWs(
   });
 }
 
-/** Get session messages via REST. */
-async function getMessages(sessionId: string): Promise<any[]> {
-  const resp = await fetch(`${BASE}/api/sessions/${sessionId}/messages`, {
-    headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-  });
-  if (!resp.ok) return [];
-  return resp.json();
+/**
+ * Re-throw RPC errors that indicate a real server-side failure (e.g. the
+ * capability gate rejected the method, or the WS handshake failed). Only
+ * swallow the connection/transport errors that historically meant "host is
+ * offline" — those are the cases the legacy REST wrappers tolerated.
+ *
+ * In particular, `method_not_supported` (M12 Phase D-1 capability gate) must
+ * propagate so a misconfigured client doesn't pass the spec by reporting
+ * "no sessions" / "no messages".
+ */
+function rethrowIfRealFailure(err: unknown): never | void {
+  const message = err instanceof Error ? err.message : String(err);
+  if (
+    message.includes('method_not_supported') ||
+    message.includes('m9-ws aux:') ||
+    message.includes('rpc-error[')
+  ) {
+    throw err;
+  }
 }
 
-/** Get session task list via REST. */
+/**
+ * Get session messages via the WS UI Protocol (`session/messages_page`).
+ * M12 Phase D-5: REST `GET /api/sessions/{id}/messages` was retired.
+ */
+async function getMessages(sessionId: string): Promise<any[]> {
+  try {
+    return await fetchSessionMessages({
+      baseUrl: BASE,
+      token: TOKEN,
+      profileId: PROFILE,
+      sessionId,
+    });
+  } catch (err) {
+    rethrowIfRealFailure(err);
+    return [];
+  }
+}
+
+/**
+ * Get session task list via the WS UI Protocol (`session/tasks.list`).
+ * M12 Phase D-5: REST `GET /api/sessions/{id}/tasks` was retired.
+ */
 async function getTasks(sessionId: string): Promise<any[]> {
-  const resp = await fetch(`${BASE}/api/sessions/${sessionId}/tasks`, {
-    headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
+  try {
+    return await fetchSessionTasks({
+      baseUrl: BASE,
+      token: TOKEN,
+      profileId: PROFILE,
+      sessionId,
+    });
+  } catch (err) {
+    rethrowIfRealFailure(err);
+    return [];
+  }
+}
+
+/**
+ * List sessions via the WS UI Protocol (`session/list`).
+ * M12 Phase D-5: REST `GET /api/sessions` was retired.
+ */
+async function listSessions(): Promise<any[]> {
+  try {
+    return await fetchSessionList({
+      baseUrl: BASE,
+      token: TOKEN,
+      profileId: PROFILE,
+    });
+  } catch (err) {
+    rethrowIfRealFailure(err);
+    return [];
+  }
+}
+
+/**
+ * Delete a session via the WS UI Protocol (`session/delete`).
+ * M12 Phase D-5: REST `DELETE /api/sessions/{id}` was retired.
+ */
+async function deleteSession(sessionId: string): Promise<void> {
+  await deleteSessionWs({
+    baseUrl: BASE,
+    token: TOKEN,
+    profileId: PROFILE,
+    sessionId,
   });
-  if (!resp.ok) return [];
-  return resp.json();
 }
 
 async function startBackgroundTts(
@@ -399,12 +475,8 @@ test.describe('Cross-session isolation', () => {
     expect(bContent).not.toContain('alpha');
   });
 
-  test('session list API returns both sessions', async () => {
-    const resp = await fetch(`${BASE}/api/sessions`, {
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
-    expect(resp.ok).toBe(true);
-    const sessions = await resp.json();
+  test('session list returns at least one session via WS session/list', async () => {
+    const sessions = await listSessions();
     expect(Array.isArray(sessions)).toBe(true);
     expect(sessions.length).toBeGreaterThan(0);
   });
@@ -419,37 +491,24 @@ test.describe('Session create & delete lifecycle', () => {
     const sid = `lifecycle-new-${Date.now()}`;
     await chatViaWs('hello from lifecycle test', sid);
 
-    const resp = await fetch(`${BASE}/api/sessions`, {
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
-    const sessions = await resp.json();
+    const sessions = await listSessions();
     const found = sessions.find((s: any) => s.id === sid);
     expect(found).toBeTruthy();
   });
 
-  test('DELETE /api/sessions/:id removes session from list', async () => {
+  test('session/delete removes session from list', async () => {
     const sid = `lifecycle-del-${Date.now()}`;
     await chatViaWs('message to delete', sid);
 
     // Verify it exists
-    let resp = await fetch(`${BASE}/api/sessions`, {
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
-    let sessions = await resp.json();
+    let sessions = await listSessions();
     expect(sessions.find((s: any) => s.id === sid)).toBeTruthy();
 
-    // Delete it
-    const delResp = await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
-    expect(delResp.status).toBe(204);
+    // Delete it via WS
+    await deleteSession(sid);
 
     // Verify it's gone from session list
-    resp = await fetch(`${BASE}/api/sessions`, {
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
-    sessions = await resp.json();
+    sessions = await listSessions();
     expect(sessions.find((s: any) => s.id === sid)).toBeFalsy();
   });
 
@@ -461,11 +520,8 @@ test.describe('Session create & delete lifecycle', () => {
     let msgs = await getMessages(sid);
     expect(msgs.length).toBeGreaterThan(0);
 
-    // Delete session
-    await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
+    // Delete session via WS
+    await deleteSession(sid);
 
     // Messages should be gone
     msgs = await getMessages(sid);
@@ -486,11 +542,8 @@ test.describe('Session create & delete lifecycle', () => {
       30_000,
     );
 
-    // Delete the session
-    await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
+    // Delete the session via WS
+    await deleteSession(sid);
 
     // Create a new session and check if workspace files still exist on disk
     const sid2 = `lifecycle-ws-check-${Date.now()}`;
@@ -512,11 +565,8 @@ test.describe('Session create & delete lifecycle', () => {
     const sid = `lifecycle-nosend-${Date.now()}`;
     await chatViaWs('first message', sid);
 
-    // Delete
-    await fetch(`${BASE}/api/sessions/${encodeURIComponent(sid)}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${TOKEN}`, 'X-Profile-Id': PROFILE },
-    });
+    // Delete via WS
+    await deleteSession(sid);
 
     // Send to deleted session — should either create a new empty session
     // or return the response without the old context

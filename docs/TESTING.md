@@ -93,8 +93,9 @@ cargo test -p octos-cli ui_protocol --features api -- --nocapture
 # 4. Build and boot a local API server for live browser/protocol checks.
 cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000
-curl -sf http://localhost:3000/api/status \
-  -H "Authorization: Bearer ci-test-token"
+# M12 Phase D-5: `/api/status` was retired; use `/health` for liveness
+# probes and the WS `system/status.get` RPC for the structured payload.
+curl -sf http://localhost:3000/health
 
 # 5. M9 wire protocol Playwright gate against the local server.
 npm --prefix e2e install

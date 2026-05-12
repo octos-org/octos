@@ -201,8 +201,9 @@ else
     echo "    Check logs: cat /tmp/frpc.log"
 fi
 
-# Check local octos
-if curl -sf --max-time 3 "http://localhost:${LOCAL_PORT}/api/status" > /dev/null 2>&1; then
+# Check local octos. `/api/status` was retired in M12 Phase D-5 — use
+# the public `/health` endpoint for liveness probes.
+if curl -sf --max-time 3 "http://localhost:${LOCAL_PORT}/health" > /dev/null 2>&1; then
     echo "    octos serve is running on port ${LOCAL_PORT}"
 else
     echo "    NOTE: octos serve is not running on port ${LOCAL_PORT}"

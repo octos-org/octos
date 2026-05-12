@@ -417,8 +417,9 @@ echo ""
 echo "==> Step 9: Verifying..."
 sleep 3
 
-# Check local octos serve
-if ssh_cmd "curl -sf --max-time 3 http://localhost:${SERVE_PORT}/api/status" > /dev/null 2>&1; then
+# Check local octos serve. `/api/status` was retired in M12 Phase D-5 — use
+# the public `/health` endpoint for liveness probes.
+if ssh_cmd "curl -sf --max-time 3 http://localhost:${SERVE_PORT}/health" > /dev/null 2>&1; then
     echo "    octos serve: RUNNING on port ${SERVE_PORT}"
 else
     echo "    octos serve: starting up (check ${RDATA}/logs/serve.\$(date +%F).log)"

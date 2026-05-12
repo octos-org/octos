@@ -12,7 +12,12 @@
  *   OCTOS_TEST_URL=http://localhost:3000 npx playwright test web-client
  */
 import { test, expect } from '@playwright/test';
-import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
+import {
+  chatWS,
+  fetchSessionList,
+  fetchSessionMessages,
+  type ChatWsEvent,
+} from '../lib/m9-ws-client';
 
 test.setTimeout(240_000);
 
@@ -46,23 +51,43 @@ async function chatViaWs(
   });
 }
 
+/**
+ * Get session messages via the WS UI Protocol (`session/messages_page`).
+ * M12 Phase D-5: REST `GET /api/sessions/{id}/messages` was retired.
+ *
+ * The legacy helper accepted a `source: 'full' | 'memory'` toggle that
+ * has no WS analog yet — the WS dispatcher always returns the "full"
+ * source. `sinceSeq` maps directly to the `since_seq` param.
+ */
 async function getSessionMessages(
-  request: any,
+  _request: any,
   baseURL: string,
   sessionId: string,
   params: { source?: 'full' | 'memory'; sinceSeq?: number } = {},
 ): Promise<any[]> {
-  const search = new URLSearchParams();
-  if (params.source) search.set('source', params.source);
-  if (typeof params.sinceSeq === 'number') {
-    search.set('since_seq', String(params.sinceSeq));
+  try {
+    return await fetchSessionMessages({
+      baseUrl: baseURL,
+      token: AUTH_TOKEN,
+      sessionId,
+      sinceSeq: params.sinceSeq,
+    });
+  } catch (err) {
+    // Surface capability/protocol failures loudly; only swallow connection
+    // errors that historically meant "host offline". M12 Phase D-1 added a
+    // strict capability gate — a `method_not_supported` here means the WS
+    // handshake didn't negotiate `auxiliary.rest_to_ws.v1`, which is a real
+    // bug in the helper, not "no messages found".
+    const message = err instanceof Error ? err.message : String(err);
+    if (
+      message.includes('method_not_supported') ||
+      message.includes('m9-ws aux:') ||
+      message.includes('rpc-error[')
+    ) {
+      throw err;
+    }
+    return [];
   }
-  const suffix = search.size > 0 ? `?${search.toString()}` : '';
-  const res = await request.get(`${baseURL}/api/sessions/${sessionId}/messages${suffix}`, {
-    headers: headers(),
-  });
-  if (!res.ok()) return [];
-  return res.json();
 }
 
 // ---------------------------------------------------------------------------
@@ -159,9 +184,9 @@ test('WS chat completes with terminal done event', async ({
 // Test 4: Chat session persistence — messages survive across requests
 //
 // Verifies that sending two messages with the same session_id maintains
-// conversation context (the persistence guarantee is independent of the
-// streaming transport — REST `/api/sessions/:id/messages` is the source
-// of truth, the WS path just drives the live turn).
+// conversation context. M12 Phase D-5: history is now fetched via the WS
+// `session/messages_page` method (the REST source-of-truth endpoint was
+// retired); the WS chat path drives the live turn.
 // ---------------------------------------------------------------------------
 test('session persists across requests', async ({ request, baseURL }) => {
 
@@ -291,15 +316,15 @@ test('concurrent sessions are isolated', async ({ baseURL }) => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 7: Session list API returns valid data
+// Test 7: WS session/list returns valid data
+//
+// M12 Phase D-5: REST `GET /api/sessions` was retired; the WS UI Protocol's
+// `session/list` method now provides the same payload.
 // ---------------------------------------------------------------------------
-test('session list API works', async ({ request, baseURL }) => {
-
-  const res = await request.get(`${baseURL}/api/sessions`, {
-    headers: headers(),
+test('session/list works via WS', async ({ baseURL }) => {
+  const sessions = await fetchSessionList({
+    baseUrl: baseURL!,
+    token: AUTH_TOKEN,
   });
-
-  expect(res.ok()).toBe(true);
-  const body = await res.json();
-  expect(Array.isArray(body)).toBe(true);
+  expect(Array.isArray(sessions)).toBe(true);
 });

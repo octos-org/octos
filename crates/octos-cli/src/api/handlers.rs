@@ -280,15 +280,16 @@ fn encode_api_session_path_id(id: &str) -> String {
     octos_bus::session::encode_path_component(id)
 }
 
-/// GET /api/sessions -- list sessions.
+/// Result entry shape for the WS `session/list` RPC method (formerly the
+/// body of `GET /api/sessions`, retired in M12 Phase D-5).
 #[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
     pub message_count: usize,
     /// Display title (auto-derived from first user message; manual rename via
-    /// PATCH /api/sessions/:id/title preserves across new messages). None
-    /// for legacy sessions persisted before the title field existed; the
-    /// client should fall back to deriving a title from message content.
+    /// the WS `session/title.set` RPC method preserves across new messages).
+    /// None for legacy sessions persisted before the title field existed;
+    /// the client should fall back to deriving a title from message content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }
@@ -302,6 +303,9 @@ fn is_internal_session_topic(topic: &str) -> bool {
     topic.starts_with("child-") || topic == "default.tasks" || topic.ends_with(".tasks")
 }
 
+// Helper for `ui_protocol::handle_session_list` (M12 Phase D-5).
+// The REST route `GET /api/sessions` was retired; this function survives
+// as the implementation backing the WS `session/list` RPC method.
 pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -360,9 +364,14 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     Json(all).into_response()
 }
 
-/// GET /api/sessions/:id/messages -- get session history.
+// Helper for `ui_protocol::handle_session_messages_page` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/messages` was retired; this
+// function survives as the implementation backing the WS
+// `session/messages_page` RPC method.
 ///
-/// Query params: `?limit=100&offset=0`
+/// Backing impl for the WS `session/messages_page` RPC method. Pagination
+/// shape (`limit`/`offset`/`since_seq`) carried over from the legacy REST
+/// route into `SessionMessagesPageParams`.
 #[derive(Deserialize)]
 pub struct PaginationParams {
     #[serde(default = "default_page_limit")]
@@ -546,7 +555,11 @@ pub struct MessageInfo {
     pub thread_id: Option<String>,
 }
 
-/// GET /api/sessions/:id/status -- check if session has an active task.
+// Helper for `ui_protocol::handle_session_status_get` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/status` was retired; this
+// function survives as the implementation backing the WS
+// `session/status.get` RPC method.
+/// Backing impl for the WS `session/status.get` RPC method.
 pub async fn session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -568,7 +581,11 @@ pub async fn session_status(
     .into_response()
 }
 
-/// GET /api/sessions/:id/tasks -- list background tasks for a session.
+// Helper for `ui_protocol::handle_session_tasks_list` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/tasks` was retired; this
+// function survives as the implementation backing the WS
+// `session/tasks.list` RPC method.
+/// Backing impl for the WS `session/tasks.list` RPC method.
 pub async fn session_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -785,6 +802,11 @@ fn collect_session_files(
     }
 }
 
+// Helper for `ui_protocol::handle_session_files_list` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/files` was retired; this
+// function survives as the implementation backing the WS
+// `session/files.list` RPC method.
+/// Backing impl for the WS `session/files.list` RPC method.
 pub async fn session_files(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -818,6 +840,11 @@ pub async fn session_files(
     Json(files).into_response()
 }
 
+// Helper for `ui_protocol::handle_session_workspace_get` (M12 Phase D-5).
+// The REST route `GET /api/sessions/{id}/workspace-contract` was retired;
+// this function survives as the implementation backing the WS
+// `session/workspace.get` RPC method.
+/// Backing impl for the WS `session/workspace.get` RPC method.
 pub async fn session_workspace_contract(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -889,16 +916,20 @@ fn should_resolve_file_access_from_profile(
         || identity.is_some()
 }
 
-/// PATCH /api/sessions/:id/title — set a manual title for a session.
-///
-/// Body: `{ "title": "New display title" }`. The title persists across new
-/// messages (auto-derivation from first user message no longer overrides it).
-/// Empty body or missing field returns 400.
+// Helper for `ui_protocol::handle_session_title_set` (M12 Phase D-5).
+// The REST route `PATCH /api/sessions/{id}/title` was retired; this
+// function survives as the implementation backing the WS
+// `session/title.set` RPC method.
+/// Backing request shape for the WS `session/title.set` RPC method
+/// (formerly the body of `PATCH /api/sessions/{id}/title`). The title
+/// persists across new messages — auto-derivation from the first user
+/// message no longer overrides it once a manual title is set.
 #[derive(Deserialize)]
 pub struct UpdateTitleRequest {
     pub title: String,
 }
 
+/// Backing impl for the WS `session/title.set` RPC method.
 pub async fn update_session_title(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -951,7 +982,11 @@ pub async fn update_session_title(
     }
 }
 
-/// DELETE /api/sessions/:id -- delete a session.
+// Helper for `ui_protocol::handle_session_delete` (M12 Phase D-5).
+// The REST route `DELETE /api/sessions/{id}` was retired; this
+// function survives as the implementation backing the WS
+// `session/delete` RPC method.
+/// Backing impl for the WS `session/delete` RPC method.
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2338,7 +2373,9 @@ fn categorize(filename: &str) -> String {
     }
 }
 
-/// GET /api/status -- server status.
+/// Result shape for the WS `system/status.get` RPC method (formerly the
+/// body of `GET /api/status`, retired in M12 Phase D-5). The `/health`
+/// endpoint remains REST as the public liveness probe.
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub version: String,
@@ -2354,6 +2391,9 @@ pub struct StatusResponse {
     pub base_domain: String,
 }
 
+// Helper for `ui_protocol::handle_system_status_get` (M12 Phase D-5).
+// The REST route `GET /api/status` was retired; this function survives
+// as the implementation backing the WS `system/status.get` RPC method.
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
     // M11-F: surface a profile-aware status. The legacy server-wide

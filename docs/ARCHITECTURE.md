@@ -1255,11 +1255,9 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 | Route | Method | Description |
 |---|---|---|
-| `/api/chat` | POST | Send message → response |
-| `/api/chat/stream` | GET | SSE stream of ProgressEvents |
-| `/api/sessions` | GET | List all sessions |
-| `/api/sessions/{id}/messages` | GET | Paginated history (?limit=100&offset=0, max 500) |
-| `/api/status` | GET | Version, model, provider, uptime |
+| `/api/chat` | POST | Send message → response (sync; streaming runs over WS) |
+| `/api/ui-protocol/ws` | WS | JSON-RPC 2.0 UI Protocol v1 (chat stream + `session/list`, `session/messages_page`, `system/status.get`, ...) |
+| `/health` | GET | Liveness probe (was `/api/status`; data plane moved to WS `system/status.get` in M12 Phase D-5) |
 | `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
 | `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
 
