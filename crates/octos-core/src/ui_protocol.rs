@@ -79,6 +79,21 @@ pub const UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1: &str = "event.spawn_complete.v1
 /// this feature, until M9-γ-3 deletes them.
 pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelope.v1";
 
+/// Feature flag for M12 Phase D-1 auxiliary REST→WS migration.
+///
+/// Negotiated by clients that route auxiliary panel traffic (sidebar
+/// session list, right-rail snapshot/files/tasks, status pill, messages
+/// history scroll, workspace contract panel, title rename, session
+/// delete, content gallery) onto the existing
+/// `/api/ui-protocol/ws` JSON-RPC connection instead of the legacy REST
+/// endpoints on `/api/sessions/*`, `/api/status`, and `/api/my/content`.
+/// See `docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`.
+///
+/// REST endpoints stay live for clients that do not negotiate this
+/// feature; D-1 is additive only. Phase D-5 retires the REST routes
+/// once `octos-web` has migrated (tracked separately).
+pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to_ws.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -95,6 +110,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -115,6 +131,19 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::SESSION_HYDRATE => Some(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
+        methods::SESSION_LIST
+        | methods::SESSION_SNAPSHOT
+        | methods::SESSION_MESSAGES_PAGE
+        | methods::SESSION_STATUS_GET
+        | methods::SESSION_FILES_LIST
+        | methods::SESSION_TASKS_LIST
+        | methods::SESSION_WORKSPACE_GET
+        | methods::SESSION_TITLE_SET
+        | methods::SESSION_DELETE
+        | methods::SYSTEM_STATUS_GET
+        | methods::CONTENT_LIST
+        | methods::CONTENT_DELETE
+        | methods::CONTENT_BULK_DELETE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         _ => None,
     }
 }
@@ -257,6 +286,15 @@ pub mod rpc_error_codes {
 
     /// Spec §10 / M9-FIX-04 backpressure signal; carries `retry_after_ms` in `data`.
     pub const RATE_LIMITED: i64 = -32160;
+
+    /// Generic not-found error for non-session-scoped resources (content
+    /// catalog rows, profile records, ...) returned by REST 404. Distinct
+    /// from `UNKNOWN_SESSION` (-32100) which is reserved for session-scoped
+    /// 404s. M12 Phase D-1 introduced this slot when the REST→WS bridge
+    /// began surfacing content/profile 404s as typed errors; before, every
+    /// REST 404 was force-mapped to `UNKNOWN_SESSION` regardless of
+    /// resource kind.
+    pub const RESOURCE_NOT_FOUND: i64 = -32170;
 }
 
 /// Logical event-ledger cursor used for resumable UI notification consumption.
@@ -566,6 +604,31 @@ impl RpcError {
         Self::new(rpc_error_codes::RUNTIME_NOT_READY, message)
     }
 
+    /// Generic REST 404 for non-session-scoped resources (content catalog
+    /// rows, profile records, ...). Distinct from
+    /// [`Self::unknown_session`] which carries `session_id` in `data` for
+    /// session-scoped misses. M12 Phase D-1 added this so the REST→WS
+    /// bridge can surface content/profile 404s without misclassifying
+    /// them as session misses.
+    ///
+    /// `resource_type` is a short tag identifying the resource ("content",
+    /// "profile", ...); `identifier` is the resource id the client sent.
+    /// Both are echoed in `data` so clients can reconcile without parsing
+    /// the message string.
+    pub fn not_found(resource_type: impl Into<String>, identifier: impl Into<String>) -> Self {
+        let resource_type = resource_type.into();
+        let identifier = identifier.into();
+        Self::new(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            format!("{resource_type} not found: {identifier}"),
+        )
+        .with_data(serde_json::json!({
+            "kind": "not_found",
+            "resource_type": resource_type,
+            "identifier": identifier,
+        }))
+    }
+
     /// Result-side counterpart to `INVALID_PARAMS`. See
     /// [`rpc_error_codes::MALFORMED_RESULT`] for rationale.
     pub fn malformed_result(message: impl Into<String>) -> Self {
@@ -698,6 +761,44 @@ pub mod methods {
     /// legacy `/api/sessions/:id/events/stream` SSE frames bridged onto
     /// the unified v1 surface.
     pub const SESSION_EVENT: &str = "session/event";
+
+    // ---- M12 Phase D-1 auxiliary REST → WS surface ----
+    // Each method below replaces a REST endpoint listed in the ADR's
+    // inventory table (docs/adr/m12-phase-d-auxiliary-rest-to-ws.md).
+    // All thirteen are capability-gated on
+    // `UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1`
+    // (`content/delete` and `content/bulk_delete` are distinct methods
+    // sharing the `content/*` namespace).
+
+    /// Replaces `GET /api/sessions` — sidebar session list.
+    pub const SESSION_LIST: &str = "session/list";
+    /// Replaces combined `GET /api/sessions/{id}/status` + `/files` +
+    /// `/tasks` — single right-rail bootstrap fetch.
+    pub const SESSION_SNAPSHOT: &str = "session/snapshot";
+    /// Replaces `GET /api/sessions/{id}/messages` — paginated history.
+    pub const SESSION_MESSAGES_PAGE: &str = "session/messages_page";
+    /// Replaces `GET /api/sessions/{id}/status` — status-pill poller.
+    pub const SESSION_STATUS_GET: &str = "session/status.get";
+    /// Replaces `GET /api/sessions/{id}/files` — files panel listing.
+    pub const SESSION_FILES_LIST: &str = "session/files.list";
+    /// Replaces `GET /api/sessions/{id}/tasks` — background tasks panel.
+    pub const SESSION_TASKS_LIST: &str = "session/tasks.list";
+    /// Replaces `GET /api/sessions/{id}/workspace-contract` — workspace
+    /// contract panel.
+    pub const SESSION_WORKSPACE_GET: &str = "session/workspace.get";
+    /// Replaces `PATCH /api/sessions/{id}/title` — manual title setter.
+    pub const SESSION_TITLE_SET: &str = "session/title.set";
+    /// Replaces `DELETE /api/sessions/{id}` — session deletion.
+    pub const SESSION_DELETE: &str = "session/delete";
+    /// Replaces `GET /api/status` — agent/server status (distinct from
+    /// `/api/auth/status` which stays REST).
+    pub const SYSTEM_STATUS_GET: &str = "system/status.get";
+    /// Replaces `GET /api/my/content` — content gallery listing.
+    pub const CONTENT_LIST: &str = "content/list";
+    /// Replaces `DELETE /api/my/content/{id}` — single-content deletion.
+    pub const CONTENT_DELETE: &str = "content/delete";
+    /// Replaces `POST /api/my/content/bulk-delete` — bulk-content deletion.
+    pub const CONTENT_BULK_DELETE: &str = "content/bulk_delete";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -724,6 +825,19 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_HYDRATE,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
+    methods::SESSION_LIST,
+    methods::SESSION_SNAPSHOT,
+    methods::SESSION_MESSAGES_PAGE,
+    methods::SESSION_STATUS_GET,
+    methods::SESSION_FILES_LIST,
+    methods::SESSION_TASKS_LIST,
+    methods::SESSION_WORKSPACE_GET,
+    methods::SESSION_TITLE_SET,
+    methods::SESSION_DELETE,
+    methods::SYSTEM_STATUS_GET,
+    methods::CONTENT_LIST,
+    methods::CONTENT_DELETE,
+    methods::CONTENT_BULK_DELETE,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -768,6 +882,19 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_HYDRATE,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
+    methods::SESSION_LIST,
+    methods::SESSION_SNAPSHOT,
+    methods::SESSION_MESSAGES_PAGE,
+    methods::SESSION_STATUS_GET,
+    methods::SESSION_FILES_LIST,
+    methods::SESSION_TASKS_LIST,
+    methods::SESSION_WORKSPACE_GET,
+    methods::SESSION_TITLE_SET,
+    methods::SESSION_DELETE,
+    methods::SYSTEM_STATUS_GET,
+    methods::CONTENT_LIST,
+    methods::CONTENT_DELETE,
+    methods::CONTENT_BULK_DELETE,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -837,6 +964,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
             UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
         ])
     }
 
@@ -1869,6 +1997,245 @@ pub struct TurnStateGetResult {
     pub committed_seqs: Vec<u64>,
 }
 
+// ----- M12 Phase D-1 auxiliary REST → WS frames -----
+//
+// Each pair below mirrors a REST endpoint listed in the ADR's inventory
+// table (`docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`). Result payloads
+// are typed as opaque [`Value`] containers so the WS dispatchers can
+// forward the existing REST handler's JSON body byte-for-byte without
+// duplicating the REST DTO shapes (`SessionInfo`, `MessageInfo`,
+// `SessionFileInfo`, `BackgroundTaskInfo`, `WorkspaceContractStatus`,
+// `StatusResponse`, `ContentEntry`) into the protocol crate. The shapes
+// are unchanged from the REST contract — only the transport flips.
+
+/// Params for `session/list` — empty request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListParams {}
+
+/// Result for `session/list`. `sessions` is the JSON array the existing
+/// `GET /api/sessions` handler emits (one `SessionInfo` per entry, per
+/// `crates/octos-cli/src/api/handlers.rs:508`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListResult {
+    pub sessions: Value,
+}
+
+/// Params for `session/snapshot` — combined bootstrap fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshotParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Result for `session/snapshot`. Each field is the JSON body the
+/// corresponding REST endpoint returns today (status / files / tasks).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshotResult {
+    pub status: Value,
+    pub files: Value,
+    pub tasks: Value,
+}
+
+/// Params for `session/messages_page` — paginated history fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMessagesPageParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Default page size when `SessionMessagesPageParams::limit` is omitted.
+pub const SESSION_MESSAGES_PAGE_DEFAULT_LIMIT: usize = 100;
+/// Server-side clamp on `SessionMessagesPageParams::limit`. Matches the
+/// existing REST handler's `.min(500)` clamp at
+/// `crates/octos-cli/src/api/handlers.rs:685`.
+pub const SESSION_MESSAGES_PAGE_MAX_LIMIT: usize = 500;
+/// Server-side clamp on `SessionMessagesPageParams::offset`. Matches the
+/// existing REST handler's `.min(10_000)` clamp.
+pub const SESSION_MESSAGES_PAGE_MAX_OFFSET: usize = 10_000;
+
+/// Result for `session/messages_page`. `messages` mirrors the REST shape
+/// (`Vec<MessageInfo>`). `has_more` / `next_offset` are set by the
+/// dispatcher based on `messages.len() == limit`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessagesPageResult {
+    pub messages: Value,
+    pub has_more: bool,
+    pub next_offset: usize,
+}
+
+/// Params for `session/status.get` — status-pill poller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStatusGetParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Result for `session/status.get`. Mirrors the JSON body of
+/// `GET /api/sessions/{id}/status` (`{ active, has_deferred_files,
+/// has_bg_tasks }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionStatusGetResult {
+    pub status: Value,
+}
+
+/// Params for `session/files.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFilesListParams {
+    pub session_id: String,
+}
+
+/// Result for `session/files.list`. `files` matches
+/// `Vec<SessionFileInfo>` as emitted by `GET /api/sessions/{id}/files`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionFilesListResult {
+    pub files: Value,
+}
+
+/// Params for `session/tasks.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTasksListParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+}
+
+/// Result for `session/tasks.list`. `tasks` matches the JSON body of
+/// `GET /api/sessions/{id}/tasks` (a `BackgroundTaskInfo` array proxied
+/// from the gateway; empty in standalone mode).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTasksListResult {
+    pub tasks: Value,
+}
+
+/// Params for `session/workspace.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkspaceGetParams {
+    pub session_id: String,
+}
+
+/// Result for `session/workspace.get`. `contracts` matches
+/// `Vec<WorkspaceContractStatus>` as emitted by
+/// `GET /api/sessions/{id}/workspace-contract`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionWorkspaceGetResult {
+    pub contracts: Value,
+}
+
+/// Params for `session/title.set`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTitleSetParams {
+    pub session_id: String,
+    pub title: String,
+}
+
+/// Result for `session/title.set`. Echoes the resolved `session_id` and
+/// title so the SPA can roundtrip the rename in a single response (the
+/// REST `PATCH /api/sessions/{id}/title` returned `204 No Content`; the
+/// WS shape lifts the title into the response body for echo-correctness).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTitleSetResult {
+    pub session_id: String,
+    pub title: String,
+}
+
+/// Server-side clamp on `SessionTitleSetParams::title` character count.
+/// Matches the existing REST handler's character cap at
+/// `crates/octos-cli/src/api/handlers.rs:1162`.
+pub const SESSION_TITLE_SET_MAX_CHARS: usize = 200;
+
+/// Params for `session/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDeleteParams {
+    pub session_id: String,
+}
+
+/// Result for `session/delete`. Empty (the REST `DELETE` returns
+/// `204 No Content`; on WS we send an empty object for consistency with
+/// other void RPCs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDeleteResult {}
+
+/// Params for `system/status.get`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemStatusGetParams {}
+
+/// Result for `system/status.get`. `status` is the JSON body of the
+/// existing `GET /api/status` handler (`StatusResponse` —
+/// `crates/octos-cli/src/api/handlers.rs:2592`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SystemStatusGetResult {
+    pub status: Value,
+}
+
+/// Params for `content/list`. `filters` is a free-form JSON object that
+/// mirrors the REST `ContentQuery` shape (category, search, from, to,
+/// sort, limit, offset, session_id) — see
+/// `crates/octos-cli/src/content_catalog.rs:96` and the dirs/session_id
+/// fields consumed by `GET /api/my/content`. Forwarded verbatim to the
+/// existing REST handler.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContentListParams {
+    #[serde(default)]
+    pub filters: Value,
+}
+
+/// Result for `content/list`. Mirrors the JSON body of
+/// `GET /api/my/content` (`{ entries: ContentEntry[], total: number }`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentListResult {
+    pub entries: Value,
+    pub total: usize,
+}
+
+/// Params for `content/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDeleteParams {
+    pub id: String,
+}
+
+/// Result for `content/delete`. `deleted` is `true` when the row was
+/// removed, `false` when the id was not in the catalog (the REST handler
+/// returns the same boolean inside its `ActionResponse.ok`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentDeleteResult {
+    pub deleted: bool,
+}
+
+/// Params for `content/bulk_delete`. The `ids` vector is capped at
+/// [`CONTENT_BULK_DELETE_MAX_IDS`] entries; the WS dispatcher rejects
+/// over-cap requests with `INVALID_PARAMS` before any catalog write
+/// lock is taken, so a single oversized request cannot block other
+/// catalog readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentBulkDeleteParams {
+    pub ids: Vec<String>,
+}
+
+/// Server-side cap on `ContentBulkDeleteParams::ids` length. Mirrored
+/// in `crates/octos-cli/src/api/ui_protocol.rs` as the dispatcher's
+/// early-reject threshold. Chosen so a single bulk-delete cannot
+/// monopolize the catalog write-lock for more than a small bounded
+/// window even if every id is valid; the 1 MiB WS frame limit is a
+/// coarser secondary check.
+pub const CONTENT_BULK_DELETE_MAX_IDS: usize = 256;
+
+/// Result for `content/bulk_delete`. `deleted` is the number of catalog
+/// rows successfully removed — mirrors the count surfaced by the REST
+/// handler's `ActionResponse.message` ("N item(s) deleted.").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentBulkDeleteResult {
+    pub deleted: usize,
+}
+
 // ----- UPCR-2026-012 `message/persisted` -----
 
 /// Open registry for `MessagePersistedEvent.source`. Future variants must be
@@ -2251,6 +2618,20 @@ pub enum UiCommand {
     SessionHydrate(SessionHydrateParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
+    // ---- M12 Phase D-1 auxiliary REST → WS frames ----
+    SessionList(SessionListParams),
+    SessionSnapshot(SessionSnapshotParams),
+    SessionMessagesPage(SessionMessagesPageParams),
+    SessionStatusGet(SessionStatusGetParams),
+    SessionFilesList(SessionFilesListParams),
+    SessionTasksList(SessionTasksListParams),
+    SessionWorkspaceGet(SessionWorkspaceGetParams),
+    SessionTitleSet(SessionTitleSetParams),
+    SessionDelete(SessionDeleteParams),
+    SystemStatusGet(SystemStatusGetParams),
+    ContentList(ContentListParams),
+    ContentDelete(ContentDeleteParams),
+    ContentBulkDelete(ContentBulkDeleteParams),
 }
 
 impl UiCommand {
@@ -2271,6 +2652,19 @@ impl UiCommand {
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
+            Self::SessionList(_) => methods::SESSION_LIST,
+            Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
+            Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
+            Self::SessionStatusGet(_) => methods::SESSION_STATUS_GET,
+            Self::SessionFilesList(_) => methods::SESSION_FILES_LIST,
+            Self::SessionTasksList(_) => methods::SESSION_TASKS_LIST,
+            Self::SessionWorkspaceGet(_) => methods::SESSION_WORKSPACE_GET,
+            Self::SessionTitleSet(_) => methods::SESSION_TITLE_SET,
+            Self::SessionDelete(_) => methods::SESSION_DELETE,
+            Self::SystemStatusGet(_) => methods::SYSTEM_STATUS_GET,
+            Self::ContentList(_) => methods::CONTENT_LIST,
+            Self::ContentDelete(_) => methods::CONTENT_DELETE,
+            Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
         }
     }
 
@@ -2295,6 +2689,19 @@ impl UiCommand {
             Self::SessionHydrate(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
+            Self::SessionList(params) => serde_json::to_value(params),
+            Self::SessionSnapshot(params) => serde_json::to_value(params),
+            Self::SessionMessagesPage(params) => serde_json::to_value(params),
+            Self::SessionStatusGet(params) => serde_json::to_value(params),
+            Self::SessionFilesList(params) => serde_json::to_value(params),
+            Self::SessionTasksList(params) => serde_json::to_value(params),
+            Self::SessionWorkspaceGet(params) => serde_json::to_value(params),
+            Self::SessionTitleSet(params) => serde_json::to_value(params),
+            Self::SessionDelete(params) => serde_json::to_value(params),
+            Self::SystemStatusGet(params) => serde_json::to_value(params),
+            Self::ContentList(params) => serde_json::to_value(params),
+            Self::ContentDelete(params) => serde_json::to_value(params),
+            Self::ContentBulkDelete(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -2337,9 +2744,50 @@ impl UiCommand {
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
+            methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
+            methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),
+            methods::SESSION_MESSAGES_PAGE => {
+                Ok(Self::SessionMessagesPage(decode_params(method, params)?))
+            }
+            methods::SESSION_STATUS_GET => {
+                Ok(Self::SessionStatusGet(decode_params(method, params)?))
+            }
+            methods::SESSION_FILES_LIST => {
+                Ok(Self::SessionFilesList(decode_params(method, params)?))
+            }
+            methods::SESSION_TASKS_LIST => {
+                Ok(Self::SessionTasksList(decode_params(method, params)?))
+            }
+            methods::SESSION_WORKSPACE_GET => {
+                Ok(Self::SessionWorkspaceGet(decode_params(method, params)?))
+            }
+            methods::SESSION_TITLE_SET => Ok(Self::SessionTitleSet(decode_params(method, params)?)),
+            methods::SESSION_DELETE => Ok(Self::SessionDelete(decode_params(method, params)?)),
+            methods::SYSTEM_STATUS_GET => Ok(Self::SystemStatusGet(decode_optional_params(
+                method, params,
+            )?)),
+            methods::CONTENT_LIST => Ok(Self::ContentList(decode_optional_params(method, params)?)),
+            methods::CONTENT_DELETE => Ok(Self::ContentDelete(decode_params(method, params)?)),
+            methods::CONTENT_BULK_DELETE => {
+                Ok(Self::ContentBulkDelete(decode_params(method, params)?))
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
+}
+
+/// Decode params that may be omitted entirely on the wire (i.e. the
+/// param object is `{}` or absent). Used for empty-request methods like
+/// `session/list` and `system/status.get` where the params struct has no
+/// required fields.
+fn decode_optional_params<T: DeserializeOwned + Default>(
+    method: &str,
+    params: Value,
+) -> Result<T, RpcError> {
+    if params.is_null() {
+        return Ok(T::default());
+    }
+    decode_params(method, params)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3932,6 +4380,10 @@ mod tests {
             UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
             "projection.envelope.v1"
         );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            "auxiliary.rest_to_ws.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -3951,6 +4403,19 @@ mod tests {
                 "session/hydrate",
                 "thread/graph/get",
                 "turn/state/get",
+                "session/list",
+                "session/snapshot",
+                "session/messages_page",
+                "session/status.get",
+                "session/files.list",
+                "session/tasks.list",
+                "session/workspace.get",
+                "session/title.set",
+                "session/delete",
+                "system/status.get",
+                "content/list",
+                "content/delete",
+                "content/bulk_delete",
             ]
         );
         assert_eq!(
@@ -3997,6 +4462,19 @@ mod tests {
                 "session/hydrate",
                 "thread/graph/get",
                 "turn/state/get",
+                "session/list",
+                "session/snapshot",
+                "session/messages_page",
+                "session/status.get",
+                "session/files.list",
+                "session/tasks.list",
+                "session/workspace.get",
+                "session/title.set",
+                "session/delete",
+                "system/status.get",
+                "content/list",
+                "content/delete",
+                "content/bulk_delete",
             ]
         );
         assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
@@ -4034,7 +4512,20 @@ mod tests {
                     "task/output/read",
                     "session/hydrate",
                     "thread/graph/get",
-                    "turn/state/get"
+                    "turn/state/get",
+                    "session/list",
+                    "session/snapshot",
+                    "session/messages_page",
+                    "session/status.get",
+                    "session/files.list",
+                    "session/tasks.list",
+                    "session/workspace.get",
+                    "session/title.set",
+                    "session/delete",
+                    "system/status.get",
+                    "content/list",
+                    "content/delete",
+                    "content/bulk_delete"
                 ],
                 "supported_notifications": [
                     "session/open",
@@ -4069,7 +4560,8 @@ mod tests {
                     "state.turn_state_get.v1",
                     "event.message_persisted.v1",
                     "event.spawn_complete.v1",
-                    "projection.envelope.v1"
+                    "projection.envelope.v1",
+                    "auxiliary.rest_to_ws.v1"
                 ]
             })
         );
@@ -6375,6 +6867,577 @@ mod tests {
         assert_eq!(rpc.method, methods::TURN_STATE_GET);
         let decoded = UiCommand::from_rpc_request(rpc).expect("decode state");
         assert_eq!(decoded, state);
+    }
+
+    // ===== M12 Phase D-1 auxiliary REST → WS frames =====
+
+    #[test]
+    fn aux_rest_to_ws_v1_feature_string_is_stable() {
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            "auxiliary.rest_to_ws.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
+        // Each command is built, serialized via `into_rpc_request`,
+        // re-decoded via `from_rpc_request`, and asserted equal. The
+        // method string is checked against the `methods::` constant so
+        // a typo there shows up here, not at deploy.
+        let cases: Vec<(UiCommand, &str)> = vec![
+            (
+                UiCommand::SessionList(SessionListParams::default()),
+                methods::SESSION_LIST,
+            ),
+            (
+                UiCommand::SessionSnapshot(SessionSnapshotParams {
+                    session_id: "sess-1".into(),
+                    topic: Some("default".into()),
+                }),
+                methods::SESSION_SNAPSHOT,
+            ),
+            (
+                UiCommand::SessionMessagesPage(SessionMessagesPageParams {
+                    session_id: "sess-1".into(),
+                    limit: Some(50),
+                    offset: Some(0),
+                    since_seq: None,
+                    topic: None,
+                }),
+                methods::SESSION_MESSAGES_PAGE,
+            ),
+            (
+                UiCommand::SessionStatusGet(SessionStatusGetParams {
+                    session_id: "sess-1".into(),
+                    topic: None,
+                }),
+                methods::SESSION_STATUS_GET,
+            ),
+            (
+                UiCommand::SessionFilesList(SessionFilesListParams {
+                    session_id: "sess-1".into(),
+                }),
+                methods::SESSION_FILES_LIST,
+            ),
+            (
+                UiCommand::SessionTasksList(SessionTasksListParams {
+                    session_id: "sess-1".into(),
+                    topic: None,
+                }),
+                methods::SESSION_TASKS_LIST,
+            ),
+            (
+                UiCommand::SessionWorkspaceGet(SessionWorkspaceGetParams {
+                    session_id: "sess-1".into(),
+                }),
+                methods::SESSION_WORKSPACE_GET,
+            ),
+            (
+                UiCommand::SessionTitleSet(SessionTitleSetParams {
+                    session_id: "sess-1".into(),
+                    title: "Renamed".into(),
+                }),
+                methods::SESSION_TITLE_SET,
+            ),
+            (
+                UiCommand::SessionDelete(SessionDeleteParams {
+                    session_id: "sess-1".into(),
+                }),
+                methods::SESSION_DELETE,
+            ),
+            (
+                UiCommand::SystemStatusGet(SystemStatusGetParams::default()),
+                methods::SYSTEM_STATUS_GET,
+            ),
+            (
+                UiCommand::ContentList(ContentListParams {
+                    filters: serde_json::json!({ "limit": 10 }),
+                }),
+                methods::CONTENT_LIST,
+            ),
+            (
+                UiCommand::ContentDelete(ContentDeleteParams { id: "c-1".into() }),
+                methods::CONTENT_DELETE,
+            ),
+            (
+                UiCommand::ContentBulkDelete(ContentBulkDeleteParams {
+                    ids: vec!["c-1".into(), "c-2".into()],
+                }),
+                methods::CONTENT_BULK_DELETE,
+            ),
+        ];
+        assert_eq!(
+            cases.len(),
+            13,
+            "13 UiCommand arms cover the 13 auxiliary methods \
+             (`session/list`, `session/snapshot`, `session/messages_page`, \
+             `session/status.get`, `session/files.list`, `session/tasks.list`, \
+             `session/workspace.get`, `session/title.set`, `session/delete`, \
+             `system/status.get`, `content/list`, `content/delete`, \
+             `content/bulk_delete`) — `content/delete` and `content/bulk_delete` \
+             are distinct methods"
+        );
+        for (command, expected_method) in cases {
+            let rpc = command
+                .clone()
+                .into_rpc_request("req")
+                .expect("serialize command");
+            assert_eq!(rpc.method, expected_method);
+            let decoded = UiCommand::from_rpc_request(rpc).expect("decode command");
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_empty_param_methods_accept_null_params() {
+        // Wire shape per JSON-RPC 2.0 allows omitting params on
+        // no-arg methods. `session/list` and `system/status.get`
+        // accept either `{}` or absent params.
+        let session_list_null =
+            UiCommand::from_method_and_params(methods::SESSION_LIST, Value::Null)
+                .expect("session/list with null params");
+        assert!(matches!(session_list_null, UiCommand::SessionList(_)));
+
+        let system_status_null =
+            UiCommand::from_method_and_params(methods::SYSTEM_STATUS_GET, Value::Null)
+                .expect("system/status.get with null params");
+        assert!(matches!(system_status_null, UiCommand::SystemStatusGet(_)));
+
+        let content_list_null =
+            UiCommand::from_method_and_params(methods::CONTENT_LIST, Value::Null)
+                .expect("content/list with null params");
+        assert!(matches!(content_list_null, UiCommand::ContentList(_)));
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
+        // Each result struct serializes to a stable shape and decodes
+        // back. Opaque `Value` fields are forwarded byte-for-byte from
+        // the REST handler bodies so they may carry whatever shape the
+        // existing REST contract emits.
+        let listing = SessionListResult {
+            sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
+        };
+        let value = serde_json::to_value(&listing).expect("serialize");
+        let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.sessions, listing.sessions);
+
+        let snapshot = SessionSnapshotResult {
+            status: serde_json::json!({ "active": false }),
+            files: serde_json::json!([]),
+            tasks: serde_json::json!([]),
+        };
+        let value = serde_json::to_value(&snapshot).expect("serialize");
+        let decoded: SessionSnapshotResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.status, snapshot.status);
+        assert_eq!(decoded.files, snapshot.files);
+        assert_eq!(decoded.tasks, snapshot.tasks);
+
+        let page = SessionMessagesPageResult {
+            messages: serde_json::json!([]),
+            has_more: false,
+            next_offset: 0,
+        };
+        let value = serde_json::to_value(&page).expect("serialize");
+        let decoded: SessionMessagesPageResult =
+            serde_json::from_value(value).expect("deserialize");
+        assert!(!decoded.has_more);
+        assert_eq!(decoded.next_offset, 0);
+
+        let title = SessionTitleSetResult {
+            session_id: "s-1".into(),
+            title: "Renamed".into(),
+        };
+        let value = serde_json::to_value(&title).expect("serialize");
+        let decoded: SessionTitleSetResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, title);
+
+        let delete = SessionDeleteResult::default();
+        let value = serde_json::to_value(&delete).expect("serialize");
+        let decoded: SessionDeleteResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, delete);
+
+        let content = ContentListResult {
+            entries: serde_json::json!([{ "id": "c-1" }]),
+            total: 1,
+        };
+        let value = serde_json::to_value(&content).expect("serialize");
+        let decoded: ContentListResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded.entries, content.entries);
+        assert_eq!(decoded.total, content.total);
+
+        let bulk = ContentBulkDeleteResult { deleted: 5 };
+        let value = serde_json::to_value(&bulk).expect("serialize");
+        let decoded: ContentBulkDeleteResult = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(decoded, bulk);
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_methods_are_capability_gated() {
+        // The 12 new methods must gate on
+        // `auxiliary.rest_to_ws.v1`. A connection that does not
+        // negotiate the feature must NOT see them in the advertised
+        // `supported_methods`.
+        let none = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        for method in [
+            methods::SESSION_LIST,
+            methods::SESSION_SNAPSHOT,
+            methods::SESSION_MESSAGES_PAGE,
+            methods::SESSION_STATUS_GET,
+            methods::SESSION_FILES_LIST,
+            methods::SESSION_TASKS_LIST,
+            methods::SESSION_WORKSPACE_GET,
+            methods::SESSION_TITLE_SET,
+            methods::SESSION_DELETE,
+            methods::SYSTEM_STATUS_GET,
+            methods::CONTENT_LIST,
+            methods::CONTENT_DELETE,
+            methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                !none.supports_method(method),
+                "method {method} must NOT be advertised without aux_rest_to_ws_v1"
+            );
+        }
+
+        let with_feature = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+        ]);
+        for method in [
+            methods::SESSION_LIST,
+            methods::SESSION_SNAPSHOT,
+            methods::SESSION_MESSAGES_PAGE,
+            methods::SESSION_STATUS_GET,
+            methods::SESSION_FILES_LIST,
+            methods::SESSION_TASKS_LIST,
+            methods::SESSION_WORKSPACE_GET,
+            methods::SESSION_TITLE_SET,
+            methods::SESSION_DELETE,
+            methods::SYSTEM_STATUS_GET,
+            methods::CONTENT_LIST,
+            methods::CONTENT_DELETE,
+            methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                with_feature.supports_method(method),
+                "method {method} must be advertised when aux_rest_to_ws_v1 is negotiated"
+            );
+        }
+        assert!(with_feature.supports_feature(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 2): every M12 Phase D-1
+    /// request/result DTO must be pinned to a JSON-shape golden, not
+    /// just to a serde round-trip. A round-trip catches "can encode
+    /// and decode", but it does NOT catch "the field was renamed but
+    /// both ends agree on the rename" — exactly the failure mode we
+    /// care about when the WS bridge has to mirror REST DTOs that
+    /// live in a different crate. The literal-JSON asserts below
+    /// force a field rename (or a missing-field default flip) in any
+    /// REST DTO to fail this test before it lands.
+    #[test]
+    fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
+        // session/list — empty params
+        assert_eq!(
+            serde_json::to_value(SessionListParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+        let parsed: SessionListParams =
+            serde_json::from_value(serde_json::json!({})).expect("decode");
+        assert_eq!(parsed, SessionListParams::default());
+
+        // session/snapshot
+        let p = SessionSnapshotParams {
+            session_id: "sess-1".into(),
+            topic: Some("topic-x".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-1", "topic": "topic-x" }),
+        );
+        // Topic is optional — when absent, it must NOT serialize as
+        // `"topic": null`. Drift in the `skip_serializing_if`
+        // directive would flip the wire shape silently.
+        let p_no_topic = SessionSnapshotParams {
+            session_id: "sess-1".into(),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p_no_topic).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-1" }),
+        );
+
+        // session/messages_page
+        let p = SessionMessagesPageParams {
+            session_id: "sess-2".into(),
+            limit: Some(50),
+            offset: Some(10),
+            since_seq: Some(100),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({
+                "session_id": "sess-2",
+                "limit": 50,
+                "offset": 10,
+                "since_seq": 100,
+            }),
+        );
+
+        // session/status.get
+        let p = SessionStatusGetParams {
+            session_id: "sess-3".into(),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-3" }),
+        );
+
+        // session/files.list
+        assert_eq!(
+            serde_json::to_value(SessionFilesListParams {
+                session_id: "sess-4".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-4" }),
+        );
+
+        // session/tasks.list
+        assert_eq!(
+            serde_json::to_value(SessionTasksListParams {
+                session_id: "sess-5".into(),
+                topic: Some("t".into()),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-5", "topic": "t" }),
+        );
+
+        // session/workspace.get
+        assert_eq!(
+            serde_json::to_value(SessionWorkspaceGetParams {
+                session_id: "sess-6".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-6" }),
+        );
+
+        // session/title.set
+        assert_eq!(
+            serde_json::to_value(SessionTitleSetParams {
+                session_id: "sess-7".into(),
+                title: "New title".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-7", "title": "New title" }),
+        );
+
+        // session/delete
+        assert_eq!(
+            serde_json::to_value(SessionDeleteParams {
+                session_id: "sess-8".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-8" }),
+        );
+
+        // system/status.get — empty
+        assert_eq!(
+            serde_json::to_value(SystemStatusGetParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // content/list — free-form filters; default object is empty
+        assert_eq!(
+            serde_json::to_value(ContentListParams::default()).expect("serialize"),
+            serde_json::json!({ "filters": null }),
+        );
+        assert_eq!(
+            serde_json::to_value(ContentListParams {
+                filters: serde_json::json!({ "category": "image", "limit": 50 }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "filters": { "category": "image", "limit": 50 } }),
+        );
+
+        // content/delete
+        assert_eq!(
+            serde_json::to_value(ContentDeleteParams { id: "c-1".into() }).expect("serialize"),
+            serde_json::json!({ "id": "c-1" }),
+        );
+
+        // content/bulk_delete
+        assert_eq!(
+            serde_json::to_value(ContentBulkDeleteParams {
+                ids: vec!["c-1".into(), "c-2".into()],
+            })
+            .expect("serialize"),
+            serde_json::json!({ "ids": ["c-1", "c-2"] }),
+        );
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
+    /// every aux result DTO. Pinned wire shapes — a rename of any
+    /// field below must show up in this test before it reaches a
+    /// downstream client. Each `assert_eq!` is the contract.
+    #[test]
+    fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
+        // session/list — `{ sessions: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionListResult {
+                sessions: serde_json::json!([{ "id": "s-1" }]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
+        );
+
+        // session/snapshot — `{ status, files, tasks }`
+        assert_eq!(
+            serde_json::to_value(SessionSnapshotResult {
+                status: serde_json::json!({ "active": true }),
+                files: serde_json::json!([{ "path": "f.txt" }]),
+                tasks: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "status": { "active": true },
+                "files": [{ "path": "f.txt" }],
+                "tasks": [],
+            }),
+        );
+
+        // session/messages_page — `{ messages, has_more, next_offset }`
+        assert_eq!(
+            serde_json::to_value(SessionMessagesPageResult {
+                messages: serde_json::json!([]),
+                has_more: true,
+                next_offset: 200,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "messages": [],
+                "has_more": true,
+                "next_offset": 200,
+            }),
+        );
+
+        // session/status.get — `{ status: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionStatusGetResult {
+                status: serde_json::json!({ "active": false }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "status": { "active": false } }),
+        );
+
+        // session/files.list — `{ files: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionFilesListResult {
+                files: serde_json::json!([{ "path": "a.txt" }]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "files": [{ "path": "a.txt" }] }),
+        );
+
+        // session/tasks.list — `{ tasks: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionTasksListResult {
+                tasks: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "tasks": [] }),
+        );
+
+        // session/workspace.get — `{ contracts: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionWorkspaceGetResult {
+                contracts: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "contracts": [] }),
+        );
+
+        // session/title.set — `{ session_id, title }`
+        assert_eq!(
+            serde_json::to_value(SessionTitleSetResult {
+                session_id: "s-1".into(),
+                title: "Hello".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "s-1", "title": "Hello" }),
+        );
+
+        // session/delete — empty object
+        assert_eq!(
+            serde_json::to_value(SessionDeleteResult::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // system/status.get — `{ status: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SystemStatusGetResult {
+                status: serde_json::json!({ "version": "0.1.1" }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "status": { "version": "0.1.1" } }),
+        );
+
+        // content/list — `{ entries, total }`
+        assert_eq!(
+            serde_json::to_value(ContentListResult {
+                entries: serde_json::json!([{ "id": "c-1" }]),
+                total: 7,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "entries": [{ "id": "c-1" }],
+                "total": 7,
+            }),
+        );
+
+        // content/delete — `{ deleted: bool }`
+        assert_eq!(
+            serde_json::to_value(ContentDeleteResult { deleted: true }).expect("serialize"),
+            serde_json::json!({ "deleted": true }),
+        );
+
+        // content/bulk_delete — `{ deleted: usize }`
+        assert_eq!(
+            serde_json::to_value(ContentBulkDeleteResult { deleted: 12 }).expect("serialize"),
+            serde_json::json!({ "deleted": 12 }),
+        );
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 1): the new
+    /// `RpcError::not_found(resource_type, identifier)` constructor
+    /// must carry the resource tag + identifier in `data` so clients
+    /// can distinguish a content-row miss from a session miss without
+    /// parsing message strings. Pinned via JSON golden.
+    #[test]
+    fn rpc_error_not_found_carries_typed_resource_data() {
+        let err = RpcError::not_found("content", "c-99");
+        assert_eq!(err.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+        let value = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(value.get("code"), Some(&json!(-32170)));
+        let data = value.get("data").expect("data present");
+        assert_eq!(data.get("kind"), Some(&json!("not_found")));
+        assert_eq!(data.get("resource_type"), Some(&json!("content")));
+        assert_eq!(data.get("identifier"), Some(&json!("c-99")));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 3): the bulk-delete cap is
+    /// part of the wire contract and must not drift silently. Pin
+    /// the constant value to 256 so a future bump shows up as a
+    /// test diff.
+    #[test]
+    fn content_bulk_delete_max_ids_constant_is_pinned() {
+        assert_eq!(
+            CONTENT_BULK_DELETE_MAX_IDS, 256,
+            "wire-contract cap; bump server dispatcher AND any client adapters together",
+        );
     }
 
     // ===== UPCR-2026-014 M9-γ projection envelope golden tests =====
