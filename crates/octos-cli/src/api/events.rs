@@ -1,17 +1,17 @@
-//! Process-wide event broadcaster + per-request channel reporter for the
-//! API surface.
+//! Process-wide event broadcaster for the API surface.
 //!
 //! Originally the SSE wire format module (M9-α-5/α-6 deleted the chat
-//! SSE transport entirely — see ADR PR #830 / audit issue #845). After
-//! the atomic delete the JSON shape produced by [`event_to_json`] is
-//! still consumed by:
+//! SSE transport entirely — see ADR PR #830 / audit issue #845). The
+//! legacy `/api/ws` text-frame handler (the last consumer of the
+//! per-request `ChannelReporter`) was retired in a follow-up cleanup.
+//! The JSON shape produced by [`event_to_json`] is now consumed by:
 //!
-//! * the legacy `/api/ws` text-frame handler (`ws_standalone_agent`),
-//!   which forwards each frame to the WebSocket client verbatim,
 //! * the harness/admin `/api/events/harness` endpoint (subscribes to
 //!   the broadcaster for M7.6 swarm-dashboard live frames),
 //! * the swarm dispatch / cost-attribution typed event publishers in
-//!   `crate::api::swarm`.
+//!   `crate::api::swarm`,
+//! * the UI Protocol v1 WS bridge in `crate::api::ui_protocol`, which
+//!   reuses `event_to_json` to encode forwarded progress frames.
 //!
 //! No SSE wire path remains in the chat transport — every chat client
 //! talks to `/api/ui-protocol/ws` exclusively.
@@ -53,60 +53,14 @@ impl ProgressReporter for EventBroadcaster {
     fn report(&self, event: ProgressEvent) {
         // Broadcaster is process-wide and not turn-scoped, so it cannot
         // resolve a thread_id without further plumbing. Per-request
-        // [`ChannelReporter`] consumers receive the field via their
-        // turn-bound thread_id; broadcaster subscribers are debug-only
-        // and tolerate the absence.
+        // consumers (e.g. the UI Protocol v1 `BoundedChannelReporter`)
+        // tag every payload with their turn-bound thread_id; broadcaster
+        // subscribers are debug-only and tolerate the absence.
         let json = match serde_json::to_string(&event_to_json(&event, None)) {
             Ok(j) => j,
             Err(_) => return,
         };
         // Ignore send errors (no subscribers)
-        let _ = self.tx.send(json);
-    }
-}
-
-/// Per-request reporter that serializes [`ProgressEvent`]s to JSON and
-/// pushes them through an mpsc channel. Used by the legacy `/api/ws`
-/// handler to isolate events per request. (The previous SSE chat path
-/// also used this — deleted in M9-α-5/α-6.)
-///
-/// M8.10 PR #2: optionally carries a `thread_id` (the user message's
-/// `client_message_id`) so every emitted payload is tagged with the
-/// thread it belongs to. When unset, the field is omitted (legacy clients
-/// continue to ignore it).
-pub(crate) struct ChannelReporter {
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
-    thread_id: Option<String>,
-}
-
-impl ChannelReporter {
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
-        Self {
-            tx,
-            thread_id: None,
-        }
-    }
-
-    /// Bind a `thread_id` to every payload this reporter emits.
-    ///
-    /// Pre-α-5/α-6 this was used by the streaming HTTP chat path. Post
-    /// delete the legacy `/api/ws` handler does not bind a thread_id
-    /// (it has no `client_message_id` on its inbound frame today), so
-    /// this constructor is held in reserve for the upcoming WS lifecycle
-    /// rewire — kept here so the bridge unit tests continue to exercise it.
-    #[allow(dead_code)]
-    pub fn with_thread_id(mut self, thread_id: Option<String>) -> Self {
-        self.thread_id = thread_id.filter(|s| !s.is_empty());
-        self
-    }
-}
-
-impl ProgressReporter for ChannelReporter {
-    fn report(&self, event: ProgressEvent) {
-        let json = match serde_json::to_string(&event_to_json(&event, self.thread_id.as_deref())) {
-            Ok(j) => j,
-            Err(_) => return,
-        };
         let _ = self.tx.send(json);
     }
 }
@@ -470,19 +424,6 @@ mod tests {
             json.get("thread_id").is_none(),
             "thread_id must be absent when caller passes None, got {json}"
         );
-    }
-
-    #[test]
-    fn channel_reporter_with_thread_id_tags_emitted_payloads() {
-        use tokio::sync::mpsc;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let reporter = ChannelReporter::new(tx).with_thread_id(Some("cmid-route-XYZ".to_string()));
-
-        reporter.report(ProgressEvent::Thinking { iteration: 0 });
-        let raw = rx.try_recv().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["type"], "thinking");
-        assert_eq!(parsed["thread_id"], "cmid-route-XYZ");
     }
 
     #[test]
