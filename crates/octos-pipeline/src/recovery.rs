@@ -279,6 +279,7 @@ mod tests {
         HandlerContext {
             input: "input".into(),
             completed: Default::default(),
+            predecessor_outcomes: Vec::new(),
             working_dir: std::env::temp_dir(),
         }
     }

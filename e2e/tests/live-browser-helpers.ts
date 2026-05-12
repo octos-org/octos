@@ -232,7 +232,7 @@ export async function login(page: Page) {
     { token: effectiveToken, profile: PROFILE_ID },
   );
 
-  await page.goto('/chat', { waitUntil: 'networkidle' });
+  await page.goto('/chat', { waitUntil: 'domcontentloaded' });
 
   const onChat = await page
     .locator(SEL.chatInput)
@@ -240,7 +240,7 @@ export async function login(page: Page) {
     .catch(() => false);
   if (onChat) return;
 
-  await page.goto('/chat', { waitUntil: 'networkidle' });
+  await page.goto('/chat', { waitUntil: 'domcontentloaded' });
   const chatVisible = await page
     .locator(SEL.chatInput)
     .isVisible({ timeout: 5_000 })
@@ -284,14 +284,14 @@ export async function login(page: Page) {
     );
 
     if (apiLoginResult) {
-      await page.reload({ waitUntil: 'networkidle' });
+      await page.reload({ waitUntil: 'domcontentloaded' });
       const apiLoginVisible = await page
         .locator(SEL.chatInput)
         .isVisible({ timeout: 10_000 })
         .catch(() => false);
       if (apiLoginVisible) return;
 
-      await page.goto('/chat', { waitUntil: 'networkidle' });
+      await page.goto('/chat', { waitUntil: 'domcontentloaded' });
       const chatAfterLogin = await page
         .locator(SEL.chatInput)
         .isVisible({ timeout: 10_000 })
@@ -412,6 +412,14 @@ const SPAWN_ACK_PATTERNS: RegExp[] = [
   /^.{0,30}已在後台運行/,
   /^.{0,80}\b(?:has\s+)?started\s+in\s+(?:the\s+)?background\b/i,
   /^.{0,80}\b(?:is\s+now\s+)?running\s+in\s+(?:the\s+)?background\b/i,
+  // M10 spawn_only intercept (octos-cli/src/agent/loop_runner.rs):
+  // "Background work started for <tool>. The final result will be
+  // delivered automatically when it is ready." — phrase doesn't match
+  // the older "started in (the) background" anchor, so without this
+  // pattern bubbleHasRealContent false-positives on M10 spawn-ack
+  // chrome and assertPairing fails before the real envelope lands
+  // (two-fast-then-one-slow soak regression discovered 2026-05-07).
+  /^Background\s+work\s+started\s+for\b/i,
 ];
 
 /**

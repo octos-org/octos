@@ -6,7 +6,7 @@ mod gateway_runtime;
 #[cfg(feature = "matrix")]
 mod matrix_integration;
 mod message_preprocessing;
-mod profile_factory;
+pub(crate) mod profile_factory;
 mod prompt;
 pub(crate) mod session_ui;
 mod skills_handler;

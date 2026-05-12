@@ -416,3 +416,249 @@ export class RpcErrorImpl extends Error {
     this.name = "RpcErrorImpl";
   }
 }
+
+// ---------------------------------------------------------------------------
+// chatWS — drop-in replacement for the legacy chatSSE() helpers used across
+// the e2e suite. Issues #836 (M9-α-7), #845 (audit lock).
+//
+// Design contract:
+//
+// 1. Same return shape as chatSSE: `{ events, content, doneEvent }` so spec
+//    bodies can swap `chatSSE(...)` -> `chatWS(...)` without rewriting their
+//    assertions, except for SSE-only fields explicitly flagged in the
+//    α-3 deferred-set follow-up (token usage, has_bg_tasks, session_result,
+//    file events). Specs that need those still use test.fixme until the
+//    server publishes the corresponding WS notifications (γ-3 / β-1).
+//
+// 2. We do NOT keep an SSE socket open in parallel — that would defeat
+//    α-5/α-6 (atomic SSE delete). Every byte we observe is a JSON-RPC
+//    notification on the M9 WebSocket.
+//
+// 3. WS notification -> synthesized SSE-shaped event mapping:
+//
+//      message/delta              -> { type: 'token', text }
+//      tool/started               -> { type: 'tool_start', tool, tool_call_id, arguments }
+//      tool/progress              -> { type: 'tool_progress', tool, tool_call_id, message, progress_pct }
+//      tool/completed             -> { type: 'tool_completed', tool, tool_call_id, ... }
+//      task/updated               -> { type: 'task_updated', task_id, status, ... }
+//      task/output/delta          -> { type: 'task_output_delta', task_id, text }
+//      progress/updated (α-4)     -> { type: 'progress_updated', ... }
+//      warning                    -> { type: 'warning', message }
+//      turn/started               -> { type: 'turn_started', turn_id }
+//      turn/completed             -> { type: 'done', content, cursor }
+//      turn/error                 -> { type: 'error', message }
+//
+//    Cumulative `content` is the concatenation of every `message/delta.text`
+//    for the active turn, matching what SSE callers see in `done.content`.
+// ---------------------------------------------------------------------------
+
+import type { Server as HttpServer } from "node:http"; // eslint-disable-line @typescript-eslint/no-unused-vars
+
+export interface ChatWsEvent {
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface ChatWsResult {
+  events: ChatWsEvent[];
+  content: string;
+  doneEvent?: ChatWsEvent;
+}
+
+export interface ChatWsOptions {
+  /** http(s):// or ws(s):// base URL. Path is appended automatically. */
+  baseUrl: string;
+  token: string;
+  message: string;
+  sessionId: string;
+  /** Optional profile id forwarded as `session/open.profile_id`. */
+  profileId?: string;
+  /** Total wait budget in ms before forcing return without `turn/completed`. */
+  maxWait?: number;
+  /** Override the WS connect timeout (default 10s). */
+  connectTimeoutMs?: number;
+  /** Override the request timeout for individual JSON-RPC calls. */
+  requestTimeoutMs?: number;
+  /** Reuse an existing client. If provided, caller owns close(). */
+  client?: M9WsClient;
+  /** Override the freshly generated turn id (defaults to a random uuid). */
+  turnId?: string;
+}
+
+/**
+ * Drive a single chat turn over the M9 WebSocket UI Protocol and collect
+ * synthesized SSE-shaped events until `turn/completed` (or `turn/error`,
+ * or the `maxWait` budget is exhausted).
+ *
+ * The promise resolves on the first terminal event for the turn, OR when the
+ * deadline elapses, whichever comes first.
+ */
+export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
+  const ownsClient = !opts.client;
+  const client =
+    opts.client ??
+    new M9WsClient({
+      url: opts.baseUrl,
+      token: opts.token,
+      profileId: opts.profileId,
+      connectTimeoutMs: opts.connectTimeoutMs,
+      requestTimeoutMs: opts.requestTimeoutMs,
+    });
+  const turnId = opts.turnId ?? freshTurnId();
+  const deadline = Date.now() + (opts.maxWait ?? 60_000);
+  const events: ChatWsEvent[] = [];
+  let content = "";
+  let doneEvent: ChatWsEvent | undefined;
+  let terminal = false;
+  let resolveTerminal!: () => void;
+  const terminalPromise = new Promise<void>((r) => {
+    resolveTerminal = r;
+  });
+
+  const handler = (n: UiNotification) => {
+    // Filter on turn_id when present; some notifications (warnings, status)
+    // arrive without a turn scope and we forward them so spec bodies can see
+    // them in `events` if they want.
+    const params = (n.params ?? {}) as Record<string, unknown>;
+    const noteTurnId = params.turn_id;
+    if (noteTurnId !== undefined && noteTurnId !== turnId) return;
+    switch (n.method) {
+      case "turn/started": {
+        events.push({ type: "turn_started", turn_id: noteTurnId, raw: params });
+        break;
+      }
+      case "message/delta": {
+        const text = String(params.text ?? "");
+        if (text) {
+          content += text;
+          events.push({ type: "token", text });
+        }
+        break;
+      }
+      case "tool/started": {
+        events.push({
+          type: "tool_start",
+          tool: params.tool_name,
+          tool_call_id: params.tool_call_id,
+          arguments: params.arguments,
+        });
+        break;
+      }
+      case "tool/progress": {
+        events.push({
+          type: "tool_progress",
+          tool: params.tool_name,
+          tool_call_id: params.tool_call_id,
+          message: params.message,
+          progress_pct: params.progress_pct,
+        });
+        break;
+      }
+      case "tool/completed": {
+        events.push({
+          type: "tool_completed",
+          tool: params.tool_name,
+          tool_call_id: params.tool_call_id,
+          ok: params.ok,
+          error: params.error,
+        });
+        break;
+      }
+      case "task/updated": {
+        events.push({
+          type: "task_updated",
+          task_id: params.task_id,
+          status: params.status,
+          tool_call_id: params.tool_call_id,
+          raw: params,
+        });
+        break;
+      }
+      case "task/output/delta": {
+        events.push({
+          type: "task_output_delta",
+          task_id: params.task_id,
+          text: params.text,
+        });
+        break;
+      }
+      case "progress/updated": {
+        events.push({ type: "progress_updated", raw: params });
+        break;
+      }
+      case "warning": {
+        events.push({ type: "warning", message: params.message });
+        break;
+      }
+      case "turn/completed": {
+        const ev: ChatWsEvent = {
+          type: "done",
+          content,
+          cursor: params.cursor,
+          turn_id: noteTurnId,
+        };
+        events.push(ev);
+        doneEvent = ev;
+        terminal = true;
+        resolveTerminal();
+        break;
+      }
+      case "turn/error": {
+        const ev: ChatWsEvent = {
+          type: "error",
+          message: params.message ?? params.code ?? "turn/error",
+          code: params.code,
+          turn_id: noteTurnId,
+        };
+        events.push(ev);
+        doneEvent = ev;
+        terminal = true;
+        resolveTerminal();
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  client.onNotification(handler);
+
+  try {
+    await client.openSession({
+      session_id: opts.sessionId,
+      profile_id: opts.profileId,
+    });
+    await client.startTurn({
+      session_id: opts.sessionId,
+      turn_id: turnId,
+      input: [{ kind: "text", text: opts.message }],
+    });
+
+    const remaining = Math.max(1_000, deadline - Date.now());
+    await Promise.race([
+      terminalPromise,
+      new Promise<void>((r) => setTimeout(r, remaining)),
+    ]);
+  } catch (err) {
+    // On RPC error during open/start, surface as `error` event so callers
+    // see an SSE-equivalent shape rather than a thrown promise.
+    const message = err instanceof Error ? err.message : String(err);
+    const ev: ChatWsEvent = { type: "error", message };
+    events.push(ev);
+    doneEvent ??= ev;
+  } finally {
+    if (ownsClient) {
+      try {
+        await client.close();
+      } catch {
+        /* swallow */
+      }
+    }
+  }
+
+  // Best-effort post-condition: if no terminal arrived, do NOT inject a
+  // synthetic done — callers historically rely on `doneEvent === undefined`
+  // to detect timeouts.
+  void terminal;
+  return { events, content, doneEvent };
+}

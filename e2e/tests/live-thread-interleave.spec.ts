@@ -105,7 +105,8 @@ async function getOrderedBubbles(page: Page) {
  *
  * Issue #731 hardening: PR #688 made `run_pipeline` `spawn_only`, so
  * deep_research now delivers as a media-attachment bubble (`.md`
- * link) ~1-3 min after the SSE `done` event for the foreground turn,
+ * link) ~1-3 min after the foreground turn's terminal event
+ * (`turn/completed` over WS post M9-α-7; previously SSE `done`),
  * NOT as inline markdown text. The bubble's `innerText` for an
  * attachment-only message can be a generic "✓ run_pipeline completed
  * (...)" or empty, neither of which contains `rust`. We extend the
@@ -273,7 +274,7 @@ test.describe('Live thread interleave (M8.10 PR #4)', () => {
     // 2. Wait briefly, then send the fast question. The slow Q may be
     //    in active foreground streaming OR may have already spawned to
     //    background — `deep_search` / `run_pipeline` are spawn_only, so
-    //    the foreground SSE turn ends with a "background started" ack
+    //    the foreground turn ends with a "background started" ack
     //    within ~2-3s and the cancel button disappears even though the
     //    real research is still running. We DO NOT gate on
     //    `cancelButton.isVisible()` here: gating on it caused a
@@ -374,10 +375,11 @@ test.describe('Live thread interleave (M8.10 PR #4)', () => {
     // attached to Q1's bubble (and not Q2's, which is the #649
     // misrouting symptom). Post-PR-#688, `run_pipeline` is `spawn_only`
     // and delivers the report as a media attachment ~1-3 min after
-    // SSE done; for those bubbles the inline text is just a generic
+    // turn/completed; for those bubbles the inline text is just a generic
     // success notification with no `rust` token, so the text-only
     // assertion would false-fail. Without either signal, the spec
-    // would false-pass on the spawn-ack alone.
+    // would false-pass on the spawn-ack alone. (Streaming transport
+    // post M9-α-7 is the WebSocket `turn/completed` notification.)
     // `waitForBothFinished` already polls for this evidence, so by the
     // time we reach here it should be present; if it's not, the late
     // result either timed out (raise SLOW_MAX_WAIT_MS) or got bound to

@@ -1,6 +1,6 @@
 //! `GET /api/events/harness` — filtered SSE stream of harness events.
 //!
-//! Subscribes to the shared [`super::SseBroadcaster`] and streams every
+//! Subscribes to the shared [`super::EventBroadcaster`] and streams every
 //! JSON frame it emits. The optional `kinds` query parameter filters by
 //! the frame's top-level `"kind"` field; when absent or empty every
 //! frame is forwarded. `dispatch_id` is accepted for wire-compatibility

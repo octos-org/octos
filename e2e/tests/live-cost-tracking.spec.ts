@@ -25,6 +25,7 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
 
 const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.bot.ominix.io';
 const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
@@ -38,10 +39,7 @@ if (BASE.includes('dspfac.ocean.ominix.io')) {
 
 test.setTimeout(900_000);
 
-interface SseEvent {
-  type: string;
-  [key: string]: unknown;
-}
+type SseEvent = ChatWsEvent;
 
 interface BackgroundTaskRow {
   id?: string;
@@ -63,64 +61,24 @@ interface BackgroundTaskRow {
   completed_at?: string | null;
 }
 
-async function chatSSE(
+/**
+ * M9-α-7 (#836): chat helper now drives the M9 WebSocket UI Protocol.
+ * Returns the same `{ events, content, doneEvent }` shape the SSE helper
+ * exposed so call sites stay unchanged.
+ */
+async function chatViaWs(
   message: string,
   sessionId: string,
   maxWait = 60_000,
 ): Promise<{ events: SseEvent[]; content: string; doneEvent?: SseEvent }> {
-  const resp = await fetch(`${BASE}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${TOKEN}`,
-      'X-Profile-Id': PROFILE,
-    },
-    body: JSON.stringify({ message, session_id: sessionId, stream: true }),
+  return chatWS({
+    baseUrl: BASE,
+    token: TOKEN,
+    profileId: PROFILE,
+    message,
+    sessionId,
+    maxWait,
   });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    if (resp.status === 502 || resp.status === 504) {
-      return { events: [], content: body || '(proxy timeout)' };
-    }
-    throw new Error(`Chat failed: ${resp.status} ${body.slice(0, 200)}`);
-  }
-  if (!resp.body) return { events: [], content: '' };
-  const events: SseEvent[] = [];
-  let content = '';
-  let doneEvent: SseEvent | undefined;
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const start = Date.now();
-  try {
-    while (Date.now() - start < maxWait) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop()!;
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const event: SseEvent = JSON.parse(data);
-          events.push(event);
-          if (event.type === 'replace' && typeof event.text === 'string') content = event.text;
-          if (event.type === 'done') {
-            doneEvent = event;
-            if (typeof event.content === 'string' && event.content) content = event.content;
-            return { events, content, doneEvent };
-          }
-        } catch {
-          /* skip malformed */
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return { events, content, doneEvent };
 }
 
 async function getTasks(sessionId: string): Promise<BackgroundTaskRow[]> {
@@ -193,7 +151,7 @@ const PIPELINE_PROMPT_B =
 test.describe('M8 cost tracking', () => {
   test('a single pipeline run produces per-task cost rows', async () => {
     const sid = `m8-cost-single-${Date.now()}`;
-    const { doneEvent } = await chatSSE(PIPELINE_PROMPT_A, sid, 480_000);
+    const { doneEvent } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
     expect(doneEvent, 'expected SSE done').toBeTruthy();
 
     const { taskCosts, totalUsd, totalTokensIn, totalTokensOut } = await getCostsForSession(sid);
@@ -226,8 +184,8 @@ test.describe('M8 cost tracking', () => {
     const sidB = `m8-cost-iso-b-${Date.now()}`;
 
     // Run them in series to keep the test budget tractable.
-    await chatSSE(PIPELINE_PROMPT_A, sidA, 480_000);
-    await chatSSE(PIPELINE_PROMPT_B, sidB, 480_000);
+    await chatViaWs(PIPELINE_PROMPT_A, sidA, 480_000);
+    await chatViaWs(PIPELINE_PROMPT_B, sidB, 480_000);
 
     const a = await getCostsForSession(sidA);
     const b = await getCostsForSession(sidB);
@@ -256,12 +214,12 @@ test.describe('M8 cost tracking', () => {
     const sid = `m8-cost-agg-${Date.now()}`;
 
     // First pipeline.
-    const { doneEvent: done1 } = await chatSSE(PIPELINE_PROMPT_A, sid, 480_000);
+    const { doneEvent: done1 } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
     expect(done1).toBeTruthy();
     const after1 = await getCostsForSession(sid);
 
     // Second pipeline (in same session).
-    const { doneEvent: done2 } = await chatSSE(PIPELINE_PROMPT_B, sid, 480_000);
+    const { doneEvent: done2 } = await chatViaWs(PIPELINE_PROMPT_B, sid, 480_000);
     expect(done2).toBeTruthy();
     const after2 = await getCostsForSession(sid);
 
@@ -286,9 +244,12 @@ test.describe('M8 cost tracking', () => {
   // Spec 4 — done event includes session-level token totals
   // ══════════════════════════════════════════════════════════════════════════
 
-  test('SSE done event includes tokens_in / tokens_out for the turn', async () => {
+  // Deferred (γ-3): WS `turn/completed` does not yet carry tokens_in /
+  // tokens_out. The session-level token totals are still observable via the
+  // REST `/api/sessions/:id/tasks` snapshot covered by the specs above.
+  test.fixme('done event includes tokens_in / tokens_out for the turn', async () => {
     const sid = `m8-cost-done-${Date.now()}`;
-    const { doneEvent } = await chatSSE('what is the capital of france', sid, 30_000);
+    const { doneEvent } = await chatViaWs('what is the capital of france', sid, 30_000);
     expect(doneEvent).toBeTruthy();
     const evt = doneEvent as { tokens_in?: number; tokens_out?: number };
     expect(typeof evt.tokens_in).toBe('number');
@@ -303,7 +264,7 @@ test.describe('M8 cost tracking', () => {
 
   test('plugin v2 cost_attribution events surface on supervised tasks', async () => {
     const sid = `m8-cost-v2-${Date.now()}`;
-    const { doneEvent } = await chatSSE(PIPELINE_PROMPT_A, sid, 480_000);
+    const { doneEvent } = await chatViaWs(PIPELINE_PROMPT_A, sid, 480_000);
     expect(doneEvent).toBeTruthy();
 
     const { tasks } = await getCostsForSession(sid);

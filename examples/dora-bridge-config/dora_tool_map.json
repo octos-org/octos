@@ -1,0 +1,53 @@
+{
+  "description": "Dora-RS to MCP tool bridge for a valve inspection pipeline",
+  "mappings": [
+    {
+      "tool_name": "capture_valve_image",
+      "description": "Capture a high-resolution image of the target valve using the inspection camera",
+      "dora_node_id": "camera_node",
+      "dora_output_id": "capture_request",
+      "parameters": {
+        "valve_id": "Identifier of the valve to photograph",
+        "resolution": "Image resolution (e.g., '1920x1080')"
+      },
+      "safety_tier": "observe",
+      "timeout_secs": 10
+    },
+    {
+      "tool_name": "move_to_valve",
+      "description": "Move the robot arm to a pre-taught valve inspection pose",
+      "dora_node_id": "motion_planner",
+      "dora_output_id": "move_command",
+      "parameters": {
+        "valve_id": "Target valve identifier",
+        "approach": "Approach strategy: 'direct' or 'via_home'"
+      },
+      "safety_tier": "safe_motion",
+      "timeout_secs": 30
+    },
+    {
+      "tool_name": "turn_valve",
+      "description": "Actuate a valve by rotating the gripper to the target angle",
+      "dora_node_id": "gripper_node",
+      "dora_output_id": "rotate_command",
+      "parameters": {
+        "valve_id": "Target valve identifier",
+        "angle_deg": "Target rotation angle in degrees",
+        "torque_limit_nm": "Maximum torque limit in Newton-meters"
+      },
+      "safety_tier": "full_actuation",
+      "timeout_secs": 45
+    },
+    {
+      "tool_name": "read_pressure_gauge",
+      "description": "Read the current pressure gauge value via computer vision",
+      "dora_node_id": "vision_node",
+      "dora_output_id": "gauge_read_request",
+      "parameters": {
+        "gauge_id": "Identifier of the pressure gauge"
+      },
+      "safety_tier": "observe",
+      "timeout_secs": 15
+    }
+  ]
+}

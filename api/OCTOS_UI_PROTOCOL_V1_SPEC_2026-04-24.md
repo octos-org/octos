@@ -204,6 +204,15 @@ Current M9 sandbox-parity decision:
   fsync) is governed by accepted
   [UPCR-2026-012](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_012_MESSAGE_PERSISTED.md),
   gated behind `event.message_persisted.v1`. Strict-ordered per session.
+- The additive M9-γ projection `Envelope` shape (canonical
+  `(thread_id, seq, client_message_id?, payload)` tuple consumed by the
+  deterministic web client projection) is governed by accepted
+  [UPCR-2026-014](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_014_PROJECTION_ENVELOPE.md),
+  gated behind `projection.envelope.v1`. The shape is documented in § 14
+  "M9-γ Envelope" of this spec; legacy `message/delta`,
+  `message/persisted`, `tool/*`, and `turn/completed` notifications
+  continue to flow on connections that do not negotiate this feature
+  until `M9-γ-3` deletes them.
 
 ## 5. Identity Model
 
@@ -227,6 +236,25 @@ These ids need to be stable and client-visible:
   A resumable position in the ordered protocol event stream.
 
 Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1).
+
+### 5.1 M9-γ projection identity (UPCR-2026-014)
+
+Under the M9-γ deterministic projection model (§ 14), envelope identity
+collapses to the per-thread `seq`. Specifically:
+
+- The canonical projection key is `(thread_id, seq)` — see `Envelope`
+  in § 14.
+- `client_message_id` rides on user-message-rooted envelopes ONLY for
+  the optimistic `<GhostBubble>` overlay's match-and-unmount logic;
+  the projection itself MUST NOT consult it.
+- The legacy per-row `message_id` (carried, for example, on
+  `MessagePersistedEvent.message_id`) is **deprecated for projection
+  identity** as of UPCR-2026-014. It survives in
+  `Envelope.payload` (e.g. `assistant_persisted.meta.message_id`) for
+  audit/render display, but the projection uses `seq` as the sole key.
+  The field is retained — not deleted — so legacy
+  `appendCompletionBubble` / `message/persisted` consumers continue to
+  work until `M9-γ-3` removes them.
 
 ## 6. Envelope Model
 
@@ -679,6 +707,52 @@ Carries non-terminal operator-visible warnings without collapsing them into gene
 
 Marks the normal terminal event for a turn.
 
+Optional fields from accepted `UPCR-2026-014` (M9-α-9):
+
+- `tokens_in` / `tokens_out`
+  Aggregated input / output token counts for the completed turn.
+  Absent when the runtime did not surface usage to the wire.
+- `session_result`
+  Object carrying the final assistant row's durable identity:
+  `{ "committed_seq": u64, "message_id": "<session>:<seq>:<ts_ns>",
+  "client_message_id"?: string }`. Mirrors the SSE-only
+  `session_result` frame so a WS client can stamp authoritative seq
+  onto an optimistic bubble without an extra REST roundtrip. Absent
+  when the turn ended without a final assistant row.
+
+### `turn/started`
+
+Optional fields from accepted `UPCR-2026-014` (M9-α-9):
+
+- `topic`
+  Sub-topic suffix that scopes the turn within a session (mirrors the
+  `<session>#<topic>` shape carried on REST/SSE chat). Absent when the
+  turn is not topic-scoped.
+
+### `file/attached`
+
+Per-turn file attachment event introduced by `UPCR-2026-014` (M9-α-9).
+Mirrors the SSE `file:` frame the agent loop emits for tools that
+declare `files_to_send`. Payload fields:
+
+- `session_id`, `turn_id` — turn-scoping fields (required).
+- `path` — filesystem path or URL the tool produced.
+- `tool_call_id` — originating tool call (optional; omitted on
+  background-result paths that don't run inside a tool execution).
+- `mime` — MIME-type hint (optional; clients fall back to extension
+  sniffing when absent).
+
+### `session/event`
+
+Wrapper envelope introduced by `UPCR-2026-014` (M9-α-9) that bridges
+legacy `/api/sessions/:id/events/stream` SSE frames onto the unified
+WS surface during the α coexistence period. The legacy stream is
+free-form; this wrapper preserves the original `type` (as `kind`) plus
+the full frame body (as `payload`) so WS-only clients keep observing
+every signal SSE consumers see while each event kind gradually lifts
+onto a typed v1 envelope. Optional `topic` echoes the legacy frame's
+topic for client-side scoping.
+
 ### `turn/error`
 
 Marks the abnormal terminal event for a turn.
@@ -775,3 +849,299 @@ See [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHEC
 1. Keep the shared Rust types in `octos-core` aligned with this doc.
 2. Build the mock `octos-tui` scaffold against these draft types.
 3. When M8 fixes land, start server-side `M9.1` transport wiring against the same shapes.
+
+## 14. M9-γ Envelope
+
+Status: **additive**, governed by accepted `UPCR-2026-014`. Capability-gated
+behind `projection.envelope.v1`. Legacy `message/delta`, `message/persisted`,
+`tool/*`, and `turn/completed` notifications continue to flow on connections
+that do not negotiate this feature, until `M9-γ-3` deletes them.
+
+ADR: [`docs/M9-GAMMA-SERVER-PROJECTION-ADR.md`](../docs/M9-GAMMA-SERVER-PROJECTION-ADR.md).
+
+This section defines the canonical envelope shape that the M9-γ
+deterministic projection consumes. The web client maintains an
+append-only `Vec<Envelope>` indexed by `(thread_id, seq)` and the
+projection function `(committed_log) → ChatViewModel` is pure,
+deterministic, and side-effect free. Identity collapses to `seq`;
+`client_message_id` lives ONLY on `user_message` envelopes (see
+§ 14.2) for the optimistic `<GhostBubble>` overlay's match-and-unmount
+path (the projection MUST NOT consult it).
+
+**Turn shape** (locked by § 14.2): every chat turn begins with exactly
+one `user_message` envelope (server-mirrored from the client's send),
+followed by zero or more `assistant_delta` / `tool_*` / `file_attached`
+/ `assistant_persisted` envelopes, terminated by exactly one
+`turn_completed` envelope. A refresh-only projection reconstructs the
+`UserView` for the chat exclusively from `user_message` envelopes —
+`assistant_delta` and `assistant_persisted` alone are insufficient.
+
+### 14.1 Envelope
+
+Wire shape (JSON):
+
+```json
+{
+  "thread_id": "thread-1",
+  "seq": 18,
+  "client_message_id": "01900000-0000-7000-8000-000000000001",
+  "payload": { "type": "...", "data": { ... } }
+}
+```
+
+Field contract:
+
+- `thread_id` (`string`, required) — Multi-turn cluster identity. All
+  envelopes for one logical conversation share a `thread_id`.
+- `seq` (`u64`, required) — Server-assigned strict total order WITHIN
+  this `thread_id`. Strictly monotonic; gaps are an error and trigger
+  rehydration. Identity for the projection.
+- `client_message_id` (`string`, optional) — Populated ONLY on
+  `user_message` envelopes (the optimistic `<GhostBubble>` overlay
+  matches its server reflection here). Absent on every other variant
+  (`assistant_delta`, `assistant_persisted`, `tool_*`, `file_attached`,
+  `turn_completed`). The projection MUST NOT consult this field. A
+  server emitting `client_message_id` on a non-`user_message` envelope
+  is a wire contract violation.
+- `payload` (object, required) — Sealed tagged union; see § 14.2.
+
+Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+in `octos-core::ui_protocol`. TS source: `Envelope` in
+[`crates/octos-web/src/runtime/ui-protocol-types.ts`](/Users/yuechen/home/octos/crates/octos-web/src/runtime/ui-protocol-types.ts:1).
+
+### 14.2 Payload (sealed tagged union)
+
+Wire form: JSON with `"type"` discriminator and content under `"data"`
+(matches Rust `serde(tag = "type", content = "data", rename_all = "snake_case")`).
+Variants:
+
+#### `user_message`
+User-message turn root — server-mirrored from the client's send. Every
+chat turn begins with exactly one `user_message` envelope. The
+projection's `UserView` is reconstructed from these envelopes alone —
+a refresh-only projection cannot recover user bubbles from
+`assistant_delta` / `assistant_persisted`. The carrying envelope's
+`client_message_id` is populated here (and ONLY here) so the
+optimistic `<GhostBubble>` overlay can match its server reflection.
+
+```json
+{ "type": "user_message",
+  "data": {
+    "text": "<user prompt>",
+    "files": [
+      { "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
+    ]
+  } }
+```
+
+`files` is an array of [`FileRef`](#145-fileref) entries; omitted on
+the wire when empty.
+
+#### `assistant_delta`
+One streamed assistant text fragment. Multiple `assistant_delta`
+envelopes for the same `thread_id` accumulate (concatenate by `seq`
+order) into the live assistant bubble.
+
+**Reconciliation rule** — `assistant_delta.text` events APPEND
+(concatenate by ascending `seq`). When an `assistant_persisted`
+envelope arrives for the same `thread_id`, its `text` field REPLACES
+the accumulated streamed text (the persisted form is canonical). This
+avoids double-rendering the final body when both delta and persisted
+events project into the same view.
+
+```json
+{ "type": "assistant_delta", "data": { "text": "<fragment>" } }
+```
+
+#### `assistant_persisted`
+Final assistant text persisted to the ledger after streaming completes.
+Carries durable [`MessageMeta`](#143-messagemeta) so the projection can
+finalize the bubble's identity and surface attachments. Per the
+`assistant_delta` reconciliation rule above, `text` REPLACES the
+concatenated streamed deltas for the same thread (canonical final
+form).
+
+```json
+{ "type": "assistant_persisted",
+  "data": {
+    "text": "<full text>",
+    "meta": {
+      "message_id": "01900000-0000-7000-8000-000000000018",
+      "persisted_at": "2026-05-09T18:30:01Z",
+      "media": ["report.md"]
+    }
+  } }
+```
+
+#### `tool_start`
+Tool invocation begun. The projection opens a tool-call card keyed on
+`tool_call_id`.
+
+```json
+{ "type": "tool_start",
+  "data": { "tool_call_id": "tc-1", "name": "shell" } }
+```
+
+#### `tool_progress`
+Tool emitted a progress message. Idempotent per `(tool_call_id, seq)`;
+the projection appends in `seq` order.
+
+```json
+{ "type": "tool_progress",
+  "data": { "tool_call_id": "tc-1", "message": "running…" } }
+```
+
+#### `tool_end`
+Tool invocation finished. `error` is set iff `status === "error"`;
+omitted on the wire when null. `reason` is an optional human-readable
+detail field, primarily populated for `skipped` and `aborted` outcomes
+(see below); omitted on the wire when null.
+
+```json
+{ "type": "tool_end",
+  "data": { "tool_call_id": "tc-1", "status": "complete" } }
+```
+
+```json
+{ "type": "tool_end",
+  "data": { "tool_call_id": "tc-2", "status": "error", "error": "…" } }
+```
+
+```json
+{ "type": "tool_end",
+  "data": { "tool_call_id": "tc-3", "status": "skipped",
+            "reason": "deadline elapsed before tool started" } }
+```
+
+```json
+{ "type": "tool_end",
+  "data": { "tool_call_id": "tc-4", "status": "aborted",
+            "reason": "user issued turn/interrupt" } }
+```
+
+`status` is a closed snake_case enum:
+
+- `complete` — tool ran to natural completion.
+- `error` — tool surfaced a failure (`error` carries the message).
+- `skipped` — tool was intentionally not run (deadline-skip,
+  pre-condition unmet). `reason` explains why.
+- `aborted` — tool execution was interrupted by an external signal
+  (user `turn/interrupt`, system cancellation). `reason` carries
+  detail.
+
+Future values require a follow-up UPCR.
+
+#### `file_attached`
+File attached to the current thread (e.g. `.md` report from
+`deep_search` or `.mp3` from `fm_tts`). The projection adds the
+attachment to the most-recent assistant bubble in `thread_id`.
+
+```json
+{ "type": "file_attached",
+  "data": { "path": "/tmp/report.md",
+            "mime": "text/markdown",
+            "size_bytes": 4096 } }
+```
+
+#### `turn_completed`
+**Hard barrier** — terminal payload for a turn within `thread_id`. Per
+the M9-γ ADR and § 14.6 below, any envelope arriving on the same
+`thread_id` AFTER this one is DROPPED by the projection (and counted
+in `octos_projection_post_completion_drop_total`). Threads are NOT
+reused — a new turn must use a NEW `thread_id`. Carries
+[`EnvelopeTokenUsage`](#144-envelopetokenusage); zero-valued fields are
+omitted on the wire.
+
+```json
+{ "type": "turn_completed",
+  "data": { "token_usage": { "input_tokens": 100, "output_tokens": 250 } } }
+```
+
+### 14.3 `MessageMeta`
+
+```json
+{
+  "message_id": "01900000-0000-7000-8000-000000000018",
+  "persisted_at": "2026-05-09T18:30:01Z",
+  "media": ["report.md"]
+}
+```
+
+- `message_id` (`string`, required) — Server-assigned UUID of the
+  durable row. Stable across replays. Mirrors
+  `MessagePersistedEvent.message_id`. **Note**: `message_id` is retained
+  here for audit/render display only; the projection uses `seq` as the
+  sole identity key (see § 5.1).
+- `persisted_at` (RFC 3339, required) — Wall-clock commit time.
+- `media` (`string[]`, optional) — File attachments persisted with the
+  message. Empty for assistant rows that carry only text. Omitted on
+  the wire when empty.
+
+### 14.4 `EnvelopeTokenUsage`
+
+```json
+{ "input_tokens": 100, "output_tokens": 250 }
+```
+
+Open object — all five fields default to zero and are omitted on the
+wire when zero (Rust `serde(skip_serializing_if = "is_zero_u64")`):
+
+- `input_tokens` (`u64`)
+- `output_tokens` (`u64`)
+- `reasoning_tokens` (`u64`)
+- `cache_read_tokens` (`u64`)
+- `cache_write_tokens` (`u64`)
+
+Future fields require a follow-up UPCR.
+
+### 14.5 `FileRef`
+
+```json
+{ "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
+```
+
+Wire-form file reference carried on `user_message` envelopes (and
+reused as the canonical attachment shape elsewhere — `file_attached`
+embeds the same triple inline). All three fields are required:
+
+- `path` (`string`) — Absolute path the server resolved for the file.
+- `mime` (`string`) — IANA media type (e.g. `image/png`,
+  `text/markdown`).
+- `size_bytes` (`u64`) — Byte size at upload/persist time.
+
+### 14.6 Hard barrier semantics
+
+Per the M9-γ ADR and the `Envelope` Rust doc-comment, the server MUST
+emit at most one `turn_completed` envelope per `(thread_id, turn)`.
+After that envelope, the projection enforces the barrier with a single
+deterministic rule:
+
+> After `turn_completed` for `thread_id` T, any subsequent envelope
+> with the same `thread_id` is **DROPPED** by the projection. The
+> projection records the drop in the
+> `octos_projection_post_completion_drop_total` metric. Threads are
+> **NOT reused** — a new turn MUST use a NEW `thread_id`.
+
+This is the canonical wire-level enforcement of the "phantom bubble"
+elimination that motivated M9-γ. The drop is silent at the projection
+layer (the metric is the operational signal); clients do NOT
+rehydrate, restart, or treat the situation as a desync. The same
+behaviour is implemented by the M9-γ-2 projection
+([`octos-web` PR #93](https://github.com/octos-org/octos-web/pull/93)).
+
+A server that needs to emit a follow-up assistant or tool event
+belonging to a logically separate turn MUST mint a new `thread_id` for
+that turn — the projection treats the new `thread_id` as a brand-new
+chat thread and projects it independently.
+
+### 14.7 Capability negotiation
+
+Clients request `projection.envelope.v1` via the `X-Octos-Ui-Features`
+header at `session/open` time. Servers advertise it through
+`UiProtocolCapabilities.supported_features` (UPCR-2026-007) when they
+emit canonical envelopes; pre-existing connections (TUI, octos-app
+legacy) continue to receive only the legacy notification surface they
+negotiated.
+
+The capability schema version remains `2`; this is an additive feature
+flag and does not bump the schema version.

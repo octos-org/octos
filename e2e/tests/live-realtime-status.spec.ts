@@ -38,9 +38,11 @@
  *     current wire — pinning would gate the timeline test on a contract
  *     the daemon does not implement.
  *
- * Why this is tight enough to catch SSE-pipeline regressions:
- *   * If the SSE bridge silently dropped tool_progress frames, the
- *     timeline `<ul>` would never render (empty `tc.progress` array
+ * Why this is tight enough to catch streaming-pipeline regressions
+ * (post M9-α-7 the streaming layer is the WebSocket UI Protocol; pre-α-7
+ * it was SSE — same invariants):
+ *   * If the streaming bridge silently dropped tool_progress frames,
+ *     the timeline `<ul>` would never render (empty `tc.progress` array
  *     hides the `<ul>` — see chat-thread.tsx:162). Step 3 fails.
  *   * If progress frames arrived but with wrong/missing tool_call_id,
  *     they'd attach to a different bubble or float orphaned. The
@@ -353,7 +355,8 @@ test.describe(`Realtime status surface (${BASE})`, () => {
 
     // 7. tool_call_id is `runPipelineToolCallId` (already extracted in
     //    step 4 from `data-tool-call-id` on the run_pipeline bubble).
-    //    This is the same id the backend SSE channel used.
+    //    This is the same id the backend streaming channel uses (WS
+    //    `tool/started`/`tool/progress` notifications post M9-α-7).
     const renderedToolCallId = runPipelineToolCallId;
     expect(
       renderedToolCallId,
@@ -382,7 +385,7 @@ test.describe(`Realtime status surface (${BASE})`, () => {
     //    identity nor the literal 'run_pipeline' tool_name match is achievable
     //    against the current wire — the cross-check would gate the timeline
     //    test on a contract the daemon does not implement. Steps 3-6 already
-    //    proved the SSE pipeline + timeline rendering work; this step keeps
+    //    proved the streaming pipeline + timeline rendering work; this step keeps
     //    the freshness/anti-stale anchor and rejects unrelated bg tools.
     const sessionIdNow = await page.evaluate(() =>
       localStorage.getItem('octos_current_session'),

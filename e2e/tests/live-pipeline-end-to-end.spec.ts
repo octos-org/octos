@@ -30,6 +30,7 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { chatWS, type ChatWsEvent } from '../lib/m9-ws-client';
 
 const BASE = process.env.OCTOS_TEST_URL || 'https://dspfac.bot.ominix.io';
 const TOKEN = process.env.OCTOS_AUTH_TOKEN || 'octos-admin-2026';
@@ -45,10 +46,7 @@ if (BASE.includes('dspfac.ocean.ominix.io')) {
 // Per-test timeout: a deep-research run can take several minutes.
 test.setTimeout(900_000);
 
-interface SseEvent {
-  type: string;
-  [key: string]: unknown;
-}
+type SseEvent = ChatWsEvent;
 
 interface ToolProgressEvent extends SseEvent {
   type: 'tool_progress';
@@ -82,67 +80,24 @@ interface BackgroundTaskRow {
   completed_at?: string | null;
 }
 
-async function chatSSE(
+/**
+ * M9-α-7 (#836): chat helper now drives the M9 WebSocket UI Protocol.
+ * Returns the same `{ events, content, doneEvent }` shape the SSE helper
+ * exposed so call sites stay unchanged.
+ */
+async function chatViaWs(
   message: string,
   sessionId: string,
   maxWait = 60_000,
 ): Promise<{ events: SseEvent[]; content: string; doneEvent?: SseEvent }> {
-  const resp = await fetch(`${BASE}/api/chat`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${TOKEN}`,
-      'X-Profile-Id': PROFILE,
-    },
-    body: JSON.stringify({ message, session_id: sessionId, stream: true }),
+  return chatWS({
+    baseUrl: BASE,
+    token: TOKEN,
+    profileId: PROFILE,
+    message,
+    sessionId,
+    maxWait,
   });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    if (resp.status === 502 || resp.status === 504) {
-      return { events: [], content: body || '(proxy timeout)' };
-    }
-    throw new Error(`Chat failed: ${resp.status} ${body.slice(0, 200)}`);
-  }
-  if (!resp.body) return { events: [], content: '' };
-
-  const events: SseEvent[] = [];
-  let content = '';
-  let doneEvent: SseEvent | undefined;
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const start = Date.now();
-  try {
-    while (Date.now() - start < maxWait) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop()!;
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (!data || data === '[DONE]') continue;
-        try {
-          const event: SseEvent = JSON.parse(data);
-          events.push(event);
-          if (event.type === 'replace' && typeof event.text === 'string') {
-            content = event.text;
-          }
-          if (event.type === 'done') {
-            doneEvent = event;
-            if (typeof event.content === 'string' && event.content) content = event.content;
-            return { events, content, doneEvent };
-          }
-        } catch {
-          /* skip malformed */
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return { events, content, doneEvent };
 }
 
 async function getTasks(sessionId: string): Promise<BackgroundTaskRow[]> {
@@ -203,7 +158,7 @@ test.describe('M8 pipeline end-to-end', () => {
   test('per-node tasks register under the run_pipeline parent task', async () => {
     const sid = `m8-pipe-tree-${Date.now()}`;
 
-    const { doneEvent, events } = await chatSSE(DEEP_RESEARCH_PROMPT, sid, 480_000);
+    const { doneEvent, events } = await chatViaWs(DEEP_RESEARCH_PROMPT, sid, 480_000);
     expect(doneEvent, 'expected SSE done').toBeTruthy();
 
     // Find the run_pipeline tool_call_id from the first ToolStarted event.
@@ -262,7 +217,7 @@ test.describe('M8 pipeline end-to-end', () => {
   test('tool_progress frames carry tool_call_id for every supervised event', async () => {
     const sid = `m8-pipe-tcid-${Date.now()}`;
 
-    const { events } = await chatSSE(DEEP_RESEARCH_PROMPT, sid, 480_000);
+    const { events } = await chatViaWs(DEEP_RESEARCH_PROMPT, sid, 480_000);
     const progressEvents = events.filter(
       (e): e is ToolProgressEvent => e.type === 'tool_progress',
     );
@@ -291,7 +246,7 @@ test.describe('M8 pipeline end-to-end', () => {
   test('plugin v2 progress events surface in runtime_detail', async () => {
     const sid = `m8-pipe-v2-${Date.now()}`;
 
-    const { doneEvent } = await chatSSE(DEEP_RESEARCH_PROMPT, sid, 480_000);
+    const { doneEvent } = await chatViaWs(DEEP_RESEARCH_PROMPT, sid, 480_000);
     expect(doneEvent, 'expected SSE done').toBeTruthy();
 
     const tasks = (await getTasks(sid)) ?? [];
@@ -348,7 +303,7 @@ test.describe('M8 pipeline end-to-end', () => {
       'investigation of the history of agentic AI from 2010 onward. Take ' +
       'your time, do many search passes, do not return early.';
     const start = Date.now();
-    const sseFinish = chatSSE(longPrompt, sid, 600_000);
+    const sseFinish = chatViaWs(longPrompt, sid, 600_000);
 
     // Wait until at least one supervised task is running.
     const runningTask = await pollUntil(
@@ -423,7 +378,7 @@ test.describe('M8 pipeline end-to-end', () => {
       'Use run_pipeline with deep_research to research a topic that does not ' +
       'exist: "the cohort of 0-source citations". Fail explicitly if you ' +
       'cannot find any sources. Do not invent.';
-    const { doneEvent } = await chatSSE(failPrompt, sid, 360_000);
+    const { doneEvent } = await chatViaWs(failPrompt, sid, 360_000);
     expect(doneEvent).toBeTruthy();
 
     const tasks = (await getTasks(sid)) ?? [];
