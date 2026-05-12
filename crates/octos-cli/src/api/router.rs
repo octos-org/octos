@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -109,6 +109,27 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // The sole chat transport is `/api/ui-protocol/ws`. The
     // harness/admin `/api/events/harness` SSE endpoint is unrelated to
     // chat and remains.
+    //
+    // M12 Phase D-5 (ADR PR #910 / audit PR #911): the auxiliary
+    // session/status REST surface has been retired and replaced by the
+    // WS UI Protocol v1 RPC methods on `/api/ui-protocol/ws`:
+    //
+    //   GET    /api/sessions                          → session/list
+    //   GET    /api/sessions/{id}/messages            → session/messages_page
+    //   GET    /api/sessions/{id}/status              → session/status.get
+    //   GET    /api/sessions/{id}/files               → session/files.list
+    //   GET    /api/sessions/{id}/tasks               → session/tasks.list
+    //   GET    /api/sessions/{id}/workspace-contract  → session/workspace.get
+    //   PATCH  /api/sessions/{id}/title               → session/title.set
+    //   DELETE /api/sessions/{id}                     → session/delete
+    //   GET    /api/status                            → system/status.get
+    //
+    // The handler functions are retained as private helpers because the
+    // WS dispatcher in `ui_protocol.rs` still reuses them to back the
+    // RPC methods above; only the REST route registrations are dropped.
+    // Auth (`/api/auth/*`), blob (`/api/files/*`), task-control
+    // (`/api/tasks/*`), chat ingress (`/api/ui-protocol/ws`), uploads,
+    // and site-preview remain REST per the ADR.
     let chat_api = Router::new()
         .route("/api/events/harness", get(events_harness::events_harness))
         .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
@@ -135,33 +156,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/files/list", get(handlers::list_content_files))
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
-        .route("/api/sessions", get(handlers::list_sessions))
-        .route(
-            "/api/sessions/{id}/messages",
-            get(handlers::session_messages),
-        )
-        // `/api/sessions/{id}/events/stream` (SSE) was deleted in
-        // M9-α-5/α-6 — every session-event subscriber now consumes the
-        // `session/event.v1` notification on `/api/ui-protocol/ws`.
-        .route("/api/sessions/{id}/status", get(handlers::session_status))
-        .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
-        .route("/api/sessions/{id}/files", get(handlers::session_files))
-        .route(
-            "/api/sessions/{id}/workspace-contract",
-            get(handlers::session_workspace_contract),
-        )
-        .route("/api/sessions/{id}", delete(handlers::delete_session))
-        .route(
-            "/api/sessions/{id}/title",
-            patch(handlers::update_session_title),
-        )
-        // M7.9 / W2 — task supervisor exposure
+        // M7.9 / W2 — task supervisor exposure (kept REST)
         .route("/api/tasks/{task_id}/cancel", post(handlers::cancel_task))
         .route(
             "/api/tasks/{task_id}/restart-from-node",
             post(handlers::restart_task_from_node),
-        )
-        .route("/api/status", get(handlers::status));
+        );
 
     // User self-service endpoints (user or admin auth)
     let my_api = Router::new()
@@ -170,7 +170,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
-        .route("/api/my/content", get(auth_handlers::my_content))
+        // M12 Phase D-5: `/api/my/content` (list), `/api/my/content/{id}`
+        // (delete), and `/api/my/content/bulk-delete` retired in favor of
+        // WS RPC methods `content/list`, `content/delete`, and
+        // `content/bulk_delete` on `/api/ui-protocol/ws`. The blob read
+        // endpoints (`/{id}/thumbnail`, `/{id}/body`) remain REST per ADR.
         .route(
             "/api/my/content/{id}/thumbnail",
             get(auth_handlers::my_content_thumbnail),
@@ -178,14 +182,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/my/content/{id}/body",
             get(auth_handlers::my_content_body),
-        )
-        .route(
-            "/api/my/content/{id}",
-            delete(auth_handlers::delete_my_content),
-        )
-        .route(
-            "/api/my/content/bulk-delete",
-            post(auth_handlers::bulk_delete_my_content),
         )
         .route(
             "/api/my/profile/start",
@@ -731,12 +727,14 @@ async fn user_auth_middleware(
         let uri_str = uri.path();
         // Allow proxy auth for chat- and session-scoped endpoints, not admin.
         // Task-control verbs (`/api/tasks/{id}/cancel`, `/restart-from-node`)
-        // are session-scoped — same trust posture as `/api/sessions`.
+        // are session-scoped — same trust posture as files/uploads. The
+        // legacy `/api/sessions`, `/api/status`, and `/api/chat` prefixes
+        // used to live here too; they were dropped together with the
+        // routes (M12 Phase D-5 retired sessions/status; the #908
+        // follow-up retired chat).
         if uri_str.starts_with("/api/ui-protocol")
             || uri_str.starts_with("/api/upload")
-            || uri_str.starts_with("/api/sessions")
             || uri_str.starts_with("/api/files")
-            || uri_str.starts_with("/api/status")
             || uri_str.starts_with("/api/tasks")
         {
             req.extensions_mut().insert(AuthIdentity::User {
@@ -867,8 +865,11 @@ mod tests {
 
     #[test]
     fn extract_token_no_auth_returns_empty() {
+        // Any URI works — `extract_token` only consults headers and the
+        // query string. `/api/version` is a stable surviving REST surface
+        // after the M12 Phase D-5 retirement of `/api/status`.
         let req = Request::builder()
-            .uri("/api/status")
+            .uri("/api/version")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "");
