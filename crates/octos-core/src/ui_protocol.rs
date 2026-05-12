@@ -286,6 +286,15 @@ pub mod rpc_error_codes {
 
     /// Spec §10 / M9-FIX-04 backpressure signal; carries `retry_after_ms` in `data`.
     pub const RATE_LIMITED: i64 = -32160;
+
+    /// Generic not-found error for non-session-scoped resources (content
+    /// catalog rows, profile records, ...) returned by REST 404. Distinct
+    /// from `UNKNOWN_SESSION` (-32100) which is reserved for session-scoped
+    /// 404s. M12 Phase D-1 introduced this slot when the REST→WS bridge
+    /// began surfacing content/profile 404s as typed errors; before, every
+    /// REST 404 was force-mapped to `UNKNOWN_SESSION` regardless of
+    /// resource kind.
+    pub const RESOURCE_NOT_FOUND: i64 = -32170;
 }
 
 /// Logical event-ledger cursor used for resumable UI notification consumption.
@@ -595,6 +604,31 @@ impl RpcError {
         Self::new(rpc_error_codes::RUNTIME_NOT_READY, message)
     }
 
+    /// Generic REST 404 for non-session-scoped resources (content catalog
+    /// rows, profile records, ...). Distinct from
+    /// [`Self::unknown_session`] which carries `session_id` in `data` for
+    /// session-scoped misses. M12 Phase D-1 added this so the REST→WS
+    /// bridge can surface content/profile 404s without misclassifying
+    /// them as session misses.
+    ///
+    /// `resource_type` is a short tag identifying the resource ("content",
+    /// "profile", ...); `identifier` is the resource id the client sent.
+    /// Both are echoed in `data` so clients can reconcile without parsing
+    /// the message string.
+    pub fn not_found(resource_type: impl Into<String>, identifier: impl Into<String>) -> Self {
+        let resource_type = resource_type.into();
+        let identifier = identifier.into();
+        Self::new(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            format!("{resource_type} not found: {identifier}"),
+        )
+        .with_data(serde_json::json!({
+            "kind": "not_found",
+            "resource_type": resource_type,
+            "identifier": identifier,
+        }))
+    }
+
     /// Result-side counterpart to `INVALID_PARAMS`. See
     /// [`rpc_error_codes::MALFORMED_RESULT`] for rationale.
     pub fn malformed_result(message: impl Into<String>) -> Self {
@@ -731,8 +765,10 @@ pub mod methods {
     // ---- M12 Phase D-1 auxiliary REST → WS surface ----
     // Each method below replaces a REST endpoint listed in the ADR's
     // inventory table (docs/adr/m12-phase-d-auxiliary-rest-to-ws.md).
-    // All twelve are capability-gated on
-    // `UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1`.
+    // All thirteen are capability-gated on
+    // `UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1`
+    // (`content/delete` and `content/bulk_delete` are distinct methods
+    // sharing the `content/*` namespace).
 
     /// Replaces `GET /api/sessions` — sidebar session list.
     pub const SESSION_LIST: &str = "session/list";
@@ -2174,11 +2210,23 @@ pub struct ContentDeleteResult {
     pub deleted: bool,
 }
 
-/// Params for `content/bulk_delete`.
+/// Params for `content/bulk_delete`. The `ids` vector is capped at
+/// [`CONTENT_BULK_DELETE_MAX_IDS`] entries; the WS dispatcher rejects
+/// over-cap requests with `INVALID_PARAMS` before any catalog write
+/// lock is taken, so a single oversized request cannot block other
+/// catalog readers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentBulkDeleteParams {
     pub ids: Vec<String>,
 }
+
+/// Server-side cap on `ContentBulkDeleteParams::ids` length. Mirrored
+/// in `crates/octos-cli/src/api/ui_protocol.rs` as the dispatcher's
+/// early-reject threshold. Chosen so a single bulk-delete cannot
+/// monopolize the catalog write-lock for more than a small bounded
+/// window even if every id is valid; the 1 MiB WS frame limit is a
+/// coarser secondary check.
+pub const CONTENT_BULK_DELETE_MAX_IDS: usize = 256;
 
 /// Result for `content/bulk_delete`. `deleted` is the number of catalog
 /// rows successfully removed — mirrors the count surfaced by the REST
@@ -6923,7 +6971,13 @@ mod tests {
         assert_eq!(
             cases.len(),
             13,
-            "13 UiCommand arms cover the 12 methods (bulk + single delete share namespace)"
+            "13 UiCommand arms cover the 13 auxiliary methods \
+             (`session/list`, `session/snapshot`, `session/messages_page`, \
+             `session/status.get`, `session/files.list`, `session/tasks.list`, \
+             `session/workspace.get`, `session/title.set`, `session/delete`, \
+             `system/status.get`, `content/list`, `content/delete`, \
+             `content/bulk_delete`) — `content/delete` and `content/bulk_delete` \
+             are distinct methods"
         );
         for (command, expected_method) in cases {
             let rpc = command
@@ -7072,6 +7126,318 @@ mod tests {
             );
         }
         assert!(with_feature.supports_feature(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 2): every M12 Phase D-1
+    /// request/result DTO must be pinned to a JSON-shape golden, not
+    /// just to a serde round-trip. A round-trip catches "can encode
+    /// and decode", but it does NOT catch "the field was renamed but
+    /// both ends agree on the rename" — exactly the failure mode we
+    /// care about when the WS bridge has to mirror REST DTOs that
+    /// live in a different crate. The literal-JSON asserts below
+    /// force a field rename (or a missing-field default flip) in any
+    /// REST DTO to fail this test before it lands.
+    #[test]
+    fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
+        // session/list — empty params
+        assert_eq!(
+            serde_json::to_value(SessionListParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+        let parsed: SessionListParams =
+            serde_json::from_value(serde_json::json!({})).expect("decode");
+        assert_eq!(parsed, SessionListParams::default());
+
+        // session/snapshot
+        let p = SessionSnapshotParams {
+            session_id: "sess-1".into(),
+            topic: Some("topic-x".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-1", "topic": "topic-x" }),
+        );
+        // Topic is optional — when absent, it must NOT serialize as
+        // `"topic": null`. Drift in the `skip_serializing_if`
+        // directive would flip the wire shape silently.
+        let p_no_topic = SessionSnapshotParams {
+            session_id: "sess-1".into(),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p_no_topic).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-1" }),
+        );
+
+        // session/messages_page
+        let p = SessionMessagesPageParams {
+            session_id: "sess-2".into(),
+            limit: Some(50),
+            offset: Some(10),
+            since_seq: Some(100),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({
+                "session_id": "sess-2",
+                "limit": 50,
+                "offset": 10,
+                "since_seq": 100,
+            }),
+        );
+
+        // session/status.get
+        let p = SessionStatusGetParams {
+            session_id: "sess-3".into(),
+            topic: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).expect("serialize"),
+            serde_json::json!({ "session_id": "sess-3" }),
+        );
+
+        // session/files.list
+        assert_eq!(
+            serde_json::to_value(SessionFilesListParams {
+                session_id: "sess-4".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-4" }),
+        );
+
+        // session/tasks.list
+        assert_eq!(
+            serde_json::to_value(SessionTasksListParams {
+                session_id: "sess-5".into(),
+                topic: Some("t".into()),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-5", "topic": "t" }),
+        );
+
+        // session/workspace.get
+        assert_eq!(
+            serde_json::to_value(SessionWorkspaceGetParams {
+                session_id: "sess-6".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-6" }),
+        );
+
+        // session/title.set
+        assert_eq!(
+            serde_json::to_value(SessionTitleSetParams {
+                session_id: "sess-7".into(),
+                title: "New title".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-7", "title": "New title" }),
+        );
+
+        // session/delete
+        assert_eq!(
+            serde_json::to_value(SessionDeleteParams {
+                session_id: "sess-8".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "sess-8" }),
+        );
+
+        // system/status.get — empty
+        assert_eq!(
+            serde_json::to_value(SystemStatusGetParams::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // content/list — free-form filters; default object is empty
+        assert_eq!(
+            serde_json::to_value(ContentListParams::default()).expect("serialize"),
+            serde_json::json!({ "filters": null }),
+        );
+        assert_eq!(
+            serde_json::to_value(ContentListParams {
+                filters: serde_json::json!({ "category": "image", "limit": 50 }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "filters": { "category": "image", "limit": 50 } }),
+        );
+
+        // content/delete
+        assert_eq!(
+            serde_json::to_value(ContentDeleteParams { id: "c-1".into() }).expect("serialize"),
+            serde_json::json!({ "id": "c-1" }),
+        );
+
+        // content/bulk_delete
+        assert_eq!(
+            serde_json::to_value(ContentBulkDeleteParams {
+                ids: vec!["c-1".into(), "c-2".into()],
+            })
+            .expect("serialize"),
+            serde_json::json!({ "ids": ["c-1", "c-2"] }),
+        );
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 2): JSON golden assertions for
+    /// every aux result DTO. Pinned wire shapes — a rename of any
+    /// field below must show up in this test before it reaches a
+    /// downstream client. Each `assert_eq!` is the contract.
+    #[test]
+    fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
+        // session/list — `{ sessions: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionListResult {
+                sessions: serde_json::json!([{ "id": "s-1" }]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
+        );
+
+        // session/snapshot — `{ status, files, tasks }`
+        assert_eq!(
+            serde_json::to_value(SessionSnapshotResult {
+                status: serde_json::json!({ "active": true }),
+                files: serde_json::json!([{ "path": "f.txt" }]),
+                tasks: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "status": { "active": true },
+                "files": [{ "path": "f.txt" }],
+                "tasks": [],
+            }),
+        );
+
+        // session/messages_page — `{ messages, has_more, next_offset }`
+        assert_eq!(
+            serde_json::to_value(SessionMessagesPageResult {
+                messages: serde_json::json!([]),
+                has_more: true,
+                next_offset: 200,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "messages": [],
+                "has_more": true,
+                "next_offset": 200,
+            }),
+        );
+
+        // session/status.get — `{ status: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionStatusGetResult {
+                status: serde_json::json!({ "active": false }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "status": { "active": false } }),
+        );
+
+        // session/files.list — `{ files: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionFilesListResult {
+                files: serde_json::json!([{ "path": "a.txt" }]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "files": [{ "path": "a.txt" }] }),
+        );
+
+        // session/tasks.list — `{ tasks: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionTasksListResult {
+                tasks: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "tasks": [] }),
+        );
+
+        // session/workspace.get — `{ contracts: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SessionWorkspaceGetResult {
+                contracts: serde_json::json!([]),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "contracts": [] }),
+        );
+
+        // session/title.set — `{ session_id, title }`
+        assert_eq!(
+            serde_json::to_value(SessionTitleSetResult {
+                session_id: "s-1".into(),
+                title: "Hello".into(),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "session_id": "s-1", "title": "Hello" }),
+        );
+
+        // session/delete — empty object
+        assert_eq!(
+            serde_json::to_value(SessionDeleteResult::default()).expect("serialize"),
+            serde_json::json!({}),
+        );
+
+        // system/status.get — `{ status: <opaque> }`
+        assert_eq!(
+            serde_json::to_value(SystemStatusGetResult {
+                status: serde_json::json!({ "version": "0.1.1" }),
+            })
+            .expect("serialize"),
+            serde_json::json!({ "status": { "version": "0.1.1" } }),
+        );
+
+        // content/list — `{ entries, total }`
+        assert_eq!(
+            serde_json::to_value(ContentListResult {
+                entries: serde_json::json!([{ "id": "c-1" }]),
+                total: 7,
+            })
+            .expect("serialize"),
+            serde_json::json!({
+                "entries": [{ "id": "c-1" }],
+                "total": 7,
+            }),
+        );
+
+        // content/delete — `{ deleted: bool }`
+        assert_eq!(
+            serde_json::to_value(ContentDeleteResult { deleted: true }).expect("serialize"),
+            serde_json::json!({ "deleted": true }),
+        );
+
+        // content/bulk_delete — `{ deleted: usize }`
+        assert_eq!(
+            serde_json::to_value(ContentBulkDeleteResult { deleted: 12 }).expect("serialize"),
+            serde_json::json!({ "deleted": 12 }),
+        );
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 1): the new
+    /// `RpcError::not_found(resource_type, identifier)` constructor
+    /// must carry the resource tag + identifier in `data` so clients
+    /// can distinguish a content-row miss from a session miss without
+    /// parsing message strings. Pinned via JSON golden.
+    #[test]
+    fn rpc_error_not_found_carries_typed_resource_data() {
+        let err = RpcError::not_found("content", "c-99");
+        assert_eq!(err.code, rpc_error_codes::RESOURCE_NOT_FOUND);
+        let value = serde_json::to_value(&err).expect("serialize");
+        assert_eq!(value.get("code"), Some(&json!(-32170)));
+        let data = value.get("data").expect("data present");
+        assert_eq!(data.get("kind"), Some(&json!("not_found")));
+        assert_eq!(data.get("resource_type"), Some(&json!("content")));
+        assert_eq!(data.get("identifier"), Some(&json!("c-99")));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 3): the bulk-delete cap is
+    /// part of the wire contract and must not drift silently. Pin
+    /// the constant value to 256 so a future bump shows up as a
+    /// test diff.
+    #[test]
+    fn content_bulk_delete_max_ids_constant_is_pinned() {
+        assert_eq!(
+            CONTENT_BULK_DELETE_MAX_IDS, 256,
+            "wire-contract cap; bump server dispatcher AND any client adapters together",
+        );
     }
 
     // ===== UPCR-2026-014 M9-γ projection envelope golden tests =====
