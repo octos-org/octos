@@ -93,9 +93,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/logout", post(auth_handlers::logout));
 
     // Chat + status API (existing)
+    //
+    // M9-α-5/α-6 (ADR PR #830 / audit issue #845): the chat SSE
+    // transport (`POST /api/chat?stream=true`, `GET /api/chat/stream`,
+    // `GET /api/sessions/:id/events/stream`) has been deleted. The
+    // sole chat transport is `/api/ui-protocol/ws`. The legacy text-
+    // frame `/api/ws` and the harness/admin `/api/events/harness` SSE
+    // endpoint are unrelated to chat and remain.
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
-        .route("/api/chat/stream", get(handlers::chat_stream))
         .route("/api/events/harness", get(events_harness::events_harness))
         .route("/api/ws", get(handlers::ws_handler))
         .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
@@ -127,10 +133,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/messages",
             get(handlers::session_messages),
         )
-        .route(
-            "/api/sessions/{id}/events/stream",
-            get(handlers::session_event_stream),
-        )
+        // `/api/sessions/{id}/events/stream` (SSE) was deleted in
+        // M9-α-5/α-6 — every session-event subscriber now consumes the
+        // `session/event.v1` notification on `/api/ui-protocol/ws`.
         .route("/api/sessions/{id}/status", get(handlers::session_status))
         .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
         .route("/api/sessions/{id}/files", get(handlers::session_files))
@@ -839,7 +844,7 @@ mod tests {
     #[test]
     fn extract_token_from_query_param() {
         let req = Request::builder()
-            .uri("/api/chat/stream?token=query-tok")
+            .uri("/api/ui-protocol/ws?token=query-tok")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "query-tok");
@@ -848,7 +853,7 @@ mod tests {
     #[test]
     fn extract_token_header_takes_precedence() {
         let req = Request::builder()
-            .uri("/api/chat/stream?token=query-tok")
+            .uri("/api/ui-protocol/ws?token=query-tok")
             .header("authorization", "Bearer header-tok")
             .body(axum::body::Body::empty())
             .unwrap();

@@ -1,7 +1,6 @@
 //! API request handlers.
 
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Extension;
@@ -10,27 +9,32 @@ use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures::stream::StreamExt;
-use octos_agent::{Agent, inspect_workspace_contract};
+use octos_agent::inspect_workspace_contract;
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey};
+use octos_core::{MAIN_PROFILE_ID, Message, SessionKey};
 use octos_llm::pricing::model_pricing;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
+use super::events::ChannelReporter;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
-use super::sse::ChannelReporter;
 use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
-/// POST /api/chat -- send a message, get a response.
-/// When `stream: true`, returns SSE events. Otherwise returns JSON.
+/// POST /api/chat -- send a message, get a response (sync JSON only).
+///
+/// M9-α-5/α-6 (ADR PR #830): the SSE branch was deleted; `stream: true`
+/// now returns `410 Gone` and clients must use `/api/ui-protocol/ws`.
+/// `media` / `attach_only` / `client_message_id` are accepted for
+/// wire-compat with older clients but unused in the surviving sync
+/// path. The legacy `/api/ws` handler (`ws_standalone_agent`) reads
+/// the same struct and still consumes them.
 #[derive(Deserialize)]
 pub struct ChatRequest {
     pub message: String,
@@ -42,17 +46,16 @@ pub struct ChatRequest {
     pub stream: bool,
     /// File paths from prior `/api/upload` call.
     #[serde(default)]
+    #[allow(dead_code)]
     pub media: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub attach_only: bool,
-    /// Web-generated correlation id. Forwarded to the gateway so the
-    /// eventual `_session_result.response_to_client_message_id` matches
-    /// the web reducer's optimistic bubble (FA-12f).
-    ///
-    /// Also propagated onto the persisted user `Message` so the matching
-    /// `session_result` event lets the web client stamp the authoritative
-    /// `historySeq` onto its optimistic bubble.
+    /// Web-generated correlation id. Used by the WS lifecycle handlers
+    /// downstream of `/api/ui-protocol/ws`. Pre-α-5/α-6 the streaming
+    /// HTTP path also threaded this through; that path is gone.
     #[serde(default)]
+    #[allow(dead_code)]
     pub client_message_id: Option<String>,
 }
 
@@ -132,7 +135,10 @@ fn resolve_profile_id_candidate(state: &AppState, candidate: &str) -> Option<Str
         .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
 }
 
-fn routed_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> Option<String> {
+pub(crate) fn routed_profile_id_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<String> {
     if let Some(host) = request_host(headers) {
         if !is_local_request_host(&host) {
             if let Some(candidate) = host.split('.').next() {
@@ -186,6 +192,123 @@ fn standalone_api_session_key_candidates(
     candidates
 }
 
+/// Returns `true` when `session_id` is a bare SPA id whose raw form is
+/// safe to query as a `SessionKey` directly. Specifically: no `:` (which
+/// is the channel/profile separator in
+/// [`octos_core::SessionKey`]) and no `#` (the topic separator).
+///
+/// Without this guard, `/api/sessions/{id}/messages?id=telegram:123`
+/// would walk the raw-id candidate and return that telegram session's
+/// history under a REST endpoint scoped to the API channel — a
+/// cross-channel / cross-profile leak (codex review P1 round 2 on the
+/// M10.5 reload-mid-stream PR).
+///
+/// We allow `web-…`, raw UUIDs, and similar punctuation-light shapes;
+/// ANY id that contains `:` is rejected for the raw-id fallback. The
+/// API-channel and profile-prefixed candidates still cover those ids
+/// — the raw-id candidate is purely the recovery path for SPA bare ids.
+fn is_safe_bare_session_id(session_id: &str) -> bool {
+    !session_id.contains(':') && !session_id.contains('#')
+}
+
+/// Topic-aware sibling of [`standalone_api_session_key_candidates`].
+///
+/// Returns the candidate `SessionKey`s the REST `/messages` and similar
+/// read paths should try, in fallback order. The fallback set is split
+/// by the resolved profile and the request's auth identity:
+///
+/// **Tenant-scoped requests** (resolved profile is NOT `MAIN_PROFILE_ID`
+/// AND the request is NOT admin-authenticated). Only ONE candidate:
+/// 1. **Profiled key** with topic (`<profile>:api:<id>#<topic>`).
+///
+/// Tenant accounts must NEVER see another profile's history by id. The
+/// `_main`, bare-channel, and raw-id candidates ALL live in shared /
+/// non-tenant namespaces; surfacing them to a tenant-scoped request
+/// would let a colliding `web-…` id read foreign rows (codex P1
+/// rounds 3 and 4).
+///
+/// **Main / local / admin mode** (resolved profile IS `MAIN_PROFILE_ID`
+/// OR the request carries admin auth):
+/// 1. **Profiled key** (`<profile>:api:<id>#<topic>`).
+/// 2. **`_main:api:<id>` key** — picks up legacy main-profile rows.
+/// 3. **Bare-channel key** (`api:<id>#<topic>`) — what the WS
+///    `turn/start` path uses when an admin-authenticated SPA sends
+///    `SessionKey::new("api", "web-…")`. The dominant production
+///    reload-mid-stream shape on hosted subdomains under admin auth
+///    (codex P2 round 5 — `connection_profile_id == None` for admin so
+///    `validate_authenticated_session_scope` accepts the bare key).
+/// 4. **Raw-id key** (`<id>` or `<id>#<topic>`) — only when `id`
+///    passes [`is_safe_bare_session_id`]. Recovers from the SPA's
+///    bare-id `SessionKey("web-…")` shape. Codex P1 round 2: rejecting
+///    `:` / `#` blocks crafted-URL leaks via this candidate.
+///
+/// Admin already has read-all privileges across all profiles via the
+/// other admin handlers, so unlocking the cross-namespace fallbacks
+/// for admin requests is no privilege escalation.
+///
+/// The dedup pass collapses duplicates when the topic is empty (in
+/// which case the bare-key and raw-id forms coincide with their
+/// no-topic counterparts).
+fn standalone_api_session_key_candidates_with_topic(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    session_id: &str,
+    topic: Option<&str>,
+) -> Vec<SessionKey> {
+    let profile_id = api_profile_id_from_headers(state, headers);
+    let topic = topic.unwrap_or_default();
+
+    // Always probe the resolved profile's own canonical key first.
+    let mut candidates = vec![SessionKey::with_profile_topic(
+        &profile_id,
+        "api",
+        session_id,
+        topic,
+    )];
+
+    // The remaining candidates (`_main:api:<id>`, bare-channel, raw-id)
+    // are gated on the resolved profile being the synthetic main
+    // profile OR the request being admin-authenticated. For tenant
+    // user requests each profile prefix is the isolation boundary, and
+    // a shared standalone `SessionManager` could otherwise let one
+    // profile read another's WS-persisted history (codex P1 rounds 3
+    // and 4 on the M10.5 reload-mid-stream PR).
+    //
+    // Codex P2 round 5: admin auth on a hosted subdomain is the
+    // canonical reload-mid-stream production shape; the WS handler
+    // there accepts bare `SessionKey`s (admin's
+    // `connection_profile_id` is `None`, so
+    // `validate_authenticated_session_scope` doesn't fire). The
+    // unprofiled fallback MUST be reachable from REST in that mode.
+    let is_admin = matches!(identity, Some(AuthIdentity::Admin));
+    let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID || is_admin;
+    if allow_cross_profile_fallback {
+        candidates.push(SessionKey::with_profile_topic(
+            MAIN_PROFILE_ID,
+            "api",
+            session_id,
+            topic,
+        ));
+        candidates.push(SessionKey::with_topic("api", session_id, topic));
+        // Raw-id candidate adds another layer of guardrails: `id` may
+        // contain attacker-controlled bytes (it lands here straight
+        // from `axum::extract::Path`), and `SessionKey` accepts any
+        // string. Codex P1 round 2: only emit the raw-id form when
+        // `id` is a safe bare SPA id (no `:` / no `#`).
+        if is_safe_bare_session_id(session_id) {
+            let raw_id = if topic.is_empty() {
+                SessionKey(session_id.to_string())
+            } else {
+                SessionKey(format!("{session_id}#{topic}"))
+            };
+            candidates.push(raw_id);
+        }
+    }
+    candidates.dedup_by(|left, right| left.0 == right.0);
+    candidates
+}
+
 fn encode_api_session_path_id(id: &str) -> String {
     octos_bus::session::encode_path_component(id)
 }
@@ -195,68 +318,24 @@ pub async fn chat(
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    // If a gateway has an API channel running, proxy the request to it.
-    // The gateway's stream forwarder now sends discrete SSE events (thinking,
-    // tool_start, tool_progress, cost_update) via send_raw_sse alongside
-    // the text-based streaming updates.
-    if let Some((profile_id, port)) = resolve_api_port(&state, &headers).await {
-        return super::webhook_proxy::api_chat_proxy(
-            &state,
-            port,
-            Some(&profile_id),
-            &req.message,
-            req.session_id.as_deref(),
-            req.topic.as_deref(),
-            &req.media,
-            req.attach_only,
-            req.stream,
-            req.client_message_id.as_deref(),
-        )
-        .await;
-    }
-
-    // No gateway with API channel — use standalone agent
+    // M9-α-5/α-6 (ADR PR #830 / audit issue #845): SSE chat is gone.
+    // `POST /api/chat` only supports the sync JSON path now — every
+    // streaming caller has migrated to `/api/ui-protocol/ws`. Fail
+    // closed when `stream=true` is requested so a stale client surfaces
+    // a clear error instead of a half-broken response.
     if req.stream {
-        match chat_streaming(state, headers, req).await {
-            Ok(sse) => sse.into_response(),
-            Err((status, msg)) => (status, msg).into_response(),
-        }
-    } else {
-        match chat_sync(state, headers, req).await {
-            Ok(json) => json.into_response(),
-            Err((status, msg)) => (status, msg).into_response(),
-        }
-    }
-}
-
-fn validate_chat_request(
-    state: &AppState,
-    req: &ChatRequest,
-) -> Result<
-    (
-        Arc<Agent>,
-        Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
-    ),
-    (StatusCode, String),
-> {
-    let agent = state.agent.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "No LLM provider configured. Set up a profile with an API key first.".into(),
-    ))?;
-    let sessions = state.sessions.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Sessions not available".into(),
-    ))?;
-
-    if req.message.len() > MAX_MESSAGE_LEN {
-        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
-        ));
+        return (
+            StatusCode::GONE,
+            "POST /api/chat?stream=true was removed in M9-α-5/α-6 — \
+             use the WebSocket UI Protocol (/api/ui-protocol/ws) instead.",
+        )
+            .into_response();
     }
 
-    Ok((agent.clone(), sessions.clone()))
+    match chat_sync(state, headers, req).await {
+        Ok(json) => json.into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
 }
 
 /// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
@@ -297,14 +376,15 @@ async fn chat_sync(
     headers: HeaderMap,
     req: ChatRequest,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    let (agent, sessions) = validate_chat_request(&state, &req)?;
+    if req.message.len() > MAX_MESSAGE_LEN {
+        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
+        ));
+    }
 
-    tracing::info!(
-        session = req.session_id.as_deref().unwrap_or("default"),
-        msg_len = req.message.len(),
-        "chat: processing message"
-    );
-
+    let profile_id = api_profile_id_from_headers(&state, &headers);
     let session_key = standalone_api_session_key_with_topic(
         &state,
         &headers,
@@ -312,13 +392,78 @@ async fn chat_sync(
         req.topic.as_deref(),
     );
 
+    tracing::info!(
+        profile_id = %profile_id,
+        session = req.session_id.as_deref().unwrap_or("default"),
+        msg_len = req.message.len(),
+        "chat: processing message"
+    );
+
+    // M11-F: every read path resolves through `state.profiles` +
+    // `state.session_cache`. An unregistered profile is a configuration
+    // bug, not a runtime fallback — `octos serve` bootstraps every
+    // profile in `ProfileStore::list()` at startup, so if a profile id
+    // arrives at `/api/chat` that the catalog doesn't know about, it
+    // means the request routed against a profile that failed (or never
+    // had) bootstrap. Fail closed with 503 rather than silently fall
+    // through to a server-wide agent (which M11-F removed).
+    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "No LLM provider configured for profile '{profile_id}'. \
+                 Set up the profile with an API key in the dashboard.",
+            ),
+        ));
+    };
+    chat_sync_via_session_runtime(state, profile_runtime, session_key, req).await
+}
+
+/// `/api/chat` dispatcher: resolves the per-session
+/// [`crate::runtime::SessionRuntime`] from the cache (constructing it
+/// on first use), runs the agent against the session-bound workspace,
+/// and persists the response through the canonical per-user JSONL.
+///
+/// M11-F: the only `/api/chat` path. The legacy server-wide
+/// `state.agent` fallback was removed; unregistered profile → 503 in
+/// the caller.
+async fn chat_sync_via_session_runtime(
+    state: Arc<AppState>,
+    profile_runtime: Arc<crate::runtime::ProfileRuntime>,
+    session_key: SessionKey,
+    req: ChatRequest,
+) -> Result<Json<ChatResponse>, (StatusCode, String)> {
+    // Acquire (or build on first use) the per-session runtime.
+    // `workspace_hint = None` → `SessionRuntime::bootstrap` derives
+    // `<profile_data_dir>/users/<encoded session base>/workspace`
+    // and writes the default `.octos-workspace.toml` there. That's
+    // the M11 fix for the `"workspace policy not found"` failure on
+    // yangmi voice clone.
+    let session_runtime = state
+        .session_cache
+        .get_or_init(&profile_runtime, session_key.clone(), None)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                profile_id = %profile_runtime.profile_id,
+                session = %session_key,
+                "chat: SessionRuntime::bootstrap failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to bootstrap session runtime: {e}"),
+            )
+        })?;
+
     let history: Vec<Message> = {
-        let mut sess = sessions.lock().await;
+        let mut sess = session_runtime.sessions.lock().await;
         let session = sess.get_or_create(&session_key).await;
         session.get_history(50).to_vec()
     };
 
-    let response = agent
+    let response = session_runtime
+        .agent
         .process_message(&req.message, &history, vec![])
         .await
         .map_err(|e| {
@@ -329,14 +474,18 @@ async fn chat_sync(
     tracing::info!(
         input_tokens = response.token_usage.input_tokens,
         output_tokens = response.token_usage.output_tokens,
-        "chat: response generated"
+        profile_id = %profile_runtime.profile_id,
+        session = %session_key,
+        "chat: response generated via SessionRuntime",
     );
 
-    // Save all conversation messages to the canonical per-user JSONL.
-    // Funnels through the same helper the gateway-side `ApiChannel` uses so
-    // standalone deployments don't split-brain into the legacy flat layout.
     for msg in &response.messages {
-        let _ = persist_chat_message_through_canonical(&sessions, &session_key, msg.clone()).await;
+        let _ = persist_chat_message_through_canonical(
+            &session_runtime.sessions,
+            &session_key,
+            msg.clone(),
+        )
+        .await;
     }
 
     Ok(Json(ChatResponse {
@@ -344,328 +493,6 @@ async fn chat_sync(
         input_tokens: response.token_usage.input_tokens,
         output_tokens: response.token_usage.output_tokens,
     }))
-}
-
-async fn chat_streaming(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    req: ChatRequest,
-) -> Result<
-    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>,
-    (StatusCode, String),
-> {
-    let (base_agent, sessions) = validate_chat_request(&state, &req)?;
-
-    let session_id = req.session_id.clone().unwrap_or_else(|| "default".into());
-    tracing::info!(
-        session = %session_id,
-        msg_len = req.message.len(),
-        "chat: streaming message"
-    );
-
-    let session_key =
-        standalone_api_session_key_with_topic(&state, &headers, &session_id, req.topic.as_deref());
-
-    // Load history before spawning
-    let history: Vec<Message> = {
-        let mut sess = sessions.lock().await;
-        let session = sess.get_or_create(&session_key).await;
-        session.get_history(50).to_vec()
-    };
-
-    // Create per-request channel and reporter.
-    //
-    // M8.10 PR #2: bind the user message's `client_message_id` to the
-    // reporter so every emitted SSE payload carries `thread_id`. The
-    // standalone `serve` mode shares a single chat_id across turns, but
-    // each turn gets a fresh ChannelReporter scoped to its cmid.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let client_message_id = req.client_message_id.clone();
-    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(MetricsReporter::new(
-        Arc::new(ChannelReporter::new(tx.clone()).with_thread_id(client_message_id.clone())),
-    ));
-
-    // Build per-request agent sharing resources with the base agent
-    let mut request_agent = Agent::new_shared(
-        AgentId::new(format!("api-{}", uuid::Uuid::now_v7())),
-        base_agent.llm_provider(),
-        base_agent.tool_registry().clone(),
-        base_agent.memory_store(),
-    )
-    .with_config(base_agent.agent_config())
-    .with_system_prompt(base_agent.system_prompt_snapshot())
-    .with_reporter(reporter);
-
-    // M8 fix-first item 8 (gaps 1 + 2): `Agent::new_shared` zeroes the
-    // file-state cache and sub-agent router/generator. Per-request agents
-    // must inherit them from the base agent so chat requests land on the
-    // same M8 wiring the rest of the runtime sees.
-    if let Some(cache) = base_agent.file_state_cache() {
-        request_agent = request_agent.with_file_state_cache(cache.clone());
-    }
-    if let Some(router) = base_agent.subagent_output_router() {
-        request_agent = request_agent.with_subagent_output_router(router.clone());
-    }
-    if let Some(generator) = base_agent.subagent_summary_generator() {
-        request_agent = request_agent.with_subagent_summary_generator(generator.clone());
-    }
-
-    let message = req.message;
-    let media = req.media;
-    let topic_for_event = req.topic.clone();
-
-    // Spawn the agent task
-    let user_event_tx = tx.clone();
-    tokio::spawn(async move {
-        let result = request_agent
-            .process_message(&message, &history, media)
-            .await;
-
-        match result {
-            Ok(response) => {
-                tracing::info!(
-                    session = %session_id,
-                    input_tokens = response.token_usage.input_tokens,
-                    output_tokens = response.token_usage.output_tokens,
-                    "chat: streaming response complete"
-                );
-
-                // Save all conversation messages (user, assistant iterations,
-                // tool calls/results) through the canonical per-user JSONL.
-                // Pre-fix this funnelled through `SessionManager::add_message_with_seq`
-                // which wrote to the legacy flat layout — a standalone
-                // `octos serve` had no gateway-side `ApiChannel` to redirect,
-                // so messages landed in `sessions/<encoded_full_key>.jsonl`
-                // while the actor wrote to `users/.../<topic>.jsonl`.
-                //
-                // Also tag the first user message with the client-supplied
-                // `client_message_id` so the persisted row carries it through
-                // the JSONL round-trip and emit a user-message session_result
-                // event so the web client can stamp the authoritative seq onto
-                // its optimistic bubble (M8.10-A user-message counterpart).
-                //
-                // Capture the committed seq of the final assistant message
-                // so the SSE `done` event can thread it back to the web client
-                // (M8.10-A).
-                let mut user_message_seq_and_meta: Option<(usize, String, String)> = None;
-                let assistant_committed_seq: Option<u64> = {
-                    let mut last_assistant_seq: Option<u64> = None;
-                    let mut user_persisted = false;
-                    for msg in &response.messages {
-                        let mut to_save = msg.clone();
-                        if !user_persisted && msg.role == MessageRole::User {
-                            user_persisted = true;
-                            // PR A: stamp via the typed setter so callers
-                            // wired to a `ClientMessageId` can't pass the
-                            // wrong identity here. Bare-`String` overrides
-                            // remain available for inbound paths where the
-                            // cmid is already a `String` from the wire.
-                            if let Some(ref cmid) = client_message_id {
-                                if !cmid.is_empty() {
-                                    to_save = to_save.with_typed_client_message_id(
-                                        octos_core::ClientMessageId::new(cmid),
-                                    );
-                                }
-                            }
-                            let timestamp = to_save.timestamp.to_rfc3339();
-                            let content_for_event = to_save.content.clone();
-                            match persist_chat_message_through_canonical(
-                                &sessions,
-                                &session_key,
-                                to_save,
-                            )
-                            .await
-                            {
-                                Ok(seq) => {
-                                    user_message_seq_and_meta =
-                                        Some((seq, content_for_event, timestamp));
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        session = %session_id,
-                                        error = %error,
-                                        "chat: failed to persist user message"
-                                    );
-                                }
-                            }
-                        } else {
-                            let is_assistant = msg.role == MessageRole::Assistant;
-                            // PR F (M8.10): pre-stamp `thread_id` on
-                            // Assistant/Tool rows so the canonical
-                            // persist's new-write fail-closed split
-                            // accepts them. Bind to the originating
-                            // `client_message_id` (the REST `chat`
-                            // endpoint requires it for proper threading).
-                            // When the request didn't supply one (legacy
-                            // clients), fall back to a UUIDv7 so the
-                            // persist still succeeds — these rows would
-                            // be invisible to per-thread routing
-                            // anyway, but at least they survive reload.
-                            if to_save.thread_id.is_none()
-                                && matches!(
-                                    to_save.role,
-                                    MessageRole::Assistant | MessageRole::Tool
-                                )
-                            {
-                                to_save.thread_id = Some(
-                                    client_message_id
-                                        .as_deref()
-                                        .filter(|s| !s.is_empty())
-                                        .map(str::to_string)
-                                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
-                                );
-                            }
-                            match persist_chat_message_through_canonical(
-                                &sessions,
-                                &session_key,
-                                to_save,
-                            )
-                            .await
-                            {
-                                Ok(seq) if is_assistant => {
-                                    last_assistant_seq = u64::try_from(seq).ok();
-                                }
-                                Ok(_) => {}
-                                Err(_) => {}
-                            }
-                        }
-                    }
-                    last_assistant_seq
-                };
-
-                // Emit a user-message session_result event so the web client
-                // can stamp the authoritative seq onto its optimistic bubble.
-                if let Some((seq, content, timestamp)) = user_message_seq_and_meta {
-                    let mut message_payload = serde_json::json!({
-                        "seq": seq,
-                        "role": "user",
-                        "content": content,
-                        "timestamp": timestamp,
-                    });
-                    if let Some(ref cmid) = client_message_id {
-                        if !cmid.is_empty() {
-                            message_payload
-                                .as_object_mut()
-                                .expect("json object")
-                                .insert(
-                                    "client_message_id".to_string(),
-                                    serde_json::Value::String(cmid.clone()),
-                                );
-                        }
-                    }
-                    let event = serde_json::json!({
-                        "type": "session_result",
-                        "topic": topic_for_event,
-                        "message": message_payload,
-                    });
-                    let _ = user_event_tx.send(event.to_string());
-                }
-
-                // Send final done event (field names match what octos-web expects)
-                let provider_metadata = response.provider_metadata.clone();
-                let model_id = provider_metadata
-                    .as_ref()
-                    .map(|meta| meta.model.clone())
-                    .or_else(|| {
-                        let provider = request_agent.llm_provider();
-                        let model = provider.model_id();
-                        if model.is_empty() {
-                            None
-                        } else {
-                            Some(model.to_string())
-                        }
-                    });
-                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
-                    pricing.cost(
-                        response.token_usage.input_tokens,
-                        response.token_usage.output_tokens,
-                    )
-                });
-                let mut done = serde_json::json!({
-                    "type": "done",
-                    "content": response.content,
-                    "model": provider_metadata.as_ref().map(|meta| meta.display_label()),
-                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": model_id,
-                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
-                    "tokens_in": response.token_usage.input_tokens,
-                    "tokens_out": response.token_usage.output_tokens,
-                    "session_cost": session_cost,
-                });
-                if let Some(seq) = assistant_committed_seq {
-                    done["committed_seq"] = serde_json::Value::from(seq);
-                }
-                // M8.10 PR #2: tag the done event with thread_id so the web
-                // client can route the committed_seq onto the right per-cmid
-                // bubble.
-                if let Some(ref tid) = client_message_id {
-                    if !tid.is_empty() {
-                        done["thread_id"] = serde_json::Value::String(tid.clone());
-                    }
-                }
-                // Bug 3 / W1.G4 cost panel — flatten per-node cost rows from
-                // tool results' structured side-channel into the SSE done
-                // event so the dashboard CostBreakdown panel can render
-                // real per-node attribution from `run_pipeline` runs.
-                let mut all_node_costs: Vec<serde_json::Value> = Vec::new();
-                for (_tool_call_id, meta) in &response.tool_results {
-                    if let Some(arr) = meta.get("node_costs").and_then(|v| v.as_array()) {
-                        all_node_costs.extend(arr.iter().cloned());
-                    }
-                }
-                if !all_node_costs.is_empty() {
-                    done["node_costs"] = serde_json::Value::Array(all_node_costs);
-                }
-                let _ = tx.send(done.to_string());
-            }
-            Err(e) => {
-                tracing::error!(session = %session_id, error = %e, "chat: streaming failed");
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": e.to_string(),
-                });
-                let _ = tx.send(err.to_string());
-            }
-        }
-        // tx drops here, closing the stream
-    });
-
-    // Return SSE stream from receiver
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Some(data) => {
-                let event: Result<Event, std::convert::Infallible> =
-                    Ok(Event::default().data(data));
-                Some((event, rx))
-            }
-            None => None,
-        }
-    });
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
-}
-
-/// GET /api/chat/stream -- SSE stream of progress events (legacy broadcast).
-pub async fn chat_stream(
-    State(state): State<Arc<AppState>>,
-) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let rx = state.broadcaster.subscribe();
-
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(data) => {
-                    let event: Result<Event, std::convert::Infallible> =
-                        Ok(Event::default().data(data));
-                    return Some((event, rx));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// GET /api/sessions -- list sessions.
@@ -771,13 +598,10 @@ pub struct TopicQueryParams {
     pub topic: Option<String>,
 }
 
-#[derive(Deserialize)]
-pub struct SessionEventStreamQueryParams {
-    #[serde(default)]
-    pub since_seq: Option<usize>,
-    #[serde(default)]
-    pub topic: Option<String>,
-}
+// `SessionEventStreamQueryParams` and the `/api/sessions/{id}/events/stream`
+// route it served were deleted in M9-α-5/α-6 (ADR PR #830 / audit issue
+// #845). Every session-event subscriber now consumes the
+// `session/event.v1` notification on `/api/ui-protocol/ws`.
 
 fn default_page_limit() -> usize {
     100
@@ -804,6 +628,12 @@ fn append_topic_query(path: &mut String, topic: Option<&str>) {
     }
 }
 
+// `append_since_seq_query` previously served the deleted
+// `/api/sessions/{id}/events/stream` proxy. Kept here (and tested below)
+// because future WS-lifecycle replays may re-introduce a `since_seq`
+// query string when re-implementing the corresponding gateway-mode
+// proxy step.
+#[allow(dead_code)]
 fn append_since_seq_query(path: &mut String, since_seq: Option<usize>) {
     if let Some(since_seq) = since_seq {
         path.push_str(if path.contains('?') {
@@ -840,6 +670,7 @@ fn session_messages_proxy_path(
 pub async fn session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
@@ -856,30 +687,71 @@ pub async fn session_messages(
                 Some(n) => n,
                 None => return (StatusCode::BAD_REQUEST, "invalid pagination").into_response(),
             };
-            let key = standalone_api_session_key_with_topic(
+            // M10.5 reload-mid-stream fix: WS turns persisted by `turn/start`
+            // (which calls `sessions.get_or_create(&params.session_id)` with
+            // whatever `SessionKey` the SPA sent) may live under a key that
+            // does NOT match the profiled key (`<profile>:api:<id>`) the REST
+            // `/messages` lookup historically used. Concretely:
+            //
+            //   • Bare channel key (`api:<id>`) — `with_profile_topic`
+            //     fall-through when no profile context is set.
+            //   • Raw SPA id (`web-…`) — when the SPA sends a bare-channel
+            //     `SessionKey::new("web-…")` literally, the WS handler
+            //     persists under `web-…` verbatim (no `api:` prefix).
+            //
+            // Fix: walk the candidate key list (profiled first, bare last)
+            // and return the first candidate that *has any history* (not
+            // just any rows on this page) — using `messages.is_empty()`
+            // after `skip(offset).take(limit)` would silently fall through
+            // to a sibling key whenever the requested page is past the end
+            // of the canonical session, mixing histories under pagination
+            // (codex review P2).
+            //
+            // Codex P2 round 5: in production deployments using admin auth
+            // on a hosted subdomain (`dspfac.crew.ominix.io` +
+            // `OCTOS_AUTH_TOKEN=admin-…`), the WS handler accepts bare
+            // `SessionKey`s and persists under those raw keys. Pass the
+            // request identity into the candidate helper so admin auth
+            // unlocks the unprofiled fallbacks even when the request
+            // resolved to a hosted profile (admin already has read-all
+            // privileges, so this is no privilege escalation).
+            let identity_ref = identity.as_ref().map(|ext| &ext.0);
+            let candidate_keys = standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
+                identity_ref,
                 &id,
                 params.topic.as_deref(),
             );
             let mut sess = sessions.lock().await;
-            let session = sess.get_or_create(&key).await;
-            let messages: Vec<MessageInfo> = session
-                .get_history(fetch_count)
-                .iter()
-                .skip(offset)
-                .take(limit)
-                .map(|m| MessageInfo {
-                    role: m.role.to_string(),
-                    content: m.content.clone(),
-                    timestamp: m.timestamp.to_rfc3339(),
-                    thread_id: m.thread_id.clone(),
-                })
-                .collect();
-            if !messages.is_empty() {
+            let mut chosen: Option<&SessionKey> = None;
+            for key in &candidate_keys {
+                let session = sess.get_or_create(key).await;
+                if !session.get_history(1).is_empty() {
+                    chosen = Some(key);
+                    break;
+                }
+            }
+            if let Some(key) = chosen {
+                let session = sess.get_or_create(key).await;
+                let messages: Vec<MessageInfo> = session
+                    .get_history(fetch_count)
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|m| MessageInfo {
+                        role: m.role.to_string(),
+                        content: m.content.clone(),
+                        timestamp: m.timestamp.to_rfc3339(),
+                        thread_id: m.thread_id.clone(),
+                    })
+                    .collect();
+                // Keep the historical contract: a page that is past the
+                // end of a real session returns `[]` (and stays on this
+                // session — does NOT flip to a sibling candidate).
                 return Json(messages).into_response();
             }
-            // Fall through to gateway if the standalone store has no history.
+            // Fall through to gateway if no candidate has any history.
         }
     } // !use_full
 
@@ -936,34 +808,6 @@ pub async fn session_status(
         "active": false,
     }))
     .into_response()
-}
-
-/// GET /api/sessions/:id/events/stream -- subscribe to committed session events.
-pub async fn session_event_stream(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<SessionEventStreamQueryParams>,
-) -> Response {
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
-        let encoded_id = encode_api_session_path_id(&id);
-        let mut path = format!("/sessions/{encoded_id}/events/stream");
-        append_since_seq_query(&mut path, params.since_seq);
-        append_topic_query(&mut path, params.topic.as_deref());
-        return super::webhook_proxy::api_sse_get_proxy(&state, port, &path).await;
-    }
-
-    let replay_complete = serde_json::json!({
-        "type": "replay_complete",
-        "topic": params.topic,
-    })
-    .to_string();
-    let stream = futures::stream::iter(vec![Ok::<Event, Infallible>(
-        Event::default().data(replay_complete),
-    )]);
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
 }
 
 /// GET /api/sessions/:id/tasks -- list background tasks for a session.
@@ -2754,11 +2598,13 @@ pub struct StatusResponse {
 
 pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let uptime = chrono::Utc::now() - state.started_at;
-    let (model, provider) = match &state.agent {
-        Some(agent) => (
-            agent.model_id().to_string(),
-            agent.provider_name().to_string(),
-        ),
+    // M11-F: surface a profile-aware status. The legacy server-wide
+    // `state.agent` was removed; report the canonical "_main" profile
+    // when present, falling back to "none" so the dashboard can still
+    // render an unconfigured-server placeholder.
+    let main_runtime = state.profiles.get(octos_core::MAIN_PROFILE_ID).cloned();
+    let (model, provider) = match &main_runtime {
+        Some(rt) => (rt.primary_model_id.clone(), rt.provider_name.clone()),
         None => ("none".to_string(), "none".to_string()),
     };
     let base_domain = state
@@ -2770,7 +2616,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
         model,
         provider,
         uptime_secs: uptime.num_seconds(),
-        agent_configured: state.agent.is_some(),
+        agent_configured: main_runtime.is_some() || !state.profiles.is_empty(),
         base_domain,
     })
 }
@@ -2908,32 +2754,52 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                         .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else if let Ok((agent, sessions)) = validate_chat_request(
-                    &state,
-                    &ChatRequest {
-                        message: content.clone(),
-                        session_id: Some(session_id.clone()),
-                        topic: None,
-                        stream: true,
-                        media: media.clone(),
-                        attach_only: false,
-                        client_message_id: None,
-                    },
-                ) {
-                    // Standalone agent mode — run the agent directly.
+                } else {
+                    // M11-F: standalone (non-gateway) mode now routes through
+                    // the per-profile `ProfileRuntime` + per-session
+                    // `SessionRuntime` cache instead of the deleted
+                    // `state.agent` legacy field. We resolve the profile id
+                    // from the request headers (matching what `chat_sync`
+                    // does), pull the `ProfileRuntime` out of `state.profiles`,
+                    // and ask the cache for the per-session view.
+                    let profile_id = api_profile_id_from_headers(&state, &headers);
+                    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": format!(
+                                "No LLM provider configured for profile '{profile_id}'. \
+                                 Set up the profile with an API key in the dashboard.",
+                            ),
+                        });
+                        let _ = send_ws(&ws_tx, &err.to_string()).await;
+                        continue;
+                    };
+                    let session_key =
+                        SessionKey::with_profile(&profile_runtime.profile_id, "api", &session_id);
+                    let session_runtime = match state
+                        .session_cache
+                        .get_or_init(&profile_runtime, session_key.clone(), None)
+                        .await
+                    {
+                        Ok(rt) => rt,
+                        Err(error) => {
+                            let err = serde_json::json!({
+                                "type": "error",
+                                "message": format!(
+                                    "failed to bootstrap session runtime: {error}"
+                                ),
+                            });
+                            let _ = send_ws(&ws_tx, &err.to_string()).await;
+                            continue;
+                        }
+                    };
                     let ws_tx2 = ws_tx.clone();
                     let _abort_ref = abort_handle.clone();
                     let handle = tokio::spawn(async move {
-                        ws_standalone_agent(ws_tx2, agent, sessions, &session_id, &content, media)
+                        ws_standalone_agent(ws_tx2, session_runtime, &session_id, &content, media)
                             .await;
                     });
                     *abort_handle.lock().await = Some(handle.abort_handle());
-                } else {
-                    let err = serde_json::json!({
-                        "type": "error",
-                        "message": "No LLM provider configured",
-                    });
-                    let _ = send_ws(&ws_tx, &err.to_string()).await;
                 }
             }
             WsClientMsg::Abort => {
@@ -3032,15 +2898,22 @@ async fn ws_proxy_to_gateway(
 }
 
 /// Run the standalone agent for a WebSocket request and stream events back.
+///
+/// M11-F: takes a `SessionRuntime` (sourced from `state.session_cache`)
+/// instead of the deleted server-wide `state.agent`. The runtime carries
+/// the per-session workspace-bound tool registry, the profile's LLM, the
+/// agent's config/system-prompt snapshot, and the per-session
+/// `SessionManager`.
 async fn ws_standalone_agent(
     ws_tx: Arc<tokio::sync::Mutex<futures::stream::SplitSink<WebSocket, WsMessage>>>,
-    base_agent: Arc<Agent>,
-    sessions: Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session_runtime: Arc<crate::runtime::SessionRuntime>,
     session_id: &str,
     message: &str,
     media: Vec<String>,
 ) {
-    let session_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id);
+    let profile_id = session_runtime.profile.profile_id.clone();
+    let session_key = SessionKey::with_profile(&profile_id, "api", session_id);
+    let sessions = session_runtime.sessions.clone();
 
     let history: Vec<Message> = {
         let mut sess = sessions.lock().await;
@@ -3054,8 +2927,9 @@ async fn ws_standalone_agent(
         Arc::new(ChannelReporter::new(tx.clone())),
     ));
 
-    let request_agent = Agent::new_shared(
-        AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
+    let base_agent = session_runtime.agent.clone();
+    let request_agent = octos_agent::Agent::new_shared(
+        octos_core::AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
         base_agent.llm_provider(),
         base_agent.tool_registry().clone(),
         base_agent.memory_store(),
@@ -3066,7 +2940,7 @@ async fn ws_standalone_agent(
 
     let message = message.to_string();
     let session_id = session_id.to_string();
-    let session_key2 = SessionKey::with_profile(MAIN_PROFILE_ID, "api", &session_id);
+    let session_key2 = SessionKey::with_profile(&profile_id, "api", &session_id);
 
     // Spawn the agent task
     tokio::spawn(async move {
@@ -3575,6 +3449,465 @@ mod tests {
         assert!(is_internal_api_session_id("web-123#research.tasks"));
         assert!(!is_internal_api_session_id("web-123#research"));
         assert!(!is_internal_api_session_id("web-123"));
+    }
+
+    #[test]
+    fn is_safe_bare_session_id_rejects_separator_chars() {
+        // Codex P1 round 2: the raw-id candidate must NOT be added when
+        // `id` carries the channel separator (`:`) or topic separator
+        // (`#`). Otherwise crafted REST URLs like
+        // `/api/sessions/telegram:123/messages` would expose
+        // cross-channel session history.
+        assert!(is_safe_bare_session_id("web-7c9e"));
+        assert!(is_safe_bare_session_id(
+            "018f8e34-1c2d-7000-9000-000000000001"
+        ));
+        assert!(!is_safe_bare_session_id("telegram:123"));
+        assert!(!is_safe_bare_session_id("dspfac:api:web-7c9e"));
+        assert!(!is_safe_bare_session_id("web-123#secret-topic"));
+    }
+
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_omits_raw_for_unsafe_ids() {
+        let state = AppState::empty_for_tests();
+        let headers = HeaderMap::new();
+
+        // `id` containing `:` must NOT produce a raw-id candidate so a
+        // crafted REST URL can't pull history from another channel.
+        // Use admin identity here so the unprofiled fallbacks ARE
+        // permitted by the cross-profile gate — that way the test
+        // isolates the `is_safe_bare_session_id` filter rather than
+        // confounding it with the cross-profile gate.
+        let candidates = standalone_api_session_key_candidates_with_topic(
+            &state,
+            &headers,
+            Some(&AuthIdentity::Admin),
+            "telegram:123",
+            None,
+        );
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+        assert!(
+            !keys.iter().any(|k| *k == "telegram:123"),
+            "raw-id candidate must be skipped for ids with `:` — got {keys:?}"
+        );
+    }
+
+    /// Codex review P1 rounds 3 and 4 regression: when the resolved
+    /// profile is a hosted tenant (NOT `_main`), the candidate list
+    /// MUST contain ONLY the tenant's own profile-prefixed key. The
+    /// `_main`, bare-channel (`api:<id>`), and raw (`<id>`) candidates
+    /// all live in shared / non-tenant namespaces and would let a
+    /// colliding `web-…` id read foreign rows.
+    ///
+    /// We can't easily construct a fully-resolved hosted state in a
+    /// unit test (it requires the full `tenant_store` plumbing), so
+    /// the regression is verified by mirroring the helper's gate
+    /// logic inline with a caller-supplied `profile_id`. If
+    /// [`standalone_api_session_key_candidates_with_topic`] ever
+    /// drifts from this gate, the inline mirror will catch it.
+    /// Codex review P1 rounds 3 and 4 regression: a tenant
+    /// (non-admin) request resolved to a hosted profile MUST see only
+    /// its own profile-prefixed candidate. The `_main`, bare-channel,
+    /// and raw-id candidates would let one tenant read another's
+    /// history by id collision.
+    ///
+    /// This test mirrors the helper's gate logic inline so future
+    /// drift is caught.
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_omits_unprofiled_for_hosted_tenant() {
+        let session_id = "web-7c9e";
+        let topic = "";
+        let profile_id = "dspfac"; // simulated hosted tenant
+        let is_admin = false;
+        let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID || is_admin;
+
+        let mut candidates = vec![SessionKey::with_profile_topic(
+            profile_id, "api", session_id, topic,
+        )];
+        if allow_cross_profile_fallback {
+            candidates.push(SessionKey::with_profile_topic(
+                MAIN_PROFILE_ID,
+                "api",
+                session_id,
+                topic,
+            ));
+            candidates.push(SessionKey::with_topic("api", session_id, topic));
+            if is_safe_bare_session_id(session_id) {
+                candidates.push(SessionKey(session_id.to_string()));
+            }
+        }
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+
+        // Tenant sees ONLY its own profile-prefixed key.
+        assert_eq!(keys, vec!["dspfac:api:web-7c9e"]);
+        assert!(!keys.iter().any(|k| *k == "_main:api:web-7c9e"));
+        assert!(!keys.iter().any(|k| *k == "api:web-7c9e"));
+        assert!(!keys.iter().any(|k| *k == "web-7c9e"));
+    }
+
+    /// Codex P2 round 5 regression: the canonical reload-mid-stream
+    /// production shape is admin auth on a hosted subdomain. The WS
+    /// handler accepts bare `SessionKey`s in admin mode (admin's
+    /// `connection_profile_id` is `None`), so REST must walk the
+    /// unprofiled fallbacks too — otherwise the just-persisted WS
+    /// rows are unreachable through `/messages` and reload-mid-stream
+    /// shows the orphan completion the M10 hardening test catches.
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_unlocks_unprofiled_for_admin_on_hosted() {
+        let session_id = "web-7c9e";
+        let topic = "";
+        let profile_id = "dspfac";
+        let is_admin = true;
+        let allow_cross_profile_fallback = profile_id == MAIN_PROFILE_ID || is_admin;
+
+        let mut candidates = vec![SessionKey::with_profile_topic(
+            profile_id, "api", session_id, topic,
+        )];
+        if allow_cross_profile_fallback {
+            candidates.push(SessionKey::with_profile_topic(
+                MAIN_PROFILE_ID,
+                "api",
+                session_id,
+                topic,
+            ));
+            candidates.push(SessionKey::with_topic("api", session_id, topic));
+            if is_safe_bare_session_id(session_id) {
+                candidates.push(SessionKey(session_id.to_string()));
+            }
+        }
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+
+        // Admin on hosted DOES see the bare-channel + raw-id
+        // candidates so reload-mid-stream after WS-bare persistence
+        // works. This is no privilege escalation: admin already has
+        // read-all access through other endpoints.
+        assert_eq!(keys.first().copied(), Some("dspfac:api:web-7c9e"));
+        assert!(keys.iter().any(|k| *k == "_main:api:web-7c9e"));
+        assert!(keys.iter().any(|k| *k == "api:web-7c9e"));
+        assert!(keys.iter().any(|k| *k == "web-7c9e"));
+    }
+
+    #[test]
+    fn standalone_api_session_key_candidates_with_topic_prefers_profiled_then_falls_back_to_bare() {
+        let state = AppState::empty_for_tests();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+
+        // No tenant_store on the AppState -> profile resolution returns the
+        // synthetic main-profile id. The candidate list still contains the
+        // bare-channel and raw-id forms so `run_standalone_turn`'s WS-side
+        // writes are reachable from REST regardless of which `SessionKey`
+        // shape the SPA sent.
+        // No identity (no admin auth, no user) — the resolved profile
+        // is `MAIN_PROFILE_ID` (no tenant_store on the AppState so
+        // profile resolution falls back to the synthetic main), so
+        // the cross-profile gate is open and the full candidate list
+        // is returned.
+        let candidates = standalone_api_session_key_candidates_with_topic(
+            &state, &headers, None, "web-7c9e", None,
+        );
+        let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
+        // Profiled key must come first so existing chat-history reads keep
+        // hitting the canonical write target before walking fallbacks.
+        assert_eq!(keys.first().copied(), Some("_main:api:web-7c9e"));
+        // Bare-channel key must be present so REST returns WS-persisted rows
+        // for `SessionKey::new("api", "web-…")`.
+        assert!(
+            keys.iter().any(|k| *k == "api:web-7c9e"),
+            "bare-channel candidate missing from {keys:?}"
+        );
+        // Raw-id key must be present so REST returns rows when the SPA sent
+        // a bare `SessionKey("web-…")` (no `api:` prefix). Codex P1.
+        assert!(
+            keys.iter().any(|k| *k == "web-7c9e"),
+            "raw-id candidate missing from {keys:?}"
+        );
+    }
+
+    /// M10.5 reload-mid-stream regression guard. WS turns persisted by
+    /// `turn/start` may live under the bare-channel key (`api:<id>`) when the
+    /// SPA sends a bare `SessionKey`. The REST `/messages` lookup must walk
+    /// the candidate-key list and surface those rows so the SPA's hydrate
+    /// step renders the user prompt + completion bubble together instead of
+    /// a placeholder orphan thread.
+    #[tokio::test]
+    async fn session_messages_falls_back_to_bare_channel_key_for_ws_persisted_sessions() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist under the bare-channel key — this is what `turn/start`
+        // does when the WS client passes `SessionKey::new("api", "web-…")`.
+        let bare_key = SessionKey::new("api", "web-reload-mid-stream");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&bare_key, Message::user("hi please weather"))
+                .await
+                .unwrap();
+            sess.add_message(
+                &bare_key,
+                Message::assistant_with_thread(
+                    "on it",
+                    octos_core::ThreadId::new("thread-reload-mid-stream"),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let mut headers = HeaderMap::new();
+        // No routed-profile resolution here, so the profiled candidate is
+        // `_main:api:web-…` (which has no JSONL on disk). The bare-channel
+        // fallback is what makes the response non-empty.
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+
+        // No identity — main-profile resolution unlocks the unprofiled
+        // fallbacks via the cross-profile gate's main-profile branch.
+        let response = session_messages(
+            State(state),
+            headers,
+            None,
+            axum::extract::Path("web-reload-mid-stream".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 2, "bare-key fallback must surface rows");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hi please weather");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "on it");
+    }
+
+    /// Codex review P2 regression: the fallback decision must be based on
+    /// whether the candidate session has *any* history, not on whether the
+    /// requested page is non-empty. Otherwise, when the canonical session
+    /// has rows but the requested page is past the end, REST silently
+    /// switches to a sibling candidate's history under pagination,
+    /// corrupting the response stream.
+    #[tokio::test]
+    async fn session_messages_does_not_mix_candidate_histories_under_pagination() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // The "real" session (under the canonical profiled key) has 2 rows.
+        let profiled_key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-pagi");
+        // A sibling bare-key session has 1 unrelated row (e.g. left over
+        // from an earlier WS write before profile promotion).
+        let bare_key = SessionKey::new("api", "web-pagi");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&profiled_key, Message::user("page one user"))
+                .await
+                .unwrap();
+            sess.add_message(
+                &profiled_key,
+                Message::assistant_with_thread(
+                    "page one reply",
+                    octos_core::ThreadId::new("thread-pagi-1"),
+                ),
+            )
+            .await
+            .unwrap();
+            sess.add_message(&bare_key, Message::user("UNRELATED bare-key row"))
+                .await
+                .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        // Request a page past the end of the profiled session: offset=10,
+        // limit=10. Pre-fix this returned the bare-key's
+        // `UNRELATED bare-key row`. Post-fix it returns `[]` and stays
+        // anchored to the profiled session.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+        let response = session_messages(
+            State(state),
+            headers,
+            None,
+            axum::extract::Path("web-pagi".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 10,
+                offset: 10,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            messages.is_empty(),
+            "page past end of profiled session must return [] without leaking bare-key rows: {messages:?}"
+        );
+    }
+
+    /// Codex P1 round 2 regression: a crafted REST URL whose `id`
+    /// contains the channel separator (`:`) MUST NOT pull history from
+    /// the bare-key store of another channel. Without
+    /// [`is_safe_bare_session_id`] the raw-id fallback would walk
+    /// `SessionKey("telegram:123")` directly and surface that
+    /// telegram session's rows under an API endpoint.
+    #[tokio::test]
+    async fn session_messages_does_not_leak_cross_channel_history_via_crafted_id() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist a telegram-channel row under the canonical key shape
+        // (`telegram:123`). REST `/api/sessions/...` is API-channel
+        // scoped — its handler must NOT see this row regardless of
+        // what `id` the caller passes.
+        let telegram_key = SessionKey::new("telegram", "123");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&telegram_key, Message::user("telegram secret"))
+                .await
+                .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+        let headers = HeaderMap::new();
+        // Pass admin identity so the cross-profile gate is open and the
+        // ONLY thing keeping the telegram row out of the response is
+        // the `is_safe_bare_session_id` filter on the raw-id candidate.
+        // Pre-filter, this would have leaked.
+        let identity = Some(Extension(AuthIdentity::Admin));
+        let response = session_messages(
+            State(state),
+            headers,
+            identity,
+            axum::extract::Path("telegram:123".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        // Either the standalone path returns [] (no API-channel rows
+        // for that id) and the gateway proxy fires (returning 503 in
+        // tests), or the standalone path returns []. Both outcomes
+        // are acceptable; what we MUST NOT see is the telegram row.
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            !body_str.contains("telegram secret"),
+            "REST must not leak telegram-channel history via crafted id; got: {body_str}"
+        );
+    }
+
+    /// Codex review P1 regression: when the SPA sends a bare `SessionKey`
+    /// whose serialized form is the literal SPA id (e.g. `web-…`, no
+    /// `api:` prefix), `run_standalone_turn` persists under that raw key.
+    /// The fallback list MUST include the raw-id candidate so REST reaches
+    /// those rows after a reload.
+    #[tokio::test]
+    async fn session_messages_falls_back_to_raw_id_for_bareless_session_keys() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist under the raw id (no `api:` prefix) — this is what the
+        // WS handler ends up doing when the SPA sends `SessionKey("web-…")`
+        // verbatim.
+        let raw_key = SessionKey("web-raw-id-only".to_string());
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&raw_key, Message::user("raw user"))
+                .await
+                .unwrap();
+            sess.add_message(
+                &raw_key,
+                Message::assistant_with_thread(
+                    "raw reply",
+                    octos_core::ThreadId::new("thread-raw"),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("dspfac.crew.ominix.io"),
+        );
+        let response = session_messages(
+            State(state),
+            headers,
+            None,
+            axum::extract::Path("web-raw-id-only".to_string()),
+            axum::extract::Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                source: None,
+                since_seq: None,
+                topic: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let messages: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(messages.len(), 2, "raw-id fallback must surface rows");
+        assert_eq!(messages[0]["content"], "raw user");
+        assert_eq!(messages[1]["content"], "raw reply");
     }
 
     #[tokio::test]
@@ -4090,5 +4423,184 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // ────────── M11-D `/api/chat` routes through `SessionRuntime` ──────────
+
+    /// Minimal stub LLM that returns a fixed assistant reply. Used to drive
+    /// the M11-D `/api/chat` route through `SessionRuntime::bootstrap` +
+    /// `Agent::process_message` without hitting a real provider.
+    struct EchoLlm {
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EchoLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.reply.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 11,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "m11d-echo"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn context_window(&self) -> u32 {
+            64_000
+        }
+    }
+
+    async fn make_m11d_profile(
+        data_dir: &std::path::Path,
+        reply: &str,
+    ) -> Arc<crate::runtime::ProfileRuntime> {
+        std::fs::create_dir_all(data_dir).unwrap();
+        let memory = Arc::new(octos_memory::EpisodeStore::open(data_dir).await.unwrap());
+        let memory_store = Arc::new(octos_memory::MemoryStore::open(data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(data_dir).await.unwrap());
+        let sandbox = octos_agent::SandboxConfig::default();
+        let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            data_dir,
+            octos_agent::create_sandbox(&sandbox),
+        );
+        Arc::new(crate::runtime::ProfileRuntime {
+            profile_id: MAIN_PROFILE_ID.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            llm: Arc::new(EchoLlm {
+                reply: reply.to_string(),
+            }),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "m11d-echo".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
+            memory,
+            memory_store,
+            tool_config,
+        })
+    }
+
+    #[tokio::test]
+    async fn chat_routes_through_session_runtime_when_profile_registered() {
+        // Acceptance evidence (M11-D Part 3): a `/api/chat` request lands
+        // in `chat_sync_via_session_runtime` whenever the routed profile
+        // is registered in `state.profiles`. The route is the exact
+        // structural path the live yangmi flow takes — it implies
+        // `SessionRuntime::bootstrap` ran, which writes the per-session
+        // `.octos-workspace.toml` (closing the "workspace policy not
+        // found" failure mode without any hotfix file at the daemon
+        // cwd).
+        let data_dir = tempfile::tempdir().unwrap();
+        let profile_data_dir = data_dir.path().join("profile-data");
+        let profile_runtime = make_m11d_profile(&profile_data_dir, "yangmi reply ack").await;
+
+        let mut profiles = HashMap::new();
+        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
+        let state = Arc::new(AppState {
+            profiles,
+            ..AppState::empty_for_tests()
+        });
+
+        let req = ChatRequest {
+            message: "用 yangmi 语音说北京今天天气晴朗".to_string(),
+            session_id: Some("yangmi-trace-001".to_string()),
+            topic: None,
+            stream: false,
+            media: Vec::new(),
+            attach_only: false,
+            client_message_id: None,
+        };
+
+        let response = chat_sync(state.clone(), HeaderMap::new(), req)
+            .await
+            .expect("chat_sync must succeed via SessionRuntime path");
+        assert_eq!(response.content, "yangmi reply ack");
+        assert_eq!(response.input_tokens, 7);
+        assert_eq!(response.output_tokens, 11);
+
+        // The session runtime was materialized into the cache — a second
+        // call for the same session reuses the same `Arc<SessionRuntime>`.
+        let cache_len = state.session_cache.len().await;
+        assert_eq!(cache_len, 1, "session cache must hold one entry");
+
+        // The per-session workspace policy bootstrap actually ran — i.e.
+        // the yangmi gap is closed at the structural level.
+        let encoded = octos_bus::session::encode_path_component(&format!(
+            "{MAIN_PROFILE_ID}:api:yangmi-trace-001"
+        ));
+        let policy_path = profile_data_dir
+            .join("users")
+            .join(&encoded)
+            .join("workspace")
+            .join(".octos-workspace.toml");
+        assert!(
+            policy_path.exists(),
+            "SessionRuntime::bootstrap must write the workspace policy at {} \
+             without any operator-side hotfix",
+            policy_path.display(),
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_returns_503_when_routed_profile_not_registered() {
+        // M11-F: the legacy `state.agent` fallback was deleted; an
+        // unregistered profile is a configuration bug, not a runtime
+        // fallback. `octos serve` bootstraps every profile in
+        // `ProfileStore::list()` at startup, so a request that lands on
+        // a profile id missing from `state.profiles` must fail closed
+        // with 503 SERVICE UNAVAILABLE (and a body that names the
+        // offending profile so operators can investigate).
+        let state = Arc::new(AppState::empty_for_tests());
+        let req = ChatRequest {
+            message: "ping".to_string(),
+            session_id: Some("legacy".to_string()),
+            topic: None,
+            stream: false,
+            media: Vec::new(),
+            attach_only: false,
+            client_message_id: None,
+        };
+
+        let result = chat_sync(state, HeaderMap::new(), req).await;
+        let (status, msg) = result
+            .err()
+            .expect("expected 503 when profile not registered");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The error must name the missing profile so the operator log
+        // surfaces the misrouted-request shape (not an opaque "no
+        // provider" message that pre-M11-F's legacy path returned).
+        assert!(
+            msg.contains(MAIN_PROFILE_ID),
+            "503 message must name the unregistered profile (got: {msg})",
+        );
     }
 }

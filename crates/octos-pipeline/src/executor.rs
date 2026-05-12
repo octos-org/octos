@@ -1559,9 +1559,19 @@ impl PipelineExecutor {
                         fanout_reservations.push(handle);
                     }
 
+                    // Parallel children inherit the fan-out node's
+                    // predecessor outcomes (same source the fan_input
+                    // string was concatenated from). Keeps GateHandler's
+                    // `predecessor_outcomes` view consistent with `input`.
+                    let par_predecessor_outcomes: Vec<NodeOutcome> = predecessors
+                        .iter()
+                        .filter_map(|p| completed.get(*p).cloned())
+                        .collect();
+
                     let ctx = HandlerContext {
                         input: fan_input.clone(),
                         completed: completed.clone(),
+                        predecessor_outcomes: par_predecessor_outcomes,
                         working_dir: self.config.working_dir.clone(),
                     };
 
@@ -1913,9 +1923,19 @@ impl PipelineExecutor {
                         dp_reservations.push(handle);
                     }
 
+                    // Same logic as the static-fan-out site: dynamic
+                    // workers inherit the dynamic_parallel node's
+                    // predecessors so GateHandler sees the same
+                    // upstream outcomes that built `dp_input`.
+                    let dp_predecessor_outcomes: Vec<NodeOutcome> = predecessors
+                        .iter()
+                        .filter_map(|p| completed.get(*p).cloned())
+                        .collect();
+
                     let ctx = HandlerContext {
                         input: dp_input.clone(),
                         completed: completed.clone(),
+                        predecessor_outcomes: dp_predecessor_outcomes,
                         working_dir: self.config.working_dir.clone(),
                     };
 
@@ -2078,9 +2098,20 @@ impl PipelineExecutor {
                 bridge.set_words(vec![seq_label.to_string()]);
             }
 
+            // Direct-predecessor outcomes in graph edge order — preserves
+            // each predecessor's `OutcomeStatus` (Pass/Fail/Error) for
+            // GateHandler. `Vec` ordering matches edge iteration so the
+            // single-predecessor branching case is fully deterministic
+            // (codex round-5 + round-6).
+            let predecessor_outcomes: Vec<NodeOutcome> = predecessors
+                .iter()
+                .filter_map(|p| completed.get(*p).cloned())
+                .collect();
+
             let ctx = HandlerContext {
                 input: input_text,
                 completed: completed.clone(),
+                predecessor_outcomes,
                 working_dir: self.config.working_dir.clone(),
             };
 

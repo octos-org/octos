@@ -17,7 +17,9 @@ use axum::http::{HeaderMap, Uri};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
-use octos_agent::{Agent, ToolApprovalDecision, ToolApprovalRequest};
+use octos_agent::{
+    Agent, BackgroundResultKind, BackgroundResultPayload, ToolApprovalDecision, ToolApprovalRequest,
+};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
@@ -30,16 +32,17 @@ use octos_core::ui_protocol::{
     TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
     ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
     ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnStartParams,
-    TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand,
-    UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem,
-    UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, approval_cancelled_reasons, approval_kinds, hydrate_sections,
+    progress_kinds, thread_status,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
 use serde::Serialize;
@@ -55,7 +58,7 @@ use super::ui_protocol_approvals::PendingApprovalStore;
 use super::ui_protocol_audit::{ApprovalsAuditConfig, ApprovalsAuditLog, log_decision_tracing};
 use super::ui_protocol_diff::{DiffPreviewConfig, PendingDiffPreviewStore};
 use super::ui_protocol_ledger::{
-    LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
+    ConnectionId, LedgerConfig, LedgeredUiProtocolEvent, UiProtocolLedger, UiProtocolLedgerEvent,
     spawn_eviction_task,
 };
 use super::ui_protocol_progress::{
@@ -97,6 +100,12 @@ const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
 type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
+
+/// Per-connection registry of live ledger-forwarder tasks keyed by session.
+/// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
+/// into the WS write channel for the lifetime of the connection. Dropping
+/// or aborting a handle terminates the pump.
+type SharedLiveForwarders = Arc<tokio::sync::Mutex<HashMap<SessionKey, AbortHandle>>>;
 
 /// Outcome of pushing a frame onto the per-connection writer channel.
 ///
@@ -166,6 +175,11 @@ impl ConnectionMetrics {
 pub(crate) struct WsConnection {
     writer: mpsc::Sender<WsMessage>,
     metrics: Arc<ConnectionMetrics>,
+    /// Unique within the process. Stamped onto every ledger append we
+    /// also direct-send so the live forwarder running on this same
+    /// connection can drop the broadcast copy and avoid duplicate
+    /// delivery to the WS.
+    connection_id: ConnectionId,
 }
 
 impl WsConnection {
@@ -173,7 +187,13 @@ impl WsConnection {
         Self {
             writer,
             metrics: Arc::new(ConnectionMetrics::default()),
+            connection_id: ConnectionId::next(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_id(&self) -> ConnectionId {
+        self.connection_id
     }
 
     #[cfg(test)]
@@ -490,6 +510,14 @@ struct ConnectionUiFeatures {
     turn_state_get: bool,
     /// UPCR-2026-012 `event.message_persisted.v1` negotiated.
     message_persisted: bool,
+    /// M10 Phase 1 `event.spawn_complete.v1` negotiated. When set, the
+    /// connection receives `turn/spawn_complete` envelope events for
+    /// `spawn_only` background completions and the corresponding
+    /// `message/persisted` row (with `source: background`) is suppressed
+    /// at the per-connection wire-emit gate. When unset, the legacy
+    /// `message/persisted` shape is preserved and `turn/spawn_complete`
+    /// is suppressed.
+    spawn_complete: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -522,6 +550,7 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             ),
+            spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
             header_present: has_any_ui_feature_token(headers, query),
         }
     }
@@ -563,6 +592,9 @@ impl ConnectionUiFeatures {
         }
         if self.message_persisted {
             requested.push(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1);
+        }
+        if self.spawn_complete {
+            requested.push(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -678,7 +710,7 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
 ///
 /// Subsequent calls return the same `Arc`, regardless of what the new
 /// caller passes — by design, the ledger is process-singleton.
-async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
+pub(super) async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
     static EVENT_LEDGER: OnceLock<Arc<UiProtocolLedger>> = OnceLock::new();
     if let Some(existing) = EVENT_LEDGER.get() {
         return existing.clone();
@@ -739,19 +771,191 @@ async fn event_ledger(state: &AppState) -> Arc<UiProtocolLedger> {
 /// UPCR-2026-012's ordering invariant.
 ///
 /// Delivery model: the entry is persisted to the ledger ring (disk +
-/// in-memory). Clients receive `message/persisted` via the existing
-/// cursor-based replay path on `session/open { after: <cursor> }` or
-/// via the next durable replay window. Live wire fan-out to currently
-/// connected subscribers is a follow-up: there is no general
-/// publish-subscribe broadcast for ledger events in v1, and adding one
-/// is governed by a separate UPCR. Until then, clients that need
-/// near-real-time `message/persisted` should reopen with the latest
-/// cursor after each turn boundary; UPCR-2026-012 explicitly permits
-/// this delivery model ("Clients use this as their `after` value for
-/// subsequent `session/hydrate` and `session/open` calls").
+/// in-memory). Clients receive `message/persisted` via two paths,
+/// whichever wins the race: (a) cursor-based replay on
+/// `session/open { after: <cursor> }`, or (b) the per-session live
+/// publish-subscribe broadcast (`UiProtocolLedger::subscribe`) drained
+/// by `spawn_live_forwarder` for currently connected WebSocket clients.
+/// Both paths are reconciled by the forwarder's `baseline_seq` filter
+/// (replay snapshot head) and `from_connection` self-suppression so
+/// each event reaches each WS exactly once. Issue #760 / PR #761
+/// closed the original "no live fan-out" gap; clients that go offline
+/// still resync via cursor on reconnect.
+/// Bounded channel capacity for the per-session `SendFileTool` sink. Each
+/// session drains its own channel into the canonical-persist path, so 64
+/// pending messages is generous; if a runaway tool ever exceeds this we'd
+/// rather backpressure the agent loop than balloon memory.
+const SEND_FILE_CHANNEL_CAPACITY: usize = 64;
+
+tokio::task_local! {
+    /// M10 Phase 1: task-local override for `MessagePersistedSource` read
+    /// by `install_message_commit_observer`. The
+    /// [`BackgroundResultSender`] callback enters this scope before
+    /// invoking [`persist_assistant_with_media`] so the resulting
+    /// `MessagePersistedEvent` carries `source: background` instead of
+    /// the role-derived `assistant` default. The per-connection
+    /// capability filter then identifies "this is a duplicate of a
+    /// `turn/spawn_complete`" and suppresses it for clients that
+    /// negotiated the new wire shape.
+    ///
+    /// Without this override the `Message` role is `Assistant`, the
+    /// observer maps it to `MessagePersistedSource::Assistant`, and
+    /// the duplicate-suppression branch at
+    /// `live_event_passes_capability_filter` never fires — which
+    /// codex flagged as a P1 against the Phase 1 wire contract.
+    static MESSAGE_PERSISTED_SOURCE_OVERRIDE: Option<MessagePersistedSource>;
+}
+
+/// Resolve the source for an upcoming `MessagePersistedEvent`. Returns the
+/// task-local override when one is set (e.g. inside the `BackgroundResultSender`
+/// scope), otherwise falls back to the role-derived default — preserving
+/// the pre-M10 behaviour for every other persist path.
+fn current_message_persisted_source(role: octos_core::MessageRole) -> MessagePersistedSource {
+    MESSAGE_PERSISTED_SOURCE_OVERRIDE
+        .try_with(|override_value| *override_value)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| MessagePersistedSource::from_role(role))
+}
+
+/// Pre-stamp `thread_id` on a row about to be persisted by the standalone
+/// turn loop so every User/Assistant/Tool row from the same turn shares the
+/// originating `TurnId`-derived thread id.
+///
+/// Caller-supplied `thread_id` values are preserved. System rows are left
+/// alone (they aren't thread-scoped). For `User`/`Assistant`/`Tool` rows
+/// missing a `thread_id`, the supplied `turn_thread_id` is stamped.
+///
+/// **M10 Phase 6.1**: extending this from Assistant/Tool only to also cover
+/// `User` closes the empty-placeholder bubble. `process_message_inner`
+/// builds the user row with `client_message_id: None`, so without the
+/// pre-stamp `derive_thread_id_for_new_write` falls back to a fresh
+/// `now_v7()` for the user row while assistant rows are stamped with the
+/// `TurnId`. The SPA reducer keys threads on `thread_id`; a divergent user
+/// thread leaves an empty pending bubble in the user's thread and creates
+/// an orphan thread for the assistant rows.
+fn pre_stamp_turn_thread_id(message: Message, turn_thread_id: &str) -> Message {
+    let mut to_save = message;
+    if to_save.thread_id.is_none()
+        && matches!(
+            to_save.role,
+            MessageRole::User | MessageRole::Assistant | MessageRole::Tool
+        )
+    {
+        to_save.thread_id = Some(turn_thread_id.to_owned());
+    }
+    to_save
+}
+
+/// Shared persist helper used by the api/serve background-result sender
+/// (spawn_only completions) and the `send_file` sink. Builds an assistant
+/// `Message` with the given content + media + thread_id, writes it through
+/// the canonical session helper (which serialises with other writers via
+/// the per-key Tokio mutex and triggers `MessageCommitObserver`), then
+/// invalidates the cached `SessionManager` entry so subsequent
+/// `session/hydrate` and `/api/sessions/:id/messages` reads pick up the
+/// new row instead of the pre-persist snapshot. Mirrors the gateway's
+/// `session_actor.rs::deliver_background_notification` post-write
+/// invalidate at `api_channel.rs:1503`.
+///
+/// Returns `Some(PersistedMessageMeta)` on success — the row's committed
+/// seq plus the wire `message_id` derived the same way `MessageCommitObserver`
+/// computes it (`session:seq:timestamp_ns`). The shared id lets the
+/// `BackgroundResultSender` callback emit a `turn/spawn_complete`
+/// envelope whose `message_id` matches the parallel `message/persisted`
+/// event — clients that key dedup or confirmation off `message_id`
+/// then see one logical row, regardless of which wire shape they
+/// negotiated. `None` signals a persist failure (already logged).
+async fn persist_assistant_with_media(
+    sessions: &Arc<TokioMutex<octos_bus::SessionManager>>,
+    data_dir: &Path,
+    session_id: &SessionKey,
+    content: String,
+    media: Vec<String>,
+    thread_id: String,
+    label: &str,
+) -> Option<PersistedMessageMeta> {
+    let mut message = Message::assistant_with_thread(content, octos_core::ThreadId::new(thread_id));
+    message.media = media;
+    // Capture the stamped timestamp BEFORE the canonical persist
+    // consumes the message — `MessageCommitObserver` derives the wire
+    // `message_id` from `(session_id, committed_seq, message.timestamp)`,
+    // and we need that same value here so the spawn_complete envelope
+    // can advertise the identical id.
+    let timestamp_ns = message.timestamp.timestamp_nanos_opt().unwrap_or(0);
+
+    let committed_seq = match octos_bus::session::persist_message_through_canonical_path(
+        data_dir, session_id, message,
+    )
+    .await
+    {
+        Ok(seq) => seq,
+        Err(error) => {
+            tracing::warn!(
+                session = %session_id.0,
+                label,
+                error = %error,
+                "api/serve: failed to persist background-delivered message"
+            );
+            return None;
+        }
+    };
+
+    sessions.lock().await.invalidate_cache(session_id);
+    Some(PersistedMessageMeta {
+        committed_seq,
+        message_id: format!("{}:{committed_seq}:{timestamp_ns}", session_id.0),
+    })
+}
+
+/// Metadata returned by [`persist_assistant_with_media`] so callers can
+/// emit wire events whose identity matches the durable row written by
+/// `MessageCommitObserver`. See the helper's doc comment for rationale.
+#[derive(Debug, Clone)]
+struct PersistedMessageMeta {
+    committed_seq: usize,
+    message_id: String,
+}
+
+/// M9-γ-7 (issue #844): the agent loop's iterative tool-calling pattern
+/// commits an Assistant `Message` per LLM iteration. When the LLM returns
+/// only `tool_calls` (no text content) and no media — the metadata-only
+/// shape that bracketed every `tool/started` → `tool/completed` cycle —
+/// the persisted row is invisible to the user but still triggers
+/// `MessageCommitObserver`. Pre-fix the ledger emitted N
+/// `message/persisted` envelopes per turn for an N-iteration loop, all
+/// carrying the same `thread_id`. The web reducer keyed off `thread_id`
+/// merged them into a "phantom" empty assistant bubble that briefly
+/// flickered into the chat pane (the 2026-05-09 phantom-bubble bug).
+///
+/// The defensive web-side fix in octos-web #92 hid those bubbles. The
+/// authoritative server-side fix is to suppress the `message/persisted`
+/// emit for these intermediate metadata-only assistant rows so the wire
+/// surface emits exactly one `message/persisted` per turn for the final
+/// user-visible assistant text.
+///
+/// Filter: skip emission when the row is `Assistant`, content is
+/// empty after `trim()`, and `media` is empty. Tool messages (role
+/// `Tool`) and assistant rows with text or media are unaffected. Once
+/// the SSE chat path is deleted (α-5/α-6) and the WS turn loop is sole
+/// transport, this filter remains correct because the filtering criteria
+/// describe a metadata-only row (no rendering surface) regardless of
+/// transport.
+fn is_metadata_only_assistant_row(message: &octos_core::Message) -> bool {
+    message.role == octos_core::MessageRole::Assistant
+        && message.content.trim().is_empty()
+        && message.media.is_empty()
+}
+
 fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
     let observer: octos_bus::MessageCommitObserver =
         Arc::new(move |session_key, message, committed_seq| {
+            // M9-γ-7: drop intermediate metadata-only assistant rows
+            // (LLM returned only `tool_calls`, no rendered text). See
+            // [`is_metadata_only_assistant_row`] for the rationale.
+            if is_metadata_only_assistant_row(message) {
+                return;
+            }
             let event = MessagePersistedEvent {
                 session_id: session_key.clone(),
                 // The `Message` struct does not yet carry a typed
@@ -772,7 +976,13 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                     message.timestamp.timestamp_nanos_opt().unwrap_or(0)
                 ),
                 client_message_id: message.client_message_id.clone(),
-                source: MessagePersistedSource::from_role(message.role),
+                // M10 Phase 1: read the task-local source override
+                // first so a `BackgroundResultSender` persist (which
+                // duplicates a `turn/spawn_complete` envelope) emits
+                // `source: background`. The per-connection wire
+                // filter keys off this to suppress the duplicate for
+                // clients that negotiated `event.spawn_complete.v1`.
+                source: current_message_persisted_source(message.role),
                 // Placeholder; the ledger's `with_cursor` hook
                 // overwrites this with the assigned seq.
                 cursor: UiCursor {
@@ -780,6 +990,12 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                     seq: 0,
                 },
                 persisted_at: Utc::now(),
+                // P1.3 fix: surface the persisted message's `media`
+                // attachments on the wire so spawn_only / send_file
+                // deliveries reach the chat bubble. Empty Vec
+                // serialises to omitted (back-compat for clients
+                // that don't yet understand the field).
+                media: message.media.clone(),
             };
             // Append to the ledger; the ledger stamps the cursor onto
             // both the envelope AND the `MessagePersistedEvent.cursor`
@@ -856,7 +1072,7 @@ impl BoundedChannelReporter {
 
 impl octos_agent::ProgressReporter for BoundedChannelReporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
-        let json = match serde_json::to_string(&super::sse::event_to_json(
+        let json = match serde_json::to_string(&super::events::event_to_json(
             &event,
             self.thread_id.as_deref(),
         )) {
@@ -1219,9 +1435,23 @@ pub async fn ws_handler(
         .as_ref()
         .and_then(|Extension(identity)| authenticated_profile_id(identity))
         .map(ToOwned::to_owned);
+    // Hosted multi-tenant standalone serve routes by subdomain
+    // (`<profile>.<base>.example.com`). Admin tokens authenticate as
+    // `AuthIdentity::Admin` so `connection_profile_id` is `None`, but the
+    // `Host` header still carries the per-tenant profile. Stash it on the
+    // connection so per-session resolution (notably plugin work_dir →
+    // file-API root) can pick the right profile data dir even for admin
+    // sessions originated from a hosted subdomain.
+    let routed_profile_id = super::handlers::routed_profile_id_from_headers(&state, &headers);
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
     ws.on_upgrade(move |socket| {
-        ui_protocol_connection(socket, state, connection_profile_id, features)
+        ui_protocol_connection(
+            socket,
+            state,
+            connection_profile_id,
+            routed_profile_id,
+            features,
+        )
     })
 }
 
@@ -1229,6 +1459,7 @@ async fn ui_protocol_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     connection_profile_id: Option<String>,
+    routed_profile_id: Option<String>,
     features: ConnectionUiFeatures,
 ) {
     let (ws_sink, mut ws_rx) = socket.split();
@@ -1240,6 +1471,7 @@ async fn ui_protocol_connection(
     let ws = WsConnection::new(writer_tx);
     let active_turns = active_turns_registry();
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
     let ledger = event_ledger(&state).await;
     // Force lazy init of the diff-preview store on this connection so
@@ -1249,6 +1481,7 @@ async fn ui_protocol_connection(
     // installs the ephemeral RAM-only fallback.
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
     let connection_profile_id = connection_profile_id.as_deref();
+    let routed_profile_id = routed_profile_id.as_deref();
 
     while let Some(Ok(msg)) = ws_rx.next().await {
         let text = match msg {
@@ -1287,6 +1520,7 @@ async fn ui_protocol_connection(
                     &state,
                     &ledger,
                     &contracts.approvals,
+                    &live_forwarders,
                     connection_profile_id,
                     features,
                     id,
@@ -1303,6 +1537,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -1359,6 +1594,7 @@ async fn ui_protocol_connection(
                     &contracts.approvals,
                     &active_turns,
                     connection_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -1388,14 +1624,35 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::PermissionProfileList(_) | UiCommand::PermissionProfileSet(_) => {
+                // `permission/profile/*` RPCs are declared in the core
+                // protocol type registry but not yet wired in the v1
+                // server slice. Reply with `method_not_supported` so
+                // clients negotiate around them rather than hang.
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::method_not_supported(
+                        "permission/profile/* not yet implemented in server",
+                    ),
+                );
+            }
         }
     }
 
     abort_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
+    abort_live_forwarders(&live_forwarders).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
+}
+
+async fn abort_live_forwarders(forwarders: &SharedLiveForwarders) {
+    let mut guard = forwarders.lock().await;
+    for (_, abort) in guard.drain() {
+        abort.abort();
+    }
 }
 
 fn parse_ws_text_frame(text: &str) -> Result<RpcRequest<Value>, RpcError> {
@@ -1541,17 +1798,29 @@ fn profile_mismatch_error(
 async fn handle_session_open(
     ws: &WsConnection,
     state: &Arc<AppState>,
-    ledger: &UiProtocolLedger,
+    ledger: &Arc<UiProtocolLedger>,
     approvals: &PendingApprovalStore,
+    live_forwarders: &SharedLiveForwarders,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     params: SessionOpenParams,
 ) {
+    // Subscribe to the live ledger broadcast BEFORE the replay query so any
+    // event that lands while we're still computing replay/opened sits in the
+    // broadcast buffer and gets emitted by the forwarder once we hand it off
+    // (filtered to seq > replay snapshot head to avoid duplicating replay).
+    // Issue #760: without this, late background-task artifacts (deep_research
+    // result, mofa podcast, run_pipeline output, TTS audio) reach the ledger
+    // but never push to the live WS.
+    let session_id_for_subscribe = params.session_id.clone();
+    let live_rx = ledger.subscribe(&session_id_for_subscribe);
+
     let outcome = match open_session_result(
         state,
         ledger,
         approvals,
+        ws.connection_id,
         connection_profile_id,
         features,
         params,
@@ -1560,6 +1829,12 @@ async fn handle_session_open(
     {
         Ok(outcome) => outcome,
         Err(error) => {
+            // Drop the receiver, then opportunistically reclaim the
+            // broadcast sender slot if no other connection is subscribed
+            // (codex MUST-FIX-3: failure paths previously leaked one
+            // sender per failed open).
+            drop(live_rx);
+            ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
             let _ = send_rpc_error(ws, Some(id), error);
             return;
         }
@@ -1596,13 +1871,16 @@ async fn handle_session_open(
     // We silently skip filtered events rather than emitting
     // `protocol/replay_lossy`. The client never asked for these events,
     // so dropping them is not lossy from their perspective.
+    //
+    // M10 Phase 1: the same dual filter that `live_event_passes_capability_filter`
+    // applies for the live broadcast must apply during replay so a
+    // reconnecting client sees exactly one shape per `spawn_only`
+    // completion (either the legacy `message/persisted` OR the new
+    // `turn/spawn_complete`, never both). Reusing the helper keeps replay
+    // and live in lockstep.
     for event in outcome.replay {
-        if !features.message_persisted {
-            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) =
-                &event.event
-            {
-                continue;
-            }
+        if !live_event_passes_capability_filter(&event.event, features) {
+            continue;
         }
         let _ = send_ledger_event_durable(ws, ledger, event.event);
     }
@@ -1613,7 +1891,153 @@ async fn handle_session_open(
             UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(event)),
         );
     }
+    // Baseline = head_seq captured atomically with replay (codex MUST-FIX-1).
+    // Using opened_event.cursor.seq instead would silently filter out any
+    // event that happened to land between replay and the session/open
+    // append, exactly the gap codex flagged.
+    let baseline_seq = outcome.replay_baseline_seq;
+    let session_id = match &outcome.opened_event.event {
+        UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) => {
+            opened.session_id.clone()
+        }
+        _ => session_id_for_subscribe,
+    };
+    let ledger_for_forwarder = ledger.clone();
     let _ = send_ledger_event_durable(ws, ledger, outcome.opened_event.event);
+
+    // Hand the broadcast receiver to a per-session forwarder. The previous
+    // forwarder for this session on this connection (if any) is aborted —
+    // a re-`session/open` always restarts the live pump from a fresh
+    // baseline cursor.
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger_for_forwarder,
+        session_id,
+        baseline_seq,
+        ws.connection_id,
+        features,
+        live_rx,
+        live_forwarders.clone(),
+    )
+    .await;
+}
+
+/// Pump live ledger events for `session_id` into the connection's WS write
+/// channel. Filters out events with `cursor.seq <= baseline_seq` (which
+/// were already shipped via replay) and applies the same capability
+/// gating as the live-emit path. The task ends when the WS write channel
+/// closes (peer gone), the broadcast sender is dropped (rare), or the
+/// connection cleanup aborts the handle.
+async fn spawn_live_forwarder(
+    ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
+    session_id: SessionKey,
+    baseline_seq: u64,
+    self_connection_id: ConnectionId,
+    features: ConnectionUiFeatures,
+    mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
+    forwarders: SharedLiveForwarders,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let session_for_log = session_id.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.cursor.seq <= baseline_seq {
+                        continue;
+                    }
+                    // Codex MUST-FIX-2: when the originating handler ran
+                    // on this same connection it already direct-sent the
+                    // wire frame; dropping the broadcast copy here is the
+                    // only way to keep delivery exactly-once. Other
+                    // connections still receive the event via fan-out.
+                    if event.from_connection == Some(self_connection_id) {
+                        continue;
+                    }
+                    if !live_event_passes_capability_filter(&event.event, features) {
+                        continue;
+                    }
+                    match send_ledger_event_durable(&ws, &ledger, event.event) {
+                        Ok(()) => {}
+                        Err(SendError::Closed) => break,
+                        // BackpressureDrop: `send_ledger_event_durable`
+                        // already opportunistically emits replay_lossy; keep
+                        // pumping so a recovered consumer gets caught up.
+                        Err(_) => {}
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    // Slow consumer fell behind. The ledger is durable; the
+                    // client's cursor is the source of truth and a follow-up
+                    // session/hydrate or reconnect with the last cursor
+                    // catches them up. Log and keep pumping new events.
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        session_id = %session_for_log.0,
+                        skipped_events = skipped,
+                        "live ledger forwarder lagged; client must rehydrate via cursor"
+                    );
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+    let abort = task.abort_handle();
+    // Replace any prior forwarder for this session on this connection —
+    // re-`session/open` restarts the live pump from a fresh baseline.
+    let mut guard = forwarders.lock().await;
+    if let Some(prev) = guard.insert(session_id, abort) {
+        prev.abort();
+    }
+}
+
+/// Mirror the capability filter at `ui_protocol.rs` session/open replay
+/// loop (UPCR-2026-012): a connection that did not negotiate
+/// `event.message_persisted.v1` must not receive `message/persisted`
+/// notifications via the live broadcast either. Other notifications pass
+/// unchanged today; future capability-gated kinds get added here.
+///
+/// M10 Phase 1 extends this with two intertwined gates for the
+/// `event.spawn_complete.v1` capability:
+///
+/// 1. Clients that did NOT negotiate `event.spawn_complete.v1` must not
+///    receive `turn/spawn_complete` notifications. They continue to see
+///    the legacy `message/persisted` row for the same `spawn_only`
+///    completion, preserving the wire shape they shipped with.
+/// 2. Clients that DID negotiate `event.spawn_complete.v1` see
+///    `turn/spawn_complete` instead — and the corresponding
+///    `message/persisted` row (carrying `source: background`) is
+///    suppressed at this gate so the same logical event is not
+///    delivered twice in two different shapes.
+fn live_event_passes_capability_filter(
+    event: &UiProtocolLedgerEvent,
+    features: ConnectionUiFeatures,
+) -> bool {
+    if !features.message_persisted {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(_)) = event {
+            return false;
+        }
+    }
+    if !features.spawn_complete {
+        // Old client: never deliver the new envelope.
+        if let UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(_)) = event {
+            return false;
+        }
+    } else {
+        // New client: suppress the `message/persisted` row that
+        // duplicates a `turn/spawn_complete` envelope. The row is
+        // identified by `source: background` — the only path through
+        // `MessageCommitObserver` that fires from `BackgroundResultSender`.
+        if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(event)) = event
+        {
+            if matches!(event.source, MessagePersistedSource::Background) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[derive(Debug)]
@@ -1622,12 +2046,19 @@ struct SessionOpenOutcome {
     replay: Vec<LedgeredUiProtocolEvent>,
     pending_approvals: Vec<ApprovalRequestedEvent>,
     opened_event: LedgeredUiProtocolEvent,
+    /// Head seq observed atomically with the replay snapshot. The live
+    /// forwarder uses this — NOT `opened_event.cursor.seq` — as its
+    /// drop-everything-≤-this baseline. Closes the replay/open race
+    /// where an event landing between replay and the session/open append
+    /// would otherwise be filtered out (codex PR #761 MUST-FIX-1).
+    replay_baseline_seq: u64,
 }
 
 async fn open_session_result(
     state: &Arc<AppState>,
     ledger: &UiProtocolLedger,
     approvals: &PendingApprovalStore,
+    connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     params: SessionOpenParams,
@@ -1637,11 +2068,90 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
-    let requested_workspace = validate_requested_session_cwd(state, features, &params)?;
-    if let Some(workspace_root) = requested_workspace {
-        session_workspaces().set(params.session_id.clone(), workspace_root);
+    let requested_workspace =
+        validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
+    // M11-F deliverable D: re-introduce the
+    // `appui.default_session_cwd` Tier-2 fallback that M11-E's
+    // `clone_session_tools` deletion took out. Pre-resolution order:
+    //   Tier 1 — `requested_workspace` (validated client cwd above).
+    //   Tier 2 — `AppState::appui_default_session_cwd` (operator default).
+    //   Tier 3 — `SessionRuntime::bootstrap`'s
+    //            `<profile.data_dir>/users/<encoded base>/workspace`.
+    //
+    // We resolve Tier 2 here, in the UI Protocol entrypoint, rather
+    // than threading it through `SessionRuntime::bootstrap`. Rationale:
+    //  - The bootstrap signature stays stable across M11-F.
+    //  - Tier 2 is a serve-level operator setting (octos serve reads
+    //    `config.appui.default_session_cwd`) — the runtime layer
+    //    doesn't otherwise see operator-level config, so leaving the
+    //    resolution at the dispatcher keeps `ProfileRuntime` /
+    //    `SessionRuntime` free of `AppState`-shaped knowledge.
+    //  - The hint is passed verbatim into `SessionRuntimeCache::get_or_init`,
+    //    which forwards it to `SessionRuntime::bootstrap`'s
+    //    `workspace_hint`. `validate_workspace_hint` runs the same
+    //    safety check on it as on a client-supplied cwd (canonicalize,
+    //    reject banned system roots).
+    let effective_workspace_hint: Option<PathBuf> = requested_workspace
+        .clone()
+        .or_else(|| state.appui_default_session_cwd.clone());
+    // M11-E: when a profile is registered for this session, materialize
+    // the `SessionRuntime` against the validated workspace hint NOW so
+    // the subsequent `turn/start` (and any cached read of
+    // `session_runtime.workspace_root`) observes the supplied cwd.
+    //
+    // The cache's `get_or_init` is single-flight: a same-key hit returns
+    // the EXISTING `Arc<SessionRuntime>` and IGNORES the new
+    // `workspace_hint`. That means a client cannot silently change a
+    // running session's cwd by re-opening with a different `cwd`
+    // parameter; the first cwd wins until the runtime is evicted (LRU,
+    // idle TTL, explicit `invalidate`). The `SessionOpened` reply is
+    // sourced from the cached runtime's `workspace_root` (not the
+    // requested hint) so the wire response truthfully reflects which
+    // workspace the next turn will use — closing the cache/wire
+    // divergence codex flagged on PR #884 follow-up.
+    //
+    // The `session_workspaces()` map is kept as a thin read-through
+    // view for the legacy WS dispatcher fallback (no profile registered
+    // — setup wizard / single-agent serve) and for pane snapshots that
+    // need a sync read of the workspace root. We always write the
+    // *effective* workspace root (the runtime's, when present) so the
+    // map cannot drift out of sync with the cache.
+    let mut effective_workspace_root: Option<PathBuf> = None;
+    if let Some(profile_runtime) =
+        resolve_session_profile_runtime(state, active_profile_id.as_deref())
+    {
+        let hint = effective_workspace_hint.clone();
+        match state
+            .session_cache
+            .get_or_init(&profile_runtime, params.session_id.clone(), hint)
+            .await
+        {
+            Ok(runtime) => {
+                effective_workspace_root = Some(runtime.workspace_root.clone());
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    profile_id = %profile_runtime.profile_id,
+                    session = %params.session_id,
+                    "session/open: SessionRuntime::bootstrap failed",
+                );
+                return Err(runtime_unavailable_error(format!(
+                    "failed to bootstrap session runtime: {error}"
+                )));
+            }
+        }
+    } else if let Some(workspace_root) = effective_workspace_hint.as_ref() {
+        // No profile registered (legacy single-agent serve). Stash the
+        // effective hint in the read-through map so the legacy
+        // dispatcher's pane-snapshot path can pick it up.
+        effective_workspace_root = Some(workspace_root.clone());
     }
-    let replay = ledger.replay_after(&params.session_id, params.after.as_ref())?;
+    if let Some(root) = effective_workspace_root.as_ref() {
+        session_workspaces().set(params.session_id.clone(), root.clone());
+    }
+    let (replay, replay_baseline_seq) =
+        ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
     let replayed_approval_ids = replay
         .iter()
         .filter_map(|event| match &event.event {
@@ -1667,7 +2177,11 @@ async fn open_session_result(
         sessions.data_dir()
     };
 
-    let workspace_root = session_workspace_root_for_state(state, &params.session_id);
+    // The cached SessionRuntime's `workspace_root` is the source of truth
+    // for the wire response when present. Fall back to the legacy lookup
+    // when no SessionRuntime was materialized (no profile registered).
+    let workspace_root = effective_workspace_root
+        .or_else(|| session_workspace_root_for_state(state, &params.session_id));
     let panes = features
         .pane_snapshots
         .then(|| build_pane_snapshot(&data_dir, &params.session_id, workspace_root.as_deref()));
@@ -1675,14 +2189,20 @@ async fn open_session_result(
     // clients don't have to rely on out-of-band knowledge of which feature
     // tokens the server honours.
     let capabilities = features.negotiated_capabilities();
-    let opened_event = ledger.append_notification(UiNotification::SessionOpened(SessionOpened {
-        session_id: params.session_id,
-        active_profile_id,
-        workspace_root: workspace_root.map(|path| path.to_string_lossy().to_string()),
-        cursor: None,
-        panes,
-        capabilities,
-    }));
+    // Tag the broadcast with our connection id so the live forwarder
+    // installed below skips this event (we direct-send it inline at the
+    // call site). Other connections still observe the broadcast.
+    let opened_event = ledger.append_notification_from(
+        UiNotification::SessionOpened(SessionOpened {
+            session_id: params.session_id,
+            active_profile_id,
+            workspace_root: workspace_root.map(|path| path.to_string_lossy().to_string()),
+            cursor: None,
+            panes,
+            capabilities,
+        }),
+        connection_id,
+    );
     let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
         opened_event.event.clone()
     else {
@@ -1693,12 +2213,14 @@ async fn open_session_result(
         replay,
         pending_approvals,
         opened_event,
+        replay_baseline_seq,
     })
 }
 
 fn validate_requested_session_cwd(
     state: &AppState,
     features: ConnectionUiFeatures,
+    active_profile_id: Option<&str>,
     params: &SessionOpenParams,
 ) -> Result<Option<PathBuf>, RpcError> {
     let Some(cwd) = params
@@ -1721,7 +2243,7 @@ fn validate_requested_session_cwd(
     }
 
     let workspace_root = canonical_existing_dir(cwd)?;
-    validate_session_workspace_allowed(state, &workspace_root)?;
+    validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
     Ok(Some(workspace_root))
 }
 
@@ -1762,93 +2284,122 @@ fn expand_home_path(path: &str) -> PathBuf {
 
 fn validate_session_workspace_allowed(
     state: &AppState,
+    active_profile_id: Option<&str>,
     workspace_root: &Path,
 ) -> Result<(), RpcError> {
-    let Some(agent) = &state.agent else {
+    // M11-F: per-session cwd is only honored on the profile-aware
+    // dispatch path (`SessionRuntime` materialized via
+    // `SessionRuntimeCache`). The legacy single-agent fallback was
+    // deleted in M11-F — `octos serve` bootstraps every profile in
+    // `ProfileStore::list()` at startup, so an unregistered profile
+    // here is a configuration bug. We still surface the
+    // `cwd_runtime_unavailable` typed error so the client sees a
+    // distinct shape from a path-safety rejection.
+    //
+    // We check the SPECIFIC routed profile, not just "any profile is
+    // registered" — a multi-profile deployment may have profiles A, B,
+    // and a request that routes to profile C should still get the
+    // `cwd_runtime_unavailable` rejection (codex round-3 fix). Reject
+    // early so the client sees a typed error instead of a silent
+    // wire/turn mismatch.
+    //
+    // Path safety mirrors `SessionRuntime::bootstrap`'s
+    // `validate_workspace_hint`: the cwd must canonicalize and must
+    // not be rooted under a banned system path (`/etc`, `/usr`,
+    // `/sbin`, …). Cross-session containment is intentionally NOT
+    // checked here — coding-agent UIs point sessions at arbitrary
+    // repos. Session-scope access control belongs in the auth /
+    // connection-profile gate (`validate_session_scope`), not the cwd
+    // validator.
+    if resolve_session_profile_runtime(state, active_profile_id).is_none() {
         return Err(RpcError::invalid_params(
-            "session/open cwd requires a configured coding runtime",
+            "session/open cwd requires a configured profile runtime",
         )
         .with_data(json!({
             "kind": "cwd_runtime_unavailable",
             "cwd": workspace_root.to_string_lossy(),
-        })));
-    };
-
-    let tools = agent.tool_registry();
-    session_filesystem_profile_for_workspace(tools.as_ref(), workspace_root)
-}
-
-fn session_filesystem_profile_for_workspace(
-    tools: &octos_agent::ToolRegistry,
-    workspace_root: &Path,
-) -> Result<(), RpcError> {
-    if let Some(root) = tools.workspace_root() {
-        if path_is_under_root(workspace_root, root) {
-            return Ok(());
-        }
-        return Err(RpcError::invalid_params(
-            "session/open cwd is outside the server workspace root",
-        )
-        .with_data(json!({
-            "kind": "cwd_outside_workspace_root",
-            "cwd": workspace_root.to_string_lossy(),
-            "workspace_root": root.to_string_lossy(),
+            "active_profile_id": active_profile_id,
         })));
     }
 
-    Err(
-        RpcError::invalid_params("session/open cwd cannot be authorized by this runtime")
-            .with_data(json!({
-                "kind": "cwd_authorization_unavailable",
-                "cwd": workspace_root.to_string_lossy(),
-            })),
-    )
+    validate_session_workspace_path_safety(workspace_root)
+}
+
+/// Path-safety gate for multi-profile session cwds.
+///
+/// Mirrors the banned-system-path list in
+/// `crate::runtime::session::validate_workspace_hint`. The two paths
+/// must stay in lockstep; the duplicate exists because
+/// `SessionRuntime::bootstrap` does not see `AppState` and cannot call
+/// back into this module. TODO(post-M11): collapse to a shared helper.
+fn validate_session_workspace_path_safety(workspace_root: &Path) -> Result<(), RpcError> {
+    // `validate_requested_session_cwd` already canonicalized the path
+    // and verified it is a directory, so we only need to guard against
+    // banned system roots here.
+    let mut components = workspace_root.components();
+    let _root = components.next();
+    if let Some(first) = components.next() {
+        let first = first.as_os_str();
+        const BANNED: &[&str] = &[
+            "etc", "sbin", "bin", "boot", "dev", "proc", "sys", "usr", "var", "root",
+        ];
+        for entry in BANNED {
+            if first == std::ffi::OsStr::new(entry) {
+                return Err(RpcError::invalid_params(format!(
+                    "session/open cwd is rooted under a system path /{entry}"
+                ))
+                .with_data(json!({
+                    "kind": "cwd_system_path_banned",
+                    "cwd": workspace_root.to_string_lossy(),
+                    "banned_root": entry,
+                })));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the `ProfileRuntime` for the routed session, mirroring
+/// `chat_sync`'s `state.profiles.get(profile_id)` lookup.
+///
+/// `active_profile_id` is the profile id `validate_session_scope`
+/// produced for this session/open. It may be `None` when the legacy
+/// no-profile flow is in use (single-agent serve, no connection-level
+/// profile identity). Falls back to `MAIN_PROFILE_ID` so the
+/// canonical "_main" profile in standalone deployments still resolves.
+fn resolve_session_profile_runtime(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+) -> Option<Arc<crate::runtime::ProfileRuntime>> {
+    let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
+    state.profiles.get(candidate).cloned()
 }
 
 fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -> Option<PathBuf> {
-    session_workspaces().get(session_id).or_else(|| {
-        state
-            .agent
-            .as_ref()?
-            .tool_registry()
-            .workspace_root()
-            .map(Path::to_path_buf)
-    })
+    // M11-F: read-through view on `session_workspaces()` only. The
+    // legacy `state.agent.tool_registry().workspace_root()` fallback
+    // was deleted alongside `state.agent`; the cached
+    // `SessionRuntime.workspace_root` is the canonical source on a
+    // successful open, and the in-memory `session_workspaces()` map is
+    // the synchronous read-through view `session/open`'s pane snapshot
+    // path uses (computed BEFORE the async cache load completes).
+    // Tier-2 (`appui.default_session_cwd`) is consulted at
+    // `open_session_result` time as a fallback hint, so the map
+    // already reflects the operator default when no client cwd was
+    // supplied.
+    let _ = state; // unused after the agent-fallback deletion
+    session_workspaces().get(session_id)
 }
 
-fn session_tool_registry(
-    base_agent: &Agent,
-    session_id: &SessionKey,
-) -> Result<(Arc<octos_agent::ToolRegistry>, Option<PathBuf>), String> {
-    let base_tools = base_agent.tool_registry();
-    let Some(workspace_root) = session_workspaces()
-        .get(session_id)
-        .or_else(|| base_tools.workspace_root().map(Path::to_path_buf))
-    else {
-        return Ok((base_tools.clone(), None));
-    };
-
-    session_filesystem_profile_for_workspace(base_tools.as_ref(), &workspace_root)
-        .map_err(|error| error.message)?;
-    // M9 review fix (HIGH #1): inherit the effective sandbox config from
-    // `base_agent` so per-session shell tools keep the running server's
-    // sandbox policy (mode, network, read-allow paths, profile) instead of
-    // silently falling back to `SandboxConfig::default()` which disables
-    // network and overrides read paths — that fallback was the root cause
-    // of "backend cannot install npm" reports on AppUi sessions.
-    // Falls back to `SandboxConfig::default()` only when the agent was built
-    // without recording its sandbox config (legacy/test paths).
-    let sandbox_config = base_agent
-        .sandbox_config()
-        .unwrap_or_else(octos_agent::SandboxConfig::default);
-    let sandbox = octos_agent::sandbox::create_sandbox(&sandbox_config);
-    let rebound = base_tools.rebind_cwd(&workspace_root, sandbox);
-
-    Ok((Arc::new(rebound), Some(workspace_root)))
-}
-
-fn session_system_prompt(base_agent: &Agent, workspace_root: Option<&Path>) -> String {
-    let mut prompt = base_agent.system_prompt_snapshot();
+/// Append the per-session workspace-root hint to the system prompt.
+///
+/// M11-F: the base prompt comes from the SessionRuntime's agent only
+/// (legacy `state.agent` was deleted), so this helper takes the
+/// resolved `String` rather than an `Agent` reference. The text
+/// appended is identical to the pre-M11-E `session_system_prompt`
+/// wording — the SPA's reducer matches on it heuristically and must
+/// not change.
+fn append_workspace_root_hint(mut prompt: String, workspace_root: Option<&Path>) -> String {
     if let Some(workspace_root) = workspace_root {
         prompt.push_str("\n\nAppUi session workspace root: ");
         prompt.push_str(&workspace_root.to_string_lossy());
@@ -1857,16 +2408,6 @@ fn session_system_prompt(base_agent: &Agent, workspace_root: Option<&Path>) -> S
         );
     }
     prompt
-}
-
-fn path_is_under_root(path: &Path, root: &Path) -> bool {
-    let path = canonical_or_original(path);
-    let root = canonical_or_original(root);
-    path == root || path.starts_with(root)
-}
-
-fn canonical_or_original(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 const MAX_PANE_WORKSPACE_ENTRIES: usize = 200;
@@ -2249,10 +2790,37 @@ async fn handle_turn_start(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
-    params: TurnStartParams,
+    mut params: TurnStartParams,
 ) {
+    // UPCR-2026-015 (M9-β-1): if the client carried a `topic` field
+    // alongside the session_id, fold it into the resolved SessionKey
+    // BEFORE scope validation. The rest of the turn pipeline keys
+    // exclusively off `params.session_id`, so adopting the topic-
+    // suffixed form here means history lookup, ledger appends, and
+    // `task/list` filtering all see the per-topic bucket
+    // automatically. Empty / whitespace-only topics fall through to
+    // the bare session shape (matching `SessionKey::with_topic`'s
+    // own empty-string short-circuit).
+    if let Some(topic) = params
+        .topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        // Replace the SessionKey with the topic-suffixed form. Splice
+        // any existing topic suffix away first so a client that sends
+        // both `session_id: "x:y#old"` and `topic: "new"` lands in a
+        // single, unambiguous bucket (`x:y#new`) rather than the
+        // double-suffixed garbage `x:y#old#new`. The base parser
+        // already handles `#`-stripped lookups, but we want the
+        // canonical form on the wire-trip back to clients.
+        let base = params.session_id.base_key().to_owned();
+        params.session_id = SessionKey(format!("{base}#{topic}"));
+    }
+
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         let _ = send_rpc_error(ws, Some(id), error);
         return;
@@ -2269,8 +2837,33 @@ async fn handle_turn_start(
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
     if fixture.is_none() {
-        if let Err(error) = validate_runtime(state) {
-            let _ = send_rpc_error(ws, Some(id), runtime_unavailable_error(error));
+        // M11-F: validate that a `ProfileRuntime` is registered for the
+        // routed profile BEFORE spawning the turn task. The legacy
+        // `validate_runtime` (which checked `state.agent` /
+        // `state.sessions`) was deleted; the equivalent gate now is
+        // "the SessionRuntimeCache can resolve a ProfileRuntime for
+        // this session's profile id". Fail fast with the same
+        // `runtime_unavailable` shape so existing clients see no wire
+        // change.
+        let active_profile_id = params
+            .session_id
+            .profile_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                connection_profile_id
+                    .or(routed_profile_id)
+                    .map(ToOwned::to_owned)
+            });
+        if resolve_session_profile_runtime(state, active_profile_id.as_deref()).is_none() {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                runtime_unavailable_error(format!(
+                    "No ProfileRuntime registered for profile '{}'. \
+                     Set up the profile with an API key in the dashboard.",
+                    active_profile_id.as_deref().unwrap_or("<unset>"),
+                )),
+            );
             return;
         }
     }
@@ -2286,6 +2879,9 @@ async fn handle_turn_start(
     let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
     let turn_state_for_task = turn_state.clone();
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let resolved_profile_id = connection_profile_id
+        .or(routed_profile_id)
+        .map(ToOwned::to_owned);
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -2311,6 +2907,7 @@ async fn handle_turn_start(
                 features,
                 params,
                 prompt,
+                resolved_profile_id,
                 turn_state_for_task,
                 interrupt_rx,
             )
@@ -2881,6 +3478,7 @@ async fn handle_session_hydrate(
     approvals: &PendingApprovalStore,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
     params: SessionHydrateParams,
 ) {
@@ -2940,6 +3538,66 @@ async fn handle_session_hydrate(
             return;
         }
     }
+    // M10 Phase 6.2 (Bug C). Closes the Phase 5a documented punt by
+    // surfacing every retained `turn/spawn_complete` envelope from the
+    // ledger replay window on the hydrate response when (and only
+    // when) the client negotiated `event.spawn_complete.v1`. Server
+    // does NOT suppress the legacy `Background`-source rows in
+    // `messages` — the `SessionHydrateResult` payload has no
+    // alternative channel for the envelope's `content`/`media`, and
+    // codex's review rounds on the suppression-side designs surfaced
+    // multiple correctness regressions (NotConfigured-branch empty
+    // media, multi-task per-turn ambiguity, orphan companions from
+    // failed final-ack persists). Negotiated clients dedup against
+    // `replayed_envelopes` on their side using `message_id` —
+    // mirroring the live wire's split: producer emits both shapes,
+    // consumer chooses one per `event.spawn_complete.v1` capability.
+    //
+    // Non-negotiated clients receive `replayed_envelopes: None`
+    // (omitted via `skip_serializing_if`); the `messages` payload they
+    // see is byte-identical to pre-fix.
+    let replayed_envelopes = if features.spawn_complete && include_set.messages {
+        Some(
+            replayed
+                .iter()
+                .filter_map(|event| match &event.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => {
+                        Some(ev.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
+    // Codex Bug C round-6: gate the new identity/provenance fields
+    // on `features.spawn_complete`. Without negotiation we leave
+    // `HydratedMessage.message_id` and `HydratedMessage.source` as
+    // `None` so legacy clients (TUI, pre-spawn_complete SPA bundles,
+    // strict-codegen consumers) see byte-identical wire. With
+    // negotiation we synthesize `message_id` (mirrors
+    // `MessageCommitObserver`'s formula) and lift `source` from the
+    // retained `MessagePersisted` events — giving the client the
+    // identity AND provenance signals it needs to drop both the
+    // spawn-ack row AND the per-file companion rows in favour of the
+    // envelope on hydrate-time dedup.
+    let row_sources: HashMap<u64, String> = if features.spawn_complete && include_set.messages {
+        replayed
+            .iter()
+            .filter_map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) => {
+                    Some((ev.seq, ev.source.as_str().to_owned()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let expose_message_id = features.spawn_complete && include_set.messages;
+
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
     let (messages, threads_projection) = {
@@ -2955,14 +3613,42 @@ async fn handle_session_hydrate(
                         Some(after) => *seq as u64 > after.seq,
                         None => true,
                     })
-                    .map(|(seq, msg)| HydratedMessage {
-                        seq: seq as u64,
-                        role: msg.role.as_str().to_owned(),
-                        content: msg.content.clone(),
-                        turn_id: None, // Message struct does not carry typed turn_id today
-                        thread_id: msg.thread_id.clone(),
-                        client_message_id: msg.client_message_id.clone(),
-                        persisted_at: msg.timestamp,
+                    .map(|(seq, msg)| {
+                        let seq = seq as u64;
+                        // M10 Phase 6.2 (Bug C). Negotiated clients
+                        // get `(message_id, source)` so they can
+                        // dedup the hydrated rows against
+                        // `replayed_envelopes`. Non-negotiated
+                        // clients keep the pre-fix shape (both
+                        // fields `None`, omitted from the wire).
+                        let message_id = if expose_message_id {
+                            Some(format!(
+                                "{}:{seq}:{}",
+                                params.session_id.0,
+                                msg.timestamp.timestamp_nanos_opt().unwrap_or(0),
+                            ))
+                        } else {
+                            None
+                        };
+                        let source = row_sources.get(&seq).cloned();
+                        HydratedMessage {
+                            seq,
+                            role: msg.role.as_str().to_owned(),
+                            content: msg.content.clone(),
+                            turn_id: None, // Message struct does not carry typed turn_id today
+                            thread_id: msg.thread_id.clone(),
+                            client_message_id: msg.client_message_id.clone(),
+                            persisted_at: msg.timestamp,
+                            message_id,
+                            source,
+                            // P1.3 fix: surface canonical-ledger media so a
+                            // client reconnecting after a disconnect can
+                            // re-render the same `.md` / `.mp3` / `.pptx`
+                            // attachment it would have seen via the live
+                            // `message/persisted` push (`media` field on
+                            // MessagePersistedEvent).
+                            media: msg.media.clone(),
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
@@ -3016,6 +3702,7 @@ async fn handle_session_hydrate(
         threads,
         turns,
         pending_approvals,
+        replayed_envelopes,
     };
     send_serialized_rpc_result(
         ws,
@@ -3678,6 +4365,9 @@ async fn run_m9_fixture_turn(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         timestamp: Utc::now(),
+        // UPCR-2026-014 (M9-α-9): WS turn-start path has no topic in
+        // scope today; the SSE bridge in α-9 plumbs topic separately.
+        topic: None,
     });
     if send_notification_lifecycle(&ws, &ledger, started).is_err() {
         let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
@@ -4039,6 +4729,7 @@ async fn run_standalone_turn(
     features: ConnectionUiFeatures,
     params: TurnStartParams,
     prompt: String,
+    routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
 ) {
@@ -4048,6 +4739,9 @@ async fn run_standalone_turn(
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
         timestamp: Utc::now(),
+        // UPCR-2026-014 (M9-α-9): legacy WS turn-start path; topic is
+        // not in scope here (the SSE bridge surfaces it via α-9).
+        topic: None,
     });
     // turn/started is lifecycle. If the client cannot receive it we may as
     // well stop now — the rest of the turn is wasted work. Per FIX-03,
@@ -4059,8 +4753,53 @@ async fn run_standalone_turn(
         return;
     }
 
-    let (base_agent, sessions) = match validate_runtime(&state) {
-        Ok(runtime) => runtime,
+    // M11-F: resolve the per-session view through the
+    // `ProfileRuntime` + `SessionRuntimeCache` path only. The legacy
+    // single-agent fallback (`state.agent` / `validate_runtime`) was
+    // deleted — `octos serve` bootstraps every profile in
+    // `ProfileStore::list()` at startup, so an unregistered profile
+    // here is a configuration bug, not a runtime fallback. Fail closed
+    // with a typed `runtime_unavailable` terminal so the client sees
+    // the same error shape it would for a SessionRuntime::bootstrap
+    // failure.
+    let active_profile_id = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or(routed_profile_id);
+    let Some(profile_runtime) =
+        resolve_session_profile_runtime(&state, active_profile_id.as_deref())
+    else {
+        let error = format!(
+            "No ProfileRuntime registered for profile '{}'. \
+             Set up the profile with an API key in the dashboard.",
+            active_profile_id.as_deref().unwrap_or("<unset>"),
+        );
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_unavailable", error.as_str())),
+        )
+        .await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    };
+
+    // Read-through view: when `session.open` previously stashed an
+    // effective cwd in `session_workspaces()` (Tier-1 client cwd or
+    // Tier-2 operator default, resolved at `open_session_result` time),
+    // use that as the `workspace_hint`. Otherwise the bootstrap default
+    // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
+    let hint = session_workspaces().get(&session_id);
+    let session_runtime = match state
+        .session_cache
+        .get_or_init(&profile_runtime, session_id.clone(), hint)
+        .await
+    {
+        Ok(rt) => rt,
         Err(error) => {
             try_emit_terminal(
                 &turn_state,
@@ -4069,16 +4808,28 @@ async fn run_standalone_turn(
                 &ledger,
                 &session_id,
                 &turn_id,
-                Some(("runtime_unavailable", error.as_str())),
+                Some(("runtime_unavailable", &error.to_string())),
             )
             .await;
-            // FIX-06: a turn that ends — for any reason — must drop its
-            // `approve_for_turn` policy entries so a subsequent turn can't
-            // reuse them.
             contracts.scopes.evict_turn(&session_id, &turn_id);
             return;
         }
     };
+
+    // Source the per-session primitives from the SessionRuntime.
+    //
+    // `tool_registry` is an OWNED `ToolRegistry` we mutate per-turn
+    // (`set_background_result_sender`, `register(send_file_tool)`,
+    // `supervisor().set_on_change`). We snapshot from the shared
+    // `Arc<ToolRegistry>` so per-turn mutation does not race with the
+    // cached SessionRuntime.
+    let sessions = session_runtime.sessions.clone();
+    let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
+    let workspace_root: Option<PathBuf> = Some(session_runtime.workspace_root.clone());
+    let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
+    let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
+    let agent_config = session_runtime.agent.agent_config();
+    let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
 
     let history: Vec<Message> = {
         let mut sessions = sessions.lock().await;
@@ -4086,25 +4837,354 @@ async fn run_standalone_turn(
         session.get_history(50).to_vec()
     };
 
-    let (tool_registry, workspace_root) =
-        match session_tool_registry(base_agent.as_ref(), &session_id) {
-            Ok(registry) => registry,
-            Err(error) => {
-                // FIX-03 pattern: terminal emission + state transition is atomic.
-                try_emit_terminal(
-                    &turn_state,
-                    TerminalReason::Errored,
-                    &ws,
-                    &ledger,
-                    &session_id,
-                    &turn_id,
-                    Some(("cwd_binding_failed", error.as_str())),
-                )
-                .await;
-                contracts.scopes.evict_turn(&session_id, &turn_id);
-                return;
+    // For hosted multi-tenant standalone serve, the file API resolves
+    // `/api/files/...` against the per-profile data dir (`<server_data>/
+    // profiles/<profile>/data`), not the server-wide one. Plugin output
+    // must land under the SAME root the file API will check, otherwise
+    // `resolve_legacy_file_request` rejects it.
+    //
+    // The active profile id can come from three places, in order:
+    //   1. `session_id.profile_id()` — when the SPA encodes it via
+    //      `SessionKey::with_profile`. Bare-channel session ids
+    //      (`web-…`) skip this.
+    //   2. `routed_profile_id` — derived from the connection's `Host`
+    //      header during WS handshake. Hosted admin-token requests land
+    //      here; the SPA at `dspfac.crew.ominix.io` matches.
+    //   3. The registered `ProfileRuntime`'s `data_dir` when M11-E
+    //      materialized the SessionRuntime.
+    // Falls back to the server-wide data dir for local sessions / dev.
+    let plugin_root_dir = session_runtime.profile.data_dir.clone();
+
+    // β: wire `BackgroundResultSender` + `SendFileTool` so spawn_only tool
+    // completions and explicit `send_file` calls persist as assistant
+    // messages on the session and reach connected WS clients via the
+    // existing `MessageCommitObserver` -> `message/persisted` ledger append
+    // (#761 live publish-subscribe). Without this, the api/serve path drops
+    // spawn_only file deliveries on the floor — gateway wires the
+    // equivalent in `session_actor.rs::deliver_background_notification`.
+    //
+    // The canonical persist
+    // (`octos_bus::session::persist_message_through_canonical_path`)
+    // serialises with other writers via a per-key Tokio mutex, so this is
+    // safe to invoke from a `tokio::spawn`-driven background task that may
+    // complete after the originating turn has ended. After each persist we
+    // invalidate the cached `SessionManager` so `session/hydrate` and
+    // `/api/sessions/:id/messages` reads pick up the new row instead of
+    // the pre-persist snapshot (matches `ApiChannel::persist_to_session`'s
+    // post-write invalidate at `api_channel.rs:1503`).
+    //
+    // M10 Phase 1: in addition to persisting (which still fires
+    // `message/persisted` via `MessageCommitObserver` for ledger
+    // durability + `event.message_persisted.v1` clients), the closure
+    // now appends a `turn/spawn_complete` envelope event to the ledger
+    // for clients that negotiated `event.spawn_complete.v1`. The
+    // per-connection capability filter (`live_event_passes_capability_filter`)
+    // routes each connection to exactly one wire shape — old clients
+    // see `message/persisted` as before, new clients see
+    // `turn/spawn_complete` and the duplicate `message/persisted`
+    // (with `source: background`) is suppressed.
+    {
+        let bg_data_dir = sessions.lock().await.data_dir().to_path_buf();
+        let bg_sessions = sessions.clone();
+        let bg_session_id = session_id.clone();
+        let bg_thread_id = turn_id.0.to_string();
+        let bg_turn_id = turn_id.clone();
+
+        // Wire spawn_only contract-satisfied path.
+        let payload_sessions = bg_sessions.clone();
+        let payload_data_dir = bg_data_dir.clone();
+        let payload_session_id = bg_session_id.clone();
+        let payload_thread_id = bg_thread_id.clone();
+        let payload_turn_id = bg_turn_id.clone();
+        let payload_ledger = ledger.clone();
+        tool_registry.set_background_result_sender(std::sync::Arc::new(
+            move |payload: BackgroundResultPayload| {
+                let sessions = payload_sessions.clone();
+                let data_dir = payload_data_dir.clone();
+                let session_id = payload_session_id.clone();
+                let originating_thread_id = payload
+                    .originating_thread_id
+                    .clone()
+                    .filter(|tid| !tid.is_empty());
+                let thread_id = originating_thread_id
+                    .clone()
+                    .unwrap_or_else(|| payload_thread_id.clone());
+                let task_label = payload.task_label.clone();
+                let media = payload.media.clone();
+                // M10 Phase 5a: envelope_media is the media list to surface
+                // ONLY on the `turn/spawn_complete` envelope. The
+                // `NotConfigured` `send_file` fallback populates this with
+                // its `sent_files` paths so dual-negotiated clients see the
+                // file URLs on the envelope; the persisted row keeps
+                // `media: vec![]` (no double-render on old clients that DO
+                // see the per-file `message/persisted` companions). The
+                // contract-`Satisfied` path leaves `envelope_media` as the
+                // empty default; in that case the envelope falls back to
+                // `media`.
+                let envelope_media = if payload.envelope_media.is_empty() {
+                    payload.media.clone()
+                } else {
+                    payload.envelope_media.clone()
+                };
+                let kind = payload.kind;
+                let raw_content = payload.content.clone();
+                let task_id = payload.task_id.clone();
+                let turn_id = payload_turn_id.clone();
+                let ledger = payload_ledger.clone();
+                Box::pin(async move {
+                    let content_text = match kind {
+                        BackgroundResultKind::Notification => {
+                            if raw_content.is_empty() && !media.is_empty() {
+                                format!("✅ {} delivered.", task_label)
+                            } else {
+                                raw_content
+                            }
+                        }
+                        BackgroundResultKind::Report => {
+                            if raw_content.is_empty() && !media.is_empty() {
+                                format!("✅ {} completed.", task_label)
+                            } else if raw_content.len() > 1000 {
+                                let preview: String = raw_content.chars().take(300).collect();
+                                format!("✅ **{}** completed.\n\n{}…", task_label, preview,)
+                            } else {
+                                format!("✅ **{}** completed.\n\n{}", task_label, raw_content,)
+                            }
+                        }
+                    };
+                    // M10 Phase 1 (codex P1): scope the persist call in
+                    // the `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local
+                    // so `install_message_commit_observer` emits
+                    // `source: background` for this row. Without this,
+                    // `MessagePersistedSource::from_role(Assistant)`
+                    // would return `Assistant` and the per-connection
+                    // duplicate-suppression filter would never fire,
+                    // delivering both `message/persisted` AND
+                    // `turn/spawn_complete` to upgraded clients.
+                    // M10 Phase 1 (codex round 4): only mark this row as
+                    // `source: background` if we will emit a replacement
+                    // `turn/spawn_complete` envelope for it. Otherwise
+                    // upgraded clients filter the legacy
+                    // `message/persisted` row AND see no envelope —
+                    // they receive nothing for the completion. The
+                    // marker has to stay coupled to the envelope emit
+                    // for the dual-gate invariant to hold.
+                    //
+                    // Empty `Some("")` — the legacy register sentinel
+                    // returned when the supervisor's fan-out cap refuses
+                    // a task — is treated like `None` (codex round 3 P3).
+                    let task_id_clean = task_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let will_emit_envelope = task_id_clean.is_some();
+                    let persisted_meta = if will_emit_envelope {
+                        MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                            .scope(
+                                Some(MessagePersistedSource::Background),
+                                persist_assistant_with_media(
+                                    &sessions,
+                                    &data_dir,
+                                    &session_id,
+                                    content_text.clone(),
+                                    media.clone(),
+                                    thread_id.clone(),
+                                    &task_label,
+                                ),
+                            )
+                            .await
+                    } else {
+                        // No envelope incoming → leave the source as
+                        // role-derived (Assistant) so upgraded clients
+                        // still receive the `message/persisted` row.
+                        // This degrades to legacy behaviour for the
+                        // edge cases (no tracked task, empty sentinel)
+                        // rather than silently dropping the completion.
+                        persist_assistant_with_media(
+                            &sessions,
+                            &data_dir,
+                            &session_id,
+                            content_text.clone(),
+                            media.clone(),
+                            thread_id.clone(),
+                            &task_label,
+                        )
+                        .await
+                    };
+                    if let (Some(task_id_value), Some(meta)) =
+                        (task_id_clean.clone(), persisted_meta.as_ref())
+                    {
+                        let event = TurnSpawnCompleteEvent {
+                            session_id: session_id.clone(),
+                            turn_id: Some(turn_id.clone()),
+                            thread_id: Some(thread_id.clone()),
+                            task_id: task_id_value,
+                            // Codex rounds 2/6: leave this `None`. In
+                            // the standalone-turn path the reporter
+                            // binds `thread_id = turn_id.0.to_string()`
+                            // (a TurnId UUID), so `originating_thread_id`
+                            // here is NOT the user's `client_message_id`
+                            // the field is documented to carry. Phase 4
+                            // plumbing will add a typed
+                            // `originating_client_message_id` to
+                            // `BackgroundResultPayload` and populate
+                            // this from there. Today the SPA reducer
+                            // already anchors via `thread_id` (which
+                            // matches the user-prompt row's thread_id
+                            // through the M8.10 root-on-cmid
+                            // invariant), so this `None` is safe.
+                            response_to_client_message_id: None,
+                            seq: meta.committed_seq as u64,
+                            // Reuse the `MessageCommitObserver`-style
+                            // wire id for the same durable row — see
+                            // `PersistedMessageMeta` doc.
+                            message_id: meta.message_id.clone(),
+                            source: "background".to_owned(),
+                            cursor: UiCursor {
+                                stream: session_id.0.clone(),
+                                seq: 0,
+                            },
+                            persisted_at: Utc::now(),
+                            content: content_text,
+                            media: envelope_media,
+                        };
+                        ledger.append_notification(UiNotification::TurnSpawnComplete(event));
+                    } else if task_id_clean.is_none() {
+                        // Best-effort: a payload without `task_id` (or
+                        // with the empty-string sentinel returned by
+                        // the legacy register-task path under fan-out
+                        // pressure) arrives only from edge-case
+                        // callers. Old clients see `message/persisted`
+                        // as before; new clients miss this single
+                        // completion. Logging surfaces the gap so we
+                        // can fix upstream callers.
+                        tracing::debug!(
+                            session_id = %session_id.0,
+                            task_label,
+                            had_empty_task_id = task_id.as_deref() == Some(""),
+                            "background result missing task_id; turn/spawn_complete suppressed"
+                        );
+                    } else {
+                        // Persist of the spawn-ack/completion row failed.
+                        // The agent's task_supervisor records the failure
+                        // for operator visibility.
+                        //
+                        // M10 Phase 5a coalesce: the per-file `send_file`
+                        // companion rows for the NotConfigured branch
+                        // were already committed *before* this final
+                        // persist (the consumer drains them off
+                        // `out_rx` independently). Those companion rows
+                        // are tagged `MessagePersistedSource::Background`
+                        // so dual-negotiated clients suppress them at
+                        // `live_event_passes_capability_filter` —
+                        // meaning a new client whose envelope persist
+                        // failed sees ZERO file rows for the completion
+                        // (the per-file rows are filtered, the envelope
+                        // never fired). Old clients see the per-file
+                        // rows unchanged (they pass the legacy gate
+                        // regardless of source). Accepted as a
+                        // low-probability degradation: persist is
+                        // durable, this branch fires only when the
+                        // session ledger cannot accept a write, and the
+                        // task_supervisor captures the failure for
+                        // recovery follow-ups. Phase 6 will reorder the
+                        // companion rows AFTER the envelope persist
+                        // commits to close this window.
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            task_label,
+                            "background result persist failed; new clients miss this completion (per-file companion rows already committed under source: background and are suppressed)"
+                        );
+                    }
+                    persisted_meta.is_some()
+                })
+            },
+        ));
+
+        // Wire `send_file` for the legacy non-contract `files_to_send` path
+        // and any explicit agent calls. The spawn_only auto-background
+        // branch falls back to `send_file` when the workspace contract is
+        // `NotConfigured` (`execution.rs:549`) — without this registration,
+        // tools like `deep_search` (no default api-mode workspace policy)
+        // emit `files_to_send` that have nowhere to land.
+        let (out_tx, mut out_rx) =
+            mpsc::channel::<octos_core::OutboundMessage>(SEND_FILE_CHANNEL_CAPACITY);
+        // Mirror gateway's session_actor.rs:2087 base/extra split: use the
+        // session workspace root as the base_dir (so a spawn_only tool
+        // returning `files_to_send: ["output/report.md"]` resolves under
+        // the user's workspace), and keep `data_dir` as an extra-allowed
+        // directory for pipeline-generated artefacts. Fall back to
+        // `data_dir` as base when the session has no workspace (rare —
+        // CLI clients without `session.workspace_cwd.v1` capability).
+        let send_file_base = workspace_root
+            .clone()
+            .unwrap_or_else(|| bg_data_dir.clone());
+        let mut send_file_tool = octos_agent::SendFileTool::new(out_tx)
+            .with_base_dir(send_file_base)
+            .with_extra_allowed_dir(bg_data_dir.clone());
+        // Profiles with a custom `data_dir` outside `bg_data_dir` host
+        // their plugin output under a path the default extras above would
+        // reject. Add `plugin_root_dir` (resolved per-profile via
+        // `routed_profile_id` or `session_id.profile_id()`) as an extra
+        // allowed dir so spawn_only `send_file` deliveries from those
+        // profiles still pass the path-scoping check.
+        if plugin_root_dir != bg_data_dir {
+            send_file_tool = send_file_tool.with_extra_allowed_dir(plugin_root_dir.clone());
+        }
+        send_file_tool.set_context("api", &bg_session_id.0);
+        tool_registry.register(send_file_tool);
+
+        // Drain `OutboundMessage`s emitted by `send_file` calls and persist
+        // each one as an assistant message + media via the same canonical
+        // path used by the spawn_only sender. Drops out when the turn ends
+        // (the `out_tx` half is dropped along with the registry / agent
+        // when the turn-scoped state is freed).
+        //
+        // M10 Phase 5a coalesce: when the outbound carries
+        // `metadata.spawn_complete_companion = true`, persist the row with
+        // `MessagePersistedSource::Background` (via the
+        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local). This marks each
+        // per-file row from a spawn_only completion as a duplicate of the
+        // forthcoming `turn/spawn_complete` envelope so dual-negotiated
+        // clients suppress it at `live_event_passes_capability_filter`.
+        // Without the capability the override has no wire-visible effect —
+        // the row still reaches old clients as `message/persisted`.
+        let consumer_sessions = bg_sessions.clone();
+        let consumer_data_dir = bg_data_dir.clone();
+        let consumer_session_id = bg_session_id.clone();
+        let consumer_thread_id = bg_thread_id.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                let thread_id = msg
+                    .metadata
+                    .get("thread_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| consumer_thread_id.clone());
+                let is_spawn_complete_companion = msg
+                    .metadata
+                    .get("spawn_complete_companion")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let persist = persist_assistant_with_media(
+                    &consumer_sessions,
+                    &consumer_data_dir,
+                    &consumer_session_id,
+                    msg.content,
+                    msg.media,
+                    thread_id,
+                    "send_file",
+                );
+                if is_spawn_complete_companion {
+                    let _ = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                        .scope(Some(MessagePersistedSource::Background), persist)
+                        .await;
+                } else {
+                    let _ = persist.await;
+                }
             }
-        };
+        });
+    }
     let progress_workspace_root = workspace_root
         .clone()
         .or_else(|| tool_registry.workspace_root().map(Path::to_path_buf));
@@ -4133,15 +5213,19 @@ async fn run_standalone_turn(
         forward_task_progress_to_channel(&progress_tx_for_tasks, &task_progress_dropped, task);
     });
     drop(progress_tx);
+    // M11-E: the agent is built per-turn (so per-turn callbacks layer in
+    // without mutating shared session state), but its LLM, memory,
+    // sandbox, and base system prompt come from the SessionRuntime
+    // (preferred) or the legacy `state.agent`.
     let request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
-        base_agent.llm_provider(),
-        tool_registry,
-        base_agent.memory_store(),
+        llm_provider.clone(),
+        Arc::new(tool_registry),
+        memory_store.clone(),
     )
-    .with_config(base_agent.agent_config())
-    .with_system_prompt(session_system_prompt(
-        base_agent.as_ref(),
+    .with_config(agent_config.clone())
+    .with_system_prompt(append_workspace_root_hint(
+        system_prompt_base.clone(),
         workspace_root.as_deref(),
     ))
     .with_reporter(reporter);
@@ -4165,11 +5249,32 @@ async fn run_standalone_turn(
     // the WRONG sibling user under rapid-fire concurrent turns.
     let turn_thread_id_for_persist = turn_id.0.to_string();
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
+    // UPCR-2026-015 (M9-β-1): pull the pre-uploaded media paths off
+    // the params and feed them to the agent loop. `process_message`
+    // already accepts a `Vec<String>` of paths (used by the
+    // `octos chat` CLI and gateway-mode message handler) — wiring it
+    // here restores the legacy SSE chat handler's media delivery on
+    // the WS transport. The legacy `rewrite_for` field is logged at
+    // debug level for now; durable in-place rewrites land in a
+    // follow-up that touches the per-session ledger replace path.
+    let turn_media_paths: Vec<String> = params
+        .media
+        .iter()
+        .map(|file_ref| file_ref.path.clone())
+        .collect();
+    if let Some(rewrite_for) = params.rewrite_for.as_deref() {
+        tracing::debug!(
+            session = %session_id.0,
+            turn = %turn_id.0,
+            rewrite_for,
+            "turn/start carries rewrite_for; current build forwards the prompt without in-place ledger rewrite (β-1 advisory)"
+        );
+    }
     let agent_task = tokio::spawn(async move {
         let result = octos_agent::tools::TOOL_APPROVAL_CTX
             .scope(
                 approval_requester,
-                request_agent.process_message(&prompt, &history, Vec::new()),
+                request_agent.process_message(&prompt, &history, turn_media_paths),
             )
             .await;
 
@@ -4184,19 +5289,8 @@ async fn run_standalone_turn(
                         response.reasoning_content.clone(),
                     );
                     for message in response.messages.iter().cloned().chain(final_assistant) {
-                        let mut to_save = message;
-                        // PR F (M8.10): pre-stamp `thread_id` on the
-                        // persist path so Patch 8's fail-closed
-                        // `derive_thread_id_for_new_write` accepts the
-                        // write. The bound id is the originating `TurnId`,
-                        // the same value the reporter is broadcasting on
-                        // every wire event — keeps persist and wire in
-                        // lockstep so reload renders match the live UI.
-                        if to_save.thread_id.is_none()
-                            && matches!(to_save.role, MessageRole::Assistant | MessageRole::Tool)
-                        {
-                            to_save.thread_id = Some(turn_thread_id_for_persist.clone());
-                        }
+                        let to_save =
+                            pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         if let Ok(seq) = sessions
                             .add_message_with_seq(&agent_session_id, to_save)
                             .await
@@ -4367,7 +5461,9 @@ async fn run_standalone_turn(
                         send_notification_durable(&ws, &ledger, UiNotification::Warning(warning));
                 }
                 if let Some(status) = mapping.status {
-                    let event = ledger.append_progress(status.event);
+                    // Tag with this connection's id so its forwarder skips
+                    // the broadcast copy after the direct send below.
+                    let event = ledger.append_progress_from(status.event, ws.connection_id);
                     let _ = send_ledger_event_durable(&ws, &ledger, event.event);
                 }
             }
@@ -4502,6 +5598,14 @@ async fn try_emit_terminal(
                     session_id: session_id.clone(),
                     turn_id: turn_id.clone(),
                     cursor: None,
+                    // UPCR-2026-014 (M9-α-9) addendum fields; the WS
+                    // lifecycle path doesn't have token usage /
+                    // session_result threaded yet — those land via the
+                    // SSE bridge in α-9. Leaving them None preserves
+                    // the pre-addendum wire shape for WS-driven turns.
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
                 }),
             );
         }
@@ -4696,25 +5800,6 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-fn validate_runtime(
-    state: &AppState,
-) -> Result<
-    (
-        Arc<Agent>,
-        Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
-    ),
-    String,
-> {
-    let agent = state.agent.as_ref().ok_or_else(|| {
-        "No LLM provider configured. Set up a profile with an API key first.".to_string()
-    })?;
-    let sessions = state
-        .sessions
-        .as_ref()
-        .ok_or_else(|| "Sessions not available".to_string())?;
-    Ok((agent.clone(), sessions.clone()))
-}
-
 fn runtime_unavailable_error(message: impl Into<String>) -> RpcError {
     RpcError::internal_error(message).with_data(json!({
         "kind": "runtime_unavailable",
@@ -4823,7 +5908,9 @@ fn send_notification_lifecycle(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
-    let event = ledger.append_notification(notification);
+    // Tag the broadcast with the originating connection so this
+    // connection's own live forwarder skips the duplicate copy.
+    let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
     let frame = frame_from_ledger(event.event)
@@ -4853,7 +5940,7 @@ fn send_notification_durable(
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
-    let event = ledger.append_notification(notification);
+    let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     let method = ledger_event_method(&event.event).to_string();
     let frame = match frame_from_ledger(event.event) {
@@ -4989,7 +6076,7 @@ fn emit_replay_lossy_opportunistic(
         dropped_count: dropped,
         last_durable_cursor: last_cursor,
     });
-    let event = ledger.append_notification(lossy);
+    let event = ledger.append_notification_from(lossy, ws.connection_id);
     let method = octos_core::ui_protocol::methods::REPLAY_LOSSY.to_string();
     let frame = match frame_from_ledger(event.event) {
         Some(frame) => frame,
@@ -5049,6 +6136,9 @@ mod tests {
             input: vec![InputItem::Text {
                 text: "hello".into(),
             }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
         })
         .into_rpc_request("1")
         .expect("request");
@@ -5062,6 +6152,76 @@ mod tests {
             route_rpc_command(decoded, ConnectionUiFeatures::default()).expect("route"),
             UiCommand::TurnStart(_)
         ));
+    }
+
+    /// UPCR-2026-015 (M9-β-1): the WS turn/start handler accepts the
+    /// three new optional fields (`media`, `topic`, `rewrite_for`)
+    /// from a strict-additive wire shape. The legacy text-only form
+    /// continues to deserialize identically (back-compat sanity).
+    #[test]
+    fn parses_turn_start_rpc_request_with_beta1_fields() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-beta1",
+            "method": methods::TURN_START,
+            "params": {
+                "session_id": "local:test",
+                "turn_id": TurnId::new(),
+                "input": [{"kind": "text", "text": "look here"}],
+                "media": [
+                    {
+                        "path": "/tmp/chat-upload-deadbeef.png",
+                        "mime": "image/png",
+                        "size_bytes": 1234,
+                    }
+                ],
+                "topic": "research",
+                "rewrite_for": "cmid-original-1",
+            }
+        })
+        .to_string();
+
+        let decoded = parse_rpc_request(&raw).expect("parse");
+        let routed = route_rpc_command(decoded, ConnectionUiFeatures::default()).expect("route");
+        match routed {
+            UiCommand::TurnStart(params) => {
+                assert_eq!(params.media.len(), 1);
+                assert_eq!(params.media[0].path, "/tmp/chat-upload-deadbeef.png");
+                assert_eq!(params.media[0].mime, "image/png");
+                assert_eq!(params.media[0].size_bytes, 1234);
+                assert_eq!(params.topic.as_deref(), Some("research"));
+                assert_eq!(params.rewrite_for.as_deref(), Some("cmid-original-1"));
+            }
+            other => panic!("expected TurnStart, got {:?}", other),
+        }
+    }
+
+    /// UPCR-2026-015 (M9-β-1): bare turn/start (no β-1 fields)
+    /// continues to deserialize and round-trip with the new defaults.
+    #[test]
+    fn parses_legacy_turn_start_rpc_request_stays_back_compat() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": "rpc-legacy",
+            "method": methods::TURN_START,
+            "params": {
+                "session_id": "local:test",
+                "turn_id": TurnId::new(),
+                "input": [{"kind": "text", "text": "hello"}],
+            }
+        })
+        .to_string();
+
+        let decoded = parse_rpc_request(&raw).expect("parse");
+        let routed = route_rpc_command(decoded, ConnectionUiFeatures::default()).expect("route");
+        match routed {
+            UiCommand::TurnStart(params) => {
+                assert!(params.media.is_empty());
+                assert!(params.topic.is_none());
+                assert!(params.rewrite_for.is_none());
+            }
+            other => panic!("expected TurnStart, got {:?}", other),
+        }
     }
 
     #[test]
@@ -5164,6 +6324,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5213,6 +6374,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5307,6 +6469,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5356,6 +6519,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5398,6 +6562,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -5483,6 +6648,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
         );
@@ -6525,6 +7691,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6560,6 +7727,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6615,6 +7783,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6668,6 +7837,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6714,6 +7884,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6757,6 +7928,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures {
                 typed_approvals: false,
@@ -6767,6 +7939,7 @@ mod tests {
                 thread_graph: false,
                 turn_state_get: false,
                 message_persisted: false,
+                spawn_complete: false,
                 header_present: true,
             },
             SessionOpenParams {
@@ -6815,6 +7988,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6850,6 +8024,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -6902,6 +8077,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             features,
             SessionOpenParams {
@@ -6951,143 +8127,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_workspace_authorizes_approved_subdir() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).expect("project dir");
-        let tools = octos_agent::ToolRegistry::with_builtins(temp.path());
+    // M11-E: `session_filesystem_profile_for_workspace` was deleted
+    // alongside `session_tool_registry`. Its server-wide containment
+    // semantics (cwd must live under the legacy agent's workspace_root)
+    // are obsolete in the multi-profile world — coding-agent UIs
+    // legitimately point sessions at arbitrary repos OUTSIDE the
+    // profile data_dir. The replacement gate is the path-safety check
+    // in `validate_session_workspace_path_safety` + the bootstrap-time
+    // re-check inside `SessionRuntime::bootstrap`. The
+    // `session_workspace_authorizes_approved_subdir` /
+    // `session_workspace_rejects_outside_root` tests that locked the
+    // old containment behavior in place are removed with the helper;
+    // the new path-safety check is covered by the M11-E acceptance
+    // tests below + the bootstrap-side coverage in
+    // `crate::runtime::session::tests`.
 
-        session_filesystem_profile_for_workspace(&tools, &project).expect("subdir is approved");
-    }
-
-    #[test]
-    fn session_workspace_rejects_outside_root() {
-        let allowed = tempfile::tempdir().expect("allowed dir");
-        let outside = tempfile::tempdir().expect("outside dir");
-        let tools = octos_agent::ToolRegistry::with_builtins(allowed.path());
-
-        let error = session_filesystem_profile_for_workspace(&tools, outside.path())
-            .expect_err("outside workspace should be rejected");
-
-        assert_eq!(
-            error.data.as_ref().and_then(|data| data.get("kind")),
-            Some(&json!("cwd_outside_workspace_root"))
-        );
-    }
-
-    /// Minimal stub LLM provider for tests that build an `Agent` but never
-    /// actually call out to a model. `session_tool_registry` only inspects
-    /// the agent's tool registry and sandbox config — it never drives the
-    /// LLM — so a `chat` panic guard is enough.
-    struct StubLlm;
-
-    #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for StubLlm {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> eyre::Result<octos_llm::ChatResponse> {
-            unreachable!("StubLlm should not be invoked by session_tool_registry tests")
-        }
-
-        fn context_window(&self) -> u32 {
-            128_000
-        }
-
-        fn model_id(&self) -> &str {
-            "stub"
-        }
-
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-    }
-
-    /// Tier-2 of the AppUi `session_tool_registry` fallback chain: when a
-    /// session has no entry in `session_workspaces()` and the operator
-    /// configured `appui.default_session_cwd`, the API agent's recorded
-    /// `workspace_root` is used. This locks down the behavior added by
-    /// `Agent::with_workspace_root` + `serve.rs` wire-up.
-    #[tokio::test]
-    async fn session_tool_registry_uses_agent_workspace_root_as_tier2_fallback() {
-        let workspace = tempfile::tempdir().expect("workspace dir");
-        let memory_dir = tempfile::tempdir().expect("memory dir");
-        let memory = Arc::new(
-            octos_memory::EpisodeStore::open(memory_dir.path())
-                .await
-                .expect("open memory"),
-        );
-        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(StubLlm);
-        let tools = octos_agent::ToolRegistry::with_builtins(workspace.path());
-
-        let agent = octos_agent::Agent::new(AgentId::new("api-test"), llm, tools, memory)
-            .with_workspace_root(workspace.path().to_path_buf());
-
-        // Use a unique session_id so we don't collide with other tests on
-        // the process-global `session_workspaces()` store.
-        let session_id = SessionKey("local:tier2-fallback-test".into());
-
-        let (registry, root) =
-            session_tool_registry(&agent, &session_id).expect("session_tool_registry");
-
-        let root = root.expect("Tier-2 must populate workspace_root");
-        assert_eq!(
-            std::fs::canonicalize(&root).expect("canonicalize"),
-            std::fs::canonicalize(workspace.path()).expect("canonicalize"),
-            "Tier-2 fallback should pick up the agent's recorded workspace_root"
-        );
-        assert!(
-            registry.workspace_root().is_some(),
-            "rebound registry must record the workspace_root"
-        );
-    }
-
-    /// Tier-1 (capability-gated client-sent cwd via `session_workspaces`)
-    /// MUST take precedence over Tier-2 (operator default). This prevents
-    /// the operator default from clobbering octos-tui's per-session picker.
-    ///
-    /// `session_filesystem_profile_for_workspace` requires the requested
-    /// cwd to live under `tools.workspace_root()`. Since
-    /// `with_workspace_root` overwrites the registry's recorded root, we
-    /// anchor the agent at the operator-default folder (Tier-2) and put
-    /// the client-sent cwd as a subdir of it. If Tier-1 wins, the
-    /// resulting workspace_root is the subdir, not the parent.
-    #[tokio::test]
-    async fn session_tool_registry_tier1_wins_over_tier2_default() {
-        let tier2_default = tempfile::tempdir().expect("tier2 default dir");
-        let tier1_subdir = tier2_default.path().join("tier1-client-cwd");
-        std::fs::create_dir_all(&tier1_subdir).expect("tier1 subdir");
-
-        let memory_dir = tempfile::tempdir().expect("memory dir");
-        let memory = Arc::new(
-            octos_memory::EpisodeStore::open(memory_dir.path())
-                .await
-                .expect("open memory"),
-        );
-        let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(StubLlm);
-        let tools = octos_agent::ToolRegistry::with_builtins(tier2_default.path());
-
-        let agent = octos_agent::Agent::new(AgentId::new("api-test"), llm, tools, memory)
-            // Tier-2: operator-configured default cwd.
-            .with_workspace_root(tier2_default.path().to_path_buf());
-
-        // Tier-1: client-sent cwd recorded in `session_workspaces`.
-        let session_id = SessionKey("local:tier1-wins-test".into());
-        session_workspaces().set(session_id.clone(), tier1_subdir.clone());
-
-        let (_registry, root) =
-            session_tool_registry(&agent, &session_id).expect("session_tool_registry");
-
-        let root = root.expect("workspace_root must be set");
-        assert_eq!(
-            std::fs::canonicalize(&root).expect("canonicalize"),
-            std::fs::canonicalize(&tier1_subdir).expect("canonicalize"),
-            "Tier-1 (client-sent cwd) must win over Tier-2 (operator default)"
-        );
-    }
+    // M11-E: `session_tool_registry` and its Tier-1 / Tier-2 fallback
+    // helpers were deleted. The same Tier-1 invariant ("client-supplied
+    // cwd wins over the bootstrap default") now lives on
+    // `SessionRuntime::bootstrap`, exercised by
+    // `crate::runtime::session::tests::bootstrap_with_two_hints_yields_distinct_workspaces`
+    // and the M11-E acceptance tests
+    // `appui_session_with_custom_cwd_reads_supplied_workspace` +
+    // `two_appui_sessions_on_same_profile_with_different_cwds_isolated`
+    // below. Tier-2 (operator-default `appui.default_session_cwd`) is
+    // a known follow-up: the new `SessionRuntime::bootstrap` resolves
+    // workspace_hint at the per-session layer and does not yet honor a
+    // profile-scope operator default. Tracked alongside the M11
+    // shared-`validate_session_workspace_allowed`-helper TODO in
+    // `crate::runtime::session::validate_workspace_hint`.
 
     #[test]
     fn pane_snapshot_prefers_approved_session_workspace_root() {
@@ -7136,6 +8204,87 @@ mod tests {
         let messages = vec![Message::assistant("world")];
 
         assert!(final_assistant_message(&messages, "world", None).is_none());
+    }
+
+    /// M10 Phase 6.1: the standalone-turn persist loop must pre-stamp the
+    /// `User` row with the originating `TurnId`-derived thread id so the
+    /// user prompt and the assistant reply land in the same thread on the
+    /// SPA. Without this the SPA renders an empty placeholder bubble in
+    /// the user's `clientMessageId`-keyed thread and creates an orphan
+    /// thread for the assistant reply (3 bubbles per spawn_only turn
+    /// instead of the target 2).
+    #[test]
+    fn pre_stamp_turn_thread_id_stamps_user_assistant_and_tool_when_unbound() {
+        let turn_thread_id = "turn-abc";
+
+        let user = pre_stamp_turn_thread_id(Message::user("hi"), turn_thread_id);
+        let assistant = pre_stamp_turn_thread_id(Message::assistant("ok"), turn_thread_id);
+        let tool = pre_stamp_turn_thread_id(
+            Message {
+                role: MessageRole::Tool,
+                content: "result".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call-1".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            turn_thread_id,
+        );
+
+        assert_eq!(
+            user.thread_id.as_deref(),
+            Some(turn_thread_id),
+            "user row must inherit the turn-derived thread_id so its bubble \
+             coalesces with the assistant reply"
+        );
+        assert_eq!(assistant.thread_id.as_deref(), Some(turn_thread_id));
+        assert_eq!(tool.thread_id.as_deref(), Some(turn_thread_id));
+    }
+
+    /// Caller-supplied `thread_id` values must NOT be overwritten — that
+    /// would corrupt rows already routed to the correct sub-thread (e.g.
+    /// spawn_only completion rows that bind a different originating
+    /// thread).
+    #[test]
+    fn pre_stamp_turn_thread_id_preserves_caller_supplied_thread_id() {
+        let mut user = Message::user("hi");
+        user.thread_id = Some("explicit-thread".into());
+
+        let stamped = pre_stamp_turn_thread_id(user, "turn-other");
+
+        assert_eq!(
+            stamped.thread_id.as_deref(),
+            Some("explicit-thread"),
+            "caller-supplied thread_id must be preserved"
+        );
+    }
+
+    /// System rows are not thread-scoped — the helper must leave them
+    /// alone so the per-turn system primer (when present) does not get
+    /// retro-rooted into a turn thread that didn't author it.
+    #[test]
+    fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
+        let system = Message {
+            role: MessageRole::System,
+            content: "primer".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let stamped = pre_stamp_turn_thread_id(system, "turn-abc");
+
+        assert!(
+            stamped.thread_id.is_none(),
+            "system rows must remain unbound to a turn thread"
+        );
     }
 
     #[tokio::test]
@@ -7321,6 +8470,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -7343,6 +8493,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -8218,6 +9369,7 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 timestamp: Utc::now(),
+                topic: None,
             }),
         );
         assert!(first.is_ok());
@@ -8629,6 +9781,7 @@ mod tests {
             &state,
             &ledger,
             &approvals,
+            ConnectionId::next(),
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
@@ -8878,6 +10031,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            ConnectionUiFeatures::default(),
             "h1".into(),
             SessionHydrateParams {
                 session_id: session_id.clone(),
@@ -9103,12 +10257,16 @@ mod tests {
                 session_id: session_id.clone(),
                 turn_id: turn_id.clone(),
                 timestamp: Utc::now(),
+                topic: None,
             },
         ));
         let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
         }));
 
         let (ws, mut rx) = ws_connection_for_test(8);
@@ -9155,6 +10313,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            ConnectionUiFeatures::default(),
             "h-unknown".into(),
             SessionHydrateParams {
                 session_id: SessionKey("local:nope".into()),
@@ -9167,6 +10326,312 @@ mod tests {
         let frame = recv_rpc_json(&mut rx).await;
         assert!(frame.get("error").is_some(), "must return error frame");
         assert_eq!(frame["error"]["data"]["kind"], "unknown_session");
+    }
+
+    /// M10 Phase 6.2 / Bug C: a negotiated client receives the
+    /// retained `turn/spawn_complete` envelopes on the hydrate
+    /// response so it can dedup against the legacy `Background`-source
+    /// rows in `messages` on its side. The server itself does NOT
+    /// suppress rows — codex flagged multiple correctness regressions
+    /// in every server-side suppression design (NotConfigured-branch
+    /// empty media, multi-task per-turn ambiguity, orphan companions
+    /// from failed final-ack persists). Surfacing both signals lets
+    /// the client mirror the live wire's "consumer chooses one shape"
+    /// semantics without server-side guesswork.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
+        let session_id = SessionKey("local:hydrate-envelopes".into());
+        // Capture the spawn-ack row's timestamp so the envelope's
+        // `message_id` can mirror what `MessageCommitObserver` would
+        // emit on the live wire (and what the hydrate handler now
+        // synthesizes for `HydratedMessage.message_id`).
+        let spawn_ack_ts = Utc::now() + chrono::Duration::milliseconds(10);
+        let state = prg_state_with_session(&session_id, |session| {
+            let now = spawn_ack_ts - chrono::Duration::milliseconds(10);
+            session.messages.push(Message {
+                role: MessageRole::User,
+                content: "kick off deep_research".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: Some("cmid-user-1".into()),
+                thread_id: Some("cmid-user-1".into()),
+                timestamp: now,
+            });
+            // Background companion (legacy `send_file` per-file row).
+            session.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec!["research/_report.md".into()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some("cmid-user-1".into()),
+                timestamp: now + chrono::Duration::milliseconds(5),
+            });
+            // Background spawn-ack.
+            session.messages.push(Message {
+                role: MessageRole::Assistant,
+                content: "deep_research delivered.".into(),
+                media: vec!["research/_report.md".into()],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some("cmid-user-1".into()),
+                timestamp: spawn_ack_ts,
+            });
+        });
+        let approvals = PendingApprovalStore::default();
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+
+        let spawn_ack_message_id = format!(
+            "{}:2:{}",
+            session_id.0,
+            spawn_ack_ts.timestamp_nanos_opt().unwrap_or(0),
+        );
+        // Append the matching `MessagePersisted` events so the
+        // hydrate handler can surface `source: background` on the
+        // hydrated rows (mirrors what `MessageCommitObserver` would
+        // emit at live persist time under the
+        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local).
+        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            seq: 1,
+            role: "assistant".into(),
+            message_id: format!("{}:1:0", session_id.0),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        }));
+        ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            seq: 2,
+            role: "assistant".into(),
+            message_id: spawn_ack_message_id.clone(),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        }));
+        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            task_id: "task_abc".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 2,
+            message_id: spawn_ack_message_id.clone(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "deep_research delivered.".into(),
+            media: vec!["research/_report.md".into()],
+        }));
+
+        // 1) Negotiated client: messages list is byte-identical to
+        // the legacy shape (3 rows), AND the new
+        // `replayed_envelopes` field carries the envelope so the
+        // client can dedup on its side.
+        let (ws_new, mut rx_new) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws_new,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            features_for_spawn_complete_test(true, true),
+            "h-new".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec![],
+            },
+        )
+        .await;
+        let frame_new = recv_rpc_json(&mut rx_new).await;
+        let messages_new = frame_new["result"]["messages"]
+            .as_array()
+            .expect("messages array");
+        assert_eq!(
+            messages_new.len(),
+            3,
+            "server does NOT suppress rows; negotiated client dedups using replayed_envelopes",
+        );
+        // Codex Bug C round-5: the spawn-ack row's `message_id` must
+        // be present on the hydrated wire so the client can match it
+        // against the envelope. Without this, the client has nothing
+        // to dedup against.
+        let spawn_ack_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 2)
+            .expect("seq=2 spawn-ack row");
+        assert_eq!(
+            spawn_ack_row["message_id"], spawn_ack_message_id,
+            "spawn-ack row must expose message_id matching the envelope",
+        );
+        // Codex Bug C round-6: per-row provenance. The companion
+        // and spawn-ack rows surface `source: "background"` so the
+        // client can drop them in favour of the envelope. Without
+        // `source`, the client could only dedup the spawn-ack and
+        // companion rows would still render as duplicate bubbles.
+        let companion_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 1)
+            .expect("seq=1 companion row");
+        assert_eq!(companion_row["source"], "background");
+        assert_eq!(spawn_ack_row["source"], "background");
+        let user_row = messages_new
+            .iter()
+            .find(|m| m["seq"] == 0)
+            .expect("seq=0 user row");
+        // The user row never had a `MessagePersisted` ledger event in
+        // this test (we only seeded background events), so its
+        // `source` is omitted. That's fine: the client doesn't need
+        // provenance for non-coalescible rows.
+        assert!(
+            user_row.get("source").map(|v| v.is_null()).unwrap_or(true),
+            "user row's source field is omitted absent a matching ledger event; got: {user_row:?}",
+        );
+        let envelopes = frame_new["result"]["replayed_envelopes"]
+            .as_array()
+            .expect("replayed_envelopes array");
+        assert_eq!(envelopes.len(), 1, "single envelope retained");
+        assert_eq!(
+            envelopes[0]["message_id"], spawn_ack_message_id,
+            "envelope's message_id matches the spawn-ack row's id by construction",
+        );
+        assert_eq!(envelopes[0]["task_id"], "task_abc");
+        assert_eq!(envelopes[0]["thread_id"], "cmid-user-1");
+        assert_eq!(envelopes[0]["seq"], 2);
+        assert_eq!(envelopes[0]["content"], "deep_research delivered.");
+        assert_eq!(envelopes[0]["media"], json!(["research/_report.md"]));
+
+        // 2) Non-negotiated client: legacy wire shape — messages
+        // list intact, and `replayed_envelopes` field is OMITTED
+        // (not `null`) so the JSON shape matches pre-fix exactly.
+        let (ws_legacy, mut rx_legacy) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws_legacy,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            ConnectionUiFeatures::default(),
+            "h-legacy".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec![],
+            },
+        )
+        .await;
+        let frame_legacy = recv_rpc_json(&mut rx_legacy).await;
+        let messages_legacy = frame_legacy["result"]["messages"]
+            .as_array()
+            .expect("messages array");
+        assert_eq!(messages_legacy.len(), 3, "legacy unchanged");
+        let result = frame_legacy["result"].as_object().expect("result object");
+        assert!(
+            !result.contains_key("replayed_envelopes"),
+            "legacy clients see byte-identical wire (no replayed_envelopes key); got keys: {:?}",
+            result.keys().collect::<Vec<_>>(),
+        );
+        // Codex Bug C round-6: non-negotiated clients also see the
+        // pre-fix `messages` shape — no `message_id`, no `source`
+        // keys. This protects strict-codegen consumers that have no
+        // `replayed_envelopes` to bind to.
+        for msg in messages_legacy {
+            let msg_obj = msg.as_object().expect("message object");
+            assert!(
+                !msg_obj.contains_key("message_id"),
+                "legacy client message MUST NOT carry message_id; got: {msg_obj:?}",
+            );
+            assert!(
+                !msg_obj.contains_key("source"),
+                "legacy client message MUST NOT carry source; got: {msg_obj:?}",
+            );
+        }
+    }
+
+    /// Bug C corollary: a negotiated client whose hydrate request
+    /// excludes `messages` does not need the envelopes either — they
+    /// only matter as a dedup key against the messages list. Keep
+    /// `replayed_envelopes` absent in that case so the response stays
+    /// minimal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_hydrate_omits_envelopes_when_messages_excluded() {
+        let session_id = SessionKey("local:hydrate-envelopes-no-msgs".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let approvals = PendingApprovalStore::default();
+        let active_turns = active_turns_registry();
+        let ledger = event_ledger(&state).await;
+        ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session_id.clone(),
+            turn_id: None,
+            thread_id: Some("cmid-user-1".into()),
+            task_id: "task_x".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 1,
+            message_id: format!("{}:1:0", session_id.0),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "done".into(),
+            media: vec![],
+        }));
+
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &active_turns,
+            None,
+            features_for_spawn_complete_test(true, true),
+            "h-no-msgs".into(),
+            SessionHydrateParams {
+                session_id: session_id.clone(),
+                after: None,
+                include: vec!["threads".into()],
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        let result = frame["result"].as_object().expect("result object");
+        assert!(
+            !result.contains_key("messages"),
+            "messages excluded by include filter",
+        );
+        assert!(
+            !result.contains_key("replayed_envelopes"),
+            "envelopes are a messages-list dedup key; omit when messages aren't requested",
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9334,6 +10799,206 @@ mod tests {
         octos_bus::set_message_commit_observer(prev);
     }
 
+    /// M9-γ-7 (issue #844): `is_metadata_only_assistant_row` is the
+    /// pure-function classifier the observer uses to drop intermediate
+    /// metadata-only assistant rows. Lock its truth table here so a
+    /// future refactor that "helpfully" widens the filter cannot drop
+    /// rows the wire surface needs.
+    #[test]
+    fn is_metadata_only_assistant_row_truth_table() {
+        // Empty assistant with no media: metadata-only -> drop.
+        let mut empty_assistant = Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(is_metadata_only_assistant_row(&empty_assistant));
+
+        // Whitespace-only counts as empty.
+        empty_assistant.content = "   \n\t".into();
+        assert!(is_metadata_only_assistant_row(&empty_assistant));
+
+        // Assistant with text: keep.
+        empty_assistant.content = "hello".into();
+        assert!(!is_metadata_only_assistant_row(&empty_assistant));
+
+        // Assistant with media but empty text: keep (image-only response).
+        empty_assistant.content = String::new();
+        empty_assistant.media = vec!["data:image/png;base64,abc".into()];
+        assert!(!is_metadata_only_assistant_row(&empty_assistant));
+
+        // Tool messages are never filtered.
+        let tool_message = Message {
+            role: MessageRole::Tool,
+            content: String::new(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("tc-1".into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(!is_metadata_only_assistant_row(&tool_message));
+
+        // User rows are never filtered.
+        let user_message = Message {
+            role: MessageRole::User,
+            content: String::new(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        };
+        assert!(!is_metadata_only_assistant_row(&user_message));
+    }
+
+    /// M9-γ-7 (issue #844): a 3-iteration agent loop that commits
+    /// (assistant tool-call only) -> tool result -> (assistant tool-call
+    /// only) -> tool result -> (assistant final text) MUST surface
+    /// EXACTLY ONE `message/persisted` envelope for the assistant turn
+    /// (the final text row), plus the per-tool rows, on the M9 ledger.
+    /// Pre-fix this emitted three assistant `message/persisted`
+    /// envelopes, all under the same `thread_id` — the phantom-bubble
+    /// shape the web reducer collapsed (octos-web #92).
+    #[tokio::test(flavor = "current_thread")]
+    async fn gamma_7_dedup_one_assistant_persisted_per_turn() {
+        use octos_core::ui_protocol::{MessagePersistedSource, methods};
+
+        let _guard = message_commit_observer_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Spin a fresh ledger + observer wired the same way the live
+        // server wires them on the first `event_ledger` call.
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        install_message_commit_observer(ledger.clone());
+
+        let session_id = SessionKey("local:gamma-7-dedup".into());
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut manager =
+            octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+
+        // Simulate the agent loop's commits: 2 metadata-only assistant
+        // rows (intermediate iterations whose only payload was
+        // tool_calls), interleaved with their tool results, then the
+        // final assistant text row.
+        let thread = "cmid-gamma-7".to_string();
+        let mk_assistant = |content: &str, with_tool_calls: bool| Message {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            media: vec![],
+            tool_calls: if with_tool_calls {
+                Some(vec![octos_core::ToolCall {
+                    id: format!("tc-{}", uuid::Uuid::now_v7()),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }])
+            } else {
+                None
+            },
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some(thread.clone()),
+            timestamp: Utc::now(),
+        };
+        let mk_tool = |out: &str, tc_id: &str| Message {
+            role: MessageRole::Tool,
+            content: out.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tc_id.into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some(thread.clone()),
+            timestamp: Utc::now(),
+        };
+
+        // Iteration 1: assistant returns only tool_calls (empty content).
+        manager
+            .add_message_with_seq(&session_id, mk_assistant("", true))
+            .await
+            .expect("commit it1 assistant");
+        manager
+            .add_message_with_seq(&session_id, mk_tool("ok", "tc-1"))
+            .await
+            .expect("commit it1 tool");
+        // Iteration 2: assistant returns only tool_calls again.
+        manager
+            .add_message_with_seq(&session_id, mk_assistant("", true))
+            .await
+            .expect("commit it2 assistant");
+        manager
+            .add_message_with_seq(&session_id, mk_tool("ok", "tc-2"))
+            .await
+            .expect("commit it2 tool");
+        // Iteration 3: final assistant text (the user-visible reply).
+        manager
+            .add_message_with_seq(&session_id, mk_assistant("here is your answer", false))
+            .await
+            .expect("commit it3 assistant");
+
+        // Drain the broadcast and bucket by role on the
+        // `MessagePersistedEvent` payload.
+        let mut assistant_persisted = Vec::new();
+        let mut tool_persisted = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+                &event.event
+            {
+                if ev.role == octos_core::MessageRole::Assistant.as_str() {
+                    assistant_persisted.push(ev.clone());
+                } else if ev.role == octos_core::MessageRole::Tool.as_str() {
+                    tool_persisted.push(ev.clone());
+                }
+            }
+        }
+
+        assert_eq!(
+            assistant_persisted.len(),
+            1,
+            "exactly ONE assistant message/persisted per turn (the final text); \
+             got {} envelopes (phantom-bubble regression)",
+            assistant_persisted.len(),
+        );
+        let final_envelope = &assistant_persisted[0];
+        assert_eq!(final_envelope.role, "assistant");
+        assert_eq!(
+            final_envelope.source,
+            MessagePersistedSource::Assistant,
+            "assistant rows carry source=assistant"
+        );
+        // Method name matches the wire spec.
+        assert_eq!(
+            UiNotification::MessagePersisted(final_envelope.clone()).method(),
+            methods::MESSAGE_PERSISTED,
+        );
+
+        // Tool rows are unaffected — both intermediate tool results land.
+        assert_eq!(
+            tool_persisted.len(),
+            2,
+            "tool rows must NOT be filtered (they always carry content)"
+        );
+
+        // Restore the global observer slot to None so subsequent tests
+        // see a clean state.
+        octos_bus::set_message_commit_observer(None);
+    }
+
     /// PR F (M8.10 thread-binding chain `#649 → #740`): every progress
     /// event the BoundedChannelReporter emits MUST carry the bound
     /// `thread_id`. Without this, the SPA reducer for the standalone
@@ -9366,6 +11031,1555 @@ mod tests {
         assert!(
             parsed.get("thread_id").is_none(),
             "unbound reporter must not stamp thread_id (legacy compat): {parsed}"
+        );
+    }
+
+    // ========================================================================
+    // Live ledger publish-subscribe (issue #760, Phase C blocker)
+    // ========================================================================
+
+    fn message_persisted_for(session: &SessionKey) -> UiNotification {
+        UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: None,
+            seq: 0,
+            role: "assistant".into(),
+            message_id: "msg-1".into(),
+            client_message_id: None,
+            source: MessagePersistedSource::Tool,
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec![],
+        })
+    }
+
+    fn features_with_message_persisted(enabled: bool) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            message_persisted: enabled,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Build a `ConnectionUiFeatures` with the M10 Phase 1 dual gating
+    /// flags set as requested. `message_persisted` is independent so the
+    /// test can simulate clients that negotiated only one or both.
+    fn features_for_spawn_complete_test(
+        message_persisted: bool,
+        spawn_complete: bool,
+    ) -> ConnectionUiFeatures {
+        ConnectionUiFeatures {
+            message_persisted,
+            spawn_complete,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        }
+    }
+
+    /// Builds a minimal `MessagePersistedEvent` with `source: background`,
+    /// matching what `BackgroundResultSender`'s persist path produces
+    /// via `MessageCommitObserver`. M10 Phase 1's per-connection filter
+    /// suppresses this exact shape for new clients (which receive
+    /// `turn/spawn_complete` instead).
+    fn background_message_persisted_for(session: &SessionKey) -> UiNotification {
+        UiNotification::MessagePersisted(MessagePersistedEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: Some("thread-1".into()),
+            seq: 0,
+            role: "assistant".into(),
+            message_id: "msg-bg".into(),
+            client_message_id: None,
+            source: MessagePersistedSource::Background,
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            media: vec!["research/_report.md".into()],
+        })
+    }
+
+    /// Build a representative `TurnSpawnCompleteEvent` that mirrors what
+    /// `BackgroundResultSender` emits when a `spawn_only` task contracts
+    /// and the originating `client_message_id` was tracked.
+    fn turn_spawn_complete_for(session: &SessionKey) -> UiNotification {
+        UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
+            session_id: session.clone(),
+            turn_id: Some(TurnId::new()),
+            thread_id: Some("thread-1".into()),
+            task_id: "task_abc123".into(),
+            response_to_client_message_id: Some("cmid-user-1".into()),
+            seq: 0,
+            message_id: "msg-spawn".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            },
+            persisted_at: Utc::now(),
+            content: "Background research complete.".into(),
+            media: vec!["research/_report.md".into()],
+        })
+    }
+
+    /// Decodes a queued WS frame back to its JSON-RPC method name (or
+    /// returns `None` for non-text / non-JSON frames). Lets tests assert
+    /// the live broadcast forwarder routed a notification, without
+    /// coupling to whatever frame_for serialization shape is.
+    fn frame_method(frame: &WsMessage) -> Option<String> {
+        match frame {
+            WsMessage::Text(text) => {
+                let v: Value = serde_json::from_str(text).ok()?;
+                v.get("method").and_then(Value::as_str).map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_pushes_message_persisted_to_subscribed_ws() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:livefwd".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Background-task path appends late artifact AFTER the WS is wired up.
+        ledger.append_notification(message_persisted_for(&session_id));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("ws received frame within 1s")
+            .expect("ws channel still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            "live forwarder must emit message/persisted; frame={frame:?}"
+        );
+
+        // Cleanup: aborting the forwarder must not panic and must release
+        // the receiver so subsequent prune_idle_subscribers reclaims the slot.
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_skips_events_at_or_below_baseline_seq() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:baseline".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Pre-existing event so baseline_seq=1 represents "we already sent
+        // this in replay; do not re-emit live."
+        let baseline = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(baseline.cursor.seq, 1);
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            baseline.cursor.seq,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // A new append must surface; the forwarder filters strictly on
+        // seq > baseline.
+        let next = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(next.cursor.seq, 2);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("ws received frame within 1s")
+            .expect("ws channel still open");
+        let v: Value = match &frame {
+            WsMessage::Text(t) => serde_json::from_str(t).expect("valid json"),
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        assert_eq!(
+            v.get("method").and_then(Value::as_str),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        // No further frames are queued (only one live event emitted).
+        assert!(rx.try_recv().is_err(), "no more frames expected");
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_respects_message_persisted_capability_filter() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:nofeat".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_with_message_persisted(false),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        ledger.append_notification(message_persisted_for(&session_id));
+        // Give the forwarder a chance to observe + filter.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "client without event.message_persisted.v1 must not receive message/persisted"
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    // ========================================================================
+    // M10 Phase 1: `event.spawn_complete.v1` capability gating
+    // ========================================================================
+
+    /// Pure unit-level coverage of the dual filter — no WS / forwarder
+    /// machinery. Documents the four corners of the negotiation matrix
+    /// against the two relevant event shapes.
+    #[test]
+    fn capability_filter_routes_spawn_complete_dual_gating() {
+        let session = SessionKey("local:filter".into());
+        let bg_persisted =
+            UiProtocolLedgerEvent::Notification(background_message_persisted_for(&session));
+        let spawn_complete = UiProtocolLedgerEvent::Notification(turn_spawn_complete_for(&session));
+
+        // Old client (no spawn_complete capability, has message_persisted):
+        // sees `message/persisted` (Background source preserved); does NOT
+        // see `turn/spawn_complete`.
+        let old = features_for_spawn_complete_test(true, false);
+        assert!(
+            live_event_passes_capability_filter(&bg_persisted, old),
+            "old client must keep receiving the legacy message/persisted shape",
+        );
+        assert!(
+            !live_event_passes_capability_filter(&spawn_complete, old),
+            "old client must not receive the new turn/spawn_complete shape",
+        );
+
+        // New client (has both capabilities): sees `turn/spawn_complete`;
+        // the duplicate `message/persisted` (source: background) is
+        // suppressed so the same logical event is delivered exactly once.
+        let new = features_for_spawn_complete_test(true, true);
+        assert!(
+            !live_event_passes_capability_filter(&bg_persisted, new),
+            "new client must NOT receive the duplicate message/persisted background row",
+        );
+        assert!(
+            live_event_passes_capability_filter(&spawn_complete, new),
+            "new client must receive the turn/spawn_complete envelope",
+        );
+
+        // New client without message_persisted negotiation: still gets
+        // turn/spawn_complete. (The two capabilities are independent —
+        // a forward-only client can opt into the new shape without ever
+        // having shipped the older one.)
+        let new_only = features_for_spawn_complete_test(false, true);
+        assert!(
+            !live_event_passes_capability_filter(&bg_persisted, new_only),
+            "client without message_persisted does not see message/persisted regardless",
+        );
+        assert!(
+            live_event_passes_capability_filter(&spawn_complete, new_only),
+            "spawn_complete-only client receives turn/spawn_complete",
+        );
+
+        // Legacy client with NO negotiated features at all: sees neither
+        // (the old gate already blocks message/persisted; the new gate
+        // blocks turn/spawn_complete).
+        let neither = features_for_spawn_complete_test(false, false);
+        assert!(!live_event_passes_capability_filter(&bg_persisted, neither));
+        assert!(!live_event_passes_capability_filter(
+            &spawn_complete,
+            neither
+        ));
+
+        // Sanity: a non-spawn `message/persisted` (source != background,
+        // e.g. a regular assistant row) is unaffected by the spawn_complete
+        // gate. Only the duplicate-suppression branch keys on
+        // `MessagePersistedSource::Background`.
+        let regular = UiProtocolLedgerEvent::Notification(message_persisted_for(&session));
+        assert!(
+            live_event_passes_capability_filter(&regular, new),
+            "non-background message/persisted must still flow to new clients",
+        );
+    }
+
+    /// End-to-end through the live forwarder for a NEW client (negotiated
+    /// `event.spawn_complete.v1`): asserts they receive `turn/spawn_complete`
+    /// AND the duplicate `message/persisted` (source: background) is
+    /// suppressed. The combination is what kills the splice-merge
+    /// double-render.
+    #[tokio::test]
+    async fn live_forwarder_routes_spawn_complete_to_new_client() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:newfeat".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_for_spawn_complete_test(true, true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Producer side fires both — the persistence-driven
+        // `message/persisted` (via `MessageCommitObserver`) AND the new
+        // envelope (direct ledger append from `BackgroundResultSender`).
+        ledger.append_notification(background_message_persisted_for(&session_id));
+        ledger.append_notification(turn_spawn_complete_for(&session_id));
+
+        // The new client must observe exactly one frame: the spawn_complete
+        // envelope. The duplicate background message/persisted is filtered.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expected the spawn_complete envelope within 1s")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::TURN_SPAWN_COMPLETE),
+            "first frame must be turn/spawn_complete (background message/persisted suppressed)",
+        );
+
+        // No further frames should arrive — the background message/persisted
+        // was filtered.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no second frame: background message/persisted is suppressed for new clients",
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    /// Codex P1: when the BackgroundResultSender persist scope is
+    /// active, `current_message_persisted_source` must report
+    /// `Background` regardless of the `Message` role. Outside the scope
+    /// it falls back to the role-derived default — the pre-M10
+    /// behaviour stays intact for every other persist path.
+    #[tokio::test]
+    async fn message_persisted_source_override_routes_through_task_local() {
+        // Outside any scope: role-derived default.
+        let default_for_assistant = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(default_for_assistant, MessagePersistedSource::Assistant);
+        let default_for_tool = current_message_persisted_source(MessageRole::Tool);
+        assert_eq!(default_for_tool, MessagePersistedSource::Tool);
+
+        // Inside the override scope (mirrors what the
+        // `BackgroundResultSender` closure does): every role maps to
+        // `Background`.
+        let bg = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+            .scope(Some(MessagePersistedSource::Background), async {
+                (
+                    current_message_persisted_source(MessageRole::Assistant),
+                    current_message_persisted_source(MessageRole::Tool),
+                )
+            })
+            .await;
+        assert_eq!(bg.0, MessagePersistedSource::Background);
+        assert_eq!(bg.1, MessagePersistedSource::Background);
+
+        // After the scope ends, the default behaviour is restored.
+        let after = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(after, MessagePersistedSource::Assistant);
+    }
+
+    /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat
+    /// `seq` field carries the COMMITTED-ROW seq (the index in the
+    /// session message log, identical to `MessagePersistedEvent.seq`)
+    /// — NOT the UI-ledger cursor seq. The two scales differ in any
+    /// turn that has prior ledger notifications, so upgraded clients
+    /// reusing their `MessagePersisted` reducer for spawn completions
+    /// MUST observe the persisted-row seq the producer wrote, not the
+    /// ledger-assigned cursor seq.
+    #[tokio::test]
+    async fn ledger_preserves_producer_seq_and_stamps_only_cursor() {
+        let ledger = UiProtocolLedger::new(8);
+        let session_id = SessionKey("local:seq".into());
+
+        // Producer sets `seq = 7` (the committed-row index from the
+        // persist path). Ledger appends and stamps cursor.seq, but
+        // must leave `seq` untouched.
+        let mut event = match turn_spawn_complete_for(&session_id) {
+            UiNotification::TurnSpawnComplete(ev) => ev,
+            _ => unreachable!("test fixture is turn/spawn_complete"),
+        };
+        event.seq = 7;
+        event.cursor.seq = 0; // producer seeds 0; ledger stamps the real cursor.
+        let appended = ledger.append_notification(UiNotification::TurnSpawnComplete(event));
+
+        let stamped = match &appended.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
+            _ => panic!("expected turn/spawn_complete back from the ledger"),
+        };
+        assert_eq!(
+            stamped.seq, 7,
+            "ledger must NOT overwrite the producer's committed-row seq",
+        );
+        assert!(
+            stamped.cursor.seq > 0,
+            "cursor.seq must be the ledger-assigned non-zero cursor",
+        );
+
+        // Cursor is strictly monotonic across appends (same contract
+        // as the existing MessagePersisted path); flat `seq` is
+        // independent and tracked by the producer.
+        let mut event2 = match turn_spawn_complete_for(&session_id) {
+            UiNotification::TurnSpawnComplete(ev) => ev,
+            _ => unreachable!(),
+        };
+        event2.seq = 8;
+        let appended2 = ledger.append_notification(UiNotification::TurnSpawnComplete(event2));
+        let stamped2 = match &appended2.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(ev)) => ev,
+            _ => panic!("turn/spawn_complete"),
+        };
+        assert!(stamped2.cursor.seq > stamped.cursor.seq);
+        assert_eq!(stamped2.seq, 8);
+    }
+
+    /// End-to-end through the live forwarder for an OLD client (did NOT
+    /// negotiate `event.spawn_complete.v1`): they see `message/persisted`
+    /// (Background source preserved) and do NOT see `turn/spawn_complete`.
+    /// This is the back-compat path that keeps existing TUI/CLI consumers
+    /// working unchanged.
+    #[tokio::test]
+    async fn live_forwarder_falls_back_to_message_persisted_for_old_client() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:oldfeat".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            // Old client: has message_persisted but NOT spawn_complete.
+            features_for_spawn_complete_test(true, false),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        ledger.append_notification(background_message_persisted_for(&session_id));
+        ledger.append_notification(turn_spawn_complete_for(&session_id));
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expected the legacy message/persisted within 1s")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            "first frame must be the legacy message/persisted shape for old clients",
+        );
+
+        // The new envelope must NOT be delivered to an un-negotiated client.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "no second frame: turn/spawn_complete is suppressed for old clients",
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    #[tokio::test]
+    async fn live_forwarder_fans_out_to_two_concurrent_ws_connections() {
+        let (ws_a, mut rx_a) = ws_connection_for_test(16);
+        let (ws_b, mut rx_b) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:fanout".into());
+        let forwarders_a: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let forwarders_b: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let rx_a_live = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_a.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws_a.connection_id(),
+            features_with_message_persisted(true),
+            rx_a_live,
+            forwarders_a.clone(),
+        )
+        .await;
+        let rx_b_live = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_b.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws_b.connection_id(),
+            features_with_message_persisted(true),
+            rx_b_live,
+            forwarders_b.clone(),
+        )
+        .await;
+
+        ledger.append_notification(message_persisted_for(&session_id));
+
+        let frame_a = tokio::time::timeout(std::time::Duration::from_secs(1), rx_a.recv())
+            .await
+            .expect("ws_a frame")
+            .expect("ws_a open");
+        let frame_b = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+            .await
+            .expect("ws_b frame")
+            .expect("ws_b open");
+        assert_eq!(
+            frame_method(&frame_a).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+        assert_eq!(
+            frame_method(&frame_b).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        // Disconnect ws_a; ws_b must continue receiving subsequent events.
+        abort_live_forwarders(&forwarders_a).await;
+        drop(rx_a);
+        ledger.append_notification(message_persisted_for(&session_id));
+        let frame_b2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
+            .await
+            .expect("ws_b frame after sibling drop")
+            .expect("ws_b still open");
+        assert_eq!(
+            frame_method(&frame_b2).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        abort_live_forwarders(&forwarders_b).await;
+    }
+
+    // -- Codex PR #761 review fixes ----------------------------------------
+
+    /// MUST-FIX-1: an event appended *after* the replay snapshot but
+    /// *before* the live forwarder is wired up (the gap between
+    /// `replay_after_with_head` returning and `spawn_live_forwarder`
+    /// being awaited) must still reach the WS via the broadcast. The
+    /// baseline must come from the replay snapshot's head — not the
+    /// later session/open seq — otherwise a session/open append at H+2
+    /// would shift the baseline up and silently drop the H+1 event.
+    #[tokio::test]
+    async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_install() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:gap".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Pre-existing event at seq=1 — would be in replay history.
+        let initial = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(initial.cursor.seq, 1);
+
+        // Snapshot replay (head=1) + subscribe in the same order
+        // handle_session_open does.
+        let live_rx = ledger.subscribe(&session_id);
+        let (_replay, replay_head) = ledger
+            .replay_after_with_head(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay snapshot");
+        assert_eq!(replay_head, 1);
+
+        // GAP event — landed AFTER replay snapshot was taken but BEFORE
+        // the forwarder is installed. With the broken design this would
+        // be filtered out (baseline shifted to session/open's seq=H+2);
+        // with the fix the broadcast buffer holds it and the forwarder
+        // emits it once installed.
+        let gap = ledger.append_notification(message_persisted_for(&session_id));
+        assert_eq!(gap.cursor.seq, 2);
+
+        // Append session/open AFTER the gap event — exactly the
+        // ordering open_session_result produces.
+        let opened = ledger.append_notification_from(
+            UiNotification::SessionOpened(SessionOpened {
+                session_id: session_id.clone(),
+                active_profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                workspace_root: None,
+                cursor: None,
+                panes: None,
+                capabilities: UiProtocolCapabilities::first_server_slice(),
+            }),
+            ws.connection_id(),
+        );
+        assert_eq!(opened.cursor.seq, 3);
+
+        // Wire up the forwarder using replay_head as the baseline. The
+        // gap event has seq > baseline AND it is not from this
+        // connection, so it must surface on the WS.
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            replay_head,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("forwarder must emit gap event")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED),
+            "the H+1 gap event must reach the WS, not be silently filtered"
+        );
+
+        // The session/open event itself must NOT come back via the
+        // broadcast (it carries our connection_id, so the forwarder
+        // skips it — the handler already direct-sent it inline).
+        assert!(
+            rx.try_recv().is_err(),
+            "no further frames expected: session/open must be self-suppressed"
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    /// MUST-FIX-2: a `send_notification_durable` call from the same
+    /// connection that owns an active live forwarder must deliver the
+    /// frame exactly once. Without `from_connection` self-suppression
+    /// the forwarder would receive the broadcast and double-send.
+    #[tokio::test]
+    async fn send_notification_durable_does_not_double_deliver_via_live_forwarder() {
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:dedup".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // Direct-send via the standard handler path. This both persists
+        // (with our connection_id stamped) and direct-sends inline.
+        send_notification_durable(&ws, &ledger, message_persisted_for(&session_id))
+            .expect("direct send succeeds");
+
+        // Exactly one frame must arrive.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first frame")
+            .expect("ws open");
+        assert_eq!(
+            frame_method(&first).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+        // Give the forwarder time to (incorrectly) re-emit if the fix
+        // regresses; with self-suppression nothing further must arrive.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "send_notification_durable must deliver exactly once on its own connection"
+        );
+
+        // Sanity: a different connection's forwarder still receives the
+        // event via fan-out (the suppression is per-connection).
+        let (ws_other, mut rx_other) = ws_connection_for_test(16);
+        let forwarders_other: SharedLiveForwarders =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let live_rx_other = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_other.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws_other.connection_id(),
+            features_with_message_persisted(true),
+            live_rx_other,
+            forwarders_other.clone(),
+        )
+        .await;
+        send_notification_durable(&ws, &ledger, message_persisted_for(&session_id))
+            .expect("second send");
+        let frame_other = tokio::time::timeout(std::time::Duration::from_secs(1), rx_other.recv())
+            .await
+            .expect("other connection sees fan-out")
+            .expect("ws_other open");
+        assert_eq!(
+            frame_method(&frame_other).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders_other).await;
+    }
+
+    /// MUST-FIX-3: a `subscribe()` call followed by dropping the
+    /// receiver (modelling a failed `session/open` path) must not leak
+    /// a sender. The `prune_subscriber_if_idle` hook called on the
+    /// failure path reclaims the slot immediately.
+    #[tokio::test]
+    async fn session_open_failure_path_does_not_leak_broadcast_sender() {
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:leakcheck".into());
+
+        // Mirror handle_session_open's "subscribe BEFORE
+        // open_session_result" ordering. Then simulate failure: drop
+        // the receiver, prune.
+        let live_rx = ledger.subscribe(&session_id);
+        assert_eq!(ledger.subscriber_count(), 1, "sender installed");
+
+        drop(live_rx);
+        let pruned = ledger.prune_subscriber_if_idle(&session_id);
+        assert!(pruned, "failed open must reclaim the orphan sender");
+        assert_eq!(
+            ledger.subscriber_count(),
+            0,
+            "no senders survive a failed session/open"
+        );
+
+        // Steady-state sweep also reclaims any orphans that escape the
+        // failure path (defence in depth).
+        let kept = ledger.subscribe(&session_id);
+        ledger.prune_idle_subscribers(); // receiver still alive — no-op.
+        assert_eq!(ledger.subscriber_count(), 1);
+        drop(kept);
+        assert_eq!(
+            ledger.prune_idle_subscribers(),
+            1,
+            "sweep reclaims orphans after every receiver drops"
+        );
+        assert_eq!(ledger.subscriber_count(), 0);
+    }
+
+    /// Lag handling: when the broadcast buffer overflows, the receiver
+    /// observes `RecvError::Lagged(n)` and the forwarder must NOT die —
+    /// it logs and keeps pumping subsequent events. The earlier missed
+    /// events are recoverable via cursor replay (the ledger is durable).
+    #[tokio::test]
+    async fn live_forwarder_survives_broadcast_lag_and_keeps_pumping() {
+        let (ws, mut rx) = ws_connection_for_test(WS_WRITER_CHANNEL_CAPACITY);
+        let ledger = Arc::new(UiProtocolLedger::new(2048));
+        let session_id = SessionKey("local:lag".into());
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Subscribe but don't pump yet. Overflow the broadcast capacity
+        // (LIVE_BROADCAST_CAPACITY = 256) so the receiver lags.
+        let live_rx = ledger.subscribe(&session_id);
+        for _ in 0..512 {
+            ledger.append_notification(message_persisted_for(&session_id));
+        }
+
+        // Now install the forwarder — its first recv() will see
+        // Lagged(n). It must log and continue, not abort.
+        spawn_live_forwarder(
+            ws.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws.connection_id(),
+            features_with_message_persisted(true),
+            live_rx,
+            forwarders.clone(),
+        )
+        .await;
+
+        // A fresh append after lag must be delivered.
+        ledger.append_notification(message_persisted_for(&session_id));
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("post-lag frame must arrive — forwarder kept pumping")
+            .expect("ws still open");
+        assert_eq!(
+            frame_method(&frame).as_deref(),
+            Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
+        );
+
+        abort_live_forwarders(&forwarders).await;
+    }
+
+    // ----- M11-E: UI Protocol per-session workspace wiring -----------------
+
+    /// Stub `LlmProvider` for M11-E tests. The acceptance scenarios drive
+    /// `open_session_result` + the session cache wiring — they never call
+    /// out to a real model. Mirrors `handlers::make_m11d_profile`'s
+    /// `EchoLlm` but does not bother encoding a reply since these tests
+    /// only inspect the per-session `ToolRegistry` and `workspace_root`.
+    struct M11EStubLlm;
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for M11EStubLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("M11EStubLlm should not be invoked from M11-E acceptance tests")
+        }
+
+        fn model_id(&self) -> &str {
+            "m11e-stub"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    async fn make_m11e_profile(
+        profile_id: &str,
+        data_dir: &std::path::Path,
+    ) -> Arc<crate::runtime::ProfileRuntime> {
+        std::fs::create_dir_all(data_dir).expect("profile data dir");
+        let memory = Arc::new(
+            octos_memory::EpisodeStore::open(data_dir)
+                .await
+                .expect("episode store"),
+        );
+        let memory_store = Arc::new(
+            octos_memory::MemoryStore::open(data_dir)
+                .await
+                .expect("memory store"),
+        );
+        let tool_config = Arc::new(
+            octos_agent::ToolConfigStore::open(data_dir)
+                .await
+                .expect("tool config store"),
+        );
+        let sandbox = octos_agent::SandboxConfig::default();
+        let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+            data_dir,
+            octos_agent::create_sandbox(&sandbox),
+        );
+        Arc::new(crate::runtime::ProfileRuntime {
+            profile_id: profile_id.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            llm: Arc::new(M11EStubLlm),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "m11e-stub".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
+            memory,
+            memory_store,
+            tool_config,
+        })
+    }
+
+    /// AppState for M11-E acceptance tests: a registered `ProfileRuntime`
+    /// plus a process-wide `SessionManager` so the audit-log writer and
+    /// pane-snapshot path have a `data_dir` to resolve.
+    ///
+    /// M11-F: the legacy `agent` field was deleted; every read path now
+    /// resolves through `state.profiles` + `state.session_cache`.
+    async fn state_with_profile(
+        data_dir: &std::path::Path,
+        profile_id: &str,
+    ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+        std::fs::create_dir_all(data_dir).expect("data dir");
+
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir).expect("session manager"),
+        ));
+
+        let profile_data_dir = data_dir.join("profiles").join(profile_id).join("data");
+        let profile_runtime = make_m11e_profile(profile_id, &profile_data_dir).await;
+
+        let mut profiles = HashMap::new();
+        profiles.insert(profile_id.to_string(), profile_runtime.clone());
+
+        let state = Arc::new(AppState {
+            profiles,
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        (state, profile_runtime)
+    }
+
+    /// M11-E acceptance §1: a session opened with a custom `cwd` materializes
+    /// a `SessionRuntime` whose `workspace_root` IS that cwd, and the
+    /// session's `ReadFileTool` reads files from that cwd. This is the
+    /// "supplied workspace, not the daemon cwd" invariant from the issue
+    /// — the legacy `clone_session_tools` path could only honor it
+    /// indirectly through the global `session_workspaces()` map.
+    #[tokio::test]
+    async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile(temp.path(), "m11e-custom-cwd").await;
+
+        // Pre-seed the supplied workspace with a sentinel file the session
+        // is expected to read back.
+        let supplied_cwd = temp.path().join("supplied-workspace");
+        std::fs::create_dir_all(&supplied_cwd).expect("create supplied cwd");
+        let sentinel = supplied_cwd.join("hello.txt");
+        std::fs::write(&sentinel, "session-A reads its own workspace\n").expect("seed sentinel");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        let session_id = SessionKey::with_profile("m11e-custom-cwd", "api", "custom-cwd-session");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-custom-cwd"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11e-custom-cwd".into()),
+                cwd: Some(supplied_cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session/open with supplied cwd must succeed");
+
+        // The wire response carries the canonical workspace_root so dashboard
+        // clients render the right cwd on reconnect.
+        let opened_root = outcome
+            .result
+            .opened
+            .workspace_root
+            .as_ref()
+            .expect("opened workspace_root populated");
+        assert_eq!(
+            std::fs::canonicalize(opened_root).expect("canonicalize opened root"),
+            std::fs::canonicalize(&supplied_cwd).expect("canonicalize supplied cwd"),
+        );
+
+        // The session cache must hold a SessionRuntime materialized from
+        // THIS supplied cwd — that's the wiring the issue tracks.
+        let session_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_id.clone(), None)
+            .await
+            .expect("cached session runtime");
+        assert_eq!(
+            std::fs::canonicalize(&session_runtime.workspace_root).expect("canonicalize root"),
+            std::fs::canonicalize(&supplied_cwd).expect("canonicalize supplied cwd"),
+            "SessionRuntime.workspace_root must be the client-supplied cwd"
+        );
+
+        // The session's read_file tool sees the supplied workspace, not
+        // the daemon cwd / the profile data_dir.
+        let result = session_runtime
+            .tools
+            .execute("read_file", &json!({ "path": "hello.txt" }))
+            .await
+            .expect("read_file via session tools");
+        assert!(result.success, "read_file must succeed: {}", result.output);
+        assert!(
+            result.output.contains("session-A reads its own workspace"),
+            "expected session A's sentinel content, got: {}",
+            result.output
+        );
+    }
+
+    /// M11-E acceptance §2: two AppUI sessions opened on the SAME profile
+    /// with DIFFERENT cwds must not see each other's files. This is the
+    /// multi-tenant scope invariant codex flagged on PR #868 — pre-M11
+    /// the per-session view was cloned off a single `base_agent`-bound
+    /// registry, leaving the workspace_root vulnerable to cross-session
+    /// leakage if any caller forgot to rebind. With `SessionRuntime.tools`
+    /// the only path, two sessions hold two distinct `Arc<ToolRegistry>`
+    /// instances each pinned at bootstrap time.
+    #[tokio::test]
+    async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile(temp.path(), "m11e-multi-cwd").await;
+
+        let cwd_a = temp.path().join("session-a");
+        let cwd_b = temp.path().join("session-b");
+        std::fs::create_dir_all(&cwd_a).expect("create cwd-a");
+        std::fs::create_dir_all(&cwd_b).expect("create cwd-b");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        let session_a = SessionKey::with_profile("m11e-multi-cwd", "api", "session-a");
+        let session_b = SessionKey::with_profile("m11e-multi-cwd", "api", "session-b");
+
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        // Open session A with cwd_a.
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-multi-cwd"),
+            features,
+            SessionOpenParams {
+                session_id: session_a.clone(),
+                profile_id: Some("m11e-multi-cwd".into()),
+                cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session A open");
+
+        // Open session B with cwd_b.
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-multi-cwd"),
+            features,
+            SessionOpenParams {
+                session_id: session_b.clone(),
+                profile_id: Some("m11e-multi-cwd".into()),
+                cwd: Some(cwd_b.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session B open");
+
+        let rt_a = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_a.clone(), None)
+            .await
+            .expect("session A runtime");
+        let rt_b = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_b.clone(), None)
+            .await
+            .expect("session B runtime");
+
+        // Two sessions on the same profile must hold distinct
+        // `Arc<ToolRegistry>` instances (codex multi-tenant scope note).
+        assert!(
+            !Arc::ptr_eq(&rt_a.tools, &rt_b.tools),
+            "per-session tool registries must be distinct Arcs"
+        );
+        assert_ne!(rt_a.workspace_root, rt_b.workspace_root);
+
+        // Session A writes a.txt under cwd_a; session B writes b.txt under cwd_b.
+        rt_a.tools
+            .execute(
+                "write_file",
+                &json!({ "path": "a.txt", "content": "from session A\n" }),
+            )
+            .await
+            .expect("write_file under session A's workspace");
+        rt_b.tools
+            .execute(
+                "write_file",
+                &json!({ "path": "b.txt", "content": "from session B\n" }),
+            )
+            .await
+            .expect("write_file under session B's workspace");
+
+        // Cross-read MUST fail: session B cannot see a.txt; session A
+        // cannot see b.txt. Per-session isolation enforced by the
+        // workspace-bound registries built at SessionRuntime::bootstrap.
+        let a_reads_a = rt_a
+            .tools
+            .execute("read_file", &json!({ "path": "a.txt" }))
+            .await
+            .expect("session A reads its own a.txt");
+        assert!(a_reads_a.success, "{}", a_reads_a.output);
+        assert!(a_reads_a.output.contains("from session A"));
+
+        let b_reads_b = rt_b
+            .tools
+            .execute("read_file", &json!({ "path": "b.txt" }))
+            .await
+            .expect("session B reads its own b.txt");
+        assert!(b_reads_b.success, "{}", b_reads_b.output);
+        assert!(b_reads_b.output.contains("from session B"));
+
+        // Cross-read MUST fail or return error output: session A cannot
+        // see b.txt; session B cannot see a.txt. Per-session isolation
+        // enforced by the workspace-bound registries built at
+        // SessionRuntime::bootstrap.
+        let a_cross = rt_a
+            .tools
+            .execute("read_file", &json!({ "path": "b.txt" }))
+            .await
+            .expect("read_file always returns a ToolResult");
+        let a_cross_lower = a_cross.output.to_lowercase();
+        assert!(
+            !a_cross.success
+                || a_cross_lower.contains("not found")
+                || a_cross_lower.contains("no such")
+                || a_cross_lower.contains("error"),
+            "session A must NOT be able to read session B's b.txt; got: success={} output={}",
+            a_cross.success,
+            a_cross.output
+        );
+
+        let b_cross = rt_b
+            .tools
+            .execute("read_file", &json!({ "path": "a.txt" }))
+            .await
+            .expect("read_file always returns a ToolResult");
+        let b_cross_lower = b_cross.output.to_lowercase();
+        assert!(
+            !b_cross.success
+                || b_cross_lower.contains("not found")
+                || b_cross_lower.contains("no such")
+                || b_cross_lower.contains("error"),
+            "session B must NOT be able to read session A's a.txt; got: success={} output={}",
+            b_cross.success,
+            b_cross.output
+        );
+
+        // Filesystem invariant: a.txt physically lives under cwd_a, b.txt
+        // physically lives under cwd_b. Catches a regression where the
+        // per-session tool somehow wrote to the legacy
+        // `session_workspaces()`-resolved path instead of the workspace
+        // the SessionRuntime was bootstrapped against.
+        assert!(cwd_a.join("a.txt").exists());
+        assert!(cwd_b.join("b.txt").exists());
+        assert!(!cwd_a.join("b.txt").exists());
+        assert!(!cwd_b.join("a.txt").exists());
+    }
+
+    /// M11-E codex round-1 MEDIUM: a second `session/open` for the same
+    /// session_id but a DIFFERENT cwd must NOT silently rebind a
+    /// running session's workspace. The cache's `get_or_init` is
+    /// single-flight per key; a same-key hit returns the cached
+    /// `Arc<SessionRuntime>` and ignores the new `workspace_hint`.
+    /// The `SessionOpened.workspace_root` reply MUST reflect the
+    /// CACHED runtime (not the just-requested cwd) — otherwise the
+    /// SPA renders one cwd while the next turn uses another, which is
+    /// exactly the wire/state divergence codex flagged.
+    #[tokio::test]
+    async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, _profile_runtime) =
+            state_with_profile(temp.path(), "m11e-rebind-attempt").await;
+
+        let first_cwd = temp.path().join("first");
+        let second_cwd = temp.path().join("second");
+        std::fs::create_dir_all(&first_cwd).expect("create first");
+        std::fs::create_dir_all(&second_cwd).expect("create second");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let session_id = SessionKey::with_profile("m11e-rebind-attempt", "api", "single-key");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let first_open = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-rebind-attempt"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11e-rebind-attempt".into()),
+                cwd: Some(first_cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("first open");
+
+        let second_open = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-rebind-attempt"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11e-rebind-attempt".into()),
+                // Different cwd — must NOT take effect; cache is sticky.
+                cwd: Some(second_cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("second open");
+
+        let first_root = first_open
+            .result
+            .opened
+            .workspace_root
+            .expect("first workspace_root populated");
+        let second_root = second_open
+            .result
+            .opened
+            .workspace_root
+            .expect("second workspace_root populated");
+        assert_eq!(
+            std::fs::canonicalize(&first_root).expect("canonicalize first"),
+            std::fs::canonicalize(&second_root).expect("canonicalize second"),
+            "second open of the same session must report the cached \
+             workspace_root, not the just-requested cwd",
+        );
+        assert_eq!(
+            std::fs::canonicalize(&second_root).expect("canonicalize"),
+            std::fs::canonicalize(&first_cwd).expect("canonicalize"),
+            "cached workspace_root must equal the FIRST open's cwd",
+        );
+    }
+
+    /// M11-E codex round-3 HIGH: when `state.profiles` is non-empty but
+    /// the ROUTED profile is not in it, `validate_session_workspace_allowed`
+    /// must still reject the cwd with `cwd_runtime_unavailable`.
+    /// Otherwise the wire reply would advertise the requested
+    /// workspace_root while the turn dispatcher's legacy fallback uses
+    /// `base_agent`'s root — exactly the divergence the prior round
+    /// closed for the empty-profiles case. The fix routes the active
+    /// profile id into the validator so it can resolve the SPECIFIC
+    /// runtime rather than checking the map non-empty.
+    #[tokio::test]
+    async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, _profile_runtime) = state_with_profile(temp.path(), "m11e-registered").await;
+
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        // Build a SessionKey under a profile id that is NOT in
+        // `state.profiles` so the active profile resolution misses.
+        let session_id = SessionKey::with_profile("m11e-not-registered", "api", "x");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let error = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            // No connection identity so the routed id falls to the
+            // session-id-embedded "m11e-not-registered".
+            None,
+            features,
+            SessionOpenParams {
+                session_id,
+                profile_id: None,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect_err("cwd for unregistered profile must reject");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("cwd_runtime_unavailable")),
+            "unregistered profile must surface cwd_runtime_unavailable; \
+             got error data {:?}",
+            error.data,
+        );
+    }
+
+    /// M11-E codex round-1 HIGH (filed against octos-agent, not blocking
+    /// M11-E): symlink-based directory escape is an octos-agent
+    /// `resolve_path` + `read_no_follow`/`write_no_follow` property,
+    /// not a UI-Protocol property. M11-E binds each session's tools to
+    /// its own workspace_root via `SessionRuntime::bootstrap`; the
+    /// remaining gap is that the tool layer follows directory
+    /// symlinks (only the final path component is checked).
+    ///
+    /// This test pins the CURRENT octos-agent behavior so a future
+    /// `read_no_follow`/`write_no_follow` hardening flips it green
+    /// automatically. We document the gap in the PR body and propose
+    /// it as a follow-up octos-agent issue (NOT a downstream M11
+    /// ticket — the tool layer is the right home).
+    ///
+    /// Marking `#[ignore]` rather than failing the suite: the gap is
+    /// pre-existing, M11-E neither introduces nor fixes it, and a
+    /// failing test here would block landing M11-E for a problem
+    /// that lives in a different crate.
+    #[tokio::test]
+    #[ignore = "octos-agent gap: directory symlinks escape per-session workspace; tracked as follow-up issue, NOT blocking M11-E"]
+    async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (state, profile_runtime) = state_with_profile(temp.path(), "m11e-symlink").await;
+
+        let cwd_a = temp.path().join("session-a");
+        let cwd_b = temp.path().join("session-b");
+        std::fs::create_dir_all(&cwd_a).expect("create cwd-a");
+        std::fs::create_dir_all(&cwd_b).expect("create cwd-b");
+        std::fs::write(cwd_b.join("secret.txt"), "B's private data\n").expect("seed b");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let session_a = SessionKey::with_profile("m11e-symlink", "api", "session-a");
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let _ = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11e-symlink"),
+            features,
+            SessionOpenParams {
+                session_id: session_a.clone(),
+                profile_id: Some("m11e-symlink".into()),
+                cwd: Some(cwd_a.to_string_lossy().into_owned()),
+                after: None,
+            },
+        )
+        .await
+        .expect("session A open");
+
+        // Plant a directory symlink inside session A's workspace
+        // pointing at session B's workspace. The path-normalize check
+        // in `resolve_path` and the O_NOFOLLOW guard in
+        // `read_no_follow` both pass — only the FINAL path component is
+        // checked for the symlink-rejection invariant.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&cwd_b, cwd_a.join("escape")).expect("plant symlink");
+        }
+        #[cfg(not(unix))]
+        {
+            // The gap is Unix-specific (Windows tool fallback uses a
+            // separate symlink-check pattern). Skip the planting on
+            // non-Unix.
+            return;
+        }
+
+        let rt_a = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_a.clone(), None)
+            .await
+            .expect("cached session A runtime");
+
+        let result = rt_a
+            .tools
+            .execute("read_file", &json!({ "path": "escape/secret.txt" }))
+            .await
+            .expect("read_file returns a ToolResult");
+
+        // CURRENT BEHAVIOR (M11-E lock-in): octos-agent follows the
+        // parent directory symlink and reads B's file. The
+        // `#[ignore]` keeps this from failing CI while we file the
+        // octos-agent issue; flip to `assert!(!result.success)` when
+        // the tool-layer fix lands.
+        assert!(
+            result.success && result.output.contains("B's private data"),
+            "octos-agent should currently follow the directory symlink \
+             (M11-E gap documentation); got success={} output={}",
+            result.success,
+            result.output
+        );
+    }
+
+    /// M11-F deliverable D — restore `appui.default_session_cwd` Tier-2
+    /// fallback that M11-E's `clone_session_tools` deletion took out.
+    ///
+    /// Pre-resolution order on `session.open`:
+    ///   1. Tier 1 — client-supplied `cwd` (already wired via
+    ///      `session.workspace_cwd.v1` + `validate_session_workspace_allowed`).
+    ///   2. Tier 2 — operator-configured `appui.default_session_cwd`
+    ///      mirrored on `AppState::appui_default_session_cwd`. **This
+    ///      test pins that wiring.**
+    ///   3. Tier 3 — `SessionRuntime::bootstrap`'s
+    ///      `<profile.data_dir>/users/<encoded base>/workspace` default.
+    ///
+    /// Scenario: a client that does NOT advertise
+    /// `session.workspace_cwd.v1` opens an AppUI session with no `cwd`.
+    /// `AppState::appui_default_session_cwd` is set to an operator
+    /// directory. The materialized `SessionRuntime.workspace_root` MUST
+    /// equal the operator default — not the profile-data-relative
+    /// Tier-3 fallback — and the wire `workspace_root` must reflect it.
+    #[tokio::test]
+    async fn appui_session_without_client_cwd_respects_operator_default_session_cwd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (mut state_inner, profile_runtime) = {
+            let (state, profile_runtime) =
+                state_with_profile(temp.path(), "m11f-tier2-default").await;
+            // We need to mutate AppState (set appui_default_session_cwd)
+            // before sharing it. `state_with_profile` returns an
+            // `Arc<AppState>`; for the test we unwrap via
+            // `Arc::try_unwrap` knowing this is the only reference.
+            (
+                Arc::try_unwrap(state)
+                    .map_err(|_| "state Arc must be unique for test setup")
+                    .expect("unique Arc"),
+                profile_runtime,
+            )
+        };
+
+        // Operator-configured Tier-2 default. The directory exists and
+        // contains a sentinel the session is expected to read back via
+        // its own (workspace-bound) read_file tool.
+        let operator_default = temp.path().join("operator-default-workspace");
+        std::fs::create_dir_all(&operator_default).expect("create operator default");
+        std::fs::write(
+            operator_default.join("hello.txt"),
+            "tier-2 operator default visible to session\n",
+        )
+        .expect("seed sentinel");
+        state_inner.appui_default_session_cwd = Some(operator_default.clone());
+        let state = Arc::new(state_inner);
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+
+        let session_id =
+            SessionKey::with_profile("m11f-tier2-default", "api", "tier2-no-client-cwd");
+        // IMPORTANT: client does NOT advertise `session.workspace_cwd.v1`
+        // and does NOT send a cwd — this is the exact octos-app shape
+        // that the M11-E deletion of `clone_session_tools` broke.
+        let features = ConnectionUiFeatures {
+            session_workspace_cwd: false,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            Some("m11f-tier2-default"),
+            features,
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                profile_id: Some("m11f-tier2-default".into()),
+                cwd: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("session/open with operator default cwd must succeed");
+
+        // Wire response carries the operator-default workspace root.
+        let opened_root = outcome
+            .result
+            .opened
+            .workspace_root
+            .as_ref()
+            .expect("opened workspace_root populated");
+        assert_eq!(
+            std::fs::canonicalize(opened_root).expect("canonicalize opened root"),
+            std::fs::canonicalize(&operator_default).expect("canonicalize operator default"),
+            "Tier-2: SessionOpened.workspace_root must equal appui.default_session_cwd",
+        );
+
+        // The cached SessionRuntime is bound to the operator default —
+        // not the Tier-3 profile-data-relative fallback.
+        let session_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_id.clone(), None)
+            .await
+            .expect("cached session runtime");
+        assert_eq!(
+            std::fs::canonicalize(&session_runtime.workspace_root)
+                .expect("canonicalize runtime root"),
+            std::fs::canonicalize(&operator_default).expect("canonicalize operator default"),
+            "Tier-2: SessionRuntime.workspace_root must equal appui.default_session_cwd",
+        );
+
+        // End-to-end: a read_file against the relative sentinel resolves
+        // inside the operator default, proving the per-session
+        // ToolRegistry was rebound to that root (not the Tier-3
+        // `<profile_data_dir>/users/<encoded>/workspace`).
+        let result = session_runtime
+            .tools
+            .execute("read_file", &json!({ "path": "hello.txt" }))
+            .await
+            .expect("read_file via session tools");
+        assert!(
+            result.success,
+            "read_file must succeed under operator default: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("tier-2 operator default visible to session"),
+            "expected operator-default sentinel content, got: {}",
+            result.output
         );
     }
 }

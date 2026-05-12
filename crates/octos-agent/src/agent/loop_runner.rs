@@ -84,7 +84,7 @@ fn with_tier2_context_management(config: &ChatConfig, agent: &Agent) -> ChatConf
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShellRetryRecoveryKind {
+pub(crate) enum ShellRetryRecoveryKind {
     DiffLikeSuccess,
     UsefulSuccess,
     ValidationSuccess,
@@ -92,9 +92,9 @@ enum ShellRetryRecoveryKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ShellRetryRecovery {
-    kind: ShellRetryRecoveryKind,
-    content: String,
+pub(crate) struct ShellRetryRecovery {
+    pub(crate) kind: ShellRetryRecoveryKind,
+    pub(crate) content: String,
 }
 
 /// Coarse-grained control-flow hint returned by
@@ -240,8 +240,31 @@ impl Agent {
         messages: &[Message],
         retry_state: &mut LoopRetryState,
         iteration: u32,
-    ) -> Option<String> {
-        let recovery = recover_shell_retry(messages, SHELL_RETRY_RECOVERY_THRESHOLD)?;
+    ) -> Option<ShellSpiralOutcome> {
+        // Fix #1 (2026-05-10, codex round 2): the spiral detector must be
+        // INTRA-TURN. Two prior bugs:
+        //   (a) the unconditional dispatch scanned the entire session's
+        //       message history, so once any past turn accumulated a
+        //       4-shell streak with failures, every subsequent turn was
+        //       force-ended regardless of its tool;
+        //   (b) gating only on `latest_completed_tool_name == shell`
+        //       would (i) miss multi-tool batches like
+        //       `[shell, read_file]` where the trailing Tool message is
+        //       `read_file`, AND (ii) trip on a single fresh shell call
+        //       in a new user turn that happens to come AFTER stale
+        //       history.
+        //
+        // Restrict the scan to the slice from the most recent
+        // `MessageRole::User` onward (the current user turn) and gate on
+        // "did the latest completed Tool BATCH contain shell". With both
+        // in place the detector matches its intent: the LLM is currently
+        // spiraling on shell within this turn.
+        let window_start = current_user_turn_start(messages);
+        let window = &messages[window_start..];
+        if !latest_tool_batch_contains(window, "shell") {
+            return None;
+        }
+        let recovery = recover_shell_retry(window, SHELL_RETRY_RECOVERY_THRESHOLD)?;
         let decision = retry_state.observe_shell_spiral();
         tracing::warn!(
             recovery_kind = ?recovery.kind,
@@ -264,7 +287,7 @@ impl Agent {
                 tracing::debug!(error = %error, "failed to write shell-spiral retry event");
             }
         }
-        Some(recovery.content)
+        Some(ShellSpiralOutcome { recovery, decision })
     }
 
     /// Classify an error escaping the loop and drive it through the
@@ -870,19 +893,81 @@ impl Agent {
                                 {
                                     warn!("loop detected — breaking agent loop");
                                     let spiral_iteration = turn.iteration();
-                                    if let Some(recovered_content) = self
+                                    if let Some(outcome) = self
                                         .dispatch_shell_retry_recovery(
                                             &messages,
                                             &mut retry_state,
                                             spiral_iteration,
                                         )
                                     {
+                                        // Fix #2 (codex round 2): branch on
+                                        // (recovery.kind, decision).
+                                        //   - RetryLimit + Escalate: splice
+                                        //     the system-shaped instruction
+                                        //     into the latest Tool message
+                                        //     and continue — the LLM gets ONE
+                                        //     iteration to produce a real
+                                        //     user-facing summary.
+                                        //   - RetryLimit + Exhausted: the
+                                        //     model already had its summary
+                                        //     chance and ignored it. Don't
+                                        //     loop again — return the recovery
+                                        //     content as terminal content.
+                                        //   - Success kinds: recovery.content
+                                        //     is RAW shell output extracted
+                                        //     from the noise. Original
+                                        //     return-as-content was correct
+                                        //     for these.
+                                        let should_splice = matches!(
+                                            (
+                                                &outcome.recovery.kind,
+                                                outcome.decision,
+                                            ),
+                                            (
+                                                ShellRetryRecoveryKind::RetryLimit,
+                                                LoopDecision::Escalate,
+                                            ),
+                                        );
+                                        if should_splice {
+                                            // Codex round-2 #d: target the
+                                            // latest SHELL Tool message in
+                                            // the trailing batch, not
+                                            // whichever Tool happens to be
+                                            // last. In a mixed
+                                            // `[shell, read_file]` batch
+                                            // the trailing Tool is read_file
+                                            // — splicing into it would
+                                            // mis-attribute the recovery
+                                            // instruction and silently drop
+                                            // the actual shell output.
+                                            if let Some(idx) =
+                                                latest_tool_batch_index(&messages, "shell")
+                                            {
+                                                messages[idx].content = outcome.recovery.content;
+                                                warn!(
+                                                    "shell spiral fired pre-execution; injected recovery notice into latest shell Tool and continuing for LLM summary"
+                                                );
+                                                continue;
+                                            }
+                                        }
+                                        let terminal_content = if matches!(
+                                            outcome.recovery.kind,
+                                            ShellRetryRecoveryKind::RetryLimit,
+                                        ) {
+                                            shell_retry_terminal_user_message(
+                                                &outcome.recovery.content,
+                                            )
+                                        } else {
+                                            outcome.recovery.content
+                                        };
                                         warn!(
-                                            "loop detected after repeated shell attempts; returning recovered shell output"
+                                            recovery_kind = ?outcome.recovery.kind,
+                                            decision = %outcome.decision,
+                                            "shell spiral terminal: returning recovered content as final assistant reply"
                                         );
                                         self.emit_cost_update(turn.total_usage(), &response.usage);
                                         return Ok(ConversationResponse {
-                                            content: recovered_content,
+                                            content: terminal_content,
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -945,17 +1030,57 @@ impl Agent {
                             }
 
                             let spiral_iteration = turn.iteration();
-                            if let Some(recovered_content) = self.dispatch_shell_retry_recovery(
+                            if let Some(outcome) = self.dispatch_shell_retry_recovery(
                                 &messages,
                                 &mut retry_state,
                                 spiral_iteration,
                             ) {
+                                // Fix #2 (codex round 2): see
+                                // ShellSpiralOutcome doc — only splice +
+                                // continue on (RetryLimit, Escalate).
+                                // Everything else (RetryLimit+Exhausted,
+                                // success-kind extractions) returns the
+                                // recovery content as the terminal assistant
+                                // reply, matching original behaviour for the
+                                // success kinds and bounding the LLM-summary
+                                // attempt to a single shot for RetryLimit.
+                                let should_splice = matches!(
+                                    (&outcome.recovery.kind, outcome.decision),
+                                    (
+                                        ShellRetryRecoveryKind::RetryLimit,
+                                        LoopDecision::Escalate,
+                                    ),
+                                );
+                                if should_splice {
+                                    // Codex round-2 #d: target latest SHELL
+                                    // Tool, not last Tool. See pre-execution
+                                    // call site for rationale.
+                                    if let Some(idx) =
+                                        latest_tool_batch_index(&messages, "shell")
+                                    {
+                                        messages[idx].content = outcome.recovery.content;
+                                        warn!(
+                                            "shell spiral fired post-execution; injected recovery notice into latest shell Tool and continuing for LLM summary"
+                                        );
+                                        continue;
+                                    }
+                                }
+                                let terminal_content = if matches!(
+                                    outcome.recovery.kind,
+                                    ShellRetryRecoveryKind::RetryLimit,
+                                ) {
+                                    shell_retry_terminal_user_message(&outcome.recovery.content)
+                                } else {
+                                    outcome.recovery.content
+                                };
                                 warn!(
-                                    "ending turn after repeated shell attempts with recovered shell output"
+                                    recovery_kind = ?outcome.recovery.kind,
+                                    decision = %outcome.decision,
+                                    "shell spiral terminal: returning recovered content as final assistant reply"
                                 );
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
                                 return Ok(ConversationResponse {
-                                    content: recovered_content,
+                                    content: terminal_content,
                                     reasoning_content: None,
                                     provider_metadata: Some(
                                         self.llm.provider_metadata_for_index(
@@ -1672,6 +1797,109 @@ fn resolve_tool_name(messages: &[Message], tool_msg_index: usize) -> Option<&str
                 .map(|tool_call| tool_call.name.as_str())
         })
     })
+}
+
+/// Outcome of `dispatch_shell_retry_recovery`. The caller branches on
+/// `(recovery.kind, decision)`:
+///
+///  - `(RetryLimit, Escalate)` → first spiral hit on a non-converging
+///    streak. Splice `recovery.content` (system-shaped instruction) into
+///    the latest Tool message and continue the loop so the LLM gets one
+///    iteration to produce a real user-facing summary.
+///  - `(RetryLimit, Exhausted)` → second spiral hit; the model already
+///    had its summary chance and ignored it. Terminate the turn with
+///    `recovery.content` as the assistant reply (the system-shaped string
+///    is at least better than another infinite loop).
+///  - `(DiffLikeSuccess | ValidationSuccess | UsefulSuccess, _)` →
+///    `recovery.content` is RAW shell output extracted from the
+///    spiraling noise. It IS useful as a user-facing reply; keep the
+///    original return-as-content path. Do NOT splice — that would
+///    mis-attribute older successful output to the latest shell call.
+pub(crate) struct ShellSpiralOutcome {
+    pub(crate) recovery: ShellRetryRecovery,
+    pub(crate) decision: LoopDecision,
+}
+
+/// Index of the most recent `MessageRole::User` message in `messages`,
+/// or `0` if there is no User message yet (e.g. early agent boot). The
+/// returned index marks the start of the current user turn — anything
+/// before it belongs to past turns and is OUT OF SCOPE for the
+/// shell-spiral detector.
+fn current_user_turn_start(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, msg)| (msg.role == MessageRole::User).then_some(idx))
+        .unwrap_or(0)
+}
+
+/// Walk backward from the end of `messages` collecting names attached to
+/// the trailing run of Tool messages (the "latest tool batch"). Returns
+/// true if any of those names matches `target`. Returns false if the
+/// trailing run is empty (no Tool message at the tail) or none of the
+/// resolved names match.
+///
+/// Multi-tool batch awareness: the LLM can emit several tool calls in a
+/// single response (`[shell, read_file]`), and they are appended to
+/// messages as a contiguous run of Tool entries. Gating on only the
+/// LATEST one would suppress legitimate shell-spiral detection just
+/// because a non-shell tool happened to be appended last.
+fn latest_tool_batch_contains(messages: &[Message], target: &str) -> bool {
+    latest_tool_batch_index(messages, target).is_some()
+}
+
+/// Index of the most recent Tool message in the trailing batch whose
+/// resolved tool name is `target`, or `None` if the trailing batch
+/// contains no such Tool. Mirrors the walk in
+/// `latest_tool_batch_contains` but returns the index so callers can
+/// mutate that specific message.
+///
+/// Used by the spiral-recovery splice path: when a `[shell, read_file]`
+/// batch trips the detector, the recovery notice must overwrite the
+/// SHELL Tool's content, not whichever Tool happened to be appended
+/// last. Otherwise we mis-attribute the system-shaped instruction to
+/// `read_file` and silently drop the actual shell output that the
+/// notice is supposed to reference.
+fn latest_tool_batch_index(messages: &[Message], target: &str) -> Option<usize> {
+    for idx in (0..messages.len()).rev() {
+        let msg = &messages[idx];
+        if msg.role != MessageRole::Tool {
+            return None;
+        }
+        if resolve_tool_name(messages, idx) == Some(target) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Sanitize the system-shaped `[SHELL RETRY LIMIT]` content for the
+/// terminal Exhausted path so the user-facing assistant reply isn't a
+/// raw LLM-instruction string. Strips the fixed prefix that
+/// `shell_retry_limit_message` prepends and wraps the latest shell
+/// output in a short user-readable framing.
+///
+/// Codex round-3 BLOCK: the prefix can NEST. After the Escalate splice
+/// overwrites a shell Tool's content with `[SHELL RETRY LIMIT] ... +
+/// original output`, a follow-up recovery wraps that already-prefixed
+/// content again, producing two layers of the system prefix. We strip
+/// recursively until no prefix remains so the user-facing assistant
+/// reply never leaks an inner `[SHELL RETRY LIMIT] ... Stop retrying
+/// shell ...` instruction.
+fn shell_retry_terminal_user_message(content: &str) -> String {
+    const PREFIX: &str = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n";
+    let mut tail = content;
+    while let Some(stripped) = tail.strip_prefix(PREFIX) {
+        tail = stripped;
+    }
+    if tail.trim().is_empty() {
+        "I tried multiple shell approaches but couldn't converge on an answer. Please rephrase or give me a more specific direction.".to_string()
+    } else {
+        format!(
+            "I tried multiple shell approaches but couldn't converge on an answer. Latest output:\n\n{tail}"
+        )
+    }
 }
 
 fn is_useful_shell_output(content: &str) -> bool {
@@ -3220,6 +3448,395 @@ printf '{"output":"voice saved","success":true}\n'
         assert_eq!(recovered.kind, ShellRetryRecoveryKind::RetryLimit);
         assert!(recovered.content.contains("[SHELL RETRY LIMIT]"));
         assert!(recovered.content.contains("could not find Cargo.toml"));
+    }
+
+    // ── Fix #1+#2 (2026-05-10, codex r2): intra-turn scoping + correct splice ─
+
+    /// `current_user_turn_start` returns the index of the most recent User
+    /// message — the slice from there onward is the current turn, the
+    /// scan window for the spiral detector.
+    #[test]
+    fn current_user_turn_start_returns_index_of_last_user_message() {
+        let mut messages = stale_shell_failure_streak("call_shell");
+        // first User is at index 0; nothing else; so current_user_turn_start
+        // returns 0.
+        assert_eq!(current_user_turn_start(&messages), 0);
+
+        // Push a NEW user message simulating a new turn the user types
+        // after the original streak.
+        messages.push(Message::user("now ask me about weather"));
+        let new_user_idx = messages.len() - 1;
+        assert_eq!(current_user_turn_start(&messages), new_user_idx);
+    }
+
+    #[test]
+    fn current_user_turn_start_returns_zero_when_no_user_message() {
+        let messages: Vec<Message> = vec![Message {
+            role: MessageRole::Assistant,
+            content: "boot".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        assert_eq!(current_user_turn_start(&messages), 0);
+    }
+
+    /// Multi-tool batch awareness: the LLM can emit
+    /// `[shell, read_file]` in a single response. Both Tool results are
+    /// appended consecutively. The gate must see "this batch contains
+    /// shell" — checking only the latest Tool name would suppress
+    /// legitimate detection.
+    #[test]
+    fn latest_tool_batch_contains_picks_up_shell_in_mixed_batch() {
+        let messages = vec![
+            Message::user("repair"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "call_shell".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        metadata: None,
+                    },
+                    ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "x"}),
+                        metadata: None,
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "failed".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "{ \"x\": 1 }".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_read".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(latest_tool_batch_contains(&messages, "shell"));
+        assert!(latest_tool_batch_contains(&messages, "read_file"));
+    }
+
+    #[test]
+    fn latest_tool_batch_contains_returns_false_when_pure_non_shell_batch() {
+        let messages = vec![
+            Message::user("ask weather"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_w".into(),
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({"city": "Beijing"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "Clear sky 19.9C".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_w".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(!latest_tool_batch_contains(&messages, "shell"));
+    }
+
+    /// Regression for the 2026-05-10 mini1 incident. A session that
+    /// accumulated a 4-call shell streak with failures in turn N must NOT
+    /// have turn N+1 force-ended when turn N+1 (a) starts with a fresh
+    /// User message and (b) only ran `read_file`.
+    ///
+    /// With Fix #1 v2 (intra-turn window scan), `recover_shell_retry`
+    /// applied to the windowed slice from the new User message onward
+    /// sees zero shell calls — the threshold (4) is not met — so the
+    /// detector returns None at the SCAN layer. The batch-aware gate is
+    /// belt-and-suspenders for the case of mixed batches.
+    #[test]
+    fn intra_turn_window_skips_stale_shell_history_from_prior_turn() {
+        let mut messages = stale_shell_failure_streak("call_shell");
+        // New user turn after the stale streak.
+        messages.push(Message::user("now read manifest.json"));
+        // This turn ran read_file only.
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: "call_read_now".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "manifest.json"}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: "{ ... 6kb manifest ... }".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("call_read_now".into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        // Whole-history scan still matches the stale streak — that's the
+        // BUG we're fixing. The window is what restores correctness.
+        assert!(recover_shell_retry(&messages, 4).is_some());
+
+        let window_start = current_user_turn_start(&messages);
+        let window = &messages[window_start..];
+        // Inside the new-turn window, there are zero shell calls.
+        assert!(!latest_tool_batch_contains(window, "shell"));
+        // ...so the windowed scan finds no streak.
+        assert!(recover_shell_retry(window, 4).is_none());
+    }
+
+    /// Same window, but the new turn DOES run shell (legitimately) — the
+    /// detector must NOT fire after one shell call (threshold = 4).
+    #[test]
+    fn intra_turn_window_does_not_trip_on_single_fresh_shell_after_stale_streak() {
+        let mut messages = stale_shell_failure_streak("call_shell");
+        messages.push(Message::user("ok try one more thing"));
+        messages.push(Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: Some(vec![ToolCall {
+                id: "call_shell_new".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "cargo build"}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: "Compiling foo v0.1.0\nFinished\n\nExit code: 0".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("call_shell_new".into()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+
+        let window_start = current_user_turn_start(&messages);
+        let window = &messages[window_start..];
+        // gate passes (current batch contains shell) but the windowed
+        // scan has only 1 shell call — far below the 4-streak threshold.
+        assert!(latest_tool_batch_contains(window, "shell"));
+        assert!(recover_shell_retry(window, 4).is_none());
+    }
+
+    /// Codex round-2 #d: in a mixed `[shell, read_file]` batch, the splice
+    /// must target the SHELL Tool, not whichever Tool happened to be
+    /// appended last. `latest_tool_batch_index(_, "shell")` returns the
+    /// index of the SHELL Tool inside the trailing batch; the read_file
+    /// Tool's content stays untouched.
+    #[test]
+    fn latest_tool_batch_index_returns_shell_index_in_mixed_batch() {
+        let messages = vec![
+            Message::user("repair"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "call_shell".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        metadata: None,
+                    },
+                    ToolCall {
+                        id: "call_read".into(),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "x"}),
+                        metadata: None,
+                    },
+                ]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "shell failed".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "{ \"x\": 1 }".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_read".into()),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        // The trailing run is [shell-tool, read_file-tool]. The shell index
+        // is the second-to-last entry (len - 2), NOT the last (len - 1).
+        let shell_idx =
+            latest_tool_batch_index(&messages, "shell").expect("shell present in batch");
+        assert_eq!(shell_idx, messages.len() - 2);
+        assert_eq!(messages[shell_idx].content, "shell failed");
+
+        // Simulating the splice: only the shell Tool's content changes.
+        let mut spliced = messages.clone();
+        spliced[shell_idx].content = "[SHELL RETRY LIMIT] ...".to_string();
+        assert_eq!(spliced[shell_idx].content, "[SHELL RETRY LIMIT] ...");
+        // The read_file Tool's content stays untouched — preserves the
+        // useful tool result that was correctly attributed.
+        assert_eq!(spliced[messages.len() - 1].content, "{ \"x\": 1 }");
+    }
+
+    /// Codex round-2 #e: terminal RetryLimit + Exhausted user message
+    /// must not be the raw system-shaped instruction. The sanitizer
+    /// strips the prefix and frames the latest output for the user.
+    #[test]
+    fn shell_retry_terminal_user_message_strips_system_prefix() {
+        let raw = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\nerror: could not find Cargo.toml\n\nExit code: 101";
+        let sanitized = shell_retry_terminal_user_message(raw);
+        assert!(!sanitized.contains("[SHELL RETRY LIMIT]"));
+        assert!(!sanitized.contains("Stop retrying shell and summarize"));
+        assert!(sanitized.contains("could not find Cargo.toml"));
+        assert!(
+            sanitized.starts_with("I tried multiple shell approaches"),
+            "expected user-facing framing, got: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn shell_retry_terminal_user_message_fallback_when_no_output() {
+        let raw = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n   ";
+        let sanitized = shell_retry_terminal_user_message(raw);
+        assert!(sanitized.contains("Please rephrase or give me a more specific direction"));
+    }
+
+    /// Codex round-3 BLOCK regression: after the Escalate splice
+    /// overwrites a shell Tool's content with `[SHELL RETRY LIMIT] ... +
+    /// original output`, a follow-up Exhausted recovery can wrap THAT
+    /// already-prefixed content again, producing nested prefixes. The
+    /// sanitizer must strip ALL of them — leaking even one inner
+    /// "Stop retrying shell and summarize the blocker" string into the
+    /// user-facing reply is wrong.
+    #[test]
+    fn shell_retry_terminal_user_message_unwraps_nested_prefix() {
+        let prefix = "[SHELL RETRY LIMIT] Repeated shell repair attempts did not converge. Stop retrying shell and summarize the blocker.\n\nLatest shell output:\n";
+        let inner = format!("{prefix}error: real shell output\n\nExit code: 101");
+        let outer = format!("{prefix}{inner}");
+        // Outer wrapping a wrapped string — two prefix layers.
+        let sanitized = shell_retry_terminal_user_message(&outer);
+        assert!(!sanitized.contains("[SHELL RETRY LIMIT]"));
+        assert!(!sanitized.contains("Stop retrying shell and summarize"));
+        assert!(sanitized.contains("error: real shell output"));
+
+        // Three-deep paranoia case: should still strip cleanly.
+        let triple = format!("{prefix}{outer}");
+        let sanitized3 = shell_retry_terminal_user_message(&triple);
+        assert!(!sanitized3.contains("[SHELL RETRY LIMIT]"));
+        assert!(sanitized3.contains("error: real shell output"));
+    }
+
+    /// Helper: builds a 4-call shell-streak with all failures, exactly the
+    /// shape the live mini1 session had at 19:35–19:36 PDT on 2026-05-10
+    /// before the user asked unrelated questions.
+    fn stale_shell_failure_streak(id_prefix: &str) -> Vec<Message> {
+        let mut out = vec![Message::user("repair the repo")];
+        for i in 1..=4 {
+            let id = format!("{id_prefix}_{i}");
+            out.push(Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: id.clone(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+            out.push(Message {
+                role: MessageRole::Tool,
+                content: "error: could not find Cargo.toml\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some(id),
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        out
     }
 
     // ── is_productive_tool_message (M6.2) ───────────────────────────────

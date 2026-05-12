@@ -181,13 +181,15 @@ pub struct Config {
     #[serde(default)]
     pub content_routing: Option<octos_llm::RoutingConfig>,
 
-    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by the
-    /// API agent inside `octos serve`. Operators can anchor every AppUi
-    /// session that does not advertise the `session.workspace_cwd.v1`
-    /// capability to a chosen folder via `appui.default_session_cwd`,
-    /// so clients like octos-app — which sends `cwd: None` — get a
-    /// useful workspace root transparently. Capability-gated client-sent
-    /// cwds (Tier-1 of `session_tool_registry`) still take precedence.
+    /// AppUi (octos-app, octos-tui, etc.) session defaults applied by
+    /// `octos serve`. Operators can anchor every AppUi session that
+    /// does not advertise the `session.workspace_cwd.v1` capability to
+    /// a chosen folder via `appui.default_session_cwd` — the Tier-2
+    /// fallback consulted by the UI Protocol dispatcher when no
+    /// client-supplied cwd is present and before
+    /// `SessionRuntime::bootstrap`'s Tier-3 profile-default workspace
+    /// root. Capability-gated client-sent cwds (Tier-1) still take
+    /// precedence.
     #[serde(default)]
     pub appui: AppUiConfig,
 }
@@ -952,7 +954,7 @@ impl Config {
             }
         }
 
-        // Fall back to environment variable.
+        // Resolve the env var name we expect to hold this provider's key.
         let env_var = self.api_key_env.clone().unwrap_or_else(|| {
             octos_llm::registry::lookup(provider)
                 .and_then(|e| e.api_key_env)
@@ -960,6 +962,12 @@ impl Config {
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
 
+        // M11-F: per-profile API keys live on
+        // `ProfileRuntime::credentials`; consumers that need them
+        // read off the profile runtime directly. `Config::get_api_key`
+        // falls straight through to the process environment, which
+        // matches every non-serve entry point (`octos chat`,
+        // `octos gateway`).
         std::env::var(&env_var).wrap_err_with(|| {
             format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
         })

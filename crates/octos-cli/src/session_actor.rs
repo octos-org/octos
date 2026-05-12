@@ -18,7 +18,7 @@ use octos_agent::tools::spawn::{
 };
 use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
-    SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
+    ReadTaskOutputTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
 };
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, HookContext, HookExecutor, HookPayload,
@@ -2119,6 +2119,24 @@ impl ActorFactory {
             supervisor.clone(),
             session_key.to_string(),
         ));
+        // M10 Phase 4 — agent context isolation. The LLM gets a small
+        // `task_handle` envelope when it invokes a spawn_only tool; this
+        // tool is how it grep/head/tails the actual output without
+        // re-polluting context. Reads from the M8.7 router file plus
+        // (for `file` mode) the per-user workspace.
+        tools.register(ReadTaskOutputTool::new(
+            supervisor.clone(),
+            session_key.to_string(),
+            Some(self.subagent_output_router.clone()),
+            user_workspace.clone(),
+        ));
+        // Codex round 3 P2: pin `read_task_output` against the
+        // `ToolLifecycle` LRU evictor. Without this, in long-running
+        // gateway sessions the reader can be auto-deferred after the
+        // idle threshold and disappear from `specs()`, making the
+        // `task_handle` envelope point at a tool the LLM is no longer
+        // offered. The base-tool list is the LRU pin point.
+        tools.add_base_tools(["read_task_output"]);
         tools.register(message_tool);
         tools.register(send_file_tool);
 
