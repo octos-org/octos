@@ -555,6 +555,8 @@ mod tests {
             memory,
             memory_store,
             tool_config,
+            cron_service: None,
+            hook_executor: None,
         })
     }
 
