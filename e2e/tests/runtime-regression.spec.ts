@@ -66,6 +66,27 @@ async function chatViaWs(
 }
 
 /**
+ * Re-throw RPC errors that indicate a real server-side failure (e.g. the
+ * capability gate rejected the method, or the WS handshake failed). Only
+ * swallow the connection/transport errors that historically meant "host is
+ * offline" — those are the cases the legacy REST wrappers tolerated.
+ *
+ * In particular, `method_not_supported` (M12 Phase D-1 capability gate) must
+ * propagate so a misconfigured client doesn't pass the spec by reporting
+ * "no sessions" / "no messages".
+ */
+function rethrowIfRealFailure(err: unknown): never | void {
+  const message = err instanceof Error ? err.message : String(err);
+  if (
+    message.includes('method_not_supported') ||
+    message.includes('m9-ws aux:') ||
+    message.includes('rpc-error[')
+  ) {
+    throw err;
+  }
+}
+
+/**
  * Get session messages via the WS UI Protocol (`session/messages_page`).
  * M12 Phase D-5: REST `GET /api/sessions/{id}/messages` was retired.
  */
@@ -77,7 +98,8 @@ async function getMessages(sessionId: string): Promise<any[]> {
       profileId: PROFILE,
       sessionId,
     });
-  } catch {
+  } catch (err) {
+    rethrowIfRealFailure(err);
     return [];
   }
 }
@@ -94,7 +116,8 @@ async function getTasks(sessionId: string): Promise<any[]> {
       profileId: PROFILE,
       sessionId,
     });
-  } catch {
+  } catch (err) {
+    rethrowIfRealFailure(err);
     return [];
   }
 }
@@ -110,7 +133,8 @@ async function listSessions(): Promise<any[]> {
       token: TOKEN,
       profileId: PROFILE,
     });
-  } catch {
+  } catch (err) {
+    rethrowIfRealFailure(err);
     return [];
   }
 }

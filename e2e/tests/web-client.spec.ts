@@ -72,7 +72,20 @@ async function getSessionMessages(
       sessionId,
       sinceSeq: params.sinceSeq,
     });
-  } catch {
+  } catch (err) {
+    // Surface capability/protocol failures loudly; only swallow connection
+    // errors that historically meant "host offline". M12 Phase D-1 added a
+    // strict capability gate — a `method_not_supported` here means the WS
+    // handshake didn't negotiate `auxiliary.rest_to_ws.v1`, which is a real
+    // bug in the helper, not "no messages found".
+    const message = err instanceof Error ? err.message : String(err);
+    if (
+      message.includes('method_not_supported') ||
+      message.includes('m9-ws aux:') ||
+      message.includes('rpc-error[')
+    ) {
+      throw err;
+    }
     return [];
   }
 }
