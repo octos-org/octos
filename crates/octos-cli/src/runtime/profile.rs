@@ -236,6 +236,33 @@ pub struct ProfileRuntime {
     pub tool_config: Arc<ToolConfigStore>,
 }
 
+/// Which OS process is calling [`ProfileRuntime::bootstrap`].
+///
+/// Used to decide whether [`EpisodeStore::open`] should fail loudly
+/// on redb lock contention (the canonical owner — `Serve`) or degrade
+/// gracefully (the companion process — `Gateway`).
+///
+/// See the type-level docs on
+/// [`octos_memory::EpisodeStore`](EpisodeStore) for why the role
+/// split exists: redb is single-writer-single-process, and `octos
+/// serve` + `octos gateway` are separate OS processes that both
+/// bootstrap the same profile. Serve owns the canonical store;
+/// gateway is allowed to degrade so channel polling stays alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapRole {
+    /// Caller owns the canonical EpisodeStore. `EpisodeStore::open`
+    /// runs in strict mode and fails if the redb file lock is already
+    /// held. Use this from `octos serve` and other entry points whose
+    /// correctness depends on persistence being intact.
+    Serve,
+    /// Caller is a companion process that should keep running even
+    /// when the canonical EpisodeStore is owned elsewhere.
+    /// `EpisodeStore::open_or_degraded` runs and silently installs a
+    /// no-op store on lock contention. Use this from
+    /// `octos gateway` subprocesses.
+    Gateway,
+}
+
 impl ProfileRuntime {
     /// Build a fully populated [`ProfileRuntime`] from a parsed
     /// [`UserProfile`] + the per-profile `data_dir`.
@@ -279,6 +306,7 @@ impl ProfileRuntime {
         profile: &UserProfile,
         data_dir: &Path,
         octos_home: Option<&Path>,
+        role: BootstrapRole,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config.
         let config = config_from_profile(profile, None, None);
@@ -319,7 +347,17 @@ impl ProfileRuntime {
         let runtime_qos_catalog = bundle.runtime_qos_catalog.clone();
 
         // Step 4: open the memory stores.
-        let memory = Arc::new(EpisodeStore::open(data_dir).await.wrap_err_with(|| {
+        //
+        // The opener variant depends on the caller's role (see
+        // [`BootstrapRole`] docs). Serve must hold the canonical
+        // EpisodeStore; gateway falls back to a degraded handle when
+        // serve already owns the redb lock so it doesn't crashloop on
+        // every startup. Tracked by issue #899.
+        let memory_open_result = match role {
+            BootstrapRole::Serve => EpisodeStore::open(data_dir).await,
+            BootstrapRole::Gateway => EpisodeStore::open_or_degraded(data_dir).await,
+        };
+        let memory = Arc::new(memory_open_result.wrap_err_with(|| {
             format!("failed to open episode store for profile '{}'", profile.id)
         })?);
         let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
@@ -625,7 +663,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let err = ProfileRuntime::bootstrap(&profile, &data_dir, None)
+        let err = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
             .await
             .err()
             .expect("bootstrap must fail without a provider");
@@ -668,7 +706,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let err = ProfileRuntime::bootstrap(&profile, &data_dir, None)
+        let err = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
             .await
             .err()
             .expect("bootstrap must fail without a provider");
@@ -766,7 +804,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None)
+        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
             .await
             .expect("bootstrap should succeed with a valid provider config");
 
@@ -790,6 +828,190 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("MARKER-FRAGMENT-XYZ")),
             "plugin_prompt_fragments should still surface the fragment for gateway",
+        );
+    }
+
+    /// Regression test for the M11-F production crashloop tracked in
+    /// `octos-org/octos#899`:
+    ///
+    /// `octos serve` and `octos gateway` are separate OS processes,
+    /// both calling `ProfileRuntime::bootstrap` against the same
+    /// per-profile data dir. Before this fix the second bootstrap
+    /// crashed inside `EpisodeStore::open` with
+    /// `redb::DatabaseError::DatabaseAlreadyOpen`, gateway exited,
+    /// launchd auto-restarted it, and every profile crashlooped every
+    /// ~2 seconds. Now the second bootstrap must succeed with the
+    /// EpisodeStore in degraded mode.
+    ///
+    /// We simulate the cross-process race by bootstrapping the same
+    /// profile twice in a row in the same test — the first handle on
+    /// `rt_owner.memory` keeps the redb lock held while the second
+    /// `ProfileRuntime::bootstrap` call runs, exercising the same
+    /// `DatabaseAlreadyOpen` path the gateway subprocess hits in
+    /// production.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn bootstrap_succeeds_when_redb_already_owned_by_sibling_process() {
+        const KEY_NAME: &str = "OCTOS_GH899_TEST_API_KEY";
+        // SAFETY: env var name is unique to this test.
+        unsafe {
+            std::env::set_var(KEY_NAME, "test-key-sk-fake");
+        }
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: see set_var above.
+                unsafe {
+                    std::env::remove_var(KEY_NAME);
+                }
+            }
+        }
+        let _guard = EnvGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("gh899").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let profile = UserProfile {
+            id: "gh899".to_string(),
+            name: "GH899".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some(KEY_NAME.to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Simulates `octos serve`: bootstraps first as `Serve`,
+        // takes the redb lock. `rt_owner` stays live for the whole
+        // test so the lock remains held.
+        let rt_owner = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("first bootstrap (owner) should succeed");
+        assert!(
+            !rt_owner.memory.is_degraded(),
+            "first bootstrap should hold the canonical redb",
+        );
+
+        // Simulates `octos gateway` running as a subprocess of serve:
+        // hits the lock contention. Before #899 this returned
+        // `Err(failed to open episode store ... Database already open)`.
+        // Now it must succeed because the `Gateway` role opts into
+        // the degraded fallback; the resulting handle's EpisodeStore
+        // operates in degraded mode.
+        let rt_sibling =
+            ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Gateway)
+                .await
+                .expect(
+                    "second bootstrap (Gateway role) should succeed even \
+                     when redb is already locked — this is the crashloop \
+                     fix from issue #899",
+                );
+        assert!(
+            rt_sibling.memory.is_degraded(),
+            "Gateway-role bootstrap's episode store must be degraded",
+        );
+    }
+
+    /// Companion to the crashloop test: a *second* `Serve`-role
+    /// bootstrap must NOT silently degrade. This prevents a
+    /// gateway-first/dev-workflow misordering from flipping canonical
+    /// ownership to the gateway and quietly degrading serve's
+    /// persistence — a concern codex raised on the round-1 review of
+    /// #899. Serve must fail loudly so the operator sees the
+    /// deployment misconfiguration.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn second_serve_role_bootstrap_fails_loudly_when_redb_already_owned() {
+        const KEY_NAME: &str = "OCTOS_GH899_SERVE_STRICT_TEST_API_KEY";
+        // SAFETY: env var name is unique to this test.
+        unsafe {
+            std::env::set_var(KEY_NAME, "test-key-sk-fake");
+        }
+        struct EnvGuard;
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: see set_var above.
+                unsafe {
+                    std::env::remove_var(KEY_NAME);
+                }
+            }
+        }
+        let _guard = EnvGuard;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("gh899s").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let profile = UserProfile {
+            id: "gh899s".to_string(),
+            name: "GH899S".to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("openai".to_string()),
+                        model_id: Some("gpt-4o-mini".to_string()),
+                        route: Some(LlmRouteConfig {
+                            route_id: None,
+                            label: None,
+                            base_url: None,
+                            api_key_env: Some(KEY_NAME.to_string()),
+                            api_type: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let _rt_owner = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("first Serve bootstrap should succeed");
+
+        // Second Serve-role bootstrap must error — never silently
+        // degrade. This is the property codex's round-1 review asked
+        // us to lock down.
+        let err = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .err()
+            .expect(
+                "second Serve-role bootstrap must fail loudly on redb \
+                 lock contention — silent degradation would risk \
+                 flipping canonical ownership",
+            );
+        let msg = err.to_string() + " " + &format!("{err:?}");
+        assert!(
+            msg.contains("Database already open") || msg.contains("Cannot acquire lock"),
+            "error must surface the redb lock contention; got: {err:?}",
         );
     }
 }
