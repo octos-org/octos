@@ -51,6 +51,18 @@ pub fn resolve_extras(manifest: &PluginManifest, skill_dir: &Path) -> SkillExtra
 
     // Auto-inject SKILL.md when skill has spawn_only tools so the LLM
     // knows how to access deferred tools via spawn.
+    //
+    // M10 Phase 4 (codex round 2 P2): the `read_task_output` contract
+    // teaching is NOT injected globally here. The `extras.prompt_fragments`
+    // are merged into the system prompt on every agent that loads the
+    // skill — including CLI chat / swarm workers whose registries do not
+    // wire `read_task_output`. Without registry-aware gating those agents
+    // would learn about a tool they cannot call. Instead, the
+    // `spawn_only_handle_message` envelope itself documents the contract
+    // inline (`read_with`, `read_modes`, and the `summary` field), so
+    // only agents that actually emit the new envelope teach the LLM
+    // about it — automatic and consistent with the gating in
+    // `execution.rs::is_tool_visible`.
     if manifest.tools.iter().any(|t| t.spawn_only) {
         let skill_md = skill_dir.join("SKILL.md");
         if skill_md.exists() {

@@ -73,7 +73,33 @@ pub struct BackgroundResultPayload {
     pub task_label: String,
     pub content: String,
     pub kind: BackgroundResultKind,
+    /// Media to attach to the persisted ledger row that mirrors this
+    /// completion (legacy `message/persisted` shape). For the
+    /// `NotConfigured` `send_file` fallback this stays `vec![]` because
+    /// each file already has its own per-file `message/persisted` row
+    /// — adding the same paths here would double-render attachments on
+    /// old clients that don't negotiate `event.spawn_complete.v1`.
+    /// For the `Satisfied` workspace-contract path it carries
+    /// `output_files` directly (no separate per-file rows on that path).
     pub media: Vec<String>,
+    /// M10 Phase 5a: media to surface ONLY on the `turn/spawn_complete`
+    /// envelope, never on the persisted row.
+    ///
+    /// Why two fields: dual-negotiated clients (capability
+    /// `event.spawn_complete.v1`) receive the envelope; the
+    /// per-file `message/persisted` companions are filtered as
+    /// `MessagePersistedSource::Background`. So the envelope MUST
+    /// carry the file URLs or the new client renders a text-only bubble.
+    /// Old clients DO see the per-file rows; if the envelope's media
+    /// also leaked into the persisted row they'd double-render.
+    /// Splitting persist-media from envelope-media keeps the two wire
+    /// shapes independent.
+    ///
+    /// Empty `Vec` (default) means "no envelope-only attachments";
+    /// the envelope falls back to `media` for compatibility with the
+    /// `Satisfied` path. Populated explicitly only by the
+    /// `NotConfigured` success branch in `execution.rs`.
+    pub envelope_media: Vec<String>,
     /// M8.10 follow-up (#649): the user message's `client_message_id` that
     /// originated this background task. Carries through to the late-arriving
     /// outbound's `metadata.thread_id` so the API channel can stamp SSE
@@ -81,6 +107,13 @@ pub struct BackgroundResultPayload {
     /// map happens to hold when the background task finally finalises.
     /// `None` for legacy callers and tests that don't track origination.
     pub originating_thread_id: Option<String>,
+    /// M10 Phase 1: the task supervisor `TaskId` for the spawn_only task
+    /// that produced this completion. Surfaced on the wire as
+    /// `TurnSpawnCompleteEvent.task_id` so the client can attribute the
+    /// new bubble to a specific background task (and, in Phase 4, drive
+    /// `read_task_output` against it). `None` for legacy callers and
+    /// tests that do not register tasks with the supervisor.
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2935,7 +2968,9 @@ impl Tool for SpawnTool {
                         content: content.clone(),
                         kind: result_kind,
                         media: result_media.clone(),
+                        envelope_media: vec![],
                         originating_thread_id: originating_thread_id.clone(),
+                        task_id: tracked_task_id.clone(),
                     },
                 )
                 .await
@@ -3939,7 +3974,9 @@ PY
             content: "done".to_string(),
             kind: BackgroundResultKind::Notification,
             media: vec!["/tmp/output.mp3".to_string()],
+            envelope_media: vec![],
             originating_thread_id: None,
+            task_id: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);
