@@ -14,7 +14,9 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle,
 };
-use octos_core::{MAIN_PROFILE_ID, Message, SessionKey};
+#[cfg(test)]
+use octos_core::Message;
+use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -22,43 +24,17 @@ use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::router::AuthIdentity;
 use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
 
-/// POST /api/chat -- send a message, get a response (sync JSON only).
+/// Legacy `POST /api/chat` retired.
 ///
-/// M9-α-5/α-6 (ADR PR #830): the SSE branch was deleted; `stream: true`
-/// now returns `410 Gone` and clients must use `/api/ui-protocol/ws`.
-/// `media` / `attach_only` / `client_message_id` are accepted for
-/// wire-compat with older clients but unused in the surviving sync
-/// path.
-#[derive(Deserialize)]
-pub struct ChatRequest {
-    pub message: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub topic: Option<String>,
-    #[serde(default)]
-    pub stream: bool,
-    /// File paths from prior `/api/upload` call.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub media: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub attach_only: bool,
-    /// Web-generated correlation id. Used by the WS lifecycle handlers
-    /// downstream of `/api/ui-protocol/ws`. Pre-α-5/α-6 the streaming
-    /// HTTP path also threaded this through; that path is gone.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub client_message_id: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ChatResponse {
-    pub content: String,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-}
+/// Transport history:
+/// - M9-α-5/α-6 (ADR PR #830): the SSE branch was deleted; `stream: true`
+///   returned `410 Gone` and clients had to use `/api/ui-protocol/ws`.
+/// - Cleanup follow-up to PR #908: the surviving sync JSON path was
+///   retired once the last callers (the `coding_multi_session`
+///   integration test, three e2e specs, and
+///   `scripts/validate-m4-1a-live.sh`) migrated to the WS path.
+///
+/// The sole chat transport is now `/api/ui-protocol/ws`.
 
 #[derive(Serialize)]
 pub(crate) struct ContentFileEntry {
@@ -86,9 +62,6 @@ fn resolve_scoped_download_path(
     resolve_scoped_file_handle(base_dir, request_path)
         .or_else(|| resolve_legacy_file_request(base_dir, request_path))
 }
-
-/// Maximum message length (1MB).
-const MAX_MESSAGE_LEN: usize = 1_048_576;
 
 fn request_host(headers: &HeaderMap) -> Option<String> {
     let raw = headers
@@ -307,196 +280,6 @@ fn encode_api_session_path_id(id: &str) -> String {
     octos_bus::session::encode_path_component(id)
 }
 
-pub async fn chat(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
-) -> Response {
-    // M9-α-5/α-6 (ADR PR #830 / audit issue #845): SSE chat is gone.
-    // `POST /api/chat` only supports the sync JSON path now — every
-    // streaming caller has migrated to `/api/ui-protocol/ws`. Fail
-    // closed when `stream=true` is requested so a stale client surfaces
-    // a clear error instead of a half-broken response.
-    if req.stream {
-        return (
-            StatusCode::GONE,
-            "POST /api/chat?stream=true was removed in M9-α-5/α-6 — \
-             use the WebSocket UI Protocol (/api/ui-protocol/ws) instead.",
-        )
-            .into_response();
-    }
-
-    match chat_sync(state, headers, req).await {
-        Ok(json) => json.into_response(),
-        Err((status, msg)) => (status, msg).into_response(),
-    }
-}
-
-/// Persist a `Message` to the canonical per-user `<topic>.jsonl` and
-/// invalidate the `SessionManager` LRU cache for the key.
-///
-/// This is the unified write path for the standalone `octos serve` /chat
-/// handlers. Mirrors `ApiChannel::persist_to_session` in the gateway path
-/// — both funnel through `octos_bus::persist_message_through_canonical_path`
-/// so the storage layer is the single ordering point.
-///
-/// Returns the committed per-session sequence number so callers (e.g. the
-/// streaming handler) can correlate it back to the optimistic bubble.
-async fn persist_chat_message_through_canonical(
-    sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
-    key: &SessionKey,
-    message: Message,
-) -> eyre::Result<usize> {
-    let data_dir = {
-        let manager = sessions.lock().await;
-        manager.data_dir()
-    };
-
-    let result = octos_bus::persist_message_through_canonical_path(&data_dir, key, message).await;
-
-    // Drop any stale `SessionManager` cache entry so a follow-up read
-    // (duplicate-detection, `?source=full`) consults disk instead of
-    // returning a pre-write empty `Session`.
-    {
-        let mut manager = sessions.lock().await;
-        manager.invalidate_cache(key);
-    }
-
-    result
-}
-
-async fn chat_sync(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    req: ChatRequest,
-) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    if req.message.len() > MAX_MESSAGE_LEN {
-        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
-        ));
-    }
-
-    let profile_id = api_profile_id_from_headers(&state, &headers);
-    let session_key = standalone_api_session_key_with_topic(
-        &state,
-        &headers,
-        req.session_id.as_deref().unwrap_or("default"),
-        req.topic.as_deref(),
-    );
-
-    tracing::info!(
-        profile_id = %profile_id,
-        session = req.session_id.as_deref().unwrap_or("default"),
-        msg_len = req.message.len(),
-        "chat: processing message"
-    );
-
-    // M11-F: every read path resolves through `state.profiles` +
-    // `state.session_cache`. An unregistered profile is a configuration
-    // bug, not a runtime fallback — `octos serve` bootstraps every
-    // profile in `ProfileStore::list()` at startup, so if a profile id
-    // arrives at `/api/chat` that the catalog doesn't know about, it
-    // means the request routed against a profile that failed (or never
-    // had) bootstrap. Fail closed with 503 rather than silently fall
-    // through to a server-wide agent (which M11-F removed).
-    let Some(profile_runtime) = state.profiles.get(&profile_id).cloned() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "No LLM provider configured for profile '{profile_id}'. \
-                 Set up the profile with an API key in the dashboard.",
-            ),
-        ));
-    };
-    chat_sync_via_session_runtime(state, profile_runtime, session_key, req).await
-}
-
-/// `/api/chat` dispatcher: resolves the per-session
-/// [`crate::runtime::SessionRuntime`] from the cache (constructing it
-/// on first use), runs the agent against the session-bound workspace,
-/// and persists the response through the canonical per-user JSONL.
-///
-/// M11-F: the only `/api/chat` path. The legacy server-wide
-/// `state.agent` fallback was removed; unregistered profile → 503 in
-/// the caller.
-async fn chat_sync_via_session_runtime(
-    state: Arc<AppState>,
-    profile_runtime: Arc<crate::runtime::ProfileRuntime>,
-    session_key: SessionKey,
-    req: ChatRequest,
-) -> Result<Json<ChatResponse>, (StatusCode, String)> {
-    // Acquire (or build on first use) the per-session runtime.
-    //
-    // M11-F regression fix REG-6: when no client cwd is supplied,
-    // forward `state.appui_default_session_cwd` (mirrored from
-    // `config.appui.default_session_cwd`) as the workspace hint. The
-    // pre-M11-F serve path wired this into the server-wide agent via
-    // `agent.with_workspace_root(default_cwd)`; we now thread the
-    // same operator default through the per-session bootstrap. When
-    // the operator sets nothing, this is `None` and the bootstrap
-    // falls back to the canonical
-    // `<profile_data_dir>/users/<encoded session base>/workspace`
-    // layout — preserving the M11 fix for the
-    // `"workspace policy not found"` failure on yangmi voice clone.
-    let workspace_hint = state.appui_default_session_cwd.clone();
-    let session_runtime = state
-        .session_cache
-        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                error = %e,
-                profile_id = %profile_runtime.profile_id,
-                session = %session_key,
-                "chat: SessionRuntime::bootstrap failed",
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to bootstrap session runtime: {e}"),
-            )
-        })?;
-
-    let history: Vec<Message> = {
-        let mut sess = session_runtime.sessions.lock().await;
-        let session = sess.get_or_create(&session_key).await;
-        session.get_history(50).to_vec()
-    };
-
-    let response = session_runtime
-        .agent
-        .process_message(&req.message, &history, vec![])
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "chat: LLM processing failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    tracing::info!(
-        input_tokens = response.token_usage.input_tokens,
-        output_tokens = response.token_usage.output_tokens,
-        profile_id = %profile_runtime.profile_id,
-        session = %session_key,
-        "chat: response generated via SessionRuntime",
-    );
-
-    for msg in &response.messages {
-        let _ = persist_chat_message_through_canonical(
-            &session_runtime.sessions,
-            &session_key,
-            msg.clone(),
-        )
-        .await;
-    }
-
-    Ok(Json(ChatResponse {
-        content: response.content,
-        input_tokens: response.token_usage.input_tokens,
-        output_tokens: response.token_usage.output_tokens,
-    }))
-}
-
 /// GET /api/sessions -- list sessions.
 #[derive(Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -607,16 +390,6 @@ pub struct TopicQueryParams {
 
 fn default_page_limit() -> usize {
     100
-}
-
-fn standalone_api_session_key_with_topic(
-    state: &AppState,
-    headers: &HeaderMap,
-    session_id: &str,
-    topic: Option<&str>,
-) -> SessionKey {
-    let profile_id = api_profile_id_from_headers(state, headers);
-    SessionKey::with_profile_topic(&profile_id, "api", session_id, topic.unwrap_or_default())
 }
 
 fn append_topic_query(path: &mut String, topic: Option<&str>) {
@@ -1210,7 +983,7 @@ pub async fn delete_session(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// POST /api/upload -- upload files, returns paths for use in /api/chat media field.
+/// POST /api/upload -- upload files, returns paths for use as turn-input media handles.
 ///
 /// Accepts multipart/form-data with one or more `file` fields.
 /// Returns JSON array of server-side upload handles.
@@ -2644,62 +2417,12 @@ pub async fn health() -> Json<serde_json::Value> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn chat_request_deserialize() {
-        let json = r#"{"message": "hello"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.message, "hello");
-        assert!(req.session_id.is_none());
-        assert!(!req.stream);
-    }
-
-    #[test]
-    fn chat_request_with_session() {
-        let json = r#"{"message": "hi", "session_id": "s1"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.message, "hi");
-        assert_eq!(req.session_id.as_deref(), Some("s1"));
-    }
-
-    #[test]
-    fn chat_request_with_stream() {
-        let json = r#"{"message": "hi", "stream": true}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert!(req.stream);
-    }
-
-    /// FA-12f follow-up: the outer `ChatRequest` (served at `/api/chat`) must
-    /// accept `client_message_id` so it survives proxy forwarding to the
-    /// gateway. The prior fix patched only the gateway-internal struct; the
-    /// outer struct silently dropped the field and overflow replies arrived
-    /// with `response_to_client_message_id: null`, breaking web-side
-    /// correlation under `/queue speculative`.
-    #[test]
-    fn chat_request_accepts_client_message_id() {
-        let json = r#"{"message": "hi", "client_message_id": "client-bravo-xyz"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.client_message_id.as_deref(), Some("client-bravo-xyz"));
-    }
-
-    #[test]
-    fn chat_request_client_message_id_defaults_to_none() {
-        let json = r#"{"message": "hi"}"#;
-        let req: ChatRequest = serde_json::from_str(json).unwrap();
-        assert!(req.client_message_id.is_none());
-    }
-
-    #[test]
-    fn chat_response_serialize() {
-        let resp = ChatResponse {
-            content: "world".into(),
-            input_tokens: 10,
-            output_tokens: 5,
-        };
-        let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["content"], "world");
-        assert_eq!(json["input_tokens"], 10);
-        assert_eq!(json["output_tokens"], 5);
-    }
+    // Legacy `POST /api/chat` REST tests (chat_request_*, chat_response_*)
+    // were retired with the handler in the cleanup follow-up to PR #908.
+    // Wire-level chat coverage now lives in
+    // `api::ui_protocol::tests` (turn/start, turn/completed, etc.) and
+    // the `coding_multi_session` integration test (per-session workspace
+    // isolation).
 
     #[test]
     fn session_info_serialize() {
@@ -3676,93 +3399,12 @@ mod tests {
         assert_eq!(default_page_limit(), 100);
     }
 
-    #[test]
-    fn max_message_len_is_1mb() {
-        assert_eq!(MAX_MESSAGE_LEN, 1_048_576);
-    }
-
-    #[tokio::test]
-    async fn chat_sync_writes_to_canonical_per_user_topic_jsonl() {
-        // Regression for the standalone `octos serve` /chat handlers writing
-        // to the legacy flat layout instead of the canonical per-user JSONL.
-        //
-        // Pre-fix, `chat_sync`/`chat_streaming`/the websocket handler all
-        // called `SessionManager::add_message_with_seq` directly. That writes
-        // to `<data_dir>/sessions/<encoded_full_key>.jsonl` (legacy flat),
-        // not the canonical per-user `<topic>.jsonl`. A standalone deployment
-        // without a gateway-side `ApiChannel` therefore split-brained — the
-        // actor wrote to one path, handlers wrote to another, replays missed
-        // half the history.
-        //
-        // Post-fix, every `/chat` write must funnel through
-        // `persist_chat_message_through_canonical` — a wrapper around
-        // `octos_bus::persist_message_through_canonical_path` that also
-        // invalidates the `SessionManager` LRU cache (mirroring what
-        // `ApiChannel::persist_to_session` does). The contract: messages
-        // committed via this helper land in the canonical per-user JSONL
-        // and never touch the legacy flat directory.
-        let data_dir = tempfile::tempdir().unwrap();
-        let sessions = Arc::new(tokio::sync::Mutex::new(
-            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
-        ));
-        let session_id = "web-canonical-handlers";
-        let topic = "research";
-        let key = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, topic);
-
-        // Drive a write through the helper the production handlers now use.
-        let seq = persist_chat_message_through_canonical(
-            &sessions,
-            &key,
-            Message::user("please summarise the q1 numbers"),
-        )
-        .await
-        .expect("canonical persist");
-        assert_eq!(seq, 0);
-
-        // Canonical per-user `<encoded_topic>.jsonl` must exist and carry
-        // the user message.
-        let encoded_base = octos_bus::session::encode_path_component(&format!(
-            "{MAIN_PROFILE_ID}:api:{session_id}"
-        ));
-        let encoded_topic = octos_bus::session::encode_path_component(topic);
-        let canonical = data_dir
-            .path()
-            .join("users")
-            .join(&encoded_base)
-            .join("sessions")
-            .join(format!("{encoded_topic}.jsonl"));
-        assert!(
-            canonical.exists(),
-            "/chat handler write must land in canonical per-user JSONL ({}) — \
-             this is the unified file the SessionActor and the bus-side \
-             ApiChannel also write",
-            canonical.display()
-        );
-        let body = std::fs::read_to_string(&canonical).unwrap();
-        assert!(
-            body.contains("please summarise the q1 numbers"),
-            "canonical JSONL must contain the user message text"
-        );
-
-        // Legacy flat `sessions/<encoded_full_key>.jsonl` must NOT exist —
-        // that's the old split-brain location standalone /chat used to
-        // write to.
-        let sessions_dir = data_dir.path().join("sessions");
-        if sessions_dir.exists() {
-            for entry in std::fs::read_dir(&sessions_dir).unwrap().flatten() {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    panic!(
-                        "/chat handler must NOT write to the legacy flat \
-                         layout (sessions/{}.jsonl) — that is the split-brain \
-                         path the storage unification PR is closing",
-                        name
-                    );
-                }
-            }
-        }
-    }
+    // `max_message_len_is_1mb` + `chat_sync_writes_to_canonical_per_user_topic_jsonl`
+    // were retired with the legacy `POST /api/chat` handler in the
+    // cleanup follow-up to PR #908. The canonical-JSONL invariant is
+    // now covered end-to-end by the `coding_multi_session` integration
+    // test (which drives the same `octos_bus::persist_message_through_canonical_path`
+    // call site) and by the WS UI Protocol handler's own unit tests.
 
     // ────────── M7.9 / W2 cancel + restart-from-node API tests ──────────
 
@@ -3944,245 +3586,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
-    // ────────── M11-D `/api/chat` routes through `SessionRuntime` ──────────
-
-    /// Minimal stub LLM that returns a fixed assistant reply. Used to drive
-    /// the M11-D `/api/chat` route through `SessionRuntime::bootstrap` +
-    /// `Agent::process_message` without hitting a real provider.
-    struct EchoLlm {
-        reply: String,
-    }
-
-    #[async_trait::async_trait]
-    impl octos_llm::LlmProvider for EchoLlm {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[octos_llm::ToolSpec],
-            _config: &octos_llm::ChatConfig,
-        ) -> eyre::Result<octos_llm::ChatResponse> {
-            Ok(octos_llm::ChatResponse {
-                content: Some(self.reply.clone()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                stop_reason: octos_llm::StopReason::EndTurn,
-                usage: octos_llm::TokenUsage {
-                    input_tokens: 7,
-                    output_tokens: 11,
-                    ..Default::default()
-                },
-                provider_index: None,
-            })
-        }
-
-        fn model_id(&self) -> &str {
-            "m11d-echo"
-        }
-
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-
-        fn context_window(&self) -> u32 {
-            64_000
-        }
-    }
-
-    async fn make_m11d_profile(
-        data_dir: &std::path::Path,
-        reply: &str,
-    ) -> Arc<crate::runtime::ProfileRuntime> {
-        std::fs::create_dir_all(data_dir).unwrap();
-        let memory = Arc::new(octos_memory::EpisodeStore::open(data_dir).await.unwrap());
-        let memory_store = Arc::new(octos_memory::MemoryStore::open(data_dir).await.unwrap());
-        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(data_dir).await.unwrap());
-        let sandbox = octos_agent::SandboxConfig::default();
-        let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
-            data_dir,
-            octos_agent::create_sandbox(&sandbox),
-        );
-        Arc::new(crate::runtime::ProfileRuntime {
-            profile_id: MAIN_PROFILE_ID.to_string(),
-            data_dir: data_dir.to_path_buf(),
-            llm: Arc::new(EchoLlm {
-                reply: reply.to_string(),
-            }),
-            adaptive_router: None,
-            runtime_qos_catalog: None,
-            primary_model_id: "m11d-echo".to_string(),
-            provider_name: "stub".to_string(),
-            credentials: HashMap::new(),
-            skills_dir: None,
-            plugin_env_template: Vec::new(),
-            tool_policy: None,
-            default_sandbox: sandbox,
-            tool_specs: Arc::new(base_tools),
-            plugin_tool_names: Vec::new(),
-            plugin_dirs: Vec::new(),
-            plugin_prompt_fragments: Vec::new(),
-            plugin_hooks: Vec::new(),
-            system_prompt: "test-system-prompt".to_string(),
-            memory,
-            memory_store,
-            tool_config,
-            cron_service: None,
-            hook_executor: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn chat_routes_through_session_runtime_when_profile_registered() {
-        // Acceptance evidence (M11-D Part 3): a `/api/chat` request lands
-        // in `chat_sync_via_session_runtime` whenever the routed profile
-        // is registered in `state.profiles`. The route is the exact
-        // structural path the live yangmi flow takes — it implies
-        // `SessionRuntime::bootstrap` ran, which writes the per-session
-        // `.octos-workspace.toml` (closing the "workspace policy not
-        // found" failure mode without any hotfix file at the daemon
-        // cwd).
-        let data_dir = tempfile::tempdir().unwrap();
-        let profile_data_dir = data_dir.path().join("profile-data");
-        let profile_runtime = make_m11d_profile(&profile_data_dir, "yangmi reply ack").await;
-
-        let mut profiles = HashMap::new();
-        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
-        let state = Arc::new(AppState {
-            profiles,
-            ..AppState::empty_for_tests()
-        });
-
-        let req = ChatRequest {
-            message: "用 yangmi 语音说北京今天天气晴朗".to_string(),
-            session_id: Some("yangmi-trace-001".to_string()),
-            topic: None,
-            stream: false,
-            media: Vec::new(),
-            attach_only: false,
-            client_message_id: None,
-        };
-
-        let response = chat_sync(state.clone(), HeaderMap::new(), req)
-            .await
-            .expect("chat_sync must succeed via SessionRuntime path");
-        assert_eq!(response.content, "yangmi reply ack");
-        assert_eq!(response.input_tokens, 7);
-        assert_eq!(response.output_tokens, 11);
-
-        // The session runtime was materialized into the cache — a second
-        // call for the same session reuses the same `Arc<SessionRuntime>`.
-        let cache_len = state.session_cache.len().await;
-        assert_eq!(cache_len, 1, "session cache must hold one entry");
-
-        // The per-session workspace policy bootstrap actually ran — i.e.
-        // the yangmi gap is closed at the structural level.
-        let encoded = octos_bus::session::encode_path_component(&format!(
-            "{MAIN_PROFILE_ID}:api:yangmi-trace-001"
-        ));
-        let policy_path = profile_data_dir
-            .join("users")
-            .join(&encoded)
-            .join("workspace")
-            .join(".octos-workspace.toml");
-        assert!(
-            policy_path.exists(),
-            "SessionRuntime::bootstrap must write the workspace policy at {} \
-             without any operator-side hotfix",
-            policy_path.display(),
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_returns_503_when_routed_profile_not_registered() {
-        // M11-F: the legacy `state.agent` fallback was deleted; an
-        // unregistered profile is a configuration bug, not a runtime
-        // fallback. `octos serve` bootstraps every profile in
-        // `ProfileStore::list()` at startup, so a request that lands on
-        // a profile id missing from `state.profiles` must fail closed
-        // with 503 SERVICE UNAVAILABLE (and a body that names the
-        // offending profile so operators can investigate).
-        let state = Arc::new(AppState::empty_for_tests());
-        let req = ChatRequest {
-            message: "ping".to_string(),
-            session_id: Some("legacy".to_string()),
-            topic: None,
-            stream: false,
-            media: Vec::new(),
-            attach_only: false,
-            client_message_id: None,
-        };
-
-        let result = chat_sync(state, HeaderMap::new(), req).await;
-        let (status, msg) = result
-            .err()
-            .expect("expected 503 when profile not registered");
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        // The error must name the missing profile so the operator log
-        // surfaces the misrouted-request shape (not an opaque "no
-        // provider" message that pre-M11-F's legacy path returned).
-        assert!(
-            msg.contains(MAIN_PROFILE_ID),
-            "503 message must name the unregistered profile (got: {msg})",
-        );
-    }
-
-    /// M11-F regression fix REG-6: `chat_sync_via_session_runtime` must
-    /// forward `state.appui_default_session_cwd` as the session's
-    /// workspace hint when no client cwd is supplied. Pre-M11-F serve.rs
-    /// wired this into the server-wide agent via
-    /// `agent.with_workspace_root(default_cwd)` so every `/api/chat`
-    /// inherited it; M11-F's deletion of that helper left this
-    /// dispatcher path falling back to the canonical
-    /// `<data_dir>/users/.../workspace` instead of the operator setting.
-    #[tokio::test]
-    async fn chat_sync_forwards_appui_default_session_cwd_as_workspace_hint() {
-        let tmp = tempfile::tempdir().unwrap();
-        let profile_data_dir = tmp.path().join("profile-data");
-        let operator_cwd = tmp.path().join("operator-coding-workspace");
-        std::fs::create_dir_all(&operator_cwd).unwrap();
-        let profile_runtime = make_m11d_profile(&profile_data_dir, "ack").await;
-
-        let mut profiles = HashMap::new();
-        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
-        let state = Arc::new(AppState {
-            profiles,
-            appui_default_session_cwd: Some(operator_cwd.clone()),
-            ..AppState::empty_for_tests()
-        });
-
-        let req = ChatRequest {
-            message: "anchor here".to_string(),
-            session_id: Some("reg6-trace".to_string()),
-            topic: None,
-            stream: false,
-            media: Vec::new(),
-            attach_only: false,
-            client_message_id: None,
-        };
-
-        let _response = chat_sync(state.clone(), HeaderMap::new(), req)
-            .await
-            .expect("chat_sync should succeed");
-
-        // After the first call, the cached SessionRuntime must be
-        // anchored at the operator-configured cwd (not the canonical
-        // `<profile_data_dir>/users/.../workspace`).
-        let session_key =
-            octos_core::SessionKey::with_profile(MAIN_PROFILE_ID, "api", "reg6-trace");
-        let session_runtime = state
-            .session_cache
-            .get_or_init(&profile_runtime, session_key, None)
-            .await
-            .expect("cached SessionRuntime");
-        let expected =
-            std::fs::canonicalize(&operator_cwd).unwrap_or_else(|_| operator_cwd.clone());
-        let actual = std::fs::canonicalize(&session_runtime.workspace_root)
-            .unwrap_or_else(|_| session_runtime.workspace_root.clone());
-        assert_eq!(
-            actual,
-            expected,
-            "SessionRuntime.workspace_root must equal appui.default_session_cwd \
-             when forwarded by chat_sync_via_session_runtime (got {})",
-            session_runtime.workspace_root.display()
-        );
-    }
+    // ────────── Legacy `POST /api/chat` REST tests retired ──────────
+    //
+    // The original M11-D block exercised `chat_sync` /
+    // `chat_sync_via_session_runtime` end-to-end via the
+    // `ChatRequest` shape. With the legacy REST entrypoint retired
+    // (cleanup follow-up to PR #908), the equivalent acceptance
+    // evidence now lives in:
+    //
+    //   * `crates/octos-cli/tests/coding_multi_session.rs`
+    //     — per-session `SessionRuntime::bootstrap` writes
+    //       `.octos-workspace.toml` AND multi-tenant tool registries
+    //       stay isolated when distinct `workspace_hint`s are pinned.
+    //   * `api::ui_protocol::tests` (`turn/start` happy path +
+    //     503-on-missing-profile-runtime) — WS handler hits the same
+    //     `SessionRuntimeCache::get_or_init` call site.
+    //
+    // The `appui_default_session_cwd` workspace-hint forwarding the
+    // M11-F regression-fix test asserted is now exercised directly
+    // through the WS turn dispatcher (`ui_protocol::run_standalone_turn`).
 }

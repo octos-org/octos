@@ -25,14 +25,16 @@ test.setTimeout(240_000);
 type SseEvent = ChatWsEvent;
 
 /**
- * M9-α-7 (#836): chat helper now drives the M9 WebSocket UI Protocol.
+ * M9-α-7 (#836): chat helper drives the M9 WebSocket UI Protocol —
+ * `/api/ui-protocol/ws`. The legacy `POST /api/chat` route was retired
+ * as a follow-up to PR #908.
  *
  * NOTE: The legacy SSE helper accepted an optional `topic` field on the
- * `/api/chat` body — used by `topic-scoped histories` to partition a single
- * session_id into isolated conversation threads. The M9 `turn/start` request
- * does NOT yet have a `topic` parameter (deferred follow-up). Tests that
- * pass `topic` are marked `test.fixme` until the WS protocol grows the
- * field.
+ * request body — used by `topic-scoped histories` to partition a single
+ * session_id into isolated conversation threads. The M9 `turn/start`
+ * request does NOT yet have a `topic` parameter (deferred follow-up).
+ * Tests that pass `topic` are marked `test.fixme` until the WS protocol
+ * grows the field.
  */
 async function chatViaWs(
   message: string,
@@ -91,9 +93,10 @@ function taskCurrentPhase(task: any): string | undefined {
 }
 
 test.describe('Refactor capability proofs', () => {
-  // Deferred follow-up: the `topic` parameter on `/api/chat` is not yet
-  // mirrored on the M9 `turn/start` request — un-fixme once the WS protocol
-  // gains a `topic` field on `TurnStartParams`.
+  // Deferred follow-up: the legacy SSE chat body carried an optional
+  // `topic` parameter that has not yet been mirrored on the M9
+  // `turn/start` request — un-fixme once the WS protocol gains a
+  // `topic` field on `TurnStartParams`.
   test.fixme('same session id can host separate topic-scoped histories', async () => {
     const sid = `cap-topic-${Date.now()}`;
     const baseMarker = `BASE-${Date.now()}`;
