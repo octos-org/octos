@@ -636,23 +636,6 @@ fn append_topic_query(path: &mut String, topic: Option<&str>) {
     }
 }
 
-// `append_since_seq_query` previously served the deleted
-// `/api/sessions/{id}/events/stream` proxy. Kept here (and tested below)
-// because future WS-lifecycle replays may re-introduce a `since_seq`
-// query string when re-implementing the corresponding gateway-mode
-// proxy step.
-#[allow(dead_code)]
-fn append_since_seq_query(path: &mut String, since_seq: Option<usize>) {
-    if let Some(since_seq) = since_seq {
-        path.push_str(if path.contains('?') {
-            "&since_seq="
-        } else {
-            "?since_seq="
-        });
-        path.push_str(&since_seq.to_string());
-    }
-}
-
 fn session_messages_proxy_path(
     id: &str,
     limit: usize,
@@ -4122,23 +4105,6 @@ mod tests {
         assert_eq!(
             path,
             "/sessions/slides-123/messages?limit=100&topic=slides%20untitled-deck"
-        );
-    }
-
-    #[test]
-    fn append_since_seq_query_uses_question_mark_for_clean_path() {
-        let mut path = "/sessions/slides-123/events/stream".to_string();
-        append_since_seq_query(&mut path, Some(8));
-        assert_eq!(path, "/sessions/slides-123/events/stream?since_seq=8");
-    }
-
-    #[test]
-    fn append_since_seq_query_uses_ampersand_when_query_exists() {
-        let mut path = "/sessions/slides-123/events/stream?topic=slides".to_string();
-        append_since_seq_query(&mut path, Some(8));
-        assert_eq!(
-            path,
-            "/sessions/slides-123/events/stream?topic=slides&since_seq=8"
         );
     }
 
