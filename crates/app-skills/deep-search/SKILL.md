@@ -56,7 +56,7 @@ Use `read_file` on specific source files for full content when you need detailed
 
 Results are saved to `./research/<query-slug>/`:
 
-- `_report.md` -- structured research report
+- `_<query-slug>.md` -- structured research report (topic-named; leading `_` keeps it out of `read_sources`' source-ingestion path on subsequent synthesis runs; see issue #897)
 - `_search_results.md` -- combined raw search results from all rounds
 - `01_<domain>.md` -- full page content from first source
 - `02_<domain>.md` -- full page content from second source

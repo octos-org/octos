@@ -20,6 +20,17 @@ pub struct CronService {
     inbound_tx: mpsc::Sender<InboundMessage>,
     running: AtomicBool,
     timer_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Shutdown notification: every sleeper task in `arm_timer`
+    /// `tokio::select!`s on this `Notify` alongside its
+    /// `tokio::time::sleep`. A single `notify_waiters()` call from
+    /// `shutdown_signal` / `stop` wakes ALL pending sleepers at once
+    /// so they drop their self-held `Arc<CronService>` immediately
+    /// rather than waiting out the (possibly long) `delay_ms`. This
+    /// is the round-3 codex fix for the arm_timer-vs-shutdown race
+    /// that lets a sleeper get installed AFTER `running=false`: even
+    /// when that happens, the notify wakes the sleeper on its next
+    /// poll and the Arc releases without a delay_ms-long tail.
+    shutdown_notify: tokio::sync::Notify,
 }
 
 impl CronService {
@@ -34,6 +45,7 @@ impl CronService {
             inbound_tx,
             running: AtomicBool::new(false),
             timer_handle: tokio::sync::Mutex::new(None),
+            shutdown_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -58,11 +70,66 @@ impl CronService {
     /// Stop the cron service, cancelling any pending timer.
     pub async fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+        // Wake every pending sleeper in `arm_timer` so they release
+        // their self-held `Arc<CronService>` immediately. Without
+        // this, a sleeper that started after the running flag flipped
+        // (but before `try_lock` succeeded) would self-Arc-pin the
+        // service for `delay_ms`.
+        self.shutdown_notify.notify_waiters();
         let mut handle = self.timer_handle.lock().await;
         if let Some(h) = handle.take() {
             h.abort();
         }
         info!("cron service stopped");
+    }
+
+    /// Whether the service is currently armed (i.e. `start()` has been
+    /// called and no shutdown signal has fired). Used by lifecycle
+    /// tests that need to observe the post-`Drop` shutdown signal
+    /// without racing the timer task's terminal Arc release.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Synchronous shutdown signal. Sets `running = false` so the
+    /// timer's reschedule chain (`arm_timer` → `on_timer` → `arm_timer`)
+    /// terminates on its next tick, and attempts a non-blocking abort
+    /// of the currently-armed `JoinHandle` so the in-flight
+    /// `tokio::time::sleep` does not delay shutdown.
+    ///
+    /// Intended for `Drop` impls and other sync contexts that hold the
+    /// final `Arc<CronService>` (e.g. profile-scope runtime drop). The
+    /// async [`Self::stop`] remains the preferred path when an `await`
+    /// is available because it acquires the timer mutex deterministically.
+    ///
+    /// The non-blocking `try_lock` path is best-effort: if another
+    /// caller is mutating `timer_handle` at the exact moment of drop,
+    /// we leave the abort to the runtime tear-down. The `running` flag
+    /// is the durable signal — once it flips, the next reschedule
+    /// breaks the chain and the timer task drops its self-held
+    /// `Arc<CronService>`, allowing the service to deallocate.
+    pub fn shutdown_signal(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        // Wake every pending sleeper in `arm_timer`. `notify_waiters`
+        // does NOT race the running-flag check — even if a new
+        // sleeper gets installed after the flag flipped (the
+        // `arm_timer` task held the timer_handle lock when shutdown
+        // ran, then proceeded to spawn its sleeper), that sleeper's
+        // `tokio::select!` arm wakes on this notify and short-circuits
+        // before its self-held `Arc<CronService>` is held for the
+        // long `delay_ms` interval. `notify_waiters` is fire-and-
+        // forget — sleepers registered AFTER this call do not
+        // observe it, but `arm_timer`'s post-lock running check
+        // catches that case and never spawns the sleeper in the
+        // first place. The two mechanisms together close the race
+        // codex flagged on the round-2 review.
+        self.shutdown_notify.notify_waiters();
+        if let Ok(mut handle) = self.timer_handle.try_lock() {
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+        }
+        info!("cron service shutdown signalled");
     }
 
     /// Add a new cron job.
@@ -213,9 +280,91 @@ impl CronService {
                 h.abort();
             }
 
+            // Re-check `running` AFTER acquiring the lock so a
+            // concurrent `shutdown_signal` (which flips `running` to
+            // false synchronously) is observed deterministically.
+            // Without this re-check, the following race window leaks
+            // the timer task past shutdown:
+            //   T1: shutdown_signal sets running=false, try_lock fails
+            //       (this task already holds the lock).
+            //   T1: shutdown_signal returns; Drop completes.
+            //   T2: this task spawns a new sleeper, stores the handle,
+            //       drops the lock — the sleeper now self-holds an
+            //       Arc<CronService> for `delay_ms`, blocking the
+            //       service from deallocating.
+            // With the re-check, `running == false` short-circuits and
+            // the lock is released without installing a new handle;
+            // the sleeper self-Arc release path collapses immediately.
+            if !this2.running.load(Ordering::Relaxed) {
+                return;
+            }
+
             let new_handle = tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                this.on_timer().await;
+                // Round-4 codex fix: race-proof sleep via
+                // `tokio::select!` against the service's shutdown
+                // notify, with the notify waiter registered BEFORE
+                // the final running check.
+                //
+                // `Notify::notified()` returns a future; the future
+                // only registers as a waiter on first poll. Tokio
+                // documents that any `notify_waiters()` call that
+                // happens after `notified()` has been polled at least
+                // once will wake the waiter — but a `notify_waiters`
+                // that fires before the first poll is *missed*.
+                //
+                // To close the window where `shutdown_signal` fires
+                // after the post-lock running check (above) but
+                // before this sleeper subscribes to the notify, we:
+                //   1. Construct the `notified()` future first.
+                //   2. Pin it and poll it once via `Future::poll`
+                //      indirectly by entering the `select!` block —
+                //      `tokio::select!` polls all branches on first
+                //      entry, which registers the notify waiter
+                //      atomically.
+                //   3. Inside the sleep arm, re-check `running`
+                //      after the sleep wins so a missed-notify edge
+                //      case still short-circuits `on_timer()`.
+                //   4. Pre-`select!`, check `running` one more time
+                //      so the case where `shutdown_signal` fired
+                //      between the parent's `running` check and this
+                //      task starting also terminates promptly.
+                //
+                // Combined: either (a) `running == false` is observed
+                // before `select!` and we exit, or (b) the notify
+                // waiter is registered atomically with the sleep
+                // start and a subsequent `notify_waiters` wakes it,
+                // or (c) the sleep wins, sees `running == false`,
+                // and skips `on_timer()`. There is no path where
+                // the sleeper self-Arc-pins for `delay_ms` after a
+                // shutdown has fired.
+                if !this.running.load(Ordering::Relaxed) {
+                    return;
+                }
+                let notified = this.shutdown_notify.notified();
+                tokio::pin!(notified);
+                // Force the `notified()` future to register its
+                // waiter before we re-check `running`. After this
+                // call returns, any subsequent `notify_waiters` will
+                // wake us.
+                notified.as_mut().enable();
+                // Re-check running AFTER the waiter is registered.
+                // If `shutdown_signal` raced in between the previous
+                // load and `enable()`, this check catches it. If it
+                // races in AFTER `enable()`, the select arm catches
+                // it.
+                if !this.running.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {
+                        if this.running.load(Ordering::Relaxed) {
+                            this.on_timer().await;
+                        }
+                    }
+                    _ = &mut notified => {
+                        // Shutdown raced in — drop the Arc and exit.
+                    }
+                }
             });
 
             *handle = Some(new_handle);

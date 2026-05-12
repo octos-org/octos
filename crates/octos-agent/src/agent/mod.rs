@@ -549,6 +549,14 @@ impl Agent {
         self
     }
 
+    /// Returns the attached lifecycle hooks executor, if any. Used by the
+    /// runtime layer to assert that profile-scope hook configs survive the
+    /// per-session `Agent` rebuild and per-request rebuild paths
+    /// (`ws_standalone_agent`, ui_protocol per-turn).
+    pub fn hooks(&self) -> Option<Arc<HookExecutor>> {
+        self.hooks.clone()
+    }
+
     /// Set session-level context for hook payloads.
     pub fn with_hook_context(self, ctx: HookContext) -> Self {
         *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);

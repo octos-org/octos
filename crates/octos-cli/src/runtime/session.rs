@@ -227,6 +227,19 @@ impl SessionRuntime {
             .rebind_cwd(&workspace_root, create_sandbox(&sandbox));
         tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
         tools.rebind_plugin_work_dirs(&plugin_work_dir);
+        // M11-F regression fix REG-1 follow-up round 2 (codex review):
+        // re-register a fresh `ActivateToolsTool` instance on this
+        // session's registry. The profile-level template is shared via
+        // `Arc<dyn Tool>` clones across every session that snapshots
+        // from `profile.tool_specs`; if we let the same instance
+        // straddle sessions, the most recently bootstrapped session's
+        // `wire_activate_tools()` would rebind the shared tool's
+        // `Weak<ToolRegistry>` away from earlier sessions and break
+        // their `activate_tools` calls. Minting a fresh tool per
+        // session keeps the wiring per-registry.
+        if tools.get("activate_tools").is_some() {
+            tools.register(octos_agent::ActivateToolsTool::new());
+        }
         // Per-session policy filter is a no-op for M11; future work
         // may add session-level policy overrides on top of
         // `profile.tool_policy`. The profile-level policy itself is
@@ -261,7 +274,7 @@ impl SessionRuntime {
         ));
         let file_state_cache = Arc::new(FileStateCache::new());
 
-        let agent = Agent::new_shared(
+        let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
             Arc::clone(&tools),
@@ -288,6 +301,28 @@ impl SessionRuntime {
         .with_subagent_summary_generator(subagent_summary_generator)
         .with_sandbox_config(sandbox.clone())
         .with_workspace_root(workspace_root.clone());
+
+        // M11-F regression fix REG-3: propagate the profile-scope
+        // [`octos_agent::HookExecutor`] onto the per-session agent.
+        // `ProfileRuntime::bootstrap` assembled it once from
+        // `config.hooks + plugin_result.hooks`; without this chain
+        // call, the api-mode agent would silently lose every
+        // `before_tool_call` / `after_tool_call` / `before_llm_call` /
+        // `after_llm_call` hook configured for the profile, breaking
+        // parity with `octos gateway`.
+        if let Some(hooks) = profile.hook_executor.clone() {
+            agent = agent.with_hooks(hooks);
+        }
+
+        // M11-F regression fix REG-1 follow-up (codex review): when
+        // `ProfileRuntime::bootstrap` deferred non-core tool groups and
+        // registered `activate_tools`, the agent must call
+        // `wire_activate_tools()` so the tool's `Weak<ToolRegistry>`
+        // back-reference is planted. Without this, `activate_tools`
+        // remains a no-op stub (its `set_registry` is never invoked)
+        // and the LLM cannot pull a deferred group back on demand.
+        // Gateway does the equivalent at `session_actor.rs:2500`.
+        agent.wire_activate_tools();
 
         let agent = Arc::new(agent);
 
@@ -492,6 +527,8 @@ mod tests {
             memory,
             memory_store,
             tool_config,
+            cron_service: None,
+            hook_executor: None,
         })
     }
 
@@ -620,6 +657,263 @@ mod tests {
         assert!(
             snapshot.contains("DISTINCTIVE-PROFILE-PROMPT-789"),
             "agent system prompt should inherit the profile-level prompt; got: {snapshot}",
+        );
+    }
+
+    /// Build a `ProfileRuntime` like `make_profile`, but with a
+    /// pre-constructed `Arc<HookExecutor>` stashed on the
+    /// `hook_executor` field. Used by the M11-F REG-3 regression
+    /// test below to assert end-to-end propagation onto the
+    /// per-session agent.
+    async fn make_profile_with_hooks(
+        data_dir: PathBuf,
+        executor: Arc<octos_agent::HookExecutor>,
+    ) -> Arc<ProfileRuntime> {
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
+        let sandbox = SandboxConfig::default();
+        let base_tools =
+            ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
+        Arc::new(ProfileRuntime {
+            profile_id: "_main".to_string(),
+            data_dir,
+            llm: Arc::new(StubLlm),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "stub-model".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
+            memory,
+            memory_store,
+            tool_config,
+            cron_service: None,
+            hook_executor: Some(executor),
+        })
+    }
+
+    /// M11-F regression fix REG-1 follow-up (codex review):
+    /// `SessionRuntime::bootstrap` must call `wire_activate_tools()`
+    /// on the per-session agent when `ProfileRuntime::bootstrap`
+    /// registered `activate_tools` (deferred-group scenario). Without
+    /// the wiring, `activate_tools.execute()` returns
+    /// `"tool registry not available"` and the LLM cannot pull
+    /// deferred groups back on demand.
+    #[tokio::test]
+    async fn session_runtime_agent_wires_activate_tools() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
+        let sandbox = SandboxConfig::default();
+        // Build a registry with activate_tools + a deferred entry so
+        // execute() has something to list.
+        let mut base_tools =
+            ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
+        base_tools.defer_group("group:web");
+        base_tools.register(octos_agent::ActivateToolsTool::new());
+        let profile = Arc::new(ProfileRuntime {
+            profile_id: "_main".to_string(),
+            data_dir: data_dir.clone(),
+            llm: Arc::new(StubLlm),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "stub-model".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
+            memory,
+            memory_store,
+            tool_config,
+            cron_service: None,
+            hook_executor: None,
+        });
+        let key = SessionKey::new("api", "activate-tools-probe");
+        let rt = SessionRuntime::bootstrap(&profile, key, None)
+            .await
+            .expect("bootstrap");
+
+        let registry = rt.agent.tool_registry();
+        let tool = registry
+            .get("activate_tools")
+            .expect("activate_tools must be registered");
+        // Executing with empty args lists deferred groups. The path
+        // unwraps `registry.upgrade()`; if `wire_activate_tools` did
+        // not fire, the unwrap maps to an `Err("tool registry not
+        // available")` and the assertion below fails.
+        let result = tool
+            .execute(&serde_json::json!({}))
+            .await
+            .expect("activate_tools must be wired so its registry Weak upgrades");
+        assert!(
+            !result.output.contains("tool registry not available"),
+            "activate_tools.execute should not surface 'tool registry not available'; \
+             got: {}",
+            result.output,
+        );
+    }
+
+    /// M11-F regression fix REG-1 follow-up round 2 (codex review):
+    /// `ActivateToolsTool` is stored on the registry as `Arc<dyn Tool>`,
+    /// and `ToolRegistry::rebind_cwd` clones those Arcs verbatim into
+    /// the new per-session registry. If we DON'T re-register a fresh
+    /// `ActivateToolsTool` per session, both sessions end up sharing
+    /// the SAME tool instance — and the second session's
+    /// `wire_activate_tools()` rewires the shared `Weak<ToolRegistry>`
+    /// off session A's registry onto session B's, breaking session A's
+    /// `activate_tools` calls.
+    ///
+    /// This test bootstraps two sessions from the same profile (both
+    /// of which carry `activate_tools` on the base template) and
+    /// asserts that session A's activate_tools still resolves to
+    /// session A's registry after session B has been bootstrapped.
+    #[tokio::test]
+    async fn session_runtime_isolates_activate_tools_across_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
+        let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
+        let sandbox = SandboxConfig::default();
+        let mut base_tools =
+            ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
+        base_tools.defer_group("group:web");
+        base_tools.register(octos_agent::ActivateToolsTool::new());
+        let profile = Arc::new(ProfileRuntime {
+            profile_id: "_main".to_string(),
+            data_dir: data_dir.clone(),
+            llm: Arc::new(StubLlm),
+            adaptive_router: None,
+            runtime_qos_catalog: None,
+            primary_model_id: "stub-model".to_string(),
+            provider_name: "stub".to_string(),
+            credentials: HashMap::new(),
+            skills_dir: None,
+            plugin_env_template: Vec::new(),
+            tool_policy: None,
+            default_sandbox: sandbox,
+            tool_specs: Arc::new(base_tools),
+            plugin_tool_names: Vec::new(),
+            plugin_dirs: Vec::new(),
+            plugin_prompt_fragments: Vec::new(),
+            plugin_hooks: Vec::new(),
+            system_prompt: "test-system-prompt".to_string(),
+            memory,
+            memory_store,
+            tool_config,
+            cron_service: None,
+            hook_executor: None,
+        });
+
+        let rt_a = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-a"), None)
+            .await
+            .expect("bootstrap A");
+        let rt_b = SessionRuntime::bootstrap(&profile, SessionKey::new("api", "iso-b"), None)
+            .await
+            .expect("bootstrap B");
+
+        // Both sessions must have a usable `activate_tools`. The
+        // pre-fix regression: session A's tool's Weak would have been
+        // rewired by session B's bootstrap and now upgrades to
+        // session B's registry, mixing per-session state.
+        let tool_a = rt_a
+            .agent
+            .tool_registry()
+            .get("activate_tools")
+            .expect("session A activate_tools");
+        let tool_b = rt_b
+            .agent
+            .tool_registry()
+            .get("activate_tools")
+            .expect("session B activate_tools");
+
+        // The fresh-registration step in `SessionRuntime::bootstrap`
+        // means the two sessions must hold DISTINCT `Arc<dyn Tool>`
+        // instances; if they did not, the second bootstrap would have
+        // rewired the shared Weak away from the first.
+        assert!(
+            !Arc::ptr_eq(tool_a, tool_b),
+            "activate_tools must be a fresh instance per session, not a \
+             shared Arc cloned from the profile template",
+        );
+
+        // Both tools must execute successfully (i.e. their Weak
+        // upgrades to a live registry — not "tool registry not
+        // available").
+        let result_a = tool_a
+            .execute(&serde_json::json!({}))
+            .await
+            .expect("activate_tools A wired");
+        assert!(
+            !result_a.output.contains("tool registry not available"),
+            "session A activate_tools must remain wired after session B bootstrap; got: {}",
+            result_a.output,
+        );
+        let result_b = tool_b
+            .execute(&serde_json::json!({}))
+            .await
+            .expect("activate_tools B wired");
+        assert!(
+            !result_b.output.contains("tool registry not available"),
+            "session B activate_tools must also be wired; got: {}",
+            result_b.output,
+        );
+    }
+
+    /// M11-F regression fix REG-3: when the parent `ProfileRuntime`
+    /// carries a `hook_executor`, `SessionRuntime::bootstrap` must
+    /// chain `.with_hooks(...)` onto the per-session `Agent` so the
+    /// configured `before_tool_call` / `after_tool_call` /
+    /// `before_llm_call` / `after_llm_call` hooks fire on api-mode
+    /// turns, matching the pre-M11-F `serve.rs:1413` behaviour.
+    #[tokio::test]
+    async fn session_runtime_agent_inherits_profile_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let hook = octos_agent::HookConfig {
+            event: octos_agent::HookEvent::BeforeLlmCall,
+            command: vec!["/bin/true".to_string()],
+            timeout_ms: 1000,
+            tool_filter: Vec::new(),
+        };
+        let executor = Arc::new(octos_agent::HookExecutor::new(vec![hook]));
+        let profile = make_profile_with_hooks(data_dir, executor.clone()).await;
+
+        let key = SessionKey::new("api", "hook-probe");
+        let rt = SessionRuntime::bootstrap(&profile, key, None)
+            .await
+            .expect("bootstrap");
+
+        let agent_hooks = rt
+            .agent
+            .hooks()
+            .expect("session agent must inherit profile hook_executor");
+        assert!(
+            Arc::ptr_eq(&agent_hooks, &executor),
+            "agent.hooks() must be the same Arc as profile.hook_executor",
         );
     }
 
