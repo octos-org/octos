@@ -434,14 +434,22 @@ async fn chat_sync_via_session_runtime(
     req: ChatRequest,
 ) -> Result<Json<ChatResponse>, (StatusCode, String)> {
     // Acquire (or build on first use) the per-session runtime.
-    // `workspace_hint = None` → `SessionRuntime::bootstrap` derives
+    //
+    // M11-F regression fix REG-6: when no client cwd is supplied,
+    // forward `state.appui_default_session_cwd` (mirrored from
+    // `config.appui.default_session_cwd`) as the workspace hint. The
+    // pre-M11-F serve path wired this into the server-wide agent via
+    // `agent.with_workspace_root(default_cwd)`; we now thread the
+    // same operator default through the per-session bootstrap. When
+    // the operator sets nothing, this is `None` and the bootstrap
+    // falls back to the canonical
     // `<profile_data_dir>/users/<encoded session base>/workspace`
-    // and writes the default `.octos-workspace.toml` there. That's
-    // the M11 fix for the `"workspace policy not found"` failure on
-    // yangmi voice clone.
+    // layout — preserving the M11 fix for the
+    // `"workspace policy not found"` failure on yangmi voice clone.
+    let workspace_hint = state.appui_default_session_cwd.clone();
     let session_runtime = state
         .session_cache
-        .get_or_init(&profile_runtime, session_key.clone(), None)
+        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -2776,9 +2784,22 @@ async fn ws_connection(socket: WebSocket, state: Arc<AppState>, headers: HeaderM
                     };
                     let session_key =
                         SessionKey::with_profile(&profile_runtime.profile_id, "api", &session_id);
+                    // M11-F regression fix REG-6: forward
+                    // `config.appui.default_session_cwd` (mirrored on
+                    // `AppState::appui_default_session_cwd`) as the
+                    // workspace hint when no client cwd is available.
+                    // Pre-M11-F serve.rs wired this into the server-wide
+                    // agent via `agent.with_workspace_root(default_cwd)`;
+                    // M11-F's deletion of that helper left the standalone
+                    // WS chat path falling back to the canonical
+                    // `<data_dir>/users/<encoded base>/workspace` instead
+                    // of the operator-configured directory (e.g.
+                    // octos-app uses this for the per-machine coding
+                    // workspace).
+                    let workspace_hint = state.appui_default_session_cwd.clone();
                     let session_runtime = match state
                         .session_cache
-                        .get_or_init(&profile_runtime, session_key.clone(), None)
+                        .get_or_init(&profile_runtime, session_key.clone(), workspace_hint)
                         .await
                     {
                         Ok(rt) => rt,
@@ -2928,7 +2949,7 @@ async fn ws_standalone_agent(
     ));
 
     let base_agent = session_runtime.agent.clone();
-    let request_agent = octos_agent::Agent::new_shared(
+    let mut request_agent = octos_agent::Agent::new_shared(
         octos_core::AgentId::new(format!("ws-{}", uuid::Uuid::now_v7())),
         base_agent.llm_provider(),
         base_agent.tool_registry().clone(),
@@ -2937,6 +2958,25 @@ async fn ws_standalone_agent(
     .with_config(base_agent.agent_config())
     .with_system_prompt(base_agent.system_prompt_snapshot())
     .with_reporter(reporter);
+    // M11-F regression fix REG-3: forward the profile-scope hook
+    // executor onto the per-request rebuilt agent so the standalone
+    // WS chat path observes the same `before_tool_call` /
+    // `after_tool_call` / LLM hooks as the cached `SessionRuntime`'s
+    // agent. Without this, every WS message would bypass the hook
+    // pipeline because `base_agent`'s `hooks` field is not carried
+    // forward by the `Agent::new_shared` constructor.
+    if let Some(hooks) = base_agent.hooks() {
+        request_agent = request_agent.with_hooks(hooks);
+    }
+    // M11-F regression fix REG-1 follow-up (codex review): wire the
+    // `activate_tools` back-reference on this rebuilt agent so the
+    // deferred non-core tool groups (`group:admin`, `group:sessions`,
+    // `group:web`, `group:runtime`, `group:media`) are actually
+    // activatable. `Agent::new_shared` does not re-execute the wiring,
+    // so without this the LLM observes the deferred groups via
+    // `tools.specs()` but `activate_tools` itself is a no-op stub.
+    // Gateway wires the equivalent at `session_actor.rs:2500`.
+    request_agent.wire_activate_tools();
 
     let message = message.to_string();
     let session_id = session_id.to_string();
@@ -4506,6 +4546,8 @@ mod tests {
             memory,
             memory_store,
             tool_config,
+            cron_service: None,
+            hook_executor: None,
         })
     }
 
@@ -4601,6 +4643,67 @@ mod tests {
         assert!(
             msg.contains(MAIN_PROFILE_ID),
             "503 message must name the unregistered profile (got: {msg})",
+        );
+    }
+
+    /// M11-F regression fix REG-6: `chat_sync_via_session_runtime` must
+    /// forward `state.appui_default_session_cwd` as the session's
+    /// workspace hint when no client cwd is supplied. Pre-M11-F serve.rs
+    /// wired this into the server-wide agent via
+    /// `agent.with_workspace_root(default_cwd)` so every `/api/chat`
+    /// inherited it; M11-F's deletion of that helper left this
+    /// dispatcher path falling back to the canonical
+    /// `<data_dir>/users/.../workspace` instead of the operator setting.
+    #[tokio::test]
+    async fn chat_sync_forwards_appui_default_session_cwd_as_workspace_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path().join("profile-data");
+        let operator_cwd = tmp.path().join("operator-coding-workspace");
+        std::fs::create_dir_all(&operator_cwd).unwrap();
+        let profile_runtime = make_m11d_profile(&profile_data_dir, "ack").await;
+
+        let mut profiles = HashMap::new();
+        profiles.insert(MAIN_PROFILE_ID.to_string(), profile_runtime.clone());
+        let state = Arc::new(AppState {
+            profiles,
+            appui_default_session_cwd: Some(operator_cwd.clone()),
+            ..AppState::empty_for_tests()
+        });
+
+        let req = ChatRequest {
+            message: "anchor here".to_string(),
+            session_id: Some("reg6-trace".to_string()),
+            topic: None,
+            stream: false,
+            media: Vec::new(),
+            attach_only: false,
+            client_message_id: None,
+        };
+
+        let _response = chat_sync(state.clone(), HeaderMap::new(), req)
+            .await
+            .expect("chat_sync should succeed");
+
+        // After the first call, the cached SessionRuntime must be
+        // anchored at the operator-configured cwd (not the canonical
+        // `<profile_data_dir>/users/.../workspace`).
+        let session_key =
+            octos_core::SessionKey::with_profile(MAIN_PROFILE_ID, "api", "reg6-trace");
+        let session_runtime = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_key, None)
+            .await
+            .expect("cached SessionRuntime");
+        let expected =
+            std::fs::canonicalize(&operator_cwd).unwrap_or_else(|_| operator_cwd.clone());
+        let actual = std::fs::canonicalize(&session_runtime.workspace_root)
+            .unwrap_or_else(|_| session_runtime.workspace_root.clone());
+        assert_eq!(
+            actual,
+            expected,
+            "SessionRuntime.workspace_root must equal appui.default_session_cwd \
+             when forwarded by chat_sync_via_session_runtime (got {})",
+            session_runtime.workspace_root.display()
         );
     }
 }
