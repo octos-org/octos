@@ -395,6 +395,7 @@ impl ServeCommand {
                 profile,
                 &profile_data_dir,
                 Some(&data_dir),
+                crate::runtime::BootstrapRole::Serve,
             )
             .await
             {
