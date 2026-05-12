@@ -1463,8 +1463,10 @@ if ($Tunnel) {
         Write-Host "    Check logs: Get-Content '$FrpcLog' -Tail 20"
     }
 
+    # `/api/status` was retired in M12 Phase D-5 — probe the public `/health`
+    # endpoint as a daemon liveness check instead.
     try {
-        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/api/status" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri "http://localhost:${Port}/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
         Ok "octos serve is running on port ${Port}"
     } catch {
         Warn "octos serve is not responding on port ${Port} (tunnel will retry once it starts)"

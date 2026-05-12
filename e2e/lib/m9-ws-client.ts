@@ -142,8 +142,19 @@ export interface M9WsClientOptions {
   url: string;
   /** Bearer token. */
   token: string;
-  /** Optional profile id sent on `session/open.profile_id`. */
+  /** Optional profile id sent on `session/open.profile_id`. Also forwarded
+   *  as the `X-Profile-Id` handshake header so server-side handlers that
+   *  resolve profile scope from headers (REST-equivalent aux methods like
+   *  `session/list`) honour the caller's profile, mirroring the retired
+   *  REST endpoints. */
   profileId?: string;
+  /** Capability features to negotiate via `ui_feature=` query params on the
+   *  WS handshake (UPCR-2026-007 / M12 Phase D-1). The server rejects
+   *  strictly-gated methods like `session/list`, `session/messages_page`,
+   *  `session/tasks.list`, and `session/delete` with `method_not_supported`
+   *  unless the matching `auxiliary.rest_to_ws.v1` feature is negotiated.
+   *  Defaults to `[]` (no negotiation), keeping legacy callers unchanged. */
+  uiFeatures?: readonly string[];
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
 }
@@ -163,29 +174,58 @@ export class M9WsClient {
   private closed = false;
   private readonly opts: Required<
     Pick<M9WsClientOptions, "url" | "token" | "connectTimeoutMs" | "requestTimeoutMs">
-  > & { profileId?: string };
+  > & { profileId?: string; uiFeatures: readonly string[] };
 
   constructor(opts: M9WsClientOptions) {
-    const url = opts.url
+    // Normalize scheme and path, then append `ui_feature=<feat>` query
+    // params per UPCR-2026-007. The server accepts both repeated query
+    // entries and an `X-Octos-Ui-Features` header; we use the query form
+    // because some WebSocket clients (and proxies) drop custom request
+    // headers on the upgrade. We forward via the header anyway as a
+    // belt-and-braces fallback below.
+    const features = (opts.uiFeatures ?? []).filter((f) => f && f.trim() !== "");
+    let url = opts.url
       .replace(/^http:/, "ws:")
       .replace(/^https:/, "wss:")
       .replace(/\/$/, "")
       .concat(opts.url.includes("/api/ui-protocol/ws") ? "" : "/api/ui-protocol/ws");
+    if (features.length > 0) {
+      const separator = url.includes("?") ? "&" : "?";
+      const qs = features
+        .map((f) => `ui_feature=${encodeURIComponent(f)}`)
+        .join("&");
+      url = `${url}${separator}${qs}`;
+    }
     this.opts = {
       url,
       token: opts.token,
       connectTimeoutMs: opts.connectTimeoutMs ?? 10_000,
       requestTimeoutMs: opts.requestTimeoutMs ?? 30_000,
       profileId: opts.profileId,
+      uiFeatures: features,
     };
   }
 
   /** Open the socket. Resolves once the underlying transport is open. */
   async connect(): Promise<void> {
     if (this.ws) return;
-    const ws = new WebSocket(this.opts.url, {
-      headers: { Authorization: `Bearer ${this.opts.token}` },
-    });
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.opts.token}`,
+    };
+    // Belt-and-braces: also send the negotiation as a request header so
+    // server-side gates accept the handshake even when an intermediary
+    // strips query-string features (the server checks header OR query).
+    if (this.opts.uiFeatures.length > 0) {
+      headers["X-Octos-Ui-Features"] = this.opts.uiFeatures.join(",");
+    }
+    // Forward profile scope on the handshake so handlers that resolve
+    // routing via `routed_profile_id_from_headers` (`session/list`,
+    // `session/delete`, etc.) match the retired REST endpoints, which
+    // also keyed off `X-Profile-Id`.
+    if (this.opts.profileId) {
+      headers["X-Profile-Id"] = this.opts.profileId;
+    }
+    const ws = new WebSocket(this.opts.url, { headers });
     this.ws = ws;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -661,4 +701,136 @@ export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
   // to detect timeouts.
   void terminal;
   return { events, content, doneEvent };
+}
+
+// ---------------------------------------------------------------------------
+// Auxiliary RPC helpers (M12 Phase D-1/D-5).
+//
+// These wrap the WS UI Protocol replacements for the retired REST endpoints
+// (`GET /api/sessions`, `GET /api/sessions/{id}/messages`, etc.) so spec
+// bodies can replace their `fetch(/api/sessions...)` calls with one-shot
+// async functions that own the WebSocket lifecycle.
+//
+// Each helper opens a fresh `M9WsClient`, issues the JSON-RPC method, and
+// closes the socket. If the caller already has a connected client they can
+// pass it via `opts.client` to amortize the connect cost across calls.
+// ---------------------------------------------------------------------------
+
+export interface AuxRpcOpts {
+  baseUrl: string;
+  token: string;
+  profileId?: string;
+  /** Optional pre-connected client (caller owns close()). */
+  client?: M9WsClient;
+  /** Override the request timeout for the JSON-RPC call. */
+  requestTimeoutMs?: number;
+}
+
+/** Capability features required by every aux RPC helper in this file.
+ *  The server gates the matching methods strict-opt-in: a handshake that
+ *  does NOT advertise `auxiliary.rest_to_ws.v1` will receive
+ *  `method_not_supported` (-32004), regardless of bearer/profile scope. */
+const AUX_REST_TO_WS_FEATURES = ["auxiliary.rest_to_ws.v1"] as const;
+
+async function withAuxClient<T>(
+  opts: AuxRpcOpts,
+  fn: (client: M9WsClient) => Promise<T>,
+): Promise<T> {
+  const ownsClient = !opts.client;
+  const client =
+    opts.client ??
+    new M9WsClient({
+      url: opts.baseUrl,
+      token: opts.token,
+      profileId: opts.profileId,
+      requestTimeoutMs: opts.requestTimeoutMs,
+      uiFeatures: AUX_REST_TO_WS_FEATURES,
+    });
+  try {
+    return await fn(client);
+  } finally {
+    if (ownsClient) {
+      try { await client.close(); } catch { /* swallow */ }
+    }
+  }
+}
+
+/** Throw a clearly-labelled error when an aux RPC returns a malformed
+ *  result shape. Returning `[]` (or worse, an empty default object) would
+ *  let specs pass for the wrong reason — e.g. "no sessions" when the
+ *  server actually responded with an envelope we don't know how to read.
+ *  Surface the failure loudly instead. */
+function assertArray<T>(value: unknown, method: string, field: string): T[] {
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `m9-ws aux: ${method} returned non-array \`${field}\`: ${JSON.stringify(value)}`,
+    );
+  }
+  return value as T[];
+}
+
+/** WS replacement for `GET /api/sessions`. Returns the same array shape.
+ *  Errors (including `method_not_supported` when `auxiliary.rest_to_ws.v1`
+ *  was not negotiated by the handshake) propagate to the caller — do NOT
+ *  swallow them into `[]`, which would mask "capability missing" as
+ *  "no sessions". */
+export async function fetchSessionList(opts: AuxRpcOpts): Promise<any[]> {
+  return withAuxClient(opts, async (client) => {
+    const result = await client.rawRequest<{ sessions: unknown }>(
+      "session/list",
+      {},
+    );
+    return assertArray(result?.sessions, "session/list", "sessions");
+  });
+}
+
+/** WS replacement for `GET /api/sessions/{id}/messages`. */
+export async function fetchSessionMessages(
+  opts: AuxRpcOpts & {
+    sessionId: string;
+    limit?: number;
+    offset?: number;
+    sinceSeq?: number;
+    topic?: string;
+  },
+): Promise<any[]> {
+  return withAuxClient(opts, async (client) => {
+    const params: Record<string, unknown> = { session_id: opts.sessionId };
+    if (opts.limit !== undefined) params.limit = opts.limit;
+    if (opts.offset !== undefined) params.offset = opts.offset;
+    if (opts.sinceSeq !== undefined) params.since_seq = opts.sinceSeq;
+    if (opts.topic !== undefined) params.topic = opts.topic;
+    const result = await client.rawRequest<{ messages: unknown }>(
+      "session/messages_page",
+      params,
+    );
+    return assertArray(result?.messages, "session/messages_page", "messages");
+  });
+}
+
+/** WS replacement for `GET /api/sessions/{id}/tasks`. */
+export async function fetchSessionTasks(
+  opts: AuxRpcOpts & { sessionId: string; topic?: string },
+): Promise<any[]> {
+  return withAuxClient(opts, async (client) => {
+    const params: Record<string, unknown> = { session_id: opts.sessionId };
+    if (opts.topic !== undefined) params.topic = opts.topic;
+    const result = await client.rawRequest<{ tasks: unknown }>(
+      "session/tasks.list",
+      params,
+    );
+    return assertArray(result?.tasks, "session/tasks.list", "tasks");
+  });
+}
+
+/** WS replacement for `DELETE /api/sessions/{id}`. Resolves on success;
+ *  errors (including `method_not_supported`) propagate to the caller. */
+export async function deleteSessionWs(
+  opts: AuxRpcOpts & { sessionId: string },
+): Promise<void> {
+  await withAuxClient(opts, async (client) => {
+    await client.rawRequest<unknown>("session/delete", {
+      session_id: opts.sessionId,
+    });
+  });
 }

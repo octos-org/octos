@@ -1672,7 +1672,9 @@ if [ "$ENABLE_TUNNEL" = true ]; then
         echo "    Check logs: tail -f /var/log/frpc.log"
     fi
 
-    if curl -sf --max-time 3 "http://localhost:${PORT}/api/status" > /dev/null 2>&1; then
+    # `/api/status` was retired in M12 Phase D-5 (ADR PR #910). Use the
+    # public `/health` endpoint as a daemon liveness probe instead.
+    if curl -sf --max-time 3 "http://localhost:${PORT}/health" > /dev/null 2>&1; then
         ok "octos serve is running on port ${PORT}"
     else
         warn "octos serve is not responding on port ${PORT} (tunnel will retry once it starts)"

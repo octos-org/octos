@@ -103,9 +103,10 @@
     "progress_bar": "[data-testid='task-progress']"
   },
   "api_endpoints": {
-    "session_tasks": "/api/sessions/{id}/tasks",
-    "session_events": "/api/sessions/{id}/events/stream",
-    "sessions": "/api/sessions"
+    "session_tasks_ws": "session/tasks.list (UI Protocol v1 RPC)",
+    "session_events_ws": "session/event.v1 (UI Protocol v1 notification)",
+    "sessions_ws": "session/list (UI Protocol v1 RPC)",
+    "transport": "/api/ui-protocol/ws"
   },
   "prompts": {
     "deep_research": "Do a deep research on the latest Rust programming language developments in 2026. Run the pipeline directly, don't ask me to choose."

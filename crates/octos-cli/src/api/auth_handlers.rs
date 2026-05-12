@@ -1118,8 +1118,14 @@ pub async fn delete_my_soul(
 
 // ── Content catalog endpoints ────────────────────────────────────────
 
-/// GET /api/my/content
-pub async fn my_content(
+// Helper for `ui_protocol::handle_content_list` (M12 Phase D-5).
+// The REST route `GET /api/my/content` was retired in this milestone; the
+// function survives as a private helper that the WS dispatcher calls
+// directly to back the `content/list` RPC method. Downgraded to
+// `pub(super)` so the public API surface no longer exposes a fn whose
+// route was removed.
+/// Helper backing the WS `content/list` RPC method (formerly `GET /api/my/content`).
+pub(super) async fn my_content(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
@@ -1259,8 +1265,12 @@ pub async fn my_content_body(
     Ok(([(header::CONTENT_TYPE, content_type)], Body::from(data)).into_response())
 }
 
-/// DELETE /api/my/content/:id
-pub async fn delete_my_content(
+// Helper for `ui_protocol::handle_content_delete` (M12 Phase D-5).
+// The REST route `DELETE /api/my/content/{id}` was retired in this
+// milestone; the function survives as a private helper backing the
+// `content/delete` WS RPC method.
+/// Helper backing the WS `content/delete` RPC method (formerly `DELETE /api/my/content/{id}`).
+pub(super) async fn delete_my_content(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Path(id): Path<String>,
@@ -1295,12 +1305,16 @@ pub async fn delete_my_content(
 }
 
 #[derive(Deserialize)]
-pub struct BulkDeleteRequest {
+pub(super) struct BulkDeleteRequest {
     pub ids: Vec<String>,
 }
 
-/// POST /api/my/content/bulk-delete
-pub async fn bulk_delete_my_content(
+// Helper for `ui_protocol::handle_content_bulk_delete` (M12 Phase D-5).
+// The REST route `POST /api/my/content/bulk-delete` was retired in this
+// milestone; the function survives as a private helper backing the
+// `content/bulk_delete` WS RPC method.
+/// Helper backing the WS `content/bulk_delete` RPC method (formerly `POST /api/my/content/bulk-delete`).
+pub(super) async fn bulk_delete_my_content(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     Json(req): Json<BulkDeleteRequest>,
