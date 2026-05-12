@@ -363,6 +363,21 @@ impl ServeCommand {
                 .wrap_err("failed to open profile store")?,
         );
 
+        // M11-F regression fix REG-4: bootstrap bundled app-skills
+        // (`crates/app-skills/`) and platform-skills (`crates/platform-
+        // skills/`) into `<octos_home>/{bundled-app-skills,platform-
+        // skills}/` so every `ProfileRuntime` we build below can scan
+        // them via `Config::plugin_dirs_from_project`. Pre-M11-F
+        // `serve.rs::try_create_agent` did this unconditionally per
+        // agent build; M11-F deleted the helper and never restored the
+        // call, so a clean install of `octos serve` came up with zero
+        // bundled skills available to `/api/chat` (weather, time, news,
+        // deep-search) and zero platform skills (voice). Doing it once
+        // at process startup matches the gateway flow and keeps the
+        // per-profile loop free of redundant disk writes.
+        octos_agent::bootstrap::bootstrap_bundled_skills(&data_dir);
+        octos_agent::bootstrap::bootstrap_platform_skills(&data_dir);
+
         // M11-D — build the per-profile runtime catalog. For every
         // enabled profile that has an active primary LLM selection,
         // call `ProfileRuntime::bootstrap` and stash the resulting
