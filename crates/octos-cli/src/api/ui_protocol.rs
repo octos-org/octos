@@ -4825,6 +4825,18 @@ async fn run_standalone_turn(
     // cached SessionRuntime.
     let sessions = session_runtime.sessions.clone();
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
+    // M11-F regression fix REG-1 follow-up round 2 (codex review):
+    // re-register a fresh `ActivateToolsTool` on this per-turn
+    // snapshot so `wire_activate_tools()` below rewires THIS
+    // registry's Weak, not the cached SessionRuntime's. Without this,
+    // the per-turn rebuild would mutate the shared
+    // `Arc<ActivateToolsTool>` (clones share the same Mutex<Weak>)
+    // and the SessionRuntime's cached agent would silently lose its
+    // back-reference once the per-turn registry dropped at end of
+    // turn.
+    if tool_registry.get("activate_tools").is_some() {
+        tool_registry.register(octos_agent::ActivateToolsTool::new());
+    }
     let workspace_root: Option<PathBuf> = Some(session_runtime.workspace_root.clone());
     let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
@@ -5217,7 +5229,17 @@ async fn run_standalone_turn(
     // without mutating shared session state), but its LLM, memory,
     // sandbox, and base system prompt come from the SessionRuntime
     // (preferred) or the legacy `state.agent`.
-    let request_agent = Agent::new_shared(
+    //
+    // M11-F regression fix REG-3: also propagate the profile-scope
+    // hook executor (assembled once in `ProfileRuntime::bootstrap`
+    // from `config.hooks + plugin_result.hooks`) onto the per-turn
+    // rebuilt agent. Without this, every UI Protocol turn would bypass
+    // the configured `before_tool_call` / `after_tool_call` /
+    // `before_llm_call` / `after_llm_call` hooks because
+    // `Agent::new_shared` resets `hooks: None`. We thread it directly
+    // off the SessionRuntime's parent profile so the runtime layer
+    // remains the single source of truth.
+    let mut request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
         llm_provider.clone(),
         Arc::new(tool_registry),
@@ -5229,6 +5251,17 @@ async fn run_standalone_turn(
         workspace_root.as_deref(),
     ))
     .with_reporter(reporter);
+    if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
+        request_agent = request_agent.with_hooks(hooks);
+    }
+    // M11-F regression fix REG-1 follow-up (codex review): wire the
+    // `activate_tools` back-reference on the per-turn rebuilt agent.
+    // `ProfileRuntime::bootstrap` defers non-core groups + registers
+    // the tool; without this wiring call, the LLM sees the tool in
+    // `specs()` but `activate_tools` is unable to reach the registry
+    // (its internal `Weak<ToolRegistry>` is empty). Gateway does the
+    // equivalent at `session_actor.rs:2500`.
+    request_agent.wire_activate_tools();
 
     let agent_session_id = session_id.clone();
     let approval_requester: Arc<dyn octos_agent::ToolApprovalRequester> =
@@ -11923,6 +11956,8 @@ mod tests {
             memory,
             memory_store,
             tool_config,
+            cron_service: None,
+            hook_executor: None,
         })
     }
 
