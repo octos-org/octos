@@ -5,8 +5,6 @@
   var SESSION_STORAGE_KEY = "octos_current_session";
   var token = sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
   var currentSession = localStorage.getItem(SESSION_STORAGE_KEY) || "default";
-  var sending = false;
-  var currentAbort = null;
   var taskRefreshSeq = 0;
   var taskSnapshots = new Map();
 
@@ -14,8 +12,6 @@
   var taskStatusEl = document.getElementById("task-status");
   var inputEl = document.getElementById("input");
   var formEl = document.getElementById("chat-form");
-  var sendButton = document.getElementById("send-button");
-  var cancelButton = document.getElementById("cancel-button");
   var sessionListEl = document.getElementById("session-list");
   var statusEl = document.getElementById("status-text");
   var newSessionBtn = document.getElementById("new-session");
@@ -430,35 +426,6 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function parseSseChunk(buffer, text, handler) {
-    buffer += text;
-    var lines = buffer.split("\n");
-    buffer = lines.pop();
-    lines.forEach(function (line) {
-      if (line.indexOf("data:") !== 0) return;
-      var json = line.slice(5).trim();
-      if (!json) return;
-      try {
-        handler(JSON.parse(json));
-      } catch (error) {}
-    });
-    return buffer;
-  }
-
-  function finishStreaming() {
-    sending = false;
-    currentAbort = null;
-    sendButton.disabled = false;
-    cancelButton.classList.add("hidden");
-  }
-
-  cancelButton.addEventListener("click", function () {
-    if (currentAbort) {
-      currentAbort.abort();
-    }
-    finishStreaming();
-  });
-
   authSubmitBtn.addEventListener("click", function () {
     token = authTokenEl.value.trim();
     sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
@@ -475,106 +442,19 @@
     loadSessions();
   });
 
+  // Chat submission was previously handled here via POST /api/chat with an
+  // SSE response reader. M9-α-5 deleted the SSE branch (PR #855) and the
+  // canonical chat transport is now `/api/ui-protocol/ws`. The static page
+  // bundled with `octos serve` is not migrated to WS — the modern web UI
+  // lives in the octos-web repo and already uses UI Protocol v1. The form
+  // submit is intercepted so a stale page surfaces a clear notice instead
+  // of silently no-op'ing.
   formEl.addEventListener("submit", function (e) {
     e.preventDefault();
-    var text = inputEl.value.trim();
-    if (!text || sending) return;
-
-    sending = true;
-    sendButton.disabled = true;
-    cancelButton.classList.remove("hidden");
-    inputEl.value = "";
-
-    appendMessage("user", text);
-
-    var assistantDiv = appendMessage("assistant", "");
-    assistantDiv.classList.add("streaming");
-    assistantDiv.dataset.testid = "assistant-message";
-    var bodyEl = assistantDiv.querySelector("div:last-child");
-    var accumulated = "";
-    var sid = currentSession;
-    var finished = false;
-    currentAbort = new AbortController();
-
-    function finish() {
-      if (finished) return;
-      finished = true;
-      assistantDiv.classList.remove("streaming");
-      finishStreaming();
-    }
-
-    fetch("/api/chat", {
-      method: "POST",
-      headers: headers(),
-      body: JSON.stringify({ message: text, session_id: currentSession }),
-      signal: currentAbort.signal,
-    })
-      .then(function (r) {
-        if (r.status === 401) {
-          showAuth();
-          finish();
-          return null;
-        }
-        if (!r.body) {
-          finish();
-          return null;
-        }
-        var reader = r.body.getReader();
-        var decoder = new TextDecoder();
-        var buf = "";
-
-        function read() {
-          reader.read().then(function (result) {
-            if (result.done) {
-              finish();
-              return;
-            }
-            buf = parseSseChunk(buf, decoder.decode(result.value, { stream: true }), function (data) {
-              if (data.type === "keepalive") return;
-              if (data.type === "task_status" && data.task) {
-                upsertTaskSnapshot(sid, data.task);
-                renderTaskIndicators(sid);
-                return;
-              }
-              if ((data.type === "token" || data.type === "delta") && data.text) {
-                accumulated += data.text;
-                bodyEl.textContent = accumulated;
-                messagesEl.scrollTop = messagesEl.scrollHeight;
-              } else if (data.type === "replace" && data.text) {
-                accumulated = data.text;
-                bodyEl.textContent = accumulated;
-                messagesEl.scrollTop = messagesEl.scrollHeight;
-              } else if (data.type === "done") {
-                if (accumulated) bodyEl.textContent = accumulated;
-                loadSessions();
-                refreshTaskStatus(sid);
-                if (data.has_bg_tasks) {
-                  pollForBgFiles(sid);
-                }
-                finish();
-              } else if (data.type === "file") {
-                appendFileMessage(data.filename, data.path, data.caption);
-              }
-            });
-            read();
-          }).catch(function (err) {
-            if (err && err.name === "AbortError") {
-              finish();
-              return;
-            }
-            bodyEl.textContent = "Error: " + err.message;
-            finish();
-          });
-        }
-
-        read();
-        return null;
-      })
-      .catch(function (err) {
-        if (err && err.name === "AbortError") return;
-        bodyEl.textContent = "Error: " + err.message;
-        finish();
-      });
+    appendMessage(
+      "assistant",
+      "Chat is unavailable in the bundled static UI. Use the octos-web app, which talks to /api/ui-protocol/ws."
+    );
   });
 
   inputEl.addEventListener("keydown", function (e) {

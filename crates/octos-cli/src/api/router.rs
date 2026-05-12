@@ -97,13 +97,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // M9-α-5/α-6 (ADR PR #830 / audit issue #845): the chat SSE
     // transport (`POST /api/chat?stream=true`, `GET /api/chat/stream`,
     // `GET /api/sessions/:id/events/stream`) has been deleted. The
-    // sole chat transport is `/api/ui-protocol/ws`. The legacy text-
-    // frame `/api/ws` and the harness/admin `/api/events/harness` SSE
-    // endpoint are unrelated to chat and remain.
+    // sole chat transport is `/api/ui-protocol/ws`. The legacy
+    // text-frame `/api/ws` was retired as a follow-up cleanup (it
+    // never carried the UI Protocol v1 wire format and had no live
+    // clients on the modern web/TUI). The harness/admin
+    // `/api/events/harness` SSE endpoint is unrelated to chat and
+    // remains.
     let chat_api = Router::new()
         .route("/api/chat", post(handlers::chat))
         .route("/api/events/harness", get(events_harness::events_harness))
-        .route("/api/ws", get(handlers::ws_handler))
         .route("/api/ui-protocol/ws", get(ui_protocol::ws_handler))
         .route(
             "/api/upload",
@@ -726,7 +728,6 @@ async fn user_auth_middleware(
         // Task-control verbs (`/api/tasks/{id}/cancel`, `/restart-from-node`)
         // are session-scoped — same trust posture as `/api/sessions`.
         if uri_str.starts_with("/api/chat")
-            || uri_str.starts_with("/api/ws")
             || uri_str.starts_with("/api/ui-protocol")
             || uri_str.starts_with("/api/upload")
             || uri_str.starts_with("/api/sessions")
