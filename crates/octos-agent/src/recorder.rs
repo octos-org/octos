@@ -97,7 +97,10 @@ mod tests {
 
         let recorder = BlackBoxRecorder::new(path.clone(), 1024).await.unwrap();
 
-        recorder.log("llm_call", serde_json::json!({"model": "test", "tokens": 100}));
+        recorder.log(
+            "llm_call",
+            serde_json::json!({"model": "test", "tokens": 100}),
+        );
         recorder.log("tool_call", serde_json::json!({"tool": "read_file"}));
         recorder.log("safety_check", serde_json::json!({"tier": "observe"}));
 
@@ -157,6 +160,9 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let recorder = BlackBoxRecorder::new(path, 1024).await.unwrap();
-        assert!(recorder.is_active(), "recorder should be active after creation");
+        assert!(
+            recorder.is_active(),
+            "recorder should be active after creation"
+        );
     }
 }
