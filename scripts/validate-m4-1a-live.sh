@@ -5,7 +5,16 @@
 # that the full structured progress pipeline works end-to-end on a real
 # canary: deep-research emits octos.harness.event.v1 events, the runtime sink
 # folds them into durable task_status, the UI replays them through chat, and
-# /api/sessions/:id/tasks + the SSE event stream both expose the same truth.
+# /api/sessions/:id/tasks reflects the same truth as the WS UI Protocol
+# notification stream.
+#
+# Transport: chat traffic and per-session event projection both ride
+# `/api/ui-protocol/ws` (canonical M9 UI Protocol v1). The earlier draft of
+# this script POSTed to the legacy REST endpoint `/api/chat` and tailed the
+# `/api/sessions/:id/events/stream` SSE; both were retired post-PR #908.
+# A single chat turn is now driven by `e2e/scripts/ws-chat.mjs`, and the
+# WS notification log captured by that script doubles as the "snapshot"
+# equivalent the script used to fetch over SSE.
 #
 # The script is idempotent — two back-to-back runs produce identical
 # decisions. It exits 0 when all assertions pass, or a non-zero code with a
@@ -188,51 +197,58 @@ probe_health() {
 }
 
 start_deep_research() {
-  # The backend expects a simple chat POST with the profile+auth headers.
-  # We intentionally submit a fresh session label so the script is idempotent:
-  # two back-to-back runs create sibling sessions and do not reuse state.
+  # Drive a single chat turn over `/api/ui-protocol/ws` via the
+  # standalone `e2e/scripts/ws-chat.mjs` helper. We intentionally submit
+  # a fresh session label so the script is idempotent: two back-to-back
+  # runs create sibling sessions and do not reuse state. The helper
+  # writes a single JSON line to stdout (`{status, content, events}`) —
+  # we tee it into ${OUTPUT_DIR}/submit.body so it doubles as the
+  # captured-snapshot artifact below.
   local session_id="m4-1a-live-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  log "submitting deep research prompt to session $session_id"
-  local body
-  body="$(jq -n \
-    --arg id "$session_id" \
-    --arg msg "$DEEP_RESEARCH_PROMPT" \
-    '{session_id: $id, message: $msg, stream: false}')"
+  log "submitting deep research prompt to session $session_id (over UI Protocol v1 WS)"
 
-  # Two possible endpoints exist across canary versions; prefer /api/chat.
-  local http_code
-  http_code="$(curl --silent --show-error --output "${OUTPUT_DIR}/submit.out" \
-    -o "${OUTPUT_DIR}/submit.body" \
-    -w '%{http_code}' \
-    -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer ${AUTH_TOKEN}" \
-    -H "X-Profile-Id: ${PROFILE_ID}" \
-    -X POST \
-    --data "$body" \
-    "${BASE_URL}/api/chat" || echo 000)"
-
-  if [[ "$http_code" != "200" && "$http_code" != "202" ]]; then
-    # Fall back to /api/sessions/:id/messages.
-    http_code="$(curl --silent --show-error --output "${OUTPUT_DIR}/submit.out" \
-      -o "${OUTPUT_DIR}/submit.body" \
-      -w '%{http_code}' \
-      -H 'Content-Type: application/json' \
-      -H "Authorization: Bearer ${AUTH_TOKEN}" \
-      -H "X-Profile-Id: ${PROFILE_ID}" \
-      -X POST \
-      --data "$(jq -n --arg msg "$DEEP_RESEARCH_PROMPT" '{content: $msg}')" \
-      "${BASE_URL}/api/sessions/${session_id}/messages" || echo 000)"
+  if ! command -v node >/dev/null 2>&1; then
+    emit_diagnostic \
+      "node_missing" \
+      "node is required to drive the canonical WS chat transport but was not found in PATH." \
+      "install Node.js >= 18 and ensure 'node' is on PATH"
+    exit 2
   fi
 
-  if [[ "$http_code" != "200" && "$http_code" != "202" ]]; then
+  local helper="${ROOT}/e2e/scripts/ws-chat.mjs"
+  if [[ ! -x "$helper" ]]; then
+    emit_diagnostic \
+      "ws_helper_missing" \
+      "WS chat helper missing or not executable at ${helper}." \
+      "chmod +x ${helper}"
+    exit 2
+  fi
+
+  # The helper exits with rc=0 on `turn/completed`, 3 on RPC/WS errors,
+  # 4 on deadline. We tolerate non-zero rc here because the downstream
+  # poll-until-terminal loop is the authoritative completion check —
+  # all this stage needs is for the turn to be ACCEPTED by the daemon.
+  local rc=0
+  ( cd "$ROOT/e2e" && node "$helper" \
+      --url "$BASE_URL" \
+      --token "$AUTH_TOKEN" \
+      --profile "$PROFILE_ID" \
+      --session "$session_id" \
+      --message "$DEEP_RESEARCH_PROMPT" \
+      --max-wait-ms "$((TIMEOUT_SECONDS * 1000))" \
+      > "${OUTPUT_DIR}/submit.body" 2> "${OUTPUT_DIR}/submit.out" ) || rc=$?
+
+  if (( rc == 2 || rc == 3 )); then
+    local helper_status
+    helper_status="$(jq -r '.status // .message // empty' "${OUTPUT_DIR}/submit.body" 2>/dev/null || true)"
     emit_diagnostic \
       "deep_research_submit_failed" \
-      "POST to /api/chat and /api/sessions/${session_id}/messages both returned ${http_code}." \
-      "curl -H 'Authorization: Bearer ${AUTH_TOKEN}' -H 'X-Profile-Id: ${PROFILE_ID}' -H 'Content-Type: application/json' -X POST --data '$(jq -rc . <<<"$body")' ${BASE_URL}/api/chat"
+      "ws-chat helper exited rc=${rc} (status=${helper_status:-unknown}). Inspect ${OUTPUT_DIR}/submit.body and ${OUTPUT_DIR}/submit.out." \
+      "node ${helper} --url ${BASE_URL} --token *** --profile ${PROFILE_ID} --session ${session_id} --message '<prompt>'"
     exit 3
   fi
 
-  pass "deep research submitted, session=${session_id}"
+  pass "deep research submitted, session=${session_id} (ws-chat rc=${rc})"
   printf "%s" "$session_id"
 }
 
@@ -393,18 +409,24 @@ observe_until_terminal() {
 
 capture_sse_snapshot() {
   local session_id="$1"
-  local stream_url="${BASE_URL}/api/sessions/${session_id}/events/stream"
-  log "capturing SSE snapshot from $stream_url"
+  # `/api/sessions/:id/events/stream` (legacy free-form SSE) was retired
+  # post-PR #908; per-session event projection now flows over the
+  # `session/open` notification replay on `/api/ui-protocol/ws`. The
+  # ws-chat helper that already ran for this session captured every
+  # notification it observed during the turn into ${OUTPUT_DIR}/submit.body
+  # (one JSON line of `{status, content, events: [...]}`). That log is
+  # the WS equivalent of what the script used to fetch from the SSE
+  # endpoint — point $LAST_SSE_SNAPSHOT at it so the existing emptiness
+  # check in `main()` continues to do something useful.
+  log "promoting ws-chat notification log as WS event snapshot (session=$session_id)"
   : > "$LAST_SSE_SNAPSHOT"
-  # --max-time bounds the curl window; we intentionally error-tolerant because
-  # the stream may legitimately be empty between task transitions.
-  curl --silent --show-error \
-    -H "Authorization: Bearer ${AUTH_TOKEN}" \
-    -H "X-Profile-Id: ${PROFILE_ID}" \
-    -H 'Accept: text/event-stream' \
-    --max-time 20 \
-    "$stream_url" > "$LAST_SSE_SNAPSHOT" 2>/dev/null || true
-  pass "SSE snapshot written to $LAST_SSE_SNAPSHOT"
+  if [[ -s "${OUTPUT_DIR}/submit.body" ]]; then
+    # Project the WS notification list out of the helper's single-line
+    # JSON envelope into a stream of one-notification-per-line records
+    # so the downstream byte-count check is meaningful.
+    jq -c '.events[]?' "${OUTPUT_DIR}/submit.body" > "$LAST_SSE_SNAPSHOT" 2>/dev/null || true
+  fi
+  pass "WS notification snapshot written to $LAST_SSE_SNAPSHOT"
 }
 
 validate_observation() {
@@ -597,16 +619,16 @@ main() {
 
     capture_sse_snapshot "$session_id"
     if [[ -s "$LAST_SSE_SNAPSHOT" ]]; then
-      pass "SSE stream produced data ($(wc -c < "$LAST_SSE_SNAPSHOT" | tr -d ' ') bytes)"
+      pass "WS event stream produced data ($(wc -c < "$LAST_SSE_SNAPSHOT" | tr -d ' ') bytes)"
     else
-      warn "SSE snapshot empty; retrying once"
+      warn "WS event snapshot empty; retrying once"
       sleep "$POLL_INTERVAL"
       capture_sse_snapshot "$session_id"
       if [[ ! -s "$LAST_SSE_SNAPSHOT" ]]; then
         emit_diagnostic \
-          "sse_stream_empty" \
-          "SSE endpoint produced no data within 20s twice in a row." \
-          "curl -N -H 'Authorization: Bearer ${AUTH_TOKEN}' -H 'X-Profile-Id: ${PROFILE_ID}' ${BASE_URL}/api/sessions/${session_id}/events/stream"
+          "ws_event_stream_empty" \
+          "WS UI Protocol produced no notifications during the deep-research turn (ws-chat helper exited cleanly but captured no events)." \
+          "node ${ROOT}/e2e/scripts/ws-chat.mjs --url ${BASE_URL} --token *** --profile ${PROFILE_ID} --session ${session_id} --message '<prompt>'"
         exit 3
       fi
     fi

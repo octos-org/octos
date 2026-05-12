@@ -1,5 +1,5 @@
 /**
- * Regression tests for tool-use bugs via the web API.
+ * Regression tests for tool-use bugs via the canonical chat transport.
  *
  * These tests exercise the exact tool-use sequences that triggered:
  *   1. activate_tools "tool registry not available" (OnceLock stale Weak bug)
@@ -8,16 +8,43 @@
  * Run against a live octos-serve instance:
  *   OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=<token> npx playwright test
  *
- * The tests use the /api/chat (sync) and /api/admin/shell endpoints.
+ * Transport: chat turns ride the M9 WebSocket UI Protocol via `chatWS()`
+ * (`/api/ui-protocol/ws`). The legacy `POST /api/chat` route was retired
+ * in the cleanup that followed PR #908; this spec was migrated as part
+ * of that cutover.
  */
 import { test, expect } from '@playwright/test';
+import { chatWS, type ChatWsResult } from '../lib/m9-ws-client';
 
 const AUTH_TOKEN = process.env.OCTOS_AUTH_TOKEN || '';
+const PROFILE_ID = process.env.OCTOS_PROFILE || undefined;
 
 function headers() {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
   if (AUTH_TOKEN) h['Authorization'] = `Bearer ${AUTH_TOKEN}`;
   return h;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: drive a single chat turn over the WS UI Protocol. Returns
+// `{ events, content, doneEvent }` shape preserved from `chatWS()` so
+// callers can introspect tool calls / progress in addition to the
+// final assistant content.
+// ---------------------------------------------------------------------------
+async function chatTurn(
+  baseURL: string,
+  message: string,
+  sessionId: string,
+  opts: { maxWait?: number } = {},
+): Promise<ChatWsResult> {
+  return chatWS({
+    baseUrl: baseURL,
+    token: AUTH_TOKEN,
+    profileId: PROFILE_ID,
+    message,
+    sessionId,
+    maxWait: opts.maxWait ?? 90_000,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -96,44 +123,36 @@ test('ffmpeg concat works in sandbox workdir', async ({ request, baseURL }) => {
 // then sending another message in a NEW session (different session_id) which
 // also triggers activate_tools. Both should succeed.
 // ---------------------------------------------------------------------------
-test('activate_tools works across different sessions', async ({ request, baseURL }) => {
+test('activate_tools works across different sessions', async ({ baseURL }) => {
   test.setTimeout(300_000);
   test.skip(!AUTH_TOKEN, 'OCTOS_AUTH_TOKEN required');
 
   // Session A: trigger activate_tools without also asking for shell execution.
   // This keeps the proof focused on the registry rewire bug: stale OnceLock
   // references used to fail with "tool registry not available" in session B.
-  const resA = await request.post(`${baseURL}/api/chat`, {
-    headers: headers(),
-    data: {
-      message: 'Call activate_tools with exactly ["shell"] once, then reply "session_a_ok".',
-      session_id: `test-session-a-${Date.now()}`,
-      stream: false,
-    },
-    timeout: 180_000,
-  });
+  const resA = await chatTurn(
+    baseURL!,
+    'Call activate_tools with exactly ["shell"] once, then reply "session_a_ok".',
+    `test-session-a-${Date.now()}`,
+    { maxWait: 180_000 },
+  );
 
   // We may get an error if no agent is configured (standalone mode),
-  // but the key test is that it doesn't fail with "tool registry not available"
-  if (resA.ok()) {
-    const bodyA = await resA.json();
-    expect(bodyA.content).not.toContain('tool registry not available');
+  // but the key test is that it doesn't fail with "tool registry not available".
+  if (resA.doneEvent?.type === 'done') {
+    expect(resA.content).not.toContain('tool registry not available');
   }
 
   // Session B: different session → may trigger a new SessionActor
-  const resB = await request.post(`${baseURL}/api/chat`, {
-    headers: headers(),
-    data: {
-      message: 'Call activate_tools with exactly ["shell"] once, then reply "session_b_ok".',
-      session_id: `test-session-b-${Date.now()}`,
-      stream: false,
-    },
-    timeout: 180_000,
-  });
+  const resB = await chatTurn(
+    baseURL!,
+    'Call activate_tools with exactly ["shell"] once, then reply "session_b_ok".',
+    `test-session-b-${Date.now()}`,
+    { maxWait: 180_000 },
+  );
 
-  if (resB.ok()) {
-    const bodyB = await resB.json();
-    expect(bodyB.content).not.toContain('tool registry not available');
+  if (resB.doneEvent?.type === 'done') {
+    expect(resB.content).not.toContain('tool registry not available');
   }
 });
 
@@ -145,7 +164,6 @@ test('activate_tools works across different sessions', async ({ request, baseURL
 // If any link in the chain is broken, this test fails.
 // ---------------------------------------------------------------------------
 test('full tool chain: chat triggers activate_tools → shell → ffmpeg', async ({
-  request,
   baseURL,
 }) => {
   test.setTimeout(180_000);
@@ -155,38 +173,26 @@ test('full tool chain: chat triggers activate_tools → shell → ffmpeg', async
   const prompt =
     'If shell is not already active, call activate_tools with exactly ["shell"] once and only once. Then call shell exactly once with this command: ffmpeg -version 2>&1 | head -1. Do not inspect available tools, do not call activate_tools repeatedly, and return only the ffmpeg version line.';
 
-  const sendPrompt = async (message: string, sessionId: string) =>
-    request.post(`${baseURL}/api/chat`, {
-      headers: headers(),
-      data: {
-        message,
-        session_id: sessionId,
-        stream: false,
-      },
-      timeout: 90_000,
-    });
+  let res = await chatTurn(baseURL!, prompt, baseSessionId);
 
-  let res = await sendPrompt(prompt, baseSessionId);
-
-  if (res.ok()) {
-    let body = await res.json();
-    if (typeof body.content === 'string' && body.content.includes('[LOOP DETECTED]')) {
-      res = await sendPrompt(
+  if (res.doneEvent?.type === 'done') {
+    if (res.content.includes('[LOOP DETECTED]')) {
+      res = await chatTurn(
+        baseURL!,
         'Call activate_tools(["shell"]) at most once, then call shell("ffmpeg -version 2>&1 | head -1") exactly once, then stop. Return only the ffmpeg version line.',
         `${baseSessionId}-retry`,
       );
-      if (!res.ok()) {
+      if (res.doneEvent?.type !== 'done') {
         return;
       }
-      body = await res.json();
     }
     // Should contain ffmpeg version string, NOT "tool registry not available"
     // or "ffmpeg: not found"
-    expect(body.content).not.toContain('tool registry not available');
-    expect(body.content).not.toContain('not found');
-    expect(body.content).not.toContain('not installed');
+    expect(res.content).not.toContain('tool registry not available');
+    expect(res.content).not.toContain('not found');
+    expect(res.content).not.toContain('not installed');
     // Positive check: should mention ffmpeg version somewhere
-    expect(body.content.toLowerCase()).toContain('ffmpeg');
+    expect(res.content.toLowerCase()).toContain('ffmpeg');
   }
 });
 

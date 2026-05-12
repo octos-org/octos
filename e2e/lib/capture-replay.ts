@@ -1,11 +1,21 @@
 // Capture-and-replay infrastructure for live e2e soak runs (PR I).
 //
 // Goal: when a live spec fails (or any time `OCTOS_CAPTURE_FIXTURE=1` is set)
-// auto-save the SSE event stream + final DOM state + assertion failure to
+// auto-save the streamed event log + final DOM state + assertion failure to
 // `e2e/fixtures/captured/<test-name>-<timestamp>.json`. Captured fixtures
 // can then be promoted to Layer 1 (`crates/octos-web/src/state/__tests__/
 // fixtures/captured/`) via `scripts/promote-captured-fixture.sh` to lock in
 // the regression.
+//
+// Transport note: the original PR I shipped while chat turns rode the
+// `POST /api/chat` SSE stream. That route was retired post-PR #908; the
+// canonical chat transport is now `/api/ui-protocol/ws`, which frames its
+// JSON-RPC notifications through a WebSocket rather than `fetch`. The
+// fetch / EventSource monkey-patches below still capture any fetch-based
+// stream the SPA opens, but they no longer see chat frames by default —
+// callers that need WS-frame capture should run M9WsClient-driven specs
+// directly (which already maintain their own notification log) instead
+// of relying on this page-side tee.
 //
 // The captured JSON is a SUPERSET of the PR H `SseFixture` format:
 //   {
@@ -36,13 +46,16 @@
 // Implementation strategy:
 //
 //  * Page-side `addInitScript` monkey-patches `fetch` to tee streaming
-//    `/api/chat` responses into `window.__octosCaptureBuffer`. The SPA sees
-//    an unchanged response; we get a side-channel copy. This works for
-//    chunked-encoding SSE (which is what `static/app.js` uses) AND for
-//    classic `text/event-stream` responses if the page ever switches.
+//    responses into `window.__octosCaptureBuffer`. The SPA sees an
+//    unchanged response; we get a side-channel copy. This works for
+//    classic `text/event-stream` responses and chunked-encoding streams
+//    on any fetch-based endpoint the caller lists in `streamingPaths`.
+//    Chat traffic now rides `/api/ui-protocol/ws` (post-#908) and does
+//    NOT come through fetch — capturing chat frames requires a parallel
+//    `M9WsClient` instance, not this helper.
 //
-//  * `EventSource` is also wrapped (LogPanel etc. uses native EventSource).
-//    Best-effort; main coverage is `/api/chat`.
+//  * `EventSource` is also wrapped (LogPanel etc. uses native
+//    EventSource). Best-effort; chat is no longer in scope here.
 //
 //  * Capture overhead: one extra TransformStream + one in-page array push
 //    per chunk. Negligible vs. the network and rendering work the page is
@@ -62,7 +75,7 @@ import type { Page, TestInfo } from '@playwright/test';
 export interface RawSseEvent {
   /** Wall-clock ms since capture started. */
   t: number;
-  /** Origin URL (the streaming endpoint, e.g. `/api/chat`). */
+  /** Origin URL (the fetch-streaming endpoint). */
   url: string;
   /** Source channel: `fetch-stream` | `eventsource` | `dom-marker`. */
   source: 'fetch-stream' | 'eventsource' | 'dom-marker';
@@ -112,8 +125,10 @@ export interface CaptureOptions {
   outputDir?: string;
   /** Human description; defaults to test title. */
   description?: string;
-  /** Streaming endpoints to capture. Match by URL substring. Default
-   *  matches `/api/chat`, `/api/sessions/`, `/api/tasks/`. */
+  /** Streaming fetch endpoints to capture. Match by URL substring.
+   *  Default: empty — chat traffic moved off `fetch` post-#908. Callers
+   *  should pass the specific path(s) of any remaining fetch/SSE
+   *  endpoint they want teed. */
   streamingPaths?: string[];
 }
 
@@ -182,11 +197,13 @@ export async function attachCapture(
   // before starting to decode — see the matchUrl + content-type filter
   // inside the init script.
   //
-  // Default narrowed to `/api/chat` only (per codex review): the broader
-  // `/api/sessions/` and `/api/tasks/` paths include polling endpoints
-  // that return JSON, not SSE, and teeing those needlessly burns CPU.
-  // Override `streamingPaths` if you have a custom streaming endpoint.
-  const streamingPaths = opts.streamingPaths ?? ['/api/chat'];
+  // Default narrowed to nothing: chat traffic moved to `/api/ui-protocol/ws`
+  // post-#908, so there is no built-in fetch-streaming endpoint left to
+  // tee. Callers can still capture their own SSE/NDJSON endpoints by
+  // passing `streamingPaths`. With an empty list the page-side init
+  // script installs the patches but never matches a URL, so the SPA
+  // runs unmodified.
+  const streamingPaths = opts.streamingPaths ?? [];
 
   // Hard cap on the page-side buffer to bound disk usage from a runaway
   // soak run. Configurable via env. Beyond this we drop frames silently
@@ -270,7 +287,9 @@ export async function attachCapture(
         }
       };
 
-      // Patch fetch to tee streaming /api/chat (and similar) responses.
+      // Patch fetch to tee any streaming response whose URL matches one
+      // of the configured `streamingPaths`. With an empty list (the
+      // post-#908 default) this is a no-op.
       const origFetch = w.fetch.bind(w);
       w.fetch = async function patchedFetch(
         input: RequestInfo | URL,
@@ -289,8 +308,7 @@ export async function attachCapture(
         // (e.g. polling endpoints) carry `application/json` and get short
         // circuited here so we don't burn CPU decoding chunks of fully
         // buffered JSON. SSE responses set `text/event-stream`; chunked
-        // streams without a content-type are also accepted (they're how
-        // the static SPA's `/api/chat` returns its frames).
+        // streams without a content-type are also accepted.
         const ct = (resp.headers.get('content-type') || '').toLowerCase();
         const isStream =
           ct.includes('text/event-stream') ||
