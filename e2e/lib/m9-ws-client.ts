@@ -662,3 +662,109 @@ export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
   void terminal;
   return { events, content, doneEvent };
 }
+
+// ---------------------------------------------------------------------------
+// Auxiliary RPC helpers (M12 Phase D-1/D-5).
+//
+// These wrap the WS UI Protocol replacements for the retired REST endpoints
+// (`GET /api/sessions`, `GET /api/sessions/{id}/messages`, etc.) so spec
+// bodies can replace their `fetch(/api/sessions...)` calls with one-shot
+// async functions that own the WebSocket lifecycle.
+//
+// Each helper opens a fresh `M9WsClient`, issues the JSON-RPC method, and
+// closes the socket. If the caller already has a connected client they can
+// pass it via `opts.client` to amortize the connect cost across calls.
+// ---------------------------------------------------------------------------
+
+export interface AuxRpcOpts {
+  baseUrl: string;
+  token: string;
+  profileId?: string;
+  /** Optional pre-connected client (caller owns close()). */
+  client?: M9WsClient;
+  /** Override the request timeout for the JSON-RPC call. */
+  requestTimeoutMs?: number;
+}
+
+async function withAuxClient<T>(
+  opts: AuxRpcOpts,
+  fn: (client: M9WsClient) => Promise<T>,
+): Promise<T> {
+  const ownsClient = !opts.client;
+  const client =
+    opts.client ??
+    new M9WsClient({
+      url: opts.baseUrl,
+      token: opts.token,
+      profileId: opts.profileId,
+      requestTimeoutMs: opts.requestTimeoutMs,
+    });
+  try {
+    return await fn(client);
+  } finally {
+    if (ownsClient) {
+      try { await client.close(); } catch { /* swallow */ }
+    }
+  }
+}
+
+/** WS replacement for `GET /api/sessions`. Returns the same array shape. */
+export async function fetchSessionList(opts: AuxRpcOpts): Promise<any[]> {
+  return withAuxClient(opts, async (client) => {
+    const result = await client.rawRequest<{ sessions: any }>(
+      "session/list",
+      {},
+    );
+    return Array.isArray(result?.sessions) ? result.sessions : [];
+  });
+}
+
+/** WS replacement for `GET /api/sessions/{id}/messages`. */
+export async function fetchSessionMessages(
+  opts: AuxRpcOpts & {
+    sessionId: string;
+    limit?: number;
+    offset?: number;
+    sinceSeq?: number;
+    topic?: string;
+  },
+): Promise<any[]> {
+  return withAuxClient(opts, async (client) => {
+    const params: Record<string, unknown> = { session_id: opts.sessionId };
+    if (opts.limit !== undefined) params.limit = opts.limit;
+    if (opts.offset !== undefined) params.offset = opts.offset;
+    if (opts.sinceSeq !== undefined) params.since_seq = opts.sinceSeq;
+    if (opts.topic !== undefined) params.topic = opts.topic;
+    const result = await client.rawRequest<{ messages: any }>(
+      "session/messages_page",
+      params,
+    );
+    return Array.isArray(result?.messages) ? result.messages : [];
+  });
+}
+
+/** WS replacement for `GET /api/sessions/{id}/tasks`. */
+export async function fetchSessionTasks(
+  opts: AuxRpcOpts & { sessionId: string; topic?: string },
+): Promise<any[]> {
+  return withAuxClient(opts, async (client) => {
+    const params: Record<string, unknown> = { session_id: opts.sessionId };
+    if (opts.topic !== undefined) params.topic = opts.topic;
+    const result = await client.rawRequest<{ tasks: any }>(
+      "session/tasks.list",
+      params,
+    );
+    return Array.isArray(result?.tasks) ? result.tasks : [];
+  });
+}
+
+/** WS replacement for `DELETE /api/sessions/{id}`. Resolves on success. */
+export async function deleteSessionWs(
+  opts: AuxRpcOpts & { sessionId: string },
+): Promise<void> {
+  await withAuxClient(opts, async (client) => {
+    await client.rawRequest<unknown>("session/delete", {
+      session_id: opts.sessionId,
+    });
+  });
+}
