@@ -4,19 +4,35 @@
 //! End-to-end test proving the N-sessions-per-profile invariant: two
 //! AppUI sessions opened on the SAME profile with DIFFERENT
 //! `workspace_hint`s must each observe their own files and never see
-//! each other's. The test drives the public `POST /api/chat` route via
-//! `build_router` + `tower::ServiceExt::oneshot` so the assertions
-//! exercise the production handler chain
-//! (`chat` → `chat_sync` → `chat_sync_via_session_runtime` →
-//! `SessionRuntimeCache::get_or_init` → `Agent::process_message`).
+//! each other's.
+//!
+//! # Wire-level dispatcher (post `POST /api/chat` retirement)
+//!
+//! The originating draft of this test drove `POST /api/chat` via
+//! `tower::ServiceExt::oneshot` because that was the production sync
+//! entry point. With the cleanup that retired the legacy REST chat
+//! handler (predecessor PR #908; the canonical chat transport is now
+//! `/api/ui-protocol/ws`), there is no synchronous in-process HTTP
+//! surface to drive. We could spin up a real tungstenite WebSocket
+//! against the in-process router, but the WS handler is async and
+//! delivers the final assistant content via `turn/completed`
+//! notifications, not a JSON response body — replicating it in a unit
+//! test would re-implement most of the WS run loop.
+//!
+//! Instead this test drives the **exact same production code path**
+//! that `chat_sync_via_session_runtime` did (and the WS `turn/start`
+//! pipeline still does today): resolve the per-session
+//! [`SessionRuntime`] from the cache (constructing it on first use),
+//! run [`octos_agent::Agent::process_message`] against the session-
+//! bound workspace, and persist the response through the canonical
+//! per-user JSONL via
+//! [`octos_bus::persist_message_through_canonical_path`]. Every
+//! invariant the original test cared about — `workspace_hint`
+//! forwarding, `ToolRegistry` isolation, per-session JSONL writes,
+//! per-session `.octos-workspace.toml` policy files — still surfaces
+//! at the same call site.
 //!
 //! # Step-by-step → invariant map
-//!
-//! Every assertion below is paired with the production code path it
-//! catches. The mapping is deliberate: a single mutation experiment
-//! (e.g. deleting `workspace_hint` handling in
-//! `SessionRuntime::bootstrap`) must surface as a SPECIFIC assertion
-//! failure, not a generic smoke regression.
 //!
 //! 1. Pre-warm the session cache for session A with hint = `repo-A`
 //!    → exercises [`SessionRuntime::bootstrap`]'s `workspace_hint`
@@ -24,39 +40,29 @@
 //!    `<data_dir>/users/<encoded base>/workspace` and the
 //!    "session A reads its own a.txt" assertion fails because the
 //!    workspace_root does not contain `a.txt`.
-//! 2. Drive `POST /api/chat` for session A with `read_file:a.txt`
-//!    → exercises the M11-D dispatcher and the workspace-bound
-//!    [`ToolRegistry`] cloned by [`SessionRuntime::bootstrap`].
-//!    Assertion: response body contains `"hello-A"` (the per-session
-//!    cwd was actually honored by the tool call).
-//! 3. Drive `POST /api/chat` for session B with `read_file:a.txt`
-//!    → the cross-read MUST fail. Assertion: response body contains
-//!    a "not found" / "outside working directory" marker. If the two
-//!    sessions shared a workspace, B would see A's file and this
-//!    assertion would fail. This is the multi-tenant-leak gate
-//!    codex flagged on PR #868.
-//! 4. Drive `POST /api/chat` for session B with `read_file:b.txt`
-//!    → response body contains `"hello-B"`. Symmetric check that B's
-//!    own workspace is wired correctly.
+//! 2. Drive the agent loop for session A with `read_file:a.txt`
+//!    → exercises the workspace-bound [`ToolRegistry`] cloned by
+//!    [`SessionRuntime::bootstrap`]. Assertion: response content
+//!    contains `"hello-A"` (the per-session cwd was actually honored
+//!    by the tool call).
+//! 3. Drive the agent loop for session B with `read_file:a.txt`
+//!    → the cross-read MUST fail. Assertion: response content
+//!    contains a "not found" / "outside working directory" marker.
+//!    If the two sessions shared a workspace, B would see A's file
+//!    and this assertion would fail. This is the multi-tenant-leak
+//!    gate codex flagged on PR #868.
+//! 4. Drive the agent loop for session B with `read_file:b.txt`
+//!    → response content contains `"hello-B"`. Symmetric check that
+//!    B's own workspace is wired correctly.
 //! 5. Assert independent canonical JSONL chat history files exist
 //!    under each session's `user_key` directory.
-//!    → exercises `persist_chat_message_through_canonical` writing
-//!    per-session paths derived from `SessionKey`.
+//!    → exercises `octos_bus::persist_message_through_canonical_path`
+//!    writing per-session paths derived from `SessionKey`.
 //! 6. Assert per-session `.octos-workspace.toml` files exist at
 //!    `repo-A/.octos-workspace.toml` AND `repo-B/.octos-workspace.toml`.
 //!    → exercises [`SessionRuntime::bootstrap`]'s
 //!    `write_workspace_policy_if_absent` step. If the policy write is
 //!    skipped, the M11-D yangmi gap re-opens.
-//!
-//! The mutation experiment required by the issue: delete the
-//! `workspace_hint` path in
-//! `crates/octos-cli/src/runtime/session.rs::resolve_workspace_root`
-//! (so the function always returns the data-dir-relative default).
-//! Step 2's "hello-A" assertion fails first because session A's
-//! workspace becomes the data-dir-relative path (no `a.txt` present);
-//! step 6's policy-at-repo-A path also disappears because the bootstrap
-//! writes the policy under the default workspace, not `repo-A`. The
-//! failing transcript is pasted into the PR description.
 
 #![cfg(feature = "api")]
 
@@ -64,15 +70,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use octos_cli::api::{AppState, build_router};
+use octos_cli::api::AppState;
 use octos_cli::runtime::ProfileRuntime;
 use octos_core::{MAIN_PROFILE_ID, Message, MessageRole, SessionKey, ToolCall};
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
 use serde_json::json;
 use tempfile::TempDir;
-use tower::util::ServiceExt;
 
 /// Stub LLM that simulates a coding-agent turn.
 ///
@@ -91,7 +94,7 @@ use tower::util::ServiceExt;
 ///   result appended — that second pass takes the first branch above.
 ///
 /// This is the minimal shape needed to drive a `read_file` turn
-/// through the M11-D `/api/chat` dispatcher without any external API
+/// through the `SessionRuntime` dispatcher without any external API
 /// keys or real LLM provider, mirroring the
 /// `qos_catalog::StubProvider` and the M11-C/D `EchoLlm` pattern.
 struct ReadFileStubLlm;
@@ -216,56 +219,73 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
     })
 }
 
-/// Drive a single `POST /api/chat` request through the assembled
-/// router. Returns the response body parsed into the same shape the
-/// production [`octos_cli::api::handlers::chat`] handler emits.
-async fn post_chat(
-    app: &axum::Router,
+/// In-process equivalent of a single chat turn against the canonical
+/// transport.
+///
+/// Mirrors the inner loop shared by `chat_sync_via_session_runtime`
+/// (deleted with the legacy REST chat route) and the WS UI Protocol's
+/// `turn/start` pipeline. Both: resolve the per-session
+/// `SessionRuntime` from the cache (constructing it on first use),
+/// load history, run `Agent::process_message`, and persist every
+/// produced `Message` through the canonical per-user JSONL.
+///
+/// Returns the assistant content as the agent loop produced it — the
+/// same string the legacy `ChatResponse.content` carried and the WS
+/// `turn/completed` notification streams. Per-session tool failures
+/// surface inside this `String` (matching what
+/// `ToolRegistry::execute` writes back when `read_file` cannot find
+/// the requested path), so the test can assert against it directly.
+async fn drive_turn(
+    state: &Arc<AppState>,
+    profile: &Arc<ProfileRuntime>,
     session_id: &str,
     message: &str,
-) -> (StatusCode, serde_json::Value) {
-    let body = serde_json::to_string(&json!({
-        "message": message,
-        "session_id": session_id,
-        "stream": false,
-    }))
-    .expect("serialize chat request");
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/chat")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
+) -> String {
+    let session_key = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_id, "");
+    let session_runtime = state
+        .session_cache
+        .get_or_init(profile, session_key.clone(), None)
         .await
-        .expect("router serves chat request");
+        .expect("bootstrap session runtime");
 
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
-        .await
-        .expect("read response body");
-    let parsed = if bytes.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-            panic!(
-                "expected JSON body, got {err}; raw={}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
+    let history: Vec<Message> = {
+        let mut sess = session_runtime.sessions.lock().await;
+        let session = sess.get_or_create(&session_key).await;
+        session.get_history(50).to_vec()
     };
-    (status, parsed)
+
+    let response = session_runtime
+        .agent
+        .process_message(message, &history, vec![])
+        .await
+        .expect("agent must produce a turn");
+
+    let data_dir = {
+        let manager = session_runtime.sessions.lock().await;
+        manager.data_dir()
+    };
+    for msg in &response.messages {
+        let _ =
+            octos_bus::persist_message_through_canonical_path(&data_dir, &session_key, msg.clone())
+                .await;
+    }
+    // Drop any stale `SessionManager` cache entry so a follow-up read
+    // (duplicate-detection, history reload) consults disk instead of
+    // returning a pre-write empty `Session`. Mirrors what the deleted
+    // `persist_chat_message_through_canonical` helper did.
+    {
+        let mut manager = session_runtime.sessions.lock().await;
+        manager.invalidate_cache(&session_key);
+    }
+
+    response.content
 }
 
 #[tokio::test]
 async fn coding_agent_two_sessions_isolated_workspaces() {
-    // 1. Boot a `serve` instance with one profile + a stub LLM. We use
-    //    `MAIN_PROFILE_ID` because `POST /api/chat` without any routing
-    //    header falls back to it (see `api_profile_id_from_headers`).
+    // 1. Boot a `serve`-equivalent process state with one profile + a
+    //    stub LLM. We use `MAIN_PROFILE_ID` for parity with the legacy
+    //    `POST /api/chat` no-routing-header default.
     let temp = TempDir::new().expect("tempdir");
     let profile_data_dir = temp.path().join("profile-data");
     let profile_runtime = make_m11g_profile(MAIN_PROFILE_ID, &profile_data_dir).await;
@@ -276,7 +296,6 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
         profiles,
         ..AppState::empty_for_tests()
     });
-    let app = build_router(state.clone());
 
     // 2. Pre-seed two distinct "repo" workspaces. Using `tempfile`
     //    instead of literal `/tmp/repo-A` so parallel `cargo test` runs
@@ -288,15 +307,12 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
     std::fs::write(repo_a.join("a.txt"), "hello-A\n").expect("seed a.txt");
     std::fs::write(repo_b.join("b.txt"), "hello-B\n").expect("seed b.txt");
 
-    // 3. The session keys POST /api/chat will resolve to (handlers.rs
-    //    builds these via `standalone_api_session_key_with_topic` →
-    //    `SessionKey::with_profile_topic`). We use them to pre-warm
-    //    the session cache with the desired `workspace_hint` per
-    //    session — the cache is single-flight per key, so the
-    //    subsequent `chat_sync_via_session_runtime` call that passes
-    //    `None` for the hint reuses the cached runtime built against
-    //    the supplied repo. This mirrors how `session/open` (M11-E)
-    //    threads the hint into the cache ahead of any turn.
+    // 3. The session keys we drive turns against. We pre-warm the
+    //    cache with the desired `workspace_hint` per session — the
+    //    cache is single-flight per key, so subsequent `drive_turn`
+    //    calls reuse the cached runtime built against the supplied
+    //    repo. This mirrors how `session/open` (M11-E) threads the
+    //    hint into the cache ahead of any turn.
     let session_a_id = "coding-multi-session-A";
     let session_b_id = "coding-multi-session-B";
     let key_a = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", session_a_id, "");
@@ -338,15 +354,7 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
     );
 
     // 4. Session A reads its own a.txt → response carries "hello-A".
-    let (status_a, body_a) = post_chat(&app, session_a_id, "read_file:a.txt").await;
-    assert_eq!(
-        status_a,
-        StatusCode::OK,
-        "session A read_file(a.txt) must return 200; body={body_a}",
-    );
-    let content_a = body_a["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("session A response missing content field: {body_a}"));
+    let content_a = drive_turn(&state, &profile_runtime, session_a_id, "read_file:a.txt").await;
     assert!(
         content_a.contains("hello-A"),
         "session A's read_file(a.txt) must observe its own workspace; \
@@ -357,16 +365,8 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
     //    marker. Session B's workspace is `repo-B`; `a.txt` only
     //    exists under `repo-A`. If the workspace-bound `ToolRegistry`
     //    leaked across sessions, B would observe A's file here.
-    let (status_b_cross, body_b_cross) = post_chat(&app, session_b_id, "read_file:a.txt").await;
-    assert_eq!(
-        status_b_cross,
-        StatusCode::OK,
-        "request must return 200 — the FAILURE is at the tool layer, \
-         carried in the response body; got body={body_b_cross}",
-    );
-    let content_b_cross = body_b_cross["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("session B response missing content field: {body_b_cross}"));
+    let content_b_cross =
+        drive_turn(&state, &profile_runtime, session_b_id, "read_file:a.txt").await;
     let content_b_cross_lower = content_b_cross.to_lowercase();
     assert!(
         !content_b_cross.contains("hello-A"),
@@ -382,15 +382,7 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
     );
 
     // 6. Session B reads its own b.txt → response carries "hello-B".
-    let (status_b, body_b) = post_chat(&app, session_b_id, "read_file:b.txt").await;
-    assert_eq!(
-        status_b,
-        StatusCode::OK,
-        "session B read_file(b.txt) must return 200; body={body_b}",
-    );
-    let content_b = body_b["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("session B response missing content field: {body_b}"));
+    let content_b = drive_turn(&state, &profile_runtime, session_b_id, "read_file:b.txt").await;
     assert!(
         content_b.contains("hello-B"),
         "session B's read_file(b.txt) must observe its own workspace; \
@@ -399,7 +391,6 @@ async fn coding_agent_two_sessions_isolated_workspaces() {
 
     // 7. Independent canonical chat history JSONLs under each
     //    session's user_key directory. Layout follows
-    //    `persist_chat_message_through_canonical` →
     //    `octos_bus::persist_message_through_canonical_path` →
     //    `<data_dir>/users/<encoded base_key>/sessions/<encoded topic>.jsonl`.
     //    Both files must exist AND contain their respective session's

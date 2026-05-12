@@ -100,12 +100,13 @@ test.describe('session list regressions', () => {
     await login(page);
     await createNewSession(page);
 
-    let chatPosts = 0;
-    page.on('request', (request) => {
-      if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/chat') {
-        chatPosts += 1;
-      }
-    });
+    // The pre-WS version asserted exactly one `POST /api/chat` was made,
+    // proving deep-research did not fan out into multiple user-visible
+    // turns. The modern SPA streams turns over `/api/ui-protocol/ws` and
+    // does not POST `/api/chat` (retired post-#908), so this counter is
+    // no longer the right invariant — the child_session_key task count
+    // poll below is the authoritative check that exactly one deep
+    // research child fanned out.
 
     await getInput(page).fill('深度搜索一下美国伊朗第二轮谈判可能的后果');
     await getSendButton(page).click();
@@ -120,8 +121,6 @@ test.describe('session list regressions', () => {
         { timeout: 90_000, intervals: [2_000, 3_000, 5_000] },
       )
       .toBe(1);
-
-    expect(chatPosts).toBe(1);
 
     await expect
       .poll(
