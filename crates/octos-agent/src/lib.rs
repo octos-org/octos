@@ -34,6 +34,7 @@ pub mod progress;
 pub mod prompt_guard;
 pub mod prompt_layer;
 pub mod provider_tools;
+pub mod recorder;
 pub mod sandbox;
 mod sanitize;
 pub mod session;
@@ -109,6 +110,7 @@ pub use plugins::{PluginLoadOptions, PluginLoadResult, PluginLoader, SynthesisCo
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
+pub use recorder::{BlackBoxRecorder, RecordEntry};
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
