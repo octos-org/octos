@@ -23,26 +23,31 @@ use octos_agent::{
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
-    ApprovalRequestedEvent, ApprovalTypedDetails, HydratedMessage, HydratedTurn, InputItem,
-    MessageDeltaEvent, MessagePersistedEvent, MessagePersistedSource, OutputCursor,
-    ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
-    SESSION_HYDRATE_INCLUDE_MAX, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
-    SessionOpenResult, SessionOpened, TaskCancelParams, TaskCancelResult, TaskListEntry,
-    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
+    ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
+    ContentListParams, HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent,
+    MessagePersistedEvent, MessagePersistedSource, OutputCursor, ReplayLossyEvent, RpcError,
+    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
+    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionDeleteParams,
+    SessionFilesListParams, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionMessagesPageParams, SessionOpenParams, SessionOpenResult, SessionOpened,
+    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SystemStatusGetParams, TaskCancelParams, TaskCancelResult,
+    TaskListEntry, TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
     TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
     ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
     ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
     TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent,
     TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem,
-    UiArtifactPaneSnapshot, UiCommand, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
-    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
-    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand,
+    UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem,
+    UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
+    UiProtocolCapabilities, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
 use serde::Serialize;
@@ -518,6 +523,23 @@ struct ConnectionUiFeatures {
     /// `message/persisted` shape is preserved and `turn/spawn_complete`
     /// is suppressed.
     spawn_complete: bool,
+    /// M12 Phase D-1 `auxiliary.rest_to_ws.v1` negotiated. Unlocks the
+    /// thirteen auxiliary JSON-RPC methods (`session/list`,
+    /// `session/snapshot`, `session/messages_page`, `session/status.get`,
+    /// `session/files.list`, `session/tasks.list`,
+    /// `session/workspace.get`, `session/title.set`, `session/delete`,
+    /// `system/status.get`, `content/list`, `content/delete`,
+    /// `content/bulk_delete`) on the existing WS connection.
+    /// Capability-gated per ADR
+    /// `docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`. REST endpoints
+    /// remain available for clients that do not negotiate this feature.
+    /// **Strict opt-in (codex review):** the gate fires for these methods
+    /// regardless of whether `header_present` is true, so a client that
+    /// sends no feature header at all still receives
+    /// `method_not_supported` and falls back to REST. This is what makes
+    /// Phase D-1 truly additive — pre-existing clients cannot trip into
+    /// the new methods without explicit negotiation.
+    auxiliary_rest_to_ws_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -551,6 +573,11 @@ impl ConnectionUiFeatures {
                 UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             ),
             spawn_complete: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
+            auxiliary_rest_to_ws_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
         }
     }
@@ -595,6 +622,9 @@ impl ConnectionUiFeatures {
         }
         if self.spawn_complete {
             requested.push(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1);
+        }
+        if self.auxiliary_rest_to_ws_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -1444,6 +1474,14 @@ pub async fn ws_handler(
     // sessions originated from a hosted subdomain.
     let routed_profile_id = super::handlers::routed_profile_id_from_headers(&state, &headers);
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
+    // M12 Phase D-1: auxiliary REST→WS dispatchers reuse the same REST
+    // handlers in `handlers.rs` for business logic, which means they
+    // need the same axum extractor inputs the REST routes received.
+    // Snapshot the HeaderMap and AuthIdentity onto the connection so
+    // each dispatcher arm can re-build the extractor tuple without a
+    // round-trip back through the router. None of the existing dispatch
+    // arms read these; only the new aux-REST-to-WS arms do.
+    let auth_identity = identity.map(|Extension(identity)| identity);
     ws.on_upgrade(move |socket| {
         ui_protocol_connection(
             socket,
@@ -1451,6 +1489,8 @@ pub async fn ws_handler(
             connection_profile_id,
             routed_profile_id,
             features,
+            headers,
+            auth_identity,
         )
     })
 }
@@ -1461,6 +1501,8 @@ async fn ui_protocol_connection(
     connection_profile_id: Option<String>,
     routed_profile_id: Option<String>,
     features: ConnectionUiFeatures,
+    connection_headers: HeaderMap,
+    connection_identity: Option<AuthIdentity>,
 ) {
     let (ws_sink, mut ws_rx) = socket.split();
     // Decouple the network sink from request handlers via a bounded channel
@@ -1637,6 +1679,95 @@ async fn ui_protocol_connection(
                     ),
                 );
             }
+            // -------- M12 Phase D-1 auxiliary REST → WS dispatchers --------
+            //
+            // Each arm below delegates to the same REST handler in
+            // `crates/octos-cli/src/api/handlers.rs` (or
+            // `auth_handlers.rs`) that the REST route uses. We rebuild
+            // the axum extractor tuple from the snapshotted connection
+            // headers + identity, await the handler, and forward the
+            // JSON body as the WS RPC result. No business logic is
+            // duplicated; the REST endpoints stay unchanged.
+            UiCommand::SessionList(params) => {
+                handle_session_list(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionSnapshot(params) => {
+                handle_session_snapshot(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionMessagesPage(params) => {
+                handle_session_messages_page(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionStatusGet(params) => {
+                handle_session_status_get(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionFilesList(params) => {
+                handle_session_files_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionTasksList(params) => {
+                handle_session_tasks_list(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionWorkspaceGet(params) => {
+                handle_session_workspace_get(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionTitleSet(params) => {
+                handle_session_title_set(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionDelete(params) => {
+                handle_session_delete(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SystemStatusGet(params) => {
+                handle_system_status_get(&ws, &state, id, params).await;
+            }
+            UiCommand::ContentList(params) => {
+                handle_content_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::ContentDelete(params) => {
+                handle_content_delete(&ws, &state, connection_identity.as_ref(), id, params).await;
+            }
+            UiCommand::ContentBulkDelete(params) => {
+                handle_content_bulk_delete(&ws, &state, connection_identity.as_ref(), id, params)
+                    .await;
+            }
         }
     }
 
@@ -1670,20 +1801,77 @@ fn route_rpc_command(
     request: RpcRequest<Value>,
     features: ConnectionUiFeatures,
 ) -> Result<UiCommand, RpcError> {
-    let command = UiCommand::from_rpc_request(request)?;
-    let method = command.method();
-    if !ui_protocol_server_supported_methods().contains(&method) {
-        return Err(RpcError::method_not_supported(method));
+    let method_str = request.method.as_str();
+    if !ui_protocol_server_supported_methods().contains(&method_str) {
+        return Err(RpcError::method_not_supported(method_str));
     }
-    // UPCR-2026-009 / -010 / -011: when the method is gated behind a feature
-    // flag and the connection did not negotiate that flag (and a feature
-    // header was present), reject with `method_not_supported`. Connections
-    // that send no feature header at all retain the legacy "advertise full
-    // first-slice in `SessionOpened`" behaviour and so see the methods as
-    // available — the gate fires only when the client opted into
-    // negotiation per UPCR-2026-007 but skipped this feature.
+    // UPCR-2026-009 / -010 / -011 + M12 Phase D-1: when the method is
+    // gated behind a feature flag and the connection did not negotiate
+    // that flag, reject with `method_not_supported` BEFORE attempting
+    // to deserialize the params. Doing the gate first means clients
+    // that targeted a capability-gated method without negotiating the
+    // feature see a clean `method_not_supported` (and can fall back
+    // to REST) instead of `invalid_params` for an unrelated payload
+    // shape — the spec contract is "we don't know about this method
+    // at all", not "we half-know it".
+    //
+    // Two gate flavours coexist:
+    //
+    // 1. **Legacy header-present gates** (`session/hydrate`,
+    //    `thread/graph/get`, `turn/state/get`, `task/list`,
+    //    `task/cancel`, `task/restart_from_node`): pre-existing
+    //    capabilities that historically relied on
+    //    `header_present == true` to fire — clients that send NO
+    //    feature header at all see the full first-slice in
+    //    `SessionOpened.capabilities` per UPCR-2026-007 and so see
+    //    these methods as available. Changing that legacy behaviour
+    //    here is out of scope for Phase D-1.
+    //
+    // 2. **Strict opt-in gates** (M12 Phase D-1 auxiliary methods):
+    //    the rollout-flag contract is "no negotiation = no access".
+    //    A client that sends no feature header at all must NOT trip
+    //    into the new methods accidentally — otherwise the additive
+    //    Phase D-1 contract is broken for every pre-existing client.
+    //    These gates fire regardless of `header_present`.
+    //
+    // Codex review 2026-05-12: the original implementation collapsed
+    // both flavours under `if features.header_present { ... }`, which
+    // let no-header clients call `session/delete` and friends without
+    // negotiating the capability. The split below restores the
+    // strict-opt-in semantic for the new surface while preserving
+    // legacy behaviour for pre-existing gates that explicitly relied
+    // on it.
+
+    // Flavour 2: strict opt-in. Always reject when the capability is
+    // not negotiated, regardless of whether the client sent any
+    // feature header at all.
+    let strict_gated = match method_str {
+        octos_core::ui_protocol::methods::SESSION_LIST
+        | octos_core::ui_protocol::methods::SESSION_SNAPSHOT
+        | octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE
+        | octos_core::ui_protocol::methods::SESSION_STATUS_GET
+        | octos_core::ui_protocol::methods::SESSION_FILES_LIST
+        | octos_core::ui_protocol::methods::SESSION_TASKS_LIST
+        | octos_core::ui_protocol::methods::SESSION_WORKSPACE_GET
+        | octos_core::ui_protocol::methods::SESSION_TITLE_SET
+        | octos_core::ui_protocol::methods::SESSION_DELETE
+        | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
+        | octos_core::ui_protocol::methods::CONTENT_LIST
+        | octos_core::ui_protocol::methods::CONTENT_DELETE
+        | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE => {
+            Some(features.auxiliary_rest_to_ws_v1)
+        }
+        _ => None,
+    };
+    if let Some(false) = strict_gated {
+        return Err(RpcError::method_not_supported(method_str));
+    }
+
+    // Flavour 1: legacy header-present gates. Fire only when the
+    // client opted into negotiation per UPCR-2026-007 but skipped a
+    // specific feature.
     if features.header_present {
-        let gated = match method {
+        let gated = match method_str {
             octos_core::ui_protocol::methods::SESSION_HYDRATE => Some(features.session_hydrate),
             octos_core::ui_protocol::methods::THREAD_GRAPH_GET => Some(features.thread_graph),
             octos_core::ui_protocol::methods::TURN_STATE_GET => Some(features.turn_state_get),
@@ -1695,10 +1883,10 @@ fn route_rpc_command(
             _ => None,
         };
         if let Some(false) = gated {
-            return Err(RpcError::method_not_supported(method));
+            return Err(RpcError::method_not_supported(method_str));
         }
     }
-    Ok(command)
+    UiCommand::from_rpc_request(request)
 }
 
 fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
@@ -4177,6 +4365,803 @@ fn send_serialized_rpc_result<T: Serialize>(
     }
 }
 
+// ===================== M12 Phase D-1 dispatchers =====================
+//
+// Each handler below mirrors a REST endpoint listed in
+// `docs/adr/m12-phase-d-auxiliary-rest-to-ws.md`. The strategy is to
+// invoke the existing REST handler function directly with the
+// connection's snapshotted `HeaderMap` and `AuthIdentity`, then forward
+// the resulting JSON body as the WS RPC result. This keeps the
+// auxiliary surface fed by exactly one code path (the REST handler in
+// `crates/octos-cli/src/api/handlers.rs` /
+// `crates/octos-cli/src/api/auth_handlers.rs`), so Phase D-5 retirement
+// later does not have to re-validate logic.
+
+/// Per-handler limit for extracting JSON bodies from a REST `Response`.
+/// Mirrors `MAX_TEXT_FRAME_BYTES` (1 MiB) so the WS write side cannot
+/// be fed a frame the peer would reject as oversize. Truncates with an
+/// RPC error if exceeded.
+const AUX_REST_TO_WS_MAX_BODY_BYTES: usize = MAX_TEXT_FRAME_BYTES;
+
+/// What kind of resource the dispatcher was addressing when a REST 404
+/// came back. The bridge uses this to pick the right `RpcError` variant
+/// — session-scoped methods surface `UNKNOWN_SESSION` (-32100) so the
+/// client can reconcile against its session table; non-session methods
+/// (content/profile/system) surface the generic `RESOURCE_NOT_FOUND`
+/// (-32170) so a content row miss does not pollute the session error
+/// channel.
+///
+/// Codex review 2026-05-12: the original implementation mapped EVERY
+/// REST 404 to `RpcError::unknown_session(format!("{method}: not found"))`,
+/// which (a) put the method name into the `session_id` field of the
+/// error data and (b) misclassified content/profile 404s as session
+/// misses.
+#[derive(Debug, Clone)]
+enum RestResourceContext {
+    /// Session-scoped endpoint. `id` is the addressed session id.
+    Session { id: String },
+    /// Non-session resource. `resource_type` is a short tag
+    /// ("content", "profile", ...); `id` is the resource id the
+    /// client sent (empty when the request had no addressable id).
+    Resource { resource_type: String, id: String },
+}
+
+impl RestResourceContext {
+    fn session(id: impl Into<String>) -> Self {
+        Self::Session { id: id.into() }
+    }
+
+    fn resource(resource_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::Resource {
+            resource_type: resource_type.into(),
+            id: id.into(),
+        }
+    }
+}
+
+/// Convert an axum `Response` from a REST handler into a parsed JSON
+/// [`Value`] suitable for embedding in a WS RPC result. Non-2xx
+/// responses are surfaced as typed RPC errors so the client sees the
+/// same shape it would on REST today (404/400/503 → typed RpcError
+/// variants per the ADR's `Error envelope` mapping).
+async fn rest_response_to_rpc_value(
+    response: axum::response::Response,
+    method: &str,
+    context: RestResourceContext,
+) -> Result<Value, RpcError> {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
+        .await
+        .map_err(|err| {
+            RpcError::internal_error(format!("{method}: read REST body failed: {err}"))
+        })?;
+    if !status.is_success() {
+        // Map common REST statuses to the ADR's error envelope. The
+        // body is included as `data.detail` for debugging but the
+        // message is the human-readable summary.
+        let detail = String::from_utf8_lossy(body.as_ref()).into_owned();
+        let detail = if detail.is_empty() {
+            None
+        } else {
+            Some(detail)
+        };
+        return Err(rest_status_to_rpc_error(method, status, detail, &context));
+    }
+    if body.is_empty() {
+        // REST 204 No Content (and equivalents like our `delete_session`
+        // helper) becomes a `{}` result on the WS side.
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_slice::<Value>(body.as_ref())
+        .map_err(|err| RpcError::internal_error(format!("{method}: REST body was not JSON: {err}")))
+}
+
+fn rest_status_to_rpc_error(
+    method: &str,
+    status: axum::http::StatusCode,
+    detail: Option<String>,
+    context: &RestResourceContext,
+) -> RpcError {
+    let mut data = serde_json::Map::new();
+    data.insert("rest_status".into(), json!(status.as_u16()));
+    if let Some(detail) = detail {
+        // Cap detail at 2 KiB so error frames stay small even if the
+        // REST handler returns a verbose body.
+        let mut detail = detail;
+        if detail.len() > 2048 {
+            octos_core::truncate_utf8(&mut detail, 2048, "…");
+        }
+        data.insert("detail".into(), json!(detail));
+    }
+    use axum::http::StatusCode;
+    let error = match status {
+        // Codex review 2026-05-12: split session-scoped 404 from
+        // generic 404. Session-scoped methods echo `session_id` in
+        // `data` per spec §10; non-session resources go through the
+        // new `RESOURCE_NOT_FOUND` slot so the resource_type + id
+        // reach the client without abusing the `session_id` field.
+        StatusCode::NOT_FOUND => match context {
+            RestResourceContext::Session { id } => RpcError::unknown_session(id.clone()),
+            RestResourceContext::Resource { resource_type, id } => {
+                RpcError::not_found(resource_type.clone(), id.clone())
+            }
+        },
+        StatusCode::BAD_REQUEST => {
+            RpcError::invalid_params(format!("{method}: REST returned 400 bad_request"))
+        }
+        StatusCode::SERVICE_UNAVAILABLE => RpcError::runtime_not_ready(format!(
+            "{method}: REST handler not configured on this server"
+        )),
+        StatusCode::CONFLICT => {
+            RpcError::invalid_params(format!("{method}: REST returned 409 conflict"))
+        }
+        _ => RpcError::internal_error(format!(
+            "{method}: REST returned status {}",
+            status.as_u16()
+        )),
+    };
+    // Merge the existing data (rest_status + optional detail) with
+    // whatever the typed variant already wrote (e.g.
+    // `unknown_session.data.kind = "unknown_session"`,
+    // `unknown_session.data.session_id = "..."`). Existing keys win so
+    // the typed-error contract is preserved.
+    let mut merged = data;
+    if let Some(Value::Object(existing)) = error.data.clone() {
+        for (k, v) in existing {
+            merged.insert(k, v);
+        }
+    }
+    error.with_data(Value::Object(merged))
+}
+
+/// Forward a parsed JSON body to the WS RPC result channel. Used by
+/// every Phase D-1 dispatcher after extracting the REST handler body.
+fn send_aux_rpc_result(ws: &WsConnection, id: String, method: &str, body: Value) {
+    // The body shape MUST match the WS result schema documented in
+    // `octos-core/src/ui_protocol.rs`. For methods whose Result wraps
+    // the REST body under a single field (e.g. `SessionListResult.sessions`),
+    // callers are responsible for constructing that wrapper before
+    // invoking this helper; methods whose Result is a direct alias of
+    // the REST body pass it through verbatim.
+    if let Err(error) = send_rpc_result(ws, id, body) {
+        tracing::debug!(
+            target: "octos::ui_protocol::ws::aux",
+            method = %method,
+            ?error,
+            "aux REST→WS result send failed"
+        );
+    }
+}
+
+/// Build a synthetic `Path<String>` extractor from the session id in
+/// the WS params. Axum's `Path` is a tuple wrapper so we construct it
+/// directly via `Path(...)` — the REST handler treats it like an
+/// already-extracted route segment.
+fn axum_path(value: String) -> axum::extract::Path<String> {
+    axum::extract::Path(value)
+}
+
+async fn handle_session_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: String,
+    _params: SessionListParams,
+) {
+    let response = super::handlers::list_sessions(State(state.clone()), headers.clone()).await;
+    let method = octos_core::ui_protocol::methods::SESSION_LIST;
+    // Collection endpoint — no addressable session id. Treat any
+    // (unexpected) 404 as a generic resource-not-found rather than
+    // an `UNKNOWN_SESSION` miss.
+    let context = RestResourceContext::resource("session", "");
+    match rest_response_to_rpc_value(response, method, context).await {
+        Ok(sessions) => {
+            send_aux_rpc_result(ws, id, method, json!({ "sessions": sessions }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_status_get(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: String,
+    params: SessionStatusGetParams,
+) {
+    let topic_params = axum::extract::Query(super::handlers::TopicQueryParams {
+        topic: params.topic.clone(),
+    });
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::session_status(
+        State(state.clone()),
+        headers.clone(),
+        axum_path(params.session_id),
+        topic_params,
+    )
+    .await;
+    let method = octos_core::ui_protocol::methods::SESSION_STATUS_GET;
+    let context = RestResourceContext::session(session_id_str);
+    match rest_response_to_rpc_value(response, method, context).await {
+        Ok(status) => {
+            send_aux_rpc_result(ws, id, method, json!({ "status": status }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_files_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionFilesListParams,
+) {
+    let identity_ext = identity.cloned().map(Extension);
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::session_files(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        axum_path(params.session_id),
+    )
+    .await;
+    let method = octos_core::ui_protocol::methods::SESSION_FILES_LIST;
+    let context = RestResourceContext::session(session_id_str);
+    match rest_response_to_rpc_value(response, method, context).await {
+        Ok(files) => {
+            send_aux_rpc_result(ws, id, method, json!({ "files": files }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_tasks_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: String,
+    params: SessionTasksListParams,
+) {
+    let topic_params = axum::extract::Query(super::handlers::TopicQueryParams {
+        topic: params.topic.clone(),
+    });
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::session_tasks(
+        State(state.clone()),
+        headers.clone(),
+        axum_path(params.session_id),
+        topic_params,
+    )
+    .await;
+    let method = octos_core::ui_protocol::methods::SESSION_TASKS_LIST;
+    let context = RestResourceContext::session(session_id_str);
+    match rest_response_to_rpc_value(response, method, context).await {
+        Ok(tasks) => {
+            send_aux_rpc_result(ws, id, method, json!({ "tasks": tasks }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_workspace_get(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionWorkspaceGetParams,
+) {
+    let identity_ext = identity.cloned().map(Extension);
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::session_workspace_contract(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        axum_path(params.session_id),
+    )
+    .await;
+    let method = octos_core::ui_protocol::methods::SESSION_WORKSPACE_GET;
+    let context = RestResourceContext::session(session_id_str);
+    match rest_response_to_rpc_value(response, method, context).await {
+        Ok(contracts) => {
+            send_aux_rpc_result(ws, id, method, json!({ "contracts": contracts }));
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_snapshot(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionSnapshotParams,
+) {
+    // Snapshot is a single round trip that collapses the three REST
+    // bootstrap calls (status, files, tasks). Run them concurrently
+    // and surface the first error.
+    let method = octos_core::ui_protocol::methods::SESSION_SNAPSHOT;
+    let session_id_str = params.session_id.clone();
+    let topic_params = axum::extract::Query(super::handlers::TopicQueryParams {
+        topic: params.topic.clone(),
+    });
+    let identity_ext = identity.cloned().map(Extension);
+    let status_fut = super::handlers::session_status(
+        State(state.clone()),
+        headers.clone(),
+        axum_path(params.session_id.clone()),
+        axum::extract::Query(super::handlers::TopicQueryParams {
+            topic: params.topic.clone(),
+        }),
+    );
+    let files_fut = super::handlers::session_files(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        axum_path(params.session_id.clone()),
+    );
+    let tasks_fut = super::handlers::session_tasks(
+        State(state.clone()),
+        headers.clone(),
+        axum_path(params.session_id),
+        topic_params,
+    );
+    let (status_resp, files_resp, tasks_resp) = tokio::join!(status_fut, files_fut, tasks_fut);
+    let status = match rest_response_to_rpc_value(
+        status_resp,
+        method,
+        RestResourceContext::session(session_id_str.clone()),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let files = match rest_response_to_rpc_value(
+        files_resp,
+        method,
+        RestResourceContext::session(session_id_str.clone()),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let tasks = match rest_response_to_rpc_value(
+        tasks_resp,
+        method,
+        RestResourceContext::session(session_id_str),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    send_aux_rpc_result(
+        ws,
+        id,
+        method,
+        json!({
+            "status": status,
+            "files": files,
+            "tasks": tasks,
+        }),
+    );
+}
+
+async fn handle_session_messages_page(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: SessionMessagesPageParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE;
+    let limit = params
+        .limit
+        .unwrap_or(SESSION_MESSAGES_PAGE_DEFAULT_LIMIT)
+        .min(SESSION_MESSAGES_PAGE_MAX_LIMIT);
+    let offset = params
+        .offset
+        .unwrap_or(0)
+        .min(SESSION_MESSAGES_PAGE_MAX_OFFSET);
+    let pagination = axum::extract::Query(super::handlers::PaginationParams {
+        limit,
+        offset,
+        source: None,
+        since_seq: params.since_seq,
+        topic: params.topic.clone(),
+    });
+    let identity_ext = identity.cloned().map(Extension);
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::session_messages(
+        State(state.clone()),
+        headers.clone(),
+        identity_ext,
+        axum_path(params.session_id),
+        pagination,
+    )
+    .await;
+    // Codex review 2026-05-12: previously, this dispatcher mapped REST
+    // 404 to an empty page and dropped REST 503 onto the generic JSON
+    // path (which then surfaced `INTERNAL_ERROR`). Both diverged from
+    // the REST contract documented at `handlers.rs:767` (gateway
+    // proxy 404) and `handlers.rs:783` (standalone fallback 503).
+    // Mirror REST faithfully now: 404 → `UNKNOWN_SESSION` with the
+    // addressed `session_id` echoed in `data` per spec §10; 503 →
+    // `runtime_not_ready` so clients can distinguish "session does
+    // not exist" from "server has no gateway wired".
+    let context = RestResourceContext::session(session_id_str);
+    match rest_response_to_rpc_value(response, method, context).await {
+        Ok(messages) => {
+            let len = messages.as_array().map(|arr| arr.len()).unwrap_or(0);
+            let has_more = len == limit;
+            let next_offset = offset.saturating_add(len);
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "messages": messages,
+                    "has_more": has_more,
+                    "next_offset": next_offset,
+                }),
+            );
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_session_title_set(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: String,
+    params: SessionTitleSetParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_TITLE_SET;
+    let trimmed = params.title.trim();
+    if trimmed.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: title must not be empty")),
+        );
+        return;
+    }
+    if trimmed.chars().count() > SESSION_TITLE_SET_MAX_CHARS {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: title must be at most {SESSION_TITLE_SET_MAX_CHARS} chars"
+            )),
+        );
+        return;
+    }
+    let body = axum::Json(super::handlers::UpdateTitleRequest {
+        title: trimmed.to_string(),
+    });
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::update_session_title(
+        State(state.clone()),
+        headers.clone(),
+        axum_path(params.session_id),
+        body,
+    )
+    .await;
+    let status = response.status();
+    if status.is_success() {
+        send_aux_rpc_result(
+            ws,
+            id,
+            method,
+            json!({
+                "session_id": session_id_str,
+                "title": trimmed,
+            }),
+        );
+    } else {
+        let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
+        let context = RestResourceContext::session(session_id_str);
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            rest_status_to_rpc_error(method, status, detail, &context),
+        );
+    }
+}
+
+async fn handle_session_delete(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    id: String,
+    params: SessionDeleteParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_DELETE;
+    let session_id_str = params.session_id.clone();
+    let response = super::handlers::delete_session(
+        State(state.clone()),
+        headers.clone(),
+        axum_path(params.session_id),
+    )
+    .await;
+    let status = response.status();
+    if status.is_success() {
+        send_aux_rpc_result(ws, id, method, json!({}));
+    } else {
+        let detail = axum::body::to_bytes(response.into_body(), AUX_REST_TO_WS_MAX_BODY_BYTES)
+            .await
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
+        let context = RestResourceContext::session(session_id_str);
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            rest_status_to_rpc_error(method, status, detail, &context),
+        );
+    }
+}
+
+async fn handle_system_status_get(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    id: String,
+    _params: SystemStatusGetParams,
+) {
+    let method = octos_core::ui_protocol::methods::SYSTEM_STATUS_GET;
+    let axum::Json(status) = super::handlers::status(State(state.clone())).await;
+    match serde_json::to_value(&status) {
+        Ok(value) => send_aux_rpc_result(ws, id, method, json!({ "status": value })),
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: serialize status failed: {error}")),
+            );
+        }
+    }
+}
+
+async fn handle_content_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: ContentListParams,
+) {
+    let method = octos_core::ui_protocol::methods::CONTENT_LIST;
+    let Some(identity) = identity.cloned() else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::permission_denied(format!("{method}: authenticated user identity required")),
+        );
+        return;
+    };
+    // `ContentQuery` deserializes from the same JSON the REST query
+    // string built. Forwarding the `filters` object lets clients opt
+    // in to category / search / pagination without us redefining the
+    // struct here. Null / empty filters fall back to the REST default
+    // (`Default::default()`) so `content/list` with `{}` params works
+    // identically to `GET /api/my/content` with no query string.
+    let filters = if params.filters.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        params.filters
+    };
+    let query: crate::content_catalog::ContentQuery = match serde_json::from_value(filters) {
+        Ok(q) => q,
+        Err(err) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!("{method}: invalid filters: {err}")),
+            );
+            return;
+        }
+    };
+    let result = super::auth_handlers::my_content(
+        State(state.clone()),
+        headers.clone(),
+        Extension(identity),
+        axum::extract::Query(query),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(value)) => match serde_json::to_value(&value) {
+            Ok(json_value) => {
+                let entries = json_value
+                    .get("entries")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                let total = json_value.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                send_aux_rpc_result(
+                    ws,
+                    id,
+                    method,
+                    json!({
+                        "entries": entries,
+                        "total": total,
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!(
+                        "{method}: serialize content list failed: {error}"
+                    )),
+                );
+            }
+        },
+        Err((status, message)) => {
+            // `content/list` is a collection endpoint — no
+            // addressable id. Use the generic resource context so a
+            // (rare) 404 surfaces as `RESOURCE_NOT_FOUND` rather than
+            // `UNKNOWN_SESSION`.
+            let context = RestResourceContext::resource("content", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(message), &context),
+            );
+        }
+    }
+}
+
+async fn handle_content_delete(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: ContentDeleteParams,
+) {
+    let method = octos_core::ui_protocol::methods::CONTENT_DELETE;
+    let Some(identity) = identity.cloned() else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::permission_denied(format!("{method}: authenticated user identity required")),
+        );
+        return;
+    };
+    let content_id = params.id.clone();
+    let result = super::auth_handlers::delete_my_content(
+        State(state.clone()),
+        Extension(identity),
+        axum_path(params.id),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(action)) => {
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "deleted": action.ok,
+                }),
+            );
+        }
+        Err((status, message)) => {
+            // Content row miss → `RESOURCE_NOT_FOUND` with the content
+            // id echoed in `data.identifier`. Previously this funnelled
+            // through `UNKNOWN_SESSION` and stuffed the method name in
+            // the `session_id` slot (codex review 2026-05-12).
+            let context = RestResourceContext::resource("content", content_id);
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(message), &context),
+            );
+        }
+    }
+}
+
+async fn handle_content_bulk_delete(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    identity: Option<&AuthIdentity>,
+    id: String,
+    params: ContentBulkDeleteParams,
+) {
+    let method = octos_core::ui_protocol::methods::CONTENT_BULK_DELETE;
+    let Some(identity) = identity.cloned() else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::permission_denied(format!("{method}: authenticated user identity required")),
+        );
+        return;
+    };
+    // Codex review 2026-05-12: reject over-cap bulk-delete requests
+    // before they reach the catalog write-lock. The 1 MiB frame limit
+    // is a coarser secondary check; this per-method cap keeps a
+    // single oversized request from monopolizing the catalog for
+    // even a small bounded window. Mirrored in
+    // `octos-core::ui_protocol::CONTENT_BULK_DELETE_MAX_IDS`.
+    if params.ids.len() > octos_core::ui_protocol::CONTENT_BULK_DELETE_MAX_IDS {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: ids count {} exceeds maximum of {}",
+                params.ids.len(),
+                octos_core::ui_protocol::CONTENT_BULK_DELETE_MAX_IDS,
+            ))
+            .with_data(json!({
+                "max_ids": octos_core::ui_protocol::CONTENT_BULK_DELETE_MAX_IDS,
+                "requested_ids": params.ids.len(),
+            })),
+        );
+        return;
+    }
+    let result = super::auth_handlers::bulk_delete_my_content(
+        State(state.clone()),
+        Extension(identity),
+        axum::Json(super::auth_handlers::BulkDeleteRequest { ids: params.ids }),
+    )
+    .await;
+    match result {
+        Ok(axum::Json(action)) => {
+            // The REST handler stuffs the count into the user-facing
+            // message ("N item(s) deleted."). Parse it back out so the
+            // WS shape can return a typed integer per the ADR.
+            let deleted = action
+                .message
+                .as_deref()
+                .and_then(|msg| msg.split_whitespace().next())
+                .and_then(|first| first.parse::<usize>().ok())
+                .unwrap_or(0);
+            send_aux_rpc_result(ws, id, method, json!({ "deleted": deleted }));
+        }
+        Err((status, message)) => {
+            // Bulk-delete is a collection operation; no single id is
+            // the locus. Surface 404 (which the REST handler should
+            // never return for this method) through the generic
+            // resource context.
+            let context = RestResourceContext::resource("content", "");
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                rest_status_to_rpc_error(method, status, Some(message), &context),
+            );
+        }
+    }
+}
+
 fn task_query_store_or_error(
     state: &Arc<AppState>,
 ) -> Result<&crate::session_actor::SessionTaskQueryStore, RpcError> {
@@ -6358,6 +7343,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
         );
@@ -6408,6 +7394,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
         );
@@ -6503,6 +7490,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
         );
@@ -6553,6 +7541,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
         );
@@ -6596,6 +7585,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
         );
@@ -6682,6 +7672,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
         );
@@ -7973,6 +8964,7 @@ mod tests {
                 turn_state_get: false,
                 message_persisted: false,
                 spawn_complete: false,
+                auxiliary_rest_to_ws_v1: false,
                 header_present: true,
             },
             SessionOpenParams {
@@ -8157,6 +9149,370 @@ mod tests {
                 .iter()
                 .any(|method| method == octos_core::ui_protocol::methods::TASK_CANCEL),
             "task/cancel must be gated by harness.task_control.v1"
+        );
+    }
+
+    // ===== M12 Phase D-1 auxiliary REST → WS negotiation =====
+
+    #[test]
+    fn aux_rest_to_ws_v1_feature_token_parses_from_query_string() {
+        // Mirrors the existing `?ui_feature=session.workspace_cwd.v1`
+        // pattern (`e2e/scripts/soak-m11-multi.ts:21`). A client that
+        // appends `?ui_feature=auxiliary.rest_to_ws.v1` MUST be picked
+        // up by the per-connection feature snapshot.
+        let headers = HeaderMap::new();
+        let features = ConnectionUiFeatures::from_headers_and_query(
+            &headers,
+            Some("token=redacted&ui_feature=auxiliary.rest_to_ws.v1"),
+        );
+        assert!(features.auxiliary_rest_to_ws_v1);
+        assert!(features.header_present);
+        // Negative: an unrelated feature stays unflipped.
+        assert!(!features.harness_task_control);
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_feature_token_parses_from_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.auxiliary_rest_to_ws_v1);
+        assert!(features.header_present);
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_not_negotiated_when_only_other_features_requested() {
+        // Client requests `harness.task_control.v1` — the auxiliary
+        // capability must NOT be auto-enabled. Phase D-1 is strictly
+        // opt-in.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.harness_task_control);
+        assert!(!features.auxiliary_rest_to_ws_v1);
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_negotiated_capabilities_include_only_when_requested() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        let capabilities = features.negotiated_capabilities();
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+        for method in [
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SESSION_SNAPSHOT,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SESSION_STATUS_GET,
+            octos_core::ui_protocol::methods::SESSION_FILES_LIST,
+            octos_core::ui_protocol::methods::SESSION_TASKS_LIST,
+            octos_core::ui_protocol::methods::SESSION_WORKSPACE_GET,
+            octos_core::ui_protocol::methods::SESSION_TITLE_SET,
+            octos_core::ui_protocol::methods::SESSION_DELETE,
+            octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            octos_core::ui_protocol::methods::CONTENT_DELETE,
+            octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                capabilities.supports_method(method),
+                "{method} must be advertised when auxiliary.rest_to_ws.v1 is negotiated"
+            );
+        }
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_negotiated_capabilities_omit_when_not_requested() {
+        let mut headers = HeaderMap::new();
+        // Request a different feature so `header_present == true`.
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        let capabilities = features.negotiated_capabilities();
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
+        for method in [
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SESSION_SNAPSHOT,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            octos_core::ui_protocol::methods::CONTENT_DELETE,
+            octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+        ] {
+            assert!(
+                !capabilities.supports_method(method),
+                "{method} must NOT be advertised without auxiliary.rest_to_ws.v1"
+            );
+        }
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_route_rpc_rejects_methods_when_feature_not_negotiated() {
+        // A client that sent ANY feature header but NOT
+        // `auxiliary.rest_to_ws.v1` must see the aux methods rejected
+        // with `method_not_supported`, matching the existing gate for
+        // `task/list` behind `harness.task_control.v1`.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.header_present);
+        assert!(!features.auxiliary_rest_to_ws_v1);
+        for method in [
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SESSION_SNAPSHOT,
+            octos_core::ui_protocol::methods::SESSION_DELETE,
+            octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+        ] {
+            let request = RpcRequest::<Value>::new("req-1", method, Value::Null);
+            let result = route_rpc_command(request, features);
+            let err = result.expect_err("aux method must be rejected without feature");
+            assert_eq!(
+                err.code,
+                octos_core::ui_protocol::rpc_error_codes::METHOD_NOT_SUPPORTED,
+                "{method} must reject with METHOD_NOT_SUPPORTED"
+            );
+        }
+    }
+
+    #[test]
+    fn aux_rest_to_ws_v1_route_rpc_accepts_methods_when_feature_negotiated() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(features.auxiliary_rest_to_ws_v1);
+        for (method, params) in [
+            (
+                octos_core::ui_protocol::methods::SESSION_LIST,
+                Value::Object(serde_json::Map::new()),
+            ),
+            (
+                octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+                Value::Object(serde_json::Map::new()),
+            ),
+        ] {
+            let request = RpcRequest::<Value>::new("req-2", method, params);
+            let cmd = route_rpc_command(request, features).expect("aux method accepted");
+            assert_eq!(cmd.method(), method);
+        }
+    }
+
+    /// Codex review 2026-05-12 (BLOCK 1): a client that sends NO
+    /// feature header at all must still be rejected when it calls one
+    /// of the M12 Phase D-1 auxiliary methods. The original
+    /// implementation gated only when `features.header_present` was
+    /// true, which let pre-existing no-header clients trip into
+    /// `session/delete` / `content/delete` / etc. accidentally — that
+    /// breaks the strict opt-in contract.
+    #[test]
+    fn aux_rest_to_ws_v1_route_rpc_rejects_methods_with_no_feature_header_at_all() {
+        // No header, no query string — the legacy "advertise full
+        // first-slice in SessionOpened" path. `header_present` must
+        // be false (verified) and `auxiliary_rest_to_ws_v1` must be
+        // false (verified), and yet the gate must fire.
+        let headers = HeaderMap::new();
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(
+            !features.header_present,
+            "no header → header_present must be false"
+        );
+        assert!(
+            !features.auxiliary_rest_to_ws_v1,
+            "no header → auxiliary.rest_to_ws.v1 must be false"
+        );
+        for method in [
+            octos_core::ui_protocol::methods::SESSION_LIST,
+            octos_core::ui_protocol::methods::SESSION_SNAPSHOT,
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            octos_core::ui_protocol::methods::SESSION_STATUS_GET,
+            octos_core::ui_protocol::methods::SESSION_FILES_LIST,
+            octos_core::ui_protocol::methods::SESSION_TASKS_LIST,
+            octos_core::ui_protocol::methods::SESSION_WORKSPACE_GET,
+            octos_core::ui_protocol::methods::SESSION_TITLE_SET,
+            octos_core::ui_protocol::methods::SESSION_DELETE,
+            octos_core::ui_protocol::methods::SYSTEM_STATUS_GET,
+            octos_core::ui_protocol::methods::CONTENT_LIST,
+            octos_core::ui_protocol::methods::CONTENT_DELETE,
+            octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
+        ] {
+            let request = RpcRequest::<Value>::new("req-no-header", method, Value::Null);
+            let result = route_rpc_command(request, features);
+            let err = result
+                .expect_err("aux method must be rejected when no feature header was sent at all");
+            assert_eq!(
+                err.code,
+                octos_core::ui_protocol::rpc_error_codes::METHOD_NOT_SUPPORTED,
+                "{method} must reject with METHOD_NOT_SUPPORTED even with no header",
+            );
+        }
+    }
+
+    /// Codex review 2026-05-12 (BLOCK 1, companion): the legacy
+    /// header-present gates (`session/hydrate`, `thread/graph/get`,
+    /// `turn/state/get`, `task/list`, `task/cancel`,
+    /// `task/restart_from_node`) must still pass through when no
+    /// header was sent at all — that's the documented
+    /// "advertise full first-slice in `SessionOpened`" fallback path.
+    /// Only the new M12 Phase D-1 surface flips to strict opt-in.
+    #[test]
+    fn legacy_header_present_gates_still_accept_methods_with_no_feature_header() {
+        // No header → all legacy gates fall through to
+        // `UiCommand::from_rpc_request`. The decode itself may fail
+        // because we send `Value::Null` as params, but the failure
+        // must come from `from_rpc_request`, not from the gate.
+        // Concretely: code must NOT be `METHOD_NOT_SUPPORTED`.
+        let headers = HeaderMap::new();
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(!features.header_present);
+        for method in [
+            octos_core::ui_protocol::methods::SESSION_HYDRATE,
+            octos_core::ui_protocol::methods::THREAD_GRAPH_GET,
+            octos_core::ui_protocol::methods::TURN_STATE_GET,
+            octos_core::ui_protocol::methods::TASK_LIST,
+            octos_core::ui_protocol::methods::TASK_CANCEL,
+            octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE,
+        ] {
+            let request = RpcRequest::<Value>::new("req-legacy", method, Value::Null);
+            let result = route_rpc_command(request, features);
+            // Either Ok (unlikely for Null params) or Err with a
+            // decode error — the key invariant is: NOT
+            // `METHOD_NOT_SUPPORTED`.
+            if let Err(err) = result {
+                assert_ne!(
+                    err.code,
+                    octos_core::ui_protocol::rpc_error_codes::METHOD_NOT_SUPPORTED,
+                    "{method} must NOT be rejected by capability gate when no header sent",
+                );
+            }
+        }
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 1): a REST 404 from a
+    /// session-scoped endpoint maps to `UNKNOWN_SESSION` with the
+    /// addressed session id in `data.session_id`. The original
+    /// implementation stuffed the method name into the session id
+    /// slot ("session/messages_page: not found"), defeating
+    /// reconciliation on the client side.
+    #[tokio::test]
+    async fn rest_status_to_rpc_error_404_session_context_echoes_session_id() {
+        let context = RestResourceContext::session("sess-abc");
+        let err = rest_status_to_rpc_error(
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            axum::http::StatusCode::NOT_FOUND,
+            Some("session not found".into()),
+            &context,
+        );
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::UNKNOWN_SESSION,
+        );
+        let data = err.data.as_ref().expect("typed error data");
+        assert_eq!(
+            data.get("kind").and_then(Value::as_str),
+            Some("unknown_session")
+        );
+        assert_eq!(
+            data.get("session_id").and_then(Value::as_str),
+            Some("sess-abc"),
+            "session_id slot must carry the addressed session id, not the method name",
+        );
+        // The REST status + detail are still attached for debugging.
+        assert_eq!(data.get("rest_status").and_then(Value::as_u64), Some(404));
+        assert!(data.get("detail").is_some());
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 1, companion): a REST 404 from
+    /// a non-session resource (content row, profile row) maps to the
+    /// new `RESOURCE_NOT_FOUND` slot with `resource_type` +
+    /// `identifier` echoed in `data`. Before this fix every 404 hit
+    /// `UNKNOWN_SESSION` regardless of resource kind, which forced
+    /// content/profile misses through a session-shaped error.
+    #[tokio::test]
+    async fn rest_status_to_rpc_error_404_resource_context_uses_not_found_slot() {
+        let context = RestResourceContext::resource("content", "c-42");
+        let err = rest_status_to_rpc_error(
+            octos_core::ui_protocol::methods::CONTENT_DELETE,
+            axum::http::StatusCode::NOT_FOUND,
+            None,
+            &context,
+        );
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::RESOURCE_NOT_FOUND,
+            "non-session 404 must NOT collapse to UNKNOWN_SESSION",
+        );
+        let data = err.data.as_ref().expect("typed error data");
+        assert_eq!(data.get("kind").and_then(Value::as_str), Some("not_found"));
+        assert_eq!(
+            data.get("resource_type").and_then(Value::as_str),
+            Some("content"),
+        );
+        assert_eq!(data.get("identifier").and_then(Value::as_str), Some("c-42"),);
+        assert_eq!(data.get("rest_status").and_then(Value::as_u64), Some(404));
+    }
+
+    /// Codex review 2026-05-12 (BLOCK 2): REST 503 from the
+    /// standalone fallback (no gateway wired) must surface as
+    /// `runtime_not_ready` rather than collapsing to `INTERNAL_ERROR`.
+    /// This matches `handlers.rs:783` (standalone returns 503 when
+    /// neither the gateway nor a local store can answer).
+    #[tokio::test]
+    async fn rest_status_to_rpc_error_503_maps_to_runtime_not_ready() {
+        let context = RestResourceContext::session("sess-503");
+        let err = rest_status_to_rpc_error(
+            octos_core::ui_protocol::methods::SESSION_MESSAGES_PAGE,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Some("Sessions not available".into()),
+            &context,
+        );
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::RUNTIME_NOT_READY,
+        );
+        let data = err.data.as_ref().expect("typed error data");
+        assert_eq!(data.get("rest_status").and_then(Value::as_u64), Some(503));
+    }
+
+    /// Codex review 2026-05-12 (MEDIUM 3): `content/bulk_delete` must
+    /// reject requests carrying more than
+    /// `CONTENT_BULK_DELETE_MAX_IDS` ids early, before the catalog
+    /// write-lock is taken. The dispatcher uses the constant from
+    /// `octos-core` so the cap is shared with the params DTO docs.
+    #[test]
+    fn content_bulk_delete_max_ids_constant_is_mirrored_from_core() {
+        assert_eq!(
+            octos_core::ui_protocol::CONTENT_BULK_DELETE_MAX_IDS,
+            256,
+            "bulk-delete cap is documented at 256 in the ADR; bump both sides if changed",
         );
     }
 
