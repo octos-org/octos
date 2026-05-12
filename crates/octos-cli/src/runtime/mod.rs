@@ -58,7 +58,7 @@ pub mod profile;
 pub mod session;
 
 pub use cache::SessionRuntimeCache;
-pub use profile::ProfileRuntime;
+pub use profile::{BootstrapRole, ProfileRuntime};
 pub use session::SessionRuntime;
 
 #[cfg(test)]

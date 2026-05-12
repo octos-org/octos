@@ -23,72 +23,220 @@ const EMBEDDINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("emb
 const DEFAULT_DIMENSION: usize = 1536;
 
 /// Store for episodes using redb (pure Rust embedded database).
+///
+/// # Degraded mode
+///
+/// `redb` is a single-writer-single-process embedded database — only
+/// one process at a time may hold the OS file lock on
+/// `episodes.redb`. In the production fleet `octos serve` and
+/// `octos gateway` run as separate processes that bootstrap
+/// `ProfileRuntime` independently per profile, and both call
+/// `EpisodeStore::open` against the same path. The first opener (the
+/// long-lived `octos serve` daemon) wins; the second opener (`octos
+/// gateway` subprocesses) previously crashed with
+/// `redb::DatabaseError::DatabaseAlreadyOpen` ("Database already
+/// open. Cannot acquire lock."), launchd restarted it, and the cycle
+/// repeated every ~2 seconds.
+///
+/// To prevent that crashloop without sacrificing serve-mode
+/// persistence, [`EpisodeStore::open_or_degraded`] falls back to a
+/// **degraded** in-memory store when the redb file is already locked:
+/// `db` is `None`, all mutating operations silently no-op, and all
+/// public read operations return empty. Callers that need to observe
+/// the degradation (logging, metrics) can read [`Self::is_degraded`].
+///
+/// Two opener entry points formalize the role split:
+/// - [`Self::open`] (strict) — fails when the lock is already held.
+///   The right choice for the process that *must* own the canonical
+///   store (`octos serve`, `octos chat`, the test suite). Surfaces
+///   deployment misconfigurations as errors instead of silently
+///   degrading the canonical writer.
+/// - [`Self::open_or_degraded`] — falls back to the degraded handle
+///   on lock contention. The right choice for `octos gateway`
+///   subprocesses (and other companion processes) that should keep
+///   going when the canonical store is owned elsewhere.
+///
+/// This split prevents the gateway-starts-first dev workflow from
+/// flipping canonical ownership to gateway and degrading serve.
+///
+/// Episode reads on the gateway path are best-effort already
+/// (memory-bank recall happens through the in-process `MemoryStore`,
+/// not `EpisodeStore`), and episode writes from a sub-agent are
+/// completion-summary persistence that serve will redo on
+/// `/api/chat` if it cares. The fleet still benefits from gateway
+/// channel polling staying alive.
 pub struct EpisodeStore {
-    db: Arc<Database>,
+    /// `Some(db)` when the redb file was successfully opened (the
+    /// owning process). `None` when this is a degraded in-memory
+    /// fallback because the redb file lock was already held by
+    /// another process (see the type-level docs).
+    db: Option<Arc<Database>>,
     index: RwLock<HybridIndex>,
 }
 
 impl EpisodeStore {
     /// Open or create an episode store at the given path.
+    ///
+    /// **Strict mode** — fails if the redb file lock is already held
+    /// by another process. This is the right entry point for the
+    /// process that *must* own the canonical store (`octos serve`,
+    /// `octos chat`, the agent test suite). If the lock is held, the
+    /// caller likely has a deployment misconfiguration and should
+    /// surface the error rather than silently degrading.
+    ///
+    /// For the `octos gateway` subprocess (and anywhere else that
+    /// runs alongside an existing serve daemon and should keep going
+    /// when the canonical store is owned elsewhere), use
+    /// [`Self::open_or_degraded`].
     pub async fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let data_dir = data_dir.as_ref().to_path_buf();
+        Self::open_inner(data_dir.as_ref(), false).await
+    }
+
+    /// Open or create an episode store at the given path, falling
+    /// back to a degraded in-memory store when the redb file lock is
+    /// already held by another process.
+    ///
+    /// This is the right entry point for the `octos gateway`
+    /// subprocess: `octos serve` always wins the lock in production
+    /// (process_manager spawns gateway after `ProfileRuntime` has
+    /// already bootstrapped every profile), so gateway always gets a
+    /// degraded handle when serve is the parent daemon. Writes on a
+    /// degraded handle silently no-op; reads return empty. See the
+    /// type-level docs on [`EpisodeStore`].
+    ///
+    /// **Other failure modes still bubble up.** Only the typed
+    /// `redb::DatabaseError::DatabaseAlreadyOpen` triggers the
+    /// degraded fallback; corruption / I/O / permission errors are
+    /// returned as `Err`.
+    pub async fn open_or_degraded(data_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(data_dir.as_ref(), true).await
+    }
+
+    async fn open_inner(data_dir: &Path, allow_degraded: bool) -> Result<Self> {
+        let data_dir = data_dir.to_path_buf();
         tokio::fs::create_dir_all(&data_dir)
             .await
             .wrap_err("failed to create data directory")?;
 
         let db_path = data_dir.join("episodes.redb");
+        let db_path_for_log = db_path.clone();
 
-        // redb is sync, so we spawn_blocking for the initial open + table init + index rebuild
-        let (db, index) = tokio::task::spawn_blocking(move || {
-            let db = Database::create(&db_path).wrap_err("failed to open redb database")?;
+        // redb is sync, so we spawn_blocking for the initial open + table init + index rebuild.
+        //
+        // We surface the `DatabaseAlreadyOpen` case as a typed sentinel
+        // (`Ok(None)`) so the outer task can decide whether to install
+        // the degraded fallback (gateway) or propagate the error
+        // (serve). Every other error bubbles up verbatim.
+        let result: Result<Option<(Database, HybridIndex)>> =
+            tokio::task::spawn_blocking(move || {
+                let db = match Database::create(&db_path) {
+                    Ok(db) => db,
+                    Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Ok(None),
+                    Err(e) => {
+                        return Err(eyre::Report::new(e).wrap_err("failed to open redb database"));
+                    }
+                };
 
-            // Initialize tables
-            let write_txn = db.begin_write()?;
-            {
-                let _ = write_txn.open_table(EPISODES_TABLE)?;
-                let _ = write_txn.open_table(CWD_INDEX_TABLE)?;
-                let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
-            }
-            write_txn.commit()?;
+                // Initialize tables
+                let write_txn = db.begin_write()?;
+                {
+                    let _ = write_txn.open_table(EPISODES_TABLE)?;
+                    let _ = write_txn.open_table(CWD_INDEX_TABLE)?;
+                    let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
+                }
+                write_txn.commit()?;
 
-            // Rebuild in-memory hybrid index from stored data
-            let mut index = HybridIndex::new(DEFAULT_DIMENSION);
-            {
-                let read_txn = db.begin_read()?;
-                let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
-                let embeddings_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
+                // Rebuild in-memory hybrid index from stored data
+                let mut index = HybridIndex::new(DEFAULT_DIMENSION);
+                {
+                    let read_txn = db.begin_read()?;
+                    let episodes_table = read_txn.open_table(EPISODES_TABLE)?;
+                    let embeddings_table = read_txn.open_table(EMBEDDINGS_TABLE)?;
 
-                for entry in episodes_table.iter()? {
-                    let (key, value) = entry?;
-                    let ep_id = key.value().to_string();
-                    if let Ok(episode) = serde_json::from_str::<Episode>(value.value()) {
-                        let embedding: Option<Vec<f32>> = embeddings_table
-                            .get(ep_id.as_str())
-                            .ok()
-                            .flatten()
-                            .and_then(|v| bincode::deserialize(v.value()).ok());
-                        index.insert(&ep_id, &episode.summary, embedding.as_deref());
+                    for entry in episodes_table.iter()? {
+                        let (key, value) = entry?;
+                        let ep_id = key.value().to_string();
+                        if let Ok(episode) = serde_json::from_str::<Episode>(value.value()) {
+                            let embedding: Option<Vec<f32>> = embeddings_table
+                                .get(ep_id.as_str())
+                                .ok()
+                                .flatten()
+                                .and_then(|v| bincode::deserialize(v.value()).ok());
+                            index.insert(&ep_id, &episode.summary, embedding.as_deref());
+                        }
                     }
                 }
+
+                debug!(path = %data_dir.display(), "opened episode store");
+                Ok(Some((db, index)))
+            })
+            .await?;
+
+        match result? {
+            Some((db, index)) => Ok(Self {
+                db: Some(Arc::new(db)),
+                index: RwLock::new(index),
+            }),
+            None if allow_degraded => {
+                warn!(
+                    path = %db_path_for_log.display(),
+                    "redb episode store already held by another process; \
+                     installing degraded in-memory fallback. Writes will \
+                     no-op and reads will return empty for this handle. \
+                     This is expected for `octos gateway` subprocesses \
+                     when `octos serve` already owns the lock."
+                );
+                Ok(Self {
+                    db: None,
+                    index: RwLock::new(HybridIndex::new(DEFAULT_DIMENSION)),
+                })
             }
+            None => Err(eyre::eyre!(
+                "failed to open redb database at {}: \
+                 Database already open. Cannot acquire lock. \
+                 (Strict `EpisodeStore::open` was used — if this is the \
+                 `octos gateway` subprocess, call `open_or_degraded` \
+                 instead.)",
+                db_path_for_log.display(),
+            )),
+        }
+    }
 
-            debug!(path = %data_dir.display(), "opened episode store");
-            Ok::<_, eyre::Report>((db, index))
-        })
-        .await??;
-
-        Ok(Self {
-            db: Arc::new(db),
-            index: RwLock::new(index),
-        })
+    /// `true` when this store is operating in the degraded in-memory
+    /// fallback mode described on the type-level docs (the redb file
+    /// lock was already held when [`Self::open_or_degraded`] ran).
+    /// Callers can use this for diagnostics, metrics, or to skip
+    /// persistence-dependent codepaths.
+    pub fn is_degraded(&self) -> bool {
+        self.db.is_none()
     }
 
     /// Store an episode.
+    ///
+    /// In degraded mode ([`Self::is_degraded`]) the disk write is
+    /// skipped and the call returns `Ok(())`. The in-memory hybrid
+    /// index is updated with the summary so [`Self::find_relevant_hybrid`]
+    /// (which is index-only when populated) can match it for ranking,
+    /// but full episode bodies come from disk — so the public read
+    /// methods ([`Self::find_relevant`], [`Self::find_relevant_hybrid`])
+    /// still return empty on a degraded handle because there is no
+    /// DB to fetch bodies from. The intent is "writes accepted, reads
+    /// empty," not in-memory persistence.
     pub async fn store(&self, episode: Episode) -> Result<()> {
-        let db = self.db.clone();
         let episode_id = episode.id.clone();
         let episode_id_for_index = episode_id.clone();
         let summary = episode.summary.clone();
+
+        // Degraded fallback: skip the disk write, update the in-memory
+        // index, return success. See type-level docs on `EpisodeStore`.
+        let Some(db) = self.db.clone() else {
+            match self.index.write() {
+                Ok(mut idx) => idx.insert(&episode_id_for_index, &summary, None),
+                Err(e) => warn!("index write lock poisoned, skipping update: {e}"),
+            }
+            return Ok(());
+        };
+
         let cwd = episode.working_dir.to_string_lossy().to_string();
         let episode_json =
             serde_json::to_string(&episode).wrap_err("failed to serialize episode")?;
@@ -194,7 +342,10 @@ impl EpisodeStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<Episode>> {
-        let db = self.db.clone();
+        // Degraded fallback: no DB to scan; return empty.
+        let Some(db) = self.db.clone() else {
+            return Ok(Vec::new());
+        };
         let cwd_str = cwd.to_string_lossy().to_string();
         let query = query.to_lowercase();
 
@@ -270,8 +421,25 @@ impl EpisodeStore {
     }
 
     /// Store an embedding for an episode.
+    ///
+    /// In degraded mode the disk write is skipped and the call
+    /// returns `Ok(())`. The in-memory hybrid index is updated with
+    /// the embedding, but the public read methods still return
+    /// empty for the same reason as [`Self::store`] — they need
+    /// disk-backed bodies. Follows the same "writes accepted, reads
+    /// empty" contract.
     pub async fn store_embedding(&self, episode_id: &str, embedding: Vec<f32>) -> Result<()> {
-        let db = self.db.clone();
+        // Degraded fallback: skip the disk write, update the in-memory
+        // embedding entry only, return success.
+        let Some(db) = self.db.clone() else {
+            match self.index.write() {
+                Ok(mut idx) => {
+                    let _ = idx.add_embedding(episode_id, &embedding);
+                }
+                Err(e) => warn!("index write lock poisoned, skipping embedding update: {e}"),
+            }
+            return Ok(());
+        };
         let ep_id = episode_id.to_string();
         let emb_bytes = bincode::serialize(&embedding).wrap_err("failed to serialize embedding")?;
 
@@ -300,8 +468,23 @@ impl EpisodeStore {
     /// Delete an episode by its ID. Removes from all DB tables and the in-memory index.
     ///
     /// Returns `true` if the episode existed and was deleted.
+    ///
+    /// In degraded mode the disk delete is skipped; this attempts to
+    /// remove the entry from the in-memory index only and returns
+    /// `false` (there is nothing the degraded handle can authoritatively
+    /// claim was persisted).
     pub async fn delete_by_id(&self, episode_id: &str) -> Result<bool> {
-        let db = self.db.clone();
+        // Degraded fallback: no DB to delete from; clear the in-memory
+        // entry (if any) and report `false`.
+        let Some(db) = self.db.clone() else {
+            match self.index.write() {
+                Ok(mut idx) => {
+                    let _ = idx.remove(episode_id);
+                }
+                Err(e) => warn!("index write lock poisoned, skipping removal: {e}"),
+            }
+            return Ok(false);
+        };
         let ep_id = episode_id.to_string();
 
         let found = tokio::task::spawn_blocking(move || {
@@ -387,8 +570,14 @@ impl EpisodeStore {
         };
 
         // Fetch full episodes from DB
-        let db = self.db.clone();
         let ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
+        // Degraded fallback: there is no on-disk store to read from.
+        // The hybrid index only knows about episodes inserted in this
+        // process's lifetime (which is empty at open for a degraded
+        // handle) so returning an empty Vec is correct.
+        let Some(db) = self.db.clone() else {
+            return Ok(Vec::new());
+        };
 
         tokio::task::spawn_blocking(move || {
             let read_txn = db.begin_read()?;
@@ -633,5 +822,99 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].summary, "persistent data");
+    }
+
+    /// RED-first repro for the production crashloop tracked in #899
+    /// (PR #888 / M11-F gateway consolidation).
+    ///
+    /// `octos serve` and `octos gateway` run as separate processes;
+    /// both call `EpisodeStore::open*` against the same per-profile
+    /// data dir. The second open used to crash with
+    /// `redb::DatabaseError::DatabaseAlreadyOpen` because redb is a
+    /// single-writer-single-process embedded database. This test
+    /// pins the new contract: `open_or_degraded` returns a degraded
+    /// in-memory fallback handle instead of an error.
+    #[tokio::test]
+    async fn should_return_degraded_store_when_redb_already_held_by_another_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        // Owner: behaves like `octos serve` holding the lock. Strict
+        // `open` is used so misconfigurations would still surface.
+        let owner = EpisodeStore::open(dir.path()).await.unwrap();
+        assert!(
+            !owner.is_degraded(),
+            "first opener should hold the canonical DB",
+        );
+
+        // Second opener: behaves like an `octos gateway` subprocess.
+        // It opts into the degraded fallback via `open_or_degraded`.
+        // Before the fix this returned `Err(... DatabaseAlreadyOpen ...)`;
+        // now it must succeed with a degraded fallback.
+        let degraded = EpisodeStore::open_or_degraded(dir.path()).await.unwrap();
+        assert!(
+            degraded.is_degraded(),
+            "open_or_degraded must return a degraded in-memory fallback",
+        );
+
+        // The degraded handle accepts writes (silent no-op on disk)
+        // and reports them as successful — gateway sub-agents that
+        // record completion episodes don't crash.
+        let ep = make_episode("recorded on degraded handle", "/proj");
+        let ep_id = ep.id.clone();
+        degraded
+            .store(ep)
+            .await
+            .expect("store on degraded handle must succeed");
+        degraded
+            .store_embedding(&ep_id, vec![0.0_f32; 1536])
+            .await
+            .expect("store_embedding on degraded handle must succeed");
+
+        // The owner still sees zero episodes — degraded writes are
+        // not persisted to disk, so the owner's view is unchanged.
+        let owner_view = owner
+            .find_relevant(Path::new("/proj"), "recorded", 10)
+            .await
+            .unwrap();
+        assert!(
+            owner_view.is_empty(),
+            "degraded writes must not surface to the owner; got {owner_view:?}",
+        );
+
+        // The degraded handle's own reads also return empty: the
+        // hybrid index can match the summary for ranking, but
+        // `find_relevant` / `find_relevant_hybrid` fetch full episode
+        // bodies from disk, and the degraded handle has no disk
+        // backing. This is the "writes accepted, reads empty"
+        // contract — anything stricter would be incorrect because
+        // the canonical store is owned elsewhere.
+        let degraded_view = degraded
+            .find_relevant(Path::new("/proj"), "recorded", 10)
+            .await
+            .unwrap();
+        assert!(
+            degraded_view.is_empty(),
+            "degraded reads must return empty; got {degraded_view:?}",
+        );
+    }
+
+    /// Strict `open` must fail (not silently degrade) when the redb
+    /// file lock is already held. This locks down the contract that
+    /// codex's round-1 review of #899 called out: a second
+    /// `Serve`-role bootstrap should never quietly flip canonical
+    /// ownership.
+    #[tokio::test]
+    async fn should_error_on_strict_open_when_redb_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let _owner = EpisodeStore::open(dir.path()).await.unwrap();
+
+        let err = EpisodeStore::open(dir.path())
+            .await
+            .err()
+            .expect("strict open must error when lock is held");
+        let msg = err.to_string() + " " + &format!("{err:?}");
+        assert!(
+            msg.contains("Database already open") || msg.contains("Cannot acquire lock"),
+            "strict open error must surface the lock contention; got: {err:?}",
+        );
     }
 }
