@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -11,6 +11,62 @@ pub enum FileHandleScope {
     ProfileRelative(PathBuf),
     TempUpload(PathBuf),
 }
+
+/// Scope of a resolved tool-argument path. Lets callers apply
+/// scope-specific policy (e.g. read-only for profile files,
+/// symlink-safe everywhere) on top of the unified resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPathScope {
+    /// Path resolved under the authenticated upload tmpdir
+    /// (`octos-uploads`). User-uploaded attachments live here.
+    UploadTmpdir,
+    /// Path resolved under the per-session workspace root.
+    Workspace,
+    /// Path resolved under the profile root (a profile's `data_dir`).
+    Profile,
+}
+
+/// Successful resolution of a tool-supplied file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToolPath {
+    /// Absolute on-disk path. Existence is guaranteed when the scope
+    /// is [`ToolPathScope::UploadTmpdir`] or [`ToolPathScope::Profile`]
+    /// because their resolution always passes through `canonicalize`.
+    /// For [`ToolPathScope::Workspace`] the path is canonicalized only
+    /// if it points at an existing file/dir; otherwise the result is
+    /// the normalised workspace-relative location, so write-style tools
+    /// (`write_file`, `edit_file`) can still create new files.
+    pub absolute: PathBuf,
+    /// Which root the path resolved under.
+    pub scope: ToolPathScope,
+}
+
+/// Errors returned by [`resolve_tool_path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPathError {
+    /// The supplied path tried to escape its allowed root via `..`.
+    Traversal,
+    /// The path is absolute but does not lie inside any allowed root
+    /// (workspace root, upload tmpdir, or profile root).
+    OutsideAllowedRoots,
+    /// The handle (`up/...` or `pf/...`) could not be decoded — bad
+    /// base64, empty payload, or unknown scope prefix.
+    DecodeFailed,
+}
+
+impl std::fmt::Display for ToolPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Traversal => f.write_str("path traversal is not allowed"),
+            Self::OutsideAllowedRoots => {
+                f.write_str("path is outside the workspace, upload tmpdir, and profile root")
+            }
+            Self::DecodeFailed => f.write_str("file handle could not be decoded"),
+        }
+    }
+}
+
+impl std::error::Error for ToolPathError {}
 
 pub fn temp_upload_root() -> PathBuf {
     std::env::temp_dir().join("octos-uploads")
@@ -110,6 +166,186 @@ pub fn resolve_upload_reference(raw: &str) -> Option<PathBuf> {
             canonicalize_under(&temp_upload_root(), &relative)
         }
     }
+}
+
+/// Unified file-path resolver for LLM-supplied tool arguments.
+///
+/// Tries, in order:
+///
+/// 1. Decode as an `up/<base64>/<display>` or `up/<base64>` upload handle —
+///    payload locates an existing file under `temp_upload_root()`.
+/// 2. Decode as a `pf/<base64>/<display>` or `pf/<base64>` profile handle
+///    when `profile_root` is provided — payload locates an existing file
+///    under that root.
+/// 3. Treat as absolute and accept when the canonicalised path lies inside
+///    one of the allowed roots (upload tmpdir, workspace, or profile).
+///    macOS firmlinks are handled transparently — the canonical form
+///    (e.g. `/private/var/folders/...`) and the un-prefixed form
+///    (`/var/folders/...`) compare equal.
+/// 4. If the raw value matches an existing file under `temp_upload_root()`
+///    (bare basename like `019e22…wav`, or `up/<x>` that didn't decode),
+///    return it as an [`ToolPathScope::UploadTmpdir`] entry. This is the
+///    leaf-name form the upload handler writes when the LLM strips
+///    everything but the filename.
+/// 5. Treat as workspace-relative — normalises `..`/`.` and rejects any
+///    result that would land outside the workspace.
+///
+/// Existence is REQUIRED for scopes 1, 2, and 4 (those resolutions go
+/// through `canonicalize`). For scope 5 the path is returned even if the
+/// file does not yet exist — write-style tools (`write_file`, `edit_file`)
+/// rely on this to create new files. Callers that need an existence check
+/// must perform it themselves.
+///
+/// Symlink rejection is the caller's responsibility (use
+/// `read_no_follow` / `write_no_follow` on the returned path). The
+/// resolver only verifies that the **canonical** path lies inside an
+/// allowed root, which already collapses any symlink-target reachable
+/// through the root entry.
+pub fn resolve_tool_path(
+    workspace_root: &Path,
+    profile_root: Option<&Path>,
+    user_path: &str,
+) -> Result<ResolvedToolPath, ToolPathError> {
+    // 1) Try decoding as a scoped file handle (up/... or pf/...).
+    match decode_file_handle(user_path) {
+        Some(FileHandleScope::TempUpload(relative)) => {
+            return canonicalize_under(&temp_upload_root(), &relative)
+                .map(|absolute| ResolvedToolPath {
+                    absolute,
+                    scope: ToolPathScope::UploadTmpdir,
+                })
+                .ok_or(ToolPathError::OutsideAllowedRoots);
+        }
+        Some(FileHandleScope::ProfileRelative(relative)) => {
+            let Some(profile_root) = profile_root else {
+                // A pf/... handle was supplied but the caller doesn't
+                // have a profile root to anchor it against. Surface as a
+                // decode-shaped failure so callers can fall back to
+                // their own legacy paths if any.
+                return Err(ToolPathError::DecodeFailed);
+            };
+            return canonicalize_under(profile_root, &relative)
+                .map(|absolute| ResolvedToolPath {
+                    absolute,
+                    scope: ToolPathScope::Profile,
+                })
+                .ok_or(ToolPathError::OutsideAllowedRoots);
+        }
+        None => {}
+    }
+
+    let candidate = Path::new(user_path);
+
+    // 2) Absolute paths must lie inside an allowed root.
+    if candidate.is_absolute() {
+        let candidate_canon = canonicalize_lossy(candidate);
+        let upload_root_canon = canonical_root(&temp_upload_root());
+        if candidate_canon.starts_with(&upload_root_canon) {
+            return Ok(ResolvedToolPath {
+                absolute: candidate_canon,
+                scope: ToolPathScope::UploadTmpdir,
+            });
+        }
+        let workspace_canon = canonical_root(workspace_root);
+        if candidate_canon.starts_with(&workspace_canon) {
+            return Ok(ResolvedToolPath {
+                absolute: candidate_canon,
+                scope: ToolPathScope::Workspace,
+            });
+        }
+        if let Some(profile_root) = profile_root {
+            let profile_canon = canonical_root(profile_root);
+            if candidate_canon.starts_with(&profile_canon) {
+                return Ok(ResolvedToolPath {
+                    absolute: candidate_canon,
+                    scope: ToolPathScope::Profile,
+                });
+            }
+        }
+        return Err(ToolPathError::OutsideAllowedRoots);
+    }
+
+    // 3) Bare basenames / undecodable relative paths that exist under
+    //    the upload tmpdir are accepted as uploads. This is the
+    //    leaf-name form the upload handler writes (e.g. the LLM hands
+    //    the model the filename verbatim instead of the encoded handle).
+    if let Some(relative) = safe_relative_path(user_path) {
+        if let Some(absolute) = canonicalize_under(&temp_upload_root(), &relative) {
+            return Ok(ResolvedToolPath {
+                absolute,
+                scope: ToolPathScope::UploadTmpdir,
+            });
+        }
+    }
+
+    // 4) Otherwise, treat as workspace-relative. Reject `..` traversal.
+    let joined = workspace_root.join(user_path);
+    let normalised = normalize_lexical(&joined);
+    let workspace_normalised = normalize_lexical(workspace_root);
+    if !normalised.starts_with(&workspace_normalised) {
+        return Err(ToolPathError::Traversal);
+    }
+
+    // Prefer the canonical form when the file already exists so the
+    // returned path stays comparable with `start_with(canonical_root)`
+    // checks that other tools layer on top. Falling back to the
+    // lexically-normalised form keeps write-style tools (which create
+    // missing files) working — they would error if we forced canonicalize.
+    let absolute = std::fs::canonicalize(&normalised).unwrap_or(normalised);
+    Ok(ResolvedToolPath {
+        absolute,
+        scope: ToolPathScope::Workspace,
+    })
+}
+
+/// Lexical path normalisation: collapses `.` and `..` without touching
+/// the filesystem. Mirrors `tools/mod.rs::normalize_path` — duplicated
+/// here so the resolver stays self-contained.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+            Component::Normal(seg) => {
+                out.push(seg);
+            }
+        }
+    }
+    out
+}
+
+/// Canonicalize as much of `path` as currently exists on disk; fall back
+/// to lexical normalisation for the non-existent tail. macOS firmlinks
+/// (`/var/folders/...` vs `/private/var/folders/...`) collapse through
+/// `canonicalize`; the syntactic fallback is only used when nothing on
+/// the path exists.
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut existing = path;
+    let mut suffix = PathBuf::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            let mut next_suffix = PathBuf::from(name);
+            next_suffix.push(&suffix);
+            suffix = next_suffix;
+        }
+        existing = parent;
+        if let Ok(canon) = std::fs::canonicalize(existing) {
+            return canon.join(suffix);
+        }
+        if existing.as_os_str().is_empty() {
+            break;
+        }
+    }
+    normalize_lexical(path)
 }
 
 fn encode_scoped_handle(prefix: &str, relative: &Path, display_name: &str) -> Option<String> {
