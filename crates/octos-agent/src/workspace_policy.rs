@@ -938,9 +938,21 @@ impl WorkspacePolicy {
         // and the inline `download_binary` check at
         // `tools/manage_skills.rs:836` can be retired in a follow-up PR.
         //
-        // The expected digest is interpolated through `${args.expected_sha256}`
-        // so the spawn-task input args carry the manifest-declared hash —
-        // no per-skill workspace policy edit needed.
+        // The glob is scoped to *this* invocation's installed skill via
+        // `${args.skill_dir}` so a workspace with multiple installed skills
+        // is not spuriously failed against an unrelated binary's digest.
+        // The expected digest is interpolated through
+        // `${args.expected_sha256}` so the spawn-task input args carry the
+        // manifest-declared hash — no per-skill workspace policy edit
+        // needed.
+        //
+        // Caveat: this matches the *final extracted binary*, not the
+        // downloaded archive. For tarball-distributed skills, the manifest
+        // digest of the archive will NOT match a `Sha256Match` on
+        // `${args.skill_dir}/main`. The inline `download_binary` check in
+        // `tools/manage_skills.rs` is the source-of-truth for archive
+        // verification; this validator is complementary and asserts the
+        // post-extraction binary integrity for raw-binary distributions.
         let manage_skills_contract = WorkspaceSpawnTaskPolicy {
             artifact: None,
             artifacts: Vec::new(),
@@ -949,7 +961,7 @@ impl WorkspacePolicy {
             on_deliver: vec![],
             on_failure: vec!["notify_user:Skill install verification failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::Sha256Match {
-                glob: "skills/*/main".into(),
+                glob: "${args.skill_dir}/main".into(),
                 sha256: "${args.expected_sha256}".into(),
             })],
         };

@@ -53,8 +53,13 @@ const KILL_GRACE_PERIOD: Duration = Duration::from_millis(300);
 const DEFAULT_OMINIX_API_URL: &str = "http://127.0.0.1:8081";
 
 /// Default `required_tier` for legacy ledger records emitted before Wave-3a.
+///
+/// Sentinel value (`""`) — replaced with the tier derived from the legacy
+/// `required` field by [`ValidatorOutcome::normalize_legacy_tier`] after
+/// deserialize. We can't peek at sibling fields during a `serde(default = ...)`
+/// callback, so the normalization happens explicitly on every read path.
 fn default_required_tier() -> String {
-    "hard".to_string()
+    String::new()
 }
 
 /// Test-only override for the ominix-api base URL.
@@ -247,6 +252,20 @@ impl ValidatorOutcome {
     pub fn is_soft_warning(&self) -> bool {
         self.required_tier == "soft" && !matches!(self.status, ValidatorStatus::Pass)
     }
+
+    /// Backfill `required_tier` on records emitted before Wave-3a.
+    ///
+    /// Pre-Wave-3a ledger rows have no `required_tier` field, so
+    /// `serde(default)` initializes it to the empty-string sentinel.
+    /// Normalize the sentinel back to a tier derived from the legacy
+    /// `required` field — `required: true` → `"hard"`, `required: false` →
+    /// `"none"`. Idempotent: a Wave-3a-emitted record that already carries
+    /// `"hard"`/`"soft"`/`"none"` is left untouched.
+    fn normalize_legacy_tier(&mut self) {
+        if self.required_tier.is_empty() {
+            self.required_tier = if self.required { "hard" } else { "none" }.to_string();
+        }
+    }
 }
 
 /// Append-only JSONL ledger that persists validator outcomes for replay.
@@ -307,8 +326,9 @@ impl ValidatorLedger {
             if line.trim().is_empty() {
                 continue;
             }
-            let outcome: ValidatorOutcome = serde_json::from_str(&line)
+            let mut outcome: ValidatorOutcome = serde_json::from_str(&line)
                 .wrap_err_with(|| format!("parse ledger line failed: {line}"))?;
+            outcome.normalize_legacy_tier();
             outcomes.push(outcome);
         }
         Ok(outcomes)
@@ -1277,16 +1297,42 @@ impl ValidatorRunner {
             }
         };
 
-        // Cap per-probe timeout so a stuck connection never starves the
-        // polling loop. Floor at 1s for sub-second poll intervals so the
-        // probe still has a chance to complete the TCP handshake.
-        let per_probe_timeout_ms = poll_interval_ms.clamp(1_000, 5_000);
+        // Per-probe timeout caps how long a single HTTP attempt can stall
+        // before the polling loop reclaims control. Clamp to [1s, 5s] so
+        // (a) the probe always has enough budget to complete the TCP
+        // handshake even when `poll_interval_ms` is sub-second, and (b) a
+        // hung probe never overshoots the wall-clock deadline by more than
+        // 5s. We additionally cap each probe by the *remaining* deadline
+        // inside the loop so the validator never runs past `deadline_ms`.
+        let per_probe_timeout_floor_ms = poll_interval_ms.clamp(1_000, 5_000);
         let deadline = std::time::Instant::now() + Duration::from_millis(deadline_ms);
         let interval = Duration::from_millis(poll_interval_ms);
 
         let mut attempt: u32 = 0;
-        let mut last_summary;
+        let mut last_summary = "no response yet".to_string();
         loop {
+            // Top-of-loop deadline guard: surface a Fail with the last
+            // response summary as soon as the wall-clock deadline is hit,
+            // even if `probe_http` would otherwise consume another timeout
+            // budget. Critical for short deadlines (< per-probe floor).
+            let now = std::time::Instant::now();
+            let remaining_ms = deadline.saturating_duration_since(now).as_millis() as u64;
+            if remaining_ms == 0 {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Fail,
+                    format!(
+                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {last_summary}"
+                    ),
+                    started_at,
+                    started,
+                );
+            }
+            // Bound the per-probe timeout by remaining deadline so a hung
+            // final probe cannot push the validator past `deadline_ms`.
+            let per_probe_timeout_ms = per_probe_timeout_floor_ms.min(remaining_ms.max(1));
+
             attempt += 1;
             match probe_http(
                 &url,
@@ -1337,17 +1383,19 @@ impl ValidatorRunner {
 
     /// Run a [`Sha256Match`] validator.
     ///
-    /// Resolves `sha256` against `${args.<key>}` first so a tool that passes
-    /// its expected hash through input args can wire a manifest-derived
-    /// checksum into the contract. Each file matching the glob must have a
-    /// digest equal to the (lowercased, hex) expected value; a single
-    /// mismatch is a [`Fail`]. Empty glob is a [`Fail`] so a contract that
-    /// expects an artifact under a path never silently passes.
+    /// Resolves BOTH `glob` and `sha256` against `${args.<key>}` first so a
+    /// tool that passes its expected hash through input args can scope the
+    /// check to a per-invocation artifact path (e.g. the freshly-installed
+    /// skill binary) and wire a manifest-derived checksum into the contract
+    /// in one step. Each file matching the glob must have a digest equal to
+    /// the (lowercased, hex) expected value; a single mismatch is a [`Fail`].
+    /// Empty glob is a [`Fail`] so a contract that expects an artifact under
+    /// a path never silently passes.
     fn run_sha256_match(
         &self,
         invocation: &ValidatorInvocation,
         validator: &Validator,
-        pattern: &str,
+        glob_template: &str,
         sha256_template: &str,
         started_at: DateTime<Utc>,
         started: Instant,
@@ -1373,7 +1421,18 @@ impl ValidatorRunner {
                 ),
             );
         }
-        let matches = match glob_files(&invocation.workspace_root, pattern) {
+        // Interpolate the glob so a per-invocation contract (e.g.
+        // `${args.skill_dir}/main`) can scope the digest check to the
+        // artifact this specific spawn task produced. Uses the path-safe
+        // interpolator so embedded `/` separators survive — operators
+        // pinning a literal glob like `skills/*/main` are unaffected.
+        let pattern = match interpolate_args_path(glob_template, invocation.input_args.as_ref()) {
+            Ok(pattern) => pattern,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        let matches = match glob_files(&invocation.workspace_root, &pattern) {
             Ok(matches) => matches,
             Err(reason) => {
                 return self.make_outcome(
@@ -1546,6 +1605,9 @@ enum HttpProbeFailure {
 /// also resolves `${output.<key>}` against the spawn task's `named_outputs`.
 /// See [`interpolate_template`] for the canonical doc-comment on
 /// percent-encoding semantics and missing-key error policy.
+///
+/// Use [`interpolate_args_path`] for glob/path templates where
+/// percent-encoding would break the segment separator.
 #[cfg(test)]
 fn interpolate_args(
     template: &str,
@@ -1613,6 +1675,57 @@ fn interpolate_template(
         } else {
             out.push_str(&value);
         }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Path-safe counterpart to [`interpolate_args`] for glob templates.
+///
+/// Same key lookup semantics, but values are inserted verbatim instead of
+/// percent-encoded so embedded `/` separators (e.g. `${args.skill_dir}` =
+/// `"skills/example"`) survive into the resulting glob. Path traversal
+/// attempts that try to escape the workspace root are rejected explicitly so
+/// an LLM-controlled arg value cannot wire the validator at, say, a
+/// `${args.skill_dir}/main` template that resolves to `/etc/passwd`. The
+/// caller is expected to thread the resulting glob through `glob_files`
+/// (which resolves relative paths against the workspace root, blunting
+/// further traversal).
+fn interpolate_args_path(
+    template: &str,
+    input_args: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("${args.") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "${args.".len()..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| format!("unterminated ${{args.}} reference in template: {template}"))?;
+        let key = &after[..end];
+        let value = input_arg(input_args, key).ok_or_else(|| {
+            format!("input arg '{key}' not found while interpolating template: {template}")
+        })?;
+        // Reject path-traversal segments so an LLM-controlled arg value can
+        // never escape the workspace root via `${args.X}/...`. We
+        // intentionally accept `/` as a segment separator (otherwise common
+        // contracts like `${args.skill_dir}/main` can't work) but block
+        // `..` segments and absolute-path leakage.
+        for segment in value.split('/') {
+            if segment == ".." {
+                return Err(format!(
+                    "input arg '{key}' contains '..' segment which is rejected for path templates: {value}"
+                ));
+            }
+        }
+        if value.starts_with('/') {
+            return Err(format!(
+                "input arg '{key}' must be a relative path, got absolute: {value}"
+            ));
+        }
+        out.push_str(&value);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -3056,6 +3169,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_probe_until_caps_per_probe_timeout_by_remaining_deadline() {
+        // Codex review surface: with a 100ms deadline and a 1s per-probe
+        // floor, the validator must NOT consume the full 1s for the last
+        // probe — it should cap by the remaining deadline so the validator
+        // returns ≈ at the wall-clock deadline. We point the probe at an
+        // unreachable port; without the cap, a single probe would block for
+        // 1s before failing. With the cap, the validator returns Fail in
+        // well under 1s.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        // Bind + immediately drop a listener so the port is closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{addr}/never-reachable");
+        let validator = validator_with_spec(
+            "probe_until_short_deadline",
+            ValidatorSpec::HttpProbeUntil {
+                url_template: url,
+                expected_status: 200,
+                expected_contains: None,
+                poll_interval_ms: 50,
+                deadline_ms: 100,
+            },
+        );
+        let before = std::time::Instant::now();
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        let elapsed = before.elapsed();
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        // Without the remaining-deadline cap, a single probe would block
+        // ≈1s. With the cap, the validator returns within a few hundred ms
+        // of the 100ms deadline. Allow generous headroom for cold CI.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_500),
+            "deadline overrun: elapsed = {elapsed:?} (deadline 100ms, per-probe floor 1000ms)"
+        );
+    }
+
+    #[tokio::test]
     async fn http_probe_until_fails_with_last_response_when_deadline_expires() {
         // Always returns a 503; the probe must exhaust the deadline and
         // surface a Fail outcome with the last response summary in the
@@ -3279,6 +3433,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sha256_match_interpolates_glob_against_input_args_with_path_separators() {
+        // Codex review surface: `Sha256Match.glob` must accept `${args.X}`
+        // where the value contains `/` separators so the contract can scope
+        // the digest check to a per-invocation artifact path
+        // (e.g. `${args.skill_dir}/main`). Verifies the workspace policy
+        // entry for `manage_skills` is functional rather than catastrophically
+        // matching every binary in the workspace.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills/example_v1");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let payload = b"installed skill binary v1\n";
+        std::fs::write(skill_dir.join("main"), payload).unwrap();
+
+        // Drop an unrelated binary at a sibling path; the test must not
+        // cross-contaminate with its digest, proving the glob is scoped.
+        let other_dir = dir.path().join("skills/unrelated");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(other_dir.join("main"), b"different binary").unwrap();
+
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(payload))
+        };
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation =
+            dummy_invocation(dir.path().to_path_buf()).with_input_args(serde_json::json!({
+                "skill_dir": "skills/example_v1",
+                "expected_sha256": expected.clone(),
+            }));
+        let validator = validator_with_spec(
+            "sha_scoped_to_skill_dir",
+            ValidatorSpec::Sha256Match {
+                glob: "${args.skill_dir}/main".into(),
+                sha256: "${args.expected_sha256}".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn sha256_match_rejects_traversal_segments_in_interpolated_glob() {
+        // Codex review surface: ${args.X} in a glob template must not be
+        // a vector for path-traversal escape from the workspace root.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let invocation =
+            dummy_invocation(dir.path().to_path_buf()).with_input_args(serde_json::json!({
+                "skill_dir": "../../etc",
+                "expected_sha256": "0".repeat(64),
+            }));
+        let validator = validator_with_spec(
+            "sha_traversal",
+            ValidatorSpec::Sha256Match {
+                glob: "${args.skill_dir}/main".into(),
+                sha256: "${args.expected_sha256}".into(),
+            },
+        );
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains(".."),
+            "traversal rejection should surface the offending segment: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
     async fn sha256_match_errors_when_expected_hex_is_malformed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("payload.bin"), b"contents").unwrap();
@@ -3361,6 +3583,77 @@ mod tests {
             "soft_fail outcomes must not block the required gate"
         );
         assert!(outcomes[0].is_soft_warning());
+    }
+
+    #[tokio::test]
+    async fn soft_fail_with_required_false_persists_as_soft_warning() {
+        // Codex review surface: covers the surprising case where the
+        // operator writes `required = false, soft_fail = true`. The truth
+        // table maps this to `Required::Soft` (warning, not pure optional),
+        // and the persisted outcome must carry `required_tier = "soft"` so
+        // dashboards can split it from `required = false, soft_fail = false`
+        // (purely informational) outcomes.
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = Validator {
+            id: "soft_optional_warn".into(),
+            required: false,
+            soft_fail: true,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "missing-sub-artifact.md".into(),
+                min_bytes: None,
+            },
+        };
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail);
+        assert!(
+            !outcomes[0].required,
+            "soft_fail surfaces as required=false"
+        );
+        assert_eq!(
+            outcomes[0].required_tier, "soft",
+            "(required=false, soft_fail=true) must record tier=soft, not none"
+        );
+        assert!(outcomes[0].required_gate_passed());
+        assert!(outcomes[0].is_soft_warning());
+    }
+
+    #[tokio::test]
+    async fn legacy_ledger_record_without_required_tier_normalizes_on_replay() {
+        // Codex review surface: legacy outcomes (pre-Wave-3a) have no
+        // `required_tier` field. `read_all` must normalize the empty
+        // sentinel into a tier derived from the legacy `required` field —
+        // `required = true` → "hard", `required = false` → "none" — so
+        // dashboards never see a misclassified "hard" for an old optional
+        // failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_ledger.jsonl");
+        // Two legacy records: one was hard-required (`required = true`),
+        // one was purely optional (`required = false`). Neither carries
+        // `required_tier`.
+        let legacy_hard = r#"{"schema_version":1,"validator_id":"old_hard","phase":"completion","kind":"file_exists","repo_label":"slides/x","required":true,"status":"pass","reason":"ok","duration_ms":12,"started_at":"2026-04-01T00:00:00Z"}"#;
+        let legacy_optional = r#"{"schema_version":1,"validator_id":"old_optional","phase":"completion","kind":"file_exists","repo_label":"slides/x","required":false,"status":"fail","reason":"missing","duration_ms":3,"started_at":"2026-04-01T00:00:00Z"}"#;
+        std::fs::write(&path, format!("{legacy_hard}\n{legacy_optional}\n")).unwrap();
+        let ledger = ValidatorLedger::open(&path).unwrap();
+        let outcomes = ledger.read_all().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        let hard = outcomes
+            .iter()
+            .find(|o| o.validator_id == "old_hard")
+            .unwrap();
+        assert_eq!(hard.required_tier, "hard");
+        let optional = outcomes
+            .iter()
+            .find(|o| o.validator_id == "old_optional")
+            .unwrap();
+        assert_eq!(
+            optional.required_tier, "none",
+            "legacy required=false must normalize to tier=none, not the default tier=hard"
+        );
     }
 
     #[tokio::test]
