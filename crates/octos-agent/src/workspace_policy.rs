@@ -132,13 +132,29 @@ pub struct ValidationPolicy {
 /// Each validator is identified by a stable `id`, produces a typed
 /// [`crate::validators::ValidatorOutcome`], and may be `required` (a failure
 /// blocks terminal success) or optional (a failure produces a warning only).
+///
+/// Wave-3a introduced an explicit [`Required::Soft`] tier — surfaced via the
+/// `soft_fail` companion field — so partial-artifact contracts can warn and
+/// continue without demoting the spawn task. The historic boolean
+/// `required` field is preserved verbatim for serde + ABI back-compat; the
+/// runtime collapses both fields into a single [`Required`] gate value via
+/// [`Validator::tier`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Validator {
     /// Stable identifier, unique within the validator list.
     pub id: String,
-    /// Required validators block terminal success when they fail.
-    #[serde(default = "default_required")]
+    /// Required validators block terminal success when they fail. Soft-fail
+    /// validators (see [`Self::soft_fail`]) ignore this flag.
+    #[serde(default = "default_required_bool")]
     pub required: bool,
+    /// When `true`, a failed outcome surfaces as a warning + ledger entry
+    /// but does NOT demote the spawn task — even if `required` is also
+    /// `true`. Defaults to `false` so existing policies preserve the
+    /// hard-fail semantics they have today. Use this to declare partial-
+    /// artifact contracts (e.g. "the primary report is hard-required, the
+    /// sub-artifacts are soft").
+    #[serde(default, skip_serializing_if = "is_default_false")]
+    pub soft_fail: bool,
     /// Optional per-validator timeout in milliseconds. Applies to command and
     /// tool validators. File-existence validators ignore the timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,8 +166,80 @@ pub struct Validator {
     pub spec: ValidatorSpec,
 }
 
-fn default_required() -> bool {
+impl Validator {
+    /// Collapse `required` + `soft_fail` into the operator-visible
+    /// gate-strength tier. The mapping is:
+    ///
+    /// | `required` | `soft_fail` | `tier()`         |
+    /// | ---------- | ----------- | ---------------- |
+    /// | `true`     | `false`     | [`Required::Hard`] |
+    /// | `true`     | `true`      | [`Required::Soft`] |
+    /// | `false`    | `false`     | [`Required::None`] |
+    /// | `false`    | `true`      | [`Required::Soft`] |
+    ///
+    /// `soft_fail = true` always overrides the hard semantics so the
+    /// validator never demotes its spawn task.
+    pub fn tier(&self) -> Required {
+        if self.soft_fail {
+            Required::Soft
+        } else if self.required {
+            Required::Hard
+        } else {
+            Required::None
+        }
+    }
+}
+
+/// Operator-facing strength label for a validator's gate over terminal
+/// success. Surfaced through [`Validator::tier`] and the persisted ledger
+/// outcome record so dashboards can split hard, soft, and informational
+/// failures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Required {
+    /// A failure of this validator demotes the spawn task to `Failed`.
+    /// Equivalent to the historic `required: true`.
+    #[default]
+    Hard,
+    /// A failure surfaces a warning + persists to the ledger but does NOT
+    /// demote the spawn task. Use for sub-artifacts and partial-artifact
+    /// contracts where the primary deliverable is hard-required but
+    /// auxiliary outputs are nice-to-have.
+    Soft,
+    /// A failure is fully optional — same gate behaviour as `Soft`, but
+    /// operator-visible as "this validator is informational only".
+    /// Equivalent to the historic `required: false` with `soft_fail = false`.
+    None,
+}
+
+impl Required {
+    /// Does a non-`Pass` outcome from this validator block terminal success?
+    pub fn is_hard(self) -> bool {
+        matches!(self, Self::Hard)
+    }
+
+    /// Should a non-`Pass` outcome surface as a warning (without demoting
+    /// the spawn task)? True for both `Soft` and `None` — operators are free
+    /// to filter on the explicit tier via the persisted outcome record.
+    pub fn is_warning_only(self) -> bool {
+        matches!(self, Self::Soft | Self::None)
+    }
+
+    /// Stable label for metrics + ledger records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+            Self::None => "none",
+        }
+    }
+}
+
+fn default_required_bool() -> bool {
     true
+}
+
+fn is_default_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_default_phase(phase: &ValidatorPhaseKind) -> bool {
@@ -232,6 +320,40 @@ pub enum ValidatorSpec {
     /// The format field is named `format` rather than `kind` to avoid
     /// colliding with serde's `kind` discriminator tag.
     MagicBytes { glob: String, format: MagicByteKind },
+    /// Polling HTTP probe — repeatedly GET a templated URL (with
+    /// `${args.<key>}` interpolation against the spawn task's input args)
+    /// until the expected status code (+ optional body substring) is
+    /// observed or the deadline expires.
+    ///
+    /// Closes the silent-failure path where a spawn task kicks off an
+    /// asynchronous external operation (training a voice, deploying a site)
+    /// whose completion the harness must verify without baking polling logic
+    /// into every skill. Emits [`crate::validators::ValidatorStatus::Pass`]
+    /// on the first success; [`Fail`] (with the last response summary in
+    /// the message) when the deadline expires; [`Timeout`] only if a single
+    /// probe within the deadline window itself times out at the HTTP level.
+    HttpProbeUntil {
+        url_template: String,
+        #[serde(default = "default_http_probe_status")]
+        expected_status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_contains: Option<String>,
+        /// Interval between probe attempts in milliseconds.
+        #[serde(default = "default_http_probe_until_interval_ms")]
+        poll_interval_ms: u64,
+        /// Hard wall-clock deadline in milliseconds. Once reached the
+        /// validator emits a [`Fail`] outcome surfacing the most recent
+        /// response so the LLM/operator can debug in one round.
+        #[serde(default = "default_http_probe_until_deadline_ms")]
+        deadline_ms: u64,
+    },
+    /// Assert a single file's SHA-256 digest equals `sha256`. Accepts either
+    /// an explicit hex digest OR a `${args.<key>}` template so the spawn task
+    /// can supply the expected hash through its input args (e.g. a manifest
+    /// `sha256` field captured at install time). Lifts the inline
+    /// `manage_skills::download_binary` checksum check onto the canonical
+    /// validator path so it shows up in the contract diagnostics ledger.
+    Sha256Match { glob: String, sha256: String },
 }
 
 /// File-format signature used by [`ValidatorSpec::MagicBytes`].
@@ -318,6 +440,14 @@ impl MagicByteKind {
 
 fn default_http_probe_status() -> u16 {
     200
+}
+
+fn default_http_probe_until_interval_ms() -> u64 {
+    2_000
+}
+
+fn default_http_probe_until_deadline_ms() -> u64 {
+    30_000
 }
 
 fn default_non_silent_ratio() -> f32 {
@@ -452,6 +582,7 @@ impl SpawnTaskValidatorSpec {
             Self::Bare(spec) => Validator {
                 id: format!("{task_name}.on_completion[{index}]"),
                 required: true,
+                soft_fail: false,
                 timeout_ms: None,
                 phase: ValidatorPhaseKind::Completion,
                 spec,
@@ -783,6 +914,7 @@ impl WorkspacePolicy {
             on_completion: vec![SpawnTaskValidatorSpec::Full(Validator {
                 id: "mofa_publish.deploy_url_probe".into(),
                 required: false,
+                soft_fail: false,
                 timeout_ms: None,
                 phase: ValidatorPhaseKind::Completion,
                 spec: ValidatorSpec::HttpProbe {
@@ -796,6 +928,128 @@ impl WorkspacePolicy {
             })],
         };
 
+        // Wave-3a wire target for the new `Sha256Match` variant.
+        //
+        // `manage_skills` is NOT spawn_only today, so this entry is dormant
+        // until either (a) the harness wires an `AfterTool` phase (audit
+        // Gap-1) that fires post-call validators against the synchronous
+        // tool, or (b) `manage_skills` itself flips to spawn_only. Recording
+        // it now means the canonical SHA-256 check is declared in one place
+        // and the inline `download_binary` check at
+        // `tools/manage_skills.rs:836` can be retired in a follow-up PR.
+        //
+        // The glob is scoped to *this* invocation's installed skill via
+        // `${args.skill_dir}` so a workspace with multiple installed skills
+        // is not spuriously failed against an unrelated binary's digest.
+        // The expected digest is interpolated through
+        // `${args.expected_sha256}` so the spawn-task input args carry the
+        // manifest-declared hash — no per-skill workspace policy edit
+        // needed.
+        //
+        // Caveat: this matches the *final extracted binary*, not the
+        // downloaded archive. For tarball-distributed skills, the manifest
+        // digest of the archive will NOT match a `Sha256Match` on
+        // `${args.skill_dir}/main`. The inline `download_binary` check in
+        // `tools/manage_skills.rs` is the source-of-truth for archive
+        // verification; this validator is complementary and asserts the
+        // post-extraction binary integrity for raw-binary distributions.
+        let manage_skills_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Skill install verification failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::Sha256Match {
+                glob: "${args.skill_dir}/main".into(),
+                sha256: "${args.expected_sha256}".into(),
+            })],
+        };
+
+        // Wave-3a wire target for the `soft_fail` tier.
+        //
+        // Both `synthesize_research` and `deep_search` produce a primary
+        // report (hard-required) plus optional sub-artifacts. Today neither
+        // tool is spawn_only, so these contracts are dormant until either
+        // the runtime flips them or a follow-up wires the post-tool
+        // validator phase. The shape — a hard FileExists for the primary
+        // plus a soft FileExists for any sub-artifact — is the canonical
+        // template for partial-artifact contracts.
+        //
+        // `${args.research_dir}` lets the contract scope the check to the
+        // research subdirectory each invocation produces, without baking a
+        // global path into the policy. The same shape works for the
+        // deep_search index file at `${args.research_dir}/_search_results.md`.
+        let synthesize_research_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Research synthesis failed".into()],
+            on_completion: vec![
+                // Primary report — block delivery if it's missing.
+                SpawnTaskValidatorSpec::Full(Validator {
+                    id: "synthesize_research.primary_report".into(),
+                    required: true,
+                    soft_fail: false,
+                    timeout_ms: None,
+                    phase: ValidatorPhaseKind::Completion,
+                    spec: ValidatorSpec::FileExists {
+                        path: "${args.research_dir}/synthesis.md".into(),
+                        min_bytes: Some(256),
+                    },
+                }),
+                // Sub-artifacts — warn but don't demote on absence.
+                SpawnTaskValidatorSpec::Full(Validator {
+                    id: "synthesize_research.partials_warn".into(),
+                    required: true,
+                    soft_fail: true,
+                    timeout_ms: None,
+                    phase: ValidatorPhaseKind::Completion,
+                    spec: ValidatorSpec::FileExists {
+                        path: "${args.research_dir}/_search_results.md".into(),
+                        min_bytes: None,
+                    },
+                }),
+            ],
+        };
+
+        let deep_search_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Deep search failed".into()],
+            on_completion: vec![
+                // Primary index — block delivery if it's missing.
+                SpawnTaskValidatorSpec::Full(Validator {
+                    id: "deep_search.primary_index".into(),
+                    required: true,
+                    soft_fail: false,
+                    timeout_ms: None,
+                    phase: ValidatorPhaseKind::Completion,
+                    spec: ValidatorSpec::FileExists {
+                        path: "${args.research_dir}/_search_results.md".into(),
+                        min_bytes: None,
+                    },
+                }),
+                // Per-source sub-artifacts — warn but don't demote.
+                SpawnTaskValidatorSpec::Full(Validator {
+                    id: "deep_search.sources_warn".into(),
+                    required: true,
+                    soft_fail: true,
+                    timeout_ms: None,
+                    phase: ValidatorPhaseKind::Completion,
+                    spec: ValidatorSpec::FileExists {
+                        path: "${args.research_dir}/01_source.md".into(),
+                        min_bytes: None,
+                    },
+                }),
+            ],
+        };
+
         let mut spawn_tasks = BTreeMap::new();
         spawn_tasks.insert("fm_tts".into(), tts_contract.clone());
         spawn_tasks.insert("voice_synthesize".into(), voice_synthesize_contract);
@@ -807,6 +1061,9 @@ impl WorkspacePolicy {
         spawn_tasks.insert("mofa_infographic".into(), mofa_infographic_contract);
         spawn_tasks.insert("mofa_frame".into(), mofa_frame_contract);
         spawn_tasks.insert("mofa_publish".into(), mofa_publish_contract);
+        spawn_tasks.insert("manage_skills".into(), manage_skills_contract);
+        spawn_tasks.insert("synthesize_research".into(), synthesize_research_contract);
+        spawn_tasks.insert("deep_search".into(), deep_search_contract);
 
         Self {
             schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -1355,6 +1612,7 @@ ignore = []
             Validator {
                 id: "cmd".into(),
                 required: true,
+                soft_fail: false,
                 timeout_ms: Some(3000),
                 phase: ValidatorPhaseKind::Completion,
                 spec: ValidatorSpec::Command {
@@ -1365,6 +1623,7 @@ ignore = []
             Validator {
                 id: "file".into(),
                 required: false,
+                soft_fail: false,
                 timeout_ms: None,
                 phase: ValidatorPhaseKind::TurnEnd,
                 spec: ValidatorSpec::FileExists {
@@ -1375,6 +1634,7 @@ ignore = []
             Validator {
                 id: "tool".into(),
                 required: true,
+                soft_fail: false,
                 timeout_ms: Some(5000),
                 phase: ValidatorPhaseKind::Completion,
                 spec: ValidatorSpec::ToolCall {
@@ -1402,6 +1662,8 @@ ignore = []
         let parsed: Validator = toml::from_str(toml).unwrap();
         assert_eq!(parsed.id, "x");
         assert!(parsed.required, "required defaults to true");
+        assert!(!parsed.soft_fail, "soft_fail defaults to false");
+        assert_eq!(parsed.tier(), Required::Hard);
         assert_eq!(parsed.phase, ValidatorPhaseKind::Completion);
         assert!(parsed.timeout_ms.is_none());
     }
@@ -1682,6 +1944,8 @@ ignore = []
         let validator = bare.into_validator("fm_voice_save", 0);
         assert_eq!(validator.id, "fm_voice_save.on_completion[0]");
         assert!(validator.required);
+        assert!(!validator.soft_fail);
+        assert_eq!(validator.tier(), Required::Hard);
         assert_eq!(validator.phase, ValidatorPhaseKind::Completion);
         match validator.spec {
             ValidatorSpec::OminixVoiceExists { ref name_arg } => {
@@ -1703,6 +1967,199 @@ ignore = []
         let validator = full.into_validator("ignored", 99);
         assert_eq!(validator.id, "voice_optional");
         assert!(!validator.required);
+        assert_eq!(validator.tier(), Required::None);
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-3a: HttpProbeUntil + Sha256Match + soft_fail TOML roundtrips
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn http_probe_until_roundtrips_through_toml_with_default_intervals() {
+        // Operators must be able to declare a polling probe in TOML with
+        // only the URL set; the runtime fills the poll/deadline defaults.
+        let toml = r#"
+            id = "voice_train_done"
+            kind = "http_probe_until"
+            url_template = "http://x/v1/train/status?task_id=${args.task_id}"
+            expected_contains = "complete"
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        match parsed.spec {
+            ValidatorSpec::HttpProbeUntil {
+                ref url_template,
+                expected_status,
+                ref expected_contains,
+                poll_interval_ms,
+                deadline_ms,
+            } => {
+                assert_eq!(
+                    url_template,
+                    "http://x/v1/train/status?task_id=${args.task_id}"
+                );
+                assert_eq!(expected_status, 200);
+                assert_eq!(expected_contains.as_deref(), Some("complete"));
+                assert_eq!(poll_interval_ms, 2_000);
+                assert_eq!(deadline_ms, 30_000);
+            }
+            ref other => panic!("expected HttpProbeUntil, got {other:?}"),
+        }
+        // Round-trip the validator through TOML to confirm fields survive.
+        let rendered = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: Validator = toml::from_str(&rendered).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn sha256_match_roundtrips_through_toml() {
+        let toml = r#"
+            id = "skill_main_hash"
+            kind = "sha256_match"
+            glob = "skill_main"
+            sha256 = "${args.expected_sha256}"
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        match parsed.spec {
+            ValidatorSpec::Sha256Match {
+                ref glob,
+                ref sha256,
+            } => {
+                assert_eq!(glob, "skill_main");
+                assert_eq!(sha256, "${args.expected_sha256}");
+            }
+            ref other => panic!("expected Sha256Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn soft_fail_validator_roundtrips_through_toml() {
+        // The soft_fail companion field is the Wave-3a serde contract for
+        // partial-artifact contracts: hard-required validators that should
+        // surface as warnings rather than demote the spawn task.
+        let toml = r#"
+            id = "sub_artifact_warn"
+            required = true
+            soft_fail = true
+            kind = "file_exists"
+            path = "sub-artifact.md"
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        assert!(parsed.required, "required field preserved verbatim");
+        assert!(parsed.soft_fail, "soft_fail toggled on");
+        assert_eq!(parsed.tier(), Required::Soft);
+        // Round-trip: soft_fail must serialize and deserialize cleanly.
+        let rendered = toml::to_string_pretty(&parsed).unwrap();
+        assert!(
+            rendered.contains("soft_fail = true"),
+            "soft_fail = true should be emitted in TOML: {rendered}"
+        );
+        let reparsed: Validator = toml::from_str(&rendered).unwrap();
+        assert_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn soft_fail_default_false_is_omitted_from_serialized_toml() {
+        // Existing operator policies (no soft_fail field) must round-trip
+        // byte-for-byte: soft_fail = false is the default and shouldn't
+        // surface in the rendered TOML.
+        let toml = r#"
+            id = "primary_required"
+            kind = "file_exists"
+            path = "primary.md"
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        assert!(!parsed.soft_fail);
+        let rendered = toml::to_string_pretty(&parsed).unwrap();
+        assert!(
+            !rendered.contains("soft_fail"),
+            "default soft_fail = false must not be emitted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn validator_tier_collapses_required_and_soft_fail_correctly() {
+        // The 4-case truth table from `Validator::tier`'s rustdoc.
+        let make = |required: bool, soft_fail: bool| Validator {
+            id: "x".into(),
+            required,
+            soft_fail,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "x".into(),
+                min_bytes: None,
+            },
+        };
+        assert_eq!(make(true, false).tier(), Required::Hard);
+        assert_eq!(make(true, true).tier(), Required::Soft);
+        assert_eq!(make(false, false).tier(), Required::None);
+        assert_eq!(make(false, true).tier(), Required::Soft);
+    }
+
+    // -----------------------------------------------------------------
+    // Wave-3a: `for_session()` wire targets
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_policy_declares_sha256_match_contract_for_manage_skills() {
+        // Wire target for the Wave-3a `Sha256Match` variant: lifts the
+        // inline SHA-256 check in `tools/manage_skills.rs::download_binary`
+        // onto the canonical validator path so it surfaces in the contract
+        // diagnostics ledger. The validator interpolates the expected digest
+        // through `${args.expected_sha256}` so the manage_skills tool can
+        // pass the manifest-declared hash without hard-coding it in the
+        // workspace policy.
+        let policy = WorkspacePolicy::for_session();
+        let task = policy
+            .spawn_tasks
+            .get("manage_skills")
+            .expect("manage_skills spawn-task contract should be reserved");
+        let has_sha = task.on_completion.iter().any(|entry| {
+            matches!(
+                entry,
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::Sha256Match { sha256, .. })
+                    if sha256.contains("${args.expected_sha256}")
+            )
+        });
+        assert!(
+            has_sha,
+            "manage_skills contract should declare Sha256Match interpolated against args.expected_sha256; got {:?}",
+            task.on_completion
+        );
+    }
+
+    #[test]
+    fn session_policy_declares_soft_fail_sub_artifacts_for_research_skills() {
+        // Wire target for the Wave-3a `soft_fail` tier: `synthesize_research`
+        // and `deep_search` produce a primary report PLUS optional sub-
+        // artifacts. The primary is hard-required (block delivery if it's
+        // missing); the sub-artifacts are soft-fail so a partial-artifact
+        // run still completes with operator-visible warnings.
+        let policy = WorkspacePolicy::for_session();
+        for tool in ["synthesize_research", "deep_search"] {
+            let task = policy
+                .spawn_tasks
+                .get(tool)
+                .unwrap_or_else(|| panic!("policy missing spawn task for {tool}"));
+            let mut saw_hard = false;
+            let mut saw_soft = false;
+            for entry in &task.on_completion {
+                let validator = entry.clone().into_validator(tool, 0);
+                match validator.tier() {
+                    Required::Hard => saw_hard = true,
+                    Required::Soft => saw_soft = true,
+                    Required::None => {}
+                }
+            }
+            assert!(
+                saw_hard,
+                "{tool} contract should declare a hard-required validator for the primary report"
+            );
+            assert!(
+                saw_soft,
+                "{tool} contract should declare a soft-fail validator for optional sub-artifacts"
+            );
+        }
     }
 
     // ----- WorkspacePolicyKind::Coding (Audit Gap-1 + section 7 Q3) -----

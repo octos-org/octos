@@ -1363,6 +1363,7 @@ mod tests {
         publish.on_completion = vec![SpawnTaskValidatorSpec::Full(Validator {
             id: "mofa_publish.deploy_url_probe".into(),
             required: true,
+            soft_fail: false,
             timeout_ms: Some(2000),
             phase: ValidatorPhaseKind::Completion,
             spec: ValidatorSpec::HttpProbe {
@@ -1407,6 +1408,67 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Wave-3a: end-to-end contract gate exercises the three new variants
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn enforce_spawn_task_contract_with_args_runs_sha256_match_via_interpolation() {
+        // End-to-end probe through `enforce_spawn_task_contract_with_args`
+        // for the new `Sha256Match` variant. Mirrors how `manage_skills`
+        // would wire its manifest-declared hash through input args.
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"manage_skills binary payload\n";
+        let expected_hex = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(bytes))
+        };
+
+        let skill_dir = temp.path().join("skills/example");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let binary_path = skill_dir.join("main");
+        std::fs::write(&binary_path, bytes).unwrap();
+
+        // Sole spawn-task contract: Sha256Match resolves the expected hash
+        // through args, and no artifact source / on_verify means the
+        // contract gate only runs the typed validators.
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "manage_skills_test".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: vec!["notify_user:skill install verification failed".into()],
+                on_completion: vec![crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                    crate::workspace_policy::ValidatorSpec::Sha256Match {
+                        glob: "skills/example/main".into(),
+                        sha256: "${args.expected_sha256}".into(),
+                    },
+                )],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "manage_skills_test",
+            "tool-call-sha-ok",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"expected_sha256": expected_hex.clone()})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected satisfied, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn mofa_publish_contract_fails_when_probe_returns_soft_404_html() {
         // 200 OK with a body that lacks `<!DOCTYPE` (e.g. a JSON soft-404
@@ -1439,6 +1501,57 @@ mod tests {
                     "unexpected error: {error}"
                 );
                 assert_eq!(notify_user.as_deref(), Some("Publish probe failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_spawn_task_contract_with_args_fails_when_sha256_does_not_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("skills/example");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("main"), b"actual contents").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "manage_skills_test".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: vec!["notify_user:install verification failed".into()],
+                on_completion: vec![crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                    crate::workspace_policy::ValidatorSpec::Sha256Match {
+                        glob: "skills/example/main".into(),
+                        sha256: "${args.expected_sha256}".into(),
+                    },
+                )],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let wrong_hex = "f".repeat(64);
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "manage_skills_test",
+            "tool-call-sha-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"expected_sha256": wrong_hex})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("sha256_match") || error.contains("expected="),
+                    "expected sha256 mismatch error, got: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("install verification failed"));
             }
             other => panic!("expected failure, got {other:?}"),
         }
@@ -1539,6 +1652,7 @@ mod tests {
                 on_completion: vec![SpawnTaskValidatorSpec::Full(Validator {
                     id: "fake_publish.target_exists".into(),
                     required: true,
+                    soft_fail: false,
                     timeout_ms: None,
                     phase: ValidatorPhaseKind::Completion,
                     spec: ValidatorSpec::FileExists {
@@ -1567,5 +1681,92 @@ mod tests {
             SpawnTaskContractResult::Satisfied { .. } => {}
             other => panic!("expected named_outputs path to satisfy contract, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn enforce_spawn_task_contract_with_args_treats_soft_fail_validator_as_warning() {
+        // Wire-target end-to-end probe for `Required::Soft`: a hard-required
+        // validator that's also `soft_fail` MUST surface a Fail outcome to
+        // the ledger but NOT demote the spawn task. Mirrors the
+        // `synthesize_research`/`deep_search` partial-artifact contract.
+        let temp = tempfile::tempdir().unwrap();
+        // Drop a primary report so the hard-required validator passes; the
+        // soft-fail one points at a non-existent sub-artifact and warns.
+        let primary = temp.path().join("primary.md");
+        std::fs::write(&primary, b"primary report").unwrap();
+
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "partial_artifact_task".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: Vec::new(),
+                on_deliver: Vec::new(),
+                on_failure: vec!["notify_user:partial failed".into()],
+                on_completion: vec![
+                    // Hard-required: must pass for the spawn task to satisfy.
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Full(Validator {
+                        id: "primary_required".into(),
+                        required: true,
+                        soft_fail: false,
+                        timeout_ms: None,
+                        phase: ValidatorPhaseKind::Completion,
+                        spec: crate::workspace_policy::ValidatorSpec::FileExists {
+                            path: "primary.md".into(),
+                            min_bytes: None,
+                        },
+                    }),
+                    // Soft-fail: surfaces as a warning without demoting the
+                    // gate even though `required = true`.
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Full(Validator {
+                        id: "sub_artifact_warn".into(),
+                        required: true,
+                        soft_fail: true,
+                        timeout_ms: None,
+                        phase: ValidatorPhaseKind::Completion,
+                        spec: crate::workspace_policy::ValidatorSpec::FileExists {
+                            path: "sub-artifact.md".into(),
+                            min_bytes: None,
+                        },
+                    }),
+                ],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "partial_artifact_task",
+            "tool-call-soft-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+        )
+        .await;
+
+        // Soft-fail validator must NOT demote the task even though it
+        // failed. The ledger still records the failure for operator
+        // visibility (covered by validators::tests::soft_fail_*).
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected satisfied (soft-fail must not block), got {other:?}"),
+        }
+
+        let ledger_path = temp.path().join(".octos").join("validator_outcomes.jsonl");
+        let ledger = crate::validators::ValidatorLedger::open(&ledger_path).unwrap();
+        let outcomes = ledger.read_all().unwrap();
+        let warn = outcomes
+            .iter()
+            .find(|o| o.validator_id == "sub_artifact_warn")
+            .expect("soft-fail warning should persist to the ledger");
+        assert_eq!(warn.required_tier, "soft");
+        assert!(
+            !warn.required,
+            "soft-fail must surface as required = false to legacy replayers"
+        );
+        assert!(warn.is_soft_warning());
     }
 }

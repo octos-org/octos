@@ -85,6 +85,7 @@ fn required_file_validator(id: &str, path: &str) -> Validator {
     Validator {
         id: id.into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {

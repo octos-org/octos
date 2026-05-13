@@ -457,6 +457,7 @@ async fn should_aggregate_validator_over_combined_output() {
     let validator = Validator {
         id: "aggregate_exists".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
