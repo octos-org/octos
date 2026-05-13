@@ -755,6 +755,47 @@ impl WorkspacePolicy {
             })],
         };
 
+        // mofa_publish (audit P0-3): probe the live `deploy_url` the skill
+        // emits via `named_outputs.deploy_url` after a successful publish.
+        // The probe asserts both a 200 status AND that the body carries an
+        // `<!DOCTYPE` prefix — guarding against the "200 OK with a soft
+        // 404 / SPA-shell error page" failure mode the audit calls out.
+        //
+        // `required = false` (NOT the default of true) because:
+        //
+        // 1. The mofa_publish skill in `mofa-skills/mofa-publish/` does
+        //    not yet emit `named_outputs.deploy_url`. Once that lands
+        //    (separate PR in the mofa-skills repo) this entry flips to
+        //    `required = true` so the canonical probe blocks bad
+        //    deployments.
+        // 2. Surfacing `${output.deploy_url}` against an empty
+        //    `named_outputs` map would produce a hard `Error` outcome on
+        //    every mofa_publish call until the skill catches up; setting
+        //    `required = false` keeps the validator running as a
+        //    diagnostic (recorded to the ledger) without blocking.
+        let mofa_publish_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Publish probe failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Full(Validator {
+                id: "mofa_publish.deploy_url_probe".into(),
+                required: false,
+                timeout_ms: None,
+                phase: ValidatorPhaseKind::Completion,
+                spec: ValidatorSpec::HttpProbe {
+                    url_template: "${output.deploy_url}".into(),
+                    expected_status: 200,
+                    // Sentinel rejecting a 200-with-soft-404 body. mofa_publish
+                    // ships an HTML site; the document type prefix should
+                    // always be present on a real deployed page.
+                    expected_contains: Some("<!DOCTYPE".into()),
+                },
+            })],
+        };
+
         let mut spawn_tasks = BTreeMap::new();
         spawn_tasks.insert("fm_tts".into(), tts_contract.clone());
         spawn_tasks.insert("voice_synthesize".into(), voice_synthesize_contract);
@@ -765,6 +806,7 @@ impl WorkspacePolicy {
         spawn_tasks.insert("mofa_comic".into(), mofa_comic_contract);
         spawn_tasks.insert("mofa_infographic".into(), mofa_infographic_contract);
         spawn_tasks.insert("mofa_frame".into(), mofa_frame_contract);
+        spawn_tasks.insert("mofa_publish".into(), mofa_publish_contract);
 
         Self {
             schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -1537,6 +1579,69 @@ ignore = []
                 entry.on_completion
             );
         }
+    }
+
+    #[test]
+    fn session_policy_declares_http_probe_for_mofa_publish() {
+        // P0-3 (audit): mofa_publish emits a live `deploy_url` via
+        // named_outputs; the contract must declare an HttpProbe against
+        // `${output.deploy_url}` so a 200-with-soft-404 deployment is
+        // rejected at the harness gate. The validator runs as
+        // non-required pending the mofa-skills repo follow-up that
+        // teaches the skill to emit `named_outputs.deploy_url`.
+        let policy = WorkspacePolicy::for_session();
+        let publish = policy
+            .spawn_tasks
+            .get("mofa_publish")
+            .expect("policy must declare mofa_publish spawn task");
+        let probe = publish
+            .on_completion
+            .iter()
+            .find_map(|entry| match entry {
+                SpawnTaskValidatorSpec::Full(validator) => match &validator.spec {
+                    ValidatorSpec::HttpProbe {
+                        url_template,
+                        expected_status,
+                        expected_contains,
+                    } => Some((
+                        validator.required,
+                        url_template.clone(),
+                        *expected_status,
+                        expected_contains.clone(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("mofa_publish must declare an HttpProbe Full validator");
+        assert_eq!(
+            probe.1, "${output.deploy_url}",
+            "HttpProbe must target the tool-emitted deploy_url",
+        );
+        assert_eq!(probe.2, 200, "must assert 200 status");
+        assert!(
+            probe
+                .3
+                .as_deref()
+                .map(|needle| needle.contains("<!DOCTYPE"))
+                .unwrap_or(false),
+            "expected_contains must carry the <!DOCTYPE soft-404 sentinel; got {:?}",
+            probe.3,
+        );
+        assert!(
+            !probe.0,
+            "validator must be non-required until the mofa-skills repo teaches \
+             mofa_publish to emit named_outputs.deploy_url",
+        );
+        assert_eq!(
+            publish
+                .on_failure
+                .iter()
+                .find(|action| action.starts_with("notify_user:"))
+                .cloned(),
+            Some("notify_user:Publish probe failed".to_string()),
+            "on_failure should surface a notify_user hint",
+        );
     }
 
     #[test]

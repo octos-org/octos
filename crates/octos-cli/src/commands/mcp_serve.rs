@@ -530,6 +530,7 @@ async fn run_completion_validators(
         workspace_root: workspace_root.to_path_buf(),
         repo_label: format!("mcp-serve/{contract}"),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = run_workspace_validators(
         &runner,

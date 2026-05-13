@@ -143,6 +143,12 @@ impl ValidatorStatus {
 /// (`HttpProbe`, `OminixVoiceExists`) reference these args via
 /// `${args.<key>}` template interpolation so they can assert e.g. "the
 /// requested voice name is registered with ominix-api".
+///
+/// `tool_output` carries the spawn task tool's `named_outputs` map (e.g.
+/// `mofa_publish` emits `deploy_url`). Domain validators reference these via
+/// `${output.<key>}` interpolation so they can probe the live URL the tool
+/// just produced. Absent for non-spawn contexts and for tools that emit no
+/// named outputs.
 #[derive(Clone, Debug)]
 pub struct ValidatorInvocation {
     pub phase: ValidatorPhase,
@@ -152,6 +158,10 @@ pub struct ValidatorInvocation {
     /// `${args.<key>}` interpolation; absent for non-spawn contexts (e.g.
     /// turn-end validators that don't reference task inputs).
     pub input_args: Option<serde_json::Value>,
+    /// Optional `named_outputs` map from the spawn task tool's stdout
+    /// envelope. Used by `${output.<key>}` interpolation; absent when the
+    /// tool emitted no named outputs (most legacy plugins).
+    pub tool_output: Option<serde_json::Value>,
 }
 
 impl ValidatorInvocation {
@@ -163,6 +173,7 @@ impl ValidatorInvocation {
             workspace_root,
             repo_label,
             input_args: None,
+            tool_output: None,
         }
     }
 
@@ -170,6 +181,13 @@ impl ValidatorInvocation {
     /// interpolation by domain validators.
     pub fn with_input_args(mut self, args: serde_json::Value) -> Self {
         self.input_args = Some(args);
+        self
+    }
+
+    /// Attach spawn task tool output (the `named_outputs` map) for
+    /// `${output.<key>}` template interpolation by domain validators.
+    pub fn with_tool_output(mut self, output: serde_json::Value) -> Self {
+        self.tool_output = Some(output);
         self
     }
 }
@@ -498,8 +516,38 @@ impl ValidatorRunner {
         let timeout_ms = validator.timeout_ms.unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS);
         let timeout_duration = Duration::from_millis(timeout_ms);
 
+        // Interpolate `${args.X}` and `${output.X}` references in both the
+        // executable path and each argv element. argv elements are passed
+        // as separate slots (no shell concatenation), so substitution is
+        // safe — and necessary if a policy wants to reference a tool-
+        // emitted path (e.g. `${output.patch_path}` for a `git apply`
+        // check). A missing key surfaces as an Error outcome.
+        let resolved_cmd = match interpolate_template(
+            cmd,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        let mut resolved_args = Vec::with_capacity(args.len());
+        for arg in args {
+            match interpolate_template(
+                arg,
+                invocation.input_args.as_ref(),
+                invocation.tool_output.as_ref(),
+            ) {
+                Ok(value) => resolved_args.push(value),
+                Err(reason) => {
+                    return error_outcome(invocation, validator, started_at, started, reason);
+                }
+            }
+        }
+
         // Shell-safety layer: SafePolicy denies the known-dangerous patterns.
-        let command_string = build_command_string(cmd, args);
+        let command_string = build_command_string(&resolved_cmd, &resolved_args);
         let decision = self
             .policy
             .check(&command_string, &invocation.workspace_root);
@@ -516,9 +564,9 @@ impl ValidatorRunner {
             }
         }
 
-        let mut command = Command::new(cmd);
+        let mut command = Command::new(&resolved_cmd);
         command
-            .args(args)
+            .args(&resolved_args)
             .current_dir(&invocation.workspace_root)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -712,7 +760,15 @@ impl ValidatorRunner {
         // than silently checking a literal `${args.name}` path. Note the
         // returned string is percent-encoded path-segment-safe — fine for the
         // single-filename segment use case the contract specifies.
-        let resolved_path = match interpolate_args(path, invocation.input_args.as_ref()) {
+        //
+        // `${output.X}` resolves against the spawn task's `named_outputs` map
+        // (verbatim, not percent-encoded) so a tool that emits a structured
+        // path can drive the FileExists check directly.
+        let resolved_path = match interpolate_template(
+            path,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 return error_outcome(invocation, validator, started_at, started, reason);
@@ -787,9 +843,11 @@ impl ValidatorRunner {
 
     /// Run an HTTP-probe validator.
     ///
-    /// Interpolates `${args.<key>}` against the spawn task's input args, then
-    /// performs a GET against the resulting URL and asserts the status code
-    /// (and optionally a substring of the body) matches the spec.
+    /// Interpolates `${args.<key>}` and `${output.<key>}` against the spawn
+    /// task's input args and `named_outputs` respectively, then performs a
+    /// GET against the resulting URL and asserts the status code (and
+    /// optionally a substring of the body, which is itself interpolated)
+    /// matches the spec.
     #[allow(clippy::too_many_arguments)]
     async fn run_http_probe(
         &self,
@@ -804,14 +862,37 @@ impl ValidatorRunner {
         let timeout_ms = validator
             .timeout_ms
             .unwrap_or(DEFAULT_HTTP_PROBE_TIMEOUT_MS);
-        let url = match interpolate_args(url_template, invocation.input_args.as_ref()) {
+        let url = match interpolate_template(
+            url_template,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
             Ok(url) => url,
             Err(reason) => {
                 return error_outcome(invocation, validator, started_at, started, reason);
             }
         };
 
-        match probe_http(&url, timeout_ms, expected_status, expected_contains).await {
+        // Interpolate the body-substring assertion too so policies can
+        // reference tool-emitted values (e.g. expected_contains carrying
+        // `${output.repo}` to assert the deployment HTML mentions the
+        // emitted repo slug).
+        let resolved_contains = match expected_contains {
+            Some(raw) => match interpolate_template(
+                raw,
+                invocation.input_args.as_ref(),
+                invocation.tool_output.as_ref(),
+            ) {
+                Ok(value) => Some(value),
+                Err(reason) => {
+                    return error_outcome(invocation, validator, started_at, started, reason);
+                }
+            },
+            None => None,
+        };
+        let expected_contains_ref = resolved_contains.as_deref();
+
+        match probe_http(&url, timeout_ms, expected_status, expected_contains_ref).await {
             Ok(reason) => self.make_outcome(
                 invocation,
                 validator,
@@ -940,7 +1021,27 @@ impl ValidatorRunner {
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        let matches = match glob_files(&invocation.workspace_root, pattern) {
+        // Interpolate `${args.X}` / `${output.X}` so policies can scope the
+        // glob to a per-invocation output dir (e.g.
+        // `${output.audio_dir}/**/*.wav`). A missing key is a hard error.
+        let resolved_pattern = match interpolate_template(
+            pattern,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    reason,
+                    started_at,
+                    started,
+                );
+            }
+        };
+        let matches = match glob_files(&invocation.workspace_root, &resolved_pattern) {
             Ok(matches) => matches,
             Err(reason) => {
                 return self.make_outcome(
@@ -958,7 +1059,7 @@ impl ValidatorRunner {
                 invocation,
                 validator,
                 ValidatorStatus::Fail,
-                format!("audio_non_silent: no files matched '{pattern}'"),
+                format!("audio_non_silent: no files matched '{resolved_pattern}'"),
                 started_at,
                 started,
             );
@@ -1011,7 +1112,26 @@ impl ValidatorRunner {
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        let matches = match glob_files(&invocation.workspace_root, pattern) {
+        // Interpolate `${args.X}` / `${output.X}` so policies can pin the
+        // glob to a tool-emitted output path. Missing key → Error outcome.
+        let resolved_pattern = match interpolate_template(
+            pattern,
+            invocation.input_args.as_ref(),
+            invocation.tool_output.as_ref(),
+        ) {
+            Ok(value) => value,
+            Err(reason) => {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    reason,
+                    started_at,
+                    started,
+                );
+            }
+        };
+        let matches = match glob_files(&invocation.workspace_root, &resolved_pattern) {
             Ok(matches) => matches,
             Err(reason) => {
                 return self.make_outcome(
@@ -1029,7 +1149,7 @@ impl ValidatorRunner {
                 invocation,
                 validator,
                 ValidatorStatus::Fail,
-                format!("magic_bytes: no files matched '{pattern}'"),
+                format!("magic_bytes: no files matched '{resolved_pattern}'"),
                 started_at,
                 started,
             );
@@ -1183,32 +1303,78 @@ enum HttpProbeFailure {
 
 /// Substitute `${args.<key>}` references in `template` against `input_args`.
 ///
-/// `<key>` is a dotted JSON path against the input args object. A missing key
-/// or a non-string/number value is a hard error so the validator surfaces an
-/// `Error` outcome rather than silently degrading the URL.
-///
-/// Substituted values are percent-encoded against
-/// [`URL_PATH_QUERY_RESERVED`] before being spliced into the template so an
-/// LLM- or user-controlled arg value cannot break out of the path/query
-/// segment it was placed into (e.g. inject a different host or query
-/// parameter). Templates are treated as URL fragments, not opaque strings.
+/// This thin wrapper preserves the legacy single-source signature for the
+/// inline test suite; production callers use [`interpolate_template`] which
+/// also resolves `${output.<key>}` against the spawn task's `named_outputs`.
+/// See [`interpolate_template`] for the canonical doc-comment on
+/// percent-encoding semantics and missing-key error policy.
+#[cfg(test)]
 fn interpolate_args(
     template: &str,
     input_args: Option<&serde_json::Value>,
 ) -> Result<String, String> {
+    interpolate_template(template, input_args, None)
+}
+
+/// Substitute `${args.<key>}` and `${output.<key>}` references in `template`.
+///
+/// Two interpolation sources, two trust levels:
+///
+/// - `${args.<key>}` resolves against the originating spawn task's input
+///   args (LLM-controlled). Values are percent-encoded into URL-segment-safe
+///   form so an LLM-supplied value cannot break out of the path/query slot
+///   it lands in.
+/// - `${output.<key>}` resolves against the spawn task tool's `named_outputs`
+///   map (tool-controlled, trust boundary equal to the tool itself). Values
+///   are spliced in verbatim because the canonical use case is a tool that
+///   emits a full URL (e.g. `mofa_publish` emitting `deploy_url`) that the
+///   downstream HTTP probe needs to call exactly as-is. Percent-encoding
+///   would corrupt the URL.
+///
+/// A missing key in either source surfaces as `Error` outcome (matches the
+/// `${args.X}` semantics shipped in #935): the validator runner translates
+/// this `Err` into a typed Error result rather than silently substituting
+/// the empty string.
+///
+/// Mixed templates resolve both sources in a single pass, e.g.
+/// `https://${output.host}/voices/${args.name}` works in one call. Order
+/// inside the template is preserved.
+fn interpolate_template(
+    template: &str,
+    input_args: Option<&serde_json::Value>,
+    tool_output: Option<&serde_json::Value>,
+) -> Result<String, String> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
-    while let Some(start) = rest.find("${args.") {
+    loop {
+        let next_args = rest.find("${args.");
+        let next_output = rest.find("${output.");
+        let (start, prefix_len, source, source_label, encode) = match (next_args, next_output) {
+            (None, None) => break,
+            (Some(a), None) => (a, "${args.".len(), input_args, "input arg", true),
+            (None, Some(o)) => (o, "${output.".len(), tool_output, "output", false),
+            (Some(a), Some(o)) => {
+                if a <= o {
+                    (a, "${args.".len(), input_args, "input arg", true)
+                } else {
+                    (o, "${output.".len(), tool_output, "output", false)
+                }
+            }
+        };
         out.push_str(&rest[..start]);
-        let after = &rest[start + "${args.".len()..];
+        let after = &rest[start + prefix_len..];
         let end = after
             .find('}')
-            .ok_or_else(|| format!("unterminated ${{args.}} reference in template: {template}"))?;
+            .ok_or_else(|| format!("unterminated reference in template: {template}"))?;
         let key = &after[..end];
-        let value = input_arg(input_args, key).ok_or_else(|| {
-            format!("input arg '{key}' not found while interpolating template: {template}")
+        let value = input_arg(source, key).ok_or_else(|| {
+            format!("{source_label} '{key}' not found while interpolating template: {template}")
         })?;
-        out.push_str(&percent_encode_url_segment(&value));
+        if encode {
+            out.push_str(&percent_encode_url_segment(&value));
+        } else {
+            out.push_str(&value);
+        }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -2275,5 +2441,331 @@ mod tests {
             !interpolated.contains('='),
             "raw `=` leaked: {interpolated}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: `${output.X}` template interpolation tests.
+    // -------------------------------------------------------------------
+
+    /// Minimal valid PNG signature + chunk (1x1 transparent) used by the
+    /// MagicBytes test below. Only the leading PNG signature bytes are
+    /// inspected by the validator, but a full chunk-set keeps the file
+    /// recognizable to image tools.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x62, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, b'I',
+        b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn interpolate_template_substitutes_output_key_verbatim() {
+        // Tool-emitted values (`${output.X}`) come from a trusted source
+        // and represent full URLs / paths. Percent-encoding would corrupt
+        // them, so the substitution must be verbatim.
+        let output = serde_json::json!({"deploy_url": "https://example.com/path?ref=main"});
+        let out = interpolate_template("${output.deploy_url}", None, Some(&output)).unwrap();
+        assert_eq!(out, "https://example.com/path?ref=main");
+    }
+
+    #[test]
+    fn interpolate_template_errors_when_output_key_missing() {
+        // Mirror the `${args.X}` semantics: a missing key surfaces as a
+        // hard error so the validator can produce an `Error` outcome
+        // rather than silently degrading the URL.
+        let output = serde_json::json!({});
+        let err = interpolate_template("${output.deploy_url}", None, Some(&output)).unwrap_err();
+        assert!(err.contains("'deploy_url'"), "{err}");
+        assert!(err.contains("output"), "{err}");
+    }
+
+    #[test]
+    fn interpolate_template_errors_when_tool_output_is_none() {
+        let err = interpolate_template("${output.deploy_url}", None, None).unwrap_err();
+        assert!(err.contains("'deploy_url'"), "{err}");
+    }
+
+    #[test]
+    fn interpolate_template_mixes_args_and_output_in_one_template() {
+        // A single template can reference both sources in any order.
+        let args = serde_json::json!({"name": "yangmi"});
+        let output = serde_json::json!({"host": "https://api.example.com"});
+        let out = interpolate_template(
+            "${output.host}/voices/${args.name}/check",
+            Some(&args),
+            Some(&output),
+        )
+        .unwrap();
+        assert_eq!(out, "https://api.example.com/voices/yangmi/check");
+    }
+
+    #[test]
+    fn interpolate_template_keeps_args_percent_encoding_when_output_is_present() {
+        // Mixed template: args path segment is percent-encoded even
+        // though the template also references a tool output. Confirms the
+        // two interpolation sources remain logically distinct.
+        let args = serde_json::json!({"name": "evil/../?inject=1"});
+        let output = serde_json::json!({"host": "https://api.example.com"});
+        let out = interpolate_template("${output.host}/x/${args.name}", Some(&args), Some(&output))
+            .unwrap();
+        let segment = out
+            .strip_prefix("https://api.example.com/x/")
+            .expect("prefix preserved");
+        assert!(
+            !segment.contains('/'),
+            "args `/` leaked into segment: {segment}"
+        );
+        assert!(
+            !segment.contains('?'),
+            "args `?` leaked into segment: {segment}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_exists_resolves_output_template() {
+        // `${output.X}` works inside FileExists for tools that emit a
+        // structured artifact path.
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("publish/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let index = out_dir.join("index.html");
+        std::fs::write(&index, vec![0u8; 64]).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "published_index",
+            ValidatorSpec::FileExists {
+                path: "${output.publish_dir}/index.html".into(),
+                min_bytes: Some(8),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({"publish_dir": "publish/out"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn file_exists_errors_when_required_output_key_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "needs_output",
+            ValidatorSpec::FileExists {
+                path: "${output.publish_dir}/index.html".into(),
+                min_bytes: None,
+            },
+        );
+        // tool_output missing the `publish_dir` key entirely.
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'publish_dir'"),
+            "{}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_resolves_output_url_template() {
+        // mofa_publish-style scenario: tool emits a fully-formed deploy_url;
+        // HttpProbe probes that URL verbatim (no percent-encoding).
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n<!DOCTYPE html>";
+        let addr = spawn_test_http_server(vec![response]);
+        let url_template = "${output.deploy_url}".to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_deploy",
+            ValidatorSpec::HttpProbe {
+                url_template,
+                expected_status: 200,
+                expected_contains: Some("<!DOCTYPE".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({
+            "deploy_url": format!("http://{addr}/site"),
+        }));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn http_probe_errors_when_output_deploy_url_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_deploy_missing",
+            ValidatorSpec::HttpProbe {
+                url_template: "${output.deploy_url}".into(),
+                expected_status: 200,
+                expected_contains: None,
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'deploy_url'"),
+            "{}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn http_probe_expected_contains_interpolates_args_and_output() {
+        // mofa_publish-style scenario where the deployed page mentions
+        // both an LLM-supplied slug (args.repo_slug) and a tool-emitted
+        // commit sha (output.commit_sha). Both must interpolate in the
+        // expected_contains assertion.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 26\r\n\r\nrepo=octos-site sha=abc123";
+        let addr = spawn_test_http_server(vec![response]);
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "probe_mixed",
+            ValidatorSpec::HttpProbe {
+                url_template: format!("http://{addr}/"),
+                expected_status: 200,
+                expected_contains: Some("sha=${output.commit_sha}".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_input_args(serde_json::json!({"repo_slug": "octos-site"}))
+        .with_tool_output(serde_json::json!({"commit_sha": "abc123"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn command_args_interpolate_output_key() {
+        // Command's argv can reference output values for tools that emit
+        // a path (e.g. propose_patch emitting `patch_path` → `git apply
+        // --check ${output.patch_path}`). Verbatim substitution so the
+        // path stays usable as a real filesystem argument.
+        let dir = tempfile::tempdir().unwrap();
+        let path_arg = dir.path().join("deploy.txt");
+        std::fs::write(&path_arg, b"x").unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "cmd_with_output",
+            ValidatorSpec::Command {
+                cmd: "test".into(),
+                args: vec!["-f".into(), "${output.target_path}".into()],
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({
+            "target_path": path_arg.to_string_lossy().to_string(),
+        }));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn command_args_error_when_output_key_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "cmd_missing_output",
+            ValidatorSpec::Command {
+                cmd: "true".into(),
+                args: vec!["${output.missing}".into()],
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'missing'"),
+            "{}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn magic_bytes_glob_interpolates_output_key() {
+        // MagicBytes pinned to a tool-emitted output directory.
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("publish");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("a.png"), PNG_1X1).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_output",
+            ValidatorSpec::MagicBytes {
+                glob: "${output.dir}/*.png".into(),
+                format: crate::workspace_policy::MagicByteKind::Png,
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({"dir": "publish"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn audio_non_silent_glob_interpolates_output_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("clips");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        write_sine_wav(&out_dir.join("a.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "audio_output_glob",
+            ValidatorSpec::AudioNonSilent {
+                glob: "${output.audio_dir}/*.wav".into(),
+                min_ratio: 0.3,
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_tool_output(serde_json::json!({"audio_dir": "clips"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
     }
 }

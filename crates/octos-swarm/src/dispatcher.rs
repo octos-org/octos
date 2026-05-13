@@ -521,6 +521,7 @@ impl Swarm {
                 validator.invocation.repo_label, contract.contract_id
             ),
             input_args: None,
+            tool_output: None,
         };
 
         let outcomes = validator.runner.run_all(&invocation, &scoped).await;
