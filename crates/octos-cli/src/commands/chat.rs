@@ -288,7 +288,10 @@ impl ChatCommand {
             }
         }
 
-        // Pipeline tool (DOT-based multi-step workflows, with plugin access)
+        // Pipeline tool (DOT-based multi-step workflows, with plugin access).
+        // Section B (codex review follow-up): propagate
+        // `plugins.require_signed` so pipeline workers enforce the same
+        // gate as the main session.
         let pipeline_tool = octos_pipeline::RunPipelineTool::new(
             llm.clone(),
             memory.clone(),
@@ -296,7 +299,8 @@ impl ChatCommand {
             data_dir.clone(),
         )
         .with_provider_policy(tools.provider_policy().cloned())
-        .with_plugin_dirs(plugin_dirs);
+        .with_plugin_dirs(plugin_dirs)
+        .with_plugin_require_signed(config.plugins.require_signed);
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
             "run_pipeline",

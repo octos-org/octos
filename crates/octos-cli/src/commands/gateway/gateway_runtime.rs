@@ -902,6 +902,10 @@ impl GatewayRuntime {
                 let plugins_c = plugin_dirs_for_spawn.clone();
                 let router_c = provider_router.clone();
                 let octos_home_c = cmd.octos_home.clone();
+                // Section B (codex review follow-up): capture the host's
+                // strict-signing flag so per-session `RunPipelineTool`
+                // instances honour the same `plugins.require_signed` gate.
+                let plugin_require_signed_c = config.plugins.require_signed;
 
                 struct DefaultPipelineToolFactory {
                     llm: Arc<dyn LlmProvider>,
@@ -912,6 +916,7 @@ impl GatewayRuntime {
                     plugin_dirs: Vec<PathBuf>,
                     router: Option<Arc<ProviderRouter>>,
                     octos_home: Option<PathBuf>,
+                    plugin_require_signed: bool,
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
@@ -923,7 +928,8 @@ impl GatewayRuntime {
                             self.data_dir.clone(),
                         )
                         .with_provider_policy(self.policy.clone())
-                        .with_plugin_dirs(self.plugin_dirs.clone());
+                        .with_plugin_dirs(self.plugin_dirs.clone())
+                        .with_plugin_require_signed(self.plugin_require_signed);
                         if let Some(ref router) = self.router {
                             pt = pt.with_provider_router(router.clone());
                         }
@@ -943,6 +949,7 @@ impl GatewayRuntime {
                     plugin_dirs: plugins_c,
                     router: router_c,
                     octos_home: octos_home_c,
+                    plugin_require_signed: plugin_require_signed_c,
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }

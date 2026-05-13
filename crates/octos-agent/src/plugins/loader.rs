@@ -290,13 +290,30 @@ impl PluginLoader {
         // Resolve extras (MCP servers, hooks, prompt fragments) regardless of tools.
         let extras = resolve_extras(&manifest, plugin_dir);
 
+        // Section B (codex review P1.2 + follow-up): under strict signing,
+        // REJECT any extras-only manifest before we let it install MCP
+        // servers / hooks / prompts. The `manifest.sha256` field's semantics
+        // currently anchor the executable bytes — there is no canonical hash
+        // input for extras-only skills, and even a manifest that declares a
+        // non-empty `sha256` would never see those bytes hashed below
+        // because of the `tools.is_empty()` early return. Under strict mode
+        // we refuse to mint trust for that code path entirely; the operator
+        // can split executable + extras into separate skills if they need a
+        // verifiable extras-only payload (future work).
+        if require_signed && manifest.tools.is_empty() && manifest.has_extras() {
+            eyre::bail!(
+                "plugin '{}' rejected: `plugins.require_signed` is enabled \
+                 and extras-only skills (no tools) cannot anchor a verifiable \
+                 hash. Split the executable + extras into separate skills.",
+                manifest.name,
+            );
+        }
         // Section B (codex review P1.2): under strict signing, REJECT any
-        // unsigned skill — including extras-only ones. MCP server commands
-        // and lifecycle hooks resolved from `manifest.json` introduce
-        // executable code paths the operator did not authorize via a hash.
-        // The check must run before the `tools.is_empty()` early-return
-        // below; otherwise an extras-only skill would slip past strict
-        // mode entirely.
+        // unsigned skill that declares tools. MCP server commands and
+        // lifecycle hooks resolved from `manifest.json` introduce executable
+        // code paths the operator did not authorize via a hash. The check
+        // runs BEFORE the executable search so we never read or write any
+        // bytes for an unsigned plugin under strict mode.
         if require_signed && manifest.sha256.is_none() {
             eyre::bail!(
                 "plugin '{}' rejected: `plugins.require_signed` is enabled \
@@ -1081,6 +1098,87 @@ mod tests {
         assert_eq!(
             result.tool_count, 1,
             "signed plugin must still load under require_signed"
+        );
+    }
+
+    /// Section B (codex review follow-up): under strict signing, an
+    /// extras-only skill (no tools, but with MCP servers / hooks / prompts)
+    /// is rejected because the `manifest.sha256` field can never anchor a
+    /// hash check for its executable extras — the load path otherwise
+    /// returns extras unconditionally on `tools.is_empty()`.
+    #[test]
+    fn require_signed_rejects_extras_only_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("extras-only");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // Extras-only manifest: declares an MCP server but NO tools, and
+        // even claims a fake `sha256`. Under strict mode we must reject
+        // because hashing the executable bytes never happens for skills
+        // with no tools.
+        let manifest = r#"{
+            "name": "extras-only",
+            "version": "1.0",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "mcp_servers": [{
+                "command": "/bin/echo",
+                "args": ["mcp"]
+            }],
+            "tools": []
+        }"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.tool_count, 0,
+            "extras-only skill must be rejected under require_signed"
+        );
+        assert!(
+            result.mcp_servers.is_empty(),
+            "rejected skill's MCP servers must not be installed; got: {:?}",
+            result.mcp_servers
+        );
+    }
+
+    /// Section B (codex review follow-up): under permissive mode, an
+    /// extras-only skill still loads its extras as it always did — this
+    /// is a backward-compatibility check.
+    #[test]
+    fn require_signed_off_keeps_extras_only_skill_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("extras-only-legacy");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let manifest = r#"{
+            "name": "extras-only-legacy",
+            "version": "1.0",
+            "mcp_servers": [{
+                "command": "/bin/echo",
+                "args": ["mcp"]
+            }],
+            "tools": []
+        }"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 0, "extras-only skill registers no tools");
+        assert_eq!(
+            result.mcp_servers.len(),
+            1,
+            "extras-only skill must surface its MCP server under permissive mode"
         );
     }
 

@@ -794,6 +794,7 @@ impl ProfileActorFactoryBuilder {
                 plugin_dirs: Vec<PathBuf>,
                 router: Option<Arc<ProviderRouter>>,
                 octos_home: PathBuf,
+                plugin_require_signed: bool,
             }
 
             impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
@@ -806,6 +807,7 @@ impl ProfileActorFactoryBuilder {
                     )
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
+                    .with_plugin_require_signed(self.plugin_require_signed)
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref router) = self.router {
                         pt = pt.with_provider_router(router.clone());
@@ -822,6 +824,9 @@ impl ProfileActorFactoryBuilder {
                 plugin_dirs: plugin_dirs.clone(),
                 router: provider_router.clone(),
                 octos_home: self.project_dir.clone(),
+                // Section B (codex review follow-up): propagate the
+                // profile's strict-signing policy.
+                plugin_require_signed: profile_config.plugins.require_signed,
             })
                 as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
 
