@@ -1602,11 +1602,32 @@ fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOr
         Ok(origin_str) => {
             let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
             if allowed.iter().any(|s| s == origin_str) {
-                WsOriginDecision::Allow
-            } else {
-                WsOriginDecision::RejectDisallowed {
-                    origin: origin_str.to_string(),
+                return WsOriginDecision::Allow;
+            }
+            // Per-tenant browser origins: `https://<tenant>.<base_domain>`.
+            // Hosted multi-tenant minis route by subdomain (dspfac.<base>,
+            // alice.<base>, ...) and the static CORS allowlist only covers
+            // app./admin./api. — adding every tenant up front isn't
+            // feasible. Accept any single-label subdomain of the configured
+            // base_domain so per-tenant browsers can open the WS. Tenants
+            // are sandboxed at the auth layer; the Origin gate is the
+            // cross-site protection (rejecting `evil.com` browser tabs).
+            if let Some(base) = base_domain {
+                if let Some(host) = origin_str.strip_prefix("https://") {
+                    let expected_suffix = format!(".{base}");
+                    if let Some(tenant) = host.strip_suffix(&expected_suffix) {
+                        // Single label only: non-empty, no dots, no port.
+                        if !tenant.is_empty()
+                            && !tenant.contains('.')
+                            && !tenant.contains(':')
+                        {
+                            return WsOriginDecision::Allow;
+                        }
+                    }
                 }
+            }
+            WsOriginDecision::RejectDisallowed {
+                origin: origin_str.to_string(),
             }
         }
         Err(_) => WsOriginDecision::RejectMalformed,
