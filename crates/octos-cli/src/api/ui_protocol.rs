@@ -14,7 +14,7 @@ use axum::Extension;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use octos_agent::{
@@ -1483,6 +1483,24 @@ pub async fn ws_handler(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // #923.3: gate the upgrade on Origin. CORS doesn't apply to WS
+    // handshakes, so without this a browser tab on any origin could
+    // open the socket as long as it has a valid token. Non-browser
+    // clients (TUI, gateway, scripts) typically omit the Origin
+    // header — allow that. When Origin IS present it must match the
+    // shared CORS allowlist.
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        let origin_str = origin.to_str().unwrap_or("");
+        let allowed = super::router::cors_allowlist_for_base_domain(state.base_domain.as_deref());
+        if !allowed.iter().any(|s| s == origin_str) {
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                origin = %origin_str,
+                "rejected WS upgrade from disallowed Origin"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "disallowed origin").into_response();
+        }
+    }
     let connection_profile_id = identity
         .as_ref()
         .and_then(|Extension(identity)| authenticated_profile_id(identity))
@@ -1838,17 +1856,34 @@ async fn ui_protocol_connection(
         &contracts.approvals,
     )
     .await;
-    abort_live_forwarders(&live_forwarders).await;
+    abort_live_forwarders(&live_forwarders, &ledger).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
 }
 
-async fn abort_live_forwarders(forwarders: &SharedLiveForwarders) {
-    let mut guard = forwarders.lock().await;
-    for (_, abort) in guard.drain() {
-        abort.abort();
+async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiProtocolLedger) {
+    let drained_sessions: Vec<SessionKey> = {
+        let mut guard = forwarders.lock().await;
+        guard
+            .drain()
+            .map(|(session_id, abort)| {
+                abort.abort();
+                session_id
+            })
+            .collect()
+    };
+    if drained_sessions.is_empty() {
+        return;
+    }
+    // #923.2: yield once so the aborted forwarder tasks have a chance
+    // to drop their broadcast receivers before we prune. Then sweep
+    // each session — if its receiver count is now zero we drop the
+    // sender immediately instead of waiting for the periodic sweep.
+    tokio::task::yield_now().await;
+    for session_id in drained_sessions {
+        ledger.prune_subscriber_if_idle(&session_id);
     }
 }
 
@@ -1874,8 +1909,8 @@ fn parse_ws_text_frame(text: &str) -> Result<ParsedFrame, RpcError> {
     if text.len() > MAX_TEXT_FRAME_BYTES {
         return Err(frame_too_large_error());
     }
-    let value: Value = serde_json::from_str(text)
-        .map_err(|err| RpcError::parse_error(err.to_string()))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))?;
     if !value.is_object() {
         return Err(RpcError::parse_error("envelope must be an object"));
     }
@@ -7521,13 +7556,12 @@ mod tests {
         assert_eq!(ledger_event_cursor(&spawn), Some(cursor.clone()));
 
         // Sanity: a non-cursor-bearing variant returns None.
-        let delta = UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(
-            MessageDeltaEvent {
+        let delta =
+            UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
                 session_id: session_id.clone(),
                 turn_id: TurnId::new(),
                 text: "x".into(),
-            },
-        ));
+            }));
         assert_eq!(ledger_event_cursor(&delta), None);
     }
 
@@ -12876,7 +12910,7 @@ mod tests {
 
         // Cleanup: aborting the forwarder must not panic and must release
         // the receiver so subsequent prune_idle_subscribers reclaims the slot.
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[tokio::test]
@@ -12925,7 +12959,7 @@ mod tests {
         // No further frames are queued (only one live event emitted).
         assert!(rx.try_recv().is_err(), "no more frames expected");
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[tokio::test]
@@ -12956,7 +12990,7 @@ mod tests {
             "client without event.message_persisted.v1 must not receive message/persisted"
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     // ========================================================================
@@ -13085,7 +13119,7 @@ mod tests {
             "no second frame: background message/persisted is suppressed for new clients",
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     /// Codex P1: when the BackgroundResultSender persist scope is
@@ -13220,7 +13254,7 @@ mod tests {
             "no second frame: turn/spawn_complete is suppressed for old clients",
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[tokio::test]
@@ -13277,7 +13311,7 @@ mod tests {
         );
 
         // Disconnect ws_a; ws_b must continue receiving subsequent events.
-        abort_live_forwarders(&forwarders_a).await;
+        abort_live_forwarders(&forwarders_a, &ledger).await;
         drop(rx_a);
         ledger.append_notification(message_persisted_for(&session_id));
         let frame_b2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
@@ -13289,7 +13323,7 @@ mod tests {
             Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
         );
 
-        abort_live_forwarders(&forwarders_b).await;
+        abort_live_forwarders(&forwarders_b, &ledger).await;
     }
 
     // -- Codex PR #761 review fixes ----------------------------------------
@@ -13382,7 +13416,7 @@ mod tests {
             "no further frames expected: session/open must be self-suppressed"
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     /// MUST-FIX-2: a `send_notification_durable` call from the same
@@ -13459,8 +13493,8 @@ mod tests {
             Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
         );
 
-        abort_live_forwarders(&forwarders).await;
-        abort_live_forwarders(&forwarders_other).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
+        abort_live_forwarders(&forwarders_other, &ledger).await;
     }
 
     /// MUST-FIX-3: a `subscribe()` call followed by dropping the
@@ -13544,7 +13578,7 @@ mod tests {
             Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     // ----- M11-E: UI Protocol per-session workspace wiring -----------------

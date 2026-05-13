@@ -71,10 +71,7 @@ impl PendingApprovalStore {
         &self,
         params: ApprovalRespondParams,
     ) -> Result<RespondOutcome, RpcError> {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = entries.get_mut(&params.approval_id) else {
             return Err(approval_not_found_error(&params));
         };
@@ -158,10 +155,7 @@ impl PendingApprovalStore {
         turn_id: &TurnId,
         reason: &str,
     ) -> Vec<CancelledApproval> {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let mut cancelled = Vec::new();
         for (approval_id, entry) in entries.iter_mut() {
             if entry.session_id != *session_id {
@@ -199,10 +193,7 @@ impl PendingApprovalStore {
         fallback_turn_id: &TurnId,
         reason: &str,
     ) -> Option<CancelledApproval> {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let entry = entries.get_mut(approval_id)?;
         if entry.session_id != *session_id {
             return None;
@@ -229,10 +220,7 @@ impl PendingApprovalStore {
 
     #[allow(dead_code)]
     pub(super) fn insert_pending(&self, session_id: SessionKey, approval_id: ApprovalId) {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
             approval_id,
             ApprovalEntry {
@@ -246,10 +234,7 @@ impl PendingApprovalStore {
     }
 
     pub(super) fn request(&self, event: ApprovalRequestedEvent) -> ApprovalRequestedEvent {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
             event.approval_id.clone(),
             ApprovalEntry {
@@ -268,10 +253,7 @@ impl PendingApprovalStore {
         event: ApprovalRequestedEvent,
     ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
             event.approval_id.clone(),
             ApprovalEntry {
@@ -289,10 +271,7 @@ impl PendingApprovalStore {
         &self,
         session_id: &SessionKey,
     ) -> Vec<ApprovalRequestedEvent> {
-        let entries = self
-            .entries
-            .read()
-            .expect("pending approval store poisoned");
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
         entries
             .values()
             .filter(|entry| {
@@ -305,10 +284,7 @@ impl PendingApprovalStore {
 
     #[allow(dead_code)]
     pub(super) fn remove_pending(&self, session_id: &SessionKey, approval_id: &ApprovalId) -> bool {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("pending approval store poisoned");
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let should_remove = entries.get(approval_id).is_some_and(|entry| {
             entry.session_id == *session_id && matches!(&entry.state, ApprovalEntryState::Pending)
         });
@@ -323,10 +299,7 @@ impl PendingApprovalStore {
         &self,
         approval_id: &ApprovalId,
     ) -> Option<ApprovalRequestedEvent> {
-        let entries = self
-            .entries
-            .read()
-            .expect("pending approval store poisoned");
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
         entries
             .get(approval_id)
             .and_then(|entry| entry.request.clone())
