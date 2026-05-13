@@ -185,6 +185,10 @@ pub(crate) struct WsConnection {
     /// connection can drop the broadcast copy and avoid duplicate
     /// delivery to the WS.
     connection_id: ConnectionId,
+    /// #922.2: latched when a lifecycle/RPC send hits backpressure or a
+    /// closed writer. The read loop polls this and breaks cleanly so a
+    /// silently-dropped RPC reply does not strand the client.
+    failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WsConnection {
@@ -193,7 +197,17 @@ impl WsConnection {
             writer,
             metrics: Arc::new(ConnectionMetrics::default()),
             connection_id: ConnectionId::next(),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark_failed(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(test)]
@@ -219,6 +233,12 @@ impl WsConnection {
     }
 
     /// Lifecycle: turn lifecycle / RPC reply. Caller acts on the failure.
+    ///
+    /// #922.2: a lifecycle-frame backpressure drop is treated as a
+    /// connection failure. The latched `failed` flag tells the read
+    /// loop to stop dispatch and tear down — better than silently
+    /// dropping RPC replies (which left clients timing out while the
+    /// server thought the call succeeded).
     fn send_lifecycle(&self, frame: WsMessage) -> Result<(), SendError> {
         match self.try_enqueue(frame) {
             Ok(_) => Ok(()),
@@ -227,8 +247,9 @@ impl WsConnection {
                 tracing::warn!(
                     target: "octos::ui_protocol::ws",
                     reason = "backpressure",
-                    "lifecycle ws send failed; turn will abort"
+                    "lifecycle ws send failed; aborting connection"
                 );
+                self.mark_failed();
                 Err(SendError::LifecycleFailure(
                     "writer channel full for lifecycle frame".into(),
                 ))
@@ -238,8 +259,9 @@ impl WsConnection {
                 tracing::warn!(
                     target: "octos::ui_protocol::ws",
                     reason = "closed",
-                    "lifecycle ws send failed; turn will abort"
+                    "lifecycle ws send failed; aborting connection"
                 );
+                self.mark_failed();
                 Err(SendError::LifecycleFailure(
                     "writer channel closed for lifecycle frame".into(),
                 ))
@@ -1526,6 +1548,13 @@ async fn ui_protocol_connection(
     let routed_profile_id = routed_profile_id.as_deref();
 
     while let Some(Ok(msg)) = ws_rx.next().await {
+        // #922.2: stop dispatch once a lifecycle/RPC send has been
+        // marked fatal so we don't quietly accept further requests we
+        // can never reply to. The cleanup below still appends terminal
+        // events / cancels approvals via `abort_connection_turns`.
+        if ws.is_failed() {
+            break;
+        }
         let text = match msg {
             WsMessage::Text(text) => text,
             WsMessage::Close(_) => break,
@@ -1534,7 +1563,21 @@ async fn ui_protocol_connection(
         };
 
         let request = match parse_ws_text_frame(text.as_str()) {
-            Ok(request) => request,
+            Ok(ParsedFrame::Request(request)) => request,
+            Ok(ParsedFrame::Notification(method)) => {
+                // #922.1: known inbound notifications (no `id`) are
+                // accepted silently. Unknown notifications get a debug
+                // trace but no reply — a notification by spec has no
+                // response.
+                if !is_known_inbound_notification(&method) {
+                    tracing::debug!(
+                        target: "octos::ui_protocol::ws",
+                        method = %method,
+                        "ignoring unknown inbound notification"
+                    );
+                }
+                continue;
+            }
             Err(error) => {
                 // Lifecycle: client violated the wire contract. We try to
                 // tell them, but proceed regardless — the read loop is
@@ -1809,15 +1852,55 @@ async fn abort_live_forwarders(forwarders: &SharedLiveForwarders) {
     }
 }
 
-fn parse_ws_text_frame(text: &str) -> Result<RpcRequest<Value>, RpcError> {
+/// #922.1: JSON-RPC envelopes with no `id` are notifications, not
+/// requests. The protocol's bridge sends a `ping` notification every
+/// 30s; the legacy parser required `RpcRequest.id: String`, so the
+/// server replied with a `parse_error` for every keepalive. The
+/// resulting noise also masked real parse errors.
+///
+/// Inspect the raw envelope first: if `id` is absent we return
+/// `Notification(method)` (the caller silently accepts known
+/// notifications such as `ping`). When `id` is present we parse the
+/// full `RpcRequest<Value>` shape and return `Request`. Unparseable
+/// frames continue to return `Err(RpcError)` so the existing
+/// "lifecycle: client violated wire contract" branch fires.
+#[derive(Debug)]
+enum ParsedFrame {
+    Request(RpcRequest<Value>),
+    Notification(String),
+}
+
+fn parse_ws_text_frame(text: &str) -> Result<ParsedFrame, RpcError> {
     if text.len() > MAX_TEXT_FRAME_BYTES {
         return Err(frame_too_large_error());
     }
-    parse_rpc_request(text)
+    let value: Value = serde_json::from_str(text)
+        .map_err(|err| RpcError::parse_error(err.to_string()))?;
+    if !value.is_object() {
+        return Err(RpcError::parse_error("envelope must be an object"));
+    }
+    let has_id = value.get("id").is_some_and(|v| !v.is_null());
+    if !has_id {
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::parse_error("notification missing method"))?
+            .to_owned();
+        return Ok(ParsedFrame::Notification(method));
+    }
+    let request: RpcRequest<Value> =
+        serde_json::from_value(value).map_err(|err| RpcError::parse_error(err.to_string()))?;
+    Ok(ParsedFrame::Request(request))
 }
 
+#[cfg(test)]
 fn parse_rpc_request(text: &str) -> Result<RpcRequest<Value>, RpcError> {
     serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))
+}
+
+/// Inbound notifications the server accepts (no reply emitted).
+fn is_known_inbound_notification(method: &str) -> bool {
+    matches!(method, "ping")
 }
 
 fn route_rpc_command(
@@ -8757,6 +8840,19 @@ mod tests {
             error.data.as_ref().and_then(|data| data.get("limit_bytes")),
             Some(&json!(MAX_TEXT_FRAME_BYTES))
         );
+    }
+
+    /// #922.1: an envelope without `id` is a JSON-RPC notification and
+    /// must not yield a parse_error reply.
+    #[test]
+    fn idless_envelope_parses_as_notification() {
+        let frame = r#"{"jsonrpc":"2.0","method":"ping","params":{}}"#;
+        match parse_ws_text_frame(frame).expect("parses") {
+            ParsedFrame::Notification(method) => assert_eq!(method, "ping"),
+            ParsedFrame::Request(_) => panic!("expected notification"),
+        }
+        assert!(is_known_inbound_notification("ping"));
+        assert!(!is_known_inbound_notification("unknown"));
     }
 
     #[test]
