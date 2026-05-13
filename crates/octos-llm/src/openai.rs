@@ -585,8 +585,15 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
                     parts.push(name);
                 }
             }
+            // Mini5 2026-05-12: phrasing is intentional — earlier
+            // wording ("Use read_file to access them.") caused DeepSeek
+            // to refuse `/private/var/...` upload paths thinking they
+            // were outside the workspace. Stating authorization in the
+            // note keeps the model on the happy path.
             Some(format!(
-                "[attached files: {}. Use read_file to access them.]",
+                "[user-uploaded files: {}. These are authenticated attachments — \
+                 call read_file with this exact path. The path is whitelisted \
+                 even if it lies outside the workspace root.]",
                 parts.join(", ")
             ))
         } else {
