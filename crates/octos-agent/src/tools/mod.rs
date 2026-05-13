@@ -671,13 +671,30 @@ pub use code_structure::CodeStructureTool;
 
 use std::path::{Component, Path};
 
-/// Resolve a user-provided path, ensuring it stays within base_dir.
+/// Resolve a user-provided path, ensuring it stays within base_dir
+/// **or** inside the authenticated upload tmpdir.
 ///
-/// Rejects absolute paths and prevents traversal via `../`.
-/// Does NOT follow symlinks (normalize only, no filesystem access).
+/// Absolute paths are accepted only when they point at a file under
+/// `octos_bus::file_handle::temp_upload_root()` — those files are
+/// user-uploaded attachments resolved by the WS/REST upload handler
+/// from an authenticated session, so the agent is allowed to read
+/// them even though they live outside the per-session workspace. All
+/// other absolute paths are rejected.
+///
+/// Relative paths must resolve under `base_dir` after `../` traversal
+/// is normalized away. Does NOT follow symlinks (normalize only, no
+/// filesystem access except a single existence check for the upload
+/// whitelist).
 pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
-    if PathBuf::from(user_path).is_absolute() {
-        eyre::bail!("absolute paths are not allowed: {}", user_path);
+    let candidate = PathBuf::from(user_path);
+    if candidate.is_absolute() {
+        if is_inside_upload_root(&candidate) {
+            return Ok(normalize_path(&candidate));
+        }
+        eyre::bail!(
+            "absolute paths are not allowed outside the upload tmpdir: {}",
+            user_path
+        );
     }
 
     let path = base_dir.join(user_path);
@@ -689,6 +706,53 @@ pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
     }
 
     Ok(normalized)
+}
+
+/// Returns true when `candidate` resolves under the authenticated upload
+/// tmpdir. macOS firmlinks render the same directory as both
+/// `/var/folders/...` and `/private/var/folders/...`; `resolve_upload_reference`
+/// runs `std::fs::canonicalize` and returns the `/private/` form, but
+/// `temp_upload_root()` returns the un-prefixed form. Compare via
+/// `canonicalize` on the upload root so the firmlink is collapsed; on the
+/// candidate side, walk parents to find one that exists, canonicalize that,
+/// and re-attach the remainder. Without this both Linux *and* macOS work
+/// — but Linux paths never differ syntactically, while macOS without the
+/// canonicalize step compares `/private/var/...` to `/var/...` and rejects.
+fn is_inside_upload_root(candidate: &Path) -> bool {
+    let upload_root = octos_bus::file_handle::temp_upload_root();
+    let upload_root_canon =
+        std::fs::canonicalize(&upload_root).unwrap_or_else(|_| normalize_path(&upload_root));
+    let candidate_canon = canonicalize_lossy(candidate);
+    candidate_canon.starts_with(&upload_root_canon)
+}
+
+/// Canonicalize as much of `path` as currently exists on disk; for the
+/// non-existent tail, fall back to syntactic normalization. We need this
+/// because `read_file` is called with a path whose file may have been
+/// removed (e.g. tmp cleanup) between resolution and tool execution — a
+/// strict `canonicalize` would error in that case and skip the whitelist
+/// check.
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut existing = path;
+    let mut suffix = PathBuf::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            let mut next_suffix = PathBuf::from(name);
+            next_suffix.push(&suffix);
+            suffix = next_suffix;
+        }
+        existing = parent;
+        if let Ok(canon) = std::fs::canonicalize(existing) {
+            return canon.join(suffix);
+        }
+        if existing.as_os_str().is_empty() {
+            break;
+        }
+    }
+    normalize_path(path)
 }
 
 /// Normalize path by resolving `.` and `..` components without filesystem access.
@@ -768,9 +832,42 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
             }
         }
         let mut file = opts.open(&path)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)?;
-        Ok(content)
+
+        // Peek the first 5 bytes to detect a PDF (`%PDF-`). The symlink-safe
+        // open above is already done; the bytes we read here can't have
+        // followed a symlink. PDF content is binary so `read_to_string`
+        // would fail with a UTF-8 error — for those we route through
+        // `pdf-extract` to recover plain text. Pinned by the mini5 invoice
+        // upload regression (2026-05-12): the LLM couldn't summarize a PDF
+        // because read_to_string aborted immediately.
+        let mut magic = [0u8; 5];
+        match file.read(&mut magic) {
+            Ok(n) if n >= 5 && &magic == b"%PDF-" => {
+                // PDF detected — close the partial read, load whole bytes,
+                // hand to pdf-extract. Errors from extraction get wrapped
+                // as io::Error so callers see a single error type.
+                drop(file);
+                let bytes = std::fs::read(&path)?;
+                match pdf_extract::extract_text_from_mem(&bytes) {
+                    Ok(text) => Ok(text),
+                    Err(err) => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("pdf extraction failed: {err}"),
+                    )),
+                }
+            }
+            Ok(n) => {
+                // Not a PDF. Re-open at the start and read as UTF-8 text.
+                // (Seeking back works on regular files but we re-open for
+                // simplicity — the path is already known-safe.)
+                drop(file);
+                let mut file = opts.open(&path)?;
+                let mut content = String::with_capacity(n);
+                file.read_to_string(&mut content)?;
+                Ok(content)
+            }
+            Err(err) => Err(err),
+        }
     })
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
@@ -843,6 +940,34 @@ mod nofollow_tests {
 
         let content = read_no_follow(&file).await.unwrap();
         assert_eq!(content, "hello");
+    }
+
+    /// Pins the PDF auto-extract path (mini5 invoice regression
+    /// 2026-05-12 PT): files whose first 5 bytes are `%PDF-` must be
+    /// routed through `pdf-extract` instead of `read_to_string`. We
+    /// don't ship a real PDF in tests, but feeding a malformed PDF
+    /// proves the route is taken — without the route we'd get a UTF-8
+    /// error; with it we get an `InvalidData("pdf extraction failed:
+    /// ...")` from pdf-extract.
+    #[tokio::test]
+    async fn test_read_no_follow_routes_pdf_through_extractor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pdf = dir.path().join("invalid.pdf");
+        // Real PDF magic; body is garbage so pdf-extract should fail
+        // with a parse error (NOT a UTF-8 error). The point is to prove
+        // the dispatch happened, not that we can parse this junk.
+        std::fs::write(&pdf, b"%PDF-1.4\nthis is not a valid pdf body").unwrap();
+
+        let err = read_no_follow(&pdf).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "pdf-extract failures must surface as InvalidData, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("pdf extraction failed"),
+            "error should identify the extractor, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -919,6 +1044,80 @@ mod path_tests {
         let base = Path::new("/home/user/project");
         assert!(resolve_path(base, "/etc/passwd").is_err());
         assert!(resolve_path(base, "/home/user/project/../../../etc/shadow").is_err());
+    }
+
+    /// Authenticated upload tmpdir is whitelisted — uploaded files
+    /// land outside the workspace, so `read_file(<absolute upload path>)`
+    /// must succeed (pinned by the mini5 redbank.md regression,
+    /// 2026-05-12: WS upload handles now resolve to absolute tmpdir
+    /// paths, but the LLM hit "absolute paths are not allowed" before
+    /// this fix).
+    #[test]
+    fn test_resolve_allows_absolute_path_inside_upload_root() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let abs = upload_root.join("abc-redbank-proposal.md");
+        let resolved = resolve_path(Path::new("/home/user/project"), &abs.to_string_lossy())
+            .expect("upload-tmpdir absolute paths must be accepted");
+        assert!(
+            resolved.starts_with(&upload_root),
+            "resolved path {} should be under {}",
+            resolved.display(),
+            upload_root.display()
+        );
+    }
+
+    /// Pins the mini5 redbank.md regression (2026-05-12 PT). On macOS,
+    /// `resolve_upload_reference` canonicalizes via `std::fs::canonicalize`,
+    /// returning the firmlink-resolved form `/private/var/folders/...`. But
+    /// `temp_upload_root()` returns the un-prefixed `/var/folders/...`. A
+    /// purely-syntactic `starts_with` check rejected the canonicalized path
+    /// and `read_file` errored with "absolute paths are not allowed". This
+    /// test exercises the firmlink path: it creates a real file inside the
+    /// upload tmpdir, hands `resolve_path` the canonical (post-firmlink)
+    /// absolute path, and asserts acceptance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_resolve_macos_firmlink_form_inside_upload_root() {
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir must be creatable");
+        let probe = upload_root.join(format!("probe-firmlink-{}.txt", std::process::id()));
+        std::fs::write(&probe, b"hi").unwrap();
+        let canonical = std::fs::canonicalize(&probe).expect("canonicalize uploaded file");
+        // Sanity: macOS firmlinks should give us a /private/ prefix when
+        // probing real tmpdir paths. If this ever fails it means the
+        // platform changed; the test still proves the whitelist works.
+        let canonical_str = canonical.to_string_lossy();
+        assert!(
+            canonical_str.starts_with("/private/var/") || canonical_str.starts_with("/var/"),
+            "expected macOS tmpdir under /var/folders/, got {canonical_str}"
+        );
+        let resolved = resolve_path(
+            Path::new("/home/user/project"),
+            &canonical.to_string_lossy(),
+        )
+        .expect("firmlink-canonical upload path must be accepted");
+        assert!(
+            resolved.starts_with(&std::fs::canonicalize(&upload_root).unwrap()),
+            "resolved path {} must canonicalize under upload root",
+            resolved.display()
+        );
+        let _ = std::fs::remove_file(&probe);
+    }
+
+    /// Absolute paths outside the upload tmpdir stay rejected — the
+    /// whitelist is narrow, not a general "absolute is OK" loophole.
+    #[test]
+    fn test_resolve_rejects_absolute_path_outside_upload_root() {
+        let base = Path::new("/home/user/project");
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        let parent = upload_root.parent().unwrap_or_else(|| Path::new("/"));
+        let sneaky = parent.join("not-uploads/secret.txt");
+        let err = resolve_path(base, &sneaky.to_string_lossy())
+            .expect_err("paths outside both base_dir and upload_root must be rejected");
+        assert!(
+            err.to_string().contains("absolute paths are not allowed"),
+            "expected upload-root rejection message, got: {err}"
+        );
     }
 
     #[test]

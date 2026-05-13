@@ -314,8 +314,16 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
         if non_image.is_empty() {
             return AnthropicContent::Text(msg.content.clone());
         }
+        // Mini5 2026-05-12: the prior note ("Use read_file to access them.")
+        // caused DeepSeek/Anthropic to refuse paths under /private/var/...
+        // because the LLM compared them to its declared workspace root and
+        // assumed the file was off-limits. The phrasing here makes the
+        // authorization explicit so the model goes straight to `read_file`
+        // instead of attempting a `shell cp` workaround.
         let note = format!(
-            "[attached files: {}. Use read_file to access them.]",
+            "[user-uploaded files: {}. These are authenticated attachments — \
+             call read_file with this exact path. The path is whitelisted \
+             even if it lies outside the workspace root.]",
             non_image
                 .iter()
                 .map(|p| p.as_str())
