@@ -123,6 +123,34 @@ fn relativize_workspace_path(path: &str, workspace_root: Option<&std::path::Path
     }
 }
 
+/// Decide what `content` to put on the spawn-only background-result payload
+/// when the workspace contract reports `Satisfied`.
+///
+/// Wave-3b regression guard: a contract entry with no declared artifact
+/// (e.g. `mofa_publish`, whose deliverable is a live URL, not a file)
+/// returns `Satisfied { output_files: [] }`. Before this fix the handler
+/// fell through to `content: String::new()`, dropping the tool's stdout
+/// text (the deploy URL itself for `mofa_publish`) and the user saw a
+/// blank completion.
+///
+/// Rule:
+///
+/// - When `output_files` is non-empty: emit empty content; the files
+///   themselves carry the deliverable. This matches the legacy
+///   file-attached behaviour for `fm_tts` / `podcast_generate` / etc.
+/// - When `output_files` is empty: emit the tool's stdout `output` as
+///   content. The contract verified the artifact-shaped portion of the
+///   deliverable (e.g. the HttpProbe asserting deploy_url returned
+///   `<!DOCTYPE`), but the user-visible text payload (the live URL) is
+///   what the LLM/user actually consumes.
+pub(super) fn satisfied_completion_content(output_files: &[String], tool_output: &str) -> String {
+    if output_files.is_empty() {
+        tool_output.to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// Produce the composite system-prompt text (worker prompt + realtime sensor
 /// summary) used at the top of every agent turn. Centralizing this in
 /// `execution.rs` keeps the message-building policy in a single location so
@@ -545,10 +573,24 @@ impl Agent {
                             .await
                             {
                                 SpawnTaskContractResult::Satisfied { output_files } => {
+                                    // Wave-3b regression guard: when a contract
+                                    // declares no artifact (e.g. `mofa_publish`,
+                                    // whose deliverable is a live URL, not a
+                                    // file), `output_files` is empty. Falling
+                                    // through with `content: String::new()`
+                                    // would drop the tool's stdout text (the
+                                    // deploy URL itself, in the publish case)
+                                    // and the user would see a blank completion.
+                                    // Surface the tool's text output as content
+                                    // when there are no files to attach —
+                                    // matches the legacy text-fallback path for
+                                    // contracts that don't declare artifacts.
+                                    let satisfied_content =
+                                        satisfied_completion_content(&output_files, &r.output);
                                     let result_persisted = if let Some(ref sender) = bg_sender {
                                         sender(BackgroundResultPayload {
                                             task_label: bg_name.clone(),
-                                            content: String::new(),
+                                            content: satisfied_content,
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
                                             envelope_media: vec![],
@@ -1646,7 +1688,7 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 mod tests {
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
-        should_auto_send_tool_files,
+        satisfied_completion_content, should_auto_send_tool_files,
     };
 
     #[test]
@@ -1759,5 +1801,39 @@ mod tests {
             relativize_workspace_path("/u/me/ws/a.md", None),
             "/u/me/ws/a.md"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: `Satisfied { output_files: [] }` text-fallback regression.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn satisfied_completion_keeps_tool_text_when_no_output_files() {
+        // codex P1 regression guard: a contract with no declared artifact
+        // (e.g. mofa_publish, whose deliverable is a URL) returns
+        // `Satisfied { output_files: [] }`. The background completion
+        // payload must surface the tool's stdout text (the deploy URL),
+        // not an empty string.
+        let result = satisfied_completion_content(&[], "https://deployed.example.com");
+        assert_eq!(result, "https://deployed.example.com");
+    }
+
+    #[test]
+    fn satisfied_completion_emits_empty_content_when_files_carry_deliverable() {
+        // Legacy artifact-carrying contracts (fm_tts, podcast_generate,
+        // mofa_slides, ...) still emit empty content because the files
+        // themselves are the deliverable.
+        let files = vec!["/tmp/a.mp3".to_string(), "/tmp/b.mp3".to_string()];
+        let result = satisfied_completion_content(&files, "skill text result");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn satisfied_completion_keeps_empty_text_when_no_files_and_no_text() {
+        // Defensive: empty tool output with empty output_files stays empty
+        // — the legacy "no output produced" branch downstream will surface
+        // a typed failure via the `r.success` check, not here.
+        let result = satisfied_completion_content(&[], "");
+        assert_eq!(result, "");
     }
 }
