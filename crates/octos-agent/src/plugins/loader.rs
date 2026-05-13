@@ -126,64 +126,82 @@ impl PluginLoader {
     ) -> Result<PluginLoadResult> {
         let mut result = PluginLoadResult::default();
 
+        // Delegate dir scanning + dedup to octos_plugin::discovery so the
+        // legacy loader inherits "first occurrence wins" semantics. Without
+        // this, a plugin id present in both `~/.octos/skills/` and the
+        // per-profile `<data_dir>/skills/` would register twice — and
+        // because `ToolRegistry::register` overwrites by tool name, the
+        // *last* dir's plugin would silently shadow the earlier one. The
+        // per-profile dir is typically appended last (see
+        // `runtime/profile.rs::ProfileFactory`), so a stale per-profile
+        // install would shadow a freshly-deployed global skill. We hit
+        // this twice in 2026 (yangmi, douwentao) before consolidating.
+        let mut sources: Vec<octos_plugin::PluginSource> = Vec::with_capacity(dirs.len());
         for dir in dirs {
             if !dir.exists() {
                 continue;
             }
+            sources.push(octos_plugin::PluginSource {
+                path: dir.clone(),
+                origin: octos_plugin::PluginOrigin::User,
+            });
+        }
+        let extra_env_map: std::collections::HashMap<String, String> = extra_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // Status (Available / Unavailable) is intentionally ignored: the
+        // legacy loader has never gated on `requires.bins` / `requires.env`
+        // / `requires.os` at registration time — it surfaces failures
+        // through actual invocation. Preserving that behaviour avoids
+        // silently dropping skills on hosts where a probe disagrees with
+        // reality. We may tighten this in a follow-up.
+        let discovered = octos_plugin::discover_plugins(&sources, &extra_env_map);
 
-            let entries = std::fs::read_dir(dir)?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                // Skip DOT-only pipeline skills (no manifest.json, only .dot files)
-                if !path.join("manifest.json").exists() {
-                    continue;
-                }
-
-                match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
-                    Ok((tools, extras)) => {
-                        let n = tools.len();
-                        let spawn_only = extras.spawn_only_tools.clone();
-                        for loaded in tools {
-                            let tool = loaded.tool;
-                            let name = tool.name().to_string();
-                            let risk =
-                                octos_core::ui_protocol::manifest_tool_risk(loaded.risk.as_deref());
-                            octos_core::ui_protocol::register_tool_approval_risk(
-                                name.clone(),
-                                risk,
-                            );
-                            result.tool_names.push(name.clone());
-                            registry.mark_as_plugin(&name);
-                            registry.register(tool);
-                        }
-                        // Defer spawn_only tools so they're hidden from main session specs
-                        // but still registered (available in spawn subagent registries).
-                        if !spawn_only.is_empty() {
-                            for name in &spawn_only {
-                                let msg = extras.spawn_only_messages.get(name).cloned();
-                                registry.mark_spawn_only(name, msg);
-                            }
-                            // Don't defer — tool stays visible to LLM.
-                            // The execution loop auto-redirects calls to background spawn.
-                            tracing::info!(
-                                tools = %spawn_only.join(", "),
-                                "registered spawn-only tools (auto-redirect to background)"
-                            );
-                        }
-                        result.tool_count += n;
-                        result.merge_extras(extras);
+        for plugin in discovered {
+            let path = plugin.path;
+            // Re-parse via the agent-side manifest type below: octos_plugin's
+            // PluginManifest is a structural subset and doesn't model
+            // mcp_servers / hooks / prompts / spawn_only. Discovery has
+            // already filtered for `manifest.json` presence, so we skip
+            // re-checking and head straight into the rich load path.
+            match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
+                Ok((tools, extras)) => {
+                    let n = tools.len();
+                    let spawn_only = extras.spawn_only_tools.clone();
+                    for loaded in tools {
+                        let tool = loaded.tool;
+                        let name = tool.name().to_string();
+                        let risk =
+                            octos_core::ui_protocol::manifest_tool_risk(loaded.risk.as_deref());
+                        octos_core::ui_protocol::register_tool_approval_risk(name.clone(), risk);
+                        result.tool_names.push(name.clone());
+                        registry.mark_as_plugin(&name);
+                        registry.register(tool);
                     }
-                    Err(e) => {
-                        warn!(
-                            plugin_dir = %path.display(),
-                            error = %e,
-                            "failed to load plugin, skipping"
+                    // Defer spawn_only tools so they're hidden from main session specs
+                    // but still registered (available in spawn subagent registries).
+                    if !spawn_only.is_empty() {
+                        for name in &spawn_only {
+                            let msg = extras.spawn_only_messages.get(name).cloned();
+                            registry.mark_spawn_only(name, msg);
+                        }
+                        // Don't defer — tool stays visible to LLM.
+                        // The execution loop auto-redirects calls to background spawn.
+                        tracing::info!(
+                            tools = %spawn_only.join(", "),
+                            "registered spawn-only tools (auto-redirect to background)"
                         );
                     }
+                    result.tool_count += n;
+                    result.merge_extras(extras);
+                }
+                Err(e) => {
+                    warn!(
+                        plugin_dir = %path.display(),
+                        error = %e,
+                        "failed to load plugin, skipping"
+                    );
                 }
             }
         }
@@ -1448,5 +1466,60 @@ edition = "2021"
         let result =
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_plugin_id_first_dir_wins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let write_skill = |dir: &std::path::Path, marker: &str| {
+            let plugin_dir = dir.join("shared-skill");
+            std::fs::create_dir(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.json"),
+                format!(
+                    r#"{{"name": "shared-skill", "version": "1.0",
+                          "tools": [{{"name": "shared_tool",
+                                     "description": "from-{marker}"}}]}}"#
+                ),
+            )
+            .unwrap();
+            let exec_path = plugin_dir.join("shared-skill");
+            std::fs::write(
+                &exec_path,
+                format!("#!/bin/sh\necho '{{\"output\": \"{marker}\", \"success\": true}}'"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // dir_a = global-skills equivalent (corrected build).
+        // dir_b = profile-scoped equivalent (stale shadow).
+        // Loader receives [dir_a, dir_b] — first occurrence must win.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        write_skill(dir_a.path(), "corrected");
+        write_skill(dir_b.path(), "stale");
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into(
+            &mut registry,
+            &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.tool_count, 1,
+            "duplicate plugin id should register only once"
+        );
+        assert_eq!(registry.len(), 1);
+        let tool = registry.get_tool("shared_tool").expect("tool registered");
+        assert_eq!(
+            tool.description(),
+            "from-corrected",
+            "first dir (dir_a / corrected) must win — got the shadow copy"
+        );
     }
 }
