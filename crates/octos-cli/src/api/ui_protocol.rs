@@ -2294,7 +2294,7 @@ fn validate_authenticated_session_scope(
     connection_profile_id: &str,
 ) -> Result<(), RpcError> {
     if requested_profile_id.is_some_and(|profile_id| profile_id != connection_profile_id) {
-        return Err(profile_mismatch_error(
+        return Err(authenticated_scope_mismatch_error(
             "profile_id is outside the authenticated profile",
             connection_profile_id,
             requested_profile_id,
@@ -2303,7 +2303,7 @@ fn validate_authenticated_session_scope(
 
     match session_id.profile_id() {
         Some(session_profile_id) if session_profile_id == connection_profile_id => Ok(()),
-        Some(session_profile_id) => Err(profile_mismatch_error(
+        Some(session_profile_id) => Err(authenticated_scope_mismatch_error(
             "session_id is outside the authenticated profile",
             connection_profile_id,
             Some(session_profile_id),
@@ -2312,6 +2312,7 @@ fn validate_authenticated_session_scope(
             RpcError::invalid_params("session_id must include the authenticated profile")
                 .with_data(json!({
                     "expected_profile_id": connection_profile_id,
+                    "auth_scope_violation": true,
                 })),
         ),
     }
@@ -2326,6 +2327,37 @@ fn profile_mismatch_error(
         "expected_profile_id": expected_profile_id,
         "actual_profile_id": actual_profile_id,
     }))
+}
+
+/// Profile-mismatch variant emitted only when the connection IS authenticated
+/// (i.e. carries an `AuthIdentity::User`) and the requested scope falls
+/// outside that user's profile. The `auth_scope_violation` data tag drives
+/// the WS close-code 1008 emit per the SPA bridge contract (Web PR #114) —
+/// see `is_auth_scope_violation` for the consumer side.
+fn authenticated_scope_mismatch_error(
+    message: &'static str,
+    expected_profile_id: &str,
+    actual_profile_id: Option<&str>,
+) -> RpcError {
+    RpcError::invalid_params(message).with_data(json!({
+        "expected_profile_id": expected_profile_id,
+        "actual_profile_id": actual_profile_id,
+        "auth_scope_violation": true,
+    }))
+}
+
+/// True iff the error was produced by `validate_authenticated_session_scope`,
+/// i.e. the request was rejected because the authenticated identity's profile
+/// id does not match the requested session scope. Auth-related rejections
+/// trigger a WS close-code 1008 emit so the SPA `crew:auth_expired` listener
+/// fires; non-auth `invalid_params` errors (e.g. malformed input) do not.
+fn is_auth_scope_violation(error: &RpcError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("auth_scope_violation"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 async fn handle_session_open(
@@ -2368,7 +2400,7 @@ async fn handle_session_open(
             // sender per failed open).
             drop(live_rx);
             ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
-            let _ = send_rpc_error(ws, Some(id), error);
+            send_scope_error(ws, id, error);
             return;
         }
     };
@@ -3406,7 +3438,7 @@ async fn handle_turn_start(
     }
 
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3706,7 +3738,7 @@ async fn handle_approval_respond(
     params: octos_core::ui_protocol::ApprovalRespondParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3797,7 +3829,7 @@ async fn handle_approval_scopes_list(
     params: octos_core::ui_protocol::ApprovalScopesListParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3828,7 +3860,7 @@ async fn handle_diff_preview_get(
     params: octos_core::ui_protocol::DiffPreviewGetParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3861,7 +3893,7 @@ async fn handle_task_output_read(
     params: octos_core::ui_protocol::TaskOutputReadParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3896,7 +3928,7 @@ async fn handle_task_list(
     let query_session_id =
         session_key_with_optional_topic(&params.session_id, params.topic.as_deref());
     if let Err(error) = validate_session_scope(&query_session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3935,7 +3967,7 @@ async fn handle_task_cancel(
         params.profile_id.as_deref(),
         connection_profile_id,
     ) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -3992,7 +4024,7 @@ async fn handle_task_restart_from_node(
         params.profile_id.as_deref(),
         connection_profile_id,
     ) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -4068,7 +4100,7 @@ async fn handle_session_hydrate(
     params: SessionHydrateParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
     if params.include.len() > SESSION_HYDRATE_INCLUDE_MAX {
@@ -4320,7 +4352,7 @@ async fn handle_thread_graph_get(
     params: ThreadGraphGetParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -4409,7 +4441,7 @@ async fn handle_turn_state_get(
     params: TurnStateGetParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
-        let _ = send_rpc_error(ws, Some(id), error);
+        send_scope_error(ws, id, error);
         return;
     }
 
@@ -5399,6 +5431,10 @@ async fn handle_content_list(
             Some(id),
             RpcError::permission_denied(format!("{method}: authenticated user identity required")),
         );
+        // Web PR #114 contract: SPA bridge listens for close-code 1008 to
+        // trigger `crew:auth_expired` (clears token, routes to /login). The
+        // RPC envelope alone leaves a stale-token client retrying forever.
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         return;
     };
     // `ContentQuery` deserializes from the same JSON the REST query
@@ -5487,6 +5523,8 @@ async fn handle_content_delete(
             Some(id),
             RpcError::permission_denied(format!("{method}: authenticated user identity required")),
         );
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment.
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         return;
     };
     let content_id = params.id.clone();
@@ -5536,6 +5574,8 @@ async fn handle_content_bulk_delete(
             Some(id),
             RpcError::permission_denied(format!("{method}: authenticated user identity required")),
         );
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment.
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         return;
     };
     // Codex review 2026-05-12: reject over-cap bulk-delete requests
@@ -7395,6 +7435,36 @@ fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Res
     let frame = frame_for(&RpcErrorResponse::new(id, error))
         .ok_or_else(|| SendError::LifecycleFailure("rpc error serialization".into()))?;
     ws.send_lifecycle(frame)
+}
+
+/// Push a WebSocket close frame with an explicit status code and reason. The
+/// `writer_loop` forwards the close to the peer and then drains; callers
+/// should `return` immediately after this call.
+///
+/// Used to signal durable auth failure (code 1008 / "auth_expired"). The SPA
+/// bridge (Web PR #114, `auth-context.tsx`) subscribes to close-code 1008 to
+/// invoke `crew:auth_expired`, which clears the cached token and routes to
+/// /login. Sending an `RpcError` envelope first surfaces the human-readable
+/// reason; the close frame trips the bridge's reconnect-or-relogin choice.
+fn close_ws_with_code(ws: &WsConnection, code: u16, reason: &str) -> Result<(), SendError> {
+    let frame = WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+        code,
+        reason: reason.into(),
+    }));
+    ws.send_lifecycle(frame)
+}
+
+/// Send a scope-validation error back to the caller and, when the error came
+/// from `validate_authenticated_session_scope` (i.e. the connection IS
+/// authenticated and the requested scope doesn't match), follow up with a
+/// close-code 1008 frame so the SPA `crew:auth_expired` listener fires.
+/// Non-auth scope errors (malformed input, etc.) leave the socket open.
+fn send_scope_error(ws: &WsConnection, id: String, error: RpcError) {
+    let auth_violation = is_auth_scope_violation(&error);
+    let _ = send_rpc_error(ws, Some(id), error);
+    if auth_violation {
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
+    }
 }
 
 fn send_notification_lifecycle(
@@ -9266,6 +9336,56 @@ mod tests {
                 .and_then(|data| data.get("actual_profile_id")),
             Some(&Value::String("profile-b".into()))
         );
+    }
+
+    // Place near other ui_protocol tests. Verifies a profile-mismatched session_id
+    // yields close-code 1008.
+    #[tokio::test]
+    async fn send_scope_error_closes_with_1008_on_authenticated_mismatch() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        let session_id = SessionKey::with_profile("profile-b", "api", "chat-1");
+        let error =
+            validate_session_scope(&session_id, None, Some("profile-a")).expect_err("scope error");
+        assert!(is_auth_scope_violation(&error));
+
+        send_scope_error(&ws, "rpc-1".into(), error);
+
+        // First frame is the JSON-RPC error envelope.
+        let first = rx.recv().await.expect("rpc error frame");
+        let text = match first {
+            axum::extract::ws::Message::Text(text) => text,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        assert!(text.contains("expected_profile_id"));
+
+        // Second frame is the close-code 1008 with reason "auth_expired".
+        let second = rx.recv().await.expect("close frame");
+        match second {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+                assert_eq!(frame.reason.as_str(), "auth_expired");
+            }
+            other => panic!("expected close frame with 1008, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_scope_error_does_not_close_when_unauthenticated() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        // No connection_profile_id => not authenticated; cross-profile id is
+        // a generic invalid_params, not an auth scope violation.
+        let session_id = SessionKey::with_profile("profile-a", "api", "chat-1");
+        let error =
+            validate_session_scope(&session_id, Some("profile-b"), None).expect_err("scope error");
+        assert!(!is_auth_scope_violation(&error));
+
+        send_scope_error(&ws, "rpc-1".into(), error);
+
+        // Only the JSON-RPC error envelope should arrive — no close frame.
+        let _first = rx.recv().await.expect("rpc error frame");
+        // Drop the sender side so a pending recv resolves promptly; instead,
+        // poll once with no wait to confirm the queue is empty.
+        assert!(rx.try_recv().is_err(), "no close frame expected");
     }
 
     #[test]
