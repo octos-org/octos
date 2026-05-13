@@ -11891,6 +11891,59 @@ mod tests {
         ));
     }
 
+    /// PR #928 regression: per-tenant subdomains of `base_domain` must
+    /// be accepted. Hosted multi-tenant minis route by subdomain
+    /// (`dspfac.<base>`, `alice.<base>`, ...). The pre-fix gate used the
+    /// static CORS allowlist only (app./admin./api.), so every browser
+    /// WS upgrade from a per-tenant page was 403'd, breaking the SPA.
+    #[test]
+    fn ws_origin_gate_allows_single_label_subdomain_of_base() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://dspfac.ocean.ominix.io".parse().unwrap(),
+        );
+        assert_eq!(
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io")),
+            WsOriginDecision::Allow,
+        );
+    }
+
+    /// Multi-label subdomain (e.g. `a.b.<base>`) is NOT a single
+    /// per-tenant label — reject so a hijacked deeper subdomain can't
+    /// bypass the gate.
+    #[test]
+    fn ws_origin_gate_rejects_multi_label_subdomain_of_base() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://attacker.dspfac.ocean.ominix.io".parse().unwrap(),
+        );
+        let decision =
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
+    }
+
+    /// Port-suffixed subdomain origins (e.g. `tenant.base:1234`) are
+    /// NOT plain tenant subdomains — reject.
+    #[test]
+    fn ws_origin_gate_rejects_tenant_with_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://dspfac.ocean.ominix.io:8443".parse().unwrap(),
+        );
+        let decision =
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
+    }
+
     /// #924 BLOCK 5: a header that fails ASCII parse is malformed
     /// input — keep rejecting it. Treating it as "absent" would be a
     /// downgrade-attack vector.
