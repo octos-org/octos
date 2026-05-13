@@ -311,9 +311,17 @@ mod tests {
         let file_path = dir.path().join("code.rs");
         std::fs::write(&file_path, "fn foo() {}\n").unwrap();
 
+        // Post-`resolve_tool_path` migration the resolver returns the
+        // canonical absolute path (firmlinks collapsed). Real read tools
+        // also call `resolve_path` before populating the cache, so they
+        // store the canonical form. Mirror that here so the cache lookup
+        // in `EditFileTool::execute_with_context` invalidates the same
+        // key the cache contains.
+        let canonical_file_path = std::fs::canonicalize(&file_path).unwrap_or(file_path.clone());
+
         let cache = Arc::new(FileStateCache::new());
         cache.put(CacheEntry::new(
-            file_path.clone(),
+            canonical_file_path.clone(),
             SystemTime::now(),
             0xCAFE,
             12,
@@ -339,6 +347,6 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert!(cache.peek(&file_path).is_none());
+        assert!(cache.peek(&canonical_file_path).is_none());
     }
 }

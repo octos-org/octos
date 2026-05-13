@@ -379,8 +379,27 @@ fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<
     // Walk from workspace_root downwards: each ancestor must NOT be a
     // symlink. We deliberately stop one level above the leaf — the leaf
     // is policed by the O_NOFOLLOW open in `read_capped_no_follow`.
-    let mut current = workspace_root.to_path_buf();
-    let suffix = match resolved.strip_prefix(workspace_root) {
+    //
+    // Post-`resolve_tool_path` migration: the resolver returns the
+    // canonical absolute path (firmlinks collapsed via
+    // `canonicalize`). On macOS this produces `/private/var/folders/...`
+    // while the supplied `workspace_root` is typically still in its
+    // un-prefixed `/var/folders/...` form, so `strip_prefix` would fail
+    // here even when the resolved path legitimately lies inside the
+    // workspace. Canonicalise the workspace root for the containment
+    // check so both forms compare equal.
+    let canonical_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    // Mirror the canonicalisation on the resolved leaf so it compares
+    // cleanly against the canonicalised root. `resolve_handle_path`
+    // produces either the canonical form (workspace-relative path,
+    // routed through `resolve_path` after migration) or the lexical
+    // form (absolute path normalised through `normalize_inside_workspace`).
+    // Canonicalise-as-possible here so both shapes line up.
+    let canonical_resolved =
+        std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+    let mut current = canonical_root.clone();
+    let suffix = match canonical_resolved.strip_prefix(&canonical_root) {
         Ok(s) => s.to_path_buf(),
         Err(_) => {
             // Should not happen: `resolved` was already verified to be
