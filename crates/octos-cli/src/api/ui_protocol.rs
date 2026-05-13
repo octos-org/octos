@@ -1532,6 +1532,43 @@ fn tool_risk_registry_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// #924 BLOCK 5 — outcome of the WS upgrade Origin gate.
+///
+/// CORS doesn't apply to WS handshakes, so without this gate a browser
+/// tab on any origin could open the socket as long as it has a valid
+/// token. Non-browser clients (TUI, gateway, scripts, server-to-server)
+/// typically omit the Origin header — allow that. Some server-to-server
+/// clients send the header with an empty value (`Origin: `); treat
+/// present-but-empty as absent and allow. A header with non-ASCII
+/// bytes (`to_str().is_err()`) still rejects — that is malformed input,
+/// not the same as omitting the header.
+#[derive(Debug, PartialEq, Eq)]
+enum WsOriginDecision {
+    Allow,
+    RejectDisallowed { origin: String },
+    RejectMalformed,
+}
+
+fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOriginDecision {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return WsOriginDecision::Allow;
+    };
+    match origin.to_str() {
+        Ok(origin_str) if origin_str.trim().is_empty() => WsOriginDecision::Allow,
+        Ok(origin_str) => {
+            let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
+            if allowed.iter().any(|s| s == origin_str) {
+                WsOriginDecision::Allow
+            } else {
+                WsOriginDecision::RejectDisallowed {
+                    origin: origin_str.to_string(),
+                }
+            }
+        }
+        Err(_) => WsOriginDecision::RejectMalformed,
+    }
+}
+
 /// GET /api/ui-protocol/ws — JSON-RPC over WebSocket for UI Protocol v1.
 pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
@@ -1540,22 +1577,24 @@ pub async fn ws_handler(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // #923.3: gate the upgrade on Origin. CORS doesn't apply to WS
-    // handshakes, so without this a browser tab on any origin could
-    // open the socket as long as it has a valid token. Non-browser
-    // clients (TUI, gateway, scripts) typically omit the Origin
-    // header — allow that. When Origin IS present it must match the
-    // shared CORS allowlist.
-    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
-        let origin_str = origin.to_str().unwrap_or("");
-        let allowed = super::router::cors_allowlist_for_base_domain(state.base_domain.as_deref());
-        if !allowed.iter().any(|s| s == origin_str) {
+    // #923.3 + #924 BLOCK 5: gate the upgrade on Origin. See
+    // `decide_ws_origin_gate` for the full decision table.
+    match decide_ws_origin_gate(&headers, state.base_domain.as_deref()) {
+        WsOriginDecision::Allow => {}
+        WsOriginDecision::RejectDisallowed { origin } => {
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
-                origin = %origin_str,
+                origin = %origin,
                 "rejected WS upgrade from disallowed Origin"
             );
             return (axum::http::StatusCode::FORBIDDEN, "disallowed origin").into_response();
+        }
+        WsOriginDecision::RejectMalformed => {
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                "rejected WS upgrade: Origin header is not valid ASCII"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "invalid origin").into_response();
         }
     }
     let connection_profile_id = identity
@@ -11418,6 +11457,69 @@ mod tests {
         waited.await.expect("notified() must wake within 500ms");
         latch.await.expect("latch task joins cleanly");
         assert!(ws.is_failed());
+    }
+
+    /// #924 BLOCK 5: server-to-server clients sometimes send the Origin
+    /// header with an empty value (`Origin: `). The original gate
+    /// rejected those because the empty string never matched the
+    /// allowlist; treat present-but-empty as absent.
+    #[test]
+    fn ws_origin_gate_allows_absent_or_empty_origin() {
+        // No Origin header at all → allow (TUI / gateway / scripts).
+        let headers = HeaderMap::new();
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::Allow,
+        );
+
+        // Origin header present but empty after trim → allow.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::Allow,
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn ws_origin_gate_rejects_present_non_allowlisted_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://evil.example.com".parse().unwrap(),
+        );
+        let decision = decide_ws_origin_gate(&headers, Some("bot.ominix.io"));
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { ref origin }
+                if origin == "https://evil.example.com"
+        ));
+    }
+
+    /// #924 BLOCK 5: a header that fails ASCII parse is malformed
+    /// input — keep rejecting it. Treating it as "absent" would be a
+    /// downgrade-attack vector.
+    #[test]
+    fn ws_origin_gate_rejects_non_ascii_origin() {
+        let mut headers = HeaderMap::new();
+        // Insert raw bytes that are not valid header values via the
+        // typed `HeaderValue::from_bytes` builder. We use bytes that
+        // would round-trip but contain non-ASCII content so `to_str`
+        // returns Err.
+        let val = axum::http::HeaderValue::from_bytes(b"https://\xff.example.com")
+            .expect("HeaderValue accepts arbitrary visible bytes");
+        headers.insert(axum::http::header::ORIGIN, val);
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::RejectMalformed,
+        );
     }
 
     #[tokio::test]
