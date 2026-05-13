@@ -104,6 +104,7 @@ fn aggregate_validator(
         phase: ValidatorPhase::Completion,
         workspace_root: workspace_dir.to_path_buf(),
         repo_label: "swarm-subtask-test".into(),
+        input_args: None,
     };
     AggregateValidator {
         runner,

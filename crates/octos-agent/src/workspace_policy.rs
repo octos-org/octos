@@ -18,7 +18,7 @@ pub const WORKSPACE_POLICY_FILE: &str = ".octos-workspace.toml";
 /// `docs/OCTOS_HARNESS_ABI_VERSIONING.md` for the stable and experimental
 /// fields per version. Older policy files that omit the field are accepted
 /// as v1 on deserialization.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspacePolicy {
     /// Durable ABI schema version for this policy. Defaults to
     /// [`WORKSPACE_POLICY_SCHEMA_VERSION`] when absent so pre-versioned
@@ -47,7 +47,7 @@ pub struct WorkspacePolicy {
 /// compact before the first LLM call, and how aggressively to prune stale
 /// tool outputs. When absent, the runtime falls back to the legacy extractive
 /// path and behaves exactly as before M6.3.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactionPolicy {
     /// Durable ABI schema version. See
     /// [`COMPACTION_POLICY_SCHEMA_VERSION`]. Missing in legacy files;
@@ -111,7 +111,7 @@ pub enum CompactionSummarizerKind {
 }
 
 /// Tiered validation checks run at different points in the turn lifecycle.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ValidationPolicy {
     /// Tier 1: cheap checks run every turn (< 100ms). e.g. file_exists, build exit code.
     #[serde(default)]
@@ -132,7 +132,7 @@ pub struct ValidationPolicy {
 /// Each validator is identified by a stable `id`, produces a typed
 /// [`crate::validators::ValidatorOutcome`], and may be `required` (a failure
 /// blocks terminal success) or optional (a failure produces a warning only).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Validator {
     /// Stable identifier, unique within the validator list.
     pub id: String,
@@ -170,7 +170,7 @@ pub enum ValidatorPhaseKind {
 }
 
 /// The typed body of a [`Validator`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ValidatorSpec {
     /// Run a subprocess command. Dispatched via the shell-safety layer and
@@ -194,6 +194,120 @@ pub enum ValidatorSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min_bytes: Option<u64>,
     },
+    /// HTTP probe — call URL (with `${args.<path>}` template interpolation
+    /// against the spawn task's input args), assert the response is the
+    /// expected status code, optionally assert a substring is present in the
+    /// response body. Default timeout 5s (overridden by
+    /// [`Validator::timeout_ms`]).
+    HttpProbe {
+        url_template: String,
+        #[serde(default = "default_http_probe_status")]
+        expected_status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_contains: Option<String>,
+    },
+    /// Specialization of `HttpProbe` for the common case of asserting
+    /// ominix-api has registered a custom voice. Calls
+    /// `GET ${OMINIX_API_URL:-http://127.0.0.1:8081}/v1/voices` and
+    /// asserts the response's `voices[].name` array contains the
+    /// interpolated `name_arg` value. Surfaces the available list in the
+    /// failure message so the LLM can react in one round.
+    OminixVoiceExists {
+        /// Argument key in the spawn task's input args (e.g. `name`) that
+        /// holds the voice name to look up.
+        name_arg: String,
+    },
+    /// Assert that at least one file matching `glob` has decoded audio with
+    /// `non_silent_samples / total_samples >= min_ratio`. WAV is supported
+    /// natively. MP3 support requires the `audio_mp3` feature flag.
+    AudioNonSilent {
+        glob: String,
+        #[serde(default = "default_non_silent_ratio")]
+        min_ratio: f32,
+    },
+    /// Assert each file matching `glob` has the magic-byte prefix for the
+    /// declared `format`. Catches "tool wrote 0 bytes" or "tool wrote an
+    /// HTML error page in place of an MP3".
+    ///
+    /// The format field is named `format` rather than `kind` to avoid
+    /// colliding with serde's `kind` discriminator tag.
+    MagicBytes { glob: String, format: MagicByteKind },
+}
+
+/// File-format signature used by [`ValidatorSpec::MagicBytes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MagicByteKind {
+    Mp3,
+    Wav,
+    Png,
+    Jpeg,
+    Pdf,
+    Mp4,
+    WebM,
+}
+
+impl MagicByteKind {
+    /// Return the alternative magic-byte prefixes for this file format.
+    /// A file matches if any prefix is present at the start of the byte
+    /// stream.
+    pub fn prefixes(self) -> &'static [&'static [u8]] {
+        match self {
+            // MP3 with ID3v2 tag, or a raw MPEG frame sync (0xFF Fx/Ex/Dx).
+            Self::Mp3 => &[
+                b"ID3",
+                &[0xFF, 0xFB],
+                &[0xFF, 0xFA],
+                &[0xFF, 0xF3],
+                &[0xFF, 0xF2],
+                &[0xFF, 0xE3],
+                &[0xFF, 0xE2],
+            ],
+            Self::Wav => &[b"RIFF"],
+            Self::Png => &[&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]],
+            Self::Jpeg => &[&[0xFF, 0xD8, 0xFF]],
+            Self::Pdf => &[b"%PDF-"],
+            // MP4: 4-byte size prefix followed by 'ftyp'. Most MP4s also
+            // start with 'ftyp' offset by 4 bytes, but checking the brand
+            // directly is simpler — see `magic_bytes_match`.
+            Self::Mp4 => &[b"ftyp"],
+            Self::WebM => &[&[0x1A, 0x45, 0xDF, 0xA3]],
+        }
+    }
+
+    /// Does `data` start with one of the prefixes for this format?
+    ///
+    /// For MP4, the `ftyp` marker lives at offset 4 (after the box-size
+    /// prefix), so the check is byte-position aware. For other formats the
+    /// prefix is at the beginning.
+    pub fn matches(self, data: &[u8]) -> bool {
+        if self == Self::Mp4 {
+            // MP4: bytes 4..8 must be 'ftyp'.
+            return data.len() >= 8 && &data[4..8] == b"ftyp";
+        }
+        let prefixes = self.prefixes();
+        prefixes.iter().any(|p| data.starts_with(p))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Wav => "wav",
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::Pdf => "pdf",
+            Self::Mp4 => "mp4",
+            Self::WebM => "webm",
+        }
+    }
+}
+
+fn default_http_probe_status() -> u16 {
+    200
+}
+
+fn default_non_silent_ratio() -> f32 {
+    0.3
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +377,7 @@ pub struct WorkspaceArtifactsPolicy {
     pub entries: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct WorkspaceSpawnTaskPolicy {
     #[serde(default)]
     pub artifact: Option<String>,
@@ -279,6 +393,49 @@ pub struct WorkspaceSpawnTaskPolicy {
     pub on_deliver: Vec<String>,
     #[serde(default)]
     pub on_failure: Vec<String>,
+    /// Per-spawn-task typed validators run at the completion gate, in
+    /// addition to the workspace-wide `[validation].validators`. Each entry
+    /// is auto-tagged as required+completion phase; pass an explicit
+    /// `Validator` struct (with `id`, `required`, etc.) for finer control.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_completion: Vec<SpawnTaskValidatorSpec>,
+}
+
+/// TOML-friendly wrapper for the per-spawn-task `on_completion` validator
+/// list. Accepts either:
+///
+/// * A bare `ValidatorSpec` table (no `id`/`required`/`phase`) — auto-tagged
+///   as required + completion phase + a synthetic `id` derived from the
+///   spawn task name and validator index.
+/// * A full `Validator` table with `id`, `required`, `timeout_ms`, etc.
+///
+/// Both forms surface to the runner as a [`Validator`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SpawnTaskValidatorSpec {
+    /// Full Validator struct with `id`, `required`, etc.
+    Full(Validator),
+    /// Bare spec table — id, required, and phase are auto-filled by
+    /// [`SpawnTaskValidatorSpec::into_validator`].
+    Bare(ValidatorSpec),
+}
+
+impl SpawnTaskValidatorSpec {
+    /// Lower this entry into a fully-formed `Validator` using `task_name`
+    /// and `index` to synthesize a stable id when only a bare spec was
+    /// provided.
+    pub fn into_validator(self, task_name: &str, index: usize) -> Validator {
+        match self {
+            Self::Full(validator) => validator,
+            Self::Bare(spec) => Validator {
+                id: format!("{task_name}.on_completion[{index}]"),
+                required: true,
+                timeout_ms: None,
+                phase: ValidatorPhaseKind::Completion,
+                spec,
+            },
+        }
+    }
 }
 
 impl WorkspaceSpawnTaskPolicy {
@@ -394,6 +551,7 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:TTS generation failed".into()],
+            on_completion: Vec::new(),
         };
 
         let podcast_contract = WorkspaceSpawnTaskPolicy {
@@ -406,12 +564,64 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:Podcast generation failed".into()],
+            // Catch the two user-visible failure modes from the silent-MP3
+            // bug class: tool wrote zero bytes / an HTML error page in
+            // place of audio (MagicBytes), or tool generated a valid MP3
+            // header but a silent decoded stream (AudioNonSilent).
+            on_completion: vec![
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    glob: "skill-output/mofa-podcast/*.mp3".into(),
+                    format: MagicByteKind::Mp3,
+                }),
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                    glob: "skill-output/mofa-podcast/*.mp3".into(),
+                    min_ratio: default_non_silent_ratio(),
+                }),
+            ],
+        };
+
+        // Voice synthesis (LLM-driven TTS): assert the decoded audio is not
+        // silent. Catches the "render produced empty audio" failure path.
+        let voice_synthesize_contract = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
+            on_verify: vec![
+                "file_exists:$artifact".into(),
+                "file_size_min:$artifact:1024".into(),
+            ],
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Voice synthesis failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(
+                ValidatorSpec::AudioNonSilent {
+                    glob: "skill-output/voice/*.{mp3,wav}".into(),
+                    min_ratio: default_non_silent_ratio(),
+                },
+            )],
+        };
+
+        // Voice save (custom voice registration): assert the voice was
+        // actually registered with ominix-api. Closes the yangmi gap where
+        // fm_voice_save returns success but the API has no record.
+        let fm_voice_save_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Voice registration failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(
+                ValidatorSpec::OminixVoiceExists {
+                    name_arg: "name".into(),
+                },
+            )],
         };
 
         let mut spawn_tasks = BTreeMap::new();
         spawn_tasks.insert("fm_tts".into(), tts_contract.clone());
-        spawn_tasks.insert("voice_synthesize".into(), tts_contract);
+        spawn_tasks.insert("voice_synthesize".into(), voice_synthesize_contract);
         spawn_tasks.insert("podcast_generate".into(), podcast_contract);
+        spawn_tasks.insert("fm_voice_save".into(), fm_voice_save_contract);
 
         Self {
             schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -700,6 +910,7 @@ mod tests {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         };
 
         assert_eq!(task.artifact_sources(), vec!["report", "audio"]);
@@ -714,6 +925,7 @@ mod tests {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         };
 
         assert_eq!(task.artifact_sources(), vec!["primary_audio"]);
@@ -728,6 +940,7 @@ mod tests {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         };
 
         let rendered = toml::to_string_pretty(&task).unwrap();
@@ -745,6 +958,7 @@ mod tests {
             on_complete: vec!["notify_user:legacy".into()],
             on_deliver: vec!["notify_user:deliver".into()],
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         };
 
         assert_eq!(
@@ -762,6 +976,7 @@ mod tests {
             on_complete: vec!["notify_user:legacy".into()],
             on_deliver: Vec::new(),
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         };
 
         assert_eq!(task.delivery_actions(), &["notify_user:legacy".to_string()]);
@@ -934,5 +1149,97 @@ ignore = []
         write_workspace_policy_if_absent(temp.path(), &WorkspacePolicy::for_session()).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, sentinel);
+    }
+
+    #[test]
+    fn magic_byte_kind_matches_recognized_prefixes() {
+        assert!(MagicByteKind::Mp3.matches(b"ID3\0\0"));
+        assert!(MagicByteKind::Mp3.matches(&[0xFF, 0xFB, 0x90, 0x00]));
+        assert!(!MagicByteKind::Mp3.matches(b"GIF87a"));
+
+        assert!(MagicByteKind::Wav.matches(b"RIFFxxxxWAVE"));
+        assert!(!MagicByteKind::Wav.matches(b"ID3xxxx"));
+
+        assert!(MagicByteKind::Pdf.matches(b"%PDF-1.4"));
+        assert!(MagicByteKind::Png.matches(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
+        assert!(MagicByteKind::Jpeg.matches(&[0xFF, 0xD8, 0xFF, 0xE0]));
+
+        // MP4: 'ftyp' must appear at byte offset 4 (after size prefix).
+        let mp4: [u8; 16] = [
+            0, 0, 0, 0x20, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0,
+        ];
+        assert!(MagicByteKind::Mp4.matches(&mp4));
+    }
+
+    #[test]
+    fn session_policy_declares_new_domain_validators_for_silent_failure_paths() {
+        let policy = WorkspacePolicy::for_session();
+        let podcast = policy
+            .spawn_tasks
+            .get("podcast_generate")
+            .expect("podcast contract");
+        // The two new domain validators should be declared so the
+        // "silent MP3" / "wrote HTML instead of MP3" failure modes are
+        // caught at the contract gate.
+        assert!(podcast.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent { .. })
+        )));
+        assert!(podcast.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes { .. })
+        )));
+
+        let voice_save = policy
+            .spawn_tasks
+            .get("fm_voice_save")
+            .expect("fm_voice_save contract");
+        assert!(voice_save.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::OminixVoiceExists { .. })
+        )));
+
+        let voice_synth = policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract");
+        assert!(voice_synth.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent { .. })
+        )));
+    }
+
+    #[test]
+    fn spawn_task_validator_spec_roundtrips_through_toml_bare_and_full_forms() {
+        // Bare form: just the spec table. id, required, phase auto-filled.
+        let bare_toml = r#"
+            kind = "ominix_voice_exists"
+            name_arg = "name"
+        "#;
+        let bare: SpawnTaskValidatorSpec = toml::from_str(bare_toml).unwrap();
+        let validator = bare.into_validator("fm_voice_save", 0);
+        assert_eq!(validator.id, "fm_voice_save.on_completion[0]");
+        assert!(validator.required);
+        assert_eq!(validator.phase, ValidatorPhaseKind::Completion);
+        match validator.spec {
+            ValidatorSpec::OminixVoiceExists { ref name_arg } => {
+                assert_eq!(name_arg, "name");
+            }
+            _ => panic!("expected OminixVoiceExists"),
+        }
+
+        // Full form: explicit id, required, phase.
+        let full_toml = r#"
+            id = "voice_optional"
+            required = false
+            phase = "completion"
+            kind = "magic_bytes"
+            glob = "*.mp3"
+            format = "mp3"
+        "#;
+        let full: SpawnTaskValidatorSpec = toml::from_str(full_toml).unwrap();
+        let validator = full.into_validator("ignored", 99);
+        assert_eq!(validator.id, "voice_optional");
+        assert!(!validator.required);
     }
 }

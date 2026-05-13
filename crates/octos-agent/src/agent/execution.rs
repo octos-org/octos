@@ -39,7 +39,7 @@ use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
-use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
+use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract_with_args};
 
 /// Per-tool-call result returned from the in-process dispatcher. Kept as a
 /// tuple so the aggregation path can reuse today's `futures::join_all` style
@@ -515,13 +515,14 @@ impl Agent {
                                 success = true,
                                 "spawn_only background tool completed"
                             );
-                            match enforce_spawn_task_contract(
+                            match enforce_spawn_task_contract_with_args(
                                 &bg_tools,
                                 &bg_name,
                                 &bg_tc_id,
                                 &r.files_to_send,
                                 bg_started_at,
                                 Some((&bg_supervisor, &task_id)),
+                                Some(&bg_args),
                             )
                             .await
                             {
