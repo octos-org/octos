@@ -372,9 +372,7 @@ impl PluginTool {
                     // `up/<base64>` (no display-name segment) via the
                     // legacy-relative fallback inside
                     // `resolve_upload_reference`.
-                    if let Some(resolved) =
-                        octos_bus::file_handle::resolve_upload_reference(path)
-                    {
+                    if let Some(resolved) = octos_bus::file_handle::resolve_upload_reference(path) {
                         rewritten.insert(
                             key.clone(),
                             serde_json::Value::String(resolved.to_string_lossy().into_owned()),

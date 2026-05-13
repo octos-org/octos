@@ -1617,10 +1617,7 @@ fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOr
                     let expected_suffix = format!(".{base}");
                     if let Some(tenant) = host.strip_suffix(&expected_suffix) {
                         // Single label only: non-empty, no dots, no port.
-                        if !tenant.is_empty()
-                            && !tenant.contains('.')
-                            && !tenant.contains(':')
-                        {
+                        if !tenant.is_empty() && !tenant.contains('.') && !tenant.contains(':') {
                             return WsOriginDecision::Allow;
                         }
                     }
@@ -11922,8 +11919,7 @@ mod tests {
             axum::http::header::ORIGIN,
             "https://attacker.dspfac.ocean.ominix.io".parse().unwrap(),
         );
-        let decision =
-            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
         assert!(matches!(
             decision,
             WsOriginDecision::RejectDisallowed { .. }
@@ -11939,8 +11935,7 @@ mod tests {
             axum::http::header::ORIGIN,
             "https://dspfac.ocean.ominix.io:8443".parse().unwrap(),
         );
-        let decision =
-            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
         assert!(matches!(
             decision,
             WsOriginDecision::RejectDisallowed { .. }
