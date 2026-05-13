@@ -183,6 +183,8 @@ fn resolve_hook(def: &SkillHookDef, skill_dir: &Path) -> Option<HookConfig> {
         command,
         timeout_ms: def.timeout_ms,
         tool_filter: def.tool_filter.clone(),
+        path_filter: Vec::new(),
+        requires_bin: None,
     })
 }
 

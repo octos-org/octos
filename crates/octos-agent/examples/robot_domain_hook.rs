@@ -129,6 +129,8 @@ exit 0
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }])
     .with_enricher(Arc::new(RobotSensorEnricher { bus: bus.clone() }));
 

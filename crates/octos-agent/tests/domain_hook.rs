@@ -52,6 +52,8 @@ async fn should_include_domain_data_when_enricher_registered() {
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }])
     .with_enricher(Arc::new(StaticForceEnricher { force_n: 12.5 }));
 
@@ -103,6 +105,8 @@ async fn should_omit_domain_data_when_no_enricher() {
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }]);
 
     let payload = HookPayload::before_spawn_verify(
@@ -156,6 +160,8 @@ async fn should_truncate_domain_data_at_max_payload_field_bytes() {
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }])
     .with_enricher(Arc::new(OversizeEnricher));
 
@@ -242,6 +248,8 @@ exit 0
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }])
     .with_enricher(Arc::new(DynamicForceEnricher {
         reading: std::sync::Mutex::new(55.2),
@@ -297,6 +305,8 @@ exit 0
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }])
     .with_enricher(Arc::new(DynamicForceEnricher {
         reading: std::sync::Mutex::new(12.0),
@@ -367,6 +377,8 @@ exit 0
         command: vec![script_path.to_string_lossy().to_string()],
         timeout_ms: 5000,
         tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
     }])
     .with_enricher(Arc::new(RobotEnricher));
 

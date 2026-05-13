@@ -304,6 +304,8 @@ async fn should_fire_spawn_failure_hook_when_deadline_action_is_escalate() {
         command: cmd,
         timeout_ms: 3000,
         tool_filter: vec![],
+        path_filter: Vec::new(),
+        requires_bin: None,
     };
     let hook = Arc::new(HookExecutor::new(vec![hook_cfg]));
 

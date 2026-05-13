@@ -6476,6 +6476,8 @@ mod tests {
             ],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: Vec::new(),
+            requires_bin: None,
         }
     }
 
