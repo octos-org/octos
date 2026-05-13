@@ -138,6 +138,7 @@ async fn should_block_ready_when_required_command_validator_fails() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -172,6 +173,7 @@ async fn should_warn_but_not_block_when_optional_validator_fails() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -203,6 +205,7 @@ async fn should_record_duration_and_evidence_path_for_command_validator() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -241,6 +244,7 @@ async fn should_expose_stderr_in_outcome_for_operator_visibility() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -289,6 +293,7 @@ async fn should_kill_child_process_on_validator_timeout() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
 
     let before = std::time::Instant::now();
@@ -339,6 +344,7 @@ async fn should_pass_file_exists_validator_when_file_meets_size_floor() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -362,6 +368,7 @@ async fn should_fail_file_exists_validator_when_size_under_floor() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -380,6 +387,7 @@ async fn should_pass_tool_call_validator_when_tool_succeeds() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -397,6 +405,7 @@ async fn should_fail_tool_call_validator_when_tool_reports_unsuccessful() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -424,6 +433,7 @@ async fn should_persist_outcomes_and_replay_them_byte_for_byte() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let original = runner.run_all(&invocation, &validators).await;
     assert_eq!(original.len(), 2);
@@ -476,6 +486,7 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     // Invoke via a helper that pre-seeds LD_PRELOAD on the spawned command.
     runner
@@ -732,6 +743,7 @@ async fn should_block_command_validator_with_dangerous_pattern() {
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
         input_args: None,
+        tool_output: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 

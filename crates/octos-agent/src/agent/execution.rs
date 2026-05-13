@@ -39,7 +39,9 @@ use crate::progress::ProgressEvent;
 use crate::task_supervisor::TaskRuntimeState;
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{ConcurrencyClass, TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
-use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract_with_args};
+use crate::workspace_contract::{
+    SpawnTaskContractResult, enforce_spawn_task_contract_with_args_and_output,
+};
 
 /// Per-tool-call result returned from the in-process dispatcher. Kept as a
 /// tuple so the aggregation path can reuse today's `futures::join_all` style
@@ -515,7 +517,22 @@ impl Agent {
                                 success = true,
                                 "spawn_only background tool completed"
                             );
-                            match enforce_spawn_task_contract_with_args(
+                            // Forward the tool's `named_outputs` map (parsed
+                            // from its stdout envelope by the plugin
+                            // wrapper) so validators can resolve
+                            // `${output.<key>}` references against
+                            // tool-emitted values (e.g. `mofa_publish`
+                            // emitting `deploy_url`).
+                            let named_outputs_value = r.named_outputs.as_ref().map(|map| {
+                                serde_json::Value::Object(
+                                    map.iter()
+                                        .map(|(k, v)| {
+                                            (k.clone(), serde_json::Value::String(v.clone()))
+                                        })
+                                        .collect(),
+                                )
+                            });
+                            match enforce_spawn_task_contract_with_args_and_output(
                                 &bg_tools,
                                 &bg_name,
                                 &bg_tc_id,
@@ -523,6 +540,7 @@ impl Agent {
                                 bg_started_at,
                                 Some((&bg_supervisor, &task_id)),
                                 Some(&bg_args),
+                                named_outputs_value.as_ref(),
                             )
                             .await
                             {
