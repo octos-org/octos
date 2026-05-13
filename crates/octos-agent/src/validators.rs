@@ -1173,6 +1173,12 @@ enum HttpProbeFailure {
 /// `<key>` is a dotted JSON path against the input args object. A missing key
 /// or a non-string/number value is a hard error so the validator surfaces an
 /// `Error` outcome rather than silently degrading the URL.
+///
+/// Substituted values are percent-encoded against
+/// [`URL_PATH_QUERY_RESERVED`] before being spliced into the template so an
+/// LLM- or user-controlled arg value cannot break out of the path/query
+/// segment it was placed into (e.g. inject a different host or query
+/// parameter). Templates are treated as URL fragments, not opaque strings.
 fn interpolate_args(
     template: &str,
     input_args: Option<&serde_json::Value>,
@@ -1189,11 +1195,28 @@ fn interpolate_args(
         let value = input_arg(input_args, key).ok_or_else(|| {
             format!("input arg '{key}' not found while interpolating template: {template}")
         })?;
-        out.push_str(&value);
+        out.push_str(&percent_encode_url_segment(&value));
         rest = &after[end + 1..];
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Percent-encode bytes that have reserved meaning in URL path/query segments
+/// so an LLM-controlled arg value cannot break out of the segment it was
+/// placed into. Conservative: encodes everything outside the unreserved set
+/// defined in RFC 3986 plus the `~` allowed-in-unreserved character.
+fn percent_encode_url_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(*byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Fetch a single argument value from a spawn task's input args by dotted key.
@@ -1381,11 +1404,15 @@ fn decode_non_silent_ratio_wav(path: &Path) -> Result<f32, String> {
     let mut non_silent: u64 = 0;
     let denom = match spec.sample_format {
         hound::SampleFormat::Float => 1.0_f32,
-        // 16-bit PCM max magnitude; clip 24/32-bit at i32::MAX as a coarse normaliser.
+        // PCM full-scale magnitude per bit depth: (2^(bits-1)) - 1. The
+        // earlier coarse approximation (`i32::MAX` for both 24 and 32 bit)
+        // mis-normalized 24-bit samples by a factor of 256, so a perfectly
+        // loud 24-bit recording fell below the 0.01 non-silent floor.
         hound::SampleFormat::Int => match spec.bits_per_sample {
             8 => i8::MAX as f32,
             16 => i16::MAX as f32,
-            24 | 32 => i32::MAX as f32,
+            24 => ((1u32 << 23) - 1) as f32,
+            32 => i32::MAX as f32,
             other => {
                 return Err(format!("unsupported wav bits_per_sample={other}"));
             }
@@ -2130,5 +2157,29 @@ mod tests {
         let args = serde_json::json!({});
         let err = interpolate_args("http://x/${args.name}", Some(&args)).unwrap_err();
         assert!(err.contains("'name'"));
+    }
+
+    #[test]
+    fn interpolate_args_percent_encodes_reserved_characters() {
+        // An LLM-controlled value MUST NOT be able to break out of the URL
+        // segment it lands in. `?`, `&`, `/`, `#` etc. must be percent-
+        // encoded so the resulting URL has the literal value as a single
+        // path segment, not a structural separator.
+        let args = serde_json::json!({"name": "evil/../?inject=1"});
+        let out = interpolate_args("http://x/${args.name}", Some(&args)).unwrap();
+        // The interpolated segment should not contain raw `/`, `?`, or `=`.
+        let interpolated = out.strip_prefix("http://x/").expect("prefix preserved");
+        assert!(
+            !interpolated.contains('/'),
+            "raw `/` leaked: {interpolated}"
+        );
+        assert!(
+            !interpolated.contains('?'),
+            "raw `?` leaked: {interpolated}"
+        );
+        assert!(
+            !interpolated.contains('='),
+            "raw `=` leaked: {interpolated}"
+        );
     }
 }
