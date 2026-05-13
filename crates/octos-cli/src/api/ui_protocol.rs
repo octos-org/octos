@@ -1602,11 +1602,32 @@ fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOr
         Ok(origin_str) => {
             let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
             if allowed.iter().any(|s| s == origin_str) {
-                WsOriginDecision::Allow
-            } else {
-                WsOriginDecision::RejectDisallowed {
-                    origin: origin_str.to_string(),
+                return WsOriginDecision::Allow;
+            }
+            // Per-tenant browser origins: `https://<tenant>.<base_domain>`.
+            // Hosted multi-tenant minis route by subdomain (dspfac.<base>,
+            // alice.<base>, ...) and the static CORS allowlist only covers
+            // app./admin./api. — adding every tenant up front isn't
+            // feasible. Accept any single-label subdomain of the configured
+            // base_domain so per-tenant browsers can open the WS. Tenants
+            // are sandboxed at the auth layer; the Origin gate is the
+            // cross-site protection (rejecting `evil.com` browser tabs).
+            if let Some(base) = base_domain {
+                if let Some(host) = origin_str.strip_prefix("https://") {
+                    let expected_suffix = format!(".{base}");
+                    if let Some(tenant) = host.strip_suffix(&expected_suffix) {
+                        // Single label only: non-empty, no dots, no port.
+                        if !tenant.is_empty()
+                            && !tenant.contains('.')
+                            && !tenant.contains(':')
+                        {
+                            return WsOriginDecision::Allow;
+                        }
+                    }
                 }
+            }
+            WsOriginDecision::RejectDisallowed {
+                origin: origin_str.to_string(),
             }
         }
         Err(_) => WsOriginDecision::RejectMalformed,
@@ -11867,6 +11888,59 @@ mod tests {
             decision,
             WsOriginDecision::RejectDisallowed { ref origin }
                 if origin == "https://evil.example.com"
+        ));
+    }
+
+    /// PR #928 regression: per-tenant subdomains of `base_domain` must
+    /// be accepted. Hosted multi-tenant minis route by subdomain
+    /// (`dspfac.<base>`, `alice.<base>`, ...). The pre-fix gate used the
+    /// static CORS allowlist only (app./admin./api.), so every browser
+    /// WS upgrade from a per-tenant page was 403'd, breaking the SPA.
+    #[test]
+    fn ws_origin_gate_allows_single_label_subdomain_of_base() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://dspfac.ocean.ominix.io".parse().unwrap(),
+        );
+        assert_eq!(
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io")),
+            WsOriginDecision::Allow,
+        );
+    }
+
+    /// Multi-label subdomain (e.g. `a.b.<base>`) is NOT a single
+    /// per-tenant label — reject so a hijacked deeper subdomain can't
+    /// bypass the gate.
+    #[test]
+    fn ws_origin_gate_rejects_multi_label_subdomain_of_base() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://attacker.dspfac.ocean.ominix.io".parse().unwrap(),
+        );
+        let decision =
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
+    }
+
+    /// Port-suffixed subdomain origins (e.g. `tenant.base:1234`) are
+    /// NOT plain tenant subdomains — reject.
+    #[test]
+    fn ws_origin_gate_rejects_tenant_with_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://dspfac.ocean.ominix.io:8443".parse().unwrap(),
+        );
+        let decision =
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { .. }
         ));
     }
 
