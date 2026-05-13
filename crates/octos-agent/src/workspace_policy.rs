@@ -564,13 +564,64 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:Podcast generation failed".into()],
-            on_completion: Vec::new(),
+            // Catch the two user-visible failure modes from the silent-MP3
+            // bug class: tool wrote zero bytes / an HTML error page in
+            // place of audio (MagicBytes), or tool generated a valid MP3
+            // header but a silent decoded stream (AudioNonSilent).
+            on_completion: vec![
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    glob: "skill-output/mofa-podcast/*.mp3".into(),
+                    format: MagicByteKind::Mp3,
+                }),
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                    glob: "skill-output/mofa-podcast/*.mp3".into(),
+                    min_ratio: default_non_silent_ratio(),
+                }),
+            ],
+        };
+
+        // Voice synthesis (LLM-driven TTS): assert the decoded audio is not
+        // silent. Catches the "render produced empty audio" failure path.
+        let voice_synthesize_contract = WorkspaceSpawnTaskPolicy {
+            artifact: Some("primary_audio".into()),
+            artifacts: Vec::new(),
+            on_verify: vec![
+                "file_exists:$artifact".into(),
+                "file_size_min:$artifact:1024".into(),
+            ],
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Voice synthesis failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(
+                ValidatorSpec::AudioNonSilent {
+                    glob: "skill-output/voice/*.{mp3,wav}".into(),
+                    min_ratio: default_non_silent_ratio(),
+                },
+            )],
+        };
+
+        // Voice save (custom voice registration): assert the voice was
+        // actually registered with ominix-api. Closes the yangmi gap where
+        // fm_voice_save returns success but the API has no record.
+        let fm_voice_save_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Voice registration failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(
+                ValidatorSpec::OminixVoiceExists {
+                    name_arg: "name".into(),
+                },
+            )],
         };
 
         let mut spawn_tasks = BTreeMap::new();
         spawn_tasks.insert("fm_tts".into(), tts_contract.clone());
-        spawn_tasks.insert("voice_synthesize".into(), tts_contract);
+        spawn_tasks.insert("voice_synthesize".into(), voice_synthesize_contract);
         spawn_tasks.insert("podcast_generate".into(), podcast_contract);
+        spawn_tasks.insert("fm_voice_save".into(), fm_voice_save_contract);
 
         Self {
             schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -1118,6 +1169,44 @@ ignore = []
             0, 0, 0, 0x20, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0,
         ];
         assert!(MagicByteKind::Mp4.matches(&mp4));
+    }
+
+    #[test]
+    fn session_policy_declares_new_domain_validators_for_silent_failure_paths() {
+        let policy = WorkspacePolicy::for_session();
+        let podcast = policy
+            .spawn_tasks
+            .get("podcast_generate")
+            .expect("podcast contract");
+        // The two new domain validators should be declared so the
+        // "silent MP3" / "wrote HTML instead of MP3" failure modes are
+        // caught at the contract gate.
+        assert!(podcast.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent { .. })
+        )));
+        assert!(podcast.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes { .. })
+        )));
+
+        let voice_save = policy
+            .spawn_tasks
+            .get("fm_voice_save")
+            .expect("fm_voice_save contract");
+        assert!(voice_save.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::OminixVoiceExists { .. })
+        )));
+
+        let voice_synth = policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract");
+        assert!(voice_synth.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent { .. })
+        )));
     }
 
     #[test]
