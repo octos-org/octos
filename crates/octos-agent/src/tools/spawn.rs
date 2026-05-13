@@ -2073,6 +2073,7 @@ impl Tool for SpawnTool {
                             &policy.validation.validators,
                             "spawn-agent-mcp",
                             crate::validators::ValidatorPhase::Completion,
+                            None,
                         )
                         .await
                         {
@@ -2251,6 +2252,7 @@ impl Tool for SpawnTool {
                                     &policy.validation.validators,
                                     "spawn",
                                     crate::validators::ValidatorPhase::Completion,
+                                    None,
                                 )
                                 .await
                                 {
@@ -2581,6 +2583,7 @@ impl Tool for SpawnTool {
                             &policy.validation.validators,
                             "spawn",
                             crate::validators::ValidatorPhase::Completion,
+                            None,
                         )
                         .await
                         {

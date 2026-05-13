@@ -124,6 +124,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # PDF text extraction (pure Rust; read_file auto-detects %PDF- magic)
 pdf-extract = "0.9"
 
+# Audio decoding (pure Rust)
+# WAV: always-on (small dep, used by AudioNonSilent validator on .wav files).
+# MP3: gated behind the `audio_mp3` feature on octos-agent so non-audio
+# workspaces don't pay the symphonia dep cost. Without the feature, MP3
+# AudioNonSilent validators return an explicit "feature not enabled" error
+# rather than silently passing.
+hound = "3"
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
+
 # Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
 libc = "0.2"
 

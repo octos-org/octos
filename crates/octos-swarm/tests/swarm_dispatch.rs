@@ -451,6 +451,7 @@ async fn should_aggregate_validator_over_combined_output() {
         phase: ValidatorPhase::Completion,
         workspace_root: workspace_dir.path().to_path_buf(),
         repo_label: "swarm-test".into(),
+        input_args: None,
     };
     let validator = Validator {
         id: "aggregate_exists".into(),

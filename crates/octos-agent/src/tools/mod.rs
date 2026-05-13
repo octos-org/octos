@@ -1107,7 +1107,7 @@ mod path_tests {
         )
         .expect("firmlink-canonical upload path must be accepted");
         assert!(
-            resolved.starts_with(&std::fs::canonicalize(&upload_root).unwrap()),
+            resolved.starts_with(std::fs::canonicalize(&upload_root).unwrap()),
             "resolved path {} must canonicalize under upload root",
             resolved.display()
         );
