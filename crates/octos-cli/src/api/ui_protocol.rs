@@ -401,9 +401,45 @@ impl WsConnection {
     /// We deliberately do not hold a lock across `sink.send().await` — the
     /// channel is the lock-free coordination point.
     pub(crate) async fn writer_loop(mut sink: WsSink, mut rx: mpsc::Receiver<WsMessage>) {
-        while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First tick fires immediately; skip it so we don't ship a heartbeat
+        // before any real frame.
+        ping_interval.tick().await;
+        loop {
+            tokio::select! {
+                maybe_msg = rx.recv() => {
+                    match maybe_msg {
+                        Some(msg) => {
+                            if sink.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    // Send a JSON-RPC notification as the keepalive instead of
+                    // a binary `Ping`. Codex review on the mini5 intermittent
+                    // disconnect (2026-05-13): browsers auto-Pong control
+                    // frames at the WebSocket layer — they never reach
+                    // JS-land `onmessage`. The SPA bridge tracks its own
+                    // 60 s idle timeout (`ui-protocol-bridge.ts:195`) that
+                    // only refreshes on text frames observed by the JS
+                    // handler. Binary Ping kept the TCP connection alive
+                    // for proxies but left the bridge timer starving, so
+                    // it tore the socket down after every minute of idle.
+                    // A text-frame heartbeat ticks both meters at once.
+                    let payload =
+                        "{\"jsonrpc\":\"2.0\",\"method\":\"server/heartbeat\",\"params\":{}}";
+                    if sink
+                        .send(WsMessage::Text(payload.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
         // Best-effort close — ignore errors; peer may already be gone.
