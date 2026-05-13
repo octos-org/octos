@@ -7184,6 +7184,17 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
                 ..
             },
         )) => Some(cursor.clone()),
+        // #921: extract cursors from every durable cursor-bearing variant.
+        // `MessagePersisted` and `TurnSpawnComplete` always carry a non-Option
+        // cursor (stamped by the ledger on append); without these arms a
+        // dropped send for either method silently skipped `protocol/replay_lossy`,
+        // so the client never refetched the gap.
+        UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(persisted)) => {
+            Some(persisted.cursor.clone())
+        }
+        UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(spawn)) => {
+            Some(spawn.cursor.clone())
+        }
         _ => None,
     }
 }
@@ -7353,6 +7364,88 @@ mod tests {
             }
             other => panic!("expected TurnStart, got {:?}", other),
         }
+    }
+
+    /// #921: every cursor-bearing durable notification variant must
+    /// surface its cursor through `ledger_event_cursor` so dropped
+    /// sends trigger `protocol/replay_lossy`. Asserts the positive
+    /// extraction for the four variants and a negative for a non-
+    /// cursor-bearing one (sanity).
+    #[test]
+    fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
+        let session_id = SessionKey("local:test".into());
+        let cursor = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 42,
+        };
+
+        let opened =
+            UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
+                session_id: session_id.clone(),
+                active_profile_id: None,
+                workspace_root: None,
+                cursor: Some(cursor.clone()),
+                panes: None,
+                capabilities: octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
+            }));
+        assert_eq!(ledger_event_cursor(&opened), Some(cursor.clone()));
+
+        let completed = UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+                cursor: Some(cursor.clone()),
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&completed), Some(cursor.clone()));
+
+        let persisted = UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(
+            MessagePersistedEvent {
+                session_id: session_id.clone(),
+                turn_id: None,
+                thread_id: None,
+                seq: 1,
+                role: "assistant".into(),
+                message_id: "msg-1".into(),
+                client_message_id: None,
+                source: MessagePersistedSource::Assistant,
+                cursor: cursor.clone(),
+                persisted_at: chrono::Utc::now(),
+                media: Vec::new(),
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&persisted), Some(cursor.clone()));
+
+        let spawn = UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(
+            TurnSpawnCompleteEvent {
+                session_id: session_id.clone(),
+                turn_id: None,
+                thread_id: None,
+                task_id: "task-1".into(),
+                response_to_client_message_id: None,
+                seq: 1,
+                message_id: "msg-1".into(),
+                source: "background".into(),
+                cursor: cursor.clone(),
+                persisted_at: chrono::Utc::now(),
+                content: "done".into(),
+                media: Vec::new(),
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&spawn), Some(cursor.clone()));
+
+        // Sanity: a non-cursor-bearing variant returns None.
+        let delta = UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+                text: "x".into(),
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&delta), None);
     }
 
     #[test]
