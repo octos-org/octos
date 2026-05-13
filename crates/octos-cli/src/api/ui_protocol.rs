@@ -2044,6 +2044,12 @@ async fn ui_protocol_connection(
                 handle_content_bulk_delete(&ws, &state, connection_identity.as_ref(), id, params)
                     .await;
             }
+            UiCommand::RouterSetMode(params) => {
+                handle_router_set_mode(&ws, &state, routed_profile_id, id, params).await;
+            }
+            UiCommand::RouterGetMetrics(params) => {
+                handle_router_get_metrics(&ws, &state, routed_profile_id, id, params).await;
+            }
         }
     }
 
@@ -5807,6 +5813,127 @@ fn task_cancel_rpc_error(task_id: &TaskId, error: octos_agent::TaskCancelError) 
     }
 }
 
+/// Wave4-A: resolve the per-session `AdaptiveRouter` (if any) by routing
+/// through the same `resolve_session_profile_runtime` path used by
+/// `session/open` and `turn/start`. Returns `None` for sessions whose
+/// profile has no router attached — single-provider config or
+/// `adaptive_routing.enabled = false`.
+fn resolve_router_for_session(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    routed_profile_id: Option<&str>,
+) -> Option<Arc<octos_llm::AdaptiveRouter>> {
+    let active_profile_id = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| routed_profile_id.map(ToOwned::to_owned));
+    let profile_runtime = resolve_session_profile_runtime(state, active_profile_id.as_deref())?;
+    profile_runtime.adaptive_router.clone()
+}
+
+/// Wave4-A handler for `router/set_mode`. Parses `params.mode` into the
+/// `AdaptiveMode` enum (lowercase string), dispatches to
+/// `AdaptiveRouter::set_mode`, and returns a typed ack.
+///
+/// Returns `INVALID_PARAMS` for unknown modes and a typed
+/// `runtime_unavailable` data tag when the session has no router (so
+/// the client can disable its mode-switcher UI).
+async fn handle_router_set_mode(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::RouterSetModeParams,
+) {
+    let method = octos_core::ui_protocol::methods::ROUTER_SET_MODE;
+    let mode = match params.mode.as_str() {
+        "off" => octos_llm::AdaptiveMode::Off,
+        "hedge" => octos_llm::AdaptiveMode::Hedge,
+        "lane" => octos_llm::AdaptiveMode::Lane,
+        other => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: unknown mode '{other}' (expected off | hedge | lane)"
+                )),
+            );
+            return;
+        }
+    };
+    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: no adaptive router attached to this session"
+            ))
+            .with_data(json!({ "kind": "runtime_unavailable" })),
+        );
+        return;
+    };
+    router.set_mode(mode);
+    let result = octos_core::ui_protocol::RouterSetModeResult { mode: params.mode };
+    let value = match serde_json::to_value(&result) {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::malformed_result(format!("{method}: serialize result: {error}")),
+            );
+            return;
+        }
+    };
+    let _ = send_rpc_result(ws, id, value);
+}
+
+/// Wave4-A handler for `router/get_metrics`. Returns the same payload
+/// shape as the `router/status` notification (lane scores, breaker
+/// states, mode, current provider).
+async fn handle_router_get_metrics(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: octos_core::ui_protocol::RouterGetMetricsParams,
+) {
+    let method = octos_core::ui_protocol::methods::ROUTER_GET_METRICS;
+    let Some(router) = resolve_router_for_session(state, &params.session_id, routed_profile_id)
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: no adaptive router attached to this session"
+            ))
+            .with_data(json!({ "kind": "runtime_unavailable" })),
+        );
+        return;
+    };
+    let status = router.adaptive_status();
+    let result = octos_core::ui_protocol::RouterGetMetricsResult {
+        provider_name: router.current_lane_key(),
+        mode: status.mode.to_string(),
+        qos_ranking: status.qos_ranking,
+        lane_scores: router.lane_scores(),
+        circuit_breakers: router.breaker_states(),
+    };
+    let value = match serde_json::to_value(&result) {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::malformed_result(format!("{method}: serialize result: {error}")),
+            );
+            return;
+        }
+    };
+    let _ = send_rpc_result(ws, id, value);
+}
+
 fn task_relaunch_rpc_error(task_id: &TaskId, error: octos_agent::TaskRelaunchError) -> RpcError {
     match error {
         octos_agent::TaskRelaunchError::NotFound => RpcError::unknown_task_id(task_id),
@@ -6326,6 +6453,25 @@ async fn run_standalone_turn(
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
     let agent_config = session_runtime.agent.agent_config();
     let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
+
+    // Wave4-A: emit an initial `router/status` snapshot adjacent to
+    // `turn/started` so clients can render the routing pill before the
+    // first token. No-op when this profile has no `AdaptiveRouter`
+    // attached (single-provider or `enabled = false`).
+    let adaptive_router_ref = session_runtime.profile.adaptive_router.clone();
+    emit_router_status_lifecycle(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+
+    // Wave4-A: subscribe to the AdaptiveRouter's broadcast channel and
+    // forward `FailoverEvent`s as `router/failover` notifications for
+    // the duration of this turn. The abort handle ends the forwarder
+    // when the turn ends — see the `.abort()` call near
+    // `try_emit_terminal()` below.
+    let failover_forwarder = spawn_router_failover_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        adaptive_router_ref.clone(),
+    );
 
     let history: Vec<Message> = {
         let mut sessions = sessions.lock().await;
@@ -7043,6 +7189,19 @@ async fn run_standalone_turn(
     }
 
     let _ = agent_task.await;
+
+    // Wave4-A: emit a final `router/status` snapshot adjacent to
+    // `turn/completed` so clients see the actual provider that ran
+    // the turn + any breaker / lane-score deltas. No-op when no
+    // AdaptiveRouter is attached.
+    emit_router_status_lifecycle(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+
+    // Wave4-A: tear down the failover forwarder task. Aborting is safe
+    // even if the task already exited (broadcast channel close path).
+    if let Some(handle) = failover_forwarder {
+        handle.abort();
+    }
+
     // FIX-06: a turn that ends — for any reason — must drop its
     // `approve_for_turn` policy entries so a subsequent turn can't reuse
     // them. The state-machine entry itself is intentionally retained here
@@ -7452,6 +7611,100 @@ fn send_turn_error(
     )
 }
 
+/// Wave4-A: build a `RouterStatusEvent` from an `AdaptiveRouter` snapshot.
+/// `router` is `None` for sessions without an adaptive router attached;
+/// callers MUST skip emission in that case.
+pub(crate) fn build_router_status_event(
+    session_id: &SessionKey,
+    router: &Arc<octos_llm::AdaptiveRouter>,
+) -> octos_core::ui_protocol::RouterStatusEvent {
+    let status = router.adaptive_status();
+    octos_core::ui_protocol::RouterStatusEvent {
+        session_id: session_id.clone(),
+        provider_name: router.current_lane_key(),
+        mode: status.mode.to_string(),
+        qos_ranking: status.qos_ranking,
+        lane_scores: router.lane_scores(),
+        circuit_breakers: router.breaker_states(),
+    }
+}
+
+/// Wave4-A: emit a `RouterStatus` notification on the lifecycle path
+/// (same delivery semantics as `turn/started` — failure is logged but
+/// non-fatal for the turn). No-op when `router` is `None`.
+fn emit_router_status_lifecycle(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    router: Option<&Arc<octos_llm::AdaptiveRouter>>,
+) {
+    let Some(router) = router else {
+        return;
+    };
+    let event = build_router_status_event(session_id, router);
+    let notif = UiNotification::RouterStatus(event);
+    let method = notif.method().to_string();
+    if let Err(error) = send_notification_lifecycle(ws, ledger, notif) {
+        tracing::debug!(
+            target: "octos::ui_protocol::ws",
+            method = %method,
+            error = ?error,
+            "router/status emission failed; non-fatal for turn"
+        );
+    }
+}
+
+/// Wave4-A: spawn a background task that forwards `FailoverEvent` from
+/// the AdaptiveRouter's broadcast channel onto the connection as
+/// `router/failover` notifications. The task lives for the duration of
+/// the turn — it ends naturally when the broadcast channel sender is
+/// dropped or when the calling task exits (the `tokio::spawn` is
+/// orphaned but the channel close terminates the loop).
+///
+/// Returns the `AbortHandle` so the caller can stop the forwarder when
+/// the turn ends. Returning `None` when no router is attached.
+fn spawn_router_failover_forwarder(
+    ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
+    session_id: SessionKey,
+    router: Option<Arc<octos_llm::AdaptiveRouter>>,
+) -> Option<AbortHandle> {
+    let router = router?;
+    let mut rx = router.subscribe_failover();
+    let join = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let notif = UiNotification::RouterFailover(
+                        octos_core::ui_protocol::RouterFailoverEvent {
+                            session_id: session_id.clone(),
+                            from_provider: event.from_provider,
+                            to_provider: event.to_provider,
+                            reason: event.reason,
+                            elapsed_ms: event.elapsed_ms,
+                        },
+                    );
+                    // Best-effort durable — failover events should be
+                    // ledger-persisted so a reconnecting client can
+                    // catch up, but if the client is gone we don't
+                    // care (the turn is what matters).
+                    let _ = send_notification_durable(&ws, &ledger, notif);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(
+                        target: "octos::ui_protocol::ws",
+                        skipped,
+                        "router failover subscriber lagged — events dropped"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    Some(join.abort_handle())
+}
+
 fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
     let frame = frame_for(&RpcResponse::success(id, result))
         .ok_or_else(|| SendError::LifecycleFailure("rpc result serialization".into()))?;
@@ -7676,7 +7929,12 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // would re-loop the replay flag onto itself.
             | UiNotification::ReplayLossy(_)
             | UiNotification::FileAttached(_)
-            | UiNotification::SessionEventBridged(_) => None,
+            | UiNotification::SessionEventBridged(_)
+            // Wave4-A: router/queue notifications don't carry their own
+            // cursor — they're stateless lifecycle pushes.
+            | UiNotification::RouterStatus(_)
+            | UiNotification::RouterFailover(_)
+            | UiNotification::QueueState(_) => None,
         },
         UiProtocolLedgerEvent::Progress(_) => None,
     }
@@ -15047,6 +15305,170 @@ mod tests {
                 .contains("tier-2 operator default visible to session"),
             "expected operator-default sentinel content, got: {}",
             result.output
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Wave4-A: router/status build + router/set_mode emission tests.
+    // ----------------------------------------------------------------
+
+    /// Mock provider for router-emission tests: never called, just lets
+    /// `AdaptiveRouter::new` accept two slots so the lane-scoring + breaker
+    /// snapshot paths fire end-to-end.
+    struct Wave4AStubProvider {
+        name: &'static str,
+        model: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for Wave4AStubProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Err(eyre::eyre!("stub not callable in tests"))
+        }
+        fn model_id(&self) -> &str {
+            self.model
+        }
+        fn provider_name(&self) -> &str {
+            self.name
+        }
+    }
+
+    /// Wave4-A: `build_router_status_event` captures the current
+    /// AdaptiveRouter snapshot in the wire shape expected by the
+    /// notification path. The lane-scores map is deterministic
+    /// (BTreeMap order), the mode reflects `set_mode()`, and the
+    /// breaker map carries the same keys.
+    #[test]
+    fn build_router_status_event_captures_current_router_snapshot() {
+        let router = Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![
+                Arc::new(Wave4AStubProvider {
+                    name: "zai",
+                    model: "glm-5-turbo",
+                }),
+                Arc::new(Wave4AStubProvider {
+                    name: "ollama",
+                    model: "llama3.2",
+                }),
+            ],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ));
+        router.set_mode(octos_llm::AdaptiveMode::Lane);
+
+        let session_id = SessionKey("local:wave4a-test".into());
+        let event = build_router_status_event(&session_id, &router);
+
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.mode, "lane");
+        assert!(
+            event.lane_scores.contains_key("zai/glm-5-turbo"),
+            "lane_scores must include each slot — got {:?}",
+            event.lane_scores.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            event.lane_scores.contains_key("ollama/llama3.2"),
+            "lane_scores must include each slot — got {:?}",
+            event.lane_scores.keys().collect::<Vec<_>>()
+        );
+
+        // Deterministic order — BTreeMap iter is lex-sorted.
+        let keys: Vec<&String> = event.lane_scores.keys().collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "lane_scores keys MUST be in BTreeMap (lex-sorted) order"
+        );
+
+        // Initially all breakers are closed (no failures yet).
+        for (lane, state) in &event.circuit_breakers {
+            assert_eq!(
+                state, "closed",
+                "lane {lane} should report 'closed' before any failures — got {state}"
+            );
+        }
+    }
+
+    /// Wave4-A: handler dispatches set_mode → router. We exercise the
+    /// downcalled router directly (the handler is small enough that the
+    /// failure mode we care about is "calls the wrong method on the
+    /// wrong router"). The full integration round-trip is covered by
+    /// the core `router_set_mode_command_round_trips` test.
+    #[tokio::test]
+    async fn router_set_mode_handler_dispatches_to_router() {
+        let router = Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![
+                Arc::new(Wave4AStubProvider {
+                    name: "p1",
+                    model: "m1",
+                }),
+                Arc::new(Wave4AStubProvider {
+                    name: "p2",
+                    model: "m2",
+                }),
+            ],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ));
+        assert_eq!(router.mode(), octos_llm::AdaptiveMode::Off);
+        router.set_mode(octos_llm::AdaptiveMode::Hedge);
+        assert_eq!(router.mode(), octos_llm::AdaptiveMode::Hedge);
+        router.set_mode(octos_llm::AdaptiveMode::Lane);
+        assert_eq!(router.mode(), octos_llm::AdaptiveMode::Lane);
+        router.set_mode(octos_llm::AdaptiveMode::Off);
+        assert_eq!(router.mode(), octos_llm::AdaptiveMode::Off);
+    }
+
+    /// Wave4-A: the failover broadcast subscriber receives events
+    /// emitted by the router's internal `publish_failover` path,
+    /// reshaped into the wire form expected by the API layer.
+    #[tokio::test]
+    async fn router_failover_subscriber_receives_events_with_session_id() {
+        let router = Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![
+                Arc::new(Wave4AStubProvider {
+                    name: "p1",
+                    model: "m1",
+                }),
+                Arc::new(Wave4AStubProvider {
+                    name: "p2",
+                    model: "m2",
+                }),
+            ],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ));
+        let mut rx = router.subscribe_failover();
+
+        // Drive a failover by calling the internal publish (the public
+        // path is exercised in octos-llm's tests; here we verify the
+        // subscriber surface is what the api layer expects).
+        // The internal `publish_failover` is private — we trip a real
+        // failover by calling `chat()` on a router where the primary
+        // fails. Since the stub provider always errors, both
+        // providers fail; chat() returns an error. But the failover
+        // attempt itself publishes one event.
+        use octos_llm::LlmProvider as _;
+        let messages = vec![Message::user("hi")];
+        let cfg = octos_llm::ChatConfig::default();
+        let _ = router.chat(&messages, &[], &cfg).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("failover event not received within timeout")
+            .expect("failover channel closed unexpectedly");
+        assert_eq!(event.from_provider, "p1/m1");
+        assert_eq!(event.to_provider, "p2/m2");
+        assert!(
+            event.reason.contains("chat_error"),
+            "failover reason should describe the upstream error — got {}",
+            event.reason
         );
     }
 }

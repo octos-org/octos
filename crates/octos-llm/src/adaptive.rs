@@ -527,6 +527,23 @@ pub struct AdaptiveStatus {
     pub provider_count: usize,
 }
 
+/// Wave4-A: per-router failover broadcast event. Pushed onto a
+/// `tokio::sync::broadcast::Sender<FailoverEvent>` whenever the
+/// adaptive router crosses from one lane to another inside `chat()` /
+/// `chat_stream()`. Subscribers (API layer, telemetry) consume events
+/// without blocking the router — the broadcast channel drops the
+/// oldest event on a slow consumer.
+///
+/// Identifiers use the `<provider_name>/<model_id>` shape so they line
+/// up with the `lane_scores` keys in `RouterStatusEvent`.
+#[derive(Debug, Clone)]
+pub struct FailoverEvent {
+    pub from_provider: String,
+    pub to_provider: String,
+    pub reason: String,
+    pub elapsed_ms: u64,
+}
+
 /// Adaptive provider router with metrics-driven selection.
 ///
 /// Drop-in replacement for `ProviderChain`. Tracks latency and error rates
@@ -573,6 +590,14 @@ pub struct AdaptiveRouter {
     /// Id of the credential currently in use per slot. Updated at acquire
     /// time so failure notifications can identify the right credential.
     current_credential_ids: Mutex<Vec<Option<String>>>,
+    /// Wave4-A: lock-free broadcast channel for failover events. Senders
+    /// publish into it from the `chat()` / `chat_stream()` failover loops;
+    /// API-layer subscribers consume in a separate tokio task. The channel
+    /// drops the oldest event under back-pressure (per
+    /// `tokio::sync::broadcast` semantics) so a slow subscriber can NEVER
+    /// stall the router's hot path. A capacity of 64 absorbs short bursts
+    /// without forcing immediate drops.
+    failover_tx: tokio::sync::broadcast::Sender<FailoverEvent>,
 }
 
 impl AdaptiveRouter {
@@ -613,6 +638,11 @@ impl AdaptiveRouter {
             })
             .collect();
         let slot_count = slots.len();
+        // Wave4-A: capacity 64 absorbs short failover bursts without
+        // dropping the oldest event. Slow subscribers fall behind and
+        // observe a `RecvError::Lagged` — they MUST NOT stall the
+        // router's hot path.
+        let (failover_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             slots,
             config,
@@ -630,6 +660,91 @@ impl AdaptiveRouter {
             decision_callback: RwLock::new(None),
             credential_pools: RwLock::new(vec![None; slot_count]),
             current_credential_ids: Mutex::new(vec![None; slot_count]),
+            failover_tx,
+        }
+    }
+
+    /// Wave4-A: subscribe to failover events. The subscriber receives a
+    /// `FailoverEvent` each time the router crosses a lane in
+    /// `chat()` / `chat_stream()`. The channel is `broadcast`-based, so
+    /// every active subscriber gets every event; slow consumers may
+    /// observe `RecvError::Lagged(n)` and MUST handle it (skip to head
+    /// of channel; consider re-reading `adaptive_status()` to recover).
+    pub fn subscribe_failover(&self) -> tokio::sync::broadcast::Receiver<FailoverEvent> {
+        self.failover_tx.subscribe()
+    }
+
+    /// Wave4-A: publish a `FailoverEvent` (internal). `send` returns
+    /// `Ok(receiver_count)` or `Err` when there are zero active
+    /// subscribers — both outcomes are non-fatal for the router, so we
+    /// ignore the result entirely.
+    fn publish_failover(
+        &self,
+        from_provider: &str,
+        to_provider: &str,
+        reason: &str,
+        elapsed_ms: u64,
+    ) {
+        let _ = self.failover_tx.send(FailoverEvent {
+            from_provider: from_provider.to_string(),
+            to_provider: to_provider.to_string(),
+            reason: reason.to_string(),
+            elapsed_ms,
+        });
+    }
+
+    /// Wave4-A: snapshot per-lane scores keyed by
+    /// `"<provider_name>/<model_id>"`. Returned as a `BTreeMap` so the
+    /// caller can hand it straight to the UI protocol layer without
+    /// re-sorting.
+    pub fn lane_scores(&self) -> std::collections::BTreeMap<String, f64> {
+        self.slots
+            .iter()
+            .map(|s| {
+                (
+                    format!("{}/{}", s.provider.provider_name(), s.provider.model_id()),
+                    self.score(s),
+                )
+            })
+            .collect()
+    }
+
+    /// Wave4-A: snapshot per-lane circuit-breaker state keyed by the same
+    /// `"<provider_name>/<model_id>"` shape as [`lane_scores`]. Values
+    /// are the string rendering — `"closed"`, `"open"`, or `"half_open"`
+    /// — so the wire shape stays stable across enum changes.
+    ///
+    /// We don't have a tri-state breaker yet (today it's
+    /// `consecutive_failures` past `failure_threshold`); `"half_open"`
+    /// is reserved for when one lands.
+    pub fn breaker_states(&self) -> std::collections::BTreeMap<String, String> {
+        self.slots
+            .iter()
+            .map(|s| {
+                let key = format!("{}/{}", s.provider.provider_name(), s.provider.model_id());
+                let state = if s.metrics.is_circuit_open(self.config.failure_threshold) {
+                    "open"
+                } else {
+                    "closed"
+                };
+                (key, state.to_string())
+            })
+            .collect()
+    }
+
+    /// Wave4-A: friendly accessor for the currently-selected lane in the
+    /// `"<provider_name>/<model_id>"` form expected by
+    /// `RouterStatusEvent::provider_name`. Falls back to `"unknown"`
+    /// when `last_selected` is out of range (cold-start race).
+    pub fn current_lane_key(&self) -> String {
+        let idx = self.last_selected.load(Ordering::Relaxed) as usize;
+        match self.slots.get(idx) {
+            Some(slot) => format!(
+                "{}/{}",
+                slot.provider.provider_name(),
+                slot.provider.model_id()
+            ),
+            None => "unknown".to_string(),
         }
     }
 
@@ -1561,6 +1676,10 @@ impl LlmProvider for AdaptiveRouter {
         }
 
         // ── Single-provider path (Off / Lane / fallthrough) ────────────
+        // Wave4-A: track wall time from the first attempt so the failover
+        // event's `elapsed_ms` reflects the user-visible latency before
+        // the lane change, not just the time spent in the failover loop.
+        let failover_started = Instant::now();
         match self.try_chat(start_idx, messages, tools, config).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
@@ -1592,6 +1711,28 @@ impl LlmProvider for AdaptiveRouter {
                         "Switching to {}...",
                         self.slots[idx].provider.provider_name()
                     ));
+                    // Wave4-A: publish per-attempt failover events. We
+                    // emit BEFORE the retry so a client can render the
+                    // transition even if the retry never succeeds.
+                    let from_key = format!(
+                        "{}/{}",
+                        self.slots[start_idx].provider.provider_name(),
+                        self.slots[start_idx].provider.model_id()
+                    );
+                    let to_key = format!(
+                        "{}/{}",
+                        self.slots[idx].provider.provider_name(),
+                        self.slots[idx].provider.model_id()
+                    );
+                    self.publish_failover(
+                        &from_key,
+                        &to_key,
+                        &format!("chat_error: {last_error}"),
+                        failover_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     match self.try_chat(idx, messages, tools, config).await {
                         Ok(resp) => return Ok(resp),
                         Err(e) => {
@@ -1619,6 +1760,9 @@ impl LlmProvider for AdaptiveRouter {
         let _classifier_decision = self.classify_turn(messages);
         let (start_idx, _is_probe) = self.select_provider();
 
+        // Wave4-A: failover elapsed-time anchor — see equivalent comment
+        // in `chat()` above.
+        let failover_started = Instant::now();
         match self
             .try_chat_stream(start_idx, messages, tools, config)
             .await
@@ -1652,6 +1796,25 @@ impl LlmProvider for AdaptiveRouter {
                         "Switching to {}...",
                         self.slots[idx].provider.provider_name()
                     ));
+                    let from_key = format!(
+                        "{}/{}",
+                        self.slots[start_idx].provider.provider_name(),
+                        self.slots[start_idx].provider.model_id()
+                    );
+                    let to_key = format!(
+                        "{}/{}",
+                        self.slots[idx].provider.provider_name(),
+                        self.slots[idx].provider.model_id()
+                    );
+                    self.publish_failover(
+                        &from_key,
+                        &to_key,
+                        &format!("stream_error: {last_error}"),
+                        failover_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
                     match self.try_chat_stream(idx, messages, tools, config).await {
                         Ok(stream) => return Ok(stream),
                         Err(e) => {
@@ -3008,6 +3171,195 @@ mod tests {
             fail_drift,
             warm_good.metrics.error_rate,
             warm_fail.metrics.error_rate,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave4-A: failover broadcast channel tests.
+    // ------------------------------------------------------------------
+
+    /// Wave4-A: subscribers receive a `FailoverEvent` when the router
+    /// crosses a lane in `chat()`. The first provider fails forcing
+    /// a failover to the second.
+    #[tokio::test]
+    async fn failover_broadcast_publishes_event_on_lane_change() {
+        let config = AdaptiveConfig {
+            failure_threshold: 5,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "primary down",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        );
+
+        let mut rx = router.subscribe_failover();
+
+        let messages = vec![Message::user("hello")];
+        let tools: Vec<ToolSpec> = vec![];
+        let cfg = ChatConfig::default();
+        let _ = router.chat(&messages, &tools, &cfg).await.unwrap();
+
+        // Wave4-A: the failover loop SHOULD have published at least one
+        // event. Wait up to 100ms — broadcast::Sender::send is sync but
+        // the chat loop yields, so we give the scheduler one tick.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("broadcast channel receive timed out")
+            .expect("broadcast channel was closed without an event");
+        assert_eq!(event.from_provider, "primary/m1");
+        assert_eq!(event.to_provider, "fallback/m2");
+        assert!(
+            event.reason.contains("chat_error"),
+            "reason should describe the underlying chat error — got {}",
+            event.reason
+        );
+    }
+
+    /// Wave4-A: the broadcast channel MUST NOT block the router under
+    /// back-pressure. A slow subscriber falls behind and observes
+    /// `RecvError::Lagged` — but the router keeps publishing.
+    ///
+    /// We construct a 64-deep burst (channel capacity) and verify that
+    /// the router survives without blocking and a fresh subscriber can
+    /// still read events afterwards.
+    #[tokio::test]
+    async fn failover_broadcast_does_not_block_router_under_backpressure() {
+        let router = AdaptiveRouter::new(
+            vec![Arc::new(MockProvider {
+                name: "p1",
+                model: "m1",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            })],
+            &[],
+            AdaptiveConfig::default(),
+        );
+
+        // Subscribe but never drain — the channel capacity is 64, so the
+        // 65th publish will start dropping the oldest event.
+        let _stuck_rx = router.subscribe_failover();
+
+        // Publish 100 events directly (the public API doesn't accept
+        // direct publish; we go through the same internal entry point
+        // the failover loops use).
+        for i in 0..100 {
+            router.publish_failover("from/m1", "to/m2", "test-burst", i);
+        }
+
+        // A fresh subscriber sees nothing of the previous 100 events
+        // (broadcast::Receiver only sees events sent AFTER subscribe()),
+        // but the channel must still be usable.
+        let mut fresh_rx = router.subscribe_failover();
+        router.publish_failover("from/m1", "to/m2", "post-burst", 999);
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), fresh_rx.recv())
+            .await
+            .expect("fresh subscriber receive timed out")
+            .expect("fresh subscriber channel closed");
+        assert_eq!(event.elapsed_ms, 999);
+        assert_eq!(event.reason, "post-burst");
+    }
+
+    /// Wave4-A: `lane_scores()` returns one entry per slot keyed by
+    /// `"<provider_name>/<model_id>"` in BTreeMap order.
+    #[test]
+    fn lane_scores_returns_deterministic_per_slot_snapshot() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "zai",
+                    model: "glm-5-turbo",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "ollama",
+                    model: "llama3.2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig::default(),
+        );
+
+        let scores = router.lane_scores();
+        let keys: Vec<&String> = scores.keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                &"ollama/llama3.2".to_string(),
+                &"zai/glm-5-turbo".to_string(),
+            ],
+            "lane_scores keys must be sorted (BTreeMap order)"
+        );
+    }
+
+    /// Wave4-A: `breaker_states()` reports `"closed"` initially and
+    /// `"open"` once the consecutive-failure threshold trips.
+    #[tokio::test]
+    async fn breaker_states_reports_open_after_threshold() {
+        let config = AdaptiveConfig {
+            failure_threshold: 1,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "fail",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "always_down",
+                }),
+                Arc::new(MockProvider {
+                    name: "ok",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        );
+
+        // Initially closed.
+        let states = router.breaker_states();
+        assert_eq!(states.get("fail/m1").map(String::as_str), Some("closed"));
+        assert_eq!(states.get("ok/m2").map(String::as_str), Some("closed"));
+
+        // Trip primary's breaker.
+        let _ = router
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+
+        let states = router.breaker_states();
+        assert_eq!(
+            states.get("fail/m1").map(String::as_str),
+            Some("open"),
+            "primary breaker should be open after failure_threshold trips"
         );
     }
 }
