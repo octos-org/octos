@@ -1742,10 +1742,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::SessionTitleSet(params) => {
-                handle_session_title_set(&ws, &state, &connection_headers, id, params).await;
+                handle_session_title_set(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionDelete(params) => {
-                handle_session_delete(&ws, &state, &connection_headers, id, params).await;
+                handle_session_delete(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SystemStatusGet(params) => {
                 handle_system_status_get(&ws, &state, id, params).await;
@@ -2561,6 +2577,34 @@ fn resolve_session_profile_runtime(
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
     let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
     state.profiles.get(candidate).cloned()
+}
+
+/// Resolve the canonical `SessionManager` handle for read operations
+/// (hydrate, state, etc.). Closes #919.1: turn persistence writes to
+/// the profile's `SessionRuntime.sessions`, so reads under profile
+/// auth MUST hit the same handle — otherwise `state.sessions` (the
+/// top-level data-dir store) reports `unknown_session` on reconnect.
+///
+/// Returns the per-profile session manager if a `ProfileRuntime` is
+/// registered for the resolved profile and the cache can bootstrap
+/// a `SessionRuntime` for `session_id`. Falls back to
+/// `state.sessions` so the legacy no-profile flow continues to work.
+async fn resolve_sessions_for_lookup(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    if let Some(profile_runtime) = resolve_session_profile_runtime(state, connection_profile_id) {
+        let hint = session_workspaces().get(session_id);
+        if let Ok(runtime) = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_id.clone(), hint)
+            .await
+        {
+            return Some(runtime.sessions.clone());
+        }
+    }
+    state.sessions.clone()
 }
 
 fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -> Option<PathBuf> {
@@ -3704,7 +3748,13 @@ async fn handle_session_hydrate(
         };
 
     let include_set = HydrateIncludeSet::from_request(&params.include);
-    let Some(sessions) = &state.sessions else {
+    // #919.1: route to the profile's session manager when the connection
+    // has a profile scope. Turn persistence writes to
+    // `SessionRuntime.sessions`; reads must hit the same handle or we'd
+    // report `unknown_session` on reconnect-hydrate.
+    let Some(sessions) =
+        resolve_sessions_for_lookup(state, connection_profile_id, &params.session_id).await
+    else {
         let _ = send_rpc_error(
             ws,
             Some(id),
@@ -3926,7 +3976,10 @@ async fn handle_thread_graph_get(
         }
     };
 
-    let Some(sessions) = &state.sessions else {
+    // #919.1: route to the profile's session manager when under profile auth.
+    let Some(sessions) =
+        resolve_sessions_for_lookup(state, connection_profile_id, &params.session_id).await
+    else {
         let _ = send_rpc_error(
             ws,
             Some(id),
@@ -4000,7 +4053,12 @@ async fn handle_turn_state_get(
     // (which returns `state: unknown`). When the sessions manager is
     // unavailable we fall through to the default "unknown" path so the
     // RPC remains callable in headless tests.
-    if let Some(sessions) = &state.sessions {
+    //
+    // #919.1: route to the profile's session manager when under profile
+    // auth so reads see the same store the turn writes used.
+    let sessions =
+        resolve_sessions_for_lookup(state, connection_profile_id, &params.session_id).await;
+    if let Some(sessions) = sessions.as_ref() {
         let mut sessions_guard = sessions.lock().await;
         if !sessions_guard.session_known(&params.session_id) {
             let _ = send_rpc_error(
@@ -4039,7 +4097,7 @@ async fn handle_turn_state_get(
     // turn_id via thread_id grouping (today the type system does not yet
     // carry typed turn_id on Message; we approximate via the projection's
     // thread_id and the message's stored thread_id).
-    let committed_seqs = if let Some(sessions) = &state.sessions {
+    let committed_seqs = if let Some(sessions) = sessions.as_ref() {
         let mut sessions_guard = sessions.lock().await;
         let session = sessions_guard.get_or_create(&params.session_id).await;
         let target_thread_id = projection.as_ref().and_then(|p| p.thread_id.clone());
@@ -4841,6 +4899,7 @@ async fn handle_session_title_set(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     params: SessionTitleSetParams,
 ) {
@@ -4871,6 +4930,7 @@ async fn handle_session_title_set(
     let response = super::handlers::update_session_title(
         State(state.clone()),
         headers.clone(),
+        identity.cloned().map(axum::Extension),
         axum_path(params.session_id),
         body,
     )
@@ -4904,6 +4964,7 @@ async fn handle_session_delete(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     params: SessionDeleteParams,
 ) {
@@ -4912,6 +4973,7 @@ async fn handle_session_delete(
     let response = super::handlers::delete_session(
         State(state.clone()),
         headers.clone(),
+        identity.cloned().map(axum::Extension),
         axum_path(params.session_id),
     )
     .await;

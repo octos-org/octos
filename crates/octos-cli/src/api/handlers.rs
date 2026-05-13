@@ -144,21 +144,6 @@ fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String 
     routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
 }
 
-fn standalone_api_session_key_candidates(
-    state: &AppState,
-    headers: &HeaderMap,
-    session_id: &str,
-) -> Vec<SessionKey> {
-    let profile_id = api_profile_id_from_headers(state, headers);
-    let mut candidates = vec![
-        SessionKey::with_profile(&profile_id, "api", session_id),
-        SessionKey::with_profile(MAIN_PROFILE_ID, "api", session_id),
-        SessionKey::new("api", session_id),
-    ];
-    candidates.dedup_by(|left, right| left.0 == right.0);
-    candidates
-}
-
 /// Returns `true` when `session_id` is a bare SPA id whose raw form is
 /// safe to query as a `SessionKey` directly. Specifically: no `:` (which
 /// is the channel/profile separator in
@@ -178,7 +163,8 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
     !session_id.contains(':') && !session_id.contains('#')
 }
 
-/// Topic-aware sibling of [`standalone_api_session_key_candidates`].
+/// Topic-aware, auth-aware candidate resolver shared by REST
+/// `/messages`, `session/title.set`, and `session/delete`.
 ///
 /// Returns the candidate `SessionKey`s the REST `/messages` and similar
 /// read paths should try, in fallback order. The fallback set is split
@@ -933,6 +919,7 @@ pub struct UpdateTitleRequest {
 pub async fn update_session_title(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<UpdateTitleRequest>,
 ) -> Response {
@@ -948,7 +935,18 @@ pub async fn update_session_title(
 
     if let Some(sessions) = &state.sessions {
         let mut sess = sessions.lock().await;
-        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
+        // #919.2: use the auth-aware candidate helper so raw `web-*`
+        // sessions under profile auth resolve to the profile's own
+        // store. The older `standalone_api_session_key_candidates`
+        // skipped tenant-scoped raw-id fallbacks.
+        let identity_ref = identity.as_ref().map(|ext| &ext.0);
+        for key in standalone_api_session_key_candidates_with_topic(
+            &state,
+            &headers,
+            identity_ref,
+            &id,
+            None,
+        ) {
             if sess.load(&key).await.is_some() {
                 if let Err(e) = sess.update_title(&key, title.clone()).await {
                     tracing::error!(
@@ -990,12 +988,21 @@ pub async fn update_session_title(
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     // Clear from the standalone store if available.
     if let Some(sessions) = &state.sessions {
         let mut sess = sessions.lock().await;
-        for key in standalone_api_session_key_candidates(&state, &headers, &id) {
+        // #919.2: use the auth-aware candidate helper.
+        let identity_ref = identity.as_ref().map(|ext| &ext.0);
+        for key in standalone_api_session_key_candidates_with_topic(
+            &state,
+            &headers,
+            identity_ref,
+            &id,
+            None,
+        ) {
             if sess.load(&key).await.is_some() {
                 if let Err(e) = sess.clear(&key).await {
                     tracing::error!(
