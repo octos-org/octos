@@ -536,12 +536,59 @@ pub struct AdaptiveStatus {
 ///
 /// Identifiers use the `<provider_name>/<model_id>` shape so they line
 /// up with the `lane_scores` keys in `RouterStatusEvent`.
+///
+/// **Codex P1 (Wave4-A review)**: the AdaptiveRouter is *profile*-
+/// scoped — every session on the same profile shares the same router
+/// instance ([`ProfileRuntime`]). Without an originating identifier
+/// here, two concurrent sessions on the same profile would each
+/// re-emit one another's failovers as if it were their own. The
+/// optional `originating_session_id` / `originating_turn_id` fields
+/// let the API-layer forwarder filter to events whose context matches
+/// its own session — see
+/// [`with_router_context`] for the publisher-side hookup.
 #[derive(Debug, Clone)]
 pub struct FailoverEvent {
     pub from_provider: String,
     pub to_provider: String,
     pub reason: String,
     pub elapsed_ms: u64,
+    /// Originating session id (free-form `SessionKey` string), captured
+    /// via [`ROUTER_CONTEXT`] at publish time. `None` when chat() was
+    /// invoked outside a context-aware scope (CLI smoke tests, etc.).
+    pub originating_session_id: Option<String>,
+    /// Originating turn id (UUID v7 hex), captured via [`ROUTER_CONTEXT`]
+    /// at publish time.
+    pub originating_turn_id: Option<String>,
+}
+
+/// Wave4-A: per-task context the API layer pushes BEFORE calling
+/// `provider.chat()`. Read inside `AdaptiveRouter::publish_failover` to
+/// stamp the originating session onto every emitted `FailoverEvent`.
+///
+/// Subscribers filter on this so a session B subscriber doesn't surface
+/// session A's failover under session B. The context is `Cell`-style —
+/// fork-friendly with `with_router_context`.
+#[derive(Debug, Clone, Default)]
+pub struct RouterContext {
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+tokio::task_local! {
+    /// Wave4-A: see [`RouterContext`]. Default `RouterContext::default()`
+    /// when no scope wraps the chat() call (test paths, CLI smoke).
+    pub static ROUTER_CONTEXT: RouterContext;
+}
+
+/// Wave4-A: run `fut` with the given `RouterContext` accessible via
+/// [`ROUTER_CONTEXT`]. The API layer wraps `run_standalone_turn`'s
+/// chat() path with this so the originating session id reaches the
+/// router's failover publisher.
+pub async fn with_router_context<F, T>(ctx: RouterContext, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    ROUTER_CONTEXT.scope(ctx, fut).await
 }
 
 /// Adaptive provider router with metrics-driven selection.
@@ -678,6 +725,12 @@ impl AdaptiveRouter {
     /// `Ok(receiver_count)` or `Err` when there are zero active
     /// subscribers — both outcomes are non-fatal for the router, so we
     /// ignore the result entirely.
+    ///
+    /// Reads [`ROUTER_CONTEXT`] (Codex P1): if the caller's task-local
+    /// scope provides a `RouterContext`, stamps its `session_id` /
+    /// `turn_id` onto the event so subscribers can filter to the
+    /// originating session. Falls back to `None` outside such scopes
+    /// (test paths / CLI smoke).
     fn publish_failover(
         &self,
         from_provider: &str,
@@ -685,11 +738,16 @@ impl AdaptiveRouter {
         reason: &str,
         elapsed_ms: u64,
     ) {
+        let (originating_session_id, originating_turn_id) = ROUTER_CONTEXT
+            .try_with(|ctx| (ctx.session_id.clone(), ctx.turn_id.clone()))
+            .unwrap_or_default();
         let _ = self.failover_tx.send(FailoverEvent {
             from_provider: from_provider.to_string(),
             to_provider: to_provider.to_string(),
             reason: reason.to_string(),
             elapsed_ms,
+            originating_session_id,
+            originating_turn_id,
         });
     }
 
@@ -3361,5 +3419,117 @@ mod tests {
             Some("open"),
             "primary breaker should be open after failure_threshold trips"
         );
+    }
+
+    /// Wave4-A (Codex P1): the failover publisher reads `ROUTER_CONTEXT`
+    /// via task_local and stamps the originating session/turn id onto
+    /// every emitted `FailoverEvent`. Subscribers filter on this so
+    /// concurrent sessions on the same profile-scoped router don't
+    /// receive each other's failovers.
+    #[tokio::test]
+    async fn failover_event_carries_originating_session_from_router_context() {
+        let config = AdaptiveConfig {
+            failure_threshold: 5,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = Arc::new(AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "primary down",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        ));
+        let mut rx = router.subscribe_failover();
+
+        let router_clone = router.clone();
+        let ctx = RouterContext {
+            session_id: Some("local:session-A".into()),
+            turn_id: Some("turn-A".into()),
+        };
+        let messages = vec![Message::user("hello")];
+        let cfg = ChatConfig::default();
+        let _ = with_router_context(ctx, async move {
+            router_clone.chat(&messages, &[], &cfg).await.unwrap()
+        })
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("failover event timed out")
+            .expect("broadcast channel closed");
+        assert_eq!(event.from_provider, "primary/m1");
+        assert_eq!(event.to_provider, "fallback/m2");
+        assert_eq!(
+            event.originating_session_id.as_deref(),
+            Some("local:session-A"),
+            "publisher must stamp originating session from ROUTER_CONTEXT"
+        );
+        assert_eq!(
+            event.originating_turn_id.as_deref(),
+            Some("turn-A"),
+            "publisher must stamp originating turn from ROUTER_CONTEXT"
+        );
+    }
+
+    /// Wave4-A (Codex P1): without a wrapping `ROUTER_CONTEXT` scope
+    /// (CLI smoke / test paths), the publisher falls back to `None` so
+    /// existing callers don't break.
+    #[tokio::test]
+    async fn failover_event_originating_id_is_none_outside_context_scope() {
+        let config = AdaptiveConfig {
+            failure_threshold: 5,
+            probe_probability: 0.0,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "primary down",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            config,
+        );
+        let mut rx = router.subscribe_failover();
+
+        let _ = router
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("failover event timed out")
+            .expect("broadcast channel closed");
+        assert_eq!(
+            event.originating_session_id, None,
+            "outside ROUTER_CONTEXT scope, originating_session_id must be None"
+        );
+        assert_eq!(event.originating_turn_id, None);
     }
 }

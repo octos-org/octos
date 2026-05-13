@@ -6459,7 +6459,7 @@ async fn run_standalone_turn(
     // first token. No-op when this profile has no `AdaptiveRouter`
     // attached (single-provider or `enabled = false`).
     let adaptive_router_ref = session_runtime.profile.adaptive_router.clone();
-    emit_router_status_lifecycle(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
 
     // Wave4-A: subscribe to the AdaptiveRouter's broadcast channel and
     // forward `FailoverEvent`s as `router/failover` notifications for
@@ -6933,13 +6933,24 @@ async fn run_standalone_turn(
             "turn/start carries rewrite_for; current build forwards the prompt without in-place ledger rewrite (β-1 advisory)"
         );
     }
+    // Wave4-A (Codex P1): stamp the originating session/turn id into a
+    // tokio task_local so the AdaptiveRouter's failover publisher can
+    // attribute events to the right session. Without this, sessions
+    // sharing a profile-scoped router would re-emit one another's
+    // failovers (the router fans out to all subscribers).
+    let router_ctx = octos_llm::RouterContext {
+        session_id: Some(session_id.0.clone()),
+        turn_id: Some(turn_id.0.to_string()),
+    };
     let agent_task = tokio::spawn(async move {
-        let result = octos_agent::tools::TOOL_APPROVAL_CTX
-            .scope(
+        let result = octos_llm::with_router_context(
+            router_ctx,
+            octos_agent::tools::TOOL_APPROVAL_CTX.scope(
                 approval_requester,
                 request_agent.process_message(&prompt, &history, turn_media_paths),
-            )
-            .await;
+            ),
+        )
+        .await;
 
         match result {
             Ok(response) => {
@@ -7194,13 +7205,13 @@ async fn run_standalone_turn(
     // `turn/completed` so clients see the actual provider that ran
     // the turn + any breaker / lane-score deltas. No-op when no
     // AdaptiveRouter is attached.
-    emit_router_status_lifecycle(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
 
-    // Wave4-A: tear down the failover forwarder task. Aborting is safe
-    // even if the task already exited (broadcast channel close path).
-    if let Some(handle) = failover_forwarder {
-        handle.abort();
-    }
+    // Wave4-A (Codex P1): tear down the failover forwarder task AND
+    // await its JoinHandle so the detached task cannot outlive the
+    // turn — without the await, the forwarder could keep forwarding
+    // to a half-torn-down writer.
+    stop_failover_forwarder(failover_forwarder).await;
 
     // FIX-06: a turn that ends — for any reason — must drop its
     // `approve_for_turn` policy entries so a subsequent turn can't reuse
@@ -7629,10 +7640,17 @@ pub(crate) fn build_router_status_event(
     }
 }
 
-/// Wave4-A: emit a `RouterStatus` notification on the lifecycle path
-/// (same delivery semantics as `turn/started` — failure is logged but
-/// non-fatal for the turn). No-op when `router` is `None`.
-fn emit_router_status_lifecycle(
+/// Wave4-A: emit a `RouterStatus` notification on the durable path.
+///
+/// Codex P1: this MUST NOT use lifecycle delivery — `send_lifecycle`
+/// latches the connection as `failed` on backpressure / closed, which
+/// the read loop interprets as "tear down everything". A status pill
+/// frame missing under backpressure is not worth killing the turn.
+/// Durable delivery still ledgers the frame for reconnect-replay but
+/// degrades gracefully under push pressure.
+///
+/// No-op when `router` is `None`.
+fn emit_router_status_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -7644,37 +7662,59 @@ fn emit_router_status_lifecycle(
     let event = build_router_status_event(session_id, router);
     let notif = UiNotification::RouterStatus(event);
     let method = notif.method().to_string();
-    if let Err(error) = send_notification_lifecycle(ws, ledger, notif) {
+    if let Err(error) = send_notification_durable(ws, ledger, notif) {
         tracing::debug!(
             target: "octos::ui_protocol::ws",
             method = %method,
             error = ?error,
-            "router/status emission failed; non-fatal for turn"
+            "router/status durable enqueue failed; non-fatal for turn"
         );
     }
 }
 
 /// Wave4-A: spawn a background task that forwards `FailoverEvent` from
 /// the AdaptiveRouter's broadcast channel onto the connection as
-/// `router/failover` notifications. The task lives for the duration of
-/// the turn — it ends naturally when the broadcast channel sender is
-/// dropped or when the calling task exits (the `tokio::spawn` is
-/// orphaned but the channel close terminates the loop).
+/// `router/failover` notifications.
 ///
-/// Returns the `AbortHandle` so the caller can stop the forwarder when
-/// the turn ends. Returning `None` when no router is attached.
+/// Codex P1: the AdaptiveRouter is *profile*-scoped, so a single
+/// broadcast fans out to every concurrent session on the profile. The
+/// forwarder MUST filter on
+/// `event.originating_session_id == this session_id` — otherwise
+/// concurrent sessions on the same profile re-attribute each other's
+/// failovers under their own id (wrong for the audit-log replay and
+/// the user-facing toast).
+///
+/// Codex P1 (lifecycle): the forwarder is detached but the caller
+/// stores the `JoinHandle` and awaits it on turn end via
+/// [`stop_failover_forwarder`]. A hard-close send error breaks the
+/// loop, so the forwarder cannot keep forwarding to a stale writer.
+///
+/// Returns the `JoinHandle` so the caller can stop *and await* the
+/// forwarder when the turn ends. Returns `None` when no router is
+/// attached.
 fn spawn_router_failover_forwarder(
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
     session_id: SessionKey,
     router: Option<Arc<octos_llm::AdaptiveRouter>>,
-) -> Option<AbortHandle> {
+) -> Option<tokio::task::JoinHandle<()>> {
     let router = router?;
     let mut rx = router.subscribe_failover();
+    let session_id_str = session_id.0.clone();
     let join = tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // Codex P1: filter on originating_session_id. When
+                    // the publisher provided a session id, only forward
+                    // events that match this forwarder's session. When
+                    // it didn't (test paths / CLI smoke), pass through
+                    // so headless tests still observe failover events.
+                    if let Some(originating) = event.originating_session_id.as_deref() {
+                        if originating != session_id_str {
+                            continue;
+                        }
+                    }
                     let notif = UiNotification::RouterFailover(
                         octos_core::ui_protocol::RouterFailoverEvent {
                             session_id: session_id.clone(),
@@ -7684,11 +7724,26 @@ fn spawn_router_failover_forwarder(
                             elapsed_ms: event.elapsed_ms,
                         },
                     );
-                    // Best-effort durable — failover events should be
-                    // ledger-persisted so a reconnecting client can
-                    // catch up, but if the client is gone we don't
-                    // care (the turn is what matters).
-                    let _ = send_notification_durable(&ws, &ledger, notif);
+                    // Best-effort durable — failover events ledger for
+                    // reconnect-replay. Hard-close errors (FatalClosed,
+                    // Closed) mean the client is gone; break out so
+                    // this task can't outlive the connection (Codex P1).
+                    match send_notification_durable(&ws, &ledger, notif) {
+                        Ok(()) => {}
+                        Err(SendError::FatalClosed) | Err(SendError::Closed) => {
+                            tracing::debug!(
+                                target: "octos::ui_protocol::ws",
+                                "failover forwarder: connection closed; exiting"
+                            );
+                            break;
+                        }
+                        Err(SendError::LifecycleFailure(_)) | Err(SendError::BackpressureDrop) => {
+                            // Drop surfaced as a `replay_lossy`
+                            // opportunistic emission inside
+                            // `send_notification_durable`. Continue.
+                            continue;
+                        }
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::debug!(
@@ -7702,7 +7757,20 @@ fn spawn_router_failover_forwarder(
             }
         }
     });
-    Some(join.abort_handle())
+    Some(join)
+}
+
+/// Wave4-A (Codex P1): abort + await the failover forwarder so the
+/// detached task cannot outlive the connection or forward a frame to a
+/// half-torn-down writer. `abort()` is best-effort; the subsequent
+/// `await` is what guarantees the task has actually stopped before
+/// turn cleanup returns. Awaiting an aborted JoinHandle returns a
+/// `JoinError` we ignore.
+async fn stop_failover_forwarder(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {

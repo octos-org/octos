@@ -41,8 +41,9 @@ pub mod registry;
 
 pub use adaptive::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry, FailoverEvent,
-    MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy,
-    SharedProviderMetrics, StatusCallback, derive_cold_start_catalog,
+    MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, RouterContext, SharedMetrics,
+    SharedPolicy, SharedProviderMetrics, StatusCallback, derive_cold_start_catalog,
+    with_router_context,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
