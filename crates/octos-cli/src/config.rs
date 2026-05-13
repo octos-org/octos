@@ -536,6 +536,15 @@ pub struct AdaptiveRoutingConfig {
     /// Scoring weight for published token cost (0..1). Default: 0.2.
     #[serde(default = "default_weight_cost")]
     pub weight_cost: f64,
+
+    /// Auto-escalation: when sustained latency degradation is observed on a
+    /// session, the router auto-promotes `mode` to `Hedge` and restores it
+    /// on recovery. Defaults to enabled with FA-11/12-matching thresholds
+    /// (8s ceiling, 3-consecutive-slow trigger, 0.6 recovery factor).
+    /// Operators that explicitly want to disable the latency feedback loop
+    /// can set `auto_escalation.enabled = false`.
+    #[serde(default)]
+    pub auto_escalation: AutoEscalationConfigFile,
 }
 
 impl Default for AdaptiveRoutingConfig {
@@ -553,8 +562,80 @@ impl Default for AdaptiveRoutingConfig {
             weight_error_rate: default_weight_error_rate(),
             weight_priority: default_weight_priority(),
             weight_cost: default_weight_cost(),
+            auto_escalation: AutoEscalationConfigFile::default(),
         }
     }
+}
+
+/// Per-config auto-escalation tunables. Mirrors `octos_llm::AutoEscalationConfig`
+/// but uses serde defaults so a missing `auto_escalation` block in
+/// `config.json` resolves to the recommended values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoEscalationConfigFile {
+    #[serde(default = "default_auto_escalation_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_auto_escalation_window_size")]
+    pub window_size: usize,
+    #[serde(default = "default_auto_escalation_baseline_samples")]
+    pub baseline_samples: usize,
+    #[serde(default = "default_auto_escalation_degradation_threshold")]
+    pub degradation_threshold: f64,
+    #[serde(default = "default_auto_escalation_slow_trigger")]
+    pub slow_trigger: u32,
+    #[serde(default = "default_auto_escalation_latency_ceiling_ms")]
+    pub latency_ceiling_ms: u64,
+    #[serde(default = "default_auto_escalation_recovery_factor")]
+    pub recovery_factor: f64,
+}
+
+impl Default for AutoEscalationConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: default_auto_escalation_enabled(),
+            window_size: default_auto_escalation_window_size(),
+            baseline_samples: default_auto_escalation_baseline_samples(),
+            degradation_threshold: default_auto_escalation_degradation_threshold(),
+            slow_trigger: default_auto_escalation_slow_trigger(),
+            latency_ceiling_ms: default_auto_escalation_latency_ceiling_ms(),
+            recovery_factor: default_auto_escalation_recovery_factor(),
+        }
+    }
+}
+
+impl From<&AutoEscalationConfigFile> for octos_llm::AutoEscalationConfig {
+    fn from(c: &AutoEscalationConfigFile) -> Self {
+        Self {
+            enabled: c.enabled,
+            window_size: c.window_size,
+            baseline_samples: c.baseline_samples,
+            degradation_threshold: c.degradation_threshold,
+            slow_trigger: c.slow_trigger,
+            latency_ceiling_ms: c.latency_ceiling_ms,
+            recovery_factor: c.recovery_factor,
+        }
+    }
+}
+
+fn default_auto_escalation_enabled() -> bool {
+    true
+}
+fn default_auto_escalation_window_size() -> usize {
+    5
+}
+fn default_auto_escalation_baseline_samples() -> usize {
+    5
+}
+fn default_auto_escalation_degradation_threshold() -> f64 {
+    3.0
+}
+fn default_auto_escalation_slow_trigger() -> u32 {
+    3
+}
+fn default_auto_escalation_latency_ceiling_ms() -> u64 {
+    8_000
+}
+fn default_auto_escalation_recovery_factor() -> f64 {
+    0.6
 }
 
 impl From<&AdaptiveRoutingConfig> for octos_llm::AdaptiveConfig {
@@ -1590,5 +1671,43 @@ mod tests {
         };
         let warnings = config.validate();
         assert!(warnings.iter().any(|w| w.contains("out of range")));
+    }
+
+    /// Default `AdaptiveRoutingConfig` carries `auto_escalation.enabled = true`
+    /// so out-of-the-box installs get the latency-feedback loop.
+    #[test]
+    fn auto_escalation_defaults_match_router_defaults() {
+        let cfg = AdaptiveRoutingConfig::default();
+        assert!(cfg.auto_escalation.enabled);
+        let llm_cfg = octos_llm::AutoEscalationConfig::from(&cfg.auto_escalation);
+        assert!(llm_cfg.enabled);
+        assert_eq!(llm_cfg.latency_ceiling_ms, 8_000);
+        assert!((llm_cfg.recovery_factor - 0.6).abs() < f64::EPSILON);
+        assert_eq!(llm_cfg.slow_trigger, 3);
+    }
+
+    /// Missing `auto_escalation` block in JSON resolves to the in-code
+    /// defaults instead of disabling the feature.
+    #[test]
+    fn auto_escalation_missing_block_uses_defaults() {
+        let json = r#"{
+            "enabled": true,
+            "mode": "lane"
+        }"#;
+        let cfg: AdaptiveRoutingConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.auto_escalation.enabled);
+        assert_eq!(cfg.auto_escalation.latency_ceiling_ms, 8_000);
+    }
+
+    /// Operators can disable the feature explicitly.
+    #[test]
+    fn auto_escalation_can_be_disabled() {
+        let json = r#"{
+            "enabled": true,
+            "mode": "lane",
+            "auto_escalation": { "enabled": false }
+        }"#;
+        let cfg: AdaptiveRoutingConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.auto_escalation.enabled);
     }
 }

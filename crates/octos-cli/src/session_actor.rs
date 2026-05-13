@@ -38,8 +38,8 @@ use octos_core::{
     OutboundMessage, SessionKey,
 };
 use octos_llm::{
-    AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
-    ResponsivenessObserver, pricing::model_pricing,
+    AdaptiveMode, AdaptiveRouter, AutoEscalationDecision, EmbeddingProvider, LlmProvider,
+    ProviderRouter, ResponsivenessObserver, pricing::model_pricing,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
@@ -4701,35 +4701,41 @@ impl SessionActor {
             self.overflow_cancelled.store(true, Ordering::Release);
         }
 
-        // Feed latency to responsiveness observer
+        // Feed latency to the auto-escalation pipeline. The router (lib)
+        // owns the AdaptiveMode flip via its per-session state machine;
+        // the gateway-local observer stays in sync so the speculative
+        // patience calculation in process_inbound_speculative still
+        // reads the same baseline. The Speculative queue mode flip + the
+        // "⚡" chat message remain gateway-specific UX.
         self.responsiveness.record(llm_latency);
-        if self.responsiveness.should_activate() {
-            warn!(
-                session = %self.session_key,
-                baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
-                latency_ms = llm_latency.as_millis(),
-                consecutive_slow = self.responsiveness.consecutive_slow_count(),
-                "sustained latency degradation detected, activating auto-protection"
-            );
-            self.responsiveness.set_active(true);
-            self.queue_mode = QueueMode::Speculative;
-            if let Some(ref router) = self.adaptive_router {
-                router.set_mode(AdaptiveMode::Hedge);
-                let _ = self.out_tx.send(OutboundMessage {
-                    channel: self.channel.clone(),
-                    chat_id: self.chat_id.clone(),
-                    content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                }).await;
-            }
-        } else if self.responsiveness.should_deactivate() {
-            info!(session = %self.session_key, "provider recovered, reverting to normal mode");
-            self.responsiveness.set_active(false);
-            self.queue_mode = QueueMode::Followup;
-            if let Some(ref router) = self.adaptive_router {
-                router.set_mode(AdaptiveMode::Off);
+        if let Some(ref router) = self.adaptive_router {
+            let session_id = self.session_key.to_string();
+            match router.record_turn_latency(&session_id, llm_latency) {
+                AutoEscalationDecision::Escalated => {
+                    warn!(
+                        session = %self.session_key,
+                        baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
+                        latency_ms = llm_latency.as_millis(),
+                        consecutive_slow = self.responsiveness.consecutive_slow_count(),
+                        "sustained latency degradation detected, activating auto-protection"
+                    );
+                    self.responsiveness.set_active(true);
+                    self.queue_mode = QueueMode::Speculative;
+                    let _ = self.out_tx.send(OutboundMessage {
+                        channel: self.channel.clone(),
+                        chat_id: self.chat_id.clone(),
+                        content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    }).await;
+                }
+                AutoEscalationDecision::Deescalated => {
+                    info!(session = %self.session_key, "provider recovered, reverting to normal mode");
+                    self.responsiveness.set_active(false);
+                    self.queue_mode = QueueMode::Followup;
+                }
+                AutoEscalationDecision::NoChange => {}
             }
         }
 
@@ -5984,36 +5990,41 @@ impl SessionActor {
             result.is_ok()
         );
 
-        // Feed latency to responsiveness observer
+        // Feed latency to the auto-escalation pipeline. The router (lib)
+        // owns the AdaptiveMode flip via its per-session state machine;
+        // the gateway-local observer stays in sync so the speculative
+        // patience calculation in process_inbound_speculative still
+        // reads the same baseline. The Speculative queue mode flip + the
+        // "⚡" chat message remain gateway-specific UX.
         self.responsiveness.record(llm_latency);
-        if self.responsiveness.should_activate() {
-            warn!(
-                session = %self.session_key,
-                baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
-                latency_ms = llm_latency.as_millis(),
-                consecutive_slow = self.responsiveness.consecutive_slow_count(),
-                "sustained latency degradation detected, activating auto-protection"
-            );
-            self.responsiveness.set_active(true);
-            // Escalate: hedge routing (race providers) + speculative queue (unblock for new messages)
-            self.queue_mode = QueueMode::Speculative;
-            if let Some(ref router) = self.adaptive_router {
-                router.set_mode(AdaptiveMode::Hedge);
-                let _ = self.out_tx.send(OutboundMessage {
-                    channel: self.channel.clone(),
-                    chat_id: self.chat_id.clone(),
-                    content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                }).await;
-            }
-        } else if self.responsiveness.should_deactivate() {
-            info!(session = %self.session_key, "provider recovered, reverting to normal mode");
-            self.responsiveness.set_active(false);
-            self.queue_mode = QueueMode::Followup;
-            if let Some(ref router) = self.adaptive_router {
-                router.set_mode(AdaptiveMode::Off);
+        if let Some(ref router) = self.adaptive_router {
+            let session_id = self.session_key.to_string();
+            match router.record_turn_latency(&session_id, llm_latency) {
+                AutoEscalationDecision::Escalated => {
+                    warn!(
+                        session = %self.session_key,
+                        baseline_ms = ?self.responsiveness.baseline().map(|b| b.as_millis()),
+                        latency_ms = llm_latency.as_millis(),
+                        consecutive_slow = self.responsiveness.consecutive_slow_count(),
+                        "sustained latency degradation detected, activating auto-protection"
+                    );
+                    self.responsiveness.set_active(true);
+                    self.queue_mode = QueueMode::Speculative;
+                    let _ = self.out_tx.send(OutboundMessage {
+                        channel: self.channel.clone(),
+                        chat_id: self.chat_id.clone(),
+                        content: "⚡ Detected slow responses. Enabling hedge racing + speculative queue — you won't be blocked.".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    }).await;
+                }
+                AutoEscalationDecision::Deescalated => {
+                    info!(session = %self.session_key, "provider recovered, reverting to normal mode");
+                    self.responsiveness.set_active(false);
+                    self.queue_mode = QueueMode::Followup;
+                }
+                AutoEscalationDecision::NoChange => {}
             }
         }
 

@@ -6787,13 +6787,33 @@ async fn run_standalone_turn(
             "turn/start carries rewrite_for; current build forwards the prompt without in-place ledger rewrite (β-1 advisory)"
         );
     }
+    // Wave-4c: feed turn-end latency into the AdaptiveRouter's per-session
+    // auto-escalation state machine so the web/serve path benefits from the
+    // same Lane → Hedge auto-flip the gateway has had since FA-11. Without
+    // this hook, web clients pay the slow-provider cost on every turn
+    // because `run_standalone_turn` previously bypassed
+    // `SessionActor::process_inbound{,_speculative}`'s latency feedback.
+    // The gateway-only UX (queue-mode flip, "⚡" chat notification) lives
+    // in `session_actor.rs`; serve only opts into the mode flip itself.
+    let auto_escalation_router = session_runtime.profile.adaptive_router.clone();
+    let auto_escalation_session_id = session_id.0.clone();
     let agent_task = tokio::spawn(async move {
+        let start = std::time::Instant::now();
         let result = octos_agent::tools::TOOL_APPROVAL_CTX
             .scope(
                 approval_requester,
                 request_agent.process_message(&prompt, &history, turn_media_paths),
             )
             .await;
+        let llm_latency = start.elapsed();
+
+        // Drive the router's auto-escalation. We pass the raw session id
+        // (with `api:` prefix preserved) so concurrent gateway + serve
+        // accesses on the same router are namespaced separately and do
+        // not collide on the per-session window.
+        if let Some(router) = auto_escalation_router.as_ref() {
+            router.record_turn_latency(&auto_escalation_session_id, llm_latency);
+        }
 
         match result {
             Ok(response) => {

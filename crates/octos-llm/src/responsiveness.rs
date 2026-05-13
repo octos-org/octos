@@ -45,6 +45,32 @@ impl ResponsivenessObserver {
         }
     }
 
+    /// Construct an observer with explicit parameters.
+    ///
+    /// Useful for callers (e.g. [`crate::adaptive::AdaptiveRouter`]'s
+    /// per-session auto-escalation state) that want to drive the observer
+    /// off a typed config instead of the legacy defaults.
+    pub fn with_params(
+        window_size: usize,
+        baseline_samples: usize,
+        degradation_threshold: f64,
+        slow_trigger: u32,
+    ) -> Self {
+        let window_size = window_size.max(1);
+        let baseline_samples = baseline_samples.max(1).min(window_size);
+        Self {
+            window: VecDeque::with_capacity(window_size),
+            window_size,
+            baseline: None,
+            baseline_samples,
+            degradation_threshold,
+            consecutive_slow: 0,
+            slow_trigger,
+            active: false,
+            adapt_counter: 0,
+        }
+    }
+
     /// Record a new latency observation.
     pub fn record(&mut self, latency: Duration) {
         self.window.push_back(latency);

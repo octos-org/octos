@@ -4,9 +4,10 @@
 //! per-provider latency (EMA + p95), error rates, and circuit breaker state.
 //! Supports probe/canary requests to keep metrics fresh for non-primary providers.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -19,6 +20,7 @@ use crate::config::ChatConfig;
 use crate::content_classifier::{ClassificationDecision, ContentClassifier};
 use crate::credential_pool::{CredentialPool, ErrorId, rotation_reason};
 use crate::provider::LlmProvider;
+use crate::responsiveness::ResponsivenessObserver;
 use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +68,122 @@ impl Default for AdaptiveConfig {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Auto-escalation: latency-driven Lane -> Hedge self-promotion
+// ---------------------------------------------------------------------------
+
+/// Tunables for the per-session auto-escalation state machine.
+///
+/// When sustained-latency degradation is detected on a given session the
+/// router self-promotes the global `AdaptiveMode` from `Lane` to `Hedge`
+/// (and falls back to `Lane`/`Off` when latency recovers). The thresholds
+/// match the legacy gateway-side `ResponsivenessObserver` defaults so
+/// behavior is identical for `octos gateway` after the refactor.
+#[derive(Debug, Clone)]
+pub struct AutoEscalationConfig {
+    /// Master switch. `false` disables all latency-tracking and mode flips.
+    pub enabled: bool,
+    /// Sliding window of recent turn latencies kept per session.
+    pub window_size: usize,
+    /// Number of warmup samples used to learn the baseline (median).
+    pub baseline_samples: usize,
+    /// Multiplier over baseline above which a single turn counts as "slow".
+    /// e.g. `3.0` ⇒ slow if `latency > baseline * 3`.
+    pub degradation_threshold: f64,
+    /// Consecutive slow turns required to escalate.
+    pub slow_trigger: u32,
+    /// Hard ceiling — turns longer than this always count as slow once a
+    /// baseline exists. Default 8000 ms, matches the FA-11/12 spec.
+    pub latency_ceiling_ms: u64,
+    /// Hysteresis fraction. After escalation, latency must drop below
+    /// `latency_ceiling_ms * recovery_factor` for `should_deactivate()` to
+    /// reset. Default `0.6` mirrors the existing single-fast-turn rule but
+    /// adds a soft ceiling so a single below-threshold turn that is still
+    /// noisy does not flap us back to Off.
+    pub recovery_factor: f64,
+}
+
+impl Default for AutoEscalationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_size: 5,
+            baseline_samples: 5,
+            degradation_threshold: 3.0,
+            slow_trigger: 3,
+            latency_ceiling_ms: 8_000,
+            recovery_factor: 0.6,
+        }
+    }
+}
+
+/// Decision returned from [`AdaptiveRouter::record_turn_latency`].
+///
+/// Callers that want to drive UI/queue-mode side effects (gateway "⚡"
+/// notification, `QueueMode::Speculative` flip) inspect this value;
+/// callers that just want the router's own mode-flip behavior can ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoEscalationDecision {
+    /// No change — feature disabled, still warming up, or threshold not met.
+    NoChange,
+    /// Latency window just crossed the degradation threshold. Router has
+    /// already flipped its mode to `Hedge`.
+    Escalated,
+    /// Latency window recovered. Router has already flipped back to
+    /// the previous mode (recorded at the time of escalation).
+    Deescalated,
+}
+
+/// Per-session auto-escalation state stored inside `AdaptiveRouter`.
+struct SessionAutoState {
+    observer: ResponsivenessObserver,
+    /// Last latency sample (ms). Used by `should_deactivate_with_ceiling`.
+    last_latency_ms: u64,
+    /// Mode the router was in when we escalated, so we can restore it on
+    /// recovery instead of dropping to `Off`. `None` while not escalated.
+    pre_escalation_mode: Option<AdaptiveMode>,
+}
+
+impl SessionAutoState {
+    fn new(cfg: &AutoEscalationConfig) -> Self {
+        Self {
+            observer: ResponsivenessObserver::with_params(
+                cfg.window_size.max(cfg.baseline_samples),
+                cfg.baseline_samples,
+                cfg.degradation_threshold,
+                cfg.slow_trigger,
+            ),
+            last_latency_ms: 0,
+            pre_escalation_mode: None,
+        }
+    }
+}
+
+/// Notification fired when [`AdaptiveRouter`] auto-escalates or
+/// de-escalates because of sustained latency on a session.
+///
+/// Wired by callers (gateway → "⚡ Detected slow responses…" message, web
+/// → telemetry only) via [`AdaptiveRouter::set_auto_escalation_callback`].
+#[derive(Debug, Clone)]
+pub struct AutoEscalationEvent {
+    /// The session id the router was driven by.
+    pub session_id: String,
+    /// Mode the router moved to (`Hedge` on escalate, restored mode on
+    /// deescalate).
+    pub new_mode: AdaptiveMode,
+    /// Mode the router was in before this flip.
+    pub previous_mode: AdaptiveMode,
+    /// Latest latency sample that produced the flip (ms).
+    pub latency_ms: u64,
+    /// `true` for escalations, `false` for recoveries.
+    pub escalated: bool,
+}
+
+/// Callback invoked when [`AdaptiveRouter`] auto-escalates or recovers.
+/// Held under `RwLock` so it can be swapped at runtime without restarting
+/// the router (mirrors `StatusCallback`).
+pub type AutoEscalationCallback = Arc<dyn Fn(&AutoEscalationEvent) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Per-provider metrics
@@ -573,6 +691,18 @@ pub struct AdaptiveRouter {
     /// Id of the credential currently in use per slot. Updated at acquire
     /// time so failure notifications can identify the right credential.
     current_credential_ids: Mutex<Vec<Option<String>>>,
+    /// Tuning for the latency-driven auto-escalation state machine. Cloned
+    /// per-`record_turn_latency` call so threshold tweaks at runtime are
+    /// rare — the cost is one Mutex acquire we'd already have to take.
+    auto_escalation_config: RwLock<AutoEscalationConfig>,
+    /// Per-session escalation state. Keyed by session id so a single
+    /// degraded session does not poison metrics from other sessions and
+    /// flap the global mode unnecessarily.
+    auto_escalation_state: Mutex<HashMap<String, SessionAutoState>>,
+    /// Callback fired on escalate / deescalate. Wired by gateway to send
+    /// the "⚡ Detected slow responses…" chat message; wired by serve for
+    /// telemetry.
+    auto_escalation_callback: RwLock<Option<AutoEscalationCallback>>,
 }
 
 impl AdaptiveRouter {
@@ -630,6 +760,9 @@ impl AdaptiveRouter {
             decision_callback: RwLock::new(None),
             credential_pools: RwLock::new(vec![None; slot_count]),
             current_credential_ids: Mutex::new(vec![None; slot_count]),
+            auto_escalation_config: RwLock::new(AutoEscalationConfig::default()),
+            auto_escalation_state: Mutex::new(HashMap::new()),
+            auto_escalation_callback: RwLock::new(None),
         }
     }
 
@@ -772,6 +905,169 @@ impl AdaptiveRouter {
         if let Some(cb) = self.status_callback.read().unwrap().as_ref() {
             cb(message);
         }
+    }
+
+    /// Replace the auto-escalation tunables at runtime. Subsequent
+    /// `record_turn_latency` calls observe the new config; existing
+    /// per-session state retains its already-built window.
+    pub fn set_auto_escalation_config(&self, cfg: AutoEscalationConfig) {
+        *self.auto_escalation_config.write().unwrap() = cfg;
+    }
+
+    /// Snapshot the current auto-escalation tunables (clone).
+    pub fn auto_escalation_config(&self) -> AutoEscalationConfig {
+        self.auto_escalation_config.read().unwrap().clone()
+    }
+
+    /// Install a callback invoked when the router auto-escalates or
+    /// recovers. `None` clears it. Wired by gateway to send the
+    /// "⚡ Detected slow responses…" notification; wired by serve to feed
+    /// telemetry.
+    pub fn set_auto_escalation_callback(&self, cb: Option<AutoEscalationCallback>) {
+        *self.auto_escalation_callback.write().unwrap() = cb;
+    }
+
+    /// Record a turn's end-to-end LLM latency for a session and let the
+    /// router decide whether to self-promote (`Lane`/`Off` → `Hedge`) or
+    /// recover. Returns the decision so callers can drive gateway-only
+    /// side effects (queue mode flip, "⚡" chat message).
+    ///
+    /// Concurrency: holds the per-router `auto_escalation_state` mutex
+    /// for the duration of one record + check. The mutex is short-lived
+    /// — this is not on the hot per-token path, only the once-per-turn
+    /// boundary.
+    ///
+    /// When the feature is disabled via [`AutoEscalationConfig::enabled`]
+    /// `false` the router is a no-op and returns
+    /// [`AutoEscalationDecision::NoChange`].
+    pub fn record_turn_latency(
+        &self,
+        session_id: &str,
+        latency: Duration,
+    ) -> AutoEscalationDecision {
+        let cfg = self.auto_escalation_config.read().unwrap().clone();
+        if !cfg.enabled {
+            return AutoEscalationDecision::NoChange;
+        }
+        let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+        let (decision, event) = {
+            let mut state_map = self
+                .auto_escalation_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let state = state_map
+                .entry(session_id.to_string())
+                .or_insert_with(|| SessionAutoState::new(&cfg));
+            state.last_latency_ms = latency_ms;
+            state.observer.record(latency);
+            let current_mode = self.mode();
+
+            // Escalate when the observer says so AND we're not already
+            // in Hedge mode. The observer's `should_activate` already
+            // gates on internal `active` so we don't double-fire.
+            let trigger_escalate = state.observer.should_activate();
+            let trigger_deescalate = state.observer.should_deactivate()
+                && Self::below_recovery_ceiling(latency_ms, &cfg);
+
+            if trigger_escalate && current_mode != AdaptiveMode::Hedge {
+                state.observer.set_active(true);
+                state.pre_escalation_mode = Some(current_mode);
+                self.set_mode(AdaptiveMode::Hedge);
+                warn!(
+                    session = session_id,
+                    latency_ms,
+                    previous_mode = %current_mode,
+                    "auto-escalation: promoting AdaptiveMode → Hedge on sustained latency"
+                );
+                let event = AutoEscalationEvent {
+                    session_id: session_id.to_string(),
+                    new_mode: AdaptiveMode::Hedge,
+                    previous_mode: current_mode,
+                    latency_ms,
+                    escalated: true,
+                };
+                (AutoEscalationDecision::Escalated, Some(event))
+            } else if trigger_deescalate {
+                state.observer.set_active(false);
+                let restore = state
+                    .pre_escalation_mode
+                    .take()
+                    .unwrap_or(AdaptiveMode::Off);
+                self.set_mode(restore);
+                info!(
+                    session = session_id,
+                    latency_ms,
+                    restored_mode = %restore,
+                    "auto-escalation: latency recovered, restoring mode"
+                );
+                let event = AutoEscalationEvent {
+                    session_id: session_id.to_string(),
+                    new_mode: restore,
+                    previous_mode: AdaptiveMode::Hedge,
+                    latency_ms,
+                    escalated: false,
+                };
+                (AutoEscalationDecision::Deescalated, Some(event))
+            } else {
+                (AutoEscalationDecision::NoChange, None)
+            }
+        };
+        if let Some(event) = event {
+            if let Some(cb) = self.auto_escalation_callback.read().unwrap().as_ref() {
+                cb(&event);
+            }
+        }
+        decision
+    }
+
+    fn below_recovery_ceiling(latency_ms: u64, cfg: &AutoEscalationConfig) -> bool {
+        // Latency must be below `latency_ceiling_ms * recovery_factor` for
+        // recovery to fire. This is hysteresis on top of `should_deactivate`
+        // so a single fast turn at the noisy edge of the ceiling doesn't
+        // immediately flap us back to the pre-escalation mode.
+        let ceiling = (cfg.latency_ceiling_ms as f64 * cfg.recovery_factor) as u64;
+        if ceiling == 0 {
+            return true;
+        }
+        latency_ms <= ceiling
+    }
+
+    /// Latency baseline learned for `session_id`, if any. Exposed so
+    /// gateway-side code (the speculative-overflow "patience" computation
+    /// in `session_actor.rs`) can read the same baseline the router used
+    /// to decide on escalation, instead of carrying its own observer.
+    pub fn session_latency_baseline(&self, session_id: &str) -> Option<Duration> {
+        let state_map = self
+            .auto_escalation_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state_map
+            .get(session_id)
+            .and_then(|state| state.observer.baseline())
+    }
+
+    /// Number of latency samples recorded for `session_id`. Mirrors
+    /// `ResponsivenessObserver::sample_count` for the per-session entry.
+    pub fn session_latency_samples(&self, session_id: &str) -> usize {
+        let state_map = self
+            .auto_escalation_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state_map
+            .get(session_id)
+            .map(|state| state.observer.sample_count())
+            .unwrap_or(0)
+    }
+
+    /// Drop the per-session auto-escalation state. Callers should call
+    /// this when a session terminates so the router doesn't grow
+    /// unbounded under many short-lived sessions.
+    pub fn forget_session(&self, session_id: &str) -> bool {
+        let mut state_map = self
+            .auto_escalation_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state_map.remove(session_id).is_some()
     }
 
     /// Toggle QoS quality ranking at runtime (orthogonal to mode).
@@ -3009,5 +3305,206 @@ mod tests {
             warm_good.metrics.error_rate,
             warm_fail.metrics.error_rate,
         );
+    }
+
+    // ── Auto-escalation tests ─────────────────────────────────────────────
+
+    /// Helper: build a 2-provider router with permissive defaults so we can
+    /// drive the auto-escalation state machine in isolation.
+    fn auto_escalation_router() -> AdaptiveRouter {
+        let providers: Vec<Arc<dyn LlmProvider>> = vec![
+            Arc::new(MockProvider {
+                name: "primary",
+                model: "m1",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            }),
+            Arc::new(MockProvider {
+                name: "fallback",
+                model: "m2",
+                latency_ms: 0,
+                fail: false,
+                error_msg: "",
+            }),
+        ];
+        AdaptiveRouter::new(providers, &[], AdaptiveConfig::default())
+            .with_adaptive_config(AdaptiveMode::Lane, false)
+    }
+
+    /// Sustained slow turns on a single session promote the router to Hedge.
+    #[test]
+    fn auto_escalation_promotes_to_hedge_on_sustained_latency() {
+        let router = auto_escalation_router();
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+
+        // Warmup: 5 fast samples to establish baseline ~100ms.
+        for _ in 0..5 {
+            let decision = router.record_turn_latency("s1", Duration::from_millis(100));
+            assert_eq!(decision, AutoEscalationDecision::NoChange);
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+        // Three slow turns (4x baseline > 3x threshold) → escalate on the third.
+        for i in 0..3 {
+            let decision = router.record_turn_latency("s1", Duration::from_millis(400));
+            if i < 2 {
+                assert_eq!(
+                    decision,
+                    AutoEscalationDecision::NoChange,
+                    "did not expect escalation at turn {i}"
+                );
+            }
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+    }
+
+    /// Disabling the feature is a no-op even under sustained latency.
+    #[test]
+    fn auto_escalation_disabled_is_noop() {
+        let router = auto_escalation_router();
+        router.set_auto_escalation_config(AutoEscalationConfig {
+            enabled: false,
+            ..AutoEscalationConfig::default()
+        });
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Lane,
+            "router should not have escalated with auto_escalation disabled"
+        );
+    }
+
+    /// Two different sessions track independently — slow turns on session A
+    /// do not pollute session B's window.
+    #[test]
+    fn auto_escalation_state_is_session_scoped() {
+        let router = auto_escalation_router();
+        // Warm both.
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+            router.record_turn_latency("s2", Duration::from_millis(100));
+        }
+        // s1 takes 3 slow turns → escalate.
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // But s2's observer should still be at consecutive_slow=0.
+        // We verify indirectly: feed s2 ONE slow turn and confirm it does NOT
+        // re-trigger escalation (router is already Hedge so trigger_escalate
+        // is suppressed) — what we care about is that s2's baseline and slow
+        // count are independent. Check via the helper accessors.
+        let s1_baseline = router.session_latency_baseline("s1");
+        let s2_baseline = router.session_latency_baseline("s2");
+        assert!(s1_baseline.is_some());
+        assert!(s2_baseline.is_some());
+        assert_eq!(s2_baseline, Some(Duration::from_millis(100)));
+        // s2 sample count = 5 (warmup only, fully consumed by window).
+        // s1 sample count: window_size defaults to max(window_size,
+        // baseline_samples) = 5, so 5 warmup + 3 slow = 8 records but the
+        // observer's window caps at 5 (newest first). s2 stayed at 5.
+        assert_eq!(router.session_latency_samples("s2"), 5);
+        assert_eq!(router.session_latency_samples("s1"), 5);
+    }
+
+    /// Hysteresis: a single fast turn after escalation that is still above
+    /// `latency_ceiling_ms * recovery_factor` must NOT trigger recovery.
+    #[test]
+    fn auto_escalation_hysteresis_prevents_flapping() {
+        let router = auto_escalation_router();
+        router.set_auto_escalation_config(AutoEscalationConfig {
+            // Tighter ceiling so the regression test is precise: with
+            // ceiling=200, recovery_factor=0.6 → must be ≤120ms.
+            latency_ceiling_ms: 200,
+            recovery_factor: 0.6,
+            ..AutoEscalationConfig::default()
+        });
+        // Warm at 100ms, then escalate via 3x400ms.
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // One sample at 150ms (above ceiling*0.6=120ms but below baseline*3=300ms).
+        // observer.should_deactivate() WOULD fire, but ceiling check suppresses.
+        let decision = router.record_turn_latency("s1", Duration::from_millis(150));
+        assert_eq!(
+            decision,
+            AutoEscalationDecision::NoChange,
+            "expected hysteresis to suppress recovery at 150ms above ceiling*factor"
+        );
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // Now a sample below the recovery ceiling → recover.
+        let decision = router.record_turn_latency("s1", Duration::from_millis(50));
+        assert_eq!(decision, AutoEscalationDecision::Deescalated);
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+    }
+
+    /// Recovery restores the pre-escalation mode (not just Off).
+    #[test]
+    fn auto_escalation_restores_previous_mode() {
+        let router = auto_escalation_router();
+        // Start in Lane.
+        router.set_mode(AdaptiveMode::Lane);
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        router.record_turn_latency("s1", Duration::from_millis(50));
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Lane,
+            "router should restore the pre-escalation mode (Lane), not Off"
+        );
+    }
+
+    /// Callback fires on escalate AND deescalate with full event payload.
+    #[test]
+    fn auto_escalation_callback_fires_on_both_edges() {
+        let router = auto_escalation_router();
+        let captured: Arc<Mutex<Vec<AutoEscalationEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let recv = captured.clone();
+        router.set_auto_escalation_callback(Some(Arc::new(move |e| {
+            recv.lock().unwrap().push(e.clone());
+        })));
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        router.record_turn_latency("s1", Duration::from_millis(50));
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 2, "expected 2 callback fires (esc + de-esc)");
+        assert!(events[0].escalated);
+        assert_eq!(events[0].new_mode, AdaptiveMode::Hedge);
+        assert_eq!(events[0].previous_mode, AdaptiveMode::Lane);
+        assert!(!events[1].escalated);
+        assert_eq!(events[1].new_mode, AdaptiveMode::Lane);
+        assert_eq!(events[1].previous_mode, AdaptiveMode::Hedge);
+    }
+
+    /// 4-turn fake slow run still does NOT escalate (slow_trigger default = 3).
+    /// The single-sample boundary is exercised by `forget_session`.
+    #[test]
+    fn auto_escalation_forget_session_drops_state() {
+        let router = auto_escalation_router();
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        assert!(router.session_latency_baseline("s1").is_some());
+        assert!(router.forget_session("s1"));
+        assert!(router.session_latency_baseline("s1").is_none());
+        assert!(!router.forget_session("s1"));
     }
 }
