@@ -1167,6 +1167,30 @@ mod path_tests {
             assert!(p.starts_with(base));
         }
     }
+
+    /// Codex review P1 pin (2026-05-13): the unified resolver MUST NOT
+    /// follow symlinks for workspace-relative paths. File tools layer
+    /// `O_NOFOLLOW` over the resolved path; if the resolver
+    /// canonicalised first, a symlink `workspace/secret -> /etc/passwd`
+    /// would become a plain `/etc/passwd` open and the leaf gate would
+    /// have nothing left to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_workspace_relative_does_not_follow_symlinks() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let outside = tempfile::tempdir().expect("outside tmpdir");
+        let target = outside.path().join("passwd");
+        std::fs::write(&target, b"root:x:0:0").unwrap();
+        let link = workspace.path().join("secret");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = resolve_path(workspace.path(), "secret")
+            .expect("workspace symlink path must resolve (the leaf-open gate refuses it)");
+        // The resolver returned the LEXICAL workspace path, not the
+        // canonical target outside the workspace.
+        assert_eq!(resolved, workspace.path().join("secret"));
+        assert_ne!(resolved, target);
+    }
 }
 
 #[cfg(test)]

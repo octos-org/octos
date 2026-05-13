@@ -621,23 +621,38 @@ fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool
 ///    [`octos_bus::file_handle::resolve_tool_path`] resolver — the same
 ///    table that powers the file tools. This handles `up/...` /
 ///    `pf/...` handles (with both 3-segment and LLM-truncated
-///    2-segment forms), absolute paths inside the upload tmpdir or
-///    workspace, and ordinary workspace-relative inputs.
-/// 2. Fall back to the plugin-specific filename heuristics in
-///    [`resolve_path_in_work_dir`] — search for the basename inside
-///    `work_dir`, support `_<filename>` suffix matches, etc. This is
-///    behavior that pre-dates the unified resolver and that plugins
-///    rely on for legacy "send me back the absolute path you
-///    advertised" call patterns (mini-soak regression — the LLM
-///    sometimes prefixes a fictional `/home/user/uploads/` directory
-///    to the basename and the plugin has to recover via the workspace
-///    filename lookup).
+///    2-segment forms), and absolute paths inside the upload tmpdir.
+///    Accept the result UNCONDITIONALLY when the resolver returned a
+///    non-workspace scope (upload tmpdir / profile root), because those
+///    scopes already include an existence check via canonicalize.
+/// 2. For workspace scope, only accept if the resolved file actually
+///    exists. Otherwise fall through to the plugin-specific filename
+///    heuristics in [`resolve_path_in_work_dir`] — the legacy code
+///    looks up `<work_dir>/<basename>` and `_<basename>` suffix
+///    matches, which rescues live plugin calls where the LLM hallucinates
+///    a directory prefix in front of a basename that exists at the
+///    workspace root (codex review pin, 2026-05-13: `uploads/mark.wav`
+///    when only `mark.wav` exists must still recover).
 /// 3. Final fallback: lexically join with `work_dir` (the previous
 ///    behaviour of `absolutize_path_in_work_dir`) so the plugin never
 ///    sees an empty string.
 fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> String {
+    use octos_bus::file_handle::ToolPathScope;
     if let Ok(resolved) = octos_bus::file_handle::resolve_tool_path(work_dir, None, raw_path) {
-        return resolved.absolute.to_string_lossy().into_owned();
+        let accept = match resolved.scope {
+            // Upload / profile scopes go through `canonicalize_under`,
+            // so existence is already guaranteed.
+            ToolPathScope::UploadTmpdir | ToolPathScope::Profile => true,
+            // Workspace scope returns the LEXICAL workspace location
+            // (so the tool's `O_NOFOLLOW` gate can refuse symlinks),
+            // which means missing files slip through. Plugins need the
+            // legacy filename fallback for those, so only accept the
+            // workspace result when the file actually exists.
+            ToolPathScope::Workspace => resolved.absolute.exists(),
+        };
+        if accept {
+            return resolved.absolute.to_string_lossy().into_owned();
+        }
     }
     resolve_path_in_work_dir(raw_path, work_dir)
         .unwrap_or_else(|| absolutize_path_in_work_dir(raw_path, work_dir))
@@ -1300,20 +1315,16 @@ mod tests {
             "file_path": "deck.pdf",
         }));
 
-        // `audio_path` (a fictional absolute path) cannot resolve through
-        // the unified table — it's outside every allowed root — and
-        // therefore falls back to the legacy `resolve_path_in_work_dir`
-        // filename match, which returns the LEXICAL path inside `work_dir`.
+        // `audio_path` (a fictional absolute path) cannot resolve
+        // through the unified table — it's outside every allowed root
+        // — and falls back to the legacy `resolve_path_in_work_dir`
+        // filename match. `file_path` (`deck.pdf`) is workspace-relative
+        // and resolves through the unified resolver, which returns the
+        // lexical workspace path on purpose (the tool's `O_NOFOLLOW`
+        // open is the symlink-safety gate; canonicalising here would
+        // bypass it).
         assert_eq!(rewritten["audio_path"], wav.to_string_lossy().to_string());
-        // `file_path` (`deck.pdf`) is a workspace-relative input that
-        // resolves through the unified resolver. The resolver canonicalises
-        // the result when the file exists (firmlinks collapsed via
-        // `canonicalize`), so the comparison must use the canonical form.
-        let canonical_pdf = std::fs::canonicalize(&pdf).unwrap_or(pdf);
-        assert_eq!(
-            rewritten["file_path"],
-            canonical_pdf.to_string_lossy().to_string()
-        );
+        assert_eq!(rewritten["file_path"], pdf.to_string_lossy().to_string());
     }
 
     #[test]
@@ -1350,15 +1361,12 @@ mod tests {
             "slide_dir": "slides/demo/output/imgs"
         }));
 
-        // `input` is a workspace-relative path; the unified resolver
-        // canonicalises it (firmlinks collapsed) so compare against the
-        // canonical form. `out` and `slide_dir` skip the resolver (their
-        // key matches the absolutize-only branch) so they stay lexical.
-        let canonical_script = std::fs::canonicalize(&script).unwrap_or(script);
-        assert_eq!(
-            rewritten["input"],
-            canonical_script.to_string_lossy().to_string()
-        );
+        // All three keys end up as lexical workspace paths: `input`
+        // resolves through the unified resolver (workspace scope keeps
+        // the lexical form so the leaf `O_NOFOLLOW` gate can refuse
+        // symlinks), and `out` / `slide_dir` go through the
+        // absolutize-only branch which has always been lexical.
+        assert_eq!(rewritten["input"], script.to_string_lossy().to_string());
         assert_eq!(
             rewritten["out"],
             dir.path()
@@ -1373,6 +1381,45 @@ mod tests {
                 .to_string_lossy()
                 .to_string()
         );
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_recovers_basename_when_workspace_relative_missing() {
+        // Codex review P2 (2026-05-13): when the LLM hallucinates a
+        // directory prefix in front of a basename that exists at the
+        // workspace root, the plugin filename fallback must rescue it.
+        // The unified resolver succeeds for any syntactically valid
+        // workspace-relative path even when the file is missing, so
+        // the plugin code must require existence on the workspace scope
+        // before accepting the resolver's result.
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("mark.wav");
+        std::fs::write(&mark, b"wav").unwrap();
+        // Note: `uploads/mark.wav` deliberately does NOT exist.
+
+        let def = PluginToolDef {
+            name: "voice_tool".to_string(),
+            description: "Voice tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"audio_path": {"type": "string"}}
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "audio_path": "uploads/mark.wav",
+        }));
+
+        // Must recover `<work_dir>/mark.wav` via the legacy filename
+        // fallback, NOT return the missing `<work_dir>/uploads/mark.wav`.
+        assert_eq!(rewritten["audio_path"], mark.to_string_lossy().to_string());
     }
 
     #[test]

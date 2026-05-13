@@ -286,14 +286,24 @@ pub fn resolve_tool_path(
         return Err(ToolPathError::Traversal);
     }
 
-    // Prefer the canonical form when the file already exists so the
-    // returned path stays comparable with `start_with(canonical_root)`
-    // checks that other tools layer on top. Falling back to the
-    // lexically-normalised form keeps write-style tools (which create
-    // missing files) working — they would error if we forced canonicalize.
-    let absolute = std::fs::canonicalize(&normalised).unwrap_or(normalised);
+    // Workspace-relative paths return their LEXICAL form on purpose:
+    // file tools (`read_file`, `write_file`, `list_dir`) layer their
+    // own `O_NOFOLLOW` open / symlink rejection on top of the resolved
+    // path, and that gate is the only thing standing between a symlink
+    // `workspace/secret -> /etc/passwd` and a successful read of
+    // `/etc/passwd`. If we canonicalised here the resolver would
+    // silently follow the symlink and the leaf `O_NOFOLLOW` would no
+    // longer have anything to refuse — it'd see a plain file at the
+    // canonical target. Keep the lexical workspace location and let the
+    // tool's open-time gate police symlinks atomically.
+    //
+    // Upload-tmpdir / profile-root scopes (branches 1, 2, 3, 4) still
+    // canonicalise via `canonicalize_under` / `canonicalize_lossy`
+    // because those roots' files have already been written by the
+    // server and the canonical form is required for the containment
+    // check (macOS firmlinks).
     Ok(ResolvedToolPath {
-        absolute,
+        absolute: normalised,
         scope: ToolPathScope::Workspace,
     })
 }

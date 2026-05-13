@@ -117,7 +117,7 @@ fn expect_err(result: Result<ResolvedToolPath, ToolPathError>) -> ToolPathError 
 #[test]
 fn row_1_workspace_relative_input() {
     let rig = Rig::new("row1");
-    let abs = rig.make_workspace_file("foo/bar.txt", b"hi");
+    let _abs = rig.make_workspace_file("foo/bar.txt", b"hi");
 
     let resolved = expect_resolved(resolve_tool_path(
         rig.workspace_root(),
@@ -125,7 +125,11 @@ fn row_1_workspace_relative_input() {
         "foo/bar.txt",
     ));
     assert_eq!(resolved.scope, ToolPathScope::Workspace);
-    assert_eq!(resolved.absolute, abs);
+    // Workspace-relative resolution returns the LEXICAL workspace path
+    // on purpose — file tools layer `O_NOFOLLOW` over the resolved
+    // path, and canonicalising here would silently follow symlinks
+    // before that gate gets to run. See `row_workspace_keeps_lexical_for_symlink_safety`.
+    assert_eq!(resolved.absolute, rig.workspace_root().join("foo/bar.txt"));
 }
 
 #[test]
@@ -157,6 +161,10 @@ fn row_2_absolute_inside_workspace_kept() {
         &abs.to_string_lossy(),
     ));
     assert_eq!(resolved.scope, ToolPathScope::Workspace);
+    // For absolute paths the resolver collapses macOS firmlinks via
+    // `canonicalize_lossy`, so the resolved path is the canonical form.
+    // The workspace-relative branch keeps the lexical workspace path —
+    // see `row_1_workspace_relative_input`.
     assert_eq!(resolved.absolute, abs);
 }
 
@@ -327,11 +335,12 @@ fn workspace_root_absolute_without_profile_still_works() {
     // (read_file/write_file/etc. don't track the profile root). The
     // resolver must still operate on workspace + upload tmpdir.
     let rig = Rig::new("no-profile");
-    let abs = rig.make_workspace_file("hello.txt", b"x");
+    let _abs = rig.make_workspace_file("hello.txt", b"x");
 
     let resolved = expect_resolved(resolve_tool_path(rig.workspace_root(), None, "hello.txt"));
     assert_eq!(resolved.scope, ToolPathScope::Workspace);
-    assert_eq!(resolved.absolute, abs);
+    // Lexical workspace path — same reason as `row_1_workspace_relative_input`.
+    assert_eq!(resolved.absolute, rig.workspace_root().join("hello.txt"));
 }
 
 #[test]
@@ -345,6 +354,39 @@ fn profile_handle_without_profile_root_fails() {
 
     let err = expect_err(resolve_tool_path(rig.workspace_root(), None, &handle));
     assert_eq!(err, ToolPathError::DecodeFailed);
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_relative_symlink_resolution_is_lexical_not_canonical() {
+    // Security regression pin (codex review, 2026-05-13): the
+    // workspace-relative branch must NOT canonicalise the result.
+    // File tools layer `O_NOFOLLOW` over the resolved path; if the
+    // resolver canonicalised it would silently translate
+    // `workspace/secret -> /etc/passwd` into `/etc/passwd` and the
+    // open-time gate would then see a plain file instead of a
+    // symlink. The contract is: workspace scope returns the lexical
+    // workspace path, the tool's open-time gate is responsible for
+    // refusing symlinks.
+    let rig = Rig::new("sym-safety");
+    let workspace = rig.workspace_root();
+    let outside = tempfile::tempdir().expect("outside tmpdir");
+    std::fs::write(outside.path().join("passwd"), b"root:x:0:0").unwrap();
+    // workspace/secret -> outside/passwd
+    let link = workspace.join("secret");
+    std::os::unix::fs::symlink(outside.path().join("passwd"), &link).unwrap();
+
+    let resolved = expect_resolved(resolve_tool_path(workspace, None, "secret"));
+    assert_eq!(resolved.scope, ToolPathScope::Workspace);
+    // The resolver must NOT have followed the symlink — the resolved
+    // absolute must still be the workspace path (lexical), not the
+    // outside target.
+    assert_eq!(resolved.absolute, workspace.join("secret"));
+    let outside_path = outside.path().join("passwd");
+    assert_ne!(
+        resolved.absolute, outside_path,
+        "resolver must not follow symlinks for workspace-relative paths"
+    );
 }
 
 #[cfg(target_os = "macos")]
