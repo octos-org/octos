@@ -202,26 +202,61 @@ impl Tool for SendFileTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid send_file tool input")?;
 
-        // Resolve file path: if base_dir is set, resolve relative paths against
-        // it (the OS process cwd may differ from the logical working directory).
+        // Step 1: when a `base_dir` is configured (the only path that
+        // applies any policy today), route handle-shaped inputs
+        // (`up/...`, `pf/...`) and absolute paths through the unified
+        // resolver. Relative `file_path` inputs MUST stay anchored to
+        // `base_dir` — codex P2 review (2026-05-13) flagged that
+        // letting the resolver run on every shape lets a same-basename
+        // upload (e.g. `report.pdf` written by a different session)
+        // shadow the outbound workspace file, which breaks the
+        // common write-then-send flow and risks cross-session leaks.
+        //
+        // Without `base_dir` (legacy `SendFileTool::new` path used by
+        // unit tests and standalone scripts), we keep the historical
+        // pass-through behaviour — no path mangling, no policy.
         let raw_path = Path::new(&input.file_path);
+        let looks_like_handle =
+            input.file_path.starts_with("up/") || input.file_path.starts_with("pf/");
+        let use_unified_resolver = looks_like_handle || raw_path.is_absolute();
+
         let path = if let Some(ref base_dir) = self.base_dir {
-            if raw_path.is_relative() {
-                base_dir.join(raw_path)
+            if use_unified_resolver {
+                // Pick the first extra_allowed_dir as the profile root
+                // hint. Subsequent extras still get covered by the
+                // legacy allowlist below.
+                let profile_hint = self.extra_allowed_dirs.first().map(PathBuf::as_path);
+                match octos_bus::file_handle::resolve_tool_path(
+                    base_dir,
+                    profile_hint,
+                    &input.file_path,
+                ) {
+                    Ok(resolved) => resolved.absolute,
+                    Err(_) => raw_path.to_path_buf(),
+                }
             } else {
-                raw_path.to_path_buf()
+                // Relative outbound paths — anchor to base_dir, NOT
+                // through the unified resolver (which would prefer
+                // `temp_upload_root()/<basename>` on a same-name
+                // collision).
+                base_dir.join(raw_path)
             }
         } else {
             raw_path.to_path_buf()
         };
 
-        // Validate file path is within the allowed base directory (if set).
-        // This prevents exfiltrating files from other profiles' data directories.
-        // /tmp/ is always allowed since skills commonly write output there.
+        // Step 2: containment check against the send_file allowlist
+        // (base_dir + /tmp/ + extra_allowed_dirs). The unified resolver
+        // already verified containment for `up/...`/`pf/...` handles
+        // and workspace-/profile-internal absolute paths, but the
+        // allowlist is broader (skill outputs frequently land under
+        // /tmp/) so we keep this check unconditionally.
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
             let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+            let upload_root = std::fs::canonicalize(octos_bus::file_handle::temp_upload_root())
+                .unwrap_or_else(|_| octos_bus::file_handle::temp_upload_root());
             let extra_canonical: Vec<PathBuf> = self
                 .extra_allowed_dirs
                 .iter()
@@ -231,6 +266,7 @@ impl Tool for SendFileTool {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
                         || canonical_path.starts_with(&tmp_dir)
+                        || canonical_path.starts_with(&upload_root)
                         || extra_canonical
                             .iter()
                             .any(|d| canonical_path.starts_with(d));
@@ -805,6 +841,60 @@ mod tests {
         assert!(!is_stale_slides_backup(Path::new(
             "/tmp/workspace/slides/demo/output/deck.pptx"
         )));
+    }
+
+    /// Codex review P2 (2026-05-13): a relative `file_path` like
+    /// `report.pdf` MUST resolve under `base_dir`, not against the
+    /// global upload tmpdir. Letting the unified resolver run on every
+    /// shape allowed a same-name upload (potentially from another
+    /// session) to shadow the outbound workspace file.
+    #[tokio::test]
+    async fn relative_path_prefers_base_dir_over_upload_tmpdir_collision() {
+        let base = tempfile::tempdir().unwrap();
+        let intended = base.path().join("report.pdf");
+        std::fs::write(&intended, b"workspace-report").unwrap();
+
+        // Plant a same-basename file under the upload tmpdir. The
+        // resolver's bare-basename branch (step 4 of `resolve_tool_path`)
+        // would prefer this over the workspace file if we let it run.
+        let upload_root = octos_bus::file_handle::temp_upload_root();
+        std::fs::create_dir_all(&upload_root).unwrap();
+        let upload_name = format!(
+            "report-{}-{}.pdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        // Use a unique upload name so we can also test the bare-basename
+        // collision shape explicitly without polluting other tests.
+        let upload_clone = upload_root.join("report.pdf");
+        let _ = std::fs::write(&upload_clone, b"OTHER-SESSION-UPLOAD");
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({"file_path": "report.pdf"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {}", result.output);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.media.len(), 1);
+        let attached = std::path::PathBuf::from(&msg.media[0]);
+        let canonical_attached = std::fs::canonicalize(&attached).unwrap_or(attached);
+        let canonical_intended =
+            std::fs::canonicalize(&intended).unwrap_or_else(|_| intended.clone());
+        assert_eq!(
+            canonical_attached, canonical_intended,
+            "relative send_file MUST attach the workspace copy, not the upload-tmpdir collision",
+        );
+
+        // Cleanup: remove the planted file under the global upload root.
+        let _ = std::fs::remove_file(&upload_clone);
+        let _ = std::fs::remove_file(upload_root.join(upload_name));
     }
 
     #[tokio::test]
