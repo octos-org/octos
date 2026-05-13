@@ -40,9 +40,10 @@ pub mod openrouter;
 pub mod registry;
 
 pub use adaptive::{
-    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry, MetricsSnapshot,
-    ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy, SharedProviderMetrics,
-    StatusCallback, derive_cold_start_catalog,
+    AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, AutoEscalationCallback,
+    AutoEscalationConfig, AutoEscalationDecision, AutoEscalationEvent, BaselineEntry,
+    MetricsSnapshot, ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy,
+    SharedProviderMetrics, StatusCallback, derive_cold_start_catalog,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
