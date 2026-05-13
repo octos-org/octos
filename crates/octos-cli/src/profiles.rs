@@ -116,6 +116,13 @@ pub struct ProfileConfig {
     /// tokens with persistent cooldowns and rotation strategies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_pool: Option<CredentialPoolConfig>,
+    /// Plugin loader policy. Mirrors the top-level `plugins` block in
+    /// `config.json` so per-profile gateways can opt into strict signature
+    /// enforcement independently of the host-level setting. Default
+    /// (`PluginsConfig::default()`) preserves backward compatibility —
+    /// unsigned plugins still load with a warning.
+    #[serde(default)]
+    pub plugins: crate::config::PluginsConfig,
 }
 
 /// Search configuration persisted in the profile contract.
@@ -1475,7 +1482,12 @@ pub(crate) fn config_from_profile(
         credential_pool: None,
         content_routing: profile.config.content_routing.clone(),
         appui: Default::default(),
-        plugins: Default::default(),
+        // Carry the profile-declared plugin loader policy through to the
+        // flattened `Config` so callers reading
+        // `config.plugins.require_signed` see the same value the profile
+        // JSON declared. Defaults to permissive when the profile omits
+        // the field.
+        plugins: profile.config.plugins.clone(),
     }
 }
 

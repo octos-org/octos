@@ -886,6 +886,10 @@ impl ProfileActorFactoryBuilder {
             memory_store: Some(self.memory_store.clone()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
+            // Section B (codex review P1.1): propagate the profile's
+            // strict-signing policy to SpawnTool subagents so unsigned
+            // plugins are also rejected under spawn.
+            plugin_require_signed: profile_config.plugins.require_signed,
             llm_strong,
             task_query_store: self.task_query_store.clone(),
             subagent_output_router: self.subagent_output_router.clone(),

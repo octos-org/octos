@@ -258,11 +258,23 @@ impl ChatCommand {
             eprintln!("Bootstrapped {n} platform skills");
         }
 
-        // Load plugins (includes app-skills from .octos/skills/)
+        // Load plugins (includes app-skills from .octos/skills/).
+        // Section B (codex review P1.1): honour `plugins.require_signed`
+        // from the resolved Config so an operator who opts into strict
+        // signing has it enforced on `octos chat` too.
         let plugin_dirs = Config::plugin_dirs_from_project(&cwd.join(".octos"));
         let mut plugin_result = octos_agent::PluginLoadResult::default();
         if !plugin_dirs.is_empty() {
-            match octos_agent::PluginLoader::load_into(&mut tools, &plugin_dirs, &[]) {
+            match octos_agent::PluginLoader::load_into_with_options(
+                &mut tools,
+                &plugin_dirs,
+                &[],
+                octos_agent::PluginLoadOptions {
+                    work_dir: None,
+                    synthesis_config: None,
+                    require_signed: config.plugins.require_signed,
+                },
+            ) {
                 Ok(result) => plugin_result = result,
                 Err(e) => eprintln!("Warning: plugin loading failed: {e}"),
             }

@@ -1175,6 +1175,10 @@ impl GatewayRuntime {
             memory_store: Some(memory_store.clone()),
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
+            // Section B (codex review P1.1): propagate the host
+            // strict-signing policy so SpawnTool subagents enforce the
+            // same gate.
+            plugin_require_signed: config.plugins.require_signed,
             llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
                 .unwrap_or_else(|_| llm_for_compaction.clone()),
             task_query_store: task_query_store.clone(),

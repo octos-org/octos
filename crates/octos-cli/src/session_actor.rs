@@ -1825,6 +1825,10 @@ pub struct ActorFactory {
     pub plugin_dirs: Vec<std::path::PathBuf>,
     /// Extra environment variables for plugin processes in subagents.
     pub plugin_extra_env: Vec<(String, String)>,
+    /// Section B (codex review P1.1): inherit the host's
+    /// `plugins.require_signed` policy so SpawnTool subagents enforce the
+    /// same strict-signing gate as their parent.
+    pub plugin_require_signed: bool,
     /// Session-scoped background task lookup for API inspection.
     pub task_query_store: SessionTaskQueryStore,
     /// M8 fix-first item 8 (gap 2): shared SubAgentOutputRouter — one
@@ -2182,7 +2186,8 @@ impl ActorFactory {
         }
         if !self.plugin_dirs.is_empty() {
             spawn_tool = spawn_tool
-                .with_plugin_dirs(self.plugin_dirs.clone(), self.plugin_extra_env.clone());
+                .with_plugin_dirs(self.plugin_dirs.clone(), self.plugin_extra_env.clone())
+                .with_plugin_require_signed(self.plugin_require_signed);
         }
         if let Some(ref hooks) = self.hooks {
             spawn_tool = spawn_tool.with_hooks(hooks.clone());
@@ -10532,6 +10537,7 @@ mod tests {
             memory_store: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            plugin_require_signed: false,
             task_query_store: SessionTaskQueryStore::default(),
             subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
                 dir.path().join("subagent-outputs"),

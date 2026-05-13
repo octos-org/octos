@@ -290,6 +290,21 @@ impl PluginLoader {
         // Resolve extras (MCP servers, hooks, prompt fragments) regardless of tools.
         let extras = resolve_extras(&manifest, plugin_dir);
 
+        // Section B (codex review P1.2): under strict signing, REJECT any
+        // unsigned skill — including extras-only ones. MCP server commands
+        // and lifecycle hooks resolved from `manifest.json` introduce
+        // executable code paths the operator did not authorize via a hash.
+        // The check must run before the `tools.is_empty()` early-return
+        // below; otherwise an extras-only skill would slip past strict
+        // mode entirely.
+        if require_signed && manifest.sha256.is_none() {
+            eyre::bail!(
+                "plugin '{}' rejected: `plugins.require_signed` is enabled \
+                 and manifest.json has no `sha256` field",
+                manifest.name,
+            );
+        }
+
         // If no tools declared, skip executable search entirely.
         if manifest.tools.is_empty() {
             if manifest.has_extras() {
@@ -475,15 +490,19 @@ impl PluginLoader {
                 let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
-                    .with_timeout(timeout)
-                    // Section C: stash the load-time hash so the pre-spawn
-                    // re-hash gate in `tool::execute` can detect a TOCTOU
-                    // swap between load and invocation. The gate fires
-                    // unconditionally under `require_signed`; otherwise it
-                    // fires only when a manifest hash was declared (and
-                    // therefore the operator has signaled they care about
-                    // integrity for this plugin).
-                    .with_verified_sha256(load_time_hash.clone(), require_signed);
+                    .with_timeout(timeout);
+                // Section C (codex review P2): stash the load-time hash ONLY
+                // when the operator opted into integrity for this plugin —
+                // either the manifest declared `sha256` (the author signaled
+                // care) OR `require_signed = true` (the host signaled care).
+                // For legacy unsigned plugins under permissive mode we skip
+                // the rehash gate entirely so we don't add a full executable
+                // read to every invocation and so the verified-copy refresh
+                // path stays cheap. Under strict mode the rehash gate fires
+                // unconditionally (`require_signed` propagated to the tool).
+                if manifest.sha256.is_some() || require_signed {
+                    tool = tool.with_verified_sha256(load_time_hash.clone(), require_signed);
+                }
                 if let Some(dir) = work_dir {
                     tool = tool.with_work_dir(dir.to_path_buf());
                 }
