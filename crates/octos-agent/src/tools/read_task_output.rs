@@ -404,37 +404,39 @@ fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<
     // symlink. We deliberately stop one level above the leaf — the leaf
     // is policed by the O_NOFOLLOW open in `read_capped_no_follow`.
     //
-    // Post-`resolve_tool_path` migration: the resolver returns the
-    // canonical absolute path (firmlinks collapsed via
-    // `canonicalize`). On macOS this produces `/private/var/folders/...`
-    // while the supplied `workspace_root` is typically still in its
-    // un-prefixed `/var/folders/...` form, so `strip_prefix` would fail
-    // here even when the resolved path legitimately lies inside the
-    // workspace. Canonicalise the workspace root for the containment
-    // check so both forms compare equal.
+    // CRITICAL: walk the ORIGINAL (lexical) path components, not the
+    // canonical form. If we canonicalised `resolved` here we'd rewrite
+    // a `workspace/out/file` chain — where `out` is a symlink to some
+    // other workspace dir — into the symlink target before the loop
+    // ran, so the loop would stat the *target's* ancestors and miss
+    // the symlink it was supposed to refuse. The actual `read_capped_
+    // no_follow` then still opens the original path and follows the
+    // parent symlink. Codex review round 3 P2 (2026-05-13) pinned
+    // this exact escape.
+    //
+    // Canonicalise the ROOT only — that's needed because on macOS the
+    // supplied `workspace_root` is typically the un-prefixed
+    // `/var/folders/...` form while `resolved` for absolute inputs may
+    // come back in the `/private/var/folders/...` firmlink form. We
+    // build a candidate `(canonical_root, lexical_root)` pair and try
+    // strip_prefix against both so absolute and workspace-relative
+    // resolutions both succeed.
     let canonical_root =
         std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
-    // Mirror the canonicalisation on the resolved leaf so it compares
-    // cleanly against the canonicalised root. `resolve_handle_path`
-    // produces either the canonical form (workspace-relative path,
-    // routed through `resolve_path` after migration) or the lexical
-    // form (absolute path normalised through `normalize_inside_workspace`).
-    // Canonicalise-as-possible here so both shapes line up.
-    let canonical_resolved =
-        std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
-    let mut current = canonical_root.clone();
-    let suffix = match canonical_resolved.strip_prefix(&canonical_root) {
-        Ok(s) => s.to_path_buf(),
-        Err(_) => {
-            // Should not happen: `resolved` was already verified to be
-            // inside `workspace_root` by `resolve_handle_path`. Defend
-            // anyway.
-            eyre::bail!(
-                "internal: resolved path {} not inside workspace {}",
-                resolved.display(),
-                workspace_root.display()
-            );
-        }
+    let lexical_root = workspace_root.to_path_buf();
+    let (mut current, suffix) = if let Ok(s) = resolved.strip_prefix(&lexical_root) {
+        (lexical_root, s.to_path_buf())
+    } else if let Ok(s) = resolved.strip_prefix(&canonical_root) {
+        (canonical_root, s.to_path_buf())
+    } else {
+        // Should not happen: `resolved` was already verified to be
+        // inside `workspace_root` by `resolve_handle_path`. Defend
+        // anyway.
+        eyre::bail!(
+            "internal: resolved path {} not inside workspace {}",
+            resolved.display(),
+            workspace_root.display()
+        );
     };
     let comps: Vec<_> = suffix.components().collect();
     if comps.is_empty() {
@@ -991,6 +993,60 @@ mod tests {
         assert!(
             !body.contains("root:x:0:0"),
             "parent-directory symlink must not grant read; got: {body}"
+        );
+    }
+
+    // Codex review round 3 P2 (2026-05-13): the ancestor walk must
+    // operate on the ORIGINAL path components, not on the canonical
+    // form. A symlinked parent that currently points inside the
+    // workspace would canonicalise away — but the file is still
+    // *opened* through the original path, so the parent symlink is
+    // followed. If that symlink later gets retargeted (e.g. to /etc),
+    // the read at open time sees the new target. Refuse symlinked
+    // ancestors regardless of where they currently point.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_mode_rejects_symlinked_parent_pointing_inside_workspace() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-parent-sym-inside", "stdout\n");
+
+        // Two workspace-internal dirs: `real/` (the actual target) and
+        // a symlink `out/` that currently points at `real/`.
+        let workspace = dir.path().join("workspace");
+        let real_dir = workspace.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("report.md"), b"workspace-content").unwrap();
+        let link_inside = workspace.join("out");
+        std::os::unix::fs::symlink(&real_dir, &link_inside).unwrap();
+
+        // Record `out/report.md` — traverses the parent symlink.
+        // Canonicalisation collapses it to `real/report.md`, both of
+        // which lie inside the workspace; the ancestor walk MUST still
+        // refuse `out` because the actual open uses the lexical path
+        // and would follow whatever `out` points to at open time
+        // (potentially retargeted between this check and the open).
+        let recorded = "out/report.md";
+        supervisor.mark_completed(&task_id, vec![recorded.to_string()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": recorded,
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("workspace-content"),
+            "symlinked parent (even when target lies inside workspace) must be refused — \
+             canonicalisation would otherwise let a later retarget grant escape; got: {body}"
         );
     }
 
