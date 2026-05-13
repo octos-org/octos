@@ -361,6 +361,26 @@ impl PluginTool {
         for (key, value) in obj {
             if matches!(key.as_str(), "audio_path" | "file_path" | "input") {
                 if let Some(path) = value.as_str() {
+                    // Upload-handle short-circuit: `/api/upload` returns
+                    // `up/<base64>/<filename>` and the LLM passes the
+                    // handle straight to plugin tools (fm_voice_save,
+                    // fm_tts, etc.). Decode to the real on-disk path
+                    // before falling back to workspace-relative
+                    // resolution, otherwise the plugin sees something
+                    // like `<workspace>/skill-output/up/<base64>` and
+                    // 404s. Tolerates the partially-truncated form
+                    // `up/<base64>` (no display-name segment) via the
+                    // legacy-relative fallback inside
+                    // `resolve_upload_reference`.
+                    if let Some(resolved) =
+                        octos_bus::file_handle::resolve_upload_reference(path)
+                    {
+                        rewritten.insert(
+                            key.clone(),
+                            serde_json::Value::String(resolved.to_string_lossy().into_owned()),
+                        );
+                        continue;
+                    }
                     rewritten.insert(
                         key.clone(),
                         serde_json::Value::String(
