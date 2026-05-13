@@ -9403,20 +9403,30 @@ mod tests {
     }
 
     /// Codex BLOCK regression (2026-05-13): with the writer channel at
-    /// capacity 1 and already full, `send_scope_error` must still emit the
-    /// 1008 close. The courtesy error envelope is allowed to drop; the close
-    /// is the load-bearing signal the SPA's `crew:auth_expired` listener
-    /// uses to clear its token.
+    /// capacity 2 and one slot already used, `send_scope_error` must use
+    /// the remaining slot for the 1008 close — NOT the courtesy error
+    /// envelope. The close is the load-bearing signal the SPA's
+    /// `crew:auth_expired` listener uses to clear its token. The error
+    /// envelope is allowed to drop under backpressure.
+    ///
+    /// Test geometry: capacity 2 + 1 primer = exactly one free slot at the
+    /// moment `send_scope_error` enqueues. Pre-fix the order was
+    /// error-then-close → error queued, close dropped. Post-fix the order
+    /// is close-then-error → close queued, error dropped.
     #[tokio::test]
     async fn auth_scope_violation_close_frame_survives_capacity_one_writer() {
-        let (ws, mut rx) = ws_connection_for_test(1);
+        let (ws, mut rx) = ws_connection_for_test(2);
 
-        // Pre-fill the writer channel so only one of the two outbound frames
-        // can survive. The close MUST be that one.
+        // Pre-fill ONE slot so only one of the two outbound frames can
+        // survive backpressure. The close MUST be that one.
         ws.writer
             .try_send(axum::extract::ws::Message::Text("priming".into()))
             .expect("prime channel");
-        assert_eq!(ws.writer.capacity(), 0, "channel must be full");
+        assert_eq!(
+            ws.writer.capacity(),
+            1,
+            "channel must have exactly one free slot for the backpressure case",
+        );
 
         let session_id = SessionKey::with_profile("profile-b", "api", "chat-1");
         let error =
@@ -9429,8 +9439,9 @@ mod tests {
         let primer = rx.recv().await.expect("priming frame");
         assert!(matches!(primer, axum::extract::ws::Message::Text(_)));
 
-        // The remaining frame must be the 1008 close. The error envelope may
-        // have been dropped under backpressure — that's acceptable.
+        // The next frame MUST be the 1008 close. The error envelope was
+        // dropped under backpressure — that's acceptable; the close is
+        // what the SPA listens for.
         let next = rx.recv().await.expect("close frame survives backpressure");
         match next {
             axum::extract::ws::Message::Close(Some(frame)) => {
