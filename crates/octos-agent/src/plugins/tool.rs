@@ -361,30 +361,9 @@ impl PluginTool {
         for (key, value) in obj {
             if matches!(key.as_str(), "audio_path" | "file_path" | "input") {
                 if let Some(path) = value.as_str() {
-                    // Upload-handle short-circuit: `/api/upload` returns
-                    // `up/<base64>/<filename>` and the LLM passes the
-                    // handle straight to plugin tools (fm_voice_save,
-                    // fm_tts, etc.). Decode to the real on-disk path
-                    // before falling back to workspace-relative
-                    // resolution, otherwise the plugin sees something
-                    // like `<workspace>/skill-output/up/<base64>` and
-                    // 404s. Tolerates the partially-truncated form
-                    // `up/<base64>` (no display-name segment) via the
-                    // legacy-relative fallback inside
-                    // `resolve_upload_reference`.
-                    if let Some(resolved) = octos_bus::file_handle::resolve_upload_reference(path) {
-                        rewritten.insert(
-                            key.clone(),
-                            serde_json::Value::String(resolved.to_string_lossy().into_owned()),
-                        );
-                        continue;
-                    }
                     rewritten.insert(
                         key.clone(),
-                        serde_json::Value::String(
-                            resolve_path_in_work_dir(path, work_dir)
-                                .unwrap_or_else(|| absolutize_path_in_work_dir(path, work_dir)),
-                        ),
+                        serde_json::Value::String(resolve_plugin_input_path(path, work_dir)),
                     );
                     continue;
                 }
@@ -427,12 +406,10 @@ impl PluginTool {
                             {
                                 rewritten_slide.insert(
                                     "source_image".into(),
-                                    serde_json::Value::String(
-                                        resolve_path_in_work_dir(source_image, work_dir)
-                                            .unwrap_or_else(|| {
-                                                absolutize_path_in_work_dir(source_image, work_dir)
-                                            }),
-                                    ),
+                                    serde_json::Value::String(resolve_plugin_input_path(
+                                        source_image,
+                                        work_dir,
+                                    )),
                                 );
                             }
                             serde_json::Value::Object(rewritten_slide)
@@ -633,6 +610,37 @@ fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool
         .get("properties")
         .and_then(|properties| properties.as_object())
         .is_some_and(|properties| properties.contains_key(property))
+}
+
+/// Resolve a plugin tool's input path (`audio_path` / `file_path` /
+/// `input` / per-slide `source_image`) to an absolute on-disk string.
+///
+/// Order:
+///
+/// 1. Try the shared
+///    [`octos_bus::file_handle::resolve_tool_path`] resolver — the same
+///    table that powers the file tools. This handles `up/...` /
+///    `pf/...` handles (with both 3-segment and LLM-truncated
+///    2-segment forms), absolute paths inside the upload tmpdir or
+///    workspace, and ordinary workspace-relative inputs.
+/// 2. Fall back to the plugin-specific filename heuristics in
+///    [`resolve_path_in_work_dir`] — search for the basename inside
+///    `work_dir`, support `_<filename>` suffix matches, etc. This is
+///    behavior that pre-dates the unified resolver and that plugins
+///    rely on for legacy "send me back the absolute path you
+///    advertised" call patterns (mini-soak regression — the LLM
+///    sometimes prefixes a fictional `/home/user/uploads/` directory
+///    to the basename and the plugin has to recover via the workspace
+///    filename lookup).
+/// 3. Final fallback: lexically join with `work_dir` (the previous
+///    behaviour of `absolutize_path_in_work_dir`) so the plugin never
+///    sees an empty string.
+fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> String {
+    if let Ok(resolved) = octos_bus::file_handle::resolve_tool_path(work_dir, None, raw_path) {
+        return resolved.absolute.to_string_lossy().into_owned();
+    }
+    resolve_path_in_work_dir(raw_path, work_dir)
+        .unwrap_or_else(|| absolutize_path_in_work_dir(raw_path, work_dir))
 }
 
 fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Option<String> {
@@ -1292,8 +1300,20 @@ mod tests {
             "file_path": "deck.pdf",
         }));
 
+        // `audio_path` (a fictional absolute path) cannot resolve through
+        // the unified table — it's outside every allowed root — and
+        // therefore falls back to the legacy `resolve_path_in_work_dir`
+        // filename match, which returns the LEXICAL path inside `work_dir`.
         assert_eq!(rewritten["audio_path"], wav.to_string_lossy().to_string());
-        assert_eq!(rewritten["file_path"], pdf.to_string_lossy().to_string());
+        // `file_path` (`deck.pdf`) is a workspace-relative input that
+        // resolves through the unified resolver. The resolver canonicalises
+        // the result when the file exists (firmlinks collapsed via
+        // `canonicalize`), so the comparison must use the canonical form.
+        let canonical_pdf = std::fs::canonicalize(&pdf).unwrap_or(pdf);
+        assert_eq!(
+            rewritten["file_path"],
+            canonical_pdf.to_string_lossy().to_string()
+        );
     }
 
     #[test]
@@ -1330,7 +1350,15 @@ mod tests {
             "slide_dir": "slides/demo/output/imgs"
         }));
 
-        assert_eq!(rewritten["input"], script.to_string_lossy().to_string());
+        // `input` is a workspace-relative path; the unified resolver
+        // canonicalises it (firmlinks collapsed) so compare against the
+        // canonical form. `out` and `slide_dir` skip the resolver (their
+        // key matches the absolutize-only branch) so they stay lexical.
+        let canonical_script = std::fs::canonicalize(&script).unwrap_or(script);
+        assert_eq!(
+            rewritten["input"],
+            canonical_script.to_string_lossy().to_string()
+        );
         assert_eq!(
             rewritten["out"],
             dir.path()
