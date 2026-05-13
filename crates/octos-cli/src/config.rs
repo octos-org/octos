@@ -192,6 +192,33 @@ pub struct Config {
     /// precedence.
     #[serde(default)]
     pub appui: AppUiConfig,
+
+    /// Plugin loader policy. When `plugins.require_signed = true`, plugins
+    /// without a `manifest.sha256` declaration are rejected at load time
+    /// (instead of the legacy "warn and proceed" path). Default: false
+    /// (backward compatible). Production fleets should turn this on after
+    /// ensuring every shipped skill declares `sha256` in `manifest.json`.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+}
+
+/// Plugin loader policy.
+///
+/// All fields default to backward-compatible values so existing configs
+/// continue to load plugins exactly as they did before this struct was
+/// introduced. Set `require_signed = true` to enforce strict signature
+/// verification — plugins without `manifest.sha256` will be rejected at
+/// load time and re-hash gates apply on every invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// When `true`, plugins must declare a `sha256` in their `manifest.json`
+    /// and that hash must match the bytes on disk both at load time and
+    /// before every invocation (pre-spawn re-hash closes the load→exec
+    /// TOCTOU window). When `false` (default), unsigned plugins still load
+    /// with a warning to preserve backward compatibility.
+    #[serde(default)]
+    pub require_signed: bool,
 }
 
 /// AppUi session defaults applied by `octos serve`'s API agent.
@@ -624,10 +651,16 @@ fn monitor_default_max_restart() -> u32 {
 impl Config {
     /// Directories to scan for plugins and skill packages with tools.
     ///
-    /// Scans both `.octos/plugins/` (legacy) and `.octos/skills/` (unified packages).
-    /// Skill packages that include a `manifest.json` are auto-discovered as tool
-    /// providers by `PluginLoader` (packages without manifest.json are skipped).
-    /// Resolve plugin/skill directories from a project directory (e.g. `~/.octos`).
+    /// Scans deployment-scoped dirs under `project_dir` (typically `octos_home`)
+    /// plus dirs added via `OCTOS_SKILLS_PATH`. The legacy HOME-rooted globals
+    /// (`~/.octos/skills`, `~/.octos/plugins`) are NO LONGER scanned — installs
+    /// are per-profile only under `<data_dir>/skills/`. The bundled platform
+    /// skills (`<octos_home>/platform-skills/`, admin-only) are loaded explicitly
+    /// in serve.rs.
+    ///
+    /// When this function detects that the legacy `~/.octos/skills` directory
+    /// still exists on disk it emits a one-shot `tracing::warn!` so operators
+    /// migrating from older deployments see a clear migration prompt.
     ///
     /// The `project_dir` is typically `octos_home` (for managed gateways) or
     /// `cwd/.octos` (for standalone `octos chat`). This is intentionally decoupled
@@ -649,16 +682,11 @@ impl Config {
             dirs.push(bundled);
         }
         // Note: platform-skills/ (voice, etc.) are admin-only — loaded explicitly in serve.rs
-        if let Some(home) = dirs::home_dir() {
-            let global_plugins = home.join(".octos").join("plugins");
-            if global_plugins.exists() {
-                dirs.push(global_plugins);
-            }
-            let global_skills = home.join(".octos").join("skills");
-            if global_skills.exists() {
-                dirs.push(global_skills);
-            }
-        }
+        // Legacy HOME-rooted globals (`~/.octos/skills`, `~/.octos/plugins`) are
+        // deprecated: all skill installs now live under `<data_dir>/skills/` for
+        // per-profile isolation. We still warn ONCE per process if the directory
+        // is present so operators migrating from older deployments notice it.
+        warn_once_if_legacy_global_skills_exist();
         // Extra dirs from OCTOS_SKILLS_PATH env var (colon-separated)
         if let Ok(extra) = std::env::var("OCTOS_SKILLS_PATH") {
             for p in extra.split(':') {
@@ -674,6 +702,32 @@ impl Config {
         dirs.dedup();
         dirs
     }
+}
+
+/// One-shot warning when `~/.octos/skills` still exists on disk after we
+/// stopped scanning it. Emitted at most once per process so operators see
+/// a single migration hint rather than spamming every profile bootstrap.
+fn warn_once_if_legacy_global_skills_exist() {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let legacy_skills = home.join(".octos").join("skills");
+        let legacy_plugins = home.join(".octos").join("plugins");
+        for legacy in [&legacy_skills, &legacy_plugins] {
+            if legacy.exists() {
+                tracing::warn!(
+                    path = %legacy.display(),
+                    "legacy global skill directory is no longer scanned; \
+                     migrate contents into your profile's `<data_dir>/skills/` \
+                     (e.g. `~/.octos/profiles/<id>/data/skills/`) — installs \
+                     are per-profile only"
+                );
+            }
+        }
+    });
 }
 
 /// Message queue mode for handling messages arriving during active agent runs.
@@ -1406,6 +1460,112 @@ mod tests {
         let json = r#"{"base_domain": "ocean.ominix.io"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.base_domain.as_deref(), Some("ocean.ominix.io"));
+    }
+
+    /// Section A of the per-profile-skills migration: the legacy HOME-rooted
+    /// globals (`~/.octos/skills`, `~/.octos/plugins`) MUST NOT appear in the
+    /// scan list anymore. Installs live under `<data_dir>/skills/` for
+    /// per-profile isolation; HOME-rooted globals are deprecated.
+    ///
+    /// This test pivots `HOME` to a temp dir so it works on CI hosts where
+    /// the real `$HOME/.octos/skills` may or may not exist. The function
+    /// must NOT include those paths in its result, regardless of whether
+    /// the directories exist on disk.
+    #[test]
+    #[allow(unsafe_code)]
+    fn plugin_dirs_from_project_drops_legacy_home_rooted_globals() {
+        // Serialize env mutation so parallel tests don't fight over HOME.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let project_dir = fake_home.join("octos-home");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Plant legacy HOME-rooted globals that the OLD scan list would have
+        // included. The new scan list MUST NOT include them.
+        let legacy_skills = fake_home.join(".octos").join("skills");
+        let legacy_plugins = fake_home.join(".octos").join("plugins");
+        std::fs::create_dir_all(&legacy_skills).unwrap();
+        std::fs::create_dir_all(&legacy_plugins).unwrap();
+
+        // Pivot HOME for the duration of this assertion. dirs::home_dir()
+        // honors HOME on Unix; we restore the original after the check.
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside the static LOCK above; restored on
+        // both the success and panic-unwind paths below.
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let scan = Config::plugin_dirs_from_project(&project_dir);
+
+        // Restore HOME before assertions so a panic doesn't leak the override.
+        // SAFETY: see above.
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            !scan.contains(&legacy_skills),
+            "`~/.octos/skills` must no longer be scanned; got: {scan:?}"
+        );
+        assert!(
+            !scan.contains(&legacy_plugins),
+            "`~/.octos/plugins` must no longer be scanned; got: {scan:?}"
+        );
+    }
+
+    /// Section B: `plugins.require_signed` deserializes from the new
+    /// `[plugins]` config block. Default is `false` (backward compatible).
+    #[test]
+    fn plugins_require_signed_deserialize_explicit_true() {
+        let json = r#"{"plugins": {"require_signed": true}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.plugins.require_signed);
+    }
+
+    #[test]
+    fn plugins_require_signed_defaults_to_false_when_absent() {
+        let json = r#"{"provider": "anthropic"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(
+            !config.plugins.require_signed,
+            "missing `plugins` block must default to `require_signed = false` \
+             (backward compat)"
+        );
+    }
+
+    #[test]
+    fn plugins_require_signed_defaults_to_false_when_block_empty() {
+        let json = r#"{"plugins": {}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.plugins.require_signed);
+    }
+
+    /// Section A: `<octos_home>/plugins` and `<octos_home>/skills`
+    /// (deployment-scoped, not HOME-rooted) MUST still be scanned. M11-F
+    /// REG-5 added them so admin-installed plugins are visible to every
+    /// profile.
+    #[test]
+    fn plugin_dirs_from_project_keeps_deployment_scoped_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("octos-home");
+        let project_plugins = project_dir.join("plugins");
+        let project_skills = project_dir.join("skills");
+        std::fs::create_dir_all(&project_plugins).unwrap();
+        std::fs::create_dir_all(&project_skills).unwrap();
+
+        let scan = Config::plugin_dirs_from_project(&project_dir);
+
+        assert!(
+            scan.contains(&project_plugins),
+            "`<octos_home>/plugins` must still be scanned; got: {scan:?}"
+        );
+        assert!(
+            scan.contains(&project_skills),
+            "`<octos_home>/skills` must still be scanned; got: {scan:?}"
+        );
     }
 
     #[test]

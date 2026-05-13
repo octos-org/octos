@@ -61,6 +61,13 @@ pub struct PluginLoadOptions<'a> {
     /// opt in via `x-octos-host-config-keys: ["synthesis_config"]`. Tools
     /// without the opt-in never receive this struct.
     pub synthesis_config: Option<SynthesisConfig>,
+    /// Strict signature policy. When `true`, plugins without a declared
+    /// `manifest.sha256` are REJECTED at load time (instead of the legacy
+    /// "warn and proceed" path) AND every invocation re-hashes the verified
+    /// executable bytes and compares against the load-time hash before
+    /// spawning. When `false` (the default), the legacy permissive flow is
+    /// preserved for backward compatibility.
+    pub require_signed: bool,
 }
 
 impl PluginLoadResult {
@@ -109,6 +116,7 @@ impl PluginLoader {
             PluginLoadOptions {
                 work_dir,
                 synthesis_config: None,
+                require_signed: false,
             },
         )
     }
@@ -245,6 +253,7 @@ impl PluginLoader {
             PluginLoadOptions {
                 work_dir,
                 synthesis_config: None,
+                require_signed: false,
             },
         )
     }
@@ -271,6 +280,7 @@ impl PluginLoader {
     ) -> Result<(Vec<LoadedPluginTool>, SkillExtras)> {
         let work_dir = options.work_dir;
         let synthesis_config = options.synthesis_config;
+        let require_signed = options.require_signed;
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
@@ -327,10 +337,16 @@ impl PluginLoader {
         let exe_bytes = std::fs::read(&executable)
             .map_err(|e| eyre::eyre!("cannot read plugin executable: {e}"))?;
 
+        // Section C: capture the SHA-256 of the verified bytes so the
+        // pre-spawn re-hash gate (in `tool.rs::execute`) can compare against
+        // exactly what we approved at load time. The hash is computed once
+        // here and never recomputed — re-hashing only happens at invocation
+        // time, on the verified-exe path on disk.
+        let load_time_hash = format!("{:x}", Sha256::digest(&exe_bytes));
+
         match &manifest.sha256 {
             Some(expected_hash) => {
-                let actual_hash = format!("{:x}", Sha256::digest(&exe_bytes));
-                if actual_hash != expected_hash.to_lowercase() {
+                if load_time_hash != expected_hash.to_lowercase() {
                     eyre::bail!(
                         "plugin '{}' failed integrity check (hash mismatch)",
                         manifest.name,
@@ -342,6 +358,18 @@ impl PluginLoader {
                 );
             }
             None => {
+                // Section B: when `require_signed` is on, reject the plugin
+                // immediately instead of the legacy "warn and proceed". The
+                // operator opted into strict integrity and an undeclared
+                // hash means we cannot prove the bytes on disk came from a
+                // known good source.
+                if require_signed {
+                    eyre::bail!(
+                        "plugin '{}' rejected: `plugins.require_signed` is enabled \
+                         and manifest.json has no `sha256` field",
+                        manifest.name,
+                    );
+                }
                 warn!(
                     plugin = %manifest.name,
                     version = %manifest.version,
@@ -447,7 +475,15 @@ impl PluginLoader {
                 let mut tool = PluginTool::new(plugin_name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
-                    .with_timeout(timeout);
+                    .with_timeout(timeout)
+                    // Section C: stash the load-time hash so the pre-spawn
+                    // re-hash gate in `tool::execute` can detect a TOCTOU
+                    // swap between load and invocation. The gate fires
+                    // unconditionally under `require_signed`; otherwise it
+                    // fires only when a manifest hash was declared (and
+                    // therefore the operator has signaled they care about
+                    // integrity for this plugin).
+                    .with_verified_sha256(load_time_hash.clone(), require_signed);
                 if let Some(dir) = work_dir {
                     tool = tool.with_work_dir(dir.to_path_buf());
                 }
@@ -947,6 +983,202 @@ mod tests {
         );
     }
 
+    /// Section B: a plugin without `manifest.sha256` is REJECTED at load
+    /// time when `require_signed = true` — instead of the legacy "warn and
+    /// proceed" path.
+    #[cfg(unix)]
+    #[test]
+    fn require_signed_rejects_unsigned_plugin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("unsigned-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        // No `sha256` declared → unsigned.
+        let manifest = r#"{
+            "name": "unsigned-plugin",
+            "version": "1.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+
+        let exec_path = plugin_dir.join("unsigned-plugin");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho unsigned").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.tool_count, 0,
+            "unsigned plugin must be rejected under require_signed"
+        );
+    }
+
+    /// Section B: with `require_signed = true`, signed plugins (those that
+    /// declare a matching `manifest.sha256`) still load normally.
+    #[cfg(unix)]
+    #[test]
+    fn require_signed_accepts_signed_plugin() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("signed-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho ok";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{"name": "signed-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "t", "description": "d"}}]}}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("signed-plugin");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result.tool_count, 1,
+            "signed plugin must still load under require_signed"
+        );
+    }
+
+    /// Section B: with `require_signed = false` (the legacy default),
+    /// unsigned plugins still load with a warning — backward compatibility
+    /// is preserved.
+    #[cfg(unix)]
+    #[test]
+    fn require_signed_off_keeps_legacy_unsigned_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("unsigned-legacy");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let manifest = r#"{
+            "name": "unsigned-legacy",
+            "version": "1.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("unsigned-legacy");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho legacy").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(
+            result.tool_count, 1,
+            "unsigned plugin must still load under the legacy default"
+        );
+    }
+
+    /// Section C: when the verified-exe bytes on disk are swapped between
+    /// load and invocation, the pre-spawn re-hash gate refuses to spawn the
+    /// process. We simulate the swap by overwriting `.<name>_verified`
+    /// after `load_into` returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_spawn_rehash_detects_swap() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("swap-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho original";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{"name": "swap-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "swap_tool", "description": "d"}}]}}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("swap-plugin");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 1);
+
+        // Swap the verified-exe bytes on disk so the re-hash gate fires.
+        let verified_exe = plugin_dir.join(".swap-plugin_verified");
+        assert!(
+            verified_exe.exists(),
+            "loader must write a verified-exe sibling"
+        );
+        std::fs::write(&verified_exe, b"#!/bin/sh\necho TAMPERED").unwrap();
+
+        // Execute the registered tool and assert the gate refused to spawn.
+        let tool = registry.get("swap_tool").expect("tool registered");
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "tampered plugin must not succeed");
+        assert!(
+            result.output.contains("hash mismatch"),
+            "refusal message must explain the cause; got: {}",
+            result.output
+        );
+    }
+
+    /// Section C: when the verified-exe bytes are intact, the re-hash gate
+    /// passes silently and the plugin spawns. We assert by invoking a
+    /// trivial plugin that writes a known JSON to stdout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_spawn_rehash_allows_intact_executable() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("intact-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{"name": "intact-plugin", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "intact_tool", "description": "d"}}]}}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("intact-plugin");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+
+        let tool = registry.get("intact_tool").expect("tool registered");
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(
+            result.success,
+            "intact plugin must succeed; output: {}",
+            result.output
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_is_executable_rejects_symlink() {
@@ -1324,6 +1556,7 @@ edition = "2021"
             PluginLoadOptions {
                 work_dir: None,
                 synthesis_config: Some(cfg),
+                require_signed: false,
             },
         )
         .unwrap();
@@ -1379,6 +1612,7 @@ edition = "2021"
             PluginLoadOptions {
                 work_dir: None,
                 synthesis_config: Some(cfg),
+                require_signed: false,
             },
         )
         .unwrap();

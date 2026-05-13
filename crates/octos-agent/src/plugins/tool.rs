@@ -1,12 +1,13 @@
 //! Plugin tool: wraps a plugin executable as a Tool.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -91,6 +92,16 @@ pub struct PluginTool {
     /// Only honoured when the tool's manifest opts in via
     /// `x-octos-host-config-keys: ["synthesis_config"]`.
     synthesis_config: Option<SynthesisConfig>,
+    /// Section C: SHA-256 (lowercase hex) of the verified-exe bytes computed
+    /// at load time. Stored alongside the executable path so the pre-spawn
+    /// re-hash gate in `execute()` can confirm the bytes have not been
+    /// swapped between load and exec (closes the load→exec TOCTOU window).
+    /// `None` when no hash was computed (legacy code paths).
+    verified_exe_sha256: Option<String>,
+    /// Section C: when `true`, the pre-spawn re-hash gate ALWAYS fires (and
+    /// `verified_exe_sha256` must be `Some`). When `false`, the gate is
+    /// skipped on unverified plugins to keep the legacy path cheap.
+    require_signed: bool,
 }
 
 impl PluginTool {
@@ -107,7 +118,20 @@ impl PluginTool {
             work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
             synthesis_config: None,
+            verified_exe_sha256: None,
+            require_signed: false,
         }
+    }
+
+    /// Attach the load-time SHA-256 of the verified-exe bytes so the pre-spawn
+    /// re-hash gate in [`Self::execute`] can detect a swap between load and
+    /// exec. Pass `require_signed = true` when the host config has enabled
+    /// strict integrity — the gate will then run unconditionally and an
+    /// invocation with a missing hash hard-errors.
+    pub fn with_verified_sha256(mut self, hash: String, require_signed: bool) -> Self {
+        self.verified_exe_sha256 = Some(hash);
+        self.require_signed = require_signed;
+        self
     }
 
     /// Set environment variables to block from plugin execution.
@@ -143,6 +167,15 @@ impl PluginTool {
         self
     }
 
+    /// Section C: re-read the verified-exe bytes and recompute SHA-256.
+    /// Returned as lowercase hex to match what the loader stored. Errors
+    /// propagate as eyre wrappers so the caller can surface a precise
+    /// reason in the refusal output.
+    fn rehash_verified_exe(path: &Path) -> Result<String> {
+        let bytes = std::fs::read(path).map_err(|e| eyre::eyre!("read {}: {e}", path.display()))?;
+        Ok(format!("{:x}", Sha256::digest(&bytes)))
+    }
+
     /// Create a copy of this plugin tool with a different work directory.
     /// Used to give each user session its own workspace for plugin output.
     pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
@@ -155,6 +188,8 @@ impl PluginTool {
             work_dir: Some(work_dir),
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
+            verified_exe_sha256: self.verified_exe_sha256.clone(),
+            require_signed: self.require_signed,
         }
     }
 
@@ -879,6 +914,66 @@ impl Tool for PluginTool {
             args_size = args.to_string().len(),
             "spawning plugin process"
         );
+
+        // Section C: pre-spawn re-hash gate. When a load-time hash was
+        // recorded — either because the manifest declared `sha256` OR
+        // because `require_signed` was on — re-read the verified-exe
+        // bytes, recompute SHA-256, and compare against what we approved
+        // at load time. A mismatch means the verified copy on disk has
+        // been swapped between load and invocation; refuse to run.
+        //
+        // When neither path applied (no manifest hash AND
+        // `require_signed = false`) the gate is skipped so the legacy
+        // unverified path stays cheap. Under `require_signed = true` the
+        // loader guarantees `verified_exe_sha256` is populated for every
+        // tool that reached the registry — the assertion below is a
+        // belt-and-braces hard error if something slipped past it.
+        if let Some(expected) = &self.verified_exe_sha256 {
+            match Self::rehash_verified_exe(&self.executable) {
+                Ok(actual) if actual == *expected => {
+                    tracing::debug!(
+                        plugin = %self.plugin_name,
+                        tool = %self.tool_def.name,
+                        "pre-spawn re-hash matched"
+                    );
+                }
+                Ok(actual) => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: verified executable hash mismatch \
+                             (expected {expected}, got {actual}). The on-disk binary changed \
+                             between load and invocation.",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                Err(err) => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: failed to re-hash verified executable: {err}",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        } else if self.require_signed {
+            // Fail closed: strict policy is on but the load-time hash was
+            // never recorded. This indicates a wiring bug — never let an
+            // unhashed plugin invoke under `require_signed = true`.
+            return Ok(ToolResult {
+                output: format!(
+                    "Plugin '{}' refused to spawn: `plugins.require_signed` is enabled but \
+                     no load-time hash was recorded for this tool (internal wiring error).",
+                    self.plugin_name
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
 
         // M6 req 4: enforce manifest-declared `risk` field (UPCR-2026-001).
         // When the manifest declares `risk: "high"` or `risk: "critical"`,
