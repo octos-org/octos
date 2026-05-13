@@ -289,11 +289,16 @@ impl GatewayRuntime {
         let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
             resolved_profile.as_ref().filter(|_| !cli_llm_override)
         {
-            match ProfileRuntime::bootstrap(
+            // Section B (codex review round-3): thread the host's
+            // `plugins.require_signed` into the per-profile bootstrap so
+            // strict signing applies even when the profile JSON omits
+            // the flag.
+            match ProfileRuntime::bootstrap_with_host_plugins(
                 profile,
                 &data_dir,
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
+                Some(&config.plugins),
             )
             .await
             {

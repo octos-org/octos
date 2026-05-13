@@ -287,19 +287,15 @@ impl PluginLoader {
         let manifest: PluginManifest = serde_json::from_str(&content)
             .map_err(|e| eyre::eyre!("invalid manifest.json: {e}"))?;
 
-        // Resolve extras (MCP servers, hooks, prompt fragments) regardless of tools.
-        let extras = resolve_extras(&manifest, plugin_dir);
-
         // Section B (codex review P1.2 + follow-up): under strict signing,
-        // REJECT any extras-only manifest before we let it install MCP
-        // servers / hooks / prompts. The `manifest.sha256` field's semantics
-        // currently anchor the executable bytes — there is no canonical hash
-        // input for extras-only skills, and even a manifest that declares a
-        // non-empty `sha256` would never see those bytes hashed below
-        // because of the `tools.is_empty()` early return. Under strict mode
-        // we refuse to mint trust for that code path entirely; the operator
-        // can split executable + extras into separate skills if they need a
-        // verifiable extras-only payload (future work).
+        // REJECT any extras-only manifest before we resolve extras or
+        // install anything. The `manifest.sha256` field anchors executable
+        // bytes — there is no canonical hash input for an extras-only
+        // skill, and a manifest with empty `tools` would never see those
+        // bytes hashed below because of the `tools.is_empty()` early
+        // return. Under strict mode we refuse to mint trust for that code
+        // path entirely; the operator must split executable + extras into
+        // separate skills if they need a verifiable extras-only payload.
         if require_signed && manifest.tools.is_empty() && manifest.has_extras() {
             eyre::bail!(
                 "plugin '{}' rejected: `plugins.require_signed` is enabled \
@@ -309,7 +305,7 @@ impl PluginLoader {
             );
         }
         // Section B (codex review P1.2): under strict signing, REJECT any
-        // unsigned skill that declares tools. MCP server commands and
+        // tools-bearing skill that omits `sha256`. MCP server commands and
         // lifecycle hooks resolved from `manifest.json` introduce executable
         // code paths the operator did not authorize via a hash. The check
         // runs BEFORE the executable search so we never read or write any
@@ -320,6 +316,31 @@ impl PluginLoader {
                  and manifest.json has no `sha256` field",
                 manifest.name,
             );
+        }
+
+        // Resolve extras (MCP servers, hooks, prompt fragments) regardless of tools.
+        let mut extras = resolve_extras(&manifest, plugin_dir);
+
+        // Section B (codex review round-3): under strict signing, the
+        // current `manifest.sha256` semantics anchor only the executable
+        // bytes — manifest-side declarations (MCP servers, lifecycle
+        // hooks, prompt fragments) are NOT covered by the digest. A
+        // malicious patcher could edit `manifest.json` to add executable
+        // extras without invalidating the executable hash; the strict
+        // policy must refuse to mint trust for that code path until the
+        // signed material covers the manifest too. We therefore DROP
+        // extras for every tools-bearing skill that goes through the
+        // strict path. Operators who depend on extras must either run
+        // with permissive mode or ship those declarations via a
+        // separately-trusted host config (`mcp_servers` + `hooks` on
+        // `Config`/`ProfileConfig`).
+        if require_signed && manifest.has_extras() {
+            warn!(
+                plugin = %manifest.name,
+                "dropping manifest extras (MCP servers / hooks / prompts) under \
+                 `plugins.require_signed`: the digest does not cover them"
+            );
+            extras = SkillExtras::default();
         }
 
         // If no tools declared, skip executable search entirely.
@@ -539,7 +560,6 @@ impl PluginLoader {
             .collect();
 
         // Return extras with spawn_only info
-        let mut extras = extras;
         extras.spawn_only_tools = spawn_only_names;
         extras.spawn_only_messages = spawn_only_msgs;
 
@@ -1148,6 +1168,110 @@ mod tests {
             result.mcp_servers.is_empty(),
             "rejected skill's MCP servers must not be installed; got: {:?}",
             result.mcp_servers
+        );
+    }
+
+    /// Section B (codex review round-3): under strict signing, a
+    /// tools-bearing skill that ALSO declares MCP servers / hooks /
+    /// prompts in its manifest loads ONLY its tools — the unsigned
+    /// extras are dropped because `manifest.sha256` does not cover the
+    /// manifest itself. This prevents a manifest-only patch from
+    /// installing executable extras while keeping the executable hash
+    /// matching.
+    #[cfg(unix)]
+    #[test]
+    fn require_signed_drops_extras_on_mixed_signed_manifest() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mixed-signed");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho ok";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{
+                "name": "mixed-signed",
+                "version": "1.0",
+                "sha256": "{hash}",
+                "mcp_servers": [{{
+                    "command": "/bin/echo",
+                    "args": ["unauthorized"]
+                }}],
+                "tools": [{{"name": "t", "description": "d"}}]
+            }}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("mixed-signed");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.tool_count, 1, "signed tool still registers");
+        assert!(
+            result.mcp_servers.is_empty(),
+            "unsigned MCP extras must be dropped under strict signing; got: {:?}",
+            result.mcp_servers
+        );
+        assert!(
+            result.hooks.is_empty(),
+            "unsigned hook extras must be dropped under strict signing; got: {:?}",
+            result.hooks
+        );
+    }
+
+    /// Section B (codex review round-3): under permissive mode, the same
+    /// mixed manifest installs both the tool AND the extras (legacy
+    /// behaviour — no regression).
+    #[cfg(unix)]
+    #[test]
+    fn require_signed_off_keeps_mixed_extras_on_signed_manifest() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("mixed-permissive");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho ok";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{
+                "name": "mixed-permissive",
+                "version": "1.0",
+                "sha256": "{hash}",
+                "mcp_servers": [{{
+                    "command": "/bin/echo",
+                    "args": ["legacy-mcp"]
+                }}],
+                "tools": [{{"name": "t2", "description": "d"}}]
+            }}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        let exec_path = plugin_dir.join("mixed-permissive");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result =
+            PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
+        assert_eq!(result.tool_count, 1);
+        assert_eq!(
+            result.mcp_servers.len(),
+            1,
+            "permissive mode preserves extras for backward compat"
         );
     }
 
