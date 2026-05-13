@@ -705,10 +705,23 @@ impl ValidatorRunner {
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        let target = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
+        // Mirror the `HttpProbe` template story so policies can declare e.g.
+        // `voice_profiles/${args.name}.wav` for `fm_voice_save` and have the
+        // path resolved against the spawn task's input args. A missing key is
+        // a hard error so the validator surfaces an `Error` outcome rather
+        // than silently checking a literal `${args.name}` path. Note the
+        // returned string is percent-encoded path-segment-safe — fine for the
+        // single-filename segment use case the contract specifies.
+        let resolved_path = match interpolate_args(path, invocation.input_args.as_ref()) {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                return error_outcome(invocation, validator, started_at, started, reason);
+            }
+        };
+        let target = if Path::new(&resolved_path).is_absolute() {
+            PathBuf::from(&resolved_path)
         } else {
-            invocation.workspace_root.join(path)
+            invocation.workspace_root.join(&resolved_path)
         };
         let duration_ms = started.elapsed().as_millis() as u64;
         let (status, reason) = match std::fs::metadata(&target) {
@@ -2157,6 +2170,87 @@ mod tests {
         let args = serde_json::json!({});
         let err = interpolate_args("http://x/${args.name}", Some(&args)).unwrap_err();
         assert!(err.contains("'name'"));
+    }
+
+    #[tokio::test]
+    async fn file_exists_passes_when_args_interpolation_points_to_real_file() {
+        // Mirrors the `fm_voice_save` post-condition: a templated path like
+        // `voice_profiles/${args.name}.wav` must resolve against the spawn
+        // task's input args. The existing `HttpProbe` validator already
+        // does this; `FileExists` follows the same pattern.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("voice_profiles")).unwrap();
+        let wav = dir.path().join("voice_profiles/yangmi.wav");
+        std::fs::write(&wav, vec![0u8; 64]).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "voice_wav_exists",
+            ValidatorSpec::FileExists {
+                path: "voice_profiles/${args.name}.wav".into(),
+                min_bytes: Some(32),
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"name": "yangmi"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("yangmi.wav"),
+            "reason should reference the interpolated path: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn file_exists_fails_when_interpolated_path_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("voice_profiles")).unwrap();
+        // No file written.
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "voice_wav_exists",
+            ValidatorSpec::FileExists {
+                path: "voice_profiles/${args.name}.wav".into(),
+                min_bytes: None,
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"name": "missing_voice"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("missing_voice.wav"),
+            "reason should reference the interpolated path: {}",
+            outcomes[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn file_exists_errors_when_required_arg_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "voice_wav_exists",
+            ValidatorSpec::FileExists {
+                path: "voice_profiles/${args.name}.wav".into(),
+                min_bytes: None,
+            },
+        );
+        // input_args missing the `name` key — interpolation should surface a
+        // typed Error outcome rather than silently dropping the reference.
+        let invocation =
+            dummy_invocation(dir.path().to_path_buf()).with_input_args(serde_json::json!({}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("'name'"),
+            "reason should name the missing arg: {}",
+            outcomes[0].reason
+        );
     }
 
     #[test]

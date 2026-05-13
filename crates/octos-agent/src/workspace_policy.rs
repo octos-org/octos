@@ -245,6 +245,11 @@ pub enum MagicByteKind {
     Pdf,
     Mp4,
     WebM,
+    /// OOXML / OpenDocument-style ZIP container (PPTX, DOCX, XLSX, ODT, ...).
+    /// Matches the three ZIP signatures: local-file-header (`PK\x03\x04`),
+    /// end-of-central-directory (`PK\x05\x06`), and spanned-archive
+    /// (`PK\x07\x08`).
+    Pptx,
 }
 
 impl MagicByteKind {
@@ -272,6 +277,14 @@ impl MagicByteKind {
             // directly is simpler — see `magic_bytes_match`.
             Self::Mp4 => &[b"ftyp"],
             Self::WebM => &[&[0x1A, 0x45, 0xDF, 0xA3]],
+            // PPTX (and any OOXML/zip container): all three ZIP signatures
+            // are accepted so a minimally-built archive is not rejected as
+            // structurally invalid.
+            Self::Pptx => &[
+                &[0x50, 0x4B, 0x03, 0x04],
+                &[0x50, 0x4B, 0x05, 0x06],
+                &[0x50, 0x4B, 0x07, 0x08],
+            ],
         }
     }
 
@@ -298,6 +311,7 @@ impl MagicByteKind {
             Self::Pdf => "pdf",
             Self::Mp4 => "mp4",
             Self::WebM => "webm",
+            Self::Pptx => "pptx",
         }
     }
 }
@@ -601,8 +615,19 @@ impl WorkspacePolicy {
         };
 
         // Voice save (custom voice registration): assert the voice was
-        // actually registered with ominix-api. Closes the yangmi gap where
-        // fm_voice_save returns success but the API has no record.
+        // actually registered with ominix-api AND the WAV landed in the
+        // canonical `voice_profiles` directory. Closes the yangmi gap
+        // where fm_voice_save returns success but the API has no record
+        // — plus catches the parallel disk-side failure where the voice
+        // file never reached `voice_profiles/<name>.wav`.
+        //
+        // The FileExists path uses `${args.name}` interpolation against
+        // the spawn task's input args; mofa-fm writes the WAV to
+        // `${OCTOS_VOICE_DIR:-${OCTOS_DATA_DIR}/voice_profiles}/<name>.wav`,
+        // which under the default session workspace resolves relative to
+        // the workspace root via `voice_profiles/<name>.wav`. Operators
+        // who pin a non-default `OCTOS_VOICE_DIR` can override the path
+        // in their workspace policy.
         let fm_voice_save_contract = WorkspaceSpawnTaskPolicy {
             artifact: None,
             artifacts: Vec::new(),
@@ -610,11 +635,116 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:Voice registration failed".into()],
-            on_completion: vec![SpawnTaskValidatorSpec::Bare(
-                ValidatorSpec::OminixVoiceExists {
+            on_completion: vec![
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::OminixVoiceExists {
                     name_arg: "name".into(),
-                },
-            )],
+                }),
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::FileExists {
+                    path: "voice_profiles/${args.name}.wav".into(),
+                    min_bytes: Some(1024),
+                }),
+            ],
+        };
+
+        // Slides (mofa_slides spawn task): the user-visible failure mode is
+        // a "success" reply with an HTML error page in place of the PPTX.
+        // MagicBytes (Pptx) rejects that at the contract gate by asserting
+        // the local-file-header / end-of-central-directory ZIP signature
+        // is present at byte 0. The glob runs recursively so the policy
+        // also catches slides written to nested subdirectories.
+        let mofa_slides_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Slide generation failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                glob: "**/*.pptx".into(),
+                format: MagicByteKind::Pptx,
+            })],
+        };
+
+        // mofa_cards writes PNGs into a `card_dir` (required input arg).
+        // The contract uses a recursive PNG glob so any layout under that
+        // directory is covered without hard-coding a single output path.
+        let mofa_cards_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Card generation failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                glob: "**/*.png".into(),
+                format: MagicByteKind::Png,
+            })],
+        };
+
+        // mofa_comic and mofa_infographic each take a required `out` arg
+        // pointing at a single PNG file. The contract asserts BOTH that
+        // the file landed at the declared path (FileExists with
+        // `${args.out}`, FileExists already supports template
+        // interpolation) AND that there is at least one valid PNG header
+        // present in the workspace (MagicBytes against the recursive
+        // `**/*.png` glob — MagicBytes does not template its glob today).
+        // FileExists does the per-task path check; MagicBytes does the
+        // bytes-are-actually-a-PNG check.
+        let mofa_comic_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Comic generation failed".into()],
+            on_completion: vec![
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::FileExists {
+                    path: "${args.out}".into(),
+                    min_bytes: Some(1024),
+                }),
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    glob: "**/*.png".into(),
+                    format: MagicByteKind::Png,
+                }),
+            ],
+        };
+
+        let mofa_infographic_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Infographic generation failed".into()],
+            on_completion: vec![
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::FileExists {
+                    path: "${args.out}".into(),
+                    min_bytes: Some(1024),
+                }),
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    glob: "**/*.png".into(),
+                    format: MagicByteKind::Png,
+                }),
+            ],
+        };
+
+        // mofa_frame is NOT spawn_only today (so this contract is dormant
+        // for the current manifest), but the audit's section-5 missing
+        // table lists it as an artifact-producing tool whose contract
+        // should be wired even if the gate is not yet fired. Recording
+        // the entry here lets the next spawn_only flip pick up the
+        // contract automatically.
+        let mofa_frame_contract = WorkspaceSpawnTaskPolicy {
+            artifact: None,
+            artifacts: Vec::new(),
+            on_verify: Vec::new(),
+            on_complete: vec![],
+            on_deliver: vec![],
+            on_failure: vec!["notify_user:Frame extraction failed".into()],
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                glob: "**/*.png".into(),
+                format: MagicByteKind::Png,
+            })],
         };
 
         let mut spawn_tasks = BTreeMap::new();
@@ -622,6 +752,11 @@ impl WorkspacePolicy {
         spawn_tasks.insert("voice_synthesize".into(), voice_synthesize_contract);
         spawn_tasks.insert("podcast_generate".into(), podcast_contract);
         spawn_tasks.insert("fm_voice_save".into(), fm_voice_save_contract);
+        spawn_tasks.insert("mofa_slides".into(), mofa_slides_contract);
+        spawn_tasks.insert("mofa_cards".into(), mofa_cards_contract);
+        spawn_tasks.insert("mofa_comic".into(), mofa_comic_contract);
+        spawn_tasks.insert("mofa_infographic".into(), mofa_infographic_contract);
+        spawn_tasks.insert("mofa_frame".into(), mofa_frame_contract);
 
         Self {
             schema_version: WORKSPACE_POLICY_SCHEMA_VERSION,
@@ -1172,6 +1307,19 @@ ignore = []
     }
 
     #[test]
+    fn magic_byte_kind_pptx_matches_zip_signatures() {
+        // PPTX is a ZIP archive — accept the OOXML local-file-header
+        // signature (`PK\x03\x04`) and the central-directory variants so a
+        // tool that emits a minimal/empty archive isn't spuriously rejected.
+        assert!(MagicByteKind::Pptx.matches(b"PK\x03\x04rest of zip"));
+        assert!(MagicByteKind::Pptx.matches(b"PK\x05\x06"));
+        assert!(MagicByteKind::Pptx.matches(b"PK\x07\x08"));
+        // An HTML error page surfaced in place of a PPTX must be rejected so
+        // the silent-failure path is caught at the harness gate.
+        assert!(!MagicByteKind::Pptx.matches(b"<!DOCTYPE html>"));
+    }
+
+    #[test]
     fn session_policy_declares_new_domain_validators_for_silent_failure_paths() {
         let policy = WorkspacePolicy::for_session();
         let podcast = policy
@@ -1207,6 +1355,107 @@ ignore = []
             entry,
             SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent { .. })
         )));
+    }
+
+    #[test]
+    fn session_policy_declares_voice_wav_file_exists_for_fm_voice_save() {
+        // P0-1 follow-on: fm_voice_save must also assert the voice WAV
+        // landed in the canonical voice_profiles directory. The path
+        // template uses `${args.name}` interpolation against the spawn
+        // task's input args, mirroring how the existing
+        // `OminixVoiceExists` validator interpolates the name.
+        let policy = WorkspacePolicy::for_session();
+        let voice_save = policy
+            .spawn_tasks
+            .get("fm_voice_save")
+            .expect("fm_voice_save contract");
+        let has_file_exists = voice_save.on_completion.iter().any(|entry| {
+            matches!(
+                entry,
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::FileExists { path, .. })
+                    if path.contains("${args.name}") && path.ends_with(".wav")
+            )
+        });
+        assert!(
+            has_file_exists,
+            "fm_voice_save should declare FileExists with ${{args.name}}.wav template; got {:?}",
+            voice_save.on_completion
+        );
+    }
+
+    #[test]
+    fn session_policy_declares_pptx_magic_bytes_for_mofa_slides() {
+        // P1-4: mofa_slides emits a .pptx artifact. The default session
+        // policy must declare a MagicBytes (Pptx) validator so a tool that
+        // wrote an HTML error page in place of the PPTX is rejected at
+        // the harness gate rather than declared "success" by the LLM.
+        let policy = WorkspacePolicy::for_session();
+        let slides = policy
+            .spawn_tasks
+            .get("mofa_slides")
+            .expect("mofa_slides contract");
+        assert!(slides.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                format: MagicByteKind::Pptx,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn session_policy_declares_png_magic_bytes_for_image_skills() {
+        // P1-5: every spawn-only image-emitting skill carries a MagicBytes
+        // (Png) post-condition so a corrupted / HTML error page in place
+        // of the rendered card/comic/infographic is rejected at the
+        // harness gate. `mofa_frame` is included too (covered by the
+        // audit's section 5 "What's missing" table) so that, if/when it
+        // becomes spawn_only, the contract is already wired.
+        let policy = WorkspacePolicy::for_session();
+        for tool in ["mofa_cards", "mofa_comic", "mofa_infographic", "mofa_frame"] {
+            let entry = policy
+                .spawn_tasks
+                .get(tool)
+                .unwrap_or_else(|| panic!("policy missing spawn task for {tool}"));
+            assert!(
+                entry.on_completion.iter().any(|spec| matches!(
+                    spec,
+                    SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                        format: MagicByteKind::Png,
+                        ..
+                    })
+                )),
+                "{tool} should declare MagicBytes (png); got {:?}",
+                entry.on_completion
+            );
+        }
+    }
+
+    #[test]
+    fn session_policy_declares_file_exists_for_single_file_image_skills() {
+        // mofa_comic and mofa_infographic both take a required `out` arg
+        // pointing at a single PNG file. The contract should assert the
+        // declared output landed at that path via FileExists +
+        // `${args.out}` interpolation.
+        let policy = WorkspacePolicy::for_session();
+        for tool in ["mofa_comic", "mofa_infographic"] {
+            let entry = policy
+                .spawn_tasks
+                .get(tool)
+                .unwrap_or_else(|| panic!("policy missing spawn task for {tool}"));
+            let has_file_exists = entry.on_completion.iter().any(|spec| {
+                matches!(
+                    spec,
+                    SpawnTaskValidatorSpec::Bare(ValidatorSpec::FileExists { path, .. })
+                        if path.contains("${args.out}")
+                )
+            });
+            assert!(
+                has_file_exists,
+                "{tool} should declare FileExists with ${{args.out}} template; got {:?}",
+                entry.on_completion
+            );
+        }
     }
 
     #[test]

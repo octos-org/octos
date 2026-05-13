@@ -27,6 +27,7 @@
     {
       "name": "voice_synthesize",
       "description": "Synthesize speech from text. Uses Qwen3-TTS when ominix-api is running (high quality, emotion/style control, speed adjustment). Falls back to macOS built-in Say command when ominix-api is unavailable. Produces a WAV/MP3 audio file. After generating, use send_file to deliver the audio to the user. NOTE: This tool only supports preset voices. For voice cloning or custom voice profiles, use mofa-fm (fm_tts).",
+      "spawn_only": true,
       "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",

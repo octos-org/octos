@@ -1004,4 +1004,255 @@ mod tests {
         assert!(error.contains("file_size_min:$artifact:1024"));
         assert!(error.contains("output.mp3 is 1 bytes, minimum is 1024"));
     }
+
+    /// Smallest valid PNG (1x1 transparent pixel) — used to satisfy
+    /// MagicBytes (Png) without pulling in an encoder dependency.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+        0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R', // IHDR header
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // width=1, height=1
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, // bit depth+color
+        0x00, 0x00, 0x00, 0x0D, b'I', b'D', b'A', b'T', // IDAT chunk
+        0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+        0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', // IEND chunk
+        0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[tokio::test]
+    async fn mofa_slides_contract_satisfies_when_pptx_is_present() {
+        // P1-4: the default session policy for `mofa_slides` should
+        // verify a PPTX with a valid ZIP signature is present.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let pptx = temp.path().join("output/deck.pptx");
+        std::fs::create_dir_all(pptx.parent().unwrap()).unwrap();
+        // PK\x03\x04 followed by enough padding so the magic-byte read
+        // succeeds and the file is non-trivial.
+        let mut bytes = vec![0x50, 0x4B, 0x03, 0x04];
+        bytes.extend(std::iter::repeat_n(0u8, 256));
+        std::fs::write(&pptx, &bytes).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_slides",
+            "tool-call-slides",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "output/deck.pptx"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_slides_contract_fails_when_artifact_is_html_error_page() {
+        // Catches the silent-failure path: tool wrote an HTML error page
+        // in place of the PPTX. MagicBytes (Pptx) rejects it.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let pptx = temp.path().join("output/deck.pptx");
+        std::fs::create_dir_all(pptx.parent().unwrap()).unwrap();
+        std::fs::write(&pptx, b"<!DOCTYPE html>\n<html>Internal error</html>\n").unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_slides",
+            "tool-call-slides-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "output/deck.pptx"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("magic_bytes") || error.contains("pptx"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Slide generation failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_cards_contract_satisfies_when_png_files_match_recursive_glob() {
+        // P1-5: mofa_cards emits PNGs under a per-task card_dir.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let card_dir = temp.path().join("cards/abc");
+        std::fs::create_dir_all(&card_dir).unwrap();
+        std::fs::write(card_dir.join("a.png"), PNG_1X1).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_cards",
+            "tool-call-cards",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"card_dir": "cards/abc"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_comic_contract_uses_args_out_for_file_exists_and_magic_bytes() {
+        // P1-5: mofa_comic has a required `out` arg pointing at a single
+        // PNG file. Both FileExists and MagicBytes interpolate
+        // `${args.out}` so they assert exactly the path the LLM declared.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let comic = temp.path().join("comic.png");
+        std::fs::write(&comic, PNG_1X1).unwrap();
+        // Pad to meet the 1024-byte min_bytes check on the FileExists.
+        let mut padded = PNG_1X1.to_vec();
+        padded.extend(std::iter::repeat_n(0u8, 2048));
+        std::fs::write(&comic, &padded).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_comic",
+            "tool-call-comic",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "comic.png"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_comic_contract_fails_when_args_out_file_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        // Note: the file `comic.png` is never created — the LLM-declared
+        // path doesn't exist, so FileExists with `${args.out}` should
+        // fail at the contract gate.
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_comic",
+            "tool-call-comic-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"out": "comic.png"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("does not exist") || error.contains("comic.png"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Comic generation failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fm_voice_save_contract_file_exists_succeeds_when_voice_wav_present() {
+        // P0-1: the `fm_voice_save` contract now asserts the voice WAV
+        // landed at `voice_profiles/<name>.wav` via FileExists +
+        // `${args.name}` interpolation, in addition to the
+        // OminixVoiceExists API probe.
+        let temp = tempfile::tempdir().unwrap();
+        // Strip the OminixVoiceExists validator so this test focuses on
+        // the new FileExists check. The OminixVoiceExists validator is
+        // covered by validators::tests inside `validators.rs`.
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("fm_voice_save") {
+            task.on_completion.retain(|spec| {
+                matches!(
+                    spec,
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                        crate::workspace_policy::ValidatorSpec::FileExists { .. }
+                    )
+                )
+            });
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        std::fs::create_dir_all(temp.path().join("voice_profiles")).unwrap();
+        std::fs::write(
+            temp.path().join("voice_profiles/yangmi.wav"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_voice_save",
+            "tool-call-voice-save",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"name": "yangmi", "audio_path": "/tmp/in.wav"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fm_voice_save_contract_file_exists_fails_when_voice_wav_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("fm_voice_save") {
+            task.on_completion.retain(|spec| {
+                matches!(
+                    spec,
+                    crate::workspace_policy::SpawnTaskValidatorSpec::Bare(
+                        crate::workspace_policy::ValidatorSpec::FileExists { .. }
+                    )
+                )
+            });
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        // Don't write the WAV — FileExists with `${args.name}` must fail.
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fm_voice_save",
+            "tool-call-voice-save-fail",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"name": "no_such_voice"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("no_such_voice.wav") || error.contains("does not exist"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Voice registration failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
 }
