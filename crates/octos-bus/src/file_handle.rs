@@ -335,11 +335,30 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// (`/var/folders/...` vs `/private/var/folders/...`) collapse through
 /// `canonicalize`; the syntactic fallback is only used when nothing on
 /// the path exists.
+///
+/// CRITICAL: `..` components are collapsed BEFORE the
+/// walk-parents-until-existing loop. Without this pre-normalisation an
+/// input like `/workspace/missing/../../secret.txt` would walk back to
+/// `/workspace` (the closest existing ancestor) and re-attach the
+/// original suffix verbatim, producing `/workspace/missing/../../secret.txt`
+/// which then satisfies `starts_with("/workspace")` even though the
+/// path actually escapes to `/secret.txt`. Lexically collapsing `..`
+/// up front makes the containment check honest (codex review round 4
+/// P2, 2026-05-13).
 fn canonicalize_lossy(path: &Path) -> PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
+    // Step 1: lexical normalisation — collapses `..` and `.` without
+    // touching the filesystem. After this step the path has no `..`
+    // components so `starts_with(allowed_root)` is an honest
+    // containment check.
+    let normalised = normalize_lexical(path);
+    if let Ok(canon) = std::fs::canonicalize(&normalised) {
         return canon;
     }
-    let mut existing = path;
+    // Step 2: walk parents to find the longest existing prefix and
+    // re-attach the remainder. The remainder cannot contain `..` (it
+    // was already collapsed in step 1) so the result is a real
+    // would-be on-disk location, not a traversal expression.
+    let mut existing: &Path = &normalised;
     let mut suffix = PathBuf::new();
     while let Some(parent) = existing.parent() {
         if let Some(name) = existing.file_name() {
@@ -355,7 +374,7 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
             break;
         }
     }
-    normalize_lexical(path)
+    normalised
 }
 
 fn encode_scoped_handle(prefix: &str, relative: &Path, display_name: &str) -> Option<String> {

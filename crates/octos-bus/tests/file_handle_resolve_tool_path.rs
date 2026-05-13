@@ -356,6 +356,43 @@ fn profile_handle_without_profile_root_fails() {
     assert_eq!(err, ToolPathError::DecodeFailed);
 }
 
+#[test]
+fn absolute_input_with_dotdot_through_missing_component_rejected() {
+    // Codex review round 4 P2 (2026-05-13): when an absolute input
+    // contains `..` after a non-existent component under an allowed
+    // root, the previous `canonicalize_lossy` walked back to the
+    // closest existing parent and re-attached the suffix VERBATIM,
+    // producing a path that still satisfied `starts_with(workspace)`
+    // even though it logically escaped. The resolver must lexically
+    // collapse `..` BEFORE the containment check so the workspace
+    // boundary is honest.
+    let rig = Rig::new("dotdot");
+    let workspace = rig.workspace_root();
+    let outside = tempfile::tempdir().expect("outside");
+    std::fs::write(outside.path().join("secret.txt"), b"escape").unwrap();
+
+    // Input: <workspace>/missing/../../<outside>/secret.txt
+    // Lexically normalises to <outside-parent>/secret.txt, which
+    // lies outside both the workspace and the upload tmpdir. The
+    // resolver must reject as OutsideAllowedRoots.
+    let workspace_parent = workspace.parent().expect("workspace parent");
+    let traverse = format!(
+        "{}/missing/../../{}/secret.txt",
+        workspace.display(),
+        outside
+            .path()
+            .strip_prefix(workspace_parent)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| outside.path().display().to_string()),
+    );
+    let err = expect_err(resolve_tool_path(workspace, None, &traverse));
+    assert_eq!(
+        err,
+        ToolPathError::OutsideAllowedRoots,
+        "dotdot through missing component must not be silently accepted as workspace-internal"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_relative_symlink_resolution_is_lexical_not_canonical() {
