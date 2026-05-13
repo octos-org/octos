@@ -612,6 +612,76 @@ fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool
         .is_some_and(|properties| properties.contains_key(property))
 }
 
+/// Parse the optional `named_outputs` field from a spawn_only plugin's
+/// stdout envelope.
+///
+/// Returns:
+/// - `Ok(None)` when the field is absent or `null`.
+/// - `Ok(Some(map))` when the field is a JSON object whose entries pass
+///   validation (keys match `[a-z][a-z0-9_]*`, values are strings).
+/// - `Err(message)` when the field is present but malformed: not an object,
+///   contains a non-string value, an empty key, or a key shape violation.
+///
+/// The contract layer threads the returned map into `ValidatorInvocation`
+/// so `${output.<key>}` interpolation can resolve against tool-emitted
+/// values. Values are restricted to strings in v1; nested JSON support is
+/// deferred.
+fn parse_named_outputs(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<std::collections::HashMap<String, String>>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "named_outputs must be a JSON object".to_string())?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+    let mut map = std::collections::HashMap::with_capacity(object.len());
+    for (key, entry) in object {
+        if !is_valid_named_output_key(key) {
+            return Err(format!(
+                "named_outputs key '{key}' does not match required shape [a-z][a-z0-9_]*"
+            ));
+        }
+        let string_value = entry.as_str().ok_or_else(|| {
+            format!(
+                "named_outputs value for '{key}' must be a string, got {}",
+                value_kind_label(entry)
+            )
+        })?;
+        map.insert(key.clone(), string_value.to_string());
+    }
+    Ok(Some(map))
+}
+
+/// Validate a `named_outputs` key matches `[a-z][a-z0-9_]*`.
+fn is_valid_named_output_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn value_kind_label(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Resolve a plugin tool's input path (`audio_path` / `file_path` /
 /// `input` / per-slide `source_image`) to an absolute on-disk string.
 ///
@@ -1163,6 +1233,29 @@ impl Tool for PluginTool {
                 })
                 .unwrap_or_default();
 
+            // Parse named_outputs: spawn_only plugins can surface structured
+            // values (e.g. `mofa_publish` emitting `deploy_url`) the contract
+            // layer threads to validators for `${output.<key>}` interpolation.
+            //
+            // Malformed payloads must NOT silently drop the field — surface
+            // a typed failure so the contract layer rejects the result.
+            let named_outputs = match parse_named_outputs(parsed.get("named_outputs")) {
+                Ok(value) => value,
+                Err(reason) => {
+                    tracing::warn!(
+                        plugin = %self.plugin_name,
+                        tool = %self.tool_def.name,
+                        error = %reason,
+                        "rejecting spawn_only result: malformed named_outputs"
+                    );
+                    return Ok(ToolResult {
+                        output: format!("plugin emitted malformed named_outputs: {reason}"),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
+
             // Auto-deliver output file when plugin didn't report it.
             // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
@@ -1177,6 +1270,7 @@ impl Tool for PluginTool {
                 success,
                 file_modified,
                 files_to_send,
+                named_outputs,
                 ..Default::default()
             });
         }
@@ -2622,5 +2716,180 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output, "ran");
         assert!(last.lock().unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: spawn_only stdout envelope extension — `named_outputs`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_named_outputs_returns_none_when_field_absent() {
+        // Tool that doesn't emit named_outputs should parse cleanly to None
+        // so existing spawn_only callers stay byte-identical.
+        let envelope = json!({"success": true, "output": "ok"});
+        let parsed = parse_named_outputs(envelope.get("named_outputs")).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_named_outputs_returns_none_when_field_is_null() {
+        let envelope = json!({"named_outputs": null});
+        let parsed = parse_named_outputs(envelope.get("named_outputs")).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_named_outputs_returns_none_when_object_is_empty() {
+        let envelope = json!({"named_outputs": {}});
+        let parsed = parse_named_outputs(envelope.get("named_outputs")).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_named_outputs_maps_string_values() {
+        let envelope = json!({
+            "named_outputs": {
+                "deploy_url": "https://example.com/site",
+                "repo": "octos/site",
+            }
+        });
+        let parsed = parse_named_outputs(envelope.get("named_outputs"))
+            .unwrap()
+            .expect("expected Some(map)");
+        assert_eq!(
+            parsed.get("deploy_url").map(String::as_str),
+            Some("https://example.com/site")
+        );
+        assert_eq!(parsed.get("repo").map(String::as_str), Some("octos/site"));
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_non_object_payload() {
+        let envelope = json!({"named_outputs": ["a", "b"]});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("must be a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_non_string_value() {
+        // v1: nested JSON not supported. Numbers, bools, arrays, objects
+        // must surface as errors so the contract layer sees a typed
+        // failure rather than silently dropping the field.
+        let envelope = json!({
+            "named_outputs": {"deploy_count": 42}
+        });
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(err.contains("deploy_count"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_key_starting_with_digit() {
+        let envelope = json!({"named_outputs": {"1deploy": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_uppercase_key() {
+        let envelope = json!({"named_outputs": {"DeployUrl": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_key_with_hyphen() {
+        let envelope = json!({"named_outputs": {"deploy-url": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_empty_key() {
+        let envelope = json!({"named_outputs": {"": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_accepts_underscore_and_digits_after_first_char() {
+        let envelope = json!({"named_outputs": {"deploy_url_v2": "x", "out1": "y"}});
+        let parsed = parse_named_outputs(envelope.get("named_outputs"))
+            .unwrap()
+            .expect("expected map");
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_with_named_outputs_threads_field_into_tool_result() {
+        // End-to-end: plugin emits {"named_outputs": {...}} on stdout, the
+        // PluginTool wrapper forwards it through ToolResult so the
+        // spawn_only contract path can read it.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"success\":true,\"output\":\"deployed\",\"named_outputs\":{\"deploy_url\":\"http://example.com/site\"}}'\n",
+        );
+
+        let def = make_tool_def("publish_tool", "publish");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("execute should ok");
+        assert!(result.success);
+        assert_eq!(result.output, "deployed");
+        let named = result.named_outputs.expect("named_outputs should be set");
+        assert_eq!(
+            named.get("deploy_url").map(String::as_str),
+            Some("http://example.com/site")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_with_malformed_named_outputs_returns_failure() {
+        // A plugin emitting a non-string value in named_outputs must
+        // surface as a typed failure so the contract layer rejects it.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"success\":true,\"output\":\"ok\",\"named_outputs\":{\"count\":42}}'\n",
+        );
+
+        let def = make_tool_def("bad_tool", "emits bad named outputs");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("execute should ok");
+        assert!(!result.success);
+        assert!(
+            result.output.contains("named_outputs") || result.output.contains("must be a string"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_without_named_outputs_leaves_tool_result_none() {
+        // Backward compat: legacy plugins that don't emit named_outputs
+        // must continue to produce ToolResult.named_outputs = None.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"success\":true,\"output\":\"done\"}'\n",
+        );
+
+        let def = make_tool_def("legacy_tool", "legacy");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("execute should ok");
+        assert!(result.success);
+        assert!(result.named_outputs.is_none());
     }
 }

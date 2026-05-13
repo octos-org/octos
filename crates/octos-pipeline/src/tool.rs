@@ -457,6 +457,7 @@ impl Tool for RunPipelineTool {
             file_modified: report_file,
             files_to_send,
             structured_metadata,
+            named_outputs: None,
         })
     }
 }

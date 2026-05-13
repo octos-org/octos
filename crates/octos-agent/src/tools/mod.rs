@@ -412,6 +412,14 @@ pub struct ToolResult {
     /// panel can render real per-node attribution. Absent (`None`) for
     /// every tool that does not opt in — keeps legacy callers byte-identical.
     pub structured_metadata: Option<serde_json::Value>,
+    /// Optional named outputs the tool wants the contract layer to read.
+    /// spawn_only plugin tools emit this via `"named_outputs": {"key": "value"}`
+    /// in their stdout JSON envelope. The contract layer forwards each entry
+    /// to validators so `${output.<key>}` interpolation can resolve against
+    /// tool-emitted values (e.g. `mofa_publish` emitting `deploy_url`).
+    /// Values are restricted to strings in v1; key shape must match
+    /// `[a-z][a-z0-9_]*`. Absent (`None`) when the tool emits nothing.
+    pub named_outputs: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Trait for implementing tools.

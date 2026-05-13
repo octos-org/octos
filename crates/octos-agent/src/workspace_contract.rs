@@ -47,13 +47,14 @@ pub async fn enforce_spawn_task_contract(
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
 ) -> SpawnTaskContractResult {
-    enforce_spawn_task_contract_with_args(
+    enforce_spawn_task_contract_with_args_and_output(
         tools,
         tool_name,
         tool_call_id,
         files_to_send,
         task_started_at,
         supervisor,
+        None,
         None,
     )
     .await
@@ -63,9 +64,11 @@ pub async fn enforce_spawn_task_contract(
 /// spawn task's input args so domain validators (`HttpProbe`,
 /// `OminixVoiceExists`) can resolve `${args.<key>}` references against them.
 ///
-/// Production callers in the agent loop should prefer this entry point — the
-/// args-less variant exists for legacy call sites that don't yet have the
-/// input JSON in scope.
+/// Production callers in the agent loop should prefer
+/// [`enforce_spawn_task_contract_with_args_and_output`] (which also threads
+/// the tool's `named_outputs` for `${output.<key>}` interpolation). This
+/// entry point exists for callers that have args but no tool output to
+/// forward.
 pub async fn enforce_spawn_task_contract_with_args(
     tools: &ToolRegistry,
     tool_name: &str,
@@ -74,6 +77,39 @@ pub async fn enforce_spawn_task_contract_with_args(
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
     input_args: Option<&serde_json::Value>,
+) -> SpawnTaskContractResult {
+    enforce_spawn_task_contract_with_args_and_output(
+        tools,
+        tool_name,
+        tool_call_id,
+        files_to_send,
+        task_started_at,
+        supervisor,
+        input_args,
+        None,
+    )
+    .await
+}
+
+/// Full variant of [`enforce_spawn_task_contract`] that threads BOTH the
+/// originating spawn task's input args (for `${args.<key>}` interpolation)
+/// AND the tool's `named_outputs` (for `${output.<key>}` interpolation).
+///
+/// `tool_named_outputs` is a JSON object built from the tool's stdout
+/// envelope; pass `None` for tools that emit nothing. The contract layer
+/// forwards it verbatim to [`run_declared_validators_with_output`] so the
+/// validator runner can interpolate templated URLs (e.g. `mofa_publish`
+/// emitting `deploy_url` then `HttpProbe { url_template = "${output.deploy_url}" }`).
+#[allow(clippy::too_many_arguments)]
+pub async fn enforce_spawn_task_contract_with_args_and_output(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    tool_call_id: &str,
+    files_to_send: &[PathBuf],
+    task_started_at: SystemTime,
+    supervisor: Option<(&TaskSupervisor, &str)>,
+    input_args: Option<&serde_json::Value>,
+    tool_named_outputs: Option<&serde_json::Value>,
 ) -> SpawnTaskContractResult {
     let required_by_default = default_session_policy_requires_contract(tool_name);
     let Some(workspace_root) = tools.workspace_root() else {
@@ -160,13 +196,14 @@ pub async fn enforce_spawn_task_contract_with_args(
     for (index, entry) in task_policy.on_completion.iter().enumerate() {
         combined_validators.push(entry.clone().into_validator(tool_name, index));
     }
-    match run_declared_validators(
+    match run_declared_validators_with_output(
         tools,
         workspace_root,
         &combined_validators,
         tool_name,
         ValidatorPhase::Completion,
         input_args.cloned(),
+        tool_named_outputs.cloned(),
     )
     .await
     {
@@ -505,6 +542,9 @@ fn default_session_policy_requires_contract(tool_name: &str) -> bool {
 /// domain validators (`HttpProbe`, `OminixVoiceExists`) can resolve
 /// `${args.<key>}` references. Pass `None` for non-spawn contexts (e.g.
 /// turn-end validators that don't reference task inputs).
+///
+/// Thin wrapper for non-spawn-only callers that have no tool output to
+/// forward. Spawn-only callers should use [`run_declared_validators_with_output`].
 pub async fn run_declared_validators(
     tools: &ToolRegistry,
     workspace_root: &Path,
@@ -512,6 +552,32 @@ pub async fn run_declared_validators(
     repo_label_hint: &str,
     phase: ValidatorPhase,
     input_args: Option<serde_json::Value>,
+) -> Result<Vec<ValidatorOutcome>, String> {
+    run_declared_validators_with_output(
+        tools,
+        workspace_root,
+        validators,
+        repo_label_hint,
+        phase,
+        input_args,
+        None,
+    )
+    .await
+}
+
+/// Variant of [`run_declared_validators`] that also threads the spawn
+/// task's `named_outputs` (`tool_output`) into the validator invocation so
+/// domain validators can resolve `${output.<key>}` references against
+/// tool-emitted values (e.g. `mofa_publish` emitting `deploy_url` for the
+/// HttpProbe to call).
+pub async fn run_declared_validators_with_output(
+    tools: &ToolRegistry,
+    workspace_root: &Path,
+    validators: &[Validator],
+    repo_label_hint: &str,
+    phase: ValidatorPhase,
+    input_args: Option<serde_json::Value>,
+    tool_output: Option<serde_json::Value>,
 ) -> Result<Vec<ValidatorOutcome>, String> {
     if validators.is_empty() {
         return Ok(Vec::new());
@@ -552,6 +618,7 @@ pub async fn run_declared_validators(
         workspace_root: workspace_root.to_path_buf(),
         repo_label: repo_label_hint.to_string(),
         input_args,
+        tool_output,
     };
 
     let outcomes = runner.run_all(&invocation, &scoped).await;
@@ -1253,6 +1320,252 @@ mod tests {
                 assert_eq!(notify_user.as_deref(), Some("Voice registration failed"));
             }
             other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: named_outputs end-to-end through enforce_spawn_task_contract.
+    // -------------------------------------------------------------------
+
+    /// Tiny synchronous HTTP server scripted via `responses`. Re-used from
+    /// the validators test module to drive end-to-end probes.
+    fn spawn_test_http_server(responses: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    /// Build a `mofa_publish` policy with the HttpProbe forced to
+    /// `required = true` so the test gate fails on a missing
+    /// named_output. Mirrors the eventual post-mofa-skills-follow-up
+    /// state of the policy.
+    fn mofa_publish_required_policy(url_template: &str) -> WorkspacePolicy {
+        use crate::Validator;
+        use crate::workspace_policy::{SpawnTaskValidatorSpec, ValidatorPhaseKind, ValidatorSpec};
+
+        let mut policy = WorkspacePolicy::for_session();
+        let publish = policy.spawn_tasks.entry("mofa_publish".into()).or_default();
+        publish.on_failure = vec!["notify_user:Publish probe failed".into()];
+        publish.on_completion = vec![SpawnTaskValidatorSpec::Full(Validator {
+            id: "mofa_publish.deploy_url_probe".into(),
+            required: true,
+            timeout_ms: Some(2000),
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::HttpProbe {
+                url_template: url_template.to_string(),
+                expected_status: 200,
+                expected_contains: Some("<!DOCTYPE".into()),
+            },
+        })];
+        policy
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_contract_satisfies_when_named_outputs_deploy_url_serves_doctype() {
+        // End-to-end: tool emits `named_outputs.deploy_url`; contract
+        // probes that URL; server returns a 200 with `<!DOCTYPE` body.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n<!DOCTYPE html>";
+        let addr = spawn_test_http_server(vec![response]);
+        let temp = tempfile::tempdir().unwrap();
+        // Force the validator to `required = true` so a missing/failing
+        // probe blocks the contract.
+        write_workspace_policy(
+            temp.path(),
+            &mofa_publish_required_policy("${output.deploy_url}"),
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-ok",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            Some(&json!({"deploy_url": format!("http://{addr}/site")})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_contract_fails_when_probe_returns_soft_404_html() {
+        // 200 OK with a body that lacks `<!DOCTYPE` (e.g. a JSON soft-404
+        // wrapper) must fail the contract.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"error\":\"missing\"}";
+        let addr = spawn_test_http_server(vec![response]);
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(
+            temp.path(),
+            &mofa_publish_required_policy("${output.deploy_url}"),
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-soft-404",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            Some(&json!({"deploy_url": format!("http://{addr}/missing")})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("<!DOCTYPE") || error.contains("did not contain"),
+                    "unexpected error: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Publish probe failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_contract_fails_when_named_outputs_deploy_url_missing() {
+        // The skill claimed success but emitted NO named_outputs.
+        // With a `required = true` probe, the contract should reject
+        // the result because `${output.deploy_url}` is unresolvable.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(
+            temp.path(),
+            &mofa_publish_required_policy("${output.deploy_url}"),
+        )
+        .unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-missing-url",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            // tool_output absent — emulates the current mofa_publish
+            // skill (before the mofa-skills repo follow-up).
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, .. } => {
+                assert!(
+                    error.contains("deploy_url"),
+                    "error should name the missing output key: {error}"
+                );
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_publish_default_contract_does_not_block_when_skill_not_yet_emitting_output() {
+        // Until the mofa-skills repo follow-up lands, mofa_publish does
+        // NOT yet emit `named_outputs.deploy_url`. The default contract
+        // ships the probe as `required = false` so the missing key
+        // produces a diagnostic ledger entry but does NOT fail the gate.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_publish",
+            "tool-call-publish-default-policy",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            // No named_outputs from the skill (current state).
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!(
+                "default mofa_publish policy must not block users until mofa-skills \
+                 catches up; got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_only_envelope_named_outputs_threads_through_contract_to_validator() {
+        // Wave-3b protocol invariant: a spawn_only tool emits
+        // `named_outputs` on stdout → the contract forwards it to the
+        // validator runner → the runner uses `${output.X}` interpolation
+        // to drive (in this case) a FileExists check against a tool-
+        // emitted path. Validates the full chain end-to-end without
+        // depending on HTTP.
+        use crate::Validator;
+        use crate::workspace_policy::{
+            SpawnTaskValidatorSpec, ValidatorPhaseKind, ValidatorSpec, WorkspaceSpawnTaskPolicy,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        policy.spawn_tasks.insert(
+            "fake_publish".into(),
+            WorkspaceSpawnTaskPolicy {
+                artifact: None,
+                artifacts: Vec::new(),
+                on_verify: Vec::new(),
+                on_complete: vec![],
+                on_deliver: vec![],
+                on_failure: vec!["notify_user:Fake publish failed".into()],
+                on_completion: vec![SpawnTaskValidatorSpec::Full(Validator {
+                    id: "fake_publish.target_exists".into(),
+                    required: true,
+                    timeout_ms: None,
+                    phase: ValidatorPhaseKind::Completion,
+                    spec: ValidatorSpec::FileExists {
+                        path: "${output.target_path}".into(),
+                        min_bytes: None,
+                    },
+                })],
+            },
+        );
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        std::fs::write(temp.path().join("artifact.txt"), b"x").unwrap();
+
+        let result = enforce_spawn_task_contract_with_args_and_output(
+            &ToolRegistry::with_builtins(temp.path()),
+            "fake_publish",
+            "tool-call-fake",
+            &[],
+            UNIX_EPOCH,
+            None,
+            None,
+            Some(&json!({"target_path": "artifact.txt"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected named_outputs path to satisfy contract, got {other:?}"),
         }
     }
 }
