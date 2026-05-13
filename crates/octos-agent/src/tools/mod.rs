@@ -686,6 +686,16 @@ use std::path::{Component, Path};
 /// filesystem access except a single existence check for the upload
 /// whitelist).
 pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
+    // Upload-handle short-circuit. `/api/upload` returns paths in the
+    // form `up/<base64-payload>/<filename>` — opaque handles, not
+    // filesystem paths. The SPA echoes the handle into the LLM turn
+    // as an attachment, and the LLM passes it directly to `read_file`.
+    // Decode here so the rest of `resolve_path` sees a real absolute
+    // path inside the upload tmpdir.
+    if let Some(resolved) = octos_bus::file_handle::resolve_upload_reference(user_path) {
+        return Ok(normalize_path(&resolved));
+    }
+
     let candidate = PathBuf::from(user_path);
     if candidate.is_absolute() {
         if is_inside_upload_root(&candidate) {
