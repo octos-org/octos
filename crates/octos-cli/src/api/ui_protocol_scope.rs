@@ -152,21 +152,21 @@ impl ScopePolicy {
         // Slow path: insert a new session entry. We need a write lock on
         // `sessions` only when the session isn't there yet.
         let needs_insert = {
-            let sessions = self.sessions.read().expect("scope policy poisoned");
+            let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
             !sessions.contains_key(session_id)
         };
         if needs_insert {
-            let mut sessions = self.sessions.write().expect("scope policy poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
             sessions
                 .entry(session_id.clone())
                 .or_insert_with(|| Mutex::new(SessionScopes::default()));
         }
 
-        let sessions = self.sessions.read().expect("scope policy poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         let session = sessions
             .get(session_id)
             .expect("session entry created above");
-        let mut session = session.lock().expect("session scope poisoned");
+        let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
         session.entries.insert(
             (scope_kind, match_key.clone()),
             ScopeEntry {
@@ -195,9 +195,9 @@ impl ScopePolicy {
         tool_name: &str,
         turn_id: &TurnId,
     ) -> Option<ScopeHit> {
-        let sessions = self.sessions.read().expect("scope policy poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         let session = sessions.get(session_id)?;
-        let session = session.lock().expect("session scope poisoned");
+        let session = session.lock().unwrap_or_else(|p| p.into_inner());
         let probes: [(ApprovalScopeKind, MatchKey); 3] = [
             (
                 ApprovalScopeKind::ApproveForTurn,
@@ -234,18 +234,18 @@ impl ScopePolicy {
     /// further refactoring.
     #[allow(dead_code)]
     pub(super) fn evict_session(&self, session_id: &SessionKey) {
-        let mut sessions = self.sessions.write().expect("scope policy poisoned");
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions.remove(session_id);
     }
 
     /// Drops every `ApproveForTurn` entry for `(session_id, turn_id)`. Other
     /// scope kinds (`session`, `tool`) are unaffected — they outlive the turn.
     pub(super) fn evict_turn(&self, session_id: &SessionKey, turn_id: &TurnId) {
-        let sessions = self.sessions.read().expect("scope policy poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         let Some(session) = sessions.get(session_id) else {
             return;
         };
-        let mut session = session.lock().expect("session scope poisoned");
+        let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
         session.entries.retain(|_, entry| {
             entry
                 .turn_id
@@ -258,11 +258,11 @@ impl ScopePolicy {
     /// `approval/scopes/list` handler can return it directly. Sorted for
     /// deterministic output.
     pub(super) fn list_for_session(&self, session_id: &SessionKey) -> Vec<ApprovalScopeEntry> {
-        let sessions = self.sessions.read().expect("scope policy poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         let Some(session) = sessions.get(session_id) else {
             return Vec::new();
         };
-        let session = session.lock().expect("session scope poisoned");
+        let session = session.lock().unwrap_or_else(|p| p.into_inner());
         let mut entries: Vec<ApprovalScopeEntry> = session
             .entries
             .iter()
@@ -287,13 +287,13 @@ impl ScopePolicy {
     /// Test-only: number of stored entries for a session.
     #[cfg(test)]
     pub(super) fn entry_count(&self, session_id: &SessionKey) -> usize {
-        let sessions = self.sessions.read().expect("scope policy poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions
             .get(session_id)
             .map(|session| {
                 session
                     .lock()
-                    .expect("session scope poisoned")
+                    .unwrap_or_else(|p| p.into_inner())
                     .entries
                     .len()
             })
