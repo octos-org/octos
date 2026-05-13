@@ -17,12 +17,14 @@
 //! - The router-managed output file path is computed from the supervisor's
 //!   `BackgroundTask::tool_call_id`; the LLM never supplies a path.
 //! - For `file` mode the LLM-supplied path is resolved against
-//!   `workspace_root`. Workspace-relative paths go through `resolve_path`
-//!   (rejects traversal). Absolute paths are accepted only when (a) they
-//!   appear verbatim in `task.output_files` and (b) they normalise to a
-//!   path inside the workspace root. The file is also restricted to one
-//!   of the task's `output_files`, which the supervisor records once the
-//!   task has completed.
+//!   `workspace_root` through
+//!   [`octos_bus::file_handle::resolve_tool_path`]. Workspace-relative
+//!   paths reject traversal, absolute paths must lie inside the
+//!   workspace root, and any resolution outside the
+//!   [`octos_bus::file_handle::ToolPathScope::Workspace`] scope is
+//!   refused — this tool does not surface uploads or profile files.
+//!   The file is also restricted to one of the task's `output_files`,
+//!   which the supervisor records once the task has completed.
 //! - All file reads use `O_NOFOLLOW` on Unix (symlink-target reads are
 //!   refused atomically; see `read_capped_no_follow`) so a symlink
 //!   inside the workspace cannot redirect a read outside it.
@@ -40,7 +42,7 @@ use serde_json::{Value, json};
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::task_supervisor::TaskSupervisor;
 
-use super::{Tool, ToolResult, resolve_path};
+use super::{Tool, ToolResult};
 
 /// Hard cap on the bytes any single `read_task_output` call returns. Keeps
 /// the LLM context from being re-polluted by large research reports.
@@ -302,17 +304,14 @@ impl ReadTaskOutputTool {
         //       `workspace_root` (so an absolute `output_files` entry
         //       outside the workspace cannot grant escape).
         let resolved = resolve_handle_path(&self.workspace_root, path)?;
+        // Resolve every `output_files` entry through the same routine
+        // we use for the caller-supplied path, then compare normalised
+        // forms. This keeps the absolute-vs-relative semantics
+        // identical on both sides of the whitelist check.
         let allowed_match = task.output_files.iter().any(|f| {
-            let candidate = Path::new(f);
-            if candidate.is_absolute() {
-                normalize_inside_workspace(&self.workspace_root, candidate)
-                    .map(|p| p == resolved)
-                    .unwrap_or(false)
-            } else {
-                resolve_path(&self.workspace_root, f)
-                    .map(|p| p == resolved)
-                    .unwrap_or(false)
-            }
+            resolve_handle_path(&self.workspace_root, f)
+                .map(|p| p == resolved)
+                .unwrap_or(false)
         });
         if !allowed_match {
             eyre::bail!(
@@ -356,13 +355,38 @@ impl ReadTaskOutputTool {
 /// Codex round 3 P2: required so the LLM can pass back the absolute
 /// strings that `check_background_tasks` exposes from the supervisor's
 /// `output_files` field (which are often absolute under the workspace).
+///
+/// Routed through the unified
+/// [`octos_bus::file_handle::resolve_tool_path`] resolver since the
+/// unified table already encodes "absolute inside workspace OR
+/// workspace-relative" semantics. Only the [`ToolPathScope::Workspace`]
+/// scope is permitted here — upload-tmpdir / profile-root scopes would
+/// grant the LLM read access to paths outside the per-task
+/// `output_files` whitelist, which is the whole point of this tool's
+/// gating.
 fn resolve_handle_path(workspace_root: &Path, user_path: &str) -> Result<PathBuf> {
-    let p = Path::new(user_path);
-    if p.is_absolute() {
-        normalize_inside_workspace(workspace_root, p)
-            .ok_or_else(|| eyre::eyre!("absolute path '{}' is outside the workspace", user_path))
-    } else {
-        resolve_path(workspace_root, user_path).wrap_err("path must stay inside the workspace")
+    use octos_bus::file_handle::{ToolPathError, ToolPathScope, resolve_tool_path};
+    match resolve_tool_path(workspace_root, None, user_path) {
+        Ok(resolved) => {
+            if resolved.scope == ToolPathScope::Workspace {
+                Ok(resolved.absolute)
+            } else {
+                eyre::bail!(
+                    "path '{}' resolved outside the workspace ({:?}); only workspace paths are permitted",
+                    user_path,
+                    resolved.scope
+                )
+            }
+        }
+        Err(ToolPathError::Traversal) => {
+            eyre::bail!("path must stay inside the workspace: {}", user_path)
+        }
+        Err(ToolPathError::OutsideAllowedRoots) => {
+            eyre::bail!("absolute path '{}' is outside the workspace", user_path)
+        }
+        Err(ToolPathError::DecodeFailed) => {
+            eyre::bail!("path must stay inside the workspace: {}", user_path)
+        }
     }
 }
 
@@ -379,19 +403,40 @@ fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<
     // Walk from workspace_root downwards: each ancestor must NOT be a
     // symlink. We deliberately stop one level above the leaf — the leaf
     // is policed by the O_NOFOLLOW open in `read_capped_no_follow`.
-    let mut current = workspace_root.to_path_buf();
-    let suffix = match resolved.strip_prefix(workspace_root) {
-        Ok(s) => s.to_path_buf(),
-        Err(_) => {
-            // Should not happen: `resolved` was already verified to be
-            // inside `workspace_root` by `resolve_handle_path`. Defend
-            // anyway.
-            eyre::bail!(
-                "internal: resolved path {} not inside workspace {}",
-                resolved.display(),
-                workspace_root.display()
-            );
-        }
+    //
+    // CRITICAL: walk the ORIGINAL (lexical) path components, not the
+    // canonical form. If we canonicalised `resolved` here we'd rewrite
+    // a `workspace/out/file` chain — where `out` is a symlink to some
+    // other workspace dir — into the symlink target before the loop
+    // ran, so the loop would stat the *target's* ancestors and miss
+    // the symlink it was supposed to refuse. The actual `read_capped_
+    // no_follow` then still opens the original path and follows the
+    // parent symlink. Codex review round 3 P2 (2026-05-13) pinned
+    // this exact escape.
+    //
+    // Canonicalise the ROOT only — that's needed because on macOS the
+    // supplied `workspace_root` is typically the un-prefixed
+    // `/var/folders/...` form while `resolved` for absolute inputs may
+    // come back in the `/private/var/folders/...` firmlink form. We
+    // build a candidate `(canonical_root, lexical_root)` pair and try
+    // strip_prefix against both so absolute and workspace-relative
+    // resolutions both succeed.
+    let canonical_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let lexical_root = workspace_root.to_path_buf();
+    let (mut current, suffix) = if let Ok(s) = resolved.strip_prefix(&lexical_root) {
+        (lexical_root, s.to_path_buf())
+    } else if let Ok(s) = resolved.strip_prefix(&canonical_root) {
+        (canonical_root, s.to_path_buf())
+    } else {
+        // Should not happen: `resolved` was already verified to be
+        // inside `workspace_root` by `resolve_handle_path`. Defend
+        // anyway.
+        eyre::bail!(
+            "internal: resolved path {} not inside workspace {}",
+            resolved.display(),
+            workspace_root.display()
+        );
     };
     let comps: Vec<_> = suffix.components().collect();
     if comps.is_empty() {
@@ -425,36 +470,11 @@ fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<
     Ok(())
 }
 
-/// Build a normalised PathBuf for an absolute path, returning `None` if
-/// it does not lie inside `workspace_root` after normalisation.
-fn normalize_inside_workspace(workspace_root: &Path, abs: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for comp in abs.components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    let mut root = PathBuf::new();
-    for comp in workspace_root.components() {
-        match comp {
-            Component::ParentDir => {
-                root.pop();
-            }
-            Component::CurDir => {}
-            other => root.push(other.as_os_str()),
-        }
-    }
-    if out.starts_with(&root) {
-        Some(out)
-    } else {
-        None
-    }
-}
+// Note: the previous `normalize_inside_workspace` helper retired with
+// the migration to `octos_bus::file_handle::resolve_tool_path`. The
+// unified resolver does the absolute-vs-workspace containment check
+// (with macOS firmlink collapsing) so this duplicate is no longer
+// needed.
 
 /// Apply an inline read mode (head/tail/grep/line_range) against `text`.
 /// `file` mode is rejected here — file is handled at the dispatch site so
@@ -973,6 +993,60 @@ mod tests {
         assert!(
             !body.contains("root:x:0:0"),
             "parent-directory symlink must not grant read; got: {body}"
+        );
+    }
+
+    // Codex review round 3 P2 (2026-05-13): the ancestor walk must
+    // operate on the ORIGINAL path components, not on the canonical
+    // form. A symlinked parent that currently points inside the
+    // workspace would canonicalise away — but the file is still
+    // *opened* through the original path, so the parent symlink is
+    // followed. If that symlink later gets retargeted (e.g. to /etc),
+    // the read at open time sees the new target. Refuse symlinked
+    // ancestors regardless of where they currently point.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_mode_rejects_symlinked_parent_pointing_inside_workspace() {
+        let dir = tempdir().unwrap();
+        let (supervisor, router, tool) = make_tool(dir.path());
+        let task_id = seed_task(&supervisor, &router, "tc-parent-sym-inside", "stdout\n");
+
+        // Two workspace-internal dirs: `real/` (the actual target) and
+        // a symlink `out/` that currently points at `real/`.
+        let workspace = dir.path().join("workspace");
+        let real_dir = workspace.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("report.md"), b"workspace-content").unwrap();
+        let link_inside = workspace.join("out");
+        std::os::unix::fs::symlink(&real_dir, &link_inside).unwrap();
+
+        // Record `out/report.md` — traverses the parent symlink.
+        // Canonicalisation collapses it to `real/report.md`, both of
+        // which lie inside the workspace; the ancestor walk MUST still
+        // refuse `out` because the actual open uses the lexical path
+        // and would follow whatever `out` points to at open time
+        // (potentially retargeted between this check and the open).
+        let recorded = "out/report.md";
+        supervisor.mark_completed(&task_id, vec![recorded.to_string()]);
+
+        let result = tool
+            .execute(&json!({
+                "task_handle": task_id,
+                "mode": {
+                    "kind": "file",
+                    "path": recorded,
+                    "mode": {"kind": "head", "lines": 1}
+                }
+            }))
+            .await;
+        let body = match result {
+            Ok(r) => r.output,
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !body.contains("workspace-content"),
+            "symlinked parent (even when target lies inside workspace) must be refused — \
+             canonicalisation would otherwise let a later retarget grant escape; got: {body}"
         );
     }
 

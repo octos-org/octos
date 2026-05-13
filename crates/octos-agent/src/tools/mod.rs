@@ -669,122 +669,67 @@ pub use git::GitTool;
 #[cfg(feature = "ast")]
 pub use code_structure::CodeStructureTool;
 
-use std::path::{Component, Path};
+use std::path::Path;
 
-/// Resolve a user-provided path, ensuring it stays within base_dir
-/// **or** inside the authenticated upload tmpdir.
+/// Resolve a user-provided tool-argument path, ensuring it stays within
+/// `base_dir` **or** inside the authenticated upload tmpdir.
 ///
-/// Absolute paths are accepted only when they point at a file under
-/// `octos_bus::file_handle::temp_upload_root()` — those files are
-/// user-uploaded attachments resolved by the WS/REST upload handler
-/// from an authenticated session, so the agent is allowed to read
-/// them even though they live outside the per-session workspace. All
-/// other absolute paths are rejected.
+/// This is a thin compatibility wrapper around
+/// [`octos_bus::file_handle::resolve_tool_path`] — the unified resolver
+/// introduced by `refactor: unified file-path resolver`. The wrapper
+/// preserves the historical signature (`(base_dir, user_path) ->
+/// Result<PathBuf>`) so existing tool implementations keep compiling,
+/// but the actual policy now lives in `octos-bus` so every entry point
+/// (read_file/write_file/edit_file/glob/grep/list_dir, plugin tools,
+/// `send_file`, `read_task_output`) follows the same resolution table:
 ///
-/// Relative paths must resolve under `base_dir` after `../` traversal
-/// is normalized away. Does NOT follow symlinks (normalize only, no
-/// filesystem access except a single existence check for the upload
-/// whitelist).
+/// - `up/<base64>` / `up/<base64>/<display>` upload-handle short-circuit
+/// - `pf/<base64>` / `pf/<base64>/<display>` profile-handle short-circuit
+///   (only honoured when the call site supplies a profile root)
+/// - absolute paths inside upload tmpdir, workspace, or profile root
+/// - bare basenames that exist under the upload tmpdir
+/// - workspace-relative paths (with `..` traversal rejected)
+///
+/// Symlink rejection is the caller's responsibility — use
+/// `read_no_follow` / `write_no_follow` on the returned path. The
+/// resolver only checks containment; the open-time `O_NOFOLLOW` is
+/// what closes the symlink-redirect class of escape.
+///
+/// Callers that need to know whether the resolved file lives inside
+/// the upload tmpdir vs the workspace (e.g. for read-only enforcement
+/// on profile files) should call
+/// [`octos_bus::file_handle::resolve_tool_path`] directly and inspect
+/// the [`octos_bus::file_handle::ToolPathScope`].
 pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
-    // Upload-handle short-circuit. `/api/upload` returns paths in the
-    // form `up/<base64-payload>/<filename>` — opaque handles, not
-    // filesystem paths. The SPA echoes the handle into the LLM turn
-    // as an attachment, and the LLM passes it directly to `read_file`.
-    // Decode here so the rest of `resolve_path` sees a real absolute
-    // path inside the upload tmpdir.
-    if let Some(resolved) = octos_bus::file_handle::resolve_upload_reference(user_path) {
-        return Ok(normalize_path(&resolved));
-    }
-
-    let candidate = PathBuf::from(user_path);
-    if candidate.is_absolute() {
-        if is_inside_upload_root(&candidate) {
-            return Ok(normalize_path(&candidate));
+    match octos_bus::file_handle::resolve_tool_path(base_dir, None, user_path) {
+        Ok(resolved) => Ok(resolved.absolute),
+        Err(octos_bus::file_handle::ToolPathError::Traversal) => {
+            eyre::bail!("path outside working directory: {}", user_path)
         }
-        eyre::bail!(
-            "absolute paths are not allowed outside the upload tmpdir: {}",
-            user_path
-        );
+        Err(octos_bus::file_handle::ToolPathError::OutsideAllowedRoots) => {
+            // Preserve the legacy error text — call sites and tests
+            // string-match on "absolute paths are not allowed" to
+            // identify the upload-tmpdir-only escape rejection.
+            eyre::bail!(
+                "absolute paths are not allowed outside the upload tmpdir: {}",
+                user_path
+            )
+        }
+        Err(octos_bus::file_handle::ToolPathError::DecodeFailed) => {
+            // Should not happen for callers that pass `profile_root =
+            // None` (only `pf/...` handles produce `DecodeFailed`). If
+            // we ever do see one, surface it as the closest matching
+            // legacy message rather than silently swallowing it.
+            eyre::bail!("path outside working directory: {}", user_path)
+        }
     }
-
-    let path = base_dir.join(user_path);
-    let normalized = normalize_path(&path);
-    let base_normalized = normalize_path(base_dir);
-
-    if !normalized.starts_with(&base_normalized) {
-        eyre::bail!("path outside working directory: {}", user_path);
-    }
-
-    Ok(normalized)
 }
 
-/// Returns true when `candidate` resolves under the authenticated upload
-/// tmpdir. macOS firmlinks render the same directory as both
-/// `/var/folders/...` and `/private/var/folders/...`; `resolve_upload_reference`
-/// runs `std::fs::canonicalize` and returns the `/private/` form, but
-/// `temp_upload_root()` returns the un-prefixed form. Compare via
-/// `canonicalize` on the upload root so the firmlink is collapsed; on the
-/// candidate side, walk parents to find one that exists, canonicalize that,
-/// and re-attach the remainder. Without this both Linux *and* macOS work
-/// — but Linux paths never differ syntactically, while macOS without the
-/// canonicalize step compares `/private/var/...` to `/var/...` and rejects.
-fn is_inside_upload_root(candidate: &Path) -> bool {
-    let upload_root = octos_bus::file_handle::temp_upload_root();
-    let upload_root_canon =
-        std::fs::canonicalize(&upload_root).unwrap_or_else(|_| normalize_path(&upload_root));
-    let candidate_canon = canonicalize_lossy(candidate);
-    candidate_canon.starts_with(&upload_root_canon)
-}
-
-/// Canonicalize as much of `path` as currently exists on disk; for the
-/// non-existent tail, fall back to syntactic normalization. We need this
-/// because `read_file` is called with a path whose file may have been
-/// removed (e.g. tmp cleanup) between resolution and tool execution — a
-/// strict `canonicalize` would error in that case and skip the whitelist
-/// check.
-fn canonicalize_lossy(path: &Path) -> PathBuf {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return canon;
-    }
-    let mut existing = path;
-    let mut suffix = PathBuf::new();
-    while let Some(parent) = existing.parent() {
-        if let Some(name) = existing.file_name() {
-            let mut next_suffix = PathBuf::from(name);
-            next_suffix.push(&suffix);
-            suffix = next_suffix;
-        }
-        existing = parent;
-        if let Ok(canon) = std::fs::canonicalize(existing) {
-            return canon.join(suffix);
-        }
-        if existing.as_os_str().is_empty() {
-            break;
-        }
-    }
-    normalize_path(path)
-}
-
-/// Normalize path by resolving `.` and `..` components without filesystem access.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            // RootDir and Prefix reset the path (absolute path semantics)
-            Component::RootDir | Component::Prefix(_) => {
-                out.push(component.as_os_str());
-            }
-            Component::Normal(seg) => {
-                out.push(seg);
-            }
-        }
-    }
-    out
-}
+// Note: lexical-normalisation and lossy-canonicalisation now live in
+// `octos_bus::file_handle::resolve_tool_path` so every entry point (file
+// tools, plugin tools, send_file, read_task_output) shares the same
+// machinery. The previously-inline helpers were retired with that
+// unification.
 
 /// Check that a path is not a symlink. Returns error message if it is.
 ///
@@ -1062,17 +1007,27 @@ mod path_tests {
     /// 2026-05-12: WS upload handles now resolve to absolute tmpdir
     /// paths, but the LLM hit "absolute paths are not allowed" before
     /// this fix).
+    ///
+    /// Post-`resolve_tool_path` migration: the resolver now always
+    /// returns the canonical form (firmlinks collapsed via
+    /// `canonicalize_lossy`), so the containment check uses the
+    /// canonicalised upload root instead of the un-prefixed one — the
+    /// macOS firmlink companion test already uses this same shape.
     #[test]
     fn test_resolve_allows_absolute_path_inside_upload_root() {
         let upload_root = octos_bus::file_handle::temp_upload_root();
+        // Ensure the upload root exists so canonicalize succeeds even on
+        // pristine Linux CI runners that haven't touched the tmpdir yet.
+        std::fs::create_dir_all(&upload_root).expect("upload tmpdir creatable");
         let abs = upload_root.join("abc-redbank-proposal.md");
         let resolved = resolve_path(Path::new("/home/user/project"), &abs.to_string_lossy())
             .expect("upload-tmpdir absolute paths must be accepted");
+        let canonical_upload_root = std::fs::canonicalize(&upload_root).unwrap_or(upload_root);
         assert!(
-            resolved.starts_with(&upload_root),
-            "resolved path {} should be under {}",
+            resolved.starts_with(&canonical_upload_root),
+            "resolved path {} should canonicalise under {}",
             resolved.display(),
-            upload_root.display()
+            canonical_upload_root.display()
         );
     }
 
@@ -1107,7 +1062,7 @@ mod path_tests {
         )
         .expect("firmlink-canonical upload path must be accepted");
         assert!(
-            resolved.starts_with(&std::fs::canonicalize(&upload_root).unwrap()),
+            resolved.starts_with(std::fs::canonicalize(&upload_root).unwrap()),
             "resolved path {} must canonicalize under upload root",
             resolved.display()
         );
@@ -1166,17 +1121,11 @@ mod path_tests {
         assert_eq!(p, PathBuf::from("/home/user/project/a/b/c/d/e/f.rs"));
     }
 
-    #[test]
-    fn test_normalize_handles_complex_paths() {
-        assert_eq!(
-            normalize_path(Path::new("/a/b/../c/./d")),
-            PathBuf::from("/a/c/d")
-        );
-        assert_eq!(
-            normalize_path(Path::new("/a/b/../../c")),
-            PathBuf::from("/c")
-        );
-    }
+    // Note: `test_normalize_handles_complex_paths` retired with the
+    // `normalize_path` helper. Lexical normalisation now lives in
+    // `octos_bus::file_handle::normalize_lexical` and is covered by the
+    // resolver's own `Traversal` rejection tests (see
+    // `crates/octos-bus/tests/file_handle_resolve_tool_path.rs`).
 
     /// Per-profile CWD isolation: when cwd is narrowed to a profile's data_dir,
     /// resolve_path must block access to other profiles' directories.
@@ -1217,6 +1166,30 @@ mod path_tests {
         if let Ok(p) = &result {
             assert!(p.starts_with(base));
         }
+    }
+
+    /// Codex review P1 pin (2026-05-13): the unified resolver MUST NOT
+    /// follow symlinks for workspace-relative paths. File tools layer
+    /// `O_NOFOLLOW` over the resolved path; if the resolver
+    /// canonicalised first, a symlink `workspace/secret -> /etc/passwd`
+    /// would become a plain `/etc/passwd` open and the leaf gate would
+    /// have nothing left to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_workspace_relative_does_not_follow_symlinks() {
+        let workspace = tempfile::tempdir().expect("workspace tmpdir");
+        let outside = tempfile::tempdir().expect("outside tmpdir");
+        let target = outside.path().join("passwd");
+        std::fs::write(&target, b"root:x:0:0").unwrap();
+        let link = workspace.path().join("secret");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = resolve_path(workspace.path(), "secret")
+            .expect("workspace symlink path must resolve (the leaf-open gate refuses it)");
+        // The resolver returned the LEXICAL workspace path, not the
+        // canonical target outside the workspace.
+        assert_eq!(resolved, workspace.path().join("secret"));
+        assert_ne!(resolved, target);
     }
 }
 
