@@ -3719,6 +3719,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "which 7.0.3",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ eyre = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 glob = { workspace = true }
+which = { workspace = true }
 regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }

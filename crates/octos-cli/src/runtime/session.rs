@@ -898,6 +898,8 @@ mod tests {
             command: vec!["/bin/true".to_string()],
             timeout_ms: 1000,
             tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
         };
         let executor = Arc::new(octos_agent::HookExecutor::new(vec![hook]));
         let profile = make_profile_with_hooks(data_dir, executor.clone()).await;

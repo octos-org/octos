@@ -3047,6 +3047,8 @@ mod tests {
             ],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }
     }
 
@@ -3063,6 +3065,8 @@ mod tests {
             ],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }
     }
 
