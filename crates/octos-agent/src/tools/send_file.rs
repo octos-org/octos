@@ -202,26 +202,57 @@ impl Tool for SendFileTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid send_file tool input")?;
 
-        // Resolve file path: if base_dir is set, resolve relative paths against
-        // it (the OS process cwd may differ from the logical working directory).
+        // Step 1: when a `base_dir` is configured (the only path that
+        // applies any policy at all today), try the unified resolver
+        // first. It decodes `up/...` and `pf/...` handles, accepts
+        // absolute paths inside the upload tmpdir / workspace / profile
+        // root, and rejects traversal. When it succeeds we
+        // short-circuit; when it fails we fall back to the legacy
+        // send_file allowlist (base_dir + /tmp + extras). The fallback
+        // exists because send_file allows a broader set of roots than
+        // the unified resolver knows about (specifically: skill output
+        // under `/tmp` and per-profile data_dir registered as
+        // `extra_allowed_dirs`).
+        //
+        // Without `base_dir` (legacy `SendFileTool::new` path used by
+        // unit tests and standalone scripts), we keep the historical
+        // pass-through behaviour — no path mangling, no policy.
         let raw_path = Path::new(&input.file_path);
         let path = if let Some(ref base_dir) = self.base_dir {
-            if raw_path.is_relative() {
-                base_dir.join(raw_path)
-            } else {
-                raw_path.to_path_buf()
+            // Pick the first extra_allowed_dir as the profile root
+            // hint. Subsequent extras still get covered by the legacy
+            // allowlist below.
+            let profile_hint = self.extra_allowed_dirs.first().map(PathBuf::as_path);
+            match octos_bus::file_handle::resolve_tool_path(
+                base_dir,
+                profile_hint,
+                &input.file_path,
+            ) {
+                Ok(resolved) => resolved.absolute,
+                Err(_) => {
+                    if raw_path.is_relative() {
+                        base_dir.join(raw_path)
+                    } else {
+                        raw_path.to_path_buf()
+                    }
+                }
             }
         } else {
             raw_path.to_path_buf()
         };
 
-        // Validate file path is within the allowed base directory (if set).
-        // This prevents exfiltrating files from other profiles' data directories.
-        // /tmp/ is always allowed since skills commonly write output there.
+        // Step 2: containment check against the send_file allowlist
+        // (base_dir + /tmp/ + extra_allowed_dirs). The unified resolver
+        // already verified containment for `up/...`/`pf/...` handles
+        // and workspace-/profile-internal absolute paths, but the
+        // allowlist is broader (skill outputs frequently land under
+        // /tmp/) so we keep this check unconditionally.
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
             let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
+            let upload_root = std::fs::canonicalize(octos_bus::file_handle::temp_upload_root())
+                .unwrap_or_else(|_| octos_bus::file_handle::temp_upload_root());
             let extra_canonical: Vec<PathBuf> = self
                 .extra_allowed_dirs
                 .iter()
@@ -231,6 +262,7 @@ impl Tool for SendFileTool {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
                         || canonical_path.starts_with(&tmp_dir)
+                        || canonical_path.starts_with(&upload_root)
                         || extra_canonical
                             .iter()
                             .any(|d| canonical_path.starts_with(d));

@@ -17,12 +17,14 @@
 //! - The router-managed output file path is computed from the supervisor's
 //!   `BackgroundTask::tool_call_id`; the LLM never supplies a path.
 //! - For `file` mode the LLM-supplied path is resolved against
-//!   `workspace_root`. Workspace-relative paths go through `resolve_path`
-//!   (rejects traversal). Absolute paths are accepted only when (a) they
-//!   appear verbatim in `task.output_files` and (b) they normalise to a
-//!   path inside the workspace root. The file is also restricted to one
-//!   of the task's `output_files`, which the supervisor records once the
-//!   task has completed.
+//!   `workspace_root` through
+//!   [`octos_bus::file_handle::resolve_tool_path`]. Workspace-relative
+//!   paths reject traversal, absolute paths must lie inside the
+//!   workspace root, and any resolution outside the
+//!   [`octos_bus::file_handle::ToolPathScope::Workspace`] scope is
+//!   refused — this tool does not surface uploads or profile files.
+//!   The file is also restricted to one of the task's `output_files`,
+//!   which the supervisor records once the task has completed.
 //! - All file reads use `O_NOFOLLOW` on Unix (symlink-target reads are
 //!   refused atomically; see `read_capped_no_follow`) so a symlink
 //!   inside the workspace cannot redirect a read outside it.
@@ -40,7 +42,7 @@ use serde_json::{Value, json};
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::task_supervisor::TaskSupervisor;
 
-use super::{Tool, ToolResult, resolve_path};
+use super::{Tool, ToolResult};
 
 /// Hard cap on the bytes any single `read_task_output` call returns. Keeps
 /// the LLM context from being re-polluted by large research reports.
@@ -302,17 +304,14 @@ impl ReadTaskOutputTool {
         //       `workspace_root` (so an absolute `output_files` entry
         //       outside the workspace cannot grant escape).
         let resolved = resolve_handle_path(&self.workspace_root, path)?;
+        // Resolve every `output_files` entry through the same routine
+        // we use for the caller-supplied path, then compare normalised
+        // forms. This keeps the absolute-vs-relative semantics
+        // identical on both sides of the whitelist check.
         let allowed_match = task.output_files.iter().any(|f| {
-            let candidate = Path::new(f);
-            if candidate.is_absolute() {
-                normalize_inside_workspace(&self.workspace_root, candidate)
-                    .map(|p| p == resolved)
-                    .unwrap_or(false)
-            } else {
-                resolve_path(&self.workspace_root, f)
-                    .map(|p| p == resolved)
-                    .unwrap_or(false)
-            }
+            resolve_handle_path(&self.workspace_root, f)
+                .map(|p| p == resolved)
+                .unwrap_or(false)
         });
         if !allowed_match {
             eyre::bail!(
@@ -356,13 +355,38 @@ impl ReadTaskOutputTool {
 /// Codex round 3 P2: required so the LLM can pass back the absolute
 /// strings that `check_background_tasks` exposes from the supervisor's
 /// `output_files` field (which are often absolute under the workspace).
+///
+/// Routed through the unified
+/// [`octos_bus::file_handle::resolve_tool_path`] resolver since the
+/// unified table already encodes "absolute inside workspace OR
+/// workspace-relative" semantics. Only the [`ToolPathScope::Workspace`]
+/// scope is permitted here — upload-tmpdir / profile-root scopes would
+/// grant the LLM read access to paths outside the per-task
+/// `output_files` whitelist, which is the whole point of this tool's
+/// gating.
 fn resolve_handle_path(workspace_root: &Path, user_path: &str) -> Result<PathBuf> {
-    let p = Path::new(user_path);
-    if p.is_absolute() {
-        normalize_inside_workspace(workspace_root, p)
-            .ok_or_else(|| eyre::eyre!("absolute path '{}' is outside the workspace", user_path))
-    } else {
-        resolve_path(workspace_root, user_path).wrap_err("path must stay inside the workspace")
+    use octos_bus::file_handle::{ToolPathError, ToolPathScope, resolve_tool_path};
+    match resolve_tool_path(workspace_root, None, user_path) {
+        Ok(resolved) => {
+            if resolved.scope == ToolPathScope::Workspace {
+                Ok(resolved.absolute)
+            } else {
+                eyre::bail!(
+                    "path '{}' resolved outside the workspace ({:?}); only workspace paths are permitted",
+                    user_path,
+                    resolved.scope
+                )
+            }
+        }
+        Err(ToolPathError::Traversal) => {
+            eyre::bail!("path must stay inside the workspace: {}", user_path)
+        }
+        Err(ToolPathError::OutsideAllowedRoots) => {
+            eyre::bail!("absolute path '{}' is outside the workspace", user_path)
+        }
+        Err(ToolPathError::DecodeFailed) => {
+            eyre::bail!("path must stay inside the workspace: {}", user_path)
+        }
     }
 }
 
@@ -444,36 +468,11 @@ fn reject_symlinked_ancestors(workspace_root: &Path, resolved: &Path) -> Result<
     Ok(())
 }
 
-/// Build a normalised PathBuf for an absolute path, returning `None` if
-/// it does not lie inside `workspace_root` after normalisation.
-fn normalize_inside_workspace(workspace_root: &Path, abs: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for comp in abs.components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    let mut root = PathBuf::new();
-    for comp in workspace_root.components() {
-        match comp {
-            Component::ParentDir => {
-                root.pop();
-            }
-            Component::CurDir => {}
-            other => root.push(other.as_os_str()),
-        }
-    }
-    if out.starts_with(&root) {
-        Some(out)
-    } else {
-        None
-    }
-}
+// Note: the previous `normalize_inside_workspace` helper retired with
+// the migration to `octos_bus::file_handle::resolve_tool_path`. The
+// unified resolver does the absolute-vs-workspace containment check
+// (with macOS firmlink collapsing) so this duplicate is no longer
+// needed.
 
 /// Apply an inline read mode (head/tail/grep/line_range) against `text`.
 /// `file` mode is rejected here — file is handled at the dispatch site so
