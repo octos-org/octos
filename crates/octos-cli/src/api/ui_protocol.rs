@@ -1677,16 +1677,31 @@ async fn ui_protocol_connection(
     let failed_notify = ws.failed_notify();
 
     loop {
+        // #924 round-2 BLOCK: close the lost-notify race. `notify_waiters`
+        // is only received by `Notified` futures that exist at the time of
+        // the call, and it stashes no permit. So we:
+        //   1. Bail eagerly if the latch is already set.
+        //   2. Construct `notified()` BEFORE the second latch check — this
+        //      means any subsequent `mark_failed` either (a) is caught by
+        //      the re-check below, or (b) fires `notify_waiters` against
+        //      this future, which then resolves when the select polls it.
+        //   3. Re-check the latch after creating the future to catch the
+        //      "fired between is_failed and notified()" ordering.
+        if ws.is_failed() {
+            break;
+        }
+        let notified = failed_notify.notified();
+        tokio::pin!(notified);
+        if ws.is_failed() {
+            break;
+        }
+
         let msg = tokio::select! {
             biased;
-            _ = failed_notify.notified() => {
-                // The latch may have fired before our `notified()`
-                // registration: the Acquire load is the source of
-                // truth.
-                if ws.is_failed() {
-                    break;
-                }
-                continue;
+            _ = &mut notified => {
+                // Latch arm only fires when the connection is failed; no
+                // need to re-load — the Notify is private to `mark_failed`.
+                break;
             }
             next = ws_rx.next() => match next {
                 Some(Ok(msg)) => msg,
@@ -11542,6 +11557,52 @@ mod tests {
         });
         waited.await.expect("notified() must wake within 500ms");
         latch.await.expect("latch task joins cleanly");
+        assert!(ws.is_failed());
+    }
+
+    /// #924 round-2 BLOCK: the round-1 test parks a waiter BEFORE calling
+    /// `mark_failed`. The lost-notify race only shows up the other way
+    /// around: the latch fires while the read loop is between iterations
+    /// (no `Notified` future exists yet). `notify_waiters` stashes nothing,
+    /// so the next-iteration `notified()` would never resolve without the
+    /// pre-park latch re-check. This test replays the same select shape
+    /// the production loop uses and asserts it exits on an idle socket
+    /// even when `mark_failed` fires before the read task starts polling.
+    #[tokio::test]
+    async fn mark_failed_during_idle_loop_still_cleans_up() {
+        let (ws, _rx) = ws_connection_for_test(1);
+        let failed_notify = ws.failed_notify();
+        // The "ws_rx" stand-in: an mpsc never sent on => idle socket.
+        let (_inbound_tx, mut inbound_rx) = mpsc::channel::<()>(1);
+
+        // Latch failed BEFORE the read task ever spins. This is the
+        // lost-notify ordering: the future that will park does not yet
+        // exist when `notify_waiters` fires.
+        ws.mark_failed();
+
+        let ws_for_task = ws.clone();
+        let read_task = tokio::spawn(async move {
+            loop {
+                if ws_for_task.is_failed() {
+                    break;
+                }
+                let notified = failed_notify.notified();
+                tokio::pin!(notified);
+                if ws_for_task.is_failed() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = &mut notified => break,
+                    _ = inbound_rx.recv() => continue,
+                }
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), read_task)
+            .await
+            .expect("read loop must exit promptly when latch fires before park")
+            .expect("read task joins cleanly");
         assert!(ws.is_failed());
     }
 
