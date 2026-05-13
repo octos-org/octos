@@ -1111,6 +1111,7 @@ impl PipelineExecutor {
                 &policy.validation.validators,
                 "pipeline",
                 ValidatorPhase::Completion,
+                None,
             )
             .await?;
         }
@@ -1187,6 +1188,7 @@ impl PipelineExecutor {
             &scoped,
             &format!("pipeline-node-{node_id}"),
             ValidatorPhase::Completion,
+            None,
         )
         .await
         .map(|_| ())

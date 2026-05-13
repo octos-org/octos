@@ -47,6 +47,34 @@ pub async fn enforce_spawn_task_contract(
     task_started_at: SystemTime,
     supervisor: Option<(&TaskSupervisor, &str)>,
 ) -> SpawnTaskContractResult {
+    enforce_spawn_task_contract_with_args(
+        tools,
+        tool_name,
+        tool_call_id,
+        files_to_send,
+        task_started_at,
+        supervisor,
+        None,
+    )
+    .await
+}
+
+/// Variant of [`enforce_spawn_task_contract`] that threads the originating
+/// spawn task's input args so domain validators (`HttpProbe`,
+/// `OminixVoiceExists`) can resolve `${args.<key>}` references against them.
+///
+/// Production callers in the agent loop should prefer this entry point — the
+/// args-less variant exists for legacy call sites that don't yet have the
+/// input JSON in scope.
+pub async fn enforce_spawn_task_contract_with_args(
+    tools: &ToolRegistry,
+    tool_name: &str,
+    tool_call_id: &str,
+    files_to_send: &[PathBuf],
+    task_started_at: SystemTime,
+    supervisor: Option<(&TaskSupervisor, &str)>,
+    input_args: Option<&serde_json::Value>,
+) -> SpawnTaskContractResult {
     let required_by_default = default_session_policy_requires_contract(tool_name);
     let Some(workspace_root) = tools.workspace_root() else {
         return SpawnTaskContractResult::NotConfigured {
@@ -124,12 +152,21 @@ pub async fn enforce_spawn_task_contract(
     // failure above — we treat a required validator failure as a hard contract
     // error and return Failed without entering the delivery phase. Optional
     // failures surface as warning counters through the ledger.
+    //
+    // Merge workspace-wide validators with the per-spawn-task
+    // `on_completion` list so domain validators declared inline next to the
+    // spawn task contract run in the same gate.
+    let mut combined_validators: Vec<Validator> = policy.validation.validators.clone();
+    for (index, entry) in task_policy.on_completion.iter().enumerate() {
+        combined_validators.push(entry.clone().into_validator(tool_name, index));
+    }
     match run_declared_validators(
         tools,
         workspace_root,
-        &policy.validation.validators,
+        &combined_validators,
         tool_name,
         ValidatorPhase::Completion,
+        input_args.cloned(),
     )
     .await
     {
@@ -208,6 +245,17 @@ fn resolve_artifacts(
 
     let artifact_sources = task_policy.artifact_sources();
     if artifact_sources.is_empty() {
+        // Contract declares no artifact-source — this is allowed for
+        // spawn tasks that produce no on-disk file (e.g. `fm_voice_save`
+        // which mutates an external API). Skip artifact resolution and
+        // hand the validator runner an empty resolved context; typed
+        // validators in `on_completion` will still run.
+        if task_policy.on_verify.is_empty() && task_policy.delivery_actions().is_empty() {
+            return Ok(ResolvedArtifacts {
+                context: ActionContext::default(),
+                paths: Vec::new(),
+            });
+        }
         return Err("workspace contract has no artifact source".into());
     }
 
@@ -452,12 +500,18 @@ fn default_session_policy_requires_contract(tool_name: &str) -> bool {
 /// `Err(reason)` if any required validator fails — the caller treats this as
 /// a contract-gate failure, matching the behaviour of a missing declared
 /// artifact.
+///
+/// `input_args` carries the originating spawn task's input JSON so that
+/// domain validators (`HttpProbe`, `OminixVoiceExists`) can resolve
+/// `${args.<key>}` references. Pass `None` for non-spawn contexts (e.g.
+/// turn-end validators that don't reference task inputs).
 pub async fn run_declared_validators(
     tools: &ToolRegistry,
     workspace_root: &Path,
     validators: &[Validator],
     repo_label_hint: &str,
     phase: ValidatorPhase,
+    input_args: Option<serde_json::Value>,
 ) -> Result<Vec<ValidatorOutcome>, String> {
     if validators.is_empty() {
         return Ok(Vec::new());
@@ -497,6 +551,7 @@ pub async fn run_declared_validators(
         phase,
         workspace_root: workspace_root.to_path_buf(),
         repo_label: repo_label_hint.to_string(),
+        input_args,
     };
 
     let outcomes = runner.run_all(&invocation, &scoped).await;
@@ -625,7 +680,17 @@ mod tests {
     #[tokio::test]
     async fn podcast_contract_resolves_generated_audio_for_actor_delivery() {
         let temp = tempfile::tempdir().unwrap();
-        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        // The default session contract now declares MP3-specific
+        // `magic_bytes` + `audio_non_silent` domain validators on
+        // `podcast_generate`. This test only exercises the artifact-
+        // resolution path, so we strip the per-task validators to focus
+        // on the legacy contract semantics. Tests for the new validators
+        // live in the inline `validators` module.
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("podcast_generate") {
+            task.on_completion.clear();
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
         let output = temp
             .path()
             .join("skill-output/mofa-podcast/podcast_full_123.wav");
@@ -675,6 +740,7 @@ mod tests {
                 on_complete: Vec::new(),
                 on_deliver: Vec::new(),
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -728,6 +794,7 @@ mod tests {
                 on_complete: vec!["file_exists:missing.txt".into()],
                 on_deliver: vec!["notify_user:bundle delivered".into()],
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -780,6 +847,7 @@ mod tests {
                 on_complete: vec!["send_file:$legacy".into()],
                 on_deliver: vec!["send_file:$report".into(), "send_file:$audio".into()],
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();
@@ -845,6 +913,7 @@ mod tests {
                 on_complete: Vec::new(),
                 on_deliver: Vec::new(),
                 on_failure: Vec::new(),
+                on_completion: Vec::new(),
             },
         );
         write_workspace_policy(temp.path(), &policy).unwrap();

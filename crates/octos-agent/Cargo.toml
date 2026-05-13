@@ -48,10 +48,16 @@ pdf-extract = { workspace = true }
 tempfile = { workspace = true }
 lettre = { workspace = true }
 redb = { workspace = true }
+hound = { workspace = true }
+symphonia = { workspace = true, optional = true }
 
 [features]
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
+# Enable MP3 decoding for the `AudioNonSilent` workspace-policy validator.
+# WAV decoding is always-on via `hound`; MP3 pulls in `symphonia` which is
+# heavier so we keep it opt-in for non-audio workspaces.
+audio_mp3 = ["dep:symphonia"]
 
 [lints]
 workspace = true

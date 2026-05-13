@@ -33,3 +33,13 @@ on_verify = [
     "file_size_min:$artifact:4096",
 ]
 on_failure = ["notify_user:Podcast generation failed"]
+on_completion = [
+    { kind = "magic_bytes", glob = "skill-output/mofa-podcast/*.mp3", format = "mp3" },
+    { kind = "audio_non_silent", glob = "skill-output/mofa-podcast/*.mp3", min_ratio = 0.3 },
+]
+
+[spawn_tasks.fm_voice_save]
+on_completion = [
+    { kind = "ominix_voice_exists", name_arg = "name" },
+]
+on_failure = ["notify_user:Voice registration failed"]

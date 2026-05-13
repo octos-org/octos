@@ -137,6 +137,7 @@ async fn should_block_ready_when_required_command_validator_fails() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -170,6 +171,7 @@ async fn should_warn_but_not_block_when_optional_validator_fails() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -200,6 +202,7 @@ async fn should_record_duration_and_evidence_path_for_command_validator() {
         phase: ValidatorPhase::TurnEnd,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -237,6 +240,7 @@ async fn should_expose_stderr_in_outcome_for_operator_visibility() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -284,6 +288,7 @@ async fn should_kill_child_process_on_validator_timeout() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
 
     let before = std::time::Instant::now();
@@ -333,6 +338,7 @@ async fn should_pass_file_exists_validator_when_file_meets_size_floor() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -355,6 +361,7 @@ async fn should_fail_file_exists_validator_when_size_under_floor() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -372,6 +379,7 @@ async fn should_pass_tool_call_validator_when_tool_succeeds() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -388,6 +396,7 @@ async fn should_fail_tool_call_validator_when_tool_reports_unsuccessful() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -414,6 +423,7 @@ async fn should_persist_outcomes_and_replay_them_byte_for_byte() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let original = runner.run_all(&invocation, &validators).await;
     assert_eq!(original.len(), 2);
@@ -465,6 +475,7 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     // Invoke via a helper that pre-seeds LD_PRELOAD on the spawned command.
     runner
@@ -516,6 +527,7 @@ async fn should_block_spawn_task_contract_when_required_validator_fails() {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: vec!["notify_user:validator gate failed".into()],
+            on_completion: Vec::new(),
         },
     );
     write_workspace_policy(dir.path(), &policy).unwrap();
@@ -593,6 +605,7 @@ async fn should_not_block_spawn_task_contract_when_optional_validator_fails() {
             on_complete: Vec::new(),
             on_deliver: Vec::new(),
             on_failure: Vec::new(),
+            on_completion: Vec::new(),
         },
     );
     write_workspace_policy(dir.path(), &policy).unwrap();
@@ -718,6 +731,7 @@ async fn should_block_command_validator_with_dangerous_pattern() {
         phase: ValidatorPhase::Completion,
         workspace_root: dir.path().to_path_buf(),
         repo_label: "slides/demo".into(),
+        input_args: None,
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 

@@ -673,6 +673,7 @@ impl Tool for DelegateTool {
                             &policy.validation.validators,
                             "delegate",
                             ValidatorPhase::Completion,
+                            None,
                         )
                         .await
                         .err()
