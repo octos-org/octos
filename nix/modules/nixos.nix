@@ -14,7 +14,9 @@ in
       script = ''
         exec ${cfg.finalPackage}/bin/octos serve \
           --port ${toString serviceCfg.port} \
-          --host ${lib.escapeShellArg serviceCfg.host}
+          --host ${lib.escapeShellArg serviceCfg.host} \
+          --data-dir ${lib.escapeShellArg serviceCfg.dataDir} \
+          --auth-token ${lib.escapeShellArg serviceCfg.authToken}
       '';
 
       environment = {
