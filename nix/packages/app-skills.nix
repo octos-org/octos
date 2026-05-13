@@ -4,7 +4,14 @@
   pkg-config,
   openssl,
 }:
+
 let
+  inherit (lib)
+    cleanSource
+    concatMapStrings
+    concatMapStringsSep
+    ;
+
   skillCrates = [
     "news_fetch"
     "deep-search"
@@ -24,10 +31,11 @@ let
     "weather"
   ];
 in
+
 rustPlatform.buildRustPackage {
   pname = "octos-app-skills";
   version = "1.0.0";
-  src = lib.cleanSource ../../.;
+  src = cleanSource ../../.;
 
   cargoLock.lockFile = ../../Cargo.lock;
 
@@ -38,16 +46,18 @@ rustPlatform.buildRustPackage {
 
   buildPhase = ''
     runHook preBuild
-    cargo build --release ${lib.concatMapStrings (crate: " -p " + crate) skillCrates}
+    cargo build --release ${concatMapStrings (crate: " -p " + crate) skillCrates}
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    ${lib.concatMapStringsSep "\n" (
-      bin: "install -Dm755 target/release/${bin} $out/bin/${bin}"
-    ) skillBins}
+    ${concatMapStringsSep "\n" (bin: "install -Dm755 target/release/${bin} $out/bin/${bin}") skillBins}
     runHook postInstall
   '';
+
+  passthru = {
+    inherit skillBins skillCrates;
+  };
 }

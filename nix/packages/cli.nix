@@ -7,15 +7,43 @@
   openssl,
   features ? [ ],
 }:
+
 let
-  cargoFeaturesString = builtins.concatStringsSep "," features;
+  inherit (lib)
+    cleanSource
+    concatStringsSep
+    elem
+    lessThan
+    optionalString
+    optionals
+    sort
+    unique
+    ;
+
+  supportedChannels = [
+    "discord"
+    "email"
+    "feishu"
+    "slack"
+    "telegram"
+    "twilio"
+    "wecom"
+    "whatsapp"
+  ];
+  supportedFeatures = supportedChannels ++ [ "api" ];
+
+  # sort + dedup ensures same set always produces same derivation hash
+  cargoFeatures = unique (sort lessThan features);
+
+  cargoFeaturesString = concatStringsSep "," cargoFeatures;
   dashboardPkg = callPackage ./admin-dashboard.nix { };
   rustTarget = stdenv.hostPlatform.rust.rustcTarget;
 in
+
 rustPlatform.buildRustPackage {
   pname = "octos-cli";
   version = "0.1.1";
-  src = lib.cleanSource ../../.;
+  src = cleanSource ../../.;
 
   cargoLock.lockFile = ../../Cargo.lock;
 
@@ -28,12 +56,12 @@ rustPlatform.buildRustPackage {
     "-p"
     "octos-cli"
   ]
-  ++ lib.optionals (features != [ ]) [
+  ++ optionals (cargoFeatures != [ ]) [
     "--features"
     cargoFeaturesString
   ];
 
-  preBuild = lib.optionalString (builtins.elem "api" features) ''
+  preBuild = optionalString (elem "api" cargoFeatures) ''
     mkdir -p crates/octos-cli/static/admin
     cp -r ${dashboardPkg}/admin/* crates/octos-cli/static/admin/
   '';
@@ -44,4 +72,8 @@ rustPlatform.buildRustPackage {
     install -Dm755 ./target/${rustTarget}/release/octos $out/bin/octos
     runHook postInstall
   '';
+
+  passthru = {
+    inherit supportedChannels supportedFeatures;
+  };
 }

@@ -2,9 +2,9 @@
   description = "Octos - Agentic OS";
 
   inputs = {
-    nixpkgs.url = "nixpkgs/nixos-unstable";
+    nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/*";
     nix-darwin = {
-      url = "github:nix-darwin/nix-darwin";
+      url = "https://flakehub.com/f/nix-darwin/nix-darwin/*";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
