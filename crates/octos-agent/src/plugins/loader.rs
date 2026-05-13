@@ -318,30 +318,40 @@ impl PluginLoader {
             );
         }
 
-        // Resolve extras (MCP servers, hooks, prompt fragments) regardless of tools.
-        let mut extras = resolve_extras(&manifest, plugin_dir);
-
-        // Section B (codex review round-3): under strict signing, the
+        // Section B (codex review round-3 + round-4 P2 + P2-bis): the
         // current `manifest.sha256` semantics anchor only the executable
         // bytes — manifest-side declarations (MCP servers, lifecycle
-        // hooks, prompt fragments) are NOT covered by the digest. A
-        // malicious patcher could edit `manifest.json` to add executable
-        // extras without invalidating the executable hash; the strict
-        // policy must refuse to mint trust for that code path until the
-        // signed material covers the manifest too. We therefore DROP
-        // extras for every tools-bearing skill that goes through the
-        // strict path. Operators who depend on extras must either run
-        // with permissive mode or ship those declarations via a
-        // separately-trusted host config (`mcp_servers` + `hooks` on
-        // `Config`/`ProfileConfig`).
-        if require_signed && manifest.has_extras() {
-            warn!(
-                plugin = %manifest.name,
-                "dropping manifest extras (MCP servers / hooks / prompts) under \
-                 `plugins.require_signed`: the digest does not cover them"
-            );
-            extras = SkillExtras::default();
-        }
+        // hooks, prompt fragments, and the auto-injected SKILL.md for
+        // spawn-only skills) are NOT covered by the digest. A malicious
+        // patcher could edit `manifest.json` (or replace SKILL.md
+        // contents alongside it) to add executable / prompt code paths
+        // without invalidating the executable hash. The strict policy
+        // must refuse to mint trust for those paths until the signed
+        // material covers the manifest too.
+        //
+        // We therefore SKIP `resolve_extras` entirely under strict mode
+        // so:
+        //   1. no glob expansion / file reads against the skill dir
+        //      (closing the load-time DoS surface flagged in round-4),
+        //   2. no auto-injected SKILL.md for spawn-only skills,
+        //   3. no MCP servers / hooks / prompts on the returned extras.
+        // Operators who need extras must either run with permissive mode
+        // or ship those declarations via a separately-trusted host
+        // config (`mcp_servers` + `hooks` on `Config`/`ProfileConfig`).
+        let mut extras = if require_signed {
+            if manifest.has_extras() || manifest.tools.iter().any(|t| t.spawn_only) {
+                warn!(
+                    plugin = %manifest.name,
+                    "dropping manifest extras + auto-SKILL.md under \
+                     `plugins.require_signed`: the digest does not cover them"
+                );
+            }
+            SkillExtras::default()
+        } else {
+            // Permissive mode: resolve extras the legacy way (MCP, hooks,
+            // SKILL.md auto-inject for spawn-only, prompt globs).
+            resolve_extras(&manifest, plugin_dir)
+        };
 
         // If no tools declared, skip executable search entirely.
         if manifest.tools.is_empty() {
@@ -1229,6 +1239,61 @@ mod tests {
             result.hooks.is_empty(),
             "unsigned hook extras must be dropped under strict signing; got: {:?}",
             result.hooks
+        );
+    }
+
+    /// Section B (codex review round-4 P2): under strict signing, a
+    /// signed spawn-only plugin's SKILL.md auto-injected prompt fragment
+    /// is ALSO dropped. The fragment lives outside the executable digest,
+    /// so it's not covered by `manifest.sha256` — and an unsigned edit to
+    /// SKILL.md would otherwise still slip into the agent system prompt.
+    #[cfg(unix)]
+    #[test]
+    fn require_signed_drops_auto_skill_md_for_spawn_only() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("spawn-only-signed");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho ok";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{
+                "name": "spawn-only-signed",
+                "version": "1.0",
+                "sha256": "{hash}",
+                "tools": [{{
+                    "name": "do_thing",
+                    "description": "d",
+                    "spawn_only": true
+                }}]
+            }}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), manifest).unwrap();
+        std::fs::write(plugin_dir.join("SKILL.md"), b"# UNSIGNED PROMPT").unwrap();
+        let exec_path = plugin_dir.join("spawn-only-signed");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.tool_count, 1);
+        assert!(
+            result.prompt_fragments.is_empty(),
+            "auto-SKILL.md must be dropped under strict signing; got: {:?}",
+            result.prompt_fragments
         );
     }
 

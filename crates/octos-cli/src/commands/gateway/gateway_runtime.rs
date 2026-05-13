@@ -1227,6 +1227,10 @@ impl GatewayRuntime {
                     sandbox_config: sandbox_config.clone(),
                     task_query_store: task_query_store.clone(),
                     subagent_output_router: subagent_output_router.clone(),
+                    // Section B (codex review round-4): clone the host's
+                    // plugin policy so child profiles inherit the
+                    // strict-signing gate even when their JSON omits it.
+                    host_plugins: config.plugins.clone(),
                 });
 
         // Start config watcher for hot-reload
