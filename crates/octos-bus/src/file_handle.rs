@@ -47,7 +47,14 @@ pub fn decode_file_handle(handle: &str) -> Option<FileHandleScope> {
     let mut parts = handle.splitn(3, '/');
     let prefix = parts.next()?;
     let payload = parts.next()?;
-    let _display_name = parts.next()?;
+    // The third segment is a human-readable display name appended at
+    // `encode_scoped_handle` time — purely decorative. LLMs frequently
+    // truncate the handle to `up/<base64>` (e.g. tab-complete suggests
+    // the path up to the last `/` and the trailing filename is
+    // dropped). Accepting the two-segment form rescues those calls
+    // because the payload alone carries the full relative path needed
+    // to locate the file under `temp_upload_root` / profile root.
+    let _display_name = parts.next();
     let relative = decode_relative_payload(payload)?;
 
     match prefix {
