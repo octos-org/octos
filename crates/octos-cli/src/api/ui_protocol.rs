@@ -2329,13 +2329,16 @@ fn validate_authenticated_session_scope(
             connection_profile_id,
             Some(session_profile_id),
         )),
-        None => Err(
-            RpcError::invalid_params("session_id must include the authenticated profile")
-                .with_data(json!({
-                    "expected_profile_id": connection_profile_id,
-                    "auth_scope_violation": true,
-                })),
-        ),
+        // SPA convention: a fresh session uses a raw `web-N` id with no
+        // profile prefix. Accept it under profile auth — the auth layer
+        // is the gate, the session_id is just an opaque per-tab handle.
+        // PR #857 originally landed this. PR #926 inadvertently added
+        // `auth_scope_violation: true` here, which the new 1008
+        // close-on-auth-scope-violation path then weaponized — every
+        // OTP-authenticated browser session was 1008-closed on
+        // `session/open` and the SPA fell into a reconnect storm.
+        // Mini5 OTP-flow probe (2026-05-13) reproduced this.
+        None => Ok(()),
     }
 }
 
