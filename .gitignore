@@ -94,6 +94,7 @@ scripts/deploy.sh
 !docs/M9-ALPHA-SOLE-TRANSPORT-ADR.md
 !docs/M9-GAMMA-SERVER-PROJECTION-ADR.md
 !docs/M11-PROFILE-SESSION-RUNTIME-ADR.md
+!docs/SKILL_DEPLOYMENT.md
 !workstreams/M11-runtime-unification.md
 !workstreams/M11-SOAK-TESTS.md
 # Canonical product/engineering spec docs under api/. The UI Protocol v1
