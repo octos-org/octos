@@ -493,13 +493,16 @@ impl ProfileRuntime {
         // M11-F regression fix REG-5: replace the hand-rolled
         // per-profile-only assembly with `Config::plugin_dirs_from_project`
         // (the canonical helper pre-M11-F serve.rs used) so the resulting
-        // set includes the *global* `~/.octos/plugins`, `~/.octos/skills`,
-        // `<octos_home>/plugins`, `<octos_home>/skills`, and the
-        // colon-separated `OCTOS_SKILLS_PATH` env var alongside the
-        // already-scanned `<octos_home>/bundled-app-skills/`. Platform
-        // skills (`<octos_home>/platform-skills/`, admin-only) and the
-        // per-profile `data_dir/skills/` are layered on top so the
+        // set includes the deployment-scoped `<octos_home>/plugins`,
+        // `<octos_home>/skills`, the colon-separated `OCTOS_SKILLS_PATH`
+        // env var, and the already-scanned `<octos_home>/bundled-app-skills/`.
+        // Platform skills (`<octos_home>/platform-skills/`, admin-only) and
+        // the per-profile `data_dir/skills/` are layered on top so the
         // gateway behaviour is matched 1:1.
+        //
+        // Legacy HOME-rooted globals (`~/.octos/plugins`, `~/.octos/skills`)
+        // are NO LONGER scanned — `Config::plugin_dirs_from_project` emits a
+        // one-shot migration warning on first detection.
         let plugin_work_dir = data_dir.join("skill-output");
         let _ = std::fs::create_dir_all(&plugin_work_dir);
         let mut plugin_dirs: Vec<PathBuf> = Config::plugin_dirs_from_project(&effective_octos_home);
@@ -521,6 +524,13 @@ impl ProfileRuntime {
                 PluginLoadOptions {
                     work_dir: Some(&plugin_work_dir),
                     synthesis_config: None,
+                    // Section B: honour the profile-derived
+                    // `plugins.require_signed`. Default is `false`
+                    // (backward compatible). Profile bootstrap reads
+                    // the flag from the flattened `Config` produced by
+                    // `config_from_profile` so operators can opt into
+                    // strict signature enforcement per deployment.
+                    require_signed: config.plugins.require_signed,
                 },
             ) {
                 Ok(result) => plugin_result = result,
