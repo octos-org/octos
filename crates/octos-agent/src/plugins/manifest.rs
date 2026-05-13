@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// A plugin manifest (manifest.json).
 #[derive(Debug, Deserialize)]
@@ -15,7 +15,13 @@ pub struct PluginManifest {
     #[serde(default)]
     pub tools: Vec<PluginToolDef>,
     /// SHA-256 hash of the plugin executable for integrity verification.
-    #[serde(default)]
+    ///
+    /// Empty-string values (`""`) are rejected at parse time: a manifest that
+    /// goes to the trouble of declaring `sha256` must commit to an actual
+    /// hex digest. Operators who want the legacy "unverified" path simply
+    /// omit the field — which deserializes to `None` and (under
+    /// `plugins.require_signed = false`) still loads with a warning.
+    #[serde(default, deserialize_with = "deserialize_non_empty_sha256")]
     pub sha256: Option<String>,
     /// Pre-built binaries keyed by `{os}-{arch}` (e.g. "darwin-aarch64", "linux-x86_64").
     /// Each entry has `url` (download URL) and optional `sha256` (integrity hash).
@@ -45,6 +51,24 @@ impl PluginManifest {
         !self.mcp_servers.is_empty()
             || !self.hooks.is_empty()
             || self.prompts.as_ref().is_some_and(|p| !p.include.is_empty())
+    }
+}
+
+/// Reject empty-string `sha256` at parse time so callers cannot pass the
+/// integrity gate by declaring the field with no value. A missing field
+/// still deserializes to `None` (the legacy "unverified" path); only an
+/// explicit `""` is treated as a hard error.
+fn deserialize_non_empty_sha256<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let maybe = Option::<String>::deserialize(d)?;
+    match maybe {
+        Some(s) if s.trim().is_empty() => Err(D::Error::custom(
+            "manifest.sha256 must be a non-empty hex digest (omit the field for unsigned plugins)",
+        )),
+        other => Ok(other),
     }
 }
 
@@ -456,6 +480,63 @@ mod tests {
         assert!(manifest.tools[0].accepts_host_config_key("synthesis_config"));
         // Other keys still rejected — explicit opt-in only.
         assert!(!manifest.tools[0].accepts_host_config_key("smtp_config"));
+    }
+
+    /// Section B: empty-string `sha256` is rejected at parse time. A
+    /// manifest that goes to the trouble of declaring the field must
+    /// commit to a real digest — operators who want unsigned plugins
+    /// simply omit the key.
+    #[test]
+    fn manifest_rejects_empty_sha256_at_parse_time() {
+        let json = r#"{
+            "name": "ghost",
+            "version": "1.0.0",
+            "sha256": "",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json)
+            .expect_err("empty sha256 must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-empty"),
+            "error must explain that sha256 cannot be empty; got: {msg}"
+        );
+    }
+
+    /// Section B: whitespace-only `sha256` is also rejected.
+    #[test]
+    fn manifest_rejects_whitespace_only_sha256() {
+        let json = r#"{
+            "name": "ghost",
+            "version": "1.0.0",
+            "sha256": "   ",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let err = serde_json::from_str::<PluginManifest>(json)
+            .expect_err("whitespace sha256 must fail to parse");
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    /// Section B: an explicit `null` and a missing field both yield
+    /// `sha256 = None` (the legacy unverified path).
+    #[test]
+    fn manifest_accepts_missing_or_null_sha256_as_unsigned() {
+        let missing = r#"{
+            "name": "ghost",
+            "version": "1.0.0",
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let m1: PluginManifest = serde_json::from_str(missing).unwrap();
+        assert!(m1.sha256.is_none());
+
+        let null_value = r#"{
+            "name": "ghost",
+            "version": "1.0.0",
+            "sha256": null,
+            "tools": [{"name": "t", "description": "d"}]
+        }"#;
+        let m2: PluginManifest = serde_json::from_str(null_value).unwrap();
+        assert!(m2.sha256.is_none());
     }
 
     #[test]

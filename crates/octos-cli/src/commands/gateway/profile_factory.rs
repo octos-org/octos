@@ -600,6 +600,12 @@ impl ProfileActorFactoryBuilder {
                     octos_agent::PluginLoadOptions {
                         work_dir: Some(&plugin_work_dir),
                         synthesis_config,
+                        // Section B: opt-in strict signature enforcement.
+                        // Honours `plugins.require_signed` from the
+                        // profile-derived config; default is `false`
+                        // (backward compatible — unsigned plugins still
+                        // load with a warning).
+                        require_signed: profile_config.plugins.require_signed,
                     },
                 ) {
                     Ok(result) => {

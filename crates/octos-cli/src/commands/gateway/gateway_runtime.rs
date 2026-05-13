@@ -697,6 +697,11 @@ impl GatewayRuntime {
                         octos_agent::PluginLoadOptions {
                             work_dir: Some(&plugin_work_dir),
                             synthesis_config,
+                            // Section B: opt-in strict signature enforcement.
+                            // Honours top-level `plugins.require_signed`; default
+                            // is `false` (backward compatible — unsigned plugins
+                            // still load with a warning).
+                            require_signed: config.plugins.require_signed,
                         },
                     ) {
                         Ok(result) => plugin_result = result,

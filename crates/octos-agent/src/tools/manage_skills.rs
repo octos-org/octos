@@ -849,11 +849,37 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
     }
 
     let bytes = response.bytes()?;
+    install_bytes_into_dir(dir, url, &bytes, sha256)
+}
 
+/// Install in-memory bytes into `dir` (writes `<dir>/main`), optionally
+/// verifying SHA-256 against the supplied digest. The URL is consulted only
+/// for archive detection — passing a path-like URL is fine for tests.
+///
+/// Returns:
+/// - `Ok(true)` when the bytes were written.
+/// - `Ok(false)` when the SHA-256 check failed (hash mismatch) or when the
+///   archive contained no real files. The caller can fall through to other
+///   binary sources.
+/// - `Err(_)` on I/O or archive-extraction failures.
+///
+/// Splitting this out from [`download_binary`] makes the hash-verification
+/// path unit-testable without spinning up an HTTP server.
+///
+/// `pub` because the install-time hash gate is covered by an integration
+/// test in `crates/octos-agent/tests/manage_skills_hash.rs`. Not intended
+/// for external consumers — the surface may change without notice.
+#[doc(hidden)]
+pub fn install_bytes_into_dir(
+    dir: &std::path::Path,
+    url: &str,
+    bytes: &[u8],
+    sha256: Option<&str>,
+) -> Result<bool> {
     // Verify SHA-256 if provided (hash is of the downloaded file, archive or raw)
     if let Some(expected) = sha256 {
         use sha2::{Digest, Sha256};
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = format!("{:x}", Sha256::digest(bytes));
         if actual != expected.to_lowercase() {
             return Ok(false);
         }
@@ -866,7 +892,7 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
         // Skip macOS AppleDouble resource fork files (._* prefix) which
         // appear before the actual binary in archives created on macOS.
         use std::io::Read;
-        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let gz = flate2::read::GzDecoder::new(bytes);
         let mut archive = tar::Archive::new(gz);
         let mut found = false;
         for entry in archive.entries()? {
@@ -893,7 +919,7 @@ fn download_binary(dir: &std::path::Path, url: &str, sha256: Option<&str>) -> Re
             return Ok(false);
         }
     } else {
-        std::fs::write(&dest, &bytes)?;
+        std::fs::write(&dest, bytes)?;
     }
 
     #[cfg(unix)]
