@@ -128,6 +128,11 @@ pub(crate) enum SendError {
     /// a short reason for the calling turn to abort cleanly and mark the
     /// ledger entry `delivery_failed`.
     LifecycleFailure(String),
+    /// #924 BLOCK 2: a prior lifecycle/RPC send already latched the
+    /// connection as failed. Background tasks (turn forwarders, live
+    /// forwarders, ledger fan-out) MUST stop enqueueing onto a dead
+    /// channel — callers treat this exactly like `Closed`.
+    FatalClosed,
 }
 
 // Send-site categorization per M9-FIX-04 § Acceptance criteria:
@@ -189,6 +194,12 @@ pub(crate) struct WsConnection {
     /// closed writer. The read loop polls this and breaks cleanly so a
     /// silently-dropped RPC reply does not strand the client.
     failed: Arc<std::sync::atomic::AtomicBool>,
+    /// #924 BLOCK 1: a Notify woken in tandem with `failed.store(true)`.
+    /// The connection main loop `select!`s on this alongside the inbound
+    /// frame stream so a lifecycle/RPC send failure on an idle socket
+    /// triggers cleanup immediately rather than waiting indefinitely
+    /// for the next client frame.
+    failed_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WsConnection {
@@ -198,6 +209,7 @@ impl WsConnection {
             metrics: Arc::new(ConnectionMetrics::default()),
             connection_id: ConnectionId::next(),
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failed_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -205,9 +217,21 @@ impl WsConnection {
         self.failed.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// #924 BLOCK 1: handle to the latch-wakeup notify for the read
+    /// loop's `select!` arm. Cloned cheaply (just an `Arc` bump).
+    fn failed_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.failed_notify.clone()
+    }
+
     fn mark_failed(&self) {
         self.failed
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake every current and future `notified()` waiter so the read
+        // loop wakes immediately on an idle connection. `notify_waiters`
+        // alone has no permit-stash behaviour; combined with the Acquire
+        // load in the select! arm a late `notified().await` will still
+        // see `failed == true` and bail out before parking.
+        self.failed_notify.notify_waiters();
     }
 
     #[cfg(test)]
@@ -221,6 +245,17 @@ impl WsConnection {
     }
 
     fn try_enqueue(&self, frame: WsMessage) -> Result<(), SendError> {
+        // #924 BLOCK 2: once the connection is latched as failed every
+        // further enqueue must fail loudly. Background tasks (turn
+        // forwarders, live forwarders, ledger fan-out) keep pumping
+        // until the connection cleanup aborts their handles; without
+        // this gate they would push frames onto a writer the read loop
+        // is about to drop, masking the original lifecycle failure and
+        // wasting work. `FatalClosed` is callers' signal to treat the
+        // connection like `Closed`.
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SendError::FatalClosed);
+        }
         // Update the queue-depth gauge whenever we touch the channel — cheap
         // and gives an accurate signal even when sends succeed.
         let depth = WS_WRITER_CHANNEL_CAPACITY.saturating_sub(self.writer.capacity());
@@ -266,6 +301,14 @@ impl WsConnection {
                     "writer channel closed for lifecycle frame".into(),
                 ))
             }
+            Err(SendError::FatalClosed) => {
+                // #924 BLOCK 2: prior caller already latched the
+                // connection failed; surface the lifecycle-shape error
+                // for any callsite still doing work on this connection.
+                Err(SendError::LifecycleFailure(
+                    "connection already latched as failed".into(),
+                ))
+            }
             Err(other) => Err(other),
         }
     }
@@ -300,6 +343,14 @@ impl WsConnection {
                 );
                 Err(SendError::Closed)
             }
+            Err(SendError::FatalClosed) => {
+                // #924 BLOCK 2: connection already latched failed by a
+                // prior lifecycle send — no point counting another
+                // dropped row.
+                metrics::counter!("ws.send.drop.closed", "method" => method.to_string())
+                    .increment(1);
+                Err(SendError::FatalClosed)
+            }
             Err(other) => Err(other),
         }
     }
@@ -325,6 +376,12 @@ impl WsConnection {
                     "ephemeral ws send dropped; channel closed"
                 );
                 Err(SendError::Closed)
+            }
+            Err(SendError::FatalClosed) => {
+                // #924 BLOCK 2: silently drop, consistent with the spec
+                // § 9 "ephemeral frames may be dropped" rule. The
+                // connection is already torn down by the read loop.
+                Err(SendError::FatalClosed)
             }
             Err(other) => Err(other),
         }
@@ -1565,7 +1622,30 @@ async fn ui_protocol_connection(
     let connection_profile_id = connection_profile_id.as_deref();
     let routed_profile_id = routed_profile_id.as_deref();
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    // #924 BLOCK 1: wake the read loop the instant a lifecycle/RPC
+    // send marks the connection failed. Without this, an idle socket
+    // with a failed write side would sit in `ws_rx.next().await`
+    // forever — the cleanup path only ran when the next client frame
+    // arrived, leaving subscribers and ledger fan-out registered.
+    let failed_notify = ws.failed_notify();
+
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = failed_notify.notified() => {
+                // The latch may have fired before our `notified()`
+                // registration: the Acquire load is the source of
+                // truth.
+                if ws.is_failed() {
+                    break;
+                }
+                continue;
+            }
+            next = ws_rx.next() => match next {
+                Some(Ok(msg)) => msg,
+                Some(Err(_)) | None => break,
+            },
+        };
         // #922.2: stop dispatch once a lifecycle/RPC send has been
         // marked fatal so we don't quietly accept further requests we
         // can never reply to. The cleanup below still appends terminal
@@ -2290,7 +2370,10 @@ async fn spawn_live_forwarder(
                     }
                     match send_ledger_event_durable(&ws, &ledger, event.event) {
                         Ok(()) => {}
-                        Err(SendError::Closed) => break,
+                        // #924 BLOCK 2: a closed writer OR a latched
+                        // failure both mean further pumps will produce
+                        // FatalClosed forever; stop spinning.
+                        Err(SendError::Closed | SendError::FatalClosed) => break,
                         // BackpressureDrop: `send_ledger_event_durable`
                         // already opportunistically emits replay_lossy; keep
                         // pumping so a recovered consumer gets caught up.
@@ -11238,6 +11321,66 @@ mod tests {
         );
         assert!(matches!(second, Err(SendError::BackpressureDrop)));
         assert_eq!(ws.metrics().dropped_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// #924 BLOCK 2: once a lifecycle send marks the connection failed,
+    /// every subsequent enqueue must fail with `FatalClosed` — even if
+    /// the underlying channel has spare capacity now. Background
+    /// forwarders that keep pumping after the read loop tore down would
+    /// otherwise queue frames into a writer about to drain and exit.
+    #[tokio::test]
+    async fn try_enqueue_returns_fatal_closed_after_mark_failed() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        // First send succeeds and leaves capacity available.
+        let frame = WsMessage::Text("ping".to_string().into());
+        assert!(ws.try_enqueue(frame).is_ok());
+
+        // Drain so capacity is fully open.
+        let _ = rx.try_recv();
+
+        // Latch the connection as failed (the lifecycle wrappers do
+        // this on backpressure / closed writer; here we drive the API
+        // directly to isolate the check).
+        ws.mark_failed();
+
+        // Even with capacity open, the next enqueue must fail loudly.
+        let frame = WsMessage::Text("after-fail".to_string().into());
+        let err = ws
+            .try_enqueue(frame)
+            .expect_err("post-latch enqueue must fail");
+        assert!(matches!(err, SendError::FatalClosed));
+
+        // And the lifecycle wrapper turns it into LifecycleFailure so
+        // existing RPC-reply callsites still see the failure-shaped
+        // error.
+        let res = send_rpc_result(&ws, "post-fail".into(), json!({"ok": true}));
+        assert!(matches!(res, Err(SendError::LifecycleFailure(_))));
+    }
+
+    /// #924 BLOCK 1: `mark_failed` must wake every pending `notified()`
+    /// waiter so the read loop's `select!` arm fires immediately. An
+    /// idle socket with a failed write side must NOT sit waiting for
+    /// the next client frame.
+    #[tokio::test]
+    async fn mark_failed_wakes_failed_notify_waiters() {
+        let (ws, _rx) = ws_connection_for_test(1);
+        let notify = ws.failed_notify();
+
+        // Park a waiter; latch failed; the waiter must complete promptly.
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(500), async move {
+            notify.notified().await;
+        });
+        // Run latch + await concurrently — the `notified()` future must
+        // observe the wake even though we never read another frame.
+        let ws_clone = ws.clone();
+        let latch = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ws_clone.mark_failed();
+        });
+        waited.await.expect("notified() must wake within 500ms");
+        latch.await.expect("latch task joins cleanly");
+        assert!(ws.is_failed());
     }
 
     #[tokio::test]
