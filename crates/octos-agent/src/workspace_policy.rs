@@ -335,6 +335,13 @@ pub enum WorkspacePolicyKind {
     Slides,
     Sites,
     Session,
+    /// Coding workspaces — projects with a recognised manifest
+    /// (Cargo.toml / package.json / pyproject.toml). Inherits the
+    /// `Session` spawn-task contracts and adds AfterTool hooks that
+    /// run `cargo check` (and optionally eslint / ruff when present
+    /// on PATH) after `edit_file` / `write_file` / `diff_edit` calls
+    /// scoped to the language's file extensions. Audit Gap-1 + Q3.
+    Coding,
 }
 
 impl WorkspacePolicyKind {
@@ -343,6 +350,7 @@ impl WorkspacePolicyKind {
             Self::Slides => "slides",
             Self::Sites => "sites",
             Self::Session => "session",
+            Self::Coding => "coding",
         }
     }
 
@@ -779,6 +787,26 @@ impl WorkspacePolicy {
         }
     }
 
+    /// Default policy for a coding workspace (Audit Gap-1 + section 7 Q3).
+    ///
+    /// Inherits the [`for_session`] spawn-task contracts (so a coding workspace
+    /// that still spawns slides / podcast / fm_voice_save tasks keeps the
+    /// per-skill contract gates) and overlays only the `kind = Coding`
+    /// marker. The AfterTool `cargo check` / `eslint` / `ruff` hooks live in
+    /// [`coding_default_hooks`] so the host (chat.rs / gateway.rs / serve.rs)
+    /// can merge them into its `HookExecutor` without forking the hook runner.
+    ///
+    /// The split is deliberate: hooks are runtime side-effects executed by
+    /// the agent, while `WorkspacePolicy` is a serialized declaration shared
+    /// with the LLM. Stuffing process-launch hooks into the workspace policy
+    /// would (a) leak operator-side state into a contract the LLM can read
+    /// and (b) force every embedder of the policy struct (config_watcher,
+    /// session bootstrap, REST inspectors) to know how to run shells.
+    pub fn for_coding() -> Self {
+        let mut policy = Self::for_session();
+        policy.workspace.kind = WorkspacePolicyKind::Coding;
+        policy
+    }
     pub fn for_site_build_output(build_output_dir: &str) -> Self {
         let mut policy = Self::for_kind(WorkspaceProjectKind::Sites);
         policy.validation = ValidationPolicy {
@@ -802,6 +830,86 @@ impl WorkspacePolicy {
         };
         policy
     }
+}
+
+/// Detect the workspace policy kind for `cwd` by probing for well-known
+/// language manifests. Order: `Cargo.toml` → `package.json` → `pyproject.toml`
+/// → fallback [`WorkspacePolicyKind::Session`].
+///
+/// This is the entry point for Audit Gap-1's "the harness owns the contract"
+/// stance — the runtime decides whether a workspace is `Coding` based on
+/// observable filesystem signals, not LLM input. Operators who want to
+/// override the inference write an explicit `.octos-workspace.toml`.
+pub fn detect_workspace_policy_kind(cwd: &Path) -> WorkspacePolicyKind {
+    if cwd.join("Cargo.toml").is_file()
+        || cwd.join("package.json").is_file()
+        || cwd.join("pyproject.toml").is_file()
+    {
+        WorkspacePolicyKind::Coding
+    } else {
+        WorkspacePolicyKind::Session
+    }
+}
+
+/// Default `after_tool_call` hooks for a [`WorkspacePolicyKind::Coding`]
+/// workspace (Audit Gap-1 closure).
+///
+/// Each entry mirrors the canonical `cargo check` / `eslint` / `ruff`
+/// invocation an operator would write by hand. Hosts (chat.rs, gateway.rs,
+/// serve.rs) call this on bootstrap and merge the returned hooks into the
+/// HookExecutor they hand to the agent. Operator-defined hooks always merge
+/// AFTER these defaults, so an operator-written `cargo check` hook with
+/// stricter args overrides the default's behaviour by virtue of running too
+/// (both fire, but a stricter one denies before the cheaper one matters).
+///
+/// `requires_bin` gates each entry on a binary lookup — operators who do not
+/// have `eslint` or `ruff` installed see the hooks silently skip rather than
+/// failing every after-tool callback. `cargo` is assumed present in a Rust
+/// workspace (the detector keys on `Cargo.toml`) but is still gated so
+/// nothing breaks when a stub `Cargo.toml` lives alongside a non-cargo
+/// project.
+pub fn coding_default_hooks() -> Vec<crate::hooks::HookConfig> {
+    use crate::hooks::{HookConfig, HookEvent};
+    let edit_tools = vec![
+        "edit_file".to_string(),
+        "write_file".to_string(),
+        "diff_edit".to_string(),
+    ];
+    vec![
+        // Rust: `cargo check --message-format=short` on `.rs` edits.
+        HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec![
+                "cargo".into(),
+                "check".into(),
+                "--message-format=short".into(),
+            ],
+            timeout_ms: 60_000,
+            tool_filter: edit_tools.clone(),
+            path_filter: vec!["**/*.rs".into()],
+            requires_bin: Some("cargo".into()),
+        },
+        // JS/TS: ESLint with zero-warning policy. Skipped if eslint is
+        // not on PATH. Operators who use a different linter (biome, etc.)
+        // add their own hook; the default is best-effort and explicit.
+        HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec!["eslint".into(), "--max-warnings".into(), "0".into()],
+            timeout_ms: 60_000,
+            tool_filter: edit_tools.clone(),
+            path_filter: vec!["**/*.{js,ts,tsx,jsx}".into()],
+            requires_bin: Some("eslint".into()),
+        },
+        // Python: `ruff check` on `.py` edits.
+        HookConfig {
+            event: HookEvent::AfterToolCall,
+            command: vec!["ruff".into(), "check".into()],
+            timeout_ms: 60_000,
+            tool_filter: edit_tools,
+            path_filter: vec!["**/*.py".into()],
+            requires_bin: Some("ruff".into()),
+        },
+    ]
 }
 
 pub fn workspace_policy_path(project_root: &Path) -> PathBuf {
@@ -1490,5 +1598,124 @@ ignore = []
         let validator = full.into_validator("ignored", 99);
         assert_eq!(validator.id, "voice_optional");
         assert!(!validator.required);
+    }
+
+    // ----- WorkspacePolicyKind::Coding (Audit Gap-1 + section 7 Q3) -----
+
+    #[test]
+    fn should_detect_coding_kind_when_cargo_toml_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(
+            detect_workspace_policy_kind(tmp.path()),
+            WorkspacePolicyKind::Coding
+        );
+    }
+
+    #[test]
+    fn should_detect_coding_kind_when_package_json_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
+        assert_eq!(
+            detect_workspace_policy_kind(tmp.path()),
+            WorkspacePolicyKind::Coding
+        );
+    }
+
+    #[test]
+    fn should_detect_coding_kind_when_pyproject_toml_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\n").unwrap();
+        assert_eq!(
+            detect_workspace_policy_kind(tmp.path()),
+            WorkspacePolicyKind::Coding
+        );
+    }
+
+    #[test]
+    fn should_fall_back_to_session_kind_when_no_language_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Just an unrelated file — no manifest probes match.
+        std::fs::write(tmp.path().join("README.md"), "# hi").unwrap();
+        assert_eq!(
+            detect_workspace_policy_kind(tmp.path()),
+            WorkspacePolicyKind::Session
+        );
+    }
+
+    #[test]
+    fn should_return_coding_policy_marker_for_coding_kind() {
+        let policy = WorkspacePolicy::for_coding();
+        assert_eq!(policy.workspace.kind, WorkspacePolicyKind::Coding);
+        // Inherits session spawn-task contracts so coding workspaces that
+        // still spawn slides/podcast keep the per-skill gate.
+        assert!(policy.spawn_tasks.contains_key("fm_tts"));
+        assert!(policy.spawn_tasks.contains_key("mofa_slides"));
+    }
+
+    #[test]
+    fn should_return_rust_check_hook_in_coding_defaults() {
+        let hooks = coding_default_hooks();
+        let cargo = hooks
+            .iter()
+            .find(|h| h.command.first().map(String::as_str) == Some("cargo"))
+            .expect("cargo check hook present");
+        assert_eq!(cargo.event, crate::hooks::HookEvent::AfterToolCall);
+        assert!(cargo.path_filter.iter().any(|p| p == "**/*.rs"));
+        assert!(cargo.tool_filter.iter().any(|t| t == "edit_file"));
+        assert!(cargo.tool_filter.iter().any(|t| t == "write_file"));
+        assert!(cargo.tool_filter.iter().any(|t| t == "diff_edit"));
+        assert_eq!(cargo.requires_bin.as_deref(), Some("cargo"));
+    }
+
+    #[test]
+    fn should_return_eslint_hook_gated_on_bin_in_coding_defaults() {
+        let hooks = coding_default_hooks();
+        let eslint = hooks
+            .iter()
+            .find(|h| h.command.first().map(String::as_str) == Some("eslint"))
+            .expect("eslint hook present");
+        // ESLint hook must be opt-out friendly via requires_bin — operators
+        // without eslint on PATH must NOT see hook failures every edit.
+        assert_eq!(eslint.requires_bin.as_deref(), Some("eslint"));
+        assert!(
+            eslint
+                .path_filter
+                .iter()
+                .any(|p| p.ends_with(".{js,ts,tsx,jsx}"))
+        );
+    }
+
+    #[test]
+    fn should_return_ruff_hook_gated_on_bin_in_coding_defaults() {
+        let hooks = coding_default_hooks();
+        let ruff = hooks
+            .iter()
+            .find(|h| h.command.first().map(String::as_str) == Some("ruff"))
+            .expect("ruff hook present");
+        assert_eq!(ruff.requires_bin.as_deref(), Some("ruff"));
+        assert!(ruff.path_filter.iter().any(|p| p == "**/*.py"));
+    }
+
+    #[test]
+    fn should_not_emit_coding_hooks_for_session_kind() {
+        // Session policies retain the legacy no-default-hooks behaviour so
+        // existing operators don't see a sudden new wave of cargo checks.
+        let session = WorkspacePolicy::for_session();
+        assert_eq!(session.workspace.kind, WorkspacePolicyKind::Session);
+        // The hooks helper is global (not method-on-policy); we assert that
+        // callers must opt in by inspecting the kind themselves.
+        assert_ne!(session.workspace.kind, WorkspacePolicyKind::Coding);
+    }
+
+    #[test]
+    fn should_serialize_coding_kind_as_kebab_case() {
+        let policy = WorkspacePolicy::for_coding();
+        let rendered = toml::to_string(&policy).unwrap();
+        assert!(
+            rendered.contains("kind = \"coding\""),
+            "expected kebab-case 'coding' in serialized policy:\n{}",
+            rendered
+        );
     }
 }

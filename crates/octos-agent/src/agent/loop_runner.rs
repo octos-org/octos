@@ -28,6 +28,74 @@ use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
+/// Audit Gap-8 helper: consult the workspace-contract layer at EndTurn time
+/// and return a human-readable summary of failing validators when the
+/// contract is NOT ready. Returns `None` when the workspace has no
+/// policy-managed repos under `working_dir` (today's silent-success path).
+///
+/// This is the harness-side mirror of the LLM-callable
+/// `check_workspace_contract` tool — same source of truth
+/// (`inspect_workspace_contracts`), no parallel framework. Errors from the
+/// underlying inspector are swallowed with a warning so a transient git
+/// failure (e.g. corrupt `.git` directory) cannot block an otherwise
+/// successful task; the previous behaviour is preserved on inspector error.
+fn inspect_workspace_contract_failures(working_dir: &std::path::Path) -> Option<String> {
+    let contracts = match crate::workspace_git::inspect_workspace_contracts(working_dir) {
+        Ok(contracts) => contracts,
+        Err(err) => {
+            warn!(
+                workspace_root = %working_dir.display(),
+                error = %err,
+                "workspace contract inspector failed at EndTurn; treating as no-policy"
+            );
+            return None;
+        }
+    };
+
+    // Only fail on policy-managed repos that aren't ready.
+    let failing: Vec<_> = contracts
+        .iter()
+        .filter(|status| status.policy_managed && !status.ready)
+        .collect();
+    if failing.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(failing.len() * 2);
+    // Lowercase "workspace contract" so the message matches the same
+    // grep predicate used by the existing spawn-task contract failure
+    // assertions (`error.contains("workspace contract")` in spawn.rs).
+    lines.push(format!(
+        "workspace contract not ready for {} repo(s):",
+        failing.len()
+    ));
+    for status in failing {
+        lines.push(format!("- {} (kind={})", status.repo_label, status.kind));
+        if let Some(ref error) = status.error {
+            lines.push(format!("    error: {error}"));
+        }
+        for check in &status.completion_checks {
+            if !check.passed {
+                let reason = check.reason.as_deref().unwrap_or("(no reason given)");
+                lines.push(format!("    completion failed: {} — {reason}", check.spec));
+            }
+        }
+        for check in &status.turn_end_checks {
+            if !check.passed {
+                let reason = check.reason.as_deref().unwrap_or("(no reason given)");
+                lines.push(format!("    turn_end failed: {} — {reason}", check.spec));
+            }
+        }
+        for missing in status.artifacts.iter().filter(|a| !a.present) {
+            lines.push(format!(
+                "    artifact missing: {} (pattern={})",
+                missing.name, missing.pattern
+            ));
+        }
+    }
+    Some(lines.join("\n"))
+}
+
 fn split_tool_calls(
     tool_calls: &[octos_core::ToolCall],
     batch_size: usize,
@@ -1363,8 +1431,25 @@ impl Agent {
                         }
 
                         self.emit_cost_update(turn.total_usage(), &response.usage);
+
+                        // Audit Gap-8: auto-fire `check_workspace_contract`
+                        // on Completion. The LLM-callable wrapper stays for
+                        // introspection but no longer the only enforcement
+                        // path — the harness consults the contract before
+                        // declaring SUCCESS.
+                        //
+                        // Workspaces without a policy-managed repo under the
+                        // working_dir stay Success unchanged (returns
+                        // `None`). When at least one policy-managed repo is
+                        // not ready, the result is demoted to `success =
+                        // false` and the failing validators are appended to
+                        // the result output so the caller (or LLM next turn)
+                        // sees the contract failure.
+                        let contract_failures =
+                            inspect_workspace_contract_failures(&task.context.working_dir);
+
                         self.reporter().report(ProgressEvent::TaskCompleted {
-                            success: true,
+                            success: contract_failures.is_none(),
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
@@ -1375,14 +1460,28 @@ impl Agent {
                             iterations = iteration,
                             files_modified = files_modified.len(),
                             duration_ms = task_start.elapsed().as_millis() as u64,
+                            contract_failed = contract_failures.is_some(),
                             "task completed"
                         );
-                        return Ok(self.build_result(
+                        let mut result = self.build_result(
                             &response,
                             turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
-                        ));
+                        );
+                        if let Some(failure_msg) = contract_failures {
+                            warn!(
+                                workspace_root = %task.context.working_dir.display(),
+                                "task EndTurn but workspace contract is not ready; demoting to ContractFailed"
+                            );
+                            result.success = false;
+                            if result.output.is_empty() {
+                                result.output = failure_msg;
+                            } else {
+                                result.output = format!("{}\n\n{}", result.output, failure_msg);
+                            }
+                        }
+                        return Ok(result);
                     }
                     StopReason::ToolUse => {
                         if let Err(e) = self
@@ -4274,5 +4373,212 @@ printf '{"output":"voice saved","success":true}\n'
         // Reset at start of process_message clears the flag, so a brand-new
         // burst is allowed and emits a warning (Ok), not a terminal Err.
         assert!(second.is_ok(), "second call should not error after reset");
+    }
+
+    // ----- Audit Gap-8: auto-fire check_workspace_contract on Completion -----
+
+    /// LLM stub that always returns a single EndTurn — used by the
+    /// Gap-8 tests to drive `run_task` straight to the contract-check
+    /// branch without iterating through tool calls.
+    struct EndTurnOnlyProvider;
+    #[async_trait]
+    impl LlmProvider for EndTurnOnlyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn make_managed_slides_workspace(tmp_root: &std::path::Path, slug: &str, ready: bool) {
+        use crate::workspace_git::WorkspaceProjectKind;
+        use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+        let repo_root = tmp_root.join("slides").join(slug);
+        std::fs::create_dir_all(&repo_root).unwrap();
+        write_workspace_policy(
+            &repo_root,
+            &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+        )
+        .unwrap();
+        // Every slides workspace requires script.js / memory.md / changelog.md
+        // for turn_end + output/deck.pptx + slide png for completion.
+        std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
+        std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
+        std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
+        if ready {
+            std::fs::create_dir_all(repo_root.join("output/imgs")).unwrap();
+            std::fs::write(repo_root.join("output/deck.pptx"), "fake-deck").unwrap();
+            std::fs::write(repo_root.join("output/imgs/slide-01.png"), "fake-png").unwrap();
+        }
+    }
+
+    #[test]
+    fn should_return_none_when_workspace_has_no_policy_managed_repos() {
+        // Bare working_dir with no `slides/` or `sites/` subdir →
+        // inspect_workspace_contracts yields an empty Vec → helper returns
+        // None → loop_runner keeps Success.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(inspect_workspace_contract_failures(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn should_return_none_when_all_managed_repos_are_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_managed_slides_workspace(tmp.path(), "demo", true);
+
+        let failures = inspect_workspace_contract_failures(tmp.path());
+        assert!(
+            failures.is_none(),
+            "ready workspace should not produce contract failure summary: {:?}",
+            failures
+        );
+    }
+
+    #[test]
+    fn should_return_failure_summary_when_managed_repo_is_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        // slug=broken with NO output/ artifacts → completion checks fail.
+        make_managed_slides_workspace(tmp.path(), "broken", false);
+
+        let failures = inspect_workspace_contract_failures(tmp.path())
+            .expect("broken workspace must produce contract failure summary");
+        assert!(
+            failures.contains("slides/broken"),
+            "summary should name the failing repo:\n{}",
+            failures
+        );
+        assert!(
+            failures.contains("completion failed") || failures.contains("artifact missing"),
+            "summary should describe what failed:\n{}",
+            failures
+        );
+    }
+
+    #[test]
+    fn should_return_failure_summary_with_mixed_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_managed_slides_workspace(tmp.path(), "ready-deck", true);
+        make_managed_slides_workspace(tmp.path(), "broken-deck", false);
+
+        let failures = inspect_workspace_contract_failures(tmp.path())
+            .expect("at least one broken repo must produce failures");
+        assert!(failures.contains("slides/broken-deck"));
+        // Only the broken repo should appear in the failures listing —
+        // ready-deck is not in the failing set.
+        assert!(
+            !failures.contains("ready-deck") || failures.contains("broken-deck"),
+            "ready-deck should not appear as a failure:\n{}",
+            failures
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_demotes_success_when_contract_fails() {
+        // End-to-end integration: an EndTurn that would otherwise be Success
+        // gets demoted to success=false when the working_dir contains a
+        // policy-managed repo that is not ready.
+        let dir = tempfile::tempdir().unwrap();
+        // Pre-populate a broken slides repo so contract != ready.
+        make_managed_slides_workspace(dir.path(), "demo", false);
+
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("contract-demote"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Build it".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(
+            !result.success,
+            "broken workspace contract must demote task to failure"
+        );
+        assert!(
+            result.output.contains("workspace contract") || result.output.contains("slides/demo"),
+            "result output should explain the contract failure: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_keeps_success_when_workspace_has_no_policy() {
+        // No-policy workspace must stay Success (no regression).
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("no-contract"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Hi".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(
+            result.success,
+            "no-policy workspace must keep Success (got {:?})",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_keeps_success_when_contract_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fully-ready workspace.
+        make_managed_slides_workspace(dir.path(), "ready", true);
+
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("contract-ok"), provider, tools, memory);
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "All good".into(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+        assert!(
+            result.success,
+            "ready workspace must keep Success (got {:?})",
+            result.output
+        );
     }
 }

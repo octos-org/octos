@@ -54,6 +54,28 @@ pub struct HookConfig {
     /// Only trigger for these tool names (tool events only). Empty = all tools.
     #[serde(default)]
     pub tool_filter: Vec<String>,
+    /// Only fire when the tool call's argument `path` matches one of these
+    /// glob patterns (tool events only). Empty = no path filtering applied
+    /// (today's behaviour: fire-for-all matching tools). Used by the M9
+    /// AfterTool coding-agent gate to scope `cargo check` to `**/*.rs`
+    /// edits, etc.
+    ///
+    /// Path extraction is tool-specific: `edit_file`, `write_file`, and
+    /// `diff_edit` all expose the target path at `args.path`. For tools
+    /// that do not surface a path (e.g. `shell`, `read_file`), a non-empty
+    /// `path_filter` causes the hook to be skipped — operators opt into
+    /// path-scoped filtering at their own risk.
+    ///
+    /// Invalid glob patterns are logged once at executor init and the
+    /// pattern is dropped; the remaining valid patterns still apply.
+    #[serde(default)]
+    pub path_filter: Vec<String>,
+    /// Optional binary that must be discoverable on `PATH` for this hook
+    /// to fire. Used by [`WorkspacePolicy::for_coding`] to gate optional
+    /// language hooks (`eslint`, `ruff`) without forcing operators to
+    /// install every linter. Absent or empty = no gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_bin: Option<String>,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -575,6 +597,12 @@ pub enum HookResult {
 /// Executes hooks with circuit breaker protection.
 pub struct HookExecutor {
     hooks: Vec<HookConfig>,
+    /// Precompiled path-filter glob patterns per hook, parallel to `hooks`.
+    /// Each inner Vec is the parsed `glob::Pattern` list for the hook's
+    /// `path_filter` field. Invalid patterns are dropped at construction
+    /// time so the matcher loop stays infallible. Hooks with no
+    /// `path_filter` keep an empty inner Vec.
+    path_filters: Vec<Vec<glob::Pattern>>,
     /// Per-hook consecutive failure count.
     failures: Vec<AtomicU32>,
     failure_threshold: u32,
@@ -589,8 +617,13 @@ impl HookExecutor {
 
     pub fn with_threshold(hooks: Vec<HookConfig>, failure_threshold: u32) -> Self {
         let failures = (0..hooks.len()).map(|_| AtomicU32::new(0)).collect();
+        let path_filters = hooks
+            .iter()
+            .map(|hook| compile_path_filters(&hook.command, &hook.path_filter))
+            .collect();
         Self {
             hooks,
+            path_filters,
             failures,
             failure_threshold,
             enricher: None,
@@ -652,6 +685,42 @@ impl HookExecutor {
                 if !hook.tool_filter.iter().any(|f| f == tool_name) {
                     continue;
                 }
+            }
+
+            // Apply path_filter for tool events (Audit Gap-1 closure).
+            // Globs are matched against the path string from
+            // `arguments.path`. If the hook declares a non-empty
+            // `path_filter` and either (a) the tool's arguments do not
+            // surface a `path` field or (b) no glob matches, skip the
+            // hook. Falling through silently keeps the catch-all
+            // (empty path_filter) at today's behaviour.
+            if matches!(event, HookEvent::BeforeToolCall | HookEvent::AfterToolCall)
+                && !self.path_filters[i].is_empty()
+            {
+                let tool_path = payload_ref.arguments.as_ref().and_then(extract_tool_path);
+                let Some(tool_path) = tool_path else {
+                    continue;
+                };
+                let candidate = std::path::Path::new(&tool_path);
+                let matched = self.path_filters[i]
+                    .iter()
+                    .any(|pat| pat.matches_path(candidate));
+                if !matched {
+                    continue;
+                }
+            }
+
+            // Optional binary presence gate (`requires_bin`). When a hook
+            // declares a required binary, skip it if the binary is not on
+            // PATH. Used by `WorkspacePolicy::for_coding` to ship eslint /
+            // ruff hooks as opt-in defaults without forcing operators to
+            // install every linter. The lookup uses `which::which` once
+            // per call — cheap and cache-friendly via the OS path cache.
+            if let Some(bin) = hook.requires_bin.as_deref()
+                && !bin.is_empty()
+                && which::which(bin).is_err()
+            {
+                continue;
             }
 
             // Circuit breaker: skip if too many failures
@@ -846,6 +915,39 @@ impl HookExecutor {
             }
         }
     }
+}
+
+/// Compile the `path_filter` globs declared on a [`HookConfig`]. Invalid
+/// patterns log a warning and are dropped so the matcher stays infallible.
+/// Returns an empty Vec when the input is empty (caller uses Vec::is_empty
+/// as the "no filtering" predicate).
+fn compile_path_filters(command: &[String], patterns: &[String]) -> Vec<glob::Pattern> {
+    patterns
+        .iter()
+        .filter_map(|p| match glob::Pattern::new(p) {
+            Ok(pat) => Some(pat),
+            Err(e) => {
+                warn!(
+                    hook_command = ?command,
+                    pattern = %p,
+                    error = %e,
+                    "hook path_filter pattern is invalid; dropped"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Extract the `path` argument from a tool's `arguments` JSON object. This
+/// matches the shape used by `edit_file`, `write_file`, and `diff_edit`
+/// (path at `args.path`). For tools that do not surface a path, returns
+/// `None` so the caller can skip the hook.
+fn extract_tool_path(args: &serde_json::Value) -> Option<String> {
+    args.as_object()
+        .and_then(|obj| obj.get("path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 /// Expand leading `~` or `~/` to the user's home directory.
@@ -1175,6 +1277,8 @@ mod tests {
             command: vec!["false".into()], // would fail if executed
             timeout_ms: 1000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }]);
         // Set failures at threshold so circuit breaker trips
         executor.failures[0].store(3, Ordering::Relaxed);
@@ -1226,6 +1330,8 @@ mod tests {
             command: vec!["check".into()],
             timeout_ms: 1000,
             tool_filter: vec!["shell".into(), "write_file".into()],
+            path_filter: vec![],
+            requires_bin: None,
         };
         assert!(hook.tool_filter.contains(&"shell".to_string()));
         assert!(!hook.tool_filter.contains(&"read_file".to_string()));
@@ -1296,6 +1402,8 @@ mod tests {
             command: vec!["true".into()],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }]);
         let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
@@ -1311,6 +1419,8 @@ mod tests {
             command: vec!["false".into()],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }]);
         let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
@@ -1324,6 +1434,8 @@ mod tests {
             command: vec!["false".into()],
             timeout_ms: 5000,
             tool_filter: vec!["write_file".into()],
+            path_filter: vec![],
+            requires_bin: None,
         }]);
         let payload = HookPayload::before_tool("read_file", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
@@ -1337,6 +1449,8 @@ mod tests {
             command: vec!["false".into()],
             timeout_ms: 5000,
             tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
         }]);
         let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
         let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
@@ -1353,6 +1467,8 @@ mod tests {
                 command: vec!["sh".into(), "-c".into(), "exit 2".into()],
                 timeout_ms: 5000,
                 tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
             }],
             3,
         );
@@ -1375,6 +1491,8 @@ mod tests {
                 command: vec!["sh".into(), "-c".into(), "exit 2".into()],
                 timeout_ms: 5000,
                 tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
             }],
             3,
         );
@@ -1399,6 +1517,8 @@ mod tests {
                 command: vec!["true".into()],
                 timeout_ms: 5000,
                 tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
             }],
             3,
         );
@@ -1481,5 +1601,249 @@ mod tests {
         assert!(json.contains("*.rs"));
         assert!(!json.contains("truncated"));
         assert!(!json.contains("redacted"));
+    }
+
+    // ----- Path filter (Audit Gap-1) tests -----
+
+    /// Convenience constructor for path-filter tests so the cases that follow
+    /// stay focused on the filtering behaviour itself.
+    fn hook_with_path_filter(event: HookEvent, patterns: Vec<&str>) -> HookConfig {
+        HookConfig {
+            event,
+            // `false` would fail if the hook actually fires — perfect for
+            // "should this hook fire?" semantics.
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: patterns.into_iter().map(String::from).collect(),
+            requires_bin: None,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_skip_hook_when_path_filter_does_not_match() {
+        let executor = HookExecutor::new(vec![hook_with_path_filter(
+            HookEvent::AfterToolCall,
+            vec!["**/*.rs"],
+        )]);
+        // edit_file on a Python path — `**/*.rs` glob should NOT match.
+        let payload = HookPayload::after_tool("edit_file", "tc1", "ok".into(), true, 10, None);
+        let mut payload = payload;
+        payload.arguments = Some(serde_json::json!({"path": "scripts/build.py"}));
+        let result = executor.run(HookEvent::AfterToolCall, &payload).await;
+        // Hook skipped -> Allow (not denied, not errored).
+        assert_eq!(result, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_fire_hook_when_path_filter_matches() {
+        // `true` would succeed; deny-via-exit-1 only makes sense for before-
+        // hooks. Use a before-hook with `false` so a match yields Deny.
+        let mut cfg = hook_with_path_filter(HookEvent::BeforeToolCall, vec!["**/*.rs"]);
+        cfg.command = vec!["false".into()];
+        let executor = HookExecutor::new(vec![cfg]);
+        let mut payload = HookPayload::before_tool("edit_file", serde_json::json!({}), "tc1", None);
+        payload.arguments = Some(serde_json::json!({"path": "src/lib.rs"}));
+        let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert!(
+            matches!(result, HookResult::Deny(_)),
+            "matching glob should fire the hook (got {:?})",
+            result
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_fire_hook_when_path_filter_is_empty() {
+        // Empty path_filter — fire-for-all-matching-tools (today's
+        // backward-compat behaviour).
+        let cfg = HookConfig {
+            event: HookEvent::BeforeToolCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![], // explicit empty
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![cfg]);
+        let payload = HookPayload::before_tool(
+            "edit_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            "tc1",
+            None,
+        );
+        let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert!(
+            matches!(result, HookResult::Deny(_)),
+            "empty path_filter should fall through to today's behaviour (got {:?})",
+            result
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_skip_hook_when_arguments_have_no_path_field() {
+        // Tool with `path_filter` set but a tool whose arguments lack a
+        // `path` key. The hook must be skipped (operator opted into
+        // path-scoped filtering and there is no path to test against).
+        let executor = HookExecutor::new(vec![hook_with_path_filter(
+            HookEvent::BeforeToolCall,
+            vec!["**/*.rs"],
+        )]);
+        let payload =
+            HookPayload::before_tool("shell", serde_json::json!({"command": "ls"}), "tc1", None);
+        let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert_eq!(result, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_match_any_pattern_in_path_filter() {
+        // Multiple globs: hook fires if ANY matches.
+        let mut cfg = hook_with_path_filter(HookEvent::BeforeToolCall, vec!["**/*.js", "**/*.ts"]);
+        cfg.command = vec!["false".into()];
+        let executor = HookExecutor::new(vec![cfg]);
+        let mut payload = HookPayload::before_tool("edit_file", serde_json::json!({}), "tc1", None);
+        payload.arguments = Some(serde_json::json!({"path": "frontend/src/app.ts"}));
+        let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert!(
+            matches!(result, HookResult::Deny(_)),
+            "second glob should match .ts file (got {:?})",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn should_drop_invalid_glob_patterns_at_init() {
+        // An invalid pattern should be dropped silently (logged once at
+        // init) without breaking the executor. Combine with a valid
+        // pattern so we can verify the valid one still works.
+        let cfg = HookConfig {
+            event: HookEvent::BeforeToolCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec!["[unterminated".into(), "**/*.rs".into()],
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![cfg]);
+        // path_filters[0] should only contain the valid pattern.
+        assert_eq!(executor.path_filters[0].len(), 1);
+        assert_eq!(executor.path_filters[0][0].as_str(), "**/*.rs");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_combine_tool_filter_and_path_filter() {
+        // tool_filter scopes by tool name; path_filter scopes by path.
+        // Both must be satisfied for the hook to fire.
+        let cfg = HookConfig {
+            event: HookEvent::BeforeToolCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec!["edit_file".into()],
+            path_filter: vec!["**/*.rs".into()],
+            requires_bin: None,
+        };
+        let executor = HookExecutor::new(vec![cfg]);
+
+        // Right tool, right path → hook fires.
+        let mut payload = HookPayload::before_tool(
+            "edit_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            "tc1",
+            None,
+        );
+        payload.arguments = Some(serde_json::json!({"path": "src/lib.rs"}));
+        let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert!(matches!(r, HookResult::Deny(_)));
+
+        // Right tool, wrong path → skipped.
+        let mut payload = HookPayload::before_tool(
+            "edit_file",
+            serde_json::json!({"path": "README.md"}),
+            "tc1",
+            None,
+        );
+        payload.arguments = Some(serde_json::json!({"path": "README.md"}));
+        let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert_eq!(r, HookResult::Allow);
+
+        // Wrong tool → skipped (regardless of path).
+        let mut payload = HookPayload::before_tool(
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            "tc1",
+            None,
+        );
+        payload.arguments = Some(serde_json::json!({"path": "src/lib.rs"}));
+        let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert_eq!(r, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    async fn should_skip_hook_when_requires_bin_missing() {
+        // Sentinel binary that should not exist on any reasonable test
+        // environment. The hook must be skipped without trying to spawn
+        // anything.
+        let cfg = HookConfig {
+            event: HookEvent::BeforeToolCall,
+            command: vec!["false".into()],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: Some(
+                "definitely-not-a-real-binary-on-this-host-octos-wave3c-test".into(),
+            ),
+        };
+        let executor = HookExecutor::new(vec![cfg]);
+        let payload = HookPayload::before_tool("edit_file", serde_json::json!({}), "tc1", None);
+        let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert_eq!(r, HookResult::Allow);
+    }
+
+    #[test]
+    fn should_deserialize_hook_config_with_path_filter() {
+        let json = r#"{
+            "event": "after_tool_call",
+            "command": ["cargo", "check"],
+            "tool_filter": ["edit_file", "write_file"],
+            "path_filter": ["**/*.rs"]
+        }"#;
+        let hook: HookConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(hook.path_filter, vec!["**/*.rs"]);
+        assert_eq!(hook.tool_filter.len(), 2);
+        assert!(hook.requires_bin.is_none());
+    }
+
+    #[test]
+    fn should_default_path_filter_to_empty_when_absent() {
+        let json = r#"{
+            "event": "after_tool_call",
+            "command": ["echo"]
+        }"#;
+        let hook: HookConfig = serde_json::from_str(json).unwrap();
+        assert!(hook.path_filter.is_empty());
+        assert!(hook.requires_bin.is_none());
+    }
+
+    #[test]
+    fn should_extract_path_from_arguments() {
+        let args = serde_json::json!({"path": "src/lib.rs", "content": "..."});
+        assert_eq!(extract_tool_path(&args).as_deref(), Some("src/lib.rs"));
+
+        // Missing path key
+        let args = serde_json::json!({"command": "ls"});
+        assert!(extract_tool_path(&args).is_none());
+
+        // Non-string path
+        let args = serde_json::json!({"path": 42});
+        assert!(extract_tool_path(&args).is_none());
+
+        // Non-object
+        let args = serde_json::json!([]);
+        assert!(extract_tool_path(&args).is_none());
     }
 }
