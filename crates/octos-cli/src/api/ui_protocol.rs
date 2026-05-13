@@ -110,7 +110,15 @@ type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>
 /// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
 /// into the WS write channel for the lifetime of the connection. Dropping
 /// or aborting a handle terminates the pump.
-type SharedLiveForwarders = Arc<tokio::sync::Mutex<HashMap<SessionKey, AbortHandle>>>;
+///
+/// #924 NIT 8: keep the full `JoinHandle` (not just the `AbortHandle`) so
+/// the connection-cleanup path can `await` the aborted task before pruning
+/// idle subscribers. With only an `AbortHandle`, a single `yield_now()`
+/// after `abort()` was best-effort — under load the receiver might not
+/// have dropped before `prune_subscriber_if_idle` ran, leaving the ledger
+/// broadcaster believing it still had a live subscriber.
+type SharedLiveForwarders =
+    Arc<tokio::sync::Mutex<HashMap<SessionKey, tokio::task::JoinHandle<()>>>>;
 
 /// Outcome of pushing a frame onto the per-connection writer channel.
 ///
@@ -1986,24 +1994,27 @@ async fn ui_protocol_connection(
 }
 
 async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiProtocolLedger) {
-    let drained_sessions: Vec<SessionKey> = {
+    let drained: Vec<(SessionKey, tokio::task::JoinHandle<()>)> = {
         let mut guard = forwarders.lock().await;
-        guard
-            .drain()
-            .map(|(session_id, abort)| {
-                abort.abort();
-                session_id
-            })
-            .collect()
+        guard.drain().collect()
     };
-    if drained_sessions.is_empty() {
+    if drained.is_empty() {
         return;
     }
-    // #923.2: yield once so the aborted forwarder tasks have a chance
-    // to drop their broadcast receivers before we prune. Then sweep
-    // each session — if its receiver count is now zero we drop the
-    // sender immediately instead of waiting for the periodic sweep.
-    tokio::task::yield_now().await;
+    // #923.2 + #924 NIT 8: abort every forwarder, then `await` each
+    // JoinHandle so the receiver-drop has provably happened before we
+    // prune. The old `yield_now()` was a single scheduling hint and
+    // could lose the race under load — leaving the ledger
+    // broadcaster believing it still had a live subscriber. Awaiting
+    // the JoinHandle is the canonical "task is fully done" signal in
+    // tokio. We ignore the JoinError for aborted tasks (that's the
+    // expected shape).
+    let mut drained_sessions: Vec<SessionKey> = Vec::with_capacity(drained.len());
+    for (session_id, handle) in drained {
+        handle.abort();
+        let _ = handle.await;
+        drained_sessions.push(session_id);
+    }
     for session_id in drained_sessions {
         ledger.prune_subscriber_if_idle(&session_id);
     }
@@ -2015,12 +2026,20 @@ async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiPro
 /// server replied with a `parse_error` for every keepalive. The
 /// resulting noise also masked real parse errors.
 ///
-/// Inspect the raw envelope first: if `id` is absent we return
-/// `Notification(method)` (the caller silently accepts known
-/// notifications such as `ping`). When `id` is present we parse the
-/// full `RpcRequest<Value>` shape and return `Request`. Unparseable
-/// frames continue to return `Err(RpcError)` so the existing
-/// "lifecycle: client violated wire contract" branch fires.
+/// #924 NIT 6: distinguish notifications from requests by KEY
+/// PRESENCE on `id`, not by null-check. A JSON-RPC envelope with
+/// `id: null` is malformed (per spec §4 the `id` of a request must
+/// be a String / Number / NULL only for the response correlation
+/// reserved use); routing it as a "notification" silently swallowed
+/// what should be a loud parse error. The rule:
+///
+/// - `id` absent       → Notification (today's `ping`/etc.)
+/// - `id` is String    → Request (our server's expected shape)
+/// - `id` is Number    → Reject with parse_error (we require String)
+/// - `id` is null/etc. → Reject with parse_error
+///
+/// Unparseable frames continue to return `Err(RpcError)` so the
+/// existing "lifecycle: client violated wire contract" branch fires.
 #[derive(Debug)]
 enum ParsedFrame {
     Request(RpcRequest<Value>),
@@ -2036,18 +2055,30 @@ fn parse_ws_text_frame(text: &str) -> Result<ParsedFrame, RpcError> {
     if !value.is_object() {
         return Err(RpcError::parse_error("envelope must be an object"));
     }
-    let has_id = value.get("id").is_some_and(|v| !v.is_null());
-    if !has_id {
-        let method = value
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::parse_error("notification missing method"))?
-            .to_owned();
-        return Ok(ParsedFrame::Notification(method));
+    match value.get("id") {
+        None => {
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::parse_error("notification missing method"))?
+                .to_owned();
+            Ok(ParsedFrame::Notification(method))
+        }
+        Some(Value::String(_)) => {
+            let request: RpcRequest<Value> = serde_json::from_value(value)
+                .map_err(|err| RpcError::parse_error(err.to_string()))?;
+            Ok(ParsedFrame::Request(request))
+        }
+        Some(Value::Null) => Err(RpcError::parse_error(
+            "rpc envelope `id` must not be null; omit the field for notifications",
+        )),
+        Some(Value::Number(_)) => Err(RpcError::parse_error(
+            "rpc envelope `id` must be a string; numeric ids are not supported",
+        )),
+        Some(_) => Err(RpcError::parse_error(
+            "rpc envelope `id` must be a string when present",
+        )),
     }
-    let request: RpcRequest<Value> =
-        serde_json::from_value(value).map_err(|err| RpcError::parse_error(err.to_string()))?;
-    Ok(ParsedFrame::Request(request))
 }
 
 #[cfg(test)]
@@ -2438,11 +2469,15 @@ async fn spawn_live_forwarder(
             }
         }
     });
-    let abort = task.abort_handle();
-    // Replace any prior forwarder for this session on this connection —
-    // re-`session/open` restarts the live pump from a fresh baseline.
+    // #924 NIT 8: store the full JoinHandle so the connection-cleanup
+    // path can `await` the aborted task before pruning idle
+    // subscribers. Replace any prior forwarder for this session on
+    // this connection — re-`session/open` restarts the live pump from
+    // a fresh baseline. The previous handle is aborted + the resulting
+    // JoinHandle dropped on the spot; we don't await here because
+    // re-open is a hot path.
     let mut guard = forwarders.lock().await;
-    if let Some(prev) = guard.insert(session_id, abort) {
+    if let Some(prev) = guard.insert(session_id, task) {
         prev.abort();
     }
 }
@@ -7450,29 +7485,46 @@ fn ledger_event_method(event: &UiProtocolLedgerEvent) -> &'static str {
 }
 
 fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
+    // #924 NIT 7: exhaustive on both `UiProtocolLedgerEvent` AND the
+    // inner `UiNotification`. A `_ => None` catchall would let a
+    // future cursor-bearing variant compile cleanly while silently
+    // being skipped for replay-lossy cursor extraction (#921 was
+    // exactly that bug for `MessagePersisted` / `TurnSpawnComplete`).
+    // The rule for new variants: if you add a `cursor: UiCursor` or
+    // `cursor: Option<UiCursor>` field, add it here too. Variants
+    // whose "cursor" is an `OutputCursor` (task output stream) are
+    // explicitly NOT surfaced here — that's a separate replay channel.
     match event {
-        UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
-            cursor: Some(cursor),
-            ..
-        })) => Some(cursor.clone()),
-        UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
-            TurnCompletedEvent {
-                cursor: Some(cursor),
-                ..
-            },
-        )) => Some(cursor.clone()),
-        // #921: extract cursors from every durable cursor-bearing variant.
-        // `MessagePersisted` and `TurnSpawnComplete` always carry a non-Option
-        // cursor (stamped by the ledger on append); without these arms a
-        // dropped send for either method silently skipped `protocol/replay_lossy`,
-        // so the client never refetched the gap.
-        UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(persisted)) => {
-            Some(persisted.cursor.clone())
-        }
-        UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(spawn)) => {
-            Some(spawn.cursor.clone())
-        }
-        _ => None,
+        UiProtocolLedgerEvent::Notification(notification) => match notification {
+            UiNotification::SessionOpened(SessionOpened { cursor, .. }) => cursor.clone(),
+            UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => cursor.clone(),
+            UiNotification::MessagePersisted(persisted) => Some(persisted.cursor.clone()),
+            UiNotification::TurnSpawnComplete(spawn) => Some(spawn.cursor.clone()),
+            // Non-cursor-bearing variants — exhaustively enumerated so a
+            // future addition forces an explicit decision here.
+            UiNotification::TurnStarted(_)
+            | UiNotification::MessageDelta(_)
+            | UiNotification::ToolStarted(_)
+            | UiNotification::ToolProgress(_)
+            | UiNotification::ToolCompleted(_)
+            | UiNotification::ApprovalRequested(_)
+            | UiNotification::ApprovalAutoResolved(_)
+            | UiNotification::ApprovalDecided(_)
+            | UiNotification::ApprovalCancelled(_)
+            | UiNotification::TaskUpdated(_)
+            // TaskOutputDelta carries an `OutputCursor`, not a `UiCursor`.
+            | UiNotification::TaskOutputDelta(_)
+            | UiNotification::ProgressUpdated(_)
+            | UiNotification::Warning(_)
+            | UiNotification::TurnError(_)
+            // ReplayLossy references a `last_durable_cursor` belonging to
+            // the events it summarises, not its own — surfacing it here
+            // would re-loop the replay flag onto itself.
+            | UiNotification::ReplayLossy(_)
+            | UiNotification::FileAttached(_)
+            | UiNotification::SessionEventBridged(_) => None,
+        },
+        UiProtocolLedgerEvent::Progress(_) => None,
     }
 }
 
@@ -9046,6 +9098,40 @@ mod tests {
         }
         assert!(is_known_inbound_notification("ping"));
         assert!(!is_known_inbound_notification("unknown"));
+    }
+
+    /// #924 NIT 6: distinguish notifications from requests by KEY
+    /// presence on `id`, not null-check. An envelope with
+    /// `"id": null` is malformed — surfacing it loudly via
+    /// parse_error catches client bugs that the silent-drop path
+    /// hid.
+    #[test]
+    fn null_id_envelope_is_rejected_with_parse_error() {
+        let frame =
+            r#"{"jsonrpc":"2.0","id":null,"method":"session/open","params":{"session_id":"x"}}"#;
+        let err = parse_ws_text_frame(frame).expect_err("null id must reject");
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::PARSE_ERROR
+        );
+        assert!(
+            err.message.contains("null"),
+            "parse error message should mention the null id; got {}",
+            err.message
+        );
+    }
+
+    /// #924 NIT 6: numeric ids are also rejected — the server's RpcRequest
+    /// shape requires `id: String`.
+    #[test]
+    fn numeric_id_envelope_is_rejected_with_parse_error() {
+        let frame =
+            r#"{"jsonrpc":"2.0","id":42,"method":"session/open","params":{"session_id":"x"}}"#;
+        let err = parse_ws_text_frame(frame).expect_err("numeric id must reject");
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::PARSE_ERROR
+        );
     }
 
     #[test]
