@@ -5426,15 +5426,17 @@ async fn handle_content_list(
 ) {
     let method = octos_core::ui_protocol::methods::CONTENT_LIST;
     let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: SPA bridge listens for close-code 1008 to
+        // trigger `crew:auth_expired` (clears token, routes to /login). The
+        // RPC envelope alone leaves a stale-token client retrying forever.
+        // Codex BLOCK (2026-05-13): close must precede the error envelope so
+        // it survives backpressure when only one writer slot is free.
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         let _ = send_rpc_error(
             ws,
             Some(id),
             RpcError::permission_denied(format!("{method}: authenticated user identity required")),
         );
-        // Web PR #114 contract: SPA bridge listens for close-code 1008 to
-        // trigger `crew:auth_expired` (clears token, routes to /login). The
-        // RPC envelope alone leaves a stale-token client retrying forever.
-        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         return;
     };
     // `ContentQuery` deserializes from the same JSON the REST query
@@ -5518,13 +5520,15 @@ async fn handle_content_delete(
 ) {
     let method = octos_core::ui_protocol::methods::CONTENT_DELETE;
     let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         let _ = send_rpc_error(
             ws,
             Some(id),
             RpcError::permission_denied(format!("{method}: authenticated user identity required")),
         );
-        // Web PR #114 contract: see `close_ws_with_code` doc-comment.
-        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         return;
     };
     let content_id = params.id.clone();
@@ -5569,13 +5573,15 @@ async fn handle_content_bulk_delete(
 ) {
     let method = octos_core::ui_protocol::methods::CONTENT_BULK_DELETE;
     let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
+        // BLOCK (2026-05-13): close before error so it survives writer
+        // backpressure when the channel has just one free slot.
+        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         let _ = send_rpc_error(
             ws,
             Some(id),
             RpcError::permission_denied(format!("{method}: authenticated user identity required")),
         );
-        // Web PR #114 contract: see `close_ws_with_code` doc-comment.
-        let _ = close_ws_with_code(ws, 1008, "auth_expired");
         return;
     };
     // Codex review 2026-05-12: reject over-cap bulk-delete requests
@@ -7444,8 +7450,10 @@ fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Res
 /// Used to signal durable auth failure (code 1008 / "auth_expired"). The SPA
 /// bridge (Web PR #114, `auth-context.tsx`) subscribes to close-code 1008 to
 /// invoke `crew:auth_expired`, which clears the cached token and routes to
-/// /login. Sending an `RpcError` envelope first surfaces the human-readable
-/// reason; the close frame trips the bridge's reconnect-or-relogin choice.
+/// /login. Callers MUST enqueue this close frame BEFORE any accompanying
+/// `RpcError` envelope: under writer-channel backpressure (capacity-1 with one
+/// slot used), only the first try_send survives, and the close is the
+/// load-bearing signal the SPA listens for (codex BLOCK 2026-05-13).
 fn close_ws_with_code(ws: &WsConnection, code: u16, reason: &str) -> Result<(), SendError> {
     let frame = WsMessage::Close(Some(axum::extract::ws::CloseFrame {
         code,
@@ -7456,15 +7464,19 @@ fn close_ws_with_code(ws: &WsConnection, code: u16, reason: &str) -> Result<(), 
 
 /// Send a scope-validation error back to the caller and, when the error came
 /// from `validate_authenticated_session_scope` (i.e. the connection IS
-/// authenticated and the requested scope doesn't match), follow up with a
+/// authenticated and the requested scope doesn't match), accompany it with a
 /// close-code 1008 frame so the SPA `crew:auth_expired` listener fires.
 /// Non-auth scope errors (malformed input, etc.) leave the socket open.
 fn send_scope_error(ws: &WsConnection, id: String, error: RpcError) {
     let auth_violation = is_auth_scope_violation(&error);
-    let _ = send_rpc_error(ws, Some(id), error);
+    // Codex BLOCK (2026-05-13): when the writer channel has just one free
+    // slot, the close-code is the load-bearing signal — the SPA uses it to
+    // detect auth-expiry and clear its token. Enqueue the close FIRST so it
+    // survives backpressure even if the courtesy error envelope is dropped.
     if auth_violation {
         let _ = close_ws_with_code(ws, 1008, "auth_expired");
     }
+    let _ = send_rpc_error(ws, Some(id), error);
 }
 
 fn send_notification_lifecycle(
@@ -9350,23 +9362,25 @@ mod tests {
 
         send_scope_error(&ws, "rpc-1".into(), error);
 
-        // First frame is the JSON-RPC error envelope.
-        let first = rx.recv().await.expect("rpc error frame");
-        let text = match first {
-            axum::extract::ws::Message::Text(text) => text,
-            other => panic!("expected text frame, got {other:?}"),
-        };
-        assert!(text.contains("expected_profile_id"));
-
-        // Second frame is the close-code 1008 with reason "auth_expired".
-        let second = rx.recv().await.expect("close frame");
-        match second {
+        // First frame is the close-code 1008 with reason "auth_expired" — the
+        // close MUST precede the error envelope so it survives writer-channel
+        // backpressure (codex BLOCK 2026-05-13).
+        let first = rx.recv().await.expect("close frame");
+        match first {
             axum::extract::ws::Message::Close(Some(frame)) => {
                 assert_eq!(frame.code, 1008);
                 assert_eq!(frame.reason.as_str(), "auth_expired");
             }
             other => panic!("expected close frame with 1008, got {other:?}"),
         }
+
+        // Second frame is the JSON-RPC error envelope (courtesy detail).
+        let second = rx.recv().await.expect("rpc error frame");
+        let text = match second {
+            axum::extract::ws::Message::Text(text) => text,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        assert!(text.contains("expected_profile_id"));
     }
 
     #[tokio::test]
@@ -9386,6 +9400,45 @@ mod tests {
         // Drop the sender side so a pending recv resolves promptly; instead,
         // poll once with no wait to confirm the queue is empty.
         assert!(rx.try_recv().is_err(), "no close frame expected");
+    }
+
+    /// Codex BLOCK regression (2026-05-13): with the writer channel at
+    /// capacity 1 and already full, `send_scope_error` must still emit the
+    /// 1008 close. The courtesy error envelope is allowed to drop; the close
+    /// is the load-bearing signal the SPA's `crew:auth_expired` listener
+    /// uses to clear its token.
+    #[tokio::test]
+    async fn auth_scope_violation_close_frame_survives_capacity_one_writer() {
+        let (ws, mut rx) = ws_connection_for_test(1);
+
+        // Pre-fill the writer channel so only one of the two outbound frames
+        // can survive. The close MUST be that one.
+        ws.writer
+            .try_send(axum::extract::ws::Message::Text("priming".into()))
+            .expect("prime channel");
+        assert_eq!(ws.writer.capacity(), 0, "channel must be full");
+
+        let session_id = SessionKey::with_profile("profile-b", "api", "chat-1");
+        let error =
+            validate_session_scope(&session_id, None, Some("profile-a")).expect_err("scope error");
+        assert!(is_auth_scope_violation(&error));
+
+        send_scope_error(&ws, "rpc-1".into(), error);
+
+        // Drain the priming frame first.
+        let primer = rx.recv().await.expect("priming frame");
+        assert!(matches!(primer, axum::extract::ws::Message::Text(_)));
+
+        // The remaining frame must be the 1008 close. The error envelope may
+        // have been dropped under backpressure — that's acceptable.
+        let next = rx.recv().await.expect("close frame survives backpressure");
+        match next {
+            axum::extract::ws::Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1008);
+                assert_eq!(frame.reason.as_str(), "auth_expired");
+            }
+            other => panic!("expected 1008 close to survive backpressure, got {other:?}"),
+        }
     }
 
     #[test]
