@@ -1787,7 +1787,14 @@ async fn ui_protocol_connection(
         }
     }
 
-    abort_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
+    abort_connection_turns(
+        &active_turns,
+        &connection_turns,
+        &contracts.scopes,
+        &ledger,
+        &contracts.approvals,
+    )
+    .await;
     abort_live_forwarders(&live_forwarders).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
@@ -6908,6 +6915,8 @@ async fn abort_connection_turns(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     scopes: &ScopePolicy,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
 ) {
     let turns = std::mem::take(&mut *connection_turns.lock().await);
     if turns.is_empty() {
@@ -6916,13 +6925,55 @@ async fn abort_connection_turns(
 
     let mut active = active_turns.lock().await;
     for (session_id, turn_id) in turns {
+        let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
         let should_abort = active
             .get(&session_id)
             .is_some_and(|active| active.turn_id == turn_id);
         if should_abort {
             if let Some(active) = active.remove(&session_id) {
+                aborted_state = Some(active.state.clone());
                 active.abort.abort();
             }
+        }
+        // #920.1: append a durable terminal event so reconnect-replay
+        // sees this turn end. Without this the in-flight turn vanishes
+        // from the live registry but no `turn/error` lands, so clients
+        // render an indefinite spinner. Use the same single-fire
+        // transition the rest of the lifecycle uses so we don't race
+        // with a natural completion / interrupt that may already have
+        // flipped state to Terminal.
+        if let Some(state) = aborted_state {
+            if let Some(transition) =
+                transition_to_terminal(state.as_ref(), TerminalReason::Interrupted).await
+            {
+                let _ = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    code: "connection_closed".to_owned(),
+                    message: "connection closed before turn completed".to_owned(),
+                }));
+                if let Some(ack) = transition.ack {
+                    let _ = ack.send(());
+                }
+            }
+        }
+        // #920.2: cancel every still-pending approval for the aborted
+        // turn and append a durable `approval/cancelled` for each so a
+        // reconnect doesn't re-show a modal for a dead turn.
+        let cancelled = approvals.cancel_pending_for_turn(
+            &session_id,
+            &turn_id,
+            approval_cancelled_reasons::TURN_INTERRUPTED,
+        );
+        for entry in cancelled {
+            let _ = ledger.append_notification(UiNotification::ApprovalCancelled(
+                ApprovalCancelledEvent {
+                    session_id: session_id.clone(),
+                    approval_id: entry.approval_id,
+                    turn_id: entry.turn_id,
+                    reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
+                },
+            ));
         }
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
@@ -9768,7 +9819,16 @@ mod tests {
             .insert(stale_session_id.clone(), stale_connection_turn_id);
 
         let scopes = ScopePolicy::default();
-        abort_connection_turns(&active_turns, &connection_turns, &scopes).await;
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        abort_connection_turns(
+            &active_turns,
+            &connection_turns,
+            &scopes,
+            &ledger,
+            &approvals,
+        )
+        .await;
 
         assert!(!active_turns.lock().await.contains_key(&owned_session_id));
         assert_eq!(

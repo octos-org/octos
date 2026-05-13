@@ -3395,6 +3395,7 @@ mod tests {
         let response = delete_session(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path("web-topic#research".to_string()),
         )
         .await;
