@@ -121,6 +121,9 @@ zip = "2"
 quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
+# PDF text extraction (pure Rust; read_file auto-detects %PDF- magic)
+pdf-extract = "0.9"
+
 # Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
 libc = "0.2"
 

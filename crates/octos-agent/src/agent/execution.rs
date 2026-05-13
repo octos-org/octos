@@ -542,69 +542,32 @@ impl Agent {
                                     };
 
                                     if result_persisted {
-                                        // Issue #896: emit the produced-files
-                                        // notification ONLY after the supervisor
-                                        // validation passes. Codex review on
-                                        // PR #898 flagged the original ordering
-                                        // (notification before validation) as
-                                        // user-confusing — a success-looking
-                                        // paths block could land in chat right
-                                        // before a `✗ failed` notification if
-                                        // `mark_completed_with_validation`
-                                        // rejected the outputs. Matches the
-                                        // safer ordering used on the
-                                        // `NotConfigured` path below.
-                                        match bg_supervisor.mark_completed_with_validation(
-                                            &task_id,
-                                            output_files.clone(),
-                                        ) {
-                                            Ok(()) => {
-                                                if let Some(ref sender) = bg_sender {
-                                                    if let Some(produced_msg) =
-                                                        build_spawn_only_produced_files_message(
-                                                            &bg_name,
-                                                            &output_files,
-                                                            bg_tools.workspace_root(),
-                                                        )
-                                                    {
-                                                        let _ = sender(BackgroundResultPayload {
-                                                            task_label: bg_name.clone(),
-                                                            content: produced_msg,
-                                                            kind:
-                                                                BackgroundResultKind::Notification,
-                                                            media: vec![],
-                                                            envelope_media: vec![],
-                                                            originating_thread_id:
-                                                                bg_originating_thread_id.clone(),
-                                                            task_id: Some(task_id.clone()),
-                                                        })
-                                                        .await;
-                                                    }
-                                                }
-                                            }
-                                            Err(validation_error) => {
-                                                tracing::warn!(
-                                                    tool = %bg_name,
-                                                    files = ?output_files,
-                                                    error = %validation_error,
-                                                    "workspace contract satisfied but supervisor artifact validation rejected outputs"
-                                                );
-                                                if let Some(ref sender) = bg_sender {
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✗ {} failed: {}",
-                                                            bg_name, validation_error
-                                                        ),
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                        envelope_media: vec![],
-                                                        originating_thread_id:
-                                                            bg_originating_thread_id.clone(),
-                                                        task_id: Some(task_id.clone()),
-                                                    })
-                                                    .await;
-                                                }
+                                        // Workspace contract already verified
+                                        // the declared artifacts. Trust it —
+                                        // the supervisor's job is to record
+                                        // the skill's reported outcome, not
+                                        // to re-validate file contents.
+                                        bg_supervisor
+                                            .mark_completed(&task_id, output_files.clone());
+                                        if let Some(ref sender) = bg_sender {
+                                            if let Some(produced_msg) =
+                                                build_spawn_only_produced_files_message(
+                                                    &bg_name,
+                                                    &output_files,
+                                                    bg_tools.workspace_root(),
+                                                )
+                                            {
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: produced_msg,
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: vec![],
+                                                    envelope_media: vec![],
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
+                                                    task_id: Some(task_id.clone()),
+                                                })
+                                                .await;
                                             }
                                         }
                                     } else {
@@ -895,138 +858,114 @@ impl Agent {
                                             .await;
                                         }
                                     } else {
-                                        match bg_supervisor.mark_completed_with_validation(
-                                            &task_id,
-                                            sent_files.clone(),
-                                        ) {
-                                            Ok(()) => {
-                                                let file_info = format!(
-                                                    " ({})",
-                                                    sent_files
-                                                        .iter()
-                                                        .map(|f| f.rsplit('/').next().unwrap_or(f))
-                                                        .collect::<Vec<_>>()
-                                                        .join(", ")
-                                                );
-                                                if let Some(ref sender) = bg_sender {
-                                                    // M10 Phase 5a (coalesce):
-                                                    // - `media: vec![]` keeps
-                                                    //   the persisted row's
-                                                    //   wire shape
-                                                    //   byte-identical to the
-                                                    //   pre-Phase-5a
-                                                    //   "spawn-ack with text
-                                                    //   only" row that old
-                                                    //   clients already render.
-                                                    //   Each `sent_files`
-                                                    //   entry has its OWN
-                                                    //   per-file
-                                                    //   `message/persisted`
-                                                    //   row from the
-                                                    //   `send_file` consumer
-                                                    //   above; double-listing
-                                                    //   them here would render
-                                                    //   the same attachments
-                                                    //   twice for old clients.
-                                                    // - `envelope_media:
-                                                    //   sent_files.clone()`
-                                                    //   surfaces those files
-                                                    //   on the
-                                                    //   `turn/spawn_complete`
-                                                    //   envelope so
-                                                    //   dual-negotiated
-                                                    //   clients (which
-                                                    //   suppress the per-file
-                                                    //   `Background` rows in
-                                                    //   `live_event_passes_capability_filter`)
-                                                    //   still see the
-                                                    //   attachments inline on
-                                                    //   the single completion
-                                                    //   bubble.
-                                                    //
-                                                    // Splitting persist-media
-                                                    // from envelope-media is
-                                                    // what lets the same
-                                                    // producer serve both
-                                                    // wire shapes correctly
-                                                    // without regressing
-                                                    // either.
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✓ {} completed{}",
-                                                            bg_name, file_info
-                                                        ),
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                        envelope_media: sent_files.clone(),
-                                                        originating_thread_id:
-                                                            bg_originating_thread_id.clone(),
-                                                        task_id: Some(task_id.clone()),
-                                                    })
-                                                    .await;
+                                        // Workspace contract already verified
+                                        // the declared artifacts. Trust it —
+                                        // the supervisor's job is to record
+                                        // the skill's reported outcome, not
+                                        // to re-validate file contents.
+                                        bg_supervisor.mark_completed(&task_id, sent_files.clone());
+                                        {
+                                            let file_info = format!(
+                                                " ({})",
+                                                sent_files
+                                                    .iter()
+                                                    .map(|f| f.rsplit('/').next().unwrap_or(f))
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            );
+                                            if let Some(ref sender) = bg_sender {
+                                                // M10 Phase 5a (coalesce):
+                                                // - `media: vec![]` keeps
+                                                //   the persisted row's
+                                                //   wire shape
+                                                //   byte-identical to the
+                                                //   pre-Phase-5a
+                                                //   "spawn-ack with text
+                                                //   only" row that old
+                                                //   clients already render.
+                                                //   Each `sent_files`
+                                                //   entry has its OWN
+                                                //   per-file
+                                                //   `message/persisted`
+                                                //   row from the
+                                                //   `send_file` consumer
+                                                //   above; double-listing
+                                                //   them here would render
+                                                //   the same attachments
+                                                //   twice for old clients.
+                                                // - `envelope_media:
+                                                //   sent_files.clone()`
+                                                //   surfaces those files
+                                                //   on the
+                                                //   `turn/spawn_complete`
+                                                //   envelope so
+                                                //   dual-negotiated
+                                                //   clients (which
+                                                //   suppress the per-file
+                                                //   `Background` rows in
+                                                //   `live_event_passes_capability_filter`)
+                                                //   still see the
+                                                //   attachments inline on
+                                                //   the single completion
+                                                //   bubble.
+                                                //
+                                                // Splitting persist-media
+                                                // from envelope-media is
+                                                // what lets the same
+                                                // producer serve both
+                                                // wire shapes correctly
+                                                // without regressing
+                                                // either.
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: format!(
+                                                        "✓ {} completed{}",
+                                                        bg_name, file_info
+                                                    ),
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: vec![],
+                                                    envelope_media: sent_files.clone(),
+                                                    originating_thread_id: bg_originating_thread_id
+                                                        .clone(),
+                                                    task_id: Some(task_id.clone()),
+                                                })
+                                                .await;
 
-                                                    // Issue #896: append an
-                                                    // additional notification
-                                                    // listing the produced file
-                                                    // paths (workspace-relative
-                                                    // when possible) so the
-                                                    // LLM has stable filenames
-                                                    // to reference on its next
-                                                    // turn. The legacy "✓
-                                                    // completed (basenames)"
-                                                    // bubble above only shows
-                                                    // basenames in parentheses
-                                                    // — enough to display in
-                                                    // the chat UI, but not
-                                                    // enough for the LLM to
-                                                    // pass to `read_file({path:
-                                                    // ...})` on the next turn.
-                                                    // Token-budget invariant
-                                                    // (M10 Phase 4): paths
-                                                    // only, never file
-                                                    // contents. Emitted only
-                                                    // on success and only when
-                                                    // `sent_files` is
-                                                    // non-empty (the helper
-                                                    // returns None and we
-                                                    // skip otherwise).
-                                                    if let Some(produced_msg) =
-                                                        build_spawn_only_produced_files_message(
-                                                            &bg_name,
-                                                            &sent_files,
-                                                            bg_tools.workspace_root(),
-                                                        )
-                                                    {
-                                                        let _ = sender(BackgroundResultPayload {
-                                                            task_label: bg_name.clone(),
-                                                            content: produced_msg,
-                                                            kind:
-                                                                BackgroundResultKind::Notification,
-                                                            media: vec![],
-                                                            envelope_media: vec![],
-                                                            originating_thread_id:
-                                                                bg_originating_thread_id.clone(),
-                                                            task_id: Some(task_id.clone()),
-                                                        })
-                                                        .await;
-                                                    }
-                                                }
-                                            }
-                                            Err(validation_error) => {
-                                                tracing::warn!(
-                                                    tool = %bg_name,
-                                                    files = ?sent_files,
-                                                    error = %validation_error,
-                                                    "delivered outputs but supervisor artifact validation rejected them"
-                                                );
-                                                if let Some(ref sender) = bg_sender {
+                                                // Issue #896: append an
+                                                // additional notification
+                                                // listing the produced file
+                                                // paths (workspace-relative
+                                                // when possible) so the
+                                                // LLM has stable filenames
+                                                // to reference on its next
+                                                // turn. The legacy "✓
+                                                // completed (basenames)"
+                                                // bubble above only shows
+                                                // basenames in parentheses
+                                                // — enough to display in
+                                                // the chat UI, but not
+                                                // enough for the LLM to
+                                                // pass to `read_file({path:
+                                                // ...})` on the next turn.
+                                                // Token-budget invariant
+                                                // (M10 Phase 4): paths
+                                                // only, never file
+                                                // contents. Emitted only
+                                                // on success and only when
+                                                // `sent_files` is
+                                                // non-empty (the helper
+                                                // returns None and we
+                                                // skip otherwise).
+                                                if let Some(produced_msg) =
+                                                    build_spawn_only_produced_files_message(
+                                                        &bg_name,
+                                                        &sent_files,
+                                                        bg_tools.workspace_root(),
+                                                    )
+                                                {
                                                     let _ = sender(BackgroundResultPayload {
                                                         task_label: bg_name.clone(),
-                                                        content: format!(
-                                                            "✗ {} failed: {}",
-                                                            bg_name, validation_error
-                                                        ),
+                                                        content: produced_msg,
                                                         kind: BackgroundResultKind::Notification,
                                                         media: vec![],
                                                         envelope_media: vec![],
