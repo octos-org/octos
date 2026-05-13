@@ -14,7 +14,7 @@ use axum::Extension;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use octos_agent::{
@@ -110,7 +110,15 @@ type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>
 /// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
 /// into the WS write channel for the lifetime of the connection. Dropping
 /// or aborting a handle terminates the pump.
-type SharedLiveForwarders = Arc<tokio::sync::Mutex<HashMap<SessionKey, AbortHandle>>>;
+///
+/// #924 NIT 8: keep the full `JoinHandle` (not just the `AbortHandle`) so
+/// the connection-cleanup path can `await` the aborted task before pruning
+/// idle subscribers. With only an `AbortHandle`, a single `yield_now()`
+/// after `abort()` was best-effort — under load the receiver might not
+/// have dropped before `prune_subscriber_if_idle` ran, leaving the ledger
+/// broadcaster believing it still had a live subscriber.
+type SharedLiveForwarders =
+    Arc<tokio::sync::Mutex<HashMap<SessionKey, tokio::task::JoinHandle<()>>>>;
 
 /// Outcome of pushing a frame onto the per-connection writer channel.
 ///
@@ -128,6 +136,11 @@ pub(crate) enum SendError {
     /// a short reason for the calling turn to abort cleanly and mark the
     /// ledger entry `delivery_failed`.
     LifecycleFailure(String),
+    /// #924 BLOCK 2: a prior lifecycle/RPC send already latched the
+    /// connection as failed. Background tasks (turn forwarders, live
+    /// forwarders, ledger fan-out) MUST stop enqueueing onto a dead
+    /// channel — callers treat this exactly like `Closed`.
+    FatalClosed,
 }
 
 // Send-site categorization per M9-FIX-04 § Acceptance criteria:
@@ -185,6 +198,16 @@ pub(crate) struct WsConnection {
     /// connection can drop the broadcast copy and avoid duplicate
     /// delivery to the WS.
     connection_id: ConnectionId,
+    /// #922.2: latched when a lifecycle/RPC send hits backpressure or a
+    /// closed writer. The read loop polls this and breaks cleanly so a
+    /// silently-dropped RPC reply does not strand the client.
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    /// #924 BLOCK 1: a Notify woken in tandem with `failed.store(true)`.
+    /// The connection main loop `select!`s on this alongside the inbound
+    /// frame stream so a lifecycle/RPC send failure on an idle socket
+    /// triggers cleanup immediately rather than waiting indefinitely
+    /// for the next client frame.
+    failed_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WsConnection {
@@ -193,7 +216,30 @@ impl WsConnection {
             writer,
             metrics: Arc::new(ConnectionMetrics::default()),
             connection_id: ConnectionId::next(),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failed_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// #924 BLOCK 1: handle to the latch-wakeup notify for the read
+    /// loop's `select!` arm. Cloned cheaply (just an `Arc` bump).
+    fn failed_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.failed_notify.clone()
+    }
+
+    fn mark_failed(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Wake every current and future `notified()` waiter so the read
+        // loop wakes immediately on an idle connection. `notify_waiters`
+        // alone has no permit-stash behaviour; combined with the Acquire
+        // load in the select! arm a late `notified().await` will still
+        // see `failed == true` and bail out before parking.
+        self.failed_notify.notify_waiters();
     }
 
     #[cfg(test)]
@@ -207,6 +253,17 @@ impl WsConnection {
     }
 
     fn try_enqueue(&self, frame: WsMessage) -> Result<(), SendError> {
+        // #924 BLOCK 2: once the connection is latched as failed every
+        // further enqueue must fail loudly. Background tasks (turn
+        // forwarders, live forwarders, ledger fan-out) keep pumping
+        // until the connection cleanup aborts their handles; without
+        // this gate they would push frames onto a writer the read loop
+        // is about to drop, masking the original lifecycle failure and
+        // wasting work. `FatalClosed` is callers' signal to treat the
+        // connection like `Closed`.
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SendError::FatalClosed);
+        }
         // Update the queue-depth gauge whenever we touch the channel — cheap
         // and gives an accurate signal even when sends succeed.
         let depth = WS_WRITER_CHANNEL_CAPACITY.saturating_sub(self.writer.capacity());
@@ -219,6 +276,12 @@ impl WsConnection {
     }
 
     /// Lifecycle: turn lifecycle / RPC reply. Caller acts on the failure.
+    ///
+    /// #922.2: a lifecycle-frame backpressure drop is treated as a
+    /// connection failure. The latched `failed` flag tells the read
+    /// loop to stop dispatch and tear down — better than silently
+    /// dropping RPC replies (which left clients timing out while the
+    /// server thought the call succeeded).
     fn send_lifecycle(&self, frame: WsMessage) -> Result<(), SendError> {
         match self.try_enqueue(frame) {
             Ok(_) => Ok(()),
@@ -227,8 +290,9 @@ impl WsConnection {
                 tracing::warn!(
                     target: "octos::ui_protocol::ws",
                     reason = "backpressure",
-                    "lifecycle ws send failed; turn will abort"
+                    "lifecycle ws send failed; aborting connection"
                 );
+                self.mark_failed();
                 Err(SendError::LifecycleFailure(
                     "writer channel full for lifecycle frame".into(),
                 ))
@@ -238,10 +302,19 @@ impl WsConnection {
                 tracing::warn!(
                     target: "octos::ui_protocol::ws",
                     reason = "closed",
-                    "lifecycle ws send failed; turn will abort"
+                    "lifecycle ws send failed; aborting connection"
                 );
+                self.mark_failed();
                 Err(SendError::LifecycleFailure(
                     "writer channel closed for lifecycle frame".into(),
+                ))
+            }
+            Err(SendError::FatalClosed) => {
+                // #924 BLOCK 2: prior caller already latched the
+                // connection failed; surface the lifecycle-shape error
+                // for any callsite still doing work on this connection.
+                Err(SendError::LifecycleFailure(
+                    "connection already latched as failed".into(),
                 ))
             }
             Err(other) => Err(other),
@@ -278,6 +351,14 @@ impl WsConnection {
                 );
                 Err(SendError::Closed)
             }
+            Err(SendError::FatalClosed) => {
+                // #924 BLOCK 2: connection already latched failed by a
+                // prior lifecycle send — no point counting another
+                // dropped row.
+                metrics::counter!("ws.send.drop.closed", "method" => method.to_string())
+                    .increment(1);
+                Err(SendError::FatalClosed)
+            }
             Err(other) => Err(other),
         }
     }
@@ -303,6 +384,12 @@ impl WsConnection {
                     "ephemeral ws send dropped; channel closed"
                 );
                 Err(SendError::Closed)
+            }
+            Err(SendError::FatalClosed) => {
+                // #924 BLOCK 2: silently drop, consistent with the spec
+                // § 9 "ephemeral frames may be dropped" rule. The
+                // connection is already torn down by the read loop.
+                Err(SendError::FatalClosed)
             }
             Err(other) => Err(other),
         }
@@ -1453,6 +1540,43 @@ fn tool_risk_registry_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// #924 BLOCK 5 — outcome of the WS upgrade Origin gate.
+///
+/// CORS doesn't apply to WS handshakes, so without this gate a browser
+/// tab on any origin could open the socket as long as it has a valid
+/// token. Non-browser clients (TUI, gateway, scripts, server-to-server)
+/// typically omit the Origin header — allow that. Some server-to-server
+/// clients send the header with an empty value (`Origin: `); treat
+/// present-but-empty as absent and allow. A header with non-ASCII
+/// bytes (`to_str().is_err()`) still rejects — that is malformed input,
+/// not the same as omitting the header.
+#[derive(Debug, PartialEq, Eq)]
+enum WsOriginDecision {
+    Allow,
+    RejectDisallowed { origin: String },
+    RejectMalformed,
+}
+
+fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOriginDecision {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return WsOriginDecision::Allow;
+    };
+    match origin.to_str() {
+        Ok(origin_str) if origin_str.trim().is_empty() => WsOriginDecision::Allow,
+        Ok(origin_str) => {
+            let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
+            if allowed.iter().any(|s| s == origin_str) {
+                WsOriginDecision::Allow
+            } else {
+                WsOriginDecision::RejectDisallowed {
+                    origin: origin_str.to_string(),
+                }
+            }
+        }
+        Err(_) => WsOriginDecision::RejectMalformed,
+    }
+}
+
 /// GET /api/ui-protocol/ws — JSON-RPC over WebSocket for UI Protocol v1.
 pub async fn ws_handler(
     State(state): State<Arc<AppState>>,
@@ -1461,6 +1585,26 @@ pub async fn ws_handler(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // #923.3 + #924 BLOCK 5: gate the upgrade on Origin. See
+    // `decide_ws_origin_gate` for the full decision table.
+    match decide_ws_origin_gate(&headers, state.base_domain.as_deref()) {
+        WsOriginDecision::Allow => {}
+        WsOriginDecision::RejectDisallowed { origin } => {
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                origin = %origin,
+                "rejected WS upgrade from disallowed Origin"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "disallowed origin").into_response();
+        }
+        WsOriginDecision::RejectMalformed => {
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                "rejected WS upgrade: Origin header is not valid ASCII"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "invalid origin").into_response();
+        }
+    }
     let connection_profile_id = identity
         .as_ref()
         .and_then(|Extension(identity)| authenticated_profile_id(identity))
@@ -1525,7 +1669,52 @@ async fn ui_protocol_connection(
     let connection_profile_id = connection_profile_id.as_deref();
     let routed_profile_id = routed_profile_id.as_deref();
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    // #924 BLOCK 1: wake the read loop the instant a lifecycle/RPC
+    // send marks the connection failed. Without this, an idle socket
+    // with a failed write side would sit in `ws_rx.next().await`
+    // forever — the cleanup path only ran when the next client frame
+    // arrived, leaving subscribers and ledger fan-out registered.
+    let failed_notify = ws.failed_notify();
+
+    loop {
+        // #924 round-2 BLOCK: close the lost-notify race. `notify_waiters`
+        // is only received by `Notified` futures that exist at the time of
+        // the call, and it stashes no permit. So we:
+        //   1. Bail eagerly if the latch is already set.
+        //   2. Construct `notified()` BEFORE the second latch check — this
+        //      means any subsequent `mark_failed` either (a) is caught by
+        //      the re-check below, or (b) fires `notify_waiters` against
+        //      this future, which then resolves when the select polls it.
+        //   3. Re-check the latch after creating the future to catch the
+        //      "fired between is_failed and notified()" ordering.
+        if ws.is_failed() {
+            break;
+        }
+        let notified = failed_notify.notified();
+        tokio::pin!(notified);
+        if ws.is_failed() {
+            break;
+        }
+
+        let msg = tokio::select! {
+            biased;
+            _ = &mut notified => {
+                // Latch arm only fires when the connection is failed; no
+                // need to re-load — the Notify is private to `mark_failed`.
+                break;
+            }
+            next = ws_rx.next() => match next {
+                Some(Ok(msg)) => msg,
+                Some(Err(_)) | None => break,
+            },
+        };
+        // #922.2: stop dispatch once a lifecycle/RPC send has been
+        // marked fatal so we don't quietly accept further requests we
+        // can never reply to. The cleanup below still appends terminal
+        // events / cancels approvals via `abort_connection_turns`.
+        if ws.is_failed() {
+            break;
+        }
         let text = match msg {
             WsMessage::Text(text) => text,
             WsMessage::Close(_) => break,
@@ -1534,7 +1723,21 @@ async fn ui_protocol_connection(
         };
 
         let request = match parse_ws_text_frame(text.as_str()) {
-            Ok(request) => request,
+            Ok(ParsedFrame::Request(request)) => request,
+            Ok(ParsedFrame::Notification(method)) => {
+                // #922.1: known inbound notifications (no `id`) are
+                // accepted silently. Unknown notifications get a debug
+                // trace but no reply — a notification by spec has no
+                // response.
+                if !is_known_inbound_notification(&method) {
+                    tracing::debug!(
+                        target: "octos::ui_protocol::ws",
+                        method = %method,
+                        "ignoring unknown inbound notification"
+                    );
+                }
+                continue;
+            }
             Err(error) => {
                 // Lifecycle: client violated the wire contract. We try to
                 // tell them, but proceed regardless — the read loop is
@@ -1636,6 +1839,7 @@ async fn ui_protocol_connection(
                     &contracts.approvals,
                     &active_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -1649,6 +1853,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -1661,6 +1866,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -1742,10 +1948,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::SessionTitleSet(params) => {
-                handle_session_title_set(&ws, &state, &connection_headers, id, params).await;
+                handle_session_title_set(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionDelete(params) => {
-                handle_session_delete(&ws, &state, &connection_headers, id, params).await;
+                handle_session_delete(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SystemStatusGet(params) => {
                 handle_system_status_get(&ws, &state, id, params).await;
@@ -1771,30 +1993,117 @@ async fn ui_protocol_connection(
         }
     }
 
-    abort_connection_turns(&active_turns, &connection_turns, &contracts.scopes).await;
-    abort_live_forwarders(&live_forwarders).await;
+    abort_connection_turns(
+        &active_turns,
+        &connection_turns,
+        &contracts.scopes,
+        &ledger,
+        &contracts.approvals,
+    )
+    .await;
+    abort_live_forwarders(&live_forwarders, &ledger).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
     // is closed before we return.
     drop(ws);
     let _ = writer_handle.await;
 }
 
-async fn abort_live_forwarders(forwarders: &SharedLiveForwarders) {
-    let mut guard = forwarders.lock().await;
-    for (_, abort) in guard.drain() {
-        abort.abort();
+async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiProtocolLedger) {
+    let drained: Vec<(SessionKey, tokio::task::JoinHandle<()>)> = {
+        let mut guard = forwarders.lock().await;
+        guard.drain().collect()
+    };
+    if drained.is_empty() {
+        return;
+    }
+    // #923.2 + #924 NIT 8: abort every forwarder, then `await` each
+    // JoinHandle so the receiver-drop has provably happened before we
+    // prune. The old `yield_now()` was a single scheduling hint and
+    // could lose the race under load — leaving the ledger
+    // broadcaster believing it still had a live subscriber. Awaiting
+    // the JoinHandle is the canonical "task is fully done" signal in
+    // tokio. We ignore the JoinError for aborted tasks (that's the
+    // expected shape).
+    let mut drained_sessions: Vec<SessionKey> = Vec::with_capacity(drained.len());
+    for (session_id, handle) in drained {
+        handle.abort();
+        let _ = handle.await;
+        drained_sessions.push(session_id);
+    }
+    for session_id in drained_sessions {
+        ledger.prune_subscriber_if_idle(&session_id);
     }
 }
 
-fn parse_ws_text_frame(text: &str) -> Result<RpcRequest<Value>, RpcError> {
+/// #922.1: JSON-RPC envelopes with no `id` are notifications, not
+/// requests. The protocol's bridge sends a `ping` notification every
+/// 30s; the legacy parser required `RpcRequest.id: String`, so the
+/// server replied with a `parse_error` for every keepalive. The
+/// resulting noise also masked real parse errors.
+///
+/// #924 NIT 6: distinguish notifications from requests by KEY
+/// PRESENCE on `id`, not by null-check. A JSON-RPC envelope with
+/// `id: null` is malformed (per spec §4 the `id` of a request must
+/// be a String / Number / NULL only for the response correlation
+/// reserved use); routing it as a "notification" silently swallowed
+/// what should be a loud parse error. The rule:
+///
+/// - `id` absent       → Notification (today's `ping`/etc.)
+/// - `id` is String    → Request (our server's expected shape)
+/// - `id` is Number    → Reject with parse_error (we require String)
+/// - `id` is null/etc. → Reject with parse_error
+///
+/// Unparseable frames continue to return `Err(RpcError)` so the
+/// existing "lifecycle: client violated wire contract" branch fires.
+#[derive(Debug)]
+enum ParsedFrame {
+    Request(RpcRequest<Value>),
+    Notification(String),
+}
+
+fn parse_ws_text_frame(text: &str) -> Result<ParsedFrame, RpcError> {
     if text.len() > MAX_TEXT_FRAME_BYTES {
         return Err(frame_too_large_error());
     }
-    parse_rpc_request(text)
+    let value: Value =
+        serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))?;
+    if !value.is_object() {
+        return Err(RpcError::parse_error("envelope must be an object"));
+    }
+    match value.get("id") {
+        None => {
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::parse_error("notification missing method"))?
+                .to_owned();
+            Ok(ParsedFrame::Notification(method))
+        }
+        Some(Value::String(_)) => {
+            let request: RpcRequest<Value> = serde_json::from_value(value)
+                .map_err(|err| RpcError::parse_error(err.to_string()))?;
+            Ok(ParsedFrame::Request(request))
+        }
+        Some(Value::Null) => Err(RpcError::parse_error(
+            "rpc envelope `id` must not be null; omit the field for notifications",
+        )),
+        Some(Value::Number(_)) => Err(RpcError::parse_error(
+            "rpc envelope `id` must be a string; numeric ids are not supported",
+        )),
+        Some(_) => Err(RpcError::parse_error(
+            "rpc envelope `id` must be a string when present",
+        )),
+    }
 }
 
+#[cfg(test)]
 fn parse_rpc_request(text: &str) -> Result<RpcRequest<Value>, RpcError> {
     serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))
+}
+
+/// Inbound notifications the server accepts (no reply emitted).
+fn is_known_inbound_notification(method: &str) -> bool {
+    matches!(method, "ping")
 }
 
 fn route_rpc_command(
@@ -2149,7 +2458,10 @@ async fn spawn_live_forwarder(
                     }
                     match send_ledger_event_durable(&ws, &ledger, event.event) {
                         Ok(()) => {}
-                        Err(SendError::Closed) => break,
+                        // #924 BLOCK 2: a closed writer OR a latched
+                        // failure both mean further pumps will produce
+                        // FatalClosed forever; stop spinning.
+                        Err(SendError::Closed | SendError::FatalClosed) => break,
                         // BackpressureDrop: `send_ledger_event_durable`
                         // already opportunistically emits replay_lossy; keep
                         // pumping so a recovered consumer gets caught up.
@@ -2172,11 +2484,15 @@ async fn spawn_live_forwarder(
             }
         }
     });
-    let abort = task.abort_handle();
-    // Replace any prior forwarder for this session on this connection —
-    // re-`session/open` restarts the live pump from a fresh baseline.
+    // #924 NIT 8: store the full JoinHandle so the connection-cleanup
+    // path can `await` the aborted task before pruning idle
+    // subscribers. Replace any prior forwarder for this session on
+    // this connection — re-`session/open` restarts the live pump from
+    // a fresh baseline. The previous handle is aborted + the resulting
+    // JoinHandle dropped on the spot; we don't await here because
+    // re-open is a hot path.
     let mut guard = forwarders.lock().await;
-    if let Some(prev) = guard.insert(session_id, abort) {
+    if let Some(prev) = guard.insert(session_id, task) {
         prev.abort();
     }
 }
@@ -2561,6 +2877,50 @@ fn resolve_session_profile_runtime(
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
     let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
     state.profiles.get(candidate).cloned()
+}
+
+/// Resolve the canonical `SessionManager` handle for read operations
+/// (hydrate, state, etc.). Closes #919.1: turn persistence writes to
+/// the profile's `SessionRuntime.sessions`, so reads under profile
+/// auth MUST hit the same handle — otherwise `state.sessions` (the
+/// top-level data-dir store) reports `unknown_session` on reconnect.
+///
+/// Returns the per-profile session manager if a `ProfileRuntime` is
+/// registered for the resolved profile and the cache can bootstrap
+/// a `SessionRuntime` for `session_id`. Falls back to
+/// `state.sessions` so the legacy no-profile flow continues to work.
+///
+/// #924 BLOCK 4: the active-profile precedence MUST mirror
+/// `handle_turn_start` — `session_id.profile_id()` first (the key
+/// itself encodes the owner profile), then `connection_profile_id`
+/// (token-auth scope), then `routed_profile_id` (host/header
+/// routing). Without the `session_id` precedence + the routed
+/// fallback, a host-routed admin session on a hosted subdomain
+/// hydrated from `_main`/`state.sessions` instead of the right
+/// profile runtime — and turns whose `SessionKey` already carried
+/// `<profile>:api:...` resolved to a different store than the one
+/// that persisted them.
+pub(crate) async fn resolve_sessions_for_lookup(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .or(routed_profile_id);
+    if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
+        let hint = session_workspaces().get(session_id);
+        if let Ok(runtime) = state
+            .session_cache
+            .get_or_init(&profile_runtime, session_id.clone(), hint)
+            .await
+        {
+            return Some(runtime.sessions.clone());
+        }
+    }
+    state.sessions.clone()
 }
 
 fn session_workspace_root_for_state(state: &AppState, session_id: &SessionKey) -> Option<PathBuf> {
@@ -3666,6 +4026,7 @@ async fn handle_session_hydrate(
     approvals: &PendingApprovalStore,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     params: SessionHydrateParams,
@@ -3704,7 +4065,18 @@ async fn handle_session_hydrate(
         };
 
     let include_set = HydrateIncludeSet::from_request(&params.include);
-    let Some(sessions) = &state.sessions else {
+    // #919.1: route to the profile's session manager when the connection
+    // has a profile scope. Turn persistence writes to
+    // `SessionRuntime.sessions`; reads must hit the same handle or we'd
+    // report `unknown_session` on reconnect-hydrate.
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
         let _ = send_rpc_error(
             ws,
             Some(id),
@@ -3907,6 +4279,7 @@ async fn handle_thread_graph_get(
     ledger: &Arc<UiProtocolLedger>,
     _active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     id: String,
     params: ThreadGraphGetParams,
 ) {
@@ -3926,7 +4299,15 @@ async fn handle_thread_graph_get(
         }
     };
 
-    let Some(sessions) = &state.sessions else {
+    // #919.1: route to the profile's session manager when under profile auth.
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
         let _ = send_rpc_error(
             ws,
             Some(id),
@@ -3987,6 +4368,7 @@ async fn handle_turn_state_get(
     ledger: &Arc<UiProtocolLedger>,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     id: String,
     params: TurnStateGetParams,
 ) {
@@ -4000,7 +4382,17 @@ async fn handle_turn_state_get(
     // (which returns `state: unknown`). When the sessions manager is
     // unavailable we fall through to the default "unknown" path so the
     // RPC remains callable in headless tests.
-    if let Some(sessions) = &state.sessions {
+    //
+    // #919.1: route to the profile's session manager when under profile
+    // auth so reads see the same store the turn writes used.
+    let sessions = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await;
+    if let Some(sessions) = sessions.as_ref() {
         let mut sessions_guard = sessions.lock().await;
         if !sessions_guard.session_known(&params.session_id) {
             let _ = send_rpc_error(
@@ -4039,7 +4431,7 @@ async fn handle_turn_state_get(
     // turn_id via thread_id grouping (today the type system does not yet
     // carry typed turn_id on Message; we approximate via the projection's
     // thread_id and the message's stored thread_id).
-    let committed_seqs = if let Some(sessions) = &state.sessions {
+    let committed_seqs = if let Some(sessions) = sessions.as_ref() {
         let mut sessions_guard = sessions.lock().await;
         let session = sessions_guard.get_or_create(&params.session_id).await;
         let target_thread_id = projection.as_ref().and_then(|p| p.thread_id.clone());
@@ -4841,6 +5233,7 @@ async fn handle_session_title_set(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     params: SessionTitleSetParams,
 ) {
@@ -4871,6 +5264,7 @@ async fn handle_session_title_set(
     let response = super::handlers::update_session_title(
         State(state.clone()),
         headers.clone(),
+        identity.cloned().map(axum::Extension),
         axum_path(params.session_id),
         body,
     )
@@ -4904,6 +5298,7 @@ async fn handle_session_delete(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     params: SessionDeleteParams,
 ) {
@@ -4912,6 +5307,7 @@ async fn handle_session_delete(
     let response = super::handlers::delete_session(
         State(state.clone()),
         headers.clone(),
+        identity.cloned().map(axum::Extension),
         axum_path(params.session_id),
     )
     .await;
@@ -6846,6 +7242,8 @@ async fn abort_connection_turns(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     scopes: &ScopePolicy,
+    ledger: &UiProtocolLedger,
+    approvals: &PendingApprovalStore,
 ) {
     let turns = std::mem::take(&mut *connection_turns.lock().await);
     if turns.is_empty() {
@@ -6854,13 +7252,55 @@ async fn abort_connection_turns(
 
     let mut active = active_turns.lock().await;
     for (session_id, turn_id) in turns {
+        let mut aborted_state: Option<Arc<TokioMutex<TurnState>>> = None;
         let should_abort = active
             .get(&session_id)
             .is_some_and(|active| active.turn_id == turn_id);
         if should_abort {
             if let Some(active) = active.remove(&session_id) {
+                aborted_state = Some(active.state.clone());
                 active.abort.abort();
             }
+        }
+        // #920.1: append a durable terminal event so reconnect-replay
+        // sees this turn end. Without this the in-flight turn vanishes
+        // from the live registry but no `turn/error` lands, so clients
+        // render an indefinite spinner. Use the same single-fire
+        // transition the rest of the lifecycle uses so we don't race
+        // with a natural completion / interrupt that may already have
+        // flipped state to Terminal.
+        if let Some(state) = aborted_state {
+            if let Some(transition) =
+                transition_to_terminal(state.as_ref(), TerminalReason::Interrupted).await
+            {
+                let _ = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    code: "connection_closed".to_owned(),
+                    message: "connection closed before turn completed".to_owned(),
+                }));
+                if let Some(ack) = transition.ack {
+                    let _ = ack.send(());
+                }
+            }
+        }
+        // #920.2: cancel every still-pending approval for the aborted
+        // turn and append a durable `approval/cancelled` for each so a
+        // reconnect doesn't re-show a modal for a dead turn.
+        let cancelled = approvals.cancel_pending_for_turn(
+            &session_id,
+            &turn_id,
+            approval_cancelled_reasons::TURN_INTERRUPTED,
+        );
+        for entry in cancelled {
+            let _ = ledger.append_notification(UiNotification::ApprovalCancelled(
+                ApprovalCancelledEvent {
+                    session_id: session_id.clone(),
+                    approval_id: entry.approval_id,
+                    turn_id: entry.turn_id,
+                    reason: approval_cancelled_reasons::TURN_INTERRUPTED.to_owned(),
+                },
+            ));
         }
         // FIX-06: connection close is the de-facto "session close" hook in
         // v1alpha1 — drop every recorded scope for this session so it cannot
@@ -7060,18 +7500,46 @@ fn ledger_event_method(event: &UiProtocolLedgerEvent) -> &'static str {
 }
 
 fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
+    // #924 NIT 7: exhaustive on both `UiProtocolLedgerEvent` AND the
+    // inner `UiNotification`. A `_ => None` catchall would let a
+    // future cursor-bearing variant compile cleanly while silently
+    // being skipped for replay-lossy cursor extraction (#921 was
+    // exactly that bug for `MessagePersisted` / `TurnSpawnComplete`).
+    // The rule for new variants: if you add a `cursor: UiCursor` or
+    // `cursor: Option<UiCursor>` field, add it here too. Variants
+    // whose "cursor" is an `OutputCursor` (task output stream) are
+    // explicitly NOT surfaced here — that's a separate replay channel.
     match event {
-        UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
-            cursor: Some(cursor),
-            ..
-        })) => Some(cursor.clone()),
-        UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
-            TurnCompletedEvent {
-                cursor: Some(cursor),
-                ..
-            },
-        )) => Some(cursor.clone()),
-        _ => None,
+        UiProtocolLedgerEvent::Notification(notification) => match notification {
+            UiNotification::SessionOpened(SessionOpened { cursor, .. }) => cursor.clone(),
+            UiNotification::TurnCompleted(TurnCompletedEvent { cursor, .. }) => cursor.clone(),
+            UiNotification::MessagePersisted(persisted) => Some(persisted.cursor.clone()),
+            UiNotification::TurnSpawnComplete(spawn) => Some(spawn.cursor.clone()),
+            // Non-cursor-bearing variants — exhaustively enumerated so a
+            // future addition forces an explicit decision here.
+            UiNotification::TurnStarted(_)
+            | UiNotification::MessageDelta(_)
+            | UiNotification::ToolStarted(_)
+            | UiNotification::ToolProgress(_)
+            | UiNotification::ToolCompleted(_)
+            | UiNotification::ApprovalRequested(_)
+            | UiNotification::ApprovalAutoResolved(_)
+            | UiNotification::ApprovalDecided(_)
+            | UiNotification::ApprovalCancelled(_)
+            | UiNotification::TaskUpdated(_)
+            // TaskOutputDelta carries an `OutputCursor`, not a `UiCursor`.
+            | UiNotification::TaskOutputDelta(_)
+            | UiNotification::ProgressUpdated(_)
+            | UiNotification::Warning(_)
+            | UiNotification::TurnError(_)
+            // ReplayLossy references a `last_durable_cursor` belonging to
+            // the events it summarises, not its own — surfacing it here
+            // would re-loop the replay flag onto itself.
+            | UiNotification::ReplayLossy(_)
+            | UiNotification::FileAttached(_)
+            | UiNotification::SessionEventBridged(_) => None,
+        },
+        UiProtocolLedgerEvent::Progress(_) => None,
     }
 }
 
@@ -7240,6 +7708,87 @@ mod tests {
             }
             other => panic!("expected TurnStart, got {:?}", other),
         }
+    }
+
+    /// #921: every cursor-bearing durable notification variant must
+    /// surface its cursor through `ledger_event_cursor` so dropped
+    /// sends trigger `protocol/replay_lossy`. Asserts the positive
+    /// extraction for the four variants and a negative for a non-
+    /// cursor-bearing one (sanity).
+    #[test]
+    fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
+        let session_id = SessionKey("local:test".into());
+        let cursor = UiCursor {
+            stream: session_id.0.clone(),
+            seq: 42,
+        };
+
+        let opened =
+            UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
+                session_id: session_id.clone(),
+                active_profile_id: None,
+                workspace_root: None,
+                cursor: Some(cursor.clone()),
+                panes: None,
+                capabilities: octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
+            }));
+        assert_eq!(ledger_event_cursor(&opened), Some(cursor.clone()));
+
+        let completed = UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+                cursor: Some(cursor.clone()),
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&completed), Some(cursor.clone()));
+
+        let persisted = UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(
+            MessagePersistedEvent {
+                session_id: session_id.clone(),
+                turn_id: None,
+                thread_id: None,
+                seq: 1,
+                role: "assistant".into(),
+                message_id: "msg-1".into(),
+                client_message_id: None,
+                source: MessagePersistedSource::Assistant,
+                cursor: cursor.clone(),
+                persisted_at: chrono::Utc::now(),
+                media: Vec::new(),
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&persisted), Some(cursor.clone()));
+
+        let spawn = UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(
+            TurnSpawnCompleteEvent {
+                session_id: session_id.clone(),
+                turn_id: None,
+                thread_id: None,
+                task_id: "task-1".into(),
+                response_to_client_message_id: None,
+                seq: 1,
+                message_id: "msg-1".into(),
+                source: "background".into(),
+                cursor: cursor.clone(),
+                persisted_at: chrono::Utc::now(),
+                content: "done".into(),
+                media: Vec::new(),
+            },
+        ));
+        assert_eq!(ledger_event_cursor(&spawn), Some(cursor.clone()));
+
+        // Sanity: a non-cursor-bearing variant returns None.
+        let delta =
+            UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session_id.clone(),
+                turn_id: TurnId::new(),
+                text: "x".into(),
+            }));
+        assert_eq!(ledger_event_cursor(&delta), None);
     }
 
     #[test]
@@ -8553,6 +9102,53 @@ mod tests {
         );
     }
 
+    /// #922.1: an envelope without `id` is a JSON-RPC notification and
+    /// must not yield a parse_error reply.
+    #[test]
+    fn idless_envelope_parses_as_notification() {
+        let frame = r#"{"jsonrpc":"2.0","method":"ping","params":{}}"#;
+        match parse_ws_text_frame(frame).expect("parses") {
+            ParsedFrame::Notification(method) => assert_eq!(method, "ping"),
+            ParsedFrame::Request(_) => panic!("expected notification"),
+        }
+        assert!(is_known_inbound_notification("ping"));
+        assert!(!is_known_inbound_notification("unknown"));
+    }
+
+    /// #924 NIT 6: distinguish notifications from requests by KEY
+    /// presence on `id`, not null-check. An envelope with
+    /// `"id": null` is malformed — surfacing it loudly via
+    /// parse_error catches client bugs that the silent-drop path
+    /// hid.
+    #[test]
+    fn null_id_envelope_is_rejected_with_parse_error() {
+        let frame =
+            r#"{"jsonrpc":"2.0","id":null,"method":"session/open","params":{"session_id":"x"}}"#;
+        let err = parse_ws_text_frame(frame).expect_err("null id must reject");
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::PARSE_ERROR
+        );
+        assert!(
+            err.message.contains("null"),
+            "parse error message should mention the null id; got {}",
+            err.message
+        );
+    }
+
+    /// #924 NIT 6: numeric ids are also rejected — the server's RpcRequest
+    /// shape requires `id: String`.
+    #[test]
+    fn numeric_id_envelope_is_rejected_with_parse_error() {
+        let frame =
+            r#"{"jsonrpc":"2.0","id":42,"method":"session/open","params":{"session_id":"x"}}"#;
+        let err = parse_ws_text_frame(frame).expect_err("numeric id must reject");
+        assert_eq!(
+            err.code,
+            octos_core::ui_protocol::rpc_error_codes::PARSE_ERROR
+        );
+    }
+
     #[test]
     fn authenticated_profile_id_uses_user_identity_only() {
         let user = AuthIdentity::User {
@@ -9706,7 +10302,16 @@ mod tests {
             .insert(stale_session_id.clone(), stale_connection_turn_id);
 
         let scopes = ScopePolicy::default();
-        abort_connection_turns(&active_turns, &connection_turns, &scopes).await;
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        abort_connection_turns(
+            &active_turns,
+            &connection_turns,
+            &scopes,
+            &ledger,
+            &approvals,
+        )
+        .await;
 
         assert!(!active_turns.lock().await.contains_key(&owned_session_id));
         assert_eq!(
@@ -10895,6 +11500,175 @@ mod tests {
         assert_eq!(ws.metrics().dropped_count.load(Ordering::Relaxed), 0);
     }
 
+    /// #924 BLOCK 2: once a lifecycle send marks the connection failed,
+    /// every subsequent enqueue must fail with `FatalClosed` — even if
+    /// the underlying channel has spare capacity now. Background
+    /// forwarders that keep pumping after the read loop tore down would
+    /// otherwise queue frames into a writer about to drain and exit.
+    #[tokio::test]
+    async fn try_enqueue_returns_fatal_closed_after_mark_failed() {
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        // First send succeeds and leaves capacity available.
+        let frame = WsMessage::Text("ping".to_string().into());
+        assert!(ws.try_enqueue(frame).is_ok());
+
+        // Drain so capacity is fully open.
+        let _ = rx.try_recv();
+
+        // Latch the connection as failed (the lifecycle wrappers do
+        // this on backpressure / closed writer; here we drive the API
+        // directly to isolate the check).
+        ws.mark_failed();
+
+        // Even with capacity open, the next enqueue must fail loudly.
+        let frame = WsMessage::Text("after-fail".to_string().into());
+        let err = ws
+            .try_enqueue(frame)
+            .expect_err("post-latch enqueue must fail");
+        assert!(matches!(err, SendError::FatalClosed));
+
+        // And the lifecycle wrapper turns it into LifecycleFailure so
+        // existing RPC-reply callsites still see the failure-shaped
+        // error.
+        let res = send_rpc_result(&ws, "post-fail".into(), json!({"ok": true}));
+        assert!(matches!(res, Err(SendError::LifecycleFailure(_))));
+    }
+
+    /// #924 BLOCK 1: `mark_failed` must wake every pending `notified()`
+    /// waiter so the read loop's `select!` arm fires immediately. An
+    /// idle socket with a failed write side must NOT sit waiting for
+    /// the next client frame.
+    #[tokio::test]
+    async fn mark_failed_wakes_failed_notify_waiters() {
+        let (ws, _rx) = ws_connection_for_test(1);
+        let notify = ws.failed_notify();
+
+        // Park a waiter; latch failed; the waiter must complete promptly.
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(500), async move {
+            notify.notified().await;
+        });
+        // Run latch + await concurrently — the `notified()` future must
+        // observe the wake even though we never read another frame.
+        let ws_clone = ws.clone();
+        let latch = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ws_clone.mark_failed();
+        });
+        waited.await.expect("notified() must wake within 500ms");
+        latch.await.expect("latch task joins cleanly");
+        assert!(ws.is_failed());
+    }
+
+    /// #924 round-2 BLOCK: the round-1 test parks a waiter BEFORE calling
+    /// `mark_failed`. The lost-notify race only shows up the other way
+    /// around: the latch fires while the read loop is between iterations
+    /// (no `Notified` future exists yet). `notify_waiters` stashes nothing,
+    /// so the next-iteration `notified()` would never resolve without the
+    /// pre-park latch re-check. This test replays the same select shape
+    /// the production loop uses and asserts it exits on an idle socket
+    /// even when `mark_failed` fires before the read task starts polling.
+    #[tokio::test]
+    async fn mark_failed_during_idle_loop_still_cleans_up() {
+        let (ws, _rx) = ws_connection_for_test(1);
+        let failed_notify = ws.failed_notify();
+        // The "ws_rx" stand-in: an mpsc never sent on => idle socket.
+        let (_inbound_tx, mut inbound_rx) = mpsc::channel::<()>(1);
+
+        // Latch failed BEFORE the read task ever spins. This is the
+        // lost-notify ordering: the future that will park does not yet
+        // exist when `notify_waiters` fires.
+        ws.mark_failed();
+
+        let ws_for_task = ws.clone();
+        let read_task = tokio::spawn(async move {
+            loop {
+                if ws_for_task.is_failed() {
+                    break;
+                }
+                let notified = failed_notify.notified();
+                tokio::pin!(notified);
+                if ws_for_task.is_failed() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = &mut notified => break,
+                    _ = inbound_rx.recv() => continue,
+                }
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), read_task)
+            .await
+            .expect("read loop must exit promptly when latch fires before park")
+            .expect("read task joins cleanly");
+        assert!(ws.is_failed());
+    }
+
+    /// #924 BLOCK 5: server-to-server clients sometimes send the Origin
+    /// header with an empty value (`Origin: `). The original gate
+    /// rejected those because the empty string never matched the
+    /// allowlist; treat present-but-empty as absent.
+    #[test]
+    fn ws_origin_gate_allows_absent_or_empty_origin() {
+        // No Origin header at all → allow (TUI / gateway / scripts).
+        let headers = HeaderMap::new();
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::Allow,
+        );
+
+        // Origin header present but empty after trim → allow.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::Allow,
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn ws_origin_gate_rejects_present_non_allowlisted_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://evil.example.com".parse().unwrap(),
+        );
+        let decision = decide_ws_origin_gate(&headers, Some("bot.ominix.io"));
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { ref origin }
+                if origin == "https://evil.example.com"
+        ));
+    }
+
+    /// #924 BLOCK 5: a header that fails ASCII parse is malformed
+    /// input — keep rejecting it. Treating it as "absent" would be a
+    /// downgrade-attack vector.
+    #[test]
+    fn ws_origin_gate_rejects_non_ascii_origin() {
+        let mut headers = HeaderMap::new();
+        // Insert raw bytes that are not valid header values via the
+        // typed `HeaderValue::from_bytes` builder. We use bytes that
+        // would round-trip but contain non-ASCII content so `to_str`
+        // returns Err.
+        let val = axum::http::HeaderValue::from_bytes(b"https://\xff.example.com")
+            .expect("HeaderValue accepts arbitrary visible bytes");
+        headers.insert(axum::http::header::ORIGIN, val);
+        assert_eq!(
+            decide_ws_origin_gate(&headers, None),
+            WsOriginDecision::RejectMalformed,
+        );
+    }
+
     #[tokio::test]
     async fn slow_client_does_not_wedge_other_connections() {
         // Two independent WsConnection wrappers (each with its own writer
@@ -11420,6 +12194,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             ConnectionUiFeatures::default(),
             "h1".into(),
             SessionHydrateParams {
@@ -11508,6 +12283,7 @@ mod tests {
             &ledger,
             &active_turns,
             None,
+            None,
             "g1".into(),
             ThreadGraphGetParams {
                 session_id: session_id.clone(),
@@ -11568,6 +12344,7 @@ mod tests {
             &ledger,
             &active_turns,
             None,
+            None,
             "g2".into(),
             ThreadGraphGetParams {
                 session_id: session_id.clone(),
@@ -11612,6 +12389,7 @@ mod tests {
             &state,
             &ledger,
             &active_turns,
+            None,
             None,
             "t1".into(),
             TurnStateGetParams {
@@ -11665,6 +12443,7 @@ mod tests {
             &ledger,
             &active_turns,
             None,
+            None,
             "t2".into(),
             TurnStateGetParams {
                 session_id: session_id.clone(),
@@ -11701,6 +12480,7 @@ mod tests {
             &ledger,
             &approvals,
             &active_turns,
+            None,
             None,
             ConnectionUiFeatures::default(),
             "h-unknown".into(),
@@ -11849,6 +12629,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             features_for_spawn_complete_test(true, true),
             "h-new".into(),
             SessionHydrateParams {
@@ -11927,6 +12708,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             ConnectionUiFeatures::default(),
             "h-legacy".into(),
             SessionHydrateParams {
@@ -12002,6 +12784,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             features_for_spawn_complete_test(true, true),
             "h-no-msgs".into(),
             SessionHydrateParams {
@@ -12036,6 +12819,7 @@ mod tests {
             &state,
             &ledger,
             &active_turns,
+            None,
             None,
             "t3".into(),
             TurnStateGetParams {
@@ -12565,7 +13349,7 @@ mod tests {
 
         // Cleanup: aborting the forwarder must not panic and must release
         // the receiver so subsequent prune_idle_subscribers reclaims the slot.
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[tokio::test]
@@ -12614,7 +13398,7 @@ mod tests {
         // No further frames are queued (only one live event emitted).
         assert!(rx.try_recv().is_err(), "no more frames expected");
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[tokio::test]
@@ -12645,7 +13429,7 @@ mod tests {
             "client without event.message_persisted.v1 must not receive message/persisted"
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     // ========================================================================
@@ -12774,7 +13558,7 @@ mod tests {
             "no second frame: background message/persisted is suppressed for new clients",
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     /// Codex P1: when the BackgroundResultSender persist scope is
@@ -12909,7 +13693,7 @@ mod tests {
             "no second frame: turn/spawn_complete is suppressed for old clients",
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     #[tokio::test]
@@ -12966,7 +13750,7 @@ mod tests {
         );
 
         // Disconnect ws_a; ws_b must continue receiving subsequent events.
-        abort_live_forwarders(&forwarders_a).await;
+        abort_live_forwarders(&forwarders_a, &ledger).await;
         drop(rx_a);
         ledger.append_notification(message_persisted_for(&session_id));
         let frame_b2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx_b.recv())
@@ -12978,7 +13762,7 @@ mod tests {
             Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
         );
 
-        abort_live_forwarders(&forwarders_b).await;
+        abort_live_forwarders(&forwarders_b, &ledger).await;
     }
 
     // -- Codex PR #761 review fixes ----------------------------------------
@@ -13071,7 +13855,7 @@ mod tests {
             "no further frames expected: session/open must be self-suppressed"
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     /// MUST-FIX-2: a `send_notification_durable` call from the same
@@ -13148,8 +13932,8 @@ mod tests {
             Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
         );
 
-        abort_live_forwarders(&forwarders).await;
-        abort_live_forwarders(&forwarders_other).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
+        abort_live_forwarders(&forwarders_other, &ledger).await;
     }
 
     /// MUST-FIX-3: a `subscribe()` call followed by dropping the
@@ -13233,7 +14017,7 @@ mod tests {
             Some(octos_core::ui_protocol::methods::MESSAGE_PERSISTED)
         );
 
-        abort_live_forwarders(&forwarders).await;
+        abort_live_forwarders(&forwarders, &ledger).await;
     }
 
     // ----- M11-E: UI Protocol per-session workspace wiring -----------------

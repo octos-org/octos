@@ -435,7 +435,7 @@ impl UiProtocolLedger {
 
         let count = snapshot.retained_entries.len();
         let total_disk_bytes = snapshot.total_disk_bytes;
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let session_state = inner
             .sessions
             .entry(session_id.clone())
@@ -609,7 +609,7 @@ impl UiProtocolLedger {
         let stamped;
         let on_disk_delta;
         {
-            let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
             // LRU eviction: if we'd exceed the active session cap and this
             // session is new, evict the oldest first.
@@ -707,7 +707,7 @@ impl UiProtocolLedger {
         // broadcast subscriber (which is bounded but still does work in
         // `send`) can never block the next `append`.
         let sender = {
-            let inner = self.inner.lock().expect("ui protocol ledger lock");
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             inner.subscribers.get(session_id).cloned()
         };
         if let Some(sender) = sender {
@@ -729,7 +729,7 @@ impl UiProtocolLedger {
         &self,
         session_id: &SessionKey,
     ) -> broadcast::Receiver<LedgeredUiProtocolEvent> {
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(sender) = inner.subscribers.get(session_id) {
             return sender.subscribe();
         }
@@ -744,7 +744,7 @@ impl UiProtocolLedger {
     /// ledgers, and on the `session/open` failure path so a `subscribe()`
     /// that never paired with a forwarder doesn't leak a sender.
     pub(crate) fn prune_idle_subscribers(&self) -> usize {
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let to_remove: Vec<SessionKey> = inner
             .subscribers
             .iter()
@@ -763,7 +763,7 @@ impl UiProtocolLedger {
     /// their `Receiver` and want to immediately reclaim the sender slot
     /// rather than waiting for the next sweep.
     pub(crate) fn prune_subscriber_if_idle(&self, session_id: &SessionKey) -> bool {
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let drop_it = inner
             .subscribers
             .get(session_id)
@@ -778,7 +778,7 @@ impl UiProtocolLedger {
     fn snapshot_if_session_absent(&self, session_id: &SessionKey) -> Option<DiskSessionSnapshot> {
         self.config.data_dir.as_ref()?;
         {
-            let inner = self.inner.lock().expect("ui protocol ledger lock");
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if inner.sessions.contains_key(session_id) {
                 return None;
             }
@@ -931,7 +931,7 @@ impl UiProtocolLedger {
     pub(crate) fn sweep_idle(&self) -> usize {
         let cutoff = Instant::now() - self.config.idle_ttl;
         let mut evicted = 0usize;
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let victims: Vec<SessionKey> = inner
             .sessions
             .iter()
@@ -982,7 +982,7 @@ impl UiProtocolLedger {
     /// subscribers map. Used to assert pruning behaviour.
     #[cfg(test)]
     pub(crate) fn subscriber_count(&self) -> usize {
-        let inner = self.inner.lock().expect("ui protocol ledger lock");
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.subscribers.len()
     }
 
@@ -990,7 +990,7 @@ impl UiProtocolLedger {
     /// `/metrics` endpoint integration.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn metrics(&self) -> LedgerMetrics {
-        let inner = self.inner.lock().expect("ui protocol ledger lock");
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         LedgerMetrics {
             sessions_active: inner.sessions.len(),
             sessions_evicted: inner.evicted_count,
@@ -1054,7 +1054,7 @@ impl UiProtocolLedger {
         let preload_snapshot = if self
             .inner
             .lock()
-            .expect("ui protocol ledger lock")
+            .unwrap_or_else(|p| p.into_inner())
             .sessions
             .get(session_id)
             .map(|session| {
@@ -1071,7 +1071,7 @@ impl UiProtocolLedger {
             None
         };
 
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(snapshot) = preload_snapshot {
             // Hydrate the in-memory ring from disk, mirroring what
             // `replay_after_from_disk` does, but inside the same lock
@@ -1201,7 +1201,7 @@ impl UiProtocolLedger {
             // Pair the empty replay with the current head_seq so the
             // forwarder baseline matches a no-op snapshot.
             let head_seq = {
-                let inner = self.inner.lock().expect("ui protocol ledger lock");
+                let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 inner
                     .sessions
                     .get(session_id)
@@ -1213,7 +1213,7 @@ impl UiProtocolLedger {
         validate_cursor_stream(session_id, after)?;
 
         {
-            let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(ledger) = inner.sessions.get(session_id) {
                 if let Some(oldest_seq) = ledger.entries.front().map(|entry| entry.seq) {
                     let min_after_seq = oldest_seq.saturating_sub(1);
@@ -1260,7 +1260,7 @@ impl UiProtocolLedger {
         let session_dir = data_dir
             .join("ui-protocol")
             .join(encode_session_dir_name(session_id));
-        let mut inner = self.inner.lock().expect("ui protocol ledger lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(ledger) = inner.sessions.get(session_id) {
             if let Some(oldest_seq) = ledger.entries.front().map(|entry| entry.seq) {
                 let min_after_seq = oldest_seq.saturating_sub(1);
