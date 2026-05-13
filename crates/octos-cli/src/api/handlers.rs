@@ -932,31 +932,41 @@ pub async fn update_session_title(
     }
 
     let mut updated = false;
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let candidates =
+        standalone_api_session_key_candidates_with_topic(&state, &headers, identity_ref, &id, None);
 
-    if let Some(sessions) = &state.sessions {
-        let mut sess = sessions.lock().await;
-        // #919.2: use the auth-aware candidate helper so raw `web-*`
-        // sessions under profile auth resolve to the profile's own
-        // store. The older `standalone_api_session_key_candidates`
-        // skipped tenant-scoped raw-id fallbacks.
-        let identity_ref = identity.as_ref().map(|ext| &ext.0);
-        for key in standalone_api_session_key_candidates_with_topic(
+    // #924 BLOCK 3: each candidate `SessionKey` may belong to a
+    // different profile (the candidate set includes the resolved
+    // tenant profile, `_main`, and bare-channel/raw-id forms). Route
+    // each candidate through `resolve_sessions_for_lookup` so the
+    // profile's own `SessionRuntime.sessions` is locked — turn
+    // persistence writes there, so the title update MUST land in the
+    // same store. The legacy code locked only `state.sessions`, which
+    // did not contain profile-scoped runtime sessions and returned
+    // `NOT_FOUND` for raw `web-*` ids under profile auth.
+    for key in candidates {
+        let Some(sessions) = super::ui_protocol::resolve_sessions_for_lookup(
             &state,
-            &headers,
-            identity_ref,
-            &id,
             None,
-        ) {
-            if sess.load(&key).await.is_some() {
-                if let Err(e) = sess.update_title(&key, title.clone()).await {
-                    tracing::error!(
-                        session_key = %key,
-                        error = %e,
-                        "update_title in standalone store failed"
-                    );
-                } else {
-                    updated = true;
-                }
+            routed_profile_id.as_deref(),
+            &key,
+        )
+        .await
+        else {
+            continue;
+        };
+        let mut sess = sessions.lock().await;
+        if sess.load(&key).await.is_some() {
+            if let Err(e) = sess.update_title(&key, title.clone()).await {
+                tracing::error!(
+                    session_key = %key,
+                    error = %e,
+                    "update_title in profile-scoped store failed"
+                );
+            } else {
+                updated = true;
             }
         }
     }
@@ -991,26 +1001,35 @@ pub async fn delete_session(
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    // Clear from the standalone store if available.
-    if let Some(sessions) = &state.sessions {
-        let mut sess = sessions.lock().await;
-        // #919.2: use the auth-aware candidate helper.
-        let identity_ref = identity.as_ref().map(|ext| &ext.0);
-        for key in standalone_api_session_key_candidates_with_topic(
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    let candidates =
+        standalone_api_session_key_candidates_with_topic(&state, &headers, identity_ref, &id, None);
+
+    // #924 BLOCK 3: route each candidate through the profile-aware
+    // SessionManager resolver — turn persistence writes to the
+    // profile's `SessionRuntime.sessions`, so deletes MUST hit the
+    // same store. The legacy code locked only `state.sessions`, which
+    // did not contain profile-scoped runtime sessions.
+    for key in candidates {
+        let Some(sessions) = super::ui_protocol::resolve_sessions_for_lookup(
             &state,
-            &headers,
-            identity_ref,
-            &id,
             None,
-        ) {
-            if sess.load(&key).await.is_some() {
-                if let Err(e) = sess.clear(&key).await {
-                    tracing::error!(
-                        session_key = %key,
-                        error = %e,
-                        "delete session from standalone store failed"
-                    );
-                }
+            routed_profile_id.as_deref(),
+            &key,
+        )
+        .await
+        else {
+            continue;
+        };
+        let mut sess = sessions.lock().await;
+        if sess.load(&key).await.is_some() {
+            if let Err(e) = sess.clear(&key).await {
+                tracing::error!(
+                    session_key = %key,
+                    error = %e,
+                    "delete session from profile-scoped store failed"
+                );
             }
         }
     }

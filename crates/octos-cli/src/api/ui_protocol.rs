@@ -1777,6 +1777,7 @@ async fn ui_protocol_connection(
                     &contracts.approvals,
                     &active_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -1790,6 +1791,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -1802,6 +1804,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -2797,12 +2800,28 @@ fn resolve_session_profile_runtime(
 /// registered for the resolved profile and the cache can bootstrap
 /// a `SessionRuntime` for `session_id`. Falls back to
 /// `state.sessions` so the legacy no-profile flow continues to work.
-async fn resolve_sessions_for_lookup(
+///
+/// #924 BLOCK 4: the active-profile precedence MUST mirror
+/// `handle_turn_start` — `session_id.profile_id()` first (the key
+/// itself encodes the owner profile), then `connection_profile_id`
+/// (token-auth scope), then `routed_profile_id` (host/header
+/// routing). Without the `session_id` precedence + the routed
+/// fallback, a host-routed admin session on a hosted subdomain
+/// hydrated from `_main`/`state.sessions` instead of the right
+/// profile runtime — and turns whose `SessionKey` already carried
+/// `<profile>:api:...` resolved to a different store than the one
+/// that persisted them.
+pub(crate) async fn resolve_sessions_for_lookup(
     state: &Arc<AppState>,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
-    if let Some(profile_runtime) = resolve_session_profile_runtime(state, connection_profile_id) {
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        .or(routed_profile_id);
+    if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let hint = session_workspaces().get(session_id);
         if let Ok(runtime) = state
             .session_cache
@@ -3918,6 +3937,7 @@ async fn handle_session_hydrate(
     approvals: &PendingApprovalStore,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
     params: SessionHydrateParams,
@@ -3960,8 +3980,13 @@ async fn handle_session_hydrate(
     // has a profile scope. Turn persistence writes to
     // `SessionRuntime.sessions`; reads must hit the same handle or we'd
     // report `unknown_session` on reconnect-hydrate.
-    let Some(sessions) =
-        resolve_sessions_for_lookup(state, connection_profile_id, &params.session_id).await
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
     else {
         let _ = send_rpc_error(
             ws,
@@ -4165,6 +4190,7 @@ async fn handle_thread_graph_get(
     ledger: &Arc<UiProtocolLedger>,
     _active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     id: String,
     params: ThreadGraphGetParams,
 ) {
@@ -4185,8 +4211,13 @@ async fn handle_thread_graph_get(
     };
 
     // #919.1: route to the profile's session manager when under profile auth.
-    let Some(sessions) =
-        resolve_sessions_for_lookup(state, connection_profile_id, &params.session_id).await
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
     else {
         let _ = send_rpc_error(
             ws,
@@ -4248,6 +4279,7 @@ async fn handle_turn_state_get(
     ledger: &Arc<UiProtocolLedger>,
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
     id: String,
     params: TurnStateGetParams,
 ) {
@@ -4264,8 +4296,13 @@ async fn handle_turn_state_get(
     //
     // #919.1: route to the profile's session manager when under profile
     // auth so reads see the same store the turn writes used.
-    let sessions =
-        resolve_sessions_for_lookup(state, connection_profile_id, &params.session_id).await;
+    let sessions = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await;
     if let Some(sessions) = sessions.as_ref() {
         let mut sessions_guard = sessions.lock().await;
         if !sessions_guard.session_known(&params.session_id) {
@@ -11908,6 +11945,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             ConnectionUiFeatures::default(),
             "h1".into(),
             SessionHydrateParams {
@@ -11996,6 +12034,7 @@ mod tests {
             &ledger,
             &active_turns,
             None,
+            None,
             "g1".into(),
             ThreadGraphGetParams {
                 session_id: session_id.clone(),
@@ -12056,6 +12095,7 @@ mod tests {
             &ledger,
             &active_turns,
             None,
+            None,
             "g2".into(),
             ThreadGraphGetParams {
                 session_id: session_id.clone(),
@@ -12100,6 +12140,7 @@ mod tests {
             &state,
             &ledger,
             &active_turns,
+            None,
             None,
             "t1".into(),
             TurnStateGetParams {
@@ -12153,6 +12194,7 @@ mod tests {
             &ledger,
             &active_turns,
             None,
+            None,
             "t2".into(),
             TurnStateGetParams {
                 session_id: session_id.clone(),
@@ -12189,6 +12231,7 @@ mod tests {
             &ledger,
             &approvals,
             &active_turns,
+            None,
             None,
             ConnectionUiFeatures::default(),
             "h-unknown".into(),
@@ -12337,6 +12380,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             features_for_spawn_complete_test(true, true),
             "h-new".into(),
             SessionHydrateParams {
@@ -12415,6 +12459,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             ConnectionUiFeatures::default(),
             "h-legacy".into(),
             SessionHydrateParams {
@@ -12490,6 +12535,7 @@ mod tests {
             &approvals,
             &active_turns,
             None,
+            None,
             features_for_spawn_complete_test(true, true),
             "h-no-msgs".into(),
             SessionHydrateParams {
@@ -12524,6 +12570,7 @@ mod tests {
             &state,
             &ledger,
             &active_turns,
+            None,
             None,
             "t3".into(),
             TurnStateGetParams {
