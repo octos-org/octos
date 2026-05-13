@@ -459,6 +459,7 @@ async fn should_populate_validator_results_when_workspace_policy_declares_valida
             validators: vec![Validator {
                 id: "deck-exists".into(),
                 required: true,
+                soft_fail: false,
                 timeout_ms: None,
                 phase: ValidatorPhaseKind::Completion,
                 spec: ValidatorSpec::FileExists {

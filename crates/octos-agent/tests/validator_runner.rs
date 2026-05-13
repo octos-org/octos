@@ -22,6 +22,7 @@ fn command_validator(id: &str, cmd: &str, args: &[&str]) -> Validator {
     Validator {
         id: id.to_string(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(5000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -35,6 +36,7 @@ fn file_exists_validator(id: &str, path: &str, min_bytes: Option<u64>) -> Valida
     Validator {
         id: id.to_string(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -48,6 +50,7 @@ fn tool_call_validator(id: &str, tool: &str, args: Value) -> Validator {
     Validator {
         id: id.to_string(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(5000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::ToolCall {
@@ -125,6 +128,7 @@ async fn should_block_ready_when_required_command_validator_fails() {
     let validators = vec![Validator {
         id: "cmd_fail".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -160,6 +164,7 @@ async fn should_warn_but_not_block_when_optional_validator_fails() {
     let validators = vec![Validator {
         id: "optional_fail".into(),
         required: false,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -192,6 +197,7 @@ async fn should_record_duration_and_evidence_path_for_command_validator() {
     let validators = vec![Validator {
         id: "echo_cmd".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -231,6 +237,7 @@ async fn should_expose_stderr_in_outcome_for_operator_visibility() {
     let validators = vec![Validator {
         id: "stderr_cmd".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -273,6 +280,7 @@ async fn should_kill_child_process_on_validator_timeout() {
     let validators = vec![Validator {
         id: "timeout_cmd".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(300),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -468,6 +476,7 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
     let validators = vec![Validator {
         id: "env_probe".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(5000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {
@@ -522,6 +531,7 @@ async fn should_block_spawn_task_contract_when_required_validator_fails() {
     policy.validation.validators = vec![Validator {
         id: "min_bytes_gate".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -600,6 +610,7 @@ async fn should_not_block_spawn_task_contract_when_optional_validator_fails() {
     policy.validation.validators = vec![Validator {
         id: "optional_warn".into(),
         required: false,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -665,6 +676,7 @@ async fn should_reflect_required_validator_fail_in_inspect_ready_flag() {
     policy.validation.validators = vec![Validator {
         id: "gate".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: None,
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::FileExists {
@@ -702,6 +714,7 @@ async fn should_reflect_required_validator_fail_in_inspect_ready_flag() {
         kind: "file_exists".into(),
         repo_label: "slides/demo".into(),
         required: true,
+        required_tier: "hard".into(),
         status: ValidatorStatus::Pass,
         reason: "manual seed".into(),
         duration_ms: 0,
@@ -731,6 +744,7 @@ async fn should_block_command_validator_with_dangerous_pattern() {
     let validators = vec![Validator {
         id: "dangerous".into(),
         required: true,
+        soft_fail: false,
         timeout_ms: Some(3000),
         phase: ValidatorPhaseKind::Completion,
         spec: ValidatorSpec::Command {

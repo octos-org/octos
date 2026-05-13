@@ -215,6 +215,7 @@ mod tests {
             vec![Validator {
                 id: "design-file".into(),
                 required: true,
+                soft_fail: false,
                 timeout_ms: None,
                 phase: ValidatorPhaseKind::Completion,
                 spec: ValidatorSpec::FileExists {

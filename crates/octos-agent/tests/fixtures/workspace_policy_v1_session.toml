@@ -43,3 +43,33 @@ on_completion = [
     { kind = "ominix_voice_exists", name_arg = "name" },
 ]
 on_failure = ["notify_user:Voice registration failed"]
+
+# Wave-3a: HttpProbeUntil + Sha256Match + soft_fail are operator-visible
+# TOML shapes; this fixture also acts as a syntax demo for operators.
+
+[spawn_tasks.manage_skills]
+on_completion = [
+    { kind = "sha256_match", glob = "${args.skill_dir}/main", sha256 = "${args.expected_sha256}" },
+]
+on_failure = ["notify_user:Skill install verification failed"]
+
+[[spawn_tasks.deep_search.on_completion]]
+id = "deep_search.primary_index"
+required = true
+kind = "file_exists"
+path = "${args.research_dir}/_search_results.md"
+
+[[spawn_tasks.deep_search.on_completion]]
+id = "deep_search.sources_warn"
+required = true
+soft_fail = true
+kind = "file_exists"
+path = "${args.research_dir}/01_source.md"
+
+[[spawn_tasks.deep_search.on_completion]]
+id = "deep_search.async_ready_probe"
+kind = "http_probe_until"
+url_template = "http://127.0.0.1:8081/v1/jobs/${args.job_id}"
+expected_contains = "complete"
+poll_interval_ms = 1000
+deadline_ms = 20000
