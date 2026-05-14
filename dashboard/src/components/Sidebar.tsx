@@ -2,12 +2,22 @@ import { NavLink, useMatch, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 
 export default function Sidebar() {
-  const { user, isAdmin, logout } = useAuth()
+  const { user, isAdmin, scopedProfile, logout } = useAuth()
 
   // Detect if we're on a profile route
   const adminProfileMatch = useMatch('/profile/:id/*')
   const myProfileMatch = useMatch('/my/*')
   const isProfileMode = !!(adminProfileMatch || myProfileMatch)
+
+  // Option Y (issue #315): when the request comes in on a tenant
+  // subdomain the server scopes `/api/my/*` to that tenant. Hide
+  // admin-global navigation so an admin in tenant scope sees the
+  // tenant's profile chrome only — the global "All Profiles" / Access
+  // / Server / Setup links would otherwise mislead them into thinking
+  // those actions apply to the tenant. Admin reaches global pages by
+  // visiting the root domain.
+  const isHostScoped = !!scopedProfile
+  const showAdminGlobalLinks = isAdmin && !isHostScoped
 
   // Build the base path for profile navigation links
   const profileBase = adminProfileMatch
@@ -22,6 +32,11 @@ export default function Sidebar() {
           <span className="text-accent">octos</span>
           {isAdmin ? ' Admin' : ''}
         </h1>
+        {isHostScoped && scopedProfile && (
+          <p className="mt-1 text-[10px] text-gray-500 truncate" title={`Scoped to ${scopedProfile.name}`}>
+            {scopedProfile.name}
+          </p>
+        )}
       </div>
 
       <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
@@ -29,7 +44,7 @@ export default function Sidebar() {
         {isAdmin && (
           <>
             {/* Back to dashboard (admin only) */}
-            {isAdmin && adminProfileMatch && (
+            {showAdminGlobalLinks && adminProfileMatch && (
               <Link
                 to="/"
                 className="flex items-center gap-2 px-3 py-2 mb-3 text-xs text-gray-500 hover:text-gray-300 transition-colors"
@@ -47,8 +62,8 @@ export default function Sidebar() {
             <SidebarLink to={`${profileBase}/skills`} icon={<PuzzleIcon />} label="Skills" />
             <SidebarLink to={`${profileBase}/system`} icon={<CogIcon />} label="System" />
 
-            {/* Admin links (separator + bottom section) */}
-            {isAdmin && (
+            {/* Admin links — hidden on tenant subdomains (Option Y, #315) */}
+            {showAdminGlobalLinks && (
               <>
                 <div className="border-t border-gray-700/30 my-3" />
                 <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />

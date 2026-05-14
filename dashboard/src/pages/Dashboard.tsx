@@ -21,7 +21,7 @@ function shouldShowDashboardApp(profile: ProfileResponse) {
 }
 
 export default function Dashboard() {
-  const { isAdmin } = useAuth()
+  const { isAdmin, scopedProfile } = useAuth()
   const { data, error, loading, refresh } = useOverview()
   const { toast } = useToast()
   const [actionLoading, setActionLoading] = useState(false)
@@ -49,8 +49,13 @@ export default function Dashboard() {
     }
   }, [data?.profiles])
 
-  // Non-admins go straight to their profile
-  if (!isAdmin) {
+  // Non-admins go straight to their profile.
+  // Codex P2 (PR #958 review): scoped admins (admin sessions on a
+  // tenant subdomain) likewise belong on `/my` — the global
+  // `/api/admin/overview` shown here would be misleading inside a
+  // tenant scope. Admin reaches the global dashboard by visiting the
+  // root domain.
+  if (!isAdmin || scopedProfile) {
     return <Navigate to="/my" replace />
   }
 
