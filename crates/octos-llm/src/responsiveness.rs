@@ -73,6 +73,17 @@ impl ResponsivenessObserver {
 
     /// Record a new latency observation.
     pub fn record(&mut self, latency: Duration) {
+        self.record_with_ceiling(latency, None);
+    }
+
+    /// Record a latency observation with an optional hard ceiling.
+    ///
+    /// When `ceiling_ms` is `Some(c)` and `c > 0`, any sample exceeding
+    /// the ceiling counts as "slow" even when the baseline-relative
+    /// check (`latency > baseline * degradation_threshold`) wouldn't
+    /// fire. This prevents high-baseline sessions from staying above
+    /// an operator-tuned absolute latency budget without escalating.
+    pub fn record_with_ceiling(&mut self, latency: Duration, ceiling_ms: Option<u64>) {
         self.window.push_back(latency);
         if self.window.len() > self.window_size {
             self.window.pop_front();
@@ -98,7 +109,15 @@ impl ResponsivenessObserver {
             }
         }
 
-        // Check if this request was slow relative to baseline
+        // A request is "slow" if EITHER the baseline-relative check fires
+        // OR the optional absolute ceiling is exceeded.
+        let above_ceiling = ceiling_ms
+            .map(|c| c > 0 && latency.as_millis() > u128::from(c))
+            .unwrap_or(false);
+        if above_ceiling {
+            self.consecutive_slow += 1;
+            return;
+        }
         if let Some(baseline) = self.baseline {
             if latency > baseline.mul_f64(self.degradation_threshold) {
                 self.consecutive_slow += 1;
@@ -283,5 +302,42 @@ mod tests {
         }
         assert_eq!(obs.sample_count(), 5);
         assert!(obs.baseline().is_some());
+    }
+
+    /// `record_with_ceiling` counts samples above the absolute ceiling
+    /// as "slow" even when the baseline-relative check wouldn't fire.
+    #[test]
+    fn test_ceiling_aware_record_fires_above_ceiling() {
+        let mut obs = ResponsivenessObserver::new();
+        // High baseline at 1000ms.
+        for _ in 0..5 {
+            obs.record_with_ceiling(Duration::from_millis(1000), Some(1500));
+        }
+        // 2000ms: below 3x baseline (3000ms) but above ceiling (1500ms).
+        for _ in 0..3 {
+            obs.record_with_ceiling(Duration::from_millis(2000), Some(1500));
+        }
+        assert!(
+            obs.should_activate(),
+            "samples above the absolute ceiling must count as slow"
+        );
+    }
+
+    /// `record_with_ceiling(_, None)` behaves identically to `record()`
+    /// (baseline-only behavior, legacy contract).
+    #[test]
+    fn test_ceiling_none_is_legacy_behavior() {
+        let mut obs = ResponsivenessObserver::new();
+        for _ in 0..5 {
+            obs.record_with_ceiling(Duration::from_millis(1000), None);
+        }
+        // 2000ms < 3x baseline (3000ms) → not slow.
+        for _ in 0..3 {
+            obs.record_with_ceiling(Duration::from_millis(2000), None);
+        }
+        assert!(
+            !obs.should_activate(),
+            "without a ceiling the baseline-only path should not fire"
+        );
     }
 }

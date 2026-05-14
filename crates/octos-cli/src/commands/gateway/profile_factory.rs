@@ -240,6 +240,16 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
                 AdaptiveRouter::new(providers, &costs, adaptive_config)
                     .with_adaptive_config(mode, qos_ranking),
             );
+            // Wave-4c: surface AutoEscalationConfig from config.json so
+            // operators can disable the latency feedback loop on the
+            // gateway-side too. `qos_catalog::build_adaptive_provider_chain`
+            // does the equivalent for the serve / ProfileRuntime path;
+            // this is the same wiring for `commands::gateway`.
+            if let Some(ar) = routing_config {
+                router.set_auto_escalation_config(octos_llm::AutoEscalationConfig::from(
+                    &ar.auto_escalation,
+                ));
+            }
             adaptive_router_ref = Some(router.clone());
             router
         } else {
