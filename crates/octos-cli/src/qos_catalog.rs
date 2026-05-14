@@ -144,6 +144,15 @@ pub(crate) fn build_adaptive_provider_chain(
                 AdaptiveRouter::new(providers, &costs, adaptive_config)
                     .with_adaptive_config(mode, qos),
             );
+            // Wave-4c: surface AutoEscalationConfig from config.json so
+            // operators can disable the latency feedback loop (e.g. CI,
+            // benchmarks). The router defaults to enabled; this only
+            // overrides when an `adaptive_routing.auto_escalation` block
+            // exists. (Merge note: ar_config is already &AdaptiveRoutingConfig
+            // here — the outer `if adaptive_enabled` ensures Some.)
+            router.set_auto_escalation_config(octos_llm::AutoEscalationConfig::from(
+                &ar_config.auto_escalation,
+            ));
             adaptive_router_ref = Some(router.clone());
             router
         } else {

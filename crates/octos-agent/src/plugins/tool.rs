@@ -1,12 +1,13 @@
 //! Plugin tool: wraps a plugin executable as a Tool.
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -91,6 +92,16 @@ pub struct PluginTool {
     /// Only honoured when the tool's manifest opts in via
     /// `x-octos-host-config-keys: ["synthesis_config"]`.
     synthesis_config: Option<SynthesisConfig>,
+    /// Section C: SHA-256 (lowercase hex) of the verified-exe bytes computed
+    /// at load time. Stored alongside the executable path so the pre-spawn
+    /// re-hash gate in `execute()` can confirm the bytes have not been
+    /// swapped between load and exec (closes the load→exec TOCTOU window).
+    /// `None` when no hash was computed (legacy code paths).
+    verified_exe_sha256: Option<String>,
+    /// Section C: when `true`, the pre-spawn re-hash gate ALWAYS fires (and
+    /// `verified_exe_sha256` must be `Some`). When `false`, the gate is
+    /// skipped on unverified plugins to keep the legacy path cheap.
+    require_signed: bool,
 }
 
 impl PluginTool {
@@ -107,7 +118,20 @@ impl PluginTool {
             work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
             synthesis_config: None,
+            verified_exe_sha256: None,
+            require_signed: false,
         }
+    }
+
+    /// Attach the load-time SHA-256 of the verified-exe bytes so the pre-spawn
+    /// re-hash gate in [`Self::execute`] can detect a swap between load and
+    /// exec. Pass `require_signed = true` when the host config has enabled
+    /// strict integrity — the gate will then run unconditionally and an
+    /// invocation with a missing hash hard-errors.
+    pub fn with_verified_sha256(mut self, hash: String, require_signed: bool) -> Self {
+        self.verified_exe_sha256 = Some(hash);
+        self.require_signed = require_signed;
+        self
     }
 
     /// Set environment variables to block from plugin execution.
@@ -143,6 +167,15 @@ impl PluginTool {
         self
     }
 
+    /// Section C: re-read the verified-exe bytes and recompute SHA-256.
+    /// Returned as lowercase hex to match what the loader stored. Errors
+    /// propagate as eyre wrappers so the caller can surface a precise
+    /// reason in the refusal output.
+    fn rehash_verified_exe(path: &Path) -> Result<String> {
+        let bytes = std::fs::read(path).map_err(|e| eyre::eyre!("read {}: {e}", path.display()))?;
+        Ok(format!("{:x}", Sha256::digest(&bytes)))
+    }
+
     /// Create a copy of this plugin tool with a different work directory.
     /// Used to give each user session its own workspace for plugin output.
     pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
@@ -155,6 +188,8 @@ impl PluginTool {
             work_dir: Some(work_dir),
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
+            verified_exe_sha256: self.verified_exe_sha256.clone(),
+            require_signed: self.require_signed,
         }
     }
 
@@ -612,6 +647,76 @@ fn input_schema_has_property(schema: &serde_json::Value, property: &str) -> bool
         .is_some_and(|properties| properties.contains_key(property))
 }
 
+/// Parse the optional `named_outputs` field from a spawn_only plugin's
+/// stdout envelope.
+///
+/// Returns:
+/// - `Ok(None)` when the field is absent or `null`.
+/// - `Ok(Some(map))` when the field is a JSON object whose entries pass
+///   validation (keys match `[a-z][a-z0-9_]*`, values are strings).
+/// - `Err(message)` when the field is present but malformed: not an object,
+///   contains a non-string value, an empty key, or a key shape violation.
+///
+/// The contract layer threads the returned map into `ValidatorInvocation`
+/// so `${output.<key>}` interpolation can resolve against tool-emitted
+/// values. Values are restricted to strings in v1; nested JSON support is
+/// deferred.
+fn parse_named_outputs(
+    raw: Option<&serde_json::Value>,
+) -> Result<Option<std::collections::HashMap<String, String>>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "named_outputs must be a JSON object".to_string())?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+    let mut map = std::collections::HashMap::with_capacity(object.len());
+    for (key, entry) in object {
+        if !is_valid_named_output_key(key) {
+            return Err(format!(
+                "named_outputs key '{key}' does not match required shape [a-z][a-z0-9_]*"
+            ));
+        }
+        let string_value = entry.as_str().ok_or_else(|| {
+            format!(
+                "named_outputs value for '{key}' must be a string, got {}",
+                value_kind_label(entry)
+            )
+        })?;
+        map.insert(key.clone(), string_value.to_string());
+    }
+    Ok(Some(map))
+}
+
+/// Validate a `named_outputs` key matches `[a-z][a-z0-9_]*`.
+fn is_valid_named_output_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn value_kind_label(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Resolve a plugin tool's input path (`audio_path` / `file_path` /
 /// `input` / per-slide `source_image`) to an absolute on-disk string.
 ///
@@ -809,6 +914,66 @@ impl Tool for PluginTool {
             args_size = args.to_string().len(),
             "spawning plugin process"
         );
+
+        // Section C: pre-spawn re-hash gate. When a load-time hash was
+        // recorded — either because the manifest declared `sha256` OR
+        // because `require_signed` was on — re-read the verified-exe
+        // bytes, recompute SHA-256, and compare against what we approved
+        // at load time. A mismatch means the verified copy on disk has
+        // been swapped between load and invocation; refuse to run.
+        //
+        // When neither path applied (no manifest hash AND
+        // `require_signed = false`) the gate is skipped so the legacy
+        // unverified path stays cheap. Under `require_signed = true` the
+        // loader guarantees `verified_exe_sha256` is populated for every
+        // tool that reached the registry — the assertion below is a
+        // belt-and-braces hard error if something slipped past it.
+        if let Some(expected) = &self.verified_exe_sha256 {
+            match Self::rehash_verified_exe(&self.executable) {
+                Ok(actual) if actual == *expected => {
+                    tracing::debug!(
+                        plugin = %self.plugin_name,
+                        tool = %self.tool_def.name,
+                        "pre-spawn re-hash matched"
+                    );
+                }
+                Ok(actual) => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: verified executable hash mismatch \
+                             (expected {expected}, got {actual}). The on-disk binary changed \
+                             between load and invocation.",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                Err(err) => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: failed to re-hash verified executable: {err}",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        } else if self.require_signed {
+            // Fail closed: strict policy is on but the load-time hash was
+            // never recorded. This indicates a wiring bug — never let an
+            // unhashed plugin invoke under `require_signed = true`.
+            return Ok(ToolResult {
+                output: format!(
+                    "Plugin '{}' refused to spawn: `plugins.require_signed` is enabled but \
+                     no load-time hash was recorded for this tool (internal wiring error).",
+                    self.plugin_name
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
 
         // M6 req 4: enforce manifest-declared `risk` field (UPCR-2026-001).
         // When the manifest declares `risk: "high"` or `risk: "critical"`,
@@ -1163,6 +1328,29 @@ impl Tool for PluginTool {
                 })
                 .unwrap_or_default();
 
+            // Parse named_outputs: spawn_only plugins can surface structured
+            // values (e.g. `mofa_publish` emitting `deploy_url`) the contract
+            // layer threads to validators for `${output.<key>}` interpolation.
+            //
+            // Malformed payloads must NOT silently drop the field — surface
+            // a typed failure so the contract layer rejects the result.
+            let named_outputs = match parse_named_outputs(parsed.get("named_outputs")) {
+                Ok(value) => value,
+                Err(reason) => {
+                    tracing::warn!(
+                        plugin = %self.plugin_name,
+                        tool = %self.tool_def.name,
+                        error = %reason,
+                        "rejecting spawn_only result: malformed named_outputs"
+                    );
+                    return Ok(ToolResult {
+                        output: format!("plugin emitted malformed named_outputs: {reason}"),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
+
             // Auto-deliver output file when plugin didn't report it.
             // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
@@ -1177,6 +1365,7 @@ impl Tool for PluginTool {
                 success,
                 file_modified,
                 files_to_send,
+                named_outputs,
                 ..Default::default()
             });
         }
@@ -2622,5 +2811,180 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output, "ran");
         assert!(last.lock().unwrap().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Wave-3b: spawn_only stdout envelope extension — `named_outputs`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_named_outputs_returns_none_when_field_absent() {
+        // Tool that doesn't emit named_outputs should parse cleanly to None
+        // so existing spawn_only callers stay byte-identical.
+        let envelope = json!({"success": true, "output": "ok"});
+        let parsed = parse_named_outputs(envelope.get("named_outputs")).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_named_outputs_returns_none_when_field_is_null() {
+        let envelope = json!({"named_outputs": null});
+        let parsed = parse_named_outputs(envelope.get("named_outputs")).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_named_outputs_returns_none_when_object_is_empty() {
+        let envelope = json!({"named_outputs": {}});
+        let parsed = parse_named_outputs(envelope.get("named_outputs")).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_named_outputs_maps_string_values() {
+        let envelope = json!({
+            "named_outputs": {
+                "deploy_url": "https://example.com/site",
+                "repo": "octos/site",
+            }
+        });
+        let parsed = parse_named_outputs(envelope.get("named_outputs"))
+            .unwrap()
+            .expect("expected Some(map)");
+        assert_eq!(
+            parsed.get("deploy_url").map(String::as_str),
+            Some("https://example.com/site")
+        );
+        assert_eq!(parsed.get("repo").map(String::as_str), Some("octos/site"));
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_non_object_payload() {
+        let envelope = json!({"named_outputs": ["a", "b"]});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("must be a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_non_string_value() {
+        // v1: nested JSON not supported. Numbers, bools, arrays, objects
+        // must surface as errors so the contract layer sees a typed
+        // failure rather than silently dropping the field.
+        let envelope = json!({
+            "named_outputs": {"deploy_count": 42}
+        });
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(err.contains("deploy_count"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_key_starting_with_digit() {
+        let envelope = json!({"named_outputs": {"1deploy": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_uppercase_key() {
+        let envelope = json!({"named_outputs": {"DeployUrl": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_key_with_hyphen() {
+        let envelope = json!({"named_outputs": {"deploy-url": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_rejects_empty_key() {
+        let envelope = json!({"named_outputs": {"": "x"}});
+        let err = parse_named_outputs(envelope.get("named_outputs")).unwrap_err();
+        assert!(err.contains("required shape"), "{err}");
+    }
+
+    #[test]
+    fn parse_named_outputs_accepts_underscore_and_digits_after_first_char() {
+        let envelope = json!({"named_outputs": {"deploy_url_v2": "x", "out1": "y"}});
+        let parsed = parse_named_outputs(envelope.get("named_outputs"))
+            .unwrap()
+            .expect("expected map");
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_with_named_outputs_threads_field_into_tool_result() {
+        // End-to-end: plugin emits {"named_outputs": {...}} on stdout, the
+        // PluginTool wrapper forwards it through ToolResult so the
+        // spawn_only contract path can read it.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"success\":true,\"output\":\"deployed\",\"named_outputs\":{\"deploy_url\":\"http://example.com/site\"}}'\n",
+        );
+
+        let def = make_tool_def("publish_tool", "publish");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("execute should ok");
+        assert!(result.success);
+        assert_eq!(result.output, "deployed");
+        let named = result.named_outputs.expect("named_outputs should be set");
+        assert_eq!(
+            named.get("deploy_url").map(String::as_str),
+            Some("http://example.com/site")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_with_malformed_named_outputs_returns_failure() {
+        // A plugin emitting a non-string value in named_outputs must
+        // surface as a typed failure so the contract layer rejects it.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"success\":true,\"output\":\"ok\",\"named_outputs\":{\"count\":42}}'\n",
+        );
+
+        let def = make_tool_def("bad_tool", "emits bad named outputs");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("execute should ok");
+        assert!(!result.success);
+        assert!(
+            result.output.contains("named_outputs") || result.output.contains("must be a string"),
+            "unexpected output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_without_named_outputs_leaves_tool_result_none() {
+        // Backward compat: legacy plugins that don't emit named_outputs
+        // must continue to produce ToolResult.named_outputs = None.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho '{\"success\":true,\"output\":\"done\"}'\n",
+        );
+
+        let def = make_tool_def("legacy_tool", "legacy");
+        let tool =
+            PluginTool::new("p".into(), def, script_path).with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("execute should ok");
+        assert!(result.success);
+        assert!(result.named_outputs.is_none());
     }
 }

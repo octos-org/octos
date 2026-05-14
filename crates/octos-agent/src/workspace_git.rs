@@ -733,7 +733,12 @@ fn latest_validator_outcomes(project_root: &Path, declared: &[Validator]) -> Vec
 
 fn required_validators_satisfied(declared: &[Validator], outcomes: &[ValidatorOutcome]) -> bool {
     for validator in declared {
-        if !validator.required {
+        // Only hard-required validators (`required = true` AND `soft_fail =
+        // false`) block readiness — soft-fail validators surface warnings
+        // through the ledger but never demote the contract gate, matching
+        // `run_declared_validators`' filter at
+        // `workspace_contract.rs::run_declared_validators`.
+        if !validator.tier().is_hard() {
             continue;
         }
         let outcome = outcomes

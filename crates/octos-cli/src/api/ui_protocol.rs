@@ -6942,7 +6942,14 @@ async fn run_standalone_turn(
         session_id: Some(session_id.0.clone()),
         turn_id: Some(turn_id.0.to_string()),
     };
+    // Wave-4c (#945): feed turn-end latency into the AdaptiveRouter's
+    // per-session auto-escalation state machine so the web/serve path
+    // benefits from the same Lane → Hedge auto-flip the gateway has had
+    // since FA-11.
+    let auto_escalation_router = session_runtime.profile.adaptive_router.clone();
+    let auto_escalation_session_id = session_id.0.clone();
     let agent_task = tokio::spawn(async move {
+        let start = std::time::Instant::now();
         let result = octos_llm::with_router_context(
             router_ctx,
             octos_agent::tools::TOOL_APPROVAL_CTX.scope(
@@ -6951,6 +6958,15 @@ async fn run_standalone_turn(
             ),
         )
         .await;
+        let llm_latency = start.elapsed();
+
+        // Drive the router's auto-escalation. We pass the raw session id
+        // (with `api:` prefix preserved) so concurrent gateway + serve
+        // accesses on the same router are namespaced separately and do
+        // not collide on the per-session window.
+        if let Some(router) = auto_escalation_router.as_ref() {
+            router.record_turn_latency(&auto_escalation_session_id, llm_latency);
+        }
 
         match result {
             Ok(response) => {
