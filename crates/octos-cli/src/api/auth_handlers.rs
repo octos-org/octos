@@ -1167,8 +1167,25 @@ pub(super) async fn my_content(
         StatusCode::SERVICE_UNAVAILABLE,
         "content catalog not configured".into(),
     ))?;
-    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity
+    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity.
+    //
+    // Codex P1 fix (PR #958 review): authorize the X-Profile-Id branch the
+    // same way the host-scoped path does. Without `is_authorized_for_profile`
+    // a bearer-authenticated user could pass any tenant id and read its
+    // catalog, since the bearer auth completes before the middleware's
+    // loopback-only X-Profile-Id check runs. The new check matches the
+    // semantics enforced by `resolve_my_profile_id`'s host-scoped branch:
+    // admin can target any tenant, users can target their own profile or
+    // sub-accounts they own. Cross-tenant access returns 403.
     let profile = if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+        if !is_authorized_for_profile(&state, &identity, pid) {
+            tracing::warn!(
+                identity = ?identity,
+                requested_profile = %pid,
+                "GET /api/my/content X-Profile-Id denied — identity not authorized for the profile"
+            );
+            return Err((StatusCode::FORBIDDEN, "forbidden".into()));
+        }
         ps.get(pid)
             .map_err(|_| {
                 (
@@ -1933,6 +1950,11 @@ pub async fn stop_my_sub_gateway(
 ///
 /// Authorization rules:
 /// - Admin token can act as any profile.
+/// - A user session with `UserRole::Admin` can act as any profile
+///   (matches the rest of the router which treats admin email sessions
+///   as full admins for `/api/admin/*`). Without this carve-out, an
+///   admin who logs in via OTP would 403 on tenant subdomains while
+///   the bootstrap admin token would not — codex P2 (PR #958 review).
 /// - A user can act as their own profile.
 /// - A user (top-level account) can also act as any sub-account they own.
 /// - Everyone else is denied (returns `false`).
@@ -1943,6 +1965,10 @@ pub(crate) fn is_authorized_for_profile(
 ) -> bool {
     match identity {
         AuthIdentity::Admin => true,
+        AuthIdentity::User {
+            role: UserRole::Admin,
+            ..
+        } => true,
         AuthIdentity::User { id, .. } => {
             if id == profile_id {
                 return true;
@@ -2524,6 +2550,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, "tenant-b");
+    }
+
+    #[test]
+    fn host_scope_admin_role_user_can_access_any_tenant() {
+        // Codex P2 (PR #958 review): an admin email-session
+        // (UserRole::Admin) must have the same cross-tenant scope as a
+        // bootstrap admin token. Otherwise an admin who logs in via OTP
+        // would 403 on tenant subdomains while the bootstrap token
+        // would not — inconsistent and breaks the day-to-day admin
+        // workflow.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut tenant_b = make_user_profile("tenant-b", "Tenant B");
+        tenant_b.public_subdomain = Some("tenantb".into());
+        profile_store.save(&tenant_b).unwrap();
+
+        let identity = AuthIdentity::User {
+            id: "admin-user".into(),
+            role: UserRole::Admin,
+        };
+        let result = resolve_my_profile_id(
+            &identity,
+            &profile_store,
+            &state,
+            &scoped_host_headers("tenantb.example.test"),
+        )
+        .unwrap();
+        assert_eq!(result, "tenant-b");
+    }
+
+    #[test]
+    fn is_authorized_for_profile_table() {
+        // The shared auth helper is consumed by both the host-scoped
+        // path AND the X-Profile-Id branch in `my_content` (codex P1
+        // fix). Lock the truth-table down with a focused unit test.
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--child", "Child");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+        profile_store
+            .save(&make_user_profile("other", "Other"))
+            .unwrap();
+
+        // Admin token: yes to everything.
+        assert!(is_authorized_for_profile(
+            &state,
+            &AuthIdentity::Admin,
+            "tenant"
+        ));
+        assert!(is_authorized_for_profile(
+            &state,
+            &AuthIdentity::Admin,
+            "other"
+        ));
+
+        // Admin role (OTP-authenticated admin user): yes to everything.
+        let admin_user = AuthIdentity::User {
+            id: "any-admin".into(),
+            role: UserRole::Admin,
+        };
+        assert!(is_authorized_for_profile(&state, &admin_user, "tenant"));
+        assert!(is_authorized_for_profile(&state, &admin_user, "other"));
+
+        // Regular user: own profile yes.
+        let tenant_user = AuthIdentity::User {
+            id: "tenant".into(),
+            role: UserRole::User,
+        };
+        assert!(is_authorized_for_profile(&state, &tenant_user, "tenant"));
+        // Sub-account they own: yes.
+        assert!(is_authorized_for_profile(
+            &state,
+            &tenant_user,
+            "tenant--child"
+        ));
+        // A different tenant: no.
+        assert!(!is_authorized_for_profile(&state, &tenant_user, "other"));
+        // A non-existent profile: no.
+        assert!(!is_authorized_for_profile(&state, &tenant_user, "ghost"));
     }
 
     #[test]

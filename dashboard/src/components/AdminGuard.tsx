@@ -1,17 +1,31 @@
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { Navigate, useParams } from 'react-router-dom'
 
 import { myApi } from '../api'
 import { useAuth } from '../contexts/AuthContext'
 
 export default function AdminGuard({ children }: { children: React.ReactNode }) {
-  const { isAdmin, user } = useAuth()
+  const { isAdmin, scopedProfile, user } = useAuth()
   const { id } = useParams<{ id: string }>()
   const [loading, setLoading] = useState(false)
   const [allowed, setAllowed] = useState(false)
 
+  // Codex P2 (PR #958 review): an admin session running on a tenant
+  // subdomain (host-scoped) must not see admin-global pages. Send them
+  // back to `/my` so they land on the tenant profile chrome instead of
+  // a global page that doesn't make sense in scope.
+  const isScopedAdmin = isAdmin && !!scopedProfile
+
   useEffect(() => {
     let cancelled = false
+
+    if (isScopedAdmin) {
+      setAllowed(false)
+      setLoading(false)
+      return () => {
+        cancelled = true
+      }
+    }
 
     if (isAdmin) {
       setAllowed(true)
@@ -60,7 +74,11 @@ export default function AdminGuard({ children }: { children: React.ReactNode }) 
     return () => {
       cancelled = true
     }
-  }, [id, isAdmin, user])
+  }, [id, isAdmin, isScopedAdmin, user])
+
+  if (isScopedAdmin) {
+    return <Navigate to="/my" replace />
+  }
 
   if (loading) {
     return (

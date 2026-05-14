@@ -64,12 +64,21 @@ function normalizeProfileConfig(config: ProfileConfig): ProfileConfig {
 
 export function ProfileProvider({ children }: Props) {
   const { id } = useParams<{ id: string }>()
-  const { user, isAdmin } = useAuth()
+  const { user, isAdmin, scopedProfile } = useAuth()
   const { toast } = useToast()
 
-  // Determine if viewing own profile
+  // Determine if viewing own profile.
+  //
+  // Codex P2 (PR #958 review): when the dashboard is loaded on a tenant
+  // subdomain the server's host-authoritative scoping makes
+  // `/api/my/*` operate on that tenant — not on `user.id`. Use the
+  // scoped profile id so downstream consumers (provider model lookups,
+  // search API key tests, public-subdomain previews) target the
+  // tenant. The actual profile id is also re-confirmed from the
+  // server's response in `loadProfile` below.
   const isOwn = !id
-  const profileId = id || user?.id || ''
+  const initialProfileId =
+    id ?? (isOwn ? scopedProfile?.id ?? user?.id ?? '' : user?.id ?? '')
 
   const [config, setConfig] = useState<ProfileConfig>(defaultConfig)
   const [status, setStatus] = useState<ProcessStatus | null>(null)
@@ -78,8 +87,13 @@ export function ProfileProvider({ children }: Props) {
   const [publicSubdomain, setPublicSubdomain] = useState('')
   const [enabled, setEnabled] = useState(true)
   const [parentId, setParentId] = useState<string | null>(null)
+  const [resolvedProfileId, setResolvedProfileId] = useState<string>(initialProfileId)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+
+  // The exposed `profileId` falls back to the most authoritative source
+  // available: the server's response > scoped tenant id > user id.
+  const profileId = resolvedProfileId || initialProfileId
 
   // API adapter: own profile uses myApi, admin uses api with profileId
   const adapter = useMemo(() => {
@@ -129,6 +143,12 @@ export function ProfileProvider({ children }: Props) {
       setPublicSubdomain(profile.public_subdomain || profile.id)
       setEnabled(profile.enabled)
       setParentId(profile.parent_id || null)
+      // Codex P2 (PR #958 review): the server's host-authoritative
+      // scoping may have re-mapped `/my` to a tenant profile. Trust
+      // the id returned by the server so downstream consumers
+      // (profile_id query params, public-subdomain preview, sub-account
+      // listing) operate on the right profile.
+      setResolvedProfileId(profile.id)
     } catch (e: any) {
       toast(e.message, 'error')
     } finally {
