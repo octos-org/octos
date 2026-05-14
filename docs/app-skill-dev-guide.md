@@ -102,11 +102,11 @@ The manifest declares what tools the skill provides. The LLM reads this to decid
 | `description` | No | — | Human-readable description |
 | `timeout_secs` | No | 30 | Max execution time per tool call (1-600) |
 | `requires_network` | No | false | Informational flag |
-| `sha256` | No | — | Binary integrity check (hex hash). TOCTOU-safe: verified copy written to `.{name}_verified` |
+| `sha256` | Strongly recommended for production fleets | — | Binary integrity check (hex hash). Required when the host has `plugins.require_signed = true` — plugins missing it are rejected at load time. TOCTOU-safe: verified copy written to `.{name}_verified` (`plugins/loader.rs:283-491`). Compute via `shasum -a 256 main`. |
 | `protocol_version` | No | 1 | `1` = stdin/stdout JSON only (default). `2` = also emit structured events on stderr. See [Plugin Protocol v2](#plugin-protocol-v2). |
 | `synthesis_config` | No | — | v2 only: declare a synthesis LLM call so the host injects provider/model + env keys |
 | `x-octos-host-config-keys` | No | `[]` | v2 only: env keys the host should forward into the skill (e.g. provider API keys for synthesis) |
-| `tools` | No | `[]` | Array of tool definitions. Each may set `spawn_only: true` to be auto-routed to background execution by `agent/execution.rs` |
+| `tools` | No | `[]` | Array of tool definitions. Each may set `spawn_only: true` to be auto-routed to background execution by `agent/execution.rs`. Spawn-only tools may emit a `named_outputs` map — see [Part 7: Workspace Contract](#part-7-workspace-contract). |
 | `mcp_servers` | No | `[]` | MCP server declarations |
 | `hooks` | No | `[]` | Lifecycle hook definitions |
 | `prompts` | No | — | Prompt fragment config |
@@ -577,18 +577,27 @@ GET  /api/admin/profiles/alice/skills
 DELETE /api/admin/profiles/alice/skills/my-skill
 ```
 
+### Fleet Deploy
+
+For multi-host fleets, use `scripts/fleet-install-skills.sh` (PR #939) — it replaces the legacy `mofa-skills/scripts/deploy-mini.sh` `scp` flow. The new script rsyncs each skill to a staging path on every host and then runs `octos skills install <staging-path>` server-side so the manifest's sha256 verification runs inside the same code path the runtime uses.
+
+See [`docs/SKILL_DEPLOYMENT.md`](./SKILL_DEPLOYMENT.md) for the operator-side runbook (CLI flags, env overrides, migration from legacy `~/.octos/skills/`, verification commands).
+
 ### Sideloading (Manual Install)
 
 Copy a skill directory directly — like sideloading an app:
 
 ```bash
-# Copy to global skills directory
+# Canonical: per-profile install
+cp -r my-skill/ ~/.octos/profiles/alice/data/skills/my-skill/
+chmod +x ~/.octos/profiles/alice/data/skills/my-skill/main
+
+# Legacy (deprecated): global skills directory — loader emits a warning
 cp -r my-skill/ ~/.octos/skills/my-skill/
 chmod +x ~/.octos/skills/my-skill/main
-
-# Or to a profile-specific directory
-cp -r my-skill/ ~/.octos/profiles/alice/data/skills/my-skill/
 ```
+
+The global `~/.octos/skills/` directory is being retired (PR #944). New deployments should write directly to the per-profile path.
 
 ### Installed Skill Layout
 
@@ -614,14 +623,16 @@ The `.source` file tracks where the skill was installed from:
 
 ### Skill Loading Priority
 
-When multiple directories contain a skill with the same name, first match wins:
+Loading dedupes by `manifest.id` — the **first** directory scanned that contains a given plugin id wins (`plugins/loader.rs:137-156`, PR #936). Later directories carrying the same id are silently ignored, even if the on-disk plugin is fresher.
 
 | Priority | Location | Source |
 |----------|----------|--------|
-| 1 (highest) | `<profile-data>/skills/` | Per-profile install |
-| 2 | `<project-dir>/skills/` | Project-local |
+| 1 (highest) | `~/.octos/profiles/<profile>/data/skills/` | **Canonical** per-profile install (`octos skills install --profile <p>`; `fleet-install-skills.sh`) |
+| 2 | `<project-dir>/skills/` | Project-local (development checkouts) |
 | 3 | `<project-dir>/bundled-app-skills/` | Bundled app-skills (constant `BUNDLED_APP_SKILLS_DIR` in `octos-agent/src/bootstrap.rs`; scanned by `Config::plugin_dirs_from_project`) |
-| 4 (lowest) | `~/.octos/skills/` | Global install |
+| 4 (lowest, **deprecated**) | `~/.octos/skills/` | Legacy global install — the loader emits a deprecation warning on every startup that sees this directory. See [Part 5: Install](#part-5-install) and [`docs/SKILL_DEPLOYMENT.md`](./SKILL_DEPLOYMENT.md) for the per-profile-only migration (PR #944). |
+
+**Lesson from the fleet (2026):** before PR #936 the loader registered duplicate ids twice and `ToolRegistry::register` overwrote by tool name — so a stale per-profile install could silently shadow a freshly-deployed global skill, and vice versa. Two production regressions (yangmi, douwentao) traced back to this trap before the dedup landed. On fleet upgrades, update **both** `~/.octos/skills/<x>/` *and* `<profile>/data/skills/<x>/` in lock-step until the global directory is removed.
 
 ---
 
@@ -655,6 +666,294 @@ cp target/release/my_skill ~/.octos/skills/my-skill/main
 ```
 
 > **Note:** If you change `SKILL.md` or `manifest.json` for a *bundled* skill, you must rebuild the `octos` binary too (they're embedded via `include_str!`). External skills reload immediately.
+
+---
+
+## Part 7: Workspace Contract
+
+A skill that produces an artifact — a slide deck, a podcast MP3, a deployed URL, a `.diff` patch — has a **post-condition** the harness has to enforce. Historically each skill carried its own validators (silent-MP3 detection, magic-byte parsing, HTTP probes…) baked into its binary. This was the wrong layer: the contract is a property of the *task*, not of the skill's source code, and skills cannot be trusted to validate themselves.
+
+As of 2026-05-13 the harness owns every post-condition through the **workspace_policy / workspace_contract** layer. Skills emit artifacts and structured outputs; the harness asserts the contract. Skill authors should **not** write their own validators.
+
+> See [`docs/audits/HARNESS_CONTRACT_AUDIT_2026-05-13.md`](./audits/HARNESS_CONTRACT_AUDIT_2026-05-13.md) for the full audit of the previous skill-internal contracts and the canonical replacements. The five-layer model below is the architecture the audit prescribes.
+
+### The five-layer model
+
+1. **Contract in the harness** — `WorkspacePolicy::for_session()` / `for_coding()` / per-workspace `.octos-workspace.toml`. The validators that fire post-task are declared here, not in skill code.
+2. **`named_outputs`** — spawn-only tools emit a structured `{key: value}` envelope on stdout the harness reads into `${output.X}` template references (PR #941).
+3. **Per-profile install** — every customer skill lives at `<profile>/data/skills/`; no global shadow trap (PR #944).
+4. **sha256-bound binary** — manifest's top-level `sha256` is hashed at install AND re-hashed at exec to close the load→exec TOCTOU window (`plugins/tool.rs:920-970`).
+5. **Verify-at-merge + verify-at-deploy** — `fleet-install-skills.sh` routes through `octos skills install`, which re-verifies sha256 against the manifest before copying.
+
+### The spawn-only output envelope
+
+When a tool's manifest declares `"spawn_only": true`, the agent execution loop intercepts the call, runs it as a background task, and reads a JSON envelope from the binary's stdout:
+
+```json
+{
+  "success": true,
+  "output": "Deployed to https://example.com",
+  "files_to_send": ["/abs/path/to/artifact.pptx"],
+  "named_outputs": {
+    "deploy_url": "https://example.com",
+    "repo": "owner/name"
+  }
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `success` | Yes | Boolean — false demotes the spawn task to Failed before the contract gate runs. |
+| `output` | Yes | Free-form string surfaced to the LLM in the next turn. |
+| `files_to_send` | No | Absolute paths the harness should treat as deliverables. Bound to the workspace's `artifacts.*` declarations (`workspace_contract.rs:244-272`). |
+| `named_outputs` | No | Optional map of structured outputs the harness can interpolate into validators via `${output.<key>}`. PR #941. |
+
+**`named_outputs` shape (v1):**
+
+- Keys must match `[a-z][a-z0-9_]*` (rejected at parse time — `plugins/tool.rs:697-707`).
+- Values must be **strings**. Nested JSON / arrays / numbers are not supported in v1.
+- The whole field is optional; absent / `null` / `{}` all deserialize to "no outputs".
+- A malformed envelope (non-object payload, non-string value, key shape violation) is rejected with `success: false` and a descriptive reason — see `plugins/tool.rs:1331-1357`.
+
+Emitting from a Rust spawn-only skill:
+
+```rust
+println!(
+    "{}",
+    serde_json::json!({
+        "success": true,
+        "output": format!("Deployed to {url}"),
+        "files_to_send": [],
+        "named_outputs": {
+            "deploy_url": url,
+            "repo": repo_slug,
+        }
+    })
+);
+```
+
+> No helper exists in `octos-plugin` today — emit the envelope directly. A typed `SpawnOnlyResult` helper is on the open list.
+
+### Anatomy of a validator
+
+Every workspace-contract validator is a `Validator` struct (`crates/octos-agent/src/workspace_policy.rs:142-167`):
+
+```rust
+pub struct Validator {
+    pub id: String,                 // Stable identifier, unique within the list.
+    pub required: bool,             // default true — Hard tier blocks terminal success.
+    pub soft_fail: bool,            // default false — Soft tier warns without demoting.
+    pub timeout_ms: Option<u64>,    // Optional per-validator timeout.
+    pub phase: ValidatorPhaseKind,  // TurnEnd | Completion (default).
+    pub spec: ValidatorSpec,        // The typed body — see below.
+}
+```
+
+**Gate tier** (`Validator::tier()` at `workspace_policy.rs:182-191`, PR #943):
+
+| `required` | `soft_fail` | Tier | Behaviour on failure |
+|------------|-------------|--------|------------------|
+| `true` | `false` | `Hard` | Demote spawn task to `Failed`. Default. |
+| `true` | `true` | `Soft` | Warn + persist to ledger; do **not** demote. |
+| `false` | `false` | `None` | Informational only. |
+| `false` | `true` | `Soft` | Same as `true`/`true`. |
+
+Soft-fail is the canonical way to express partial-artifact contracts: "the primary report is hard-required, the sub-artifacts are nice-to-have." `Validator::tier()` collapses both fields into the operator-visible label that surfaces in metrics + the ledger.
+
+### ValidatorSpec variants
+
+Every `ValidatorSpec` variant currently merged. Source: `crates/octos-agent/src/workspace_policy.rs:263-357`.
+
+| Variant | Serde shape | Interpolation | One-line use |
+|---------|-------------|---------------|--------------|
+| `Command { cmd, args }` | `{kind: "command", cmd, args}` | none | Run a subprocess (dispatched via the shell-safety layer + `BLOCKED_ENV_VARS`). |
+| `ToolCall { tool, args }` | `{kind: "tool_call", tool, args}` | none | Invoke a registered agent tool. Status follows the tool's `ToolResult.success`. |
+| `FileExists { path, min_bytes? }` | `{kind: "file_exists", path, min_bytes}` | `${args.X}` (percent-encoded for the single-filename segment use case) + `${output.X}` (verbatim) | Assert a file exists (and optionally meets a min byte count). |
+| `HttpProbe { url_template, expected_status?, expected_contains? }` | `{kind: "http_probe", url_template, expected_status, expected_contains}` | `${args.X}` (percent-encoded) + `${output.X}` (verbatim) | Single-shot GET → status + optional body substring. PR #935. |
+| `OminixVoiceExists { name_arg }` | `{kind: "ominix_voice_exists", name_arg}` | `name_arg` looked up in input args | Specialised probe of `${OMINIX_API_URL}/v1/voices` asserting the named voice is registered. PR #935. |
+| `AudioNonSilent { glob, min_ratio? }` | `{kind: "audio_non_silent", glob, min_ratio}` | none (glob is literal) | Decode WAV (or MP3 with the `audio_mp3` feature) and assert at least `min_ratio` of samples are non-silent across the whole file. PR #935. |
+| `MagicBytes { glob, format }` | `{kind: "magic_bytes", glob, format}` | none | Assert each file matching `glob` starts with the magic-byte prefix for `format`. Catches "wrote an HTML error page in place of an MP3" failures. PR #935. Supported formats: `mp3`, `wav`, `png`, `jpeg`, `pdf`, `mp4`, `web_m`, `pptx` (three ZIP signatures). |
+| `HttpProbeUntil { url_template, expected_status?, expected_contains?, poll_interval_ms?, deadline_ms? }` | `{kind: "http_probe_until", ...}` | same as `HttpProbe` | Polling HTTP probe; closes silent-failure paths for asynchronous external operations (training a voice, deploying a site). Default 2s interval / 30s deadline. PR #943. |
+| `Sha256Match { glob, sha256 }` | `{kind: "sha256_match", glob, sha256}` | `${args.X}` for both fields | Assert a single file's SHA-256 digest matches. Accepts either an explicit hex digest or an interpolated arg (e.g. the manifest's `sha256` captured at install). PR #943. |
+
+**`AudioNonSilent` is whole-file only** — a per-segment variant (`PerFileNonSilent`) is on the open list; it is **not yet merged**. For per-segment silence guarantees today, gate the artifact via a `MagicBytes` + `AudioNonSilent` pair and accept that mid-clip silence can pass.
+
+### Interpolation: `${args.X}` vs `${output.X}`
+
+Both reference forms are resolved by `interpolate_template` (`validators.rs:1642-1682`):
+
+| Reference | Source | Encoding | Missing-key behaviour |
+|-----------|--------|----------|-----------------------|
+| `${args.X}` | The spawn task's input args (LLM-controlled) | **Percent-encoded** for URL/filename-segment safety in `HttpProbe`/`HttpProbeUntil`/`FileExists`/`OminixVoiceExists`/`Sha256Match` | Typed `Error` outcome surfaces in the ledger; no silent pass. |
+| `${output.X}` | The spawn-only tool's `named_outputs` envelope | **Verbatim** — values are tool-controlled and already trusted | Typed `Error` outcome surfaces in the ledger; no silent pass. |
+
+The trust-boundary distinction is load-bearing: `args` come from the LLM (untrusted, must be sanitised), `outputs` come from the spawn-only binary the harness already exec'd through a sha256 gate (trusted to escape itself).
+
+For glob-pattern templates (`MagicBytes.glob`, `AudioNonSilent.glob`, `Sha256Match.glob`) interpolation uses `interpolate_args_path` (`validators.rs:1695-1733`) which keeps `/` separators but rejects `..` segments and absolute paths — so an LLM-controlled arg cannot escape the workspace root.
+
+### Per-spawn-task validators
+
+`WorkspaceSpawnTaskPolicy.on_completion` (PR #935, lifted in #938 + #941 + #943) lets you attach validators to a specific spawn task. Both a bare `ValidatorSpec` table and a full `Validator` struct are accepted (`SpawnTaskValidatorSpec` is a serde `untagged` enum, `workspace_policy.rs:565-592`). Bare specs are auto-tagged as `required + Completion + synthetic id`.
+
+`WorkspaceSpawnTaskPolicy.on_verify` (existing) takes the legacy shorthand strings (`file_exists:$artifact`, `file_size_min:$artifact:1024`). New contracts should use `on_completion` with typed validators.
+
+### Workspace-level validators
+
+`ValidationPolicy.validators: Vec<Validator>` (`workspace_policy.rs:127`) runs once per `phase` (`TurnEnd` or `Completion`) regardless of which task fired. Use this for workspace-wide guarantees (e.g. "after every turn, run `cargo check`").
+
+### Where to declare the contract
+
+**Option A — Harness-owned (canonical).** Add to `WorkspacePolicy::for_session()` in `crates/octos-agent/src/workspace_policy.rs`. Worked example, an imaginary `mofa_widget` skill:
+
+```rust
+let mofa_widget_contract = WorkspaceSpawnTaskPolicy {
+    artifact: None,
+    artifacts: Vec::new(),
+    on_verify: Vec::new(),
+    on_complete: vec![],
+    on_deliver: vec![],
+    on_failure: vec!["notify_user:Widget render failed".into()],
+    on_completion: vec![
+        // Hard: the widget file must land where the skill claims it did.
+        SpawnTaskValidatorSpec::Bare(ValidatorSpec::FileExists {
+            path: "${args.out}".into(),
+            min_bytes: Some(1024),
+        }),
+        // Hard: bytes must actually be a PNG (catches HTML-error-page failures).
+        SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+            glob: "**/*.png".into(),
+            format: MagicByteKind::Png,
+        }),
+        // Soft: a thumbnail is nice to have but absence shouldn't fail the task.
+        SpawnTaskValidatorSpec::Full(Validator {
+            id: "mofa_widget.thumbnail_warn".into(),
+            required: true,
+            soft_fail: true,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::FileExists {
+                path: "${args.out}.thumb.png".into(),
+                min_bytes: None,
+            },
+        }),
+    ],
+};
+// ...
+spawn_tasks.insert("mofa_widget".into(), mofa_widget_contract);
+```
+
+**Option B — Per-workspace TOML override.** Each session can ship a `.octos-workspace.toml` next to the working directory that overrides the defaults. The serde schema is the same as the `WorkspacePolicy` struct. Example:
+
+```toml
+schema_version = 1
+
+[workspace]
+kind = "session"
+
+[validation]
+on_turn_end = []
+on_completion = []
+
+[[validation.validators]]
+id = "fm_voice_registered"
+required = true
+phase = "completion"
+kind = "ominix_voice_exists"
+name_arg = "name"
+
+[spawn_tasks.mofa_widget]
+artifact = "primary"
+
+[[spawn_tasks.mofa_widget.on_completion]]
+kind = "file_exists"
+path = "${args.out}"
+min_bytes = 1024
+```
+
+> **The harness is authoritative.** Per audit section 7, skills MUST NOT declare a canonical `workspace_contract` block in their own `manifest.json`. The historical "Documentation-only" block at `mofa-fm/manifest.json:125-149` is exactly the anti-pattern that broke this layer. If a skill wants to *suggest* a validator the operator should opt in to, do it in `SKILL.md` prose — never as a hand-written contract block the loader could be tempted to consume.
+
+### Auto-fire on EndTurn
+
+PR #940 + the loop wiring in `agent/loop_runner.rs:1435-1480` make `check_workspace_contract` fire automatically when the agent signals `EndTurn`. If `inspect_workspace_contracts(workspace_root)` reports `ready == false`, the task is demoted from `Success` to a typed `ContractFailed`. The LLM no longer has to remember to call the inspector tool — the harness drives the gate.
+
+### Lifecycle phases
+
+- `TurnEnd` — runs after every turn. Cheap checks only.
+- `Completion` — runs once when the task signals it's done. Expensive checks (file decoding, HTTP probes) live here.
+- `Preflight` and `AfterTool` — **proposed in the audit (Gap-1, Gap-10), not yet merged**. The `Coding` workspace kind (PR #940) ships `cargo check` / `eslint` / `ruff` defaults via the **hook system** instead — see [Part 8: Hook System](#part-8-hook-system) below — so the audit's `AfterTool` gap is closed in practice even though `ValidatorPhaseKind` is still `TurnEnd | Completion`.
+
+---
+
+## Part 8: Hook System
+
+Hooks intersect with skill authoring because a skill can declare them in its manifest, and the host merges per-skill hooks with operator hooks at runtime. The two skill-author-relevant features that landed in PR #940:
+
+### `path_filter`
+
+Each `HookConfig` can declare `path_filter: Vec<String>` of glob patterns matched against the tool's `args.path` (`hooks.rs:46-78`, glob compilation at `hooks.rs:920-948`). The hook is skipped when:
+
+- `path_filter` is non-empty AND
+- the tool's args either have no `path` field or the value matches no pattern.
+
+This is how `cargo check` only fires on `.rs` edits without re-running on every `write_file` to a Markdown file.
+
+### `requires_bin`
+
+Optional `requires_bin: Option<String>` — when the named binary is not on `PATH` the hook is silently skipped. Lets operators ship a hook list that gracefully degrades on hosts without `eslint` or `ruff` installed.
+
+### `WorkspacePolicyKind::Coding` defaults
+
+When the cwd contains `Cargo.toml` / `package.json` / `pyproject.toml`, `detect_workspace_policy_kind()` (`workspace_policy.rs:1142-1151`) returns `Coding` and the host merges `coding_default_hooks()` (`workspace_policy.rs:1170-1212`) into its `HookExecutor`:
+
+| Tool | Path filter | Command | `requires_bin` |
+|------|-------------|---------|----------------|
+| `edit_file` / `write_file` / `diff_edit` | `**/*.rs` | `cargo check --message-format=short` | `cargo` |
+| same | `**/*.{js,ts,tsx,jsx}` | `eslint --max-warnings 0` | `eslint` |
+| same | `**/*.py` | `ruff check` | `ruff` |
+
+Operator-defined hooks always merge **after** these defaults so a stricter project-local hook is always invoked too (both fire).
+
+---
+
+## Part 9: Migration Notes — Existing Skills
+
+For skill authors with existing skills, here's what to align with as of 2026-05-13:
+
+### Action items
+
+- [ ] **Add `sha256` to `manifest.json`** — compute via `shasum -a 256 main` and commit. Required if any fleet host enables `plugins.require_signed = true`.
+- [ ] **Remove any skill-internal contract block.** The historical pattern of declaring a `workspace_contract` field inside `manifest.json` (used by mofa-fm pre-2026-05-13) is unsupported. The agent-side manifest type does not parse such a field — it was always documentation-only — and the canonical equivalent lives in `WorkspacePolicy::for_session()` or a `.octos-workspace.toml` override.
+- [ ] **Strip skill-internal validators from skill source code.** If your skill currently runs its own post-condition (silent-MP3 detector, HTTP probe of a remote API, magic-byte parse), move it onto the canonical `ValidatorSpec` path. Concrete examples — these are the ad-hoc patterns being retired (audit section 3):
+  - `assert_voice_registered` / `fetch_registered_voices` (mofa-fm) → replace with `ValidatorSpec::OminixVoiceExists`.
+  - `has_meaningful_tts_audio` / `parse_wav_metadata` (mofa-podcast) → replace with `ValidatorSpec::AudioNonSilent` + `ValidatorSpec::MagicBytes`.
+  - `poll_training_status` (mofa-fm) → replace with `ValidatorSpec::HttpProbeUntil`.
+- [ ] **For spawn-only artifact-producers, emit `named_outputs` where the harness needs to validate the output.** e.g. a `mofa_publish`-style skill must emit `{ "deploy_url": "..." }` so the harness's `HttpProbe { url_template = "${output.deploy_url}" }` can probe the live URL.
+- [ ] **Move to per-profile install.** Stop writing to `~/.octos/skills/`; use `octos skills install --profile <p>` or the fleet script.
+- [ ] **Ship `manifest.json` `binaries.<platform>.sha256` if you publish pre-built binaries.** The installer verifies before copy.
+
+### Backward compatibility
+
+- `manifest.json` fields that still work: every documented field from Part 1 above. The agent-side parser ignores unknown top-level fields, so an old "documentation-only" `workspace_contract` block does not break loading — but the harness does not read it either, and you should remove it.
+- `spawn_only_message` on a tool entry is still supported (it's the literal string surfaced to the LLM as the tool's immediate response). It is **not** the contract result — the workspace policy's outcome is.
+- The legacy `on_verify` shorthand strings (`file_exists:$artifact`, `file_size_min:$artifact:1024`) still work; new contracts should use the typed `on_completion` validators.
+- Double-running validation (skill-internal AND canonical) during a transition is wasteful but safe — there's no `--skip-internal-validation` skill flag.
+
+---
+
+## Part 10: Reference
+
+- **Audit:** [`docs/audits/HARNESS_CONTRACT_AUDIT_2026-05-13.md`](./audits/HARNESS_CONTRACT_AUDIT_2026-05-13.md) — full per-tool table, ad-hoc patterns inventory, framework gaps.
+- **Workspace policy source:** `crates/octos-agent/src/workspace_policy.rs` — `Validator`, `ValidatorSpec`, `MagicByteKind`, `Required`, `WorkspacePolicy::for_session()`.
+- **Validator runner:** `crates/octos-agent/src/validators.rs` — `ValidatorRunner`, interpolation, HTTP probe wiring (with the shared SSRF gate from `tools/ssrf.rs`).
+- **Workspace contract enforcement:** `crates/octos-agent/src/workspace_contract.rs` — `enforce_spawn_task_contract`, `run_declared_validators`, `bind_explicit_files_to_artifacts`.
+- **Plugin loader / sha256 gates:** `crates/octos-agent/src/plugins/loader.rs:70-491`, `crates/octos-agent/src/plugins/tool.rs:104-970`.
+- **EndTurn auto-fire:** `crates/octos-agent/src/agent/loop_runner.rs:42-80, 1435-1480`.
+- **Hook config:** `crates/octos-agent/src/hooks.rs:46-78` (HookConfig), `crates/octos-agent/src/workspace_policy.rs:1142-1212` (Coding detection + defaults).
+- **Plugin SDK protocol:** [`crates/octos-plugin/docs/protocol-v2.md`](../crates/octos-plugin/docs/protocol-v2.md).
+- **Compatibility contract:** [`docs/OCTOS_HARNESS_SKILL_COMPAT.md`](./OCTOS_HARNESS_SKILL_COMPAT.md) — the productization boundary every third-party skill must uphold.
+- **Fleet deploy runbook:** [`docs/SKILL_DEPLOYMENT.md`](./SKILL_DEPLOYMENT.md).
+- **Worked examples that already conform:** the four `crates/app-skills/harness-starter-*/` templates (audio / coding / generic / report). Their manifests demonstrate `spawn_only` + `concurrency_class` and they intentionally ship without skill-internal validators.
+- **Real spawn-only contracts in production:** see `WorkspacePolicy::for_session()` entries for `fm_tts`, `podcast_generate`, `voice_synthesize`, `fm_voice_save`, `mofa_slides`, `mofa_cards`, `mofa_comic`, `mofa_infographic`, `mofa_publish`, `manage_skills`, `synthesize_research`, `deep_search` (`workspace_policy.rs:692-1087`).
 
 ---
 
@@ -930,12 +1229,21 @@ Their `SKILL.md` says "Replace with a real ... when adapting the starter." Use t
 
 - [ ] Directory has `manifest.json`, `SKILL.md`, and executable (`main` or binary)
 - [ ] `manifest.json` has valid JSON Schema for all tool inputs
+- [ ] `manifest.json` includes top-level `sha256` (required for production fleets with `plugins.require_signed = true`; compute via `shasum -a 256 main`)
+- [ ] `manifest.json` does NOT contain a self-invented `workspace_contract` block (see [Part 9](#part-9-migration-notes--existing-skills))
 - [ ] `SKILL.md` has frontmatter with trigger keywords
 - [ ] Binary reads `argv[1]` for tool name, stdin for JSON
-- [ ] Binary writes `{"output": "...", "success": true/false}` to stdout
+- [ ] Binary writes `{"output": "...", "success": true/false}` to stdout (plus `files_to_send` / `named_outputs` if applicable)
 - [ ] Error cases return `success: false` with clear messages
+- [ ] No silent-failure paths in skill code — surface as `success: false` or rely on a harness validator (don't write your own post-condition check)
+- [ ] If `spawn_only: true` and the harness needs to validate a structured output (e.g. a deploy URL), the binary emits `named_outputs` with keys matching `[a-z][a-z0-9_]*` and string values
+- [ ] Workspace contract entry exists in `WorkspacePolicy::for_session()` or `.octos-workspace.toml` (see [Part 7](#part-7-workspace-contract))
+- [ ] If the skill produces audio, the contract declares `AudioNonSilent` (whole-file) — and `PerFileNonSilent` if per-segment guarantees are needed (PerFileNonSilent is not yet merged; track in the audit doc)
 - [ ] Standalone test passes: `echo '{"param": "val"}' | ./main my_tool`
 - [ ] Gateway test passes: skill loads and agent can invoke it
+- [ ] `cargo clippy -D warnings` clean (for Rust skills)
+- [ ] If the skill publishes pre-built binaries, every `binaries.<platform>.sha256` matches the released archive
+- [ ] If the skill behavior is gated on the `api` feature (e.g. exposes via `octos serve`), the test plan includes `--features api` (M11-G lesson)
 
 ### Extras Skill (MCP / hooks / prompts)
 
