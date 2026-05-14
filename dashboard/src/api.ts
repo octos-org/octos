@@ -18,6 +18,25 @@ import type {
 
 const BASE = '/api/admin'
 
+/// Error thrown by the dashboard's request helpers when the server returns a
+/// non-2xx response. Carries the HTTP status code so callers can distinguish
+/// auth failures (401/403) from infrastructure errors (5xx) without
+/// re-parsing the message string. Use `ApiError.isAuthError(err)` for the
+/// common "auth failed, hand back to the login flow" branch.
+export class ApiError extends Error {
+  public readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message || `HTTP ${status}`)
+    this.name = 'ApiError'
+    this.status = status
+  }
+
+  static isAuthError(err: unknown): boolean {
+    return err instanceof ApiError && (err.status === 401 || err.status === 403)
+  }
+}
+
 export interface SkillRegistryPackage {
   name: string
   description: string
@@ -48,7 +67,7 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(text || `HTTP ${res.status}`)
+    throw new ApiError(res.status, text)
   }
   return res.json()
 }
@@ -60,7 +79,7 @@ async function requestNoContent(path: string, opts?: RequestInit): Promise<void>
   })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(text || `HTTP ${res.status}`)
+    throw new ApiError(res.status, text)
   }
 }
 
@@ -71,7 +90,7 @@ async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(text || `HTTP ${res.status}`)
+    throw new ApiError(res.status, text)
   }
   return res.json()
 }
@@ -83,7 +102,7 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(text || `HTTP ${res.status}`)
+    throw new ApiError(res.status, text)
   }
   return res.json()
 }
