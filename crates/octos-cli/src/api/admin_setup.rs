@@ -163,36 +163,39 @@ pub async fn post_setup_skip(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Minimum length for a freshly-rotated admin token.
+///
+/// We deliberately accept passphrases as short as 8 characters here because
+/// the dashboard's setup flow lets operators type their own password. The
+/// previous 32-char + multi-class floor was tuned for a now-removed
+/// auto-generated random secret; forcing operators to type 32 characters of
+/// gibberish hurt usability without buying much real security (the
+/// admin-token store hashes the value with Argon2id, and the dashboard is
+/// only reachable behind the operator's session/network gate). If your
+/// deployment needs a stricter policy, run the dashboard behind an
+/// authenticating proxy or rotate via the `octos admin reset-token` CLI.
+const MIN_ROTATED_TOKEN_LEN: usize = 8;
+
 fn validate_token_strength(t: &str) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    if t.len() < 32 {
+    // The login form trims the token before sending it, so accepting a
+    // token with leading/trailing whitespace would lock the operator out on
+    // their next login (server hashes the raw value, login submits the
+    // trimmed one). Reject the mismatch outright with a clear error.
+    if t.trim().len() != t.len() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 code: "weak_token",
-                message: "token must be at least 32 characters".into(),
+                message: "token must not have leading or trailing whitespace".into(),
             }),
         ));
     }
-    let mut classes = 0;
-    if t.chars().any(|c| c.is_ascii_lowercase()) {
-        classes += 1;
-    }
-    if t.chars().any(|c| c.is_ascii_uppercase()) {
-        classes += 1;
-    }
-    if t.chars().any(|c| c.is_ascii_digit()) {
-        classes += 1;
-    }
-    if t.chars().any(|c| !c.is_ascii_alphanumeric()) {
-        classes += 1;
-    }
-    if classes < 3 {
+    if t.len() < MIN_ROTATED_TOKEN_LEN {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 code: "weak_token",
-                message: "token must contain at least 3 of: lowercase, uppercase, digits, symbols"
-                    .into(),
+                message: format!("token must be at least {MIN_ROTATED_TOKEN_LEN} characters"),
             }),
         ));
     }
@@ -764,11 +767,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_token_rejects_short_token() {
+    async fn rotate_token_rejects_seven_char_token() {
+        // Floor: tokens must be at least 8 characters. Anything shorter is
+        // rejected with `weak_token`. Operator-typed passphrases are
+        // explicitly allowed at this floor — multi-class entropy is no
+        // longer required.
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_store(dir.path());
         let body = RotateBody {
-            new_token: "TooShort-1Aa".into(),
+            new_token: "1234567".into(), // 7 chars
         };
         let err = rotate_token(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -776,12 +783,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_token_rejects_low_entropy_token() {
+    async fn rotate_token_accepts_eight_char_token() {
+        // The operator opted into a typed password. 8 chars is the floor.
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_store(dir.path());
-        // 32 chars but only lowercase + digit = 2 classes
         let body = RotateBody {
-            new_token: "abcdefghijklmnopqrstuvwxyz012345".into(),
+            new_token: "password".into(), // all lowercase, 8 chars
+        };
+        let status = rotate_token(State(state.clone()), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let record = state.admin_token_store.load().unwrap().unwrap();
+        assert!(record.verify("password"));
+    }
+
+    #[tokio::test]
+    async fn rotate_token_accepts_single_class_token_at_floor() {
+        // 8-char-only single-class token is allowed: operator chose this,
+        // multi-class is no longer required.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_store(dir.path());
+        let body = RotateBody {
+            new_token: "abcdefgh".into(),
+        };
+        let status = rotate_token(State(state), Json(body)).await.unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rotate_token_rejects_surrounding_whitespace() {
+        // The login form trims the token before submit. Persisting a value
+        // with leading/trailing whitespace would lock the operator out.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_store(dir.path());
+        let body = RotateBody {
+            new_token: " password ".into(),
+        };
+        let err = rotate_token(State(state), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "weak_token");
+    }
+
+    #[tokio::test]
+    async fn rotate_token_rejects_all_whitespace_token() {
+        // 8 spaces is technically 8 chars but trims to empty — operator
+        // would be locked out on next login.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_store(dir.path());
+        let body = RotateBody {
+            new_token: "        ".into(),
         };
         let err = rotate_token(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);

@@ -8,7 +8,8 @@
     "typecheck": "tsc -b",
     "build": "tsc -b && vite build",
     "build:embedded": "VITE_BASE_PATH=/admin/ VITE_OUT_DIR=../crates/octos-cli/static/admin npm run build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "qrcode.react": "^4.2.0",
@@ -17,13 +18,18 @@
     "react-router-dom": "^7.1.0"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
     "autoprefixer": "^10.4.20",
+    "jsdom": "^29.1.1",
     "postcss": "^8.5.0",
     "tailwindcss": "^3.4.0",
     "typescript": "^5.7.0",
-    "vite": "^6.0.0"
+    "vite": "^6.0.0",
+    "vitest": "^4.1.6"
   }
 }
