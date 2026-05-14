@@ -246,9 +246,23 @@ export interface AllowlistEntry {
   last_login_at?: string | null
 }
 
+/// The active tenant scope derived from the request `Host` /
+/// `X-Forwarded-Host` header. Populated by the server's
+/// `host_scoped_profile_id` resolver. `null` when no tenant subdomain
+/// is in scope (root domain, direct IP, or localhost). The dashboard
+/// reads this from `/api/auth/me` to hide admin-global navigation
+/// while an admin is operating inside a tenant scope (Option Y,
+/// issue #315).
+export interface ScopedAuthTarget {
+  id: string
+  name: string
+  email_login_enabled: boolean
+}
+
 export interface MeResponse {
   user: User
   profile: ProfileResponse | null
+  scoped_profile?: ScopedAuthTarget | null
 }
 
 export interface BridgeQrInfo {
