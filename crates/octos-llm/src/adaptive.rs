@@ -884,6 +884,25 @@ impl AdaptiveRouter {
         });
     }
 
+    /// Wave-4 B3: synthesize and broadcast a `FailoverEvent` to all
+    /// `subscribe_failover()` listeners. Wraps the internal
+    /// `publish_failover` so out-of-band callers — gateway tests, manual
+    /// triggers, and synthetic monitoring — can drive the failover stream
+    /// without going through the chat loop.
+    ///
+    /// `#[doc(hidden)]` because the stable public API is `subscribe`;
+    /// production publishing comes from the router itself.
+    #[doc(hidden)]
+    pub fn publish_failover_for_subscribers(
+        &self,
+        from_provider: &str,
+        to_provider: &str,
+        reason: &str,
+        elapsed_ms: u64,
+    ) {
+        self.publish_failover(from_provider, to_provider, reason, elapsed_ms);
+    }
+
     /// Wave4-A: snapshot per-lane scores keyed by
     /// `"<provider_name>/<model_id>"`. Returned as a `BTreeMap` so the
     /// caller can hand it straight to the UI protocol layer without
