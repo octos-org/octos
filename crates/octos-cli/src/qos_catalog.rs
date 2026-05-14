@@ -116,18 +116,30 @@ pub(crate) fn build_adaptive_provider_chain(
                 }
             }
         }
-        if providers.len() > 1 {
-            let adaptive_config = config
+        // Adaptive routing must be *opt-in*: when `adaptive_routing` is
+        // absent or `enabled = false`, fall back to the plain static
+        // `ProviderChain`. This kills the silent default-ON behavior the
+        // previous implementation had (router wrapping always when
+        // `providers.len() > 1`).
+        let adaptive_enabled = config
+            .adaptive_routing
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false);
+        if providers.len() > 1 && adaptive_enabled {
+            let ar_config = config
                 .adaptive_routing
                 .as_ref()
-                .map(AdaptiveConfig::from)
-                .unwrap_or_default();
-            let ar_config = config.adaptive_routing.as_ref();
-            info!("adaptive routing enabled ({} providers)", providers.len());
-            let mode = ar_config
-                .map(|c| c.mode.into())
-                .unwrap_or(AdaptiveMode::Lane);
-            let qos = ar_config.map(|c| c.qos_ranking).unwrap_or(true);
+                .expect("adaptive_enabled implies adaptive_routing.is_some()");
+            let adaptive_config = AdaptiveConfig::from(ar_config);
+            info!(
+                "adaptive routing enabled ({} providers, mode={:?}, qos={})",
+                providers.len(),
+                ar_config.mode,
+                ar_config.qos_ranking
+            );
+            let mode: AdaptiveMode = ar_config.mode.into();
+            let qos = ar_config.qos_ranking;
             let router = Arc::new(
                 AdaptiveRouter::new(providers, &costs, adaptive_config)
                     .with_adaptive_config(mode, qos),
@@ -136,15 +148,21 @@ pub(crate) fn build_adaptive_provider_chain(
             // operators can disable the latency feedback loop (e.g. CI,
             // benchmarks). The router defaults to enabled; this only
             // overrides when an `adaptive_routing.auto_escalation` block
-            // exists.
-            if let Some(ar) = ar_config {
-                router.set_auto_escalation_config(octos_llm::AutoEscalationConfig::from(
-                    &ar.auto_escalation,
-                ));
-            }
+            // exists. (Merge note: ar_config is already &AdaptiveRoutingConfig
+            // here — the outer `if adaptive_enabled` ensures Some.)
+            router.set_auto_escalation_config(octos_llm::AutoEscalationConfig::from(
+                &ar_config.auto_escalation,
+            ));
             adaptive_router_ref = Some(router.clone());
             router
         } else {
+            if providers.len() > 1 {
+                info!(
+                    "adaptive routing disabled (enabled=false or omitted) — \
+                     falling back to static ProviderChain ({} providers)",
+                    providers.len()
+                );
+            }
             Arc::new(ProviderChain::new(providers))
         }
     };
@@ -493,7 +511,13 @@ mod tests {
                     strong: true,
                 },
             ],
-            adaptive_routing: Some(AdaptiveRoutingConfig::default()),
+            // A1: AdaptiveRoutingConfig::default() now has `enabled = false`
+            // and is a *no-op*. Tests that exercise the adaptive code path
+            // must opt in explicitly.
+            adaptive_routing: Some(AdaptiveRoutingConfig {
+                enabled: true,
+                ..AdaptiveRoutingConfig::default()
+            }),
             ..Default::default()
         };
 
@@ -663,5 +687,129 @@ mod tests {
             .expect("ollama lane should be in persisted catalog");
         assert_eq!(persisted_ollama.context_window, 128_000);
         assert_eq!(persisted_ollama.max_output, 8_192);
+    }
+
+    /// A1 regression: `adaptive_routing.enabled = false` MUST NOT
+    /// instantiate an `AdaptiveRouter`. Before this fix, the helper
+    /// silently defaulted to `mode=Lane, qos=true` whenever
+    /// `providers.len() > 1`, ignoring `enabled` entirely — which the
+    /// investigation report called out as a config-correctness bug.
+    #[test]
+    fn build_adaptive_provider_chain_respects_disabled_flag() {
+        use crate::config::{AdaptiveRoutingConfig, Config, FallbackModel};
+        use octos_core::Message;
+        use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
+        use std::sync::Arc;
+
+        struct StubProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StubProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                Err(eyre::eyre!("stub not callable in tests"))
+            }
+            fn model_id(&self) -> &str {
+                "stub-model"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+
+        // Two providers AND adaptive_routing.enabled = false →
+        // no AdaptiveRouter must be built. Previously this would have
+        // wrapped silently because providers.len() > 1.
+        let config = Config {
+            provider: Some("stub".into()),
+            fallback_models: vec![FallbackModel {
+                provider: "ollama".into(),
+                model: Some("llama3.2".into()),
+                base_url: None,
+                api_key_env: None,
+                model_hints: None,
+                api_type: None,
+                cost_per_m: Some(0.5),
+                strong: true,
+            }],
+            adaptive_routing: Some(AdaptiveRoutingConfig {
+                enabled: false,
+                ..AdaptiveRoutingConfig::default()
+            }),
+            ..Default::default()
+        };
+
+        let base: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+        let bundle =
+            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled);
+
+        assert!(
+            bundle.adaptive_router.is_none(),
+            "enabled = false MUST NOT instantiate an AdaptiveRouter"
+        );
+    }
+
+    /// A1 regression: when `adaptive_routing` is entirely absent from
+    /// the config (`None`), the helper must NOT silently default-ON.
+    /// Previously the unwrap_or path quietly picked `Lane + qos=true`.
+    #[test]
+    fn build_adaptive_provider_chain_defaults_off_when_config_absent() {
+        use crate::config::{Config, FallbackModel};
+        use octos_core::Message;
+        use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
+        use std::sync::Arc;
+
+        struct StubProvider;
+        #[async_trait::async_trait]
+        impl LlmProvider for StubProvider {
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSpec],
+                _config: &ChatConfig,
+            ) -> eyre::Result<ChatResponse> {
+                Err(eyre::eyre!("stub not callable in tests"))
+            }
+            fn model_id(&self) -> &str {
+                "stub-model"
+            }
+            fn provider_name(&self) -> &str {
+                "stub"
+            }
+        }
+
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+
+        let config = Config {
+            provider: Some("stub".into()),
+            fallback_models: vec![FallbackModel {
+                provider: "ollama".into(),
+                model: Some("llama3.2".into()),
+                base_url: None,
+                api_key_env: None,
+                model_hints: None,
+                api_type: None,
+                cost_per_m: Some(0.5),
+                strong: true,
+            }],
+            adaptive_routing: None,
+            ..Default::default()
+        };
+
+        let base: Arc<dyn LlmProvider> = Arc::new(StubProvider);
+        let bundle =
+            build_adaptive_provider_chain(base, &config, &data_dir, false, ExporterMode::Disabled);
+
+        assert!(
+            bundle.adaptive_router.is_none(),
+            "missing adaptive_routing block MUST default to OFF (no router)"
+        );
     }
 }
