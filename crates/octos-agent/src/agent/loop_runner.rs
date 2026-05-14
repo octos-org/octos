@@ -939,7 +939,7 @@ impl Agent {
 
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
-                            self.emit_cost_update(turn.total_usage(), &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1033,7 +1033,7 @@ impl Agent {
                                             decision = %outcome.decision,
                                             "shell spiral terminal: returning recovered content as final assistant reply"
                                         );
-                                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                                        self.emit_cost_update(turn.total_usage(), &response);
                                         return Ok(ConversationResponse {
                                             content: terminal_content,
                                             reasoning_content: None,
@@ -1056,7 +1056,7 @@ impl Agent {
                                     // identical noise.
                                     let warning_content = self.dedup_loop_warning(warning)?;
                                     // Don't execute the tools — break out with a message
-                                    self.emit_cost_update(turn.total_usage(), &response.usage);
+                                    self.emit_cost_update(turn.total_usage(), &response);
                                     return Ok(ConversationResponse {
                                         content: warning_content,
                                         reasoning_content: None,
@@ -1146,7 +1146,7 @@ impl Agent {
                                     decision = %outcome.decision,
                                     "shell spiral terminal: returning recovered content as final assistant reply"
                                 );
-                                self.emit_cost_update(turn.total_usage(), &response.usage);
+                                self.emit_cost_update(turn.total_usage(), &response);
                                 return Ok(ConversationResponse {
                                     content: terminal_content,
                                     reasoning_content: None,
@@ -1168,7 +1168,7 @@ impl Agent {
                             }
 
                             if self.tools.spawn_only_was_invoked() {
-                                self.emit_cost_update(turn.total_usage(), &response.usage);
+                                self.emit_cost_update(turn.total_usage(), &response);
                                 let background_tools = response
                                     .tool_calls
                                     .iter()
@@ -1205,7 +1205,7 @@ impl Agent {
                             }
                         }
                         StopReason::MaxTokens => {
-                            self.emit_cost_update(turn.total_usage(), &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response);
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_default(),
                                 reasoning_content: response.reasoning_content.clone(),
@@ -1223,7 +1223,7 @@ impl Agent {
                         StopReason::ContentFiltered => {
                             // After retries in call_llm_with_hooks, content is still filtered.
                             // Return a user-visible message instead of empty content.
-                            self.emit_cost_update(turn.total_usage(), &response.usage);
+                            self.emit_cost_update(turn.total_usage(), &response);
                             warn!("content filtered by provider safety/moderation after retries");
                             return Ok(ConversationResponse {
                                 content: response.content.unwrap_or_else(|| {
@@ -1430,7 +1430,7 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response);
 
                         // Audit Gap-8: auto-fire `check_workspace_contract`
                         // on Completion. The LLM-callable wrapper stays for
@@ -1509,7 +1509,7 @@ impl Agent {
                         }
                     }
                     StopReason::MaxTokens => {
-                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
@@ -1524,7 +1524,7 @@ impl Agent {
                     }
                     StopReason::ContentFiltered => {
                         warn!("content filtered by provider safety/moderation in task");
-                        self.emit_cost_update(turn.total_usage(), &response.usage);
+                        self.emit_cost_update(turn.total_usage(), &response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,

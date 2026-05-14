@@ -134,6 +134,12 @@ pub enum ProgressEvent {
         response_cost: Option<f64>,
         /// Cumulative session cost.
         session_cost: Option<f64>,
+        /// Model identifier that produced this response. Forwarded by the
+        /// API bridge into `metadata.token_cost.model` so chat clients can
+        /// render `model · tokens_in / tokens_out · duration` footers.
+        /// `None` when the reporter cannot resolve a model id (e.g.
+        /// synthetic test fixtures).
+        model: Option<String>,
     },
 }
 

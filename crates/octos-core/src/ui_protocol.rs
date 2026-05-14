@@ -3385,6 +3385,12 @@ pub struct UiTokenCostUpdate {
     pub session_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    /// Model identifier that produced this cost update. Populated by the
+    /// agent emit layer from `LlmProvider::model_id()` so chat clients can
+    /// render `model · tokens_in / tokens_out · duration` footers without
+    /// scraping the legacy `metadata.label` field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl UiTokenCostUpdate {
@@ -3399,6 +3405,7 @@ impl UiTokenCostUpdate {
             response_cost: None,
             session_cost: None,
             currency: None,
+            model: None,
         }
     }
 }
@@ -6197,6 +6204,44 @@ mod tests {
                     }
                 }
             })
+        );
+
+        let decoded_notification: RpcNotification<Value> =
+            serde_json::from_value(wire).expect("deserialize wire");
+        let decoded = UiNotification::from_rpc_notification(decoded_notification)
+            .expect("decode progress/updated");
+        assert_eq!(decoded, event);
+    }
+
+    /// The chat bubble footer renders `model · tokens_in / tokens_out · duration`
+    /// by reading `metadata.token_cost.model`. The wire shape must survive a
+    /// round trip so the WebSocket bridge can faithfully relay the model id
+    /// the agent emit layer attached.
+    #[test]
+    fn progress_updated_token_cost_round_trip_preserves_model() {
+        let mut token_cost = UiTokenCostUpdate::new();
+        token_cost.input_tokens = Some(80);
+        token_cost.output_tokens = Some(20);
+        token_cost.model = Some("deepseek-v4-pro".into());
+
+        let metadata = UiProgressMetadata::token_cost(token_cost);
+        let turn_id = TurnId(Uuid::from_u128(11));
+        let event = UiNotification::ProgressUpdated(ProgressUpdatedEvent::new(
+            SessionKey("local:demo".into()),
+            Some(turn_id.clone()),
+            metadata,
+        ));
+
+        let wire = serde_json::to_value(
+            event
+                .clone()
+                .into_rpc_notification()
+                .expect("serialize progress/updated"),
+        )
+        .expect("serialize wire");
+        assert_eq!(
+            wire["params"]["metadata"]["token_cost"]["model"],
+            json!("deepseek-v4-pro"),
         );
 
         let decoded_notification: RpcNotification<Value> =
