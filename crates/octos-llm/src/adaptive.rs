@@ -959,7 +959,12 @@ impl AdaptiveRouter {
                 .entry(session_id.to_string())
                 .or_insert_with(|| SessionAutoState::new(&cfg));
             state.last_latency_ms = latency_ms;
-            state.observer.record(latency);
+            // Use the ceiling-aware record so absolute-latency excursions
+            // (e.g. 8s+) count as slow even when the per-session baseline
+            // would otherwise normalize them.
+            state
+                .observer
+                .record_with_ceiling(latency, Some(cfg.latency_ceiling_ms));
             let current_mode = self.mode();
 
             // Escalate when the observer says so AND we're not already
@@ -988,26 +993,40 @@ impl AdaptiveRouter {
                 };
                 (AutoEscalationDecision::Escalated, Some(event))
             } else if trigger_deescalate {
+                // Operator-override guard: if the router is no longer in
+                // Hedge mode (a `/adaptive off|lane` was issued by the
+                // user/operator since we escalated), drop our cached
+                // `pre_escalation_mode` without overriding their choice.
+                // Otherwise restore to the mode we saw at escalation
+                // time.
                 state.observer.set_active(false);
-                let restore = state
-                    .pre_escalation_mode
-                    .take()
-                    .unwrap_or(AdaptiveMode::Off);
-                self.set_mode(restore);
-                info!(
-                    session = session_id,
-                    latency_ms,
-                    restored_mode = %restore,
-                    "auto-escalation: latency recovered, restoring mode"
-                );
-                let event = AutoEscalationEvent {
-                    session_id: session_id.to_string(),
-                    new_mode: restore,
-                    previous_mode: AdaptiveMode::Hedge,
-                    latency_ms,
-                    escalated: false,
-                };
-                (AutoEscalationDecision::Deescalated, Some(event))
+                let stashed = state.pre_escalation_mode.take();
+                if current_mode != AdaptiveMode::Hedge {
+                    info!(
+                        session = session_id,
+                        latency_ms,
+                        current_mode = %current_mode,
+                        "auto-escalation: latency recovered but router was manually moved off Hedge — leaving the operator-chosen mode in place"
+                    );
+                    (AutoEscalationDecision::Deescalated, None)
+                } else {
+                    let restore = stashed.unwrap_or(AdaptiveMode::Off);
+                    self.set_mode(restore);
+                    info!(
+                        session = session_id,
+                        latency_ms,
+                        restored_mode = %restore,
+                        "auto-escalation: latency recovered, restoring mode"
+                    );
+                    let event = AutoEscalationEvent {
+                        session_id: session_id.to_string(),
+                        new_mode: restore,
+                        previous_mode: AdaptiveMode::Hedge,
+                        latency_ms,
+                        escalated: false,
+                    };
+                    (AutoEscalationDecision::Deescalated, Some(event))
+                }
             } else {
                 (AutoEscalationDecision::NoChange, None)
             }
@@ -1062,12 +1081,49 @@ impl AdaptiveRouter {
     /// Drop the per-session auto-escalation state. Callers should call
     /// this when a session terminates so the router doesn't grow
     /// unbounded under many short-lived sessions.
+    ///
+    /// Side effect: if the dropped session was the one that owned the
+    /// last escalation (i.e. its `pre_escalation_mode` was the only
+    /// record of "what the router was before Hedge"), the router is
+    /// restored to that pre-escalation mode so a session that exits
+    /// while still escalated does not leave the router stuck in Hedge
+    /// indefinitely.
     pub fn forget_session(&self, session_id: &str) -> bool {
-        let mut state_map = self
+        let dropped = {
+            let mut state_map = self
+                .auto_escalation_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state_map.remove(session_id)
+        };
+        let Some(state) = dropped else {
+            return false;
+        };
+        // If this session owned an active escalation AND no other
+        // session has its own active escalation, drop the router back
+        // to what we saw before promoting. Without this, an exit-while-
+        // escalated would leave the router stuck in Hedge.
+        if let Some(restore) = state.pre_escalation_mode {
+            if self.mode() == AdaptiveMode::Hedge && !self.any_session_escalated() {
+                self.set_mode(restore);
+                info!(
+                    session = session_id,
+                    restored_mode = %restore,
+                    "forget_session: session exited while escalated, restoring router mode"
+                );
+            }
+        }
+        true
+    }
+
+    fn any_session_escalated(&self) -> bool {
+        let state_map = self
             .auto_escalation_state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        state_map.remove(session_id).is_some()
+        state_map
+            .values()
+            .any(|s| s.pre_escalation_mode.is_some() && s.observer.is_active())
     }
 
     /// Toggle QoS quality ranking at runtime (orthogonal to mode).
@@ -3506,5 +3562,85 @@ mod tests {
         assert!(router.forget_session("s1"));
         assert!(router.session_latency_baseline("s1").is_none());
         assert!(!router.forget_session("s1"));
+    }
+
+    /// Codex review P1.2: if a session exits while still escalated,
+    /// forget_session restores the router mode so we don't get stuck in
+    /// Hedge with no record of how to recover.
+    #[test]
+    fn auto_escalation_forget_session_restores_mode() {
+        let router = auto_escalation_router();
+        assert_eq!(router.mode(), AdaptiveMode::Lane);
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // s1 exits while still escalated.
+        router.forget_session("s1");
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Lane,
+            "router should restore the pre-escalation mode when the escalating session is forgotten"
+        );
+    }
+
+    /// Codex review P1.3: if the operator manually moves the router off
+    /// Hedge (`/adaptive off|lane`) during an active escalation, a
+    /// subsequent fast turn must NOT override the operator's choice via
+    /// the cached pre_escalation_mode.
+    #[test]
+    fn auto_escalation_respects_operator_override() {
+        let router = auto_escalation_router();
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(100));
+        }
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(400));
+        }
+        assert_eq!(router.mode(), AdaptiveMode::Hedge);
+        // Operator decides to force the router off (e.g. costs).
+        router.set_mode(AdaptiveMode::Off);
+        // A fast turn arrives — recovery would normally restore Lane.
+        router.record_turn_latency("s1", Duration::from_millis(50));
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Off,
+            "router should respect the operator's manual override and not restore the pre-escalation mode"
+        );
+    }
+
+    /// Codex review P1.4: a session whose baseline drifts up to e.g. 5s
+    /// will not normally consider 8s "slow" (8 < 5*3=15). The
+    /// `latency_ceiling_ms` config knob must still trigger escalation
+    /// when an absolute ceiling is exceeded.
+    #[test]
+    fn auto_escalation_latency_ceiling_triggers_escalation() {
+        let router = auto_escalation_router();
+        // Configure a tight ceiling: 1500ms.
+        router.set_auto_escalation_config(AutoEscalationConfig {
+            latency_ceiling_ms: 1_500,
+            recovery_factor: 0.6,
+            // Keep slow_trigger=3 so the test mirrors gateway defaults.
+            ..AutoEscalationConfig::default()
+        });
+        // Warm a high baseline at 1s so 3x baseline = 3s > 1.5s ceiling.
+        // The legacy baseline-only logic would NOT fire on 2s samples
+        // (2 < 3) — only the ceiling-aware path catches them.
+        for _ in 0..5 {
+            router.record_turn_latency("s1", Duration::from_millis(1_000));
+        }
+        // 3 samples at 2s: each is below 3x baseline (3s) but above
+        // ceiling (1.5s) → must escalate.
+        for _ in 0..3 {
+            router.record_turn_latency("s1", Duration::from_millis(2_000));
+        }
+        assert_eq!(
+            router.mode(),
+            AdaptiveMode::Hedge,
+            "router should have escalated on the latency_ceiling_ms path"
+        );
     }
 }
