@@ -177,6 +177,19 @@ pub async fn post_setup_skip(
 const MIN_ROTATED_TOKEN_LEN: usize = 8;
 
 fn validate_token_strength(t: &str) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    // The login form trims the token before sending it, so accepting a
+    // token with leading/trailing whitespace would lock the operator out on
+    // their next login (server hashes the raw value, login submits the
+    // trimmed one). Reject the mismatch outright with a clear error.
+    if t.trim().len() != t.len() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "weak_token",
+                message: "token must not have leading or trailing whitespace".into(),
+            }),
+        ));
+    }
     if t.len() < MIN_ROTATED_TOKEN_LEN {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -796,6 +809,34 @@ mod tests {
         };
         let status = rotate_token(State(state), Json(body)).await.unwrap();
         assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rotate_token_rejects_surrounding_whitespace() {
+        // The login form trims the token before submit. Persisting a value
+        // with leading/trailing whitespace would lock the operator out.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_store(dir.path());
+        let body = RotateBody {
+            new_token: " password ".into(),
+        };
+        let err = rotate_token(State(state), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "weak_token");
+    }
+
+    #[tokio::test]
+    async fn rotate_token_rejects_all_whitespace_token() {
+        // 8 spaces is technically 8 chars but trims to empty — operator
+        // would be locked out on next login.
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_store(dir.path());
+        let body = RotateBody {
+            new_token: "        ".into(),
+        };
+        let err = rotate_token(State(state), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1.code, "weak_token");
     }
 
     #[tokio::test]

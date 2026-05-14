@@ -135,4 +135,27 @@ describe('SetupRotateToken', () => {
     ).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /^send$/i })).not.toBeInTheDocument()
   })
+
+  it('trims surrounding whitespace before submitting (login form trims too)', async () => {
+    // Regression: persisting " password " would lock the operator out
+    // because LoginPage calls `loginWithToken(adminToken.trim())` on next
+    // sign-in. Trim on submit so the two surfaces agree.
+    mockRotateToken.mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    renderPage()
+    const input = screen.getByLabelText(/new admin token/i)
+    await user.type(input, '  pass1234  ')
+    await user.click(screen.getByRole('button', { name: /submit/i }))
+    await waitFor(() => expect(mockRotateToken).toHaveBeenCalledWith('pass1234'))
+    await waitFor(() => expect(mockSwapToken).toHaveBeenCalledWith('pass1234'))
+  })
+
+  it('disables submit when the entry is only whitespace', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    const input = screen.getByLabelText(/new admin token/i)
+    await user.type(input, '          ') // 10 spaces — trims to empty
+    expect(screen.getByRole('button', { name: /submit/i })).toBeDisabled()
+    expect(mockRotateToken).not.toHaveBeenCalled()
+  })
 })

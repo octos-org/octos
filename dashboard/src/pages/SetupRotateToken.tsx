@@ -14,8 +14,13 @@ export default function SetupRotateToken() {
   const [rotated, setRotated] = useState(false)
   const [reveal, setReveal] = useState(false)
 
-  const tooShort = value.length > 0 && value.length < MIN_TOKEN_LEN
-  const valid = value.length >= MIN_TOKEN_LEN
+  // LoginPage submits `adminToken.trim()`, so a token persisted with
+  // leading/trailing whitespace would lock the operator out on next login.
+  // Validate (and submit) the trimmed value so the two surfaces agree.
+  const trimmed = value.trim()
+  const hasSurroundingSpace = value.length !== trimmed.length
+  const tooShort = trimmed.length > 0 && trimmed.length < MIN_TOKEN_LEN
+  const valid = trimmed.length >= MIN_TOKEN_LEN
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -27,8 +32,8 @@ export default function SetupRotateToken() {
     setError('')
     setLoading(true)
     try {
-      await api.rotateToken(value)
-      swapToken(value)
+      await api.rotateToken(trimmed)
+      swapToken(trimmed)
       setRotated(true)
     } catch (e: any) {
       setError(e?.message || 'Failed to rotate token')
@@ -78,6 +83,12 @@ export default function SetupRotateToken() {
             {tooShort && (
               <p className="mt-1 text-xs text-yellow-400">
                 Token must be at least {MIN_TOKEN_LEN} characters.
+              </p>
+            )}
+            {hasSurroundingSpace && !tooShort && (
+              <p className="mt-1 text-xs text-yellow-400">
+                Leading/trailing whitespace will be removed on submit (the login
+                form also trims).
               </p>
             )}
           </div>
