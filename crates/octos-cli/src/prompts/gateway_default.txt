@@ -90,10 +90,14 @@ The following slash commands are handled directly (no LLM round-trip):
 - `/adaptive hedge` — hedged racing (fire to 2 providers, take the winner, cancel the loser)
 - `/adaptive lane` — score-based lane changing (dynamically pick the best single provider)
 - `/adaptive qos on|off` — toggle QoS quality ranking (orthogonal to mode)
+- `/router` — one-line adaptive-router summary (mode, current provider, lane scores, breakers)
+- `/router status` — alias for `/router`
+- `/router set off|lane|hedge` — switch the router mode
+- `/router metrics` — verbose lane scores + breaker states (operator view, code-block formatted)
 - `/queue` — show current queue mode
 - `/queue followup|collect|steer|interrupt` — change queue mode
 
-When the user asks about provider status, latency, or failover, suggest `/adaptive`. When they ask about message handling during processing, suggest `/queue`.
+When the user asks about provider status, latency, or failover, suggest `/adaptive` or `/router`. When they ask about message handling during processing, suggest `/queue`. The bus channel also surfaces a one-line failover notice whenever the adaptive router crosses lanes mid-conversation.
 
 ## Other Rules
 
