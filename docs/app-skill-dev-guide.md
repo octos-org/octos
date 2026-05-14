@@ -771,12 +771,13 @@ Every `ValidatorSpec` variant currently merged. Source: `crates/octos-agent/src/
 | `FileExists { path, min_bytes? }` | `{kind: "file_exists", path, min_bytes}` | `${args.X}` (percent-encoded for the single-filename segment use case) + `${output.X}` (verbatim) | Assert a file exists (and optionally meets a min byte count). |
 | `HttpProbe { url_template, expected_status?, expected_contains? }` | `{kind: "http_probe", url_template, expected_status, expected_contains}` | `${args.X}` (percent-encoded) + `${output.X}` (verbatim) | Single-shot GET → status + optional body substring. PR #935. |
 | `OminixVoiceExists { name_arg }` | `{kind: "ominix_voice_exists", name_arg}` | `name_arg` looked up in input args | Specialised probe of `${OMINIX_API_URL}/v1/voices` asserting the named voice is registered. PR #935. |
-| `AudioNonSilent { glob, min_ratio? }` | `{kind: "audio_non_silent", glob, min_ratio}` | none (glob is literal) | Decode WAV (or MP3 with the `audio_mp3` feature) and assert at least `min_ratio` of samples are non-silent across the whole file. PR #935. |
+| `AudioNonSilent { glob, min_ratio? }` | `{kind: "audio_non_silent", glob, min_ratio}` | `${args.X}` + `${output.X}` (glob template) | Decode WAV (or MP3 with the `audio_mp3` feature) and assert at least `min_ratio` of samples are non-silent across the whole file. Passes if ANY matched file is non-silent. PR #935. |
+| `PerFileNonSilent { glob, min_ratio?, require_at_least? }` | `{kind: "per_file_non_silent", glob, min_ratio, require_at_least}` | `${args.X}` only (path-traversal-rejected) | Per-segment companion to `AudioNonSilent`: EVERY matched file must independently meet `min_ratio`, and the match count must meet `require_at_least` (0 = no minimum). Failure message surfaces the offending file's basename. PR #955. |
 | `MagicBytes { glob, format }` | `{kind: "magic_bytes", glob, format}` | none | Assert each file matching `glob` starts with the magic-byte prefix for `format`. Catches "wrote an HTML error page in place of an MP3" failures. PR #935. Supported formats: `mp3`, `wav`, `png`, `jpeg`, `pdf`, `mp4`, `web_m`, `pptx` (three ZIP signatures). |
 | `HttpProbeUntil { url_template, expected_status?, expected_contains?, poll_interval_ms?, deadline_ms? }` | `{kind: "http_probe_until", ...}` | same as `HttpProbe` | Polling HTTP probe; closes silent-failure paths for asynchronous external operations (training a voice, deploying a site). Default 2s interval / 30s deadline. PR #943. |
 | `Sha256Match { glob, sha256 }` | `{kind: "sha256_match", glob, sha256}` | `${args.X}` for both fields | Assert a single file's SHA-256 digest matches. Accepts either an explicit hex digest or an interpolated arg (e.g. the manifest's `sha256` captured at install). PR #943. |
 
-**`AudioNonSilent` is whole-file only** — a per-segment variant (`PerFileNonSilent`) is on the open list; it is **not yet merged**. For per-segment silence guarantees today, gate the artifact via a `MagicBytes` + `AudioNonSilent` pair and accept that mid-clip silence can pass.
+**Whole-file vs per-segment audio gates.** `AudioNonSilent` passes when ANY matched file is non-silent, which means a multi-segment artifact (e.g. an assembled podcast MP3) can mask a single silent intermediate segment because the silent gap gets averaged out by the surrounding speech. When per-segment guarantees matter, pair `AudioNonSilent` (whole file) with `PerFileNonSilent` (each segment) on the same spawn task. The canonical example is `podcast_generate`, which gates BOTH the final MP3 and each preserved `<output_dir>/segments/seg_*.wav` after mofa-skills #59 made segments visible after assembly.
 
 ### Interpolation: `${args.X}` vs `${output.X}`
 
@@ -1238,7 +1239,7 @@ Their `SKILL.md` says "Replace with a real ... when adapting the starter." Use t
 - [ ] No silent-failure paths in skill code — surface as `success: false` or rely on a harness validator (don't write your own post-condition check)
 - [ ] If `spawn_only: true` and the harness needs to validate a structured output (e.g. a deploy URL), the binary emits `named_outputs` with keys matching `[a-z][a-z0-9_]*` and string values
 - [ ] Workspace contract entry exists in `WorkspacePolicy::for_session()` or `.octos-workspace.toml` (see [Part 7](#part-7-workspace-contract))
-- [ ] If the skill produces audio, the contract declares `AudioNonSilent` (whole-file) — and `PerFileNonSilent` if per-segment guarantees are needed (PerFileNonSilent is not yet merged; track in the audit doc)
+- [ ] If the skill produces audio, the contract declares `AudioNonSilent` (whole-file) — and `PerFileNonSilent` if per-segment guarantees are needed (PR #955)
 - [ ] Standalone test passes: `echo '{"param": "val"}' | ./main my_tool`
 - [ ] Gateway test passes: skill loads and agent can invoke it
 - [ ] `cargo clippy -D warnings` clean (for Rust skills)
