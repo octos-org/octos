@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use eyre::Result;
 use octos_llm::ToolSpec;
 
+use crate::policy::EffectivePermissions;
 use crate::task_supervisor::TaskSupervisor;
 
 #[cfg(feature = "ast")]
@@ -1021,17 +1022,46 @@ impl ToolRegistry {
 
     /// Create a registry with built-in tools and a custom sandbox for shell commands.
     pub fn with_builtins_and_sandbox(cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
+        let permissions = EffectivePermissions::workspace_write();
+        Self::with_builtins_and_permissions(cwd, sandbox, permissions)
+    }
+
+    /// Create a registry with built-in tools under explicit runtime permissions.
+    pub fn with_builtins_and_permissions(
+        cwd: impl AsRef<Path>,
+        sandbox: Box<dyn Sandbox>,
+        permissions: EffectivePermissions,
+    ) -> Self {
         let cwd = cwd.as_ref();
         let mut registry = Self::new();
         registry.workspace_root = Some(cwd.to_path_buf());
-        registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
-        registry.register(ReadFileTool::new(cwd));
-        registry.register(DiffEditTool::new(cwd));
-        registry.register(EditFileTool::new(cwd));
-        registry.register(WriteFileTool::new(cwd));
-        registry.register(GlobTool::new(cwd));
+        registry.register(
+            ShellTool::new(cwd)
+                .with_sandbox(sandbox)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry
+            .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
+        registry.register(
+            DiffEditTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            EditFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            WriteFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(GlobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(GrepTool::new(cwd));
-        registry.register(ListDirTool::new(cwd));
+        registry
+            .register(ListDirTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry.register(BrowserTool::new());
@@ -1071,19 +1101,48 @@ impl ToolRegistry {
     /// to use a new working directory and sandbox. Non-cwd tools (web_search,
     /// web_fetch, browser, MCP, plugins, etc.) are preserved via Arc cloning.
     pub fn rebind_cwd(&self, cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
+        self.rebind_cwd_with_permissions(cwd, sandbox, EffectivePermissions::workspace_write())
+    }
+
+    /// Like [`Self::rebind_cwd`], but applies explicit runtime permissions.
+    pub fn rebind_cwd_with_permissions(
+        &self,
+        cwd: impl AsRef<Path>,
+        sandbox: Box<dyn Sandbox>,
+        permissions: EffectivePermissions,
+    ) -> Self {
         let cwd = cwd.as_ref();
         // Clone everything except cwd-bound tools
         let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
         registry.workspace_root = Some(cwd.to_path_buf());
         // Re-register cwd-bound tools with the new workspace
-        registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
-        registry.register(ReadFileTool::new(cwd));
-        registry.register(DiffEditTool::new(cwd));
-        registry.register(EditFileTool::new(cwd));
-        registry.register(WriteFileTool::new(cwd));
-        registry.register(GlobTool::new(cwd));
+        registry.register(
+            ShellTool::new(cwd)
+                .with_sandbox(sandbox)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry
+            .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
+        registry.register(
+            DiffEditTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            EditFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(
+            WriteFileTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        registry.register(GlobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(GrepTool::new(cwd));
-        registry.register(ListDirTool::new(cwd));
+        registry
+            .register(ListDirTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
         registry.register(CheckWorkspaceContractTool::new(cwd));
         registry.register(WorkspaceLogTool::new(cwd));
         registry.register(WorkspaceShowTool::new(cwd));
@@ -1321,7 +1380,7 @@ mod cwd_isolation_tests {
             ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
         registry.set_session_key("api:base-session".to_string());
         registry.mark_spawn_only_invoked();
-        let base_task = registry.register_task("deep_search", "call-base");
+        let base_task = registry.register_task("search", "call-base");
 
         let new_cwd = tempfile::tempdir().expect("create temp dir");
         let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
@@ -1335,7 +1394,7 @@ mod cwd_isolation_tests {
             "spawn-only invocation state is per agent run/session"
         );
 
-        let rebound_task = rebound.register_task("deep_search", "call-rebound");
+        let rebound_task = rebound.register_task("search", "call-rebound");
         let rebound_task = rebound
             .supervisor()
             .get_task(&rebound_task)
@@ -1708,11 +1767,11 @@ mod lifecycle_tests {
     #[test]
     fn spawn_only_handle_message_returns_task_handle_envelope() {
         let mut reg = make_registry(5, 3);
-        reg.mark_spawn_only("deep_search", None);
+        reg.mark_spawn_only("search", None);
         reg.set_output_dir_hint("/tmp/octos/skill-output");
 
         let payload = reg.spawn_only_handle_message(
-            "deep_search",
+            "search",
             "task_abc123",
             &["research/_report.md".to_string()],
         );
@@ -1771,9 +1830,9 @@ mod lifecycle_tests {
         // Phase 4 acceptance criterion: spawn_only tool result in agent
         // context is < 1KB (was 50KB+).
         let mut reg = make_registry(5, 3);
-        reg.mark_spawn_only("deep_search", None);
+        reg.mark_spawn_only("search", None);
 
-        let payload = reg.spawn_only_handle_message("deep_search", "task_xyz", &[]);
+        let payload = reg.spawn_only_handle_message("search", "task_xyz", &[]);
 
         assert!(
             payload.len() < 1024,

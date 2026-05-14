@@ -677,7 +677,9 @@ pub use git::GitTool;
 #[cfg(feature = "ast")]
 pub use code_structure::CodeStructureTool;
 
-use std::path::Path;
+use std::path::{Component, Path};
+
+use crate::policy::FilesystemScope;
 
 /// Resolve a user-provided tool-argument path, ensuring it stays within
 /// `base_dir` **or** inside the authenticated upload tmpdir.
@@ -738,6 +740,54 @@ pub fn resolve_path(base_dir: &Path, user_path: &str) -> Result<PathBuf> {
 // tools, plugin tools, send_file, read_task_output) shares the same
 // machinery. The previously-inline helpers were retired with that
 // unification.
+
+/// Resolve a user-provided path under an explicit filesystem scope.
+///
+/// [`FilesystemScope::Workspace`] (default) preserves the historical
+/// workspace fence and delegates to [`resolve_path`] (unified resolver).
+///
+/// [`FilesystemScope::Host`] is used only by the explicit
+/// `DangerFullAccess` permission profile (solo-runtime only). It accepts
+/// absolute paths anywhere on disk after syntactic normalization and
+/// resolves relative paths against `base_dir`. The workspace fence is
+/// explicitly bypassed — the safety guarantee comes from the gating on
+/// `PermissionProfile::DangerFullAccess` + `RuntimeMode::Solo`.
+pub fn resolve_path_with_scope(
+    base_dir: &Path,
+    user_path: &str,
+    filesystem_scope: FilesystemScope,
+) -> Result<PathBuf> {
+    if filesystem_scope.is_host() {
+        let candidate = PathBuf::from(user_path);
+        if candidate.is_absolute() {
+            return Ok(normalize_lexical(&candidate));
+        }
+        return Ok(normalize_lexical(&base_dir.join(user_path)));
+    }
+    resolve_path(base_dir, user_path)
+}
+
+/// Syntactic path normalization (no filesystem access). Collapses `.`
+/// components and resolves `..` against in-memory parents without
+/// canonicalising symlinks. Used by the Host-scope branch above where
+/// the workspace fence is intentionally absent.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => normalized.push(p.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    normalized
+}
 
 /// Check that a path is not a symlink. Returns error message if it is.
 ///

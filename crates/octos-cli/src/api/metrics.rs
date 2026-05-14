@@ -972,6 +972,21 @@ impl octos_agent::ProgressReporter for MetricsReporter {
         }
         self.inner.report(event);
     }
+
+    /// Issue #960 fix: forward the inner reporter's bound `thread_id` so
+    /// `agent/execution.rs`'s spawn_only intercept (which calls
+    /// `reporter.thread_id()` to capture `bg_originating_thread_id` and
+    /// `bg_originating_client_message_id`) sees the value the standalone
+    /// turn bound at construction time
+    /// (`BoundedChannelReporter::with_thread_id(turn_id.0.to_string())`)
+    /// instead of falling through to the default `None`. Without this
+    /// override the `MetricsReporter` decorator silently strips the
+    /// thread binding and the `turn/spawn_complete` envelope's
+    /// `response_to_client_message_id` lands as `None`, leaving the SPA
+    /// reducer's thread-map lookup to miss and the new bubble to drop.
+    fn thread_id(&self) -> Option<&str> {
+        self.inner.thread_id()
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,10 @@
 //! It's designed to be extended with codex-execpolicy when available.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::sync::Arc;
+
+use crate::sandbox::{SandboxConfig, SandboxMode};
 
 /// Decision for a command execution request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +19,232 @@ pub enum Decision {
     Deny,
     /// Ask the user for approval.
     Ask,
+}
+
+/// Runtime approval behavior for commands that would otherwise ask a user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// Ask an interactive client when a command policy returns [`Decision::Ask`].
+    #[default]
+    Ask,
+    /// Never ask. Commands that would ask fail directly at the tool boundary.
+    Never,
+}
+
+impl ApprovalPolicy {
+    /// Whether this policy permits an interactive approval prompt.
+    pub fn allows_prompt(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+}
+
+/// Effective filesystem reach for cwd-bound tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemScope {
+    /// File tools must stay under the session workspace root.
+    #[default]
+    Workspace,
+    /// File tools may target host paths outside the session workspace root.
+    Host,
+}
+
+impl FilesystemScope {
+    pub fn is_host(self) -> bool {
+        matches!(self, Self::Host)
+    }
+}
+
+/// Whether native file mutation tools are available.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAccessMode {
+    /// Reads and directory/search tools only. Write/edit tools fail directly.
+    ReadOnly,
+    /// Reads and writes are allowed, subject to [`FilesystemScope`].
+    #[default]
+    ReadWrite,
+}
+
+impl FileAccessMode {
+    pub fn allows_write(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
+/// Network policy recorded by the permission profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPolicy {
+    /// Keep the inherited sandbox network setting.
+    #[default]
+    Inherit,
+    /// Force network access on for the effective sandbox.
+    Allowed,
+}
+
+/// User-facing permission profile resolved by the runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProfile {
+    /// Read-only workspace access.
+    ReadOnly,
+    /// Read/write access inside the workspace.
+    #[default]
+    WorkspaceWrite,
+    /// Codex-style dangerous mode: no approvals, no sandbox, host filesystem.
+    DangerFullAccess,
+}
+
+impl PermissionProfile {
+    pub fn is_dangerous(self) -> bool {
+        matches!(self, Self::DangerFullAccess)
+    }
+}
+
+/// Runtime context used to gate dangerous profiles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    /// Local single-user coding mode.
+    Solo,
+    /// Local server/dashboard mode that may still host multiple profiles.
+    #[default]
+    Local,
+    /// Tenant tunnel mode.
+    Tenant,
+    /// Hosted/cloud relay mode.
+    Cloud,
+}
+
+impl RuntimeMode {
+    pub fn allows_dangerous(self) -> bool {
+        matches!(self, Self::Solo)
+    }
+}
+
+/// Error returned when a requested permission profile is disallowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionProfileError {
+    pub requested: PermissionProfile,
+    pub runtime_mode: RuntimeMode,
+}
+
+impl fmt::Display for PermissionProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "permission profile {:?} is not allowed in {:?} runtime mode",
+            self.requested, self.runtime_mode
+        )
+    }
+}
+
+impl std::error::Error for PermissionProfileError {}
+
+/// Effective runtime permissions after profile + runtime-mode gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectivePermissions {
+    pub permission_profile: PermissionProfile,
+    pub approval_policy: ApprovalPolicy,
+    pub filesystem_scope: FilesystemScope,
+    pub file_access: FileAccessMode,
+    pub network: NetworkPolicy,
+}
+
+impl Default for EffectivePermissions {
+    fn default() -> Self {
+        Self::workspace_write()
+    }
+}
+
+impl EffectivePermissions {
+    /// Workspace read/write defaults. Approval behavior remains interactive.
+    pub fn workspace_write() -> Self {
+        Self {
+            permission_profile: PermissionProfile::WorkspaceWrite,
+            approval_policy: ApprovalPolicy::Ask,
+            filesystem_scope: FilesystemScope::Workspace,
+            file_access: FileAccessMode::ReadWrite,
+            network: NetworkPolicy::Inherit,
+        }
+    }
+
+    /// Workspace read-only defaults. Approval behavior remains interactive.
+    pub fn read_only() -> Self {
+        Self {
+            permission_profile: PermissionProfile::ReadOnly,
+            approval_policy: ApprovalPolicy::Ask,
+            filesystem_scope: FilesystemScope::Workspace,
+            file_access: FileAccessMode::ReadOnly,
+            network: NetworkPolicy::Inherit,
+        }
+    }
+
+    /// Dangerous full host access. This is only valid after runtime-mode gating.
+    pub fn danger_full_access() -> Self {
+        Self {
+            permission_profile: PermissionProfile::DangerFullAccess,
+            approval_policy: ApprovalPolicy::Never,
+            filesystem_scope: FilesystemScope::Host,
+            file_access: FileAccessMode::ReadWrite,
+            network: NetworkPolicy::Allowed,
+        }
+    }
+
+    /// Resolve a requested permission profile for a concrete runtime mode.
+    pub fn for_runtime(
+        requested: PermissionProfile,
+        runtime_mode: RuntimeMode,
+    ) -> Result<Self, PermissionProfileError> {
+        if requested.is_dangerous() && !runtime_mode.allows_dangerous() {
+            return Err(PermissionProfileError {
+                requested,
+                runtime_mode,
+            });
+        }
+        Ok(match requested {
+            PermissionProfile::ReadOnly => Self::read_only(),
+            PermissionProfile::WorkspaceWrite => Self::workspace_write(),
+            PermissionProfile::DangerFullAccess => Self::danger_full_access(),
+        })
+    }
+
+    /// Override approval behavior without changing sandbox or filesystem scope.
+    pub fn with_approval_policy(mut self, approval_policy: ApprovalPolicy) -> Self {
+        self.approval_policy = approval_policy;
+        self
+    }
+
+    /// True only for the explicit dangerous full-access profile.
+    pub fn is_dangerous(self) -> bool {
+        self.permission_profile.is_dangerous()
+    }
+
+    /// Apply this permission profile to an inherited sandbox configuration.
+    pub fn apply_to_sandbox(self, inherited: &SandboxConfig) -> SandboxConfig {
+        let mut sandbox = inherited.clone();
+        if self.is_dangerous() {
+            sandbox.enabled = false;
+            sandbox.mode = SandboxMode::None;
+            sandbox.allow_network = true;
+            return sandbox;
+        }
+        if matches!(self.network, NetworkPolicy::Allowed) {
+            sandbox.allow_network = true;
+        }
+        sandbox
+    }
+
+    /// Build the shell command policy for these permissions.
+    pub fn shell_command_policy(self) -> Arc<dyn CommandPolicy> {
+        if self.is_dangerous() {
+            Arc::new(AllowAllPolicy)
+        } else {
+            Arc::new(SafePolicy::default())
+        }
+    }
 }
 
 /// Policy for approving command execution.
@@ -211,5 +441,57 @@ mod tests {
         assert_eq!(policy.check("sudo ls", Path::new("/tmp")), Decision::Ask);
         // Pattern at end of string
         assert_eq!(policy.check("run sudo", Path::new("/tmp")), Decision::Ask);
+    }
+
+    #[test]
+    fn never_approval_does_not_imply_host_or_sandbox_bypass() {
+        let base = SandboxConfig::default();
+        let permissions =
+            EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
+        let sandbox = permissions.apply_to_sandbox(&base);
+
+        assert_eq!(permissions.approval_policy, ApprovalPolicy::Never);
+        assert_eq!(permissions.filesystem_scope, FilesystemScope::Workspace);
+        assert_eq!(permissions.file_access, FileAccessMode::ReadWrite);
+        assert!(sandbox.enabled);
+        assert_eq!(sandbox.mode, SandboxMode::Auto);
+        assert!(!sandbox.allow_network);
+    }
+
+    #[test]
+    fn dangerous_profile_requires_solo_runtime() {
+        for runtime_mode in [RuntimeMode::Local, RuntimeMode::Tenant, RuntimeMode::Cloud] {
+            let err = EffectivePermissions::for_runtime(
+                PermissionProfile::DangerFullAccess,
+                runtime_mode,
+            )
+            .unwrap_err();
+            assert_eq!(err.requested, PermissionProfile::DangerFullAccess);
+            assert_eq!(err.runtime_mode, runtime_mode);
+        }
+
+        let permissions = EffectivePermissions::for_runtime(
+            PermissionProfile::DangerFullAccess,
+            RuntimeMode::Solo,
+        )
+        .expect("solo mode may opt into dangerous");
+        assert!(permissions.is_dangerous());
+        assert_eq!(permissions.approval_policy, ApprovalPolicy::Never);
+        assert_eq!(permissions.filesystem_scope, FilesystemScope::Host);
+    }
+
+    #[test]
+    fn dangerous_profile_disables_sandbox_and_allows_network() {
+        let base = SandboxConfig {
+            enabled: true,
+            mode: SandboxMode::Docker,
+            allow_network: false,
+            ..SandboxConfig::default()
+        };
+        let sandbox = EffectivePermissions::danger_full_access().apply_to_sandbox(&base);
+
+        assert!(!sandbox.enabled);
+        assert_eq!(sandbox.mode, SandboxMode::None);
+        assert!(sandbox.allow_network);
     }
 }

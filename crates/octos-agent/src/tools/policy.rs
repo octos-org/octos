@@ -185,7 +185,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:research",
         description: "Deep multi-round web research and synthesis",
-        tools: &["deep_search", "synthesize_research", "deep_crawl"],
+        tools: &["search", "synthesize_research", "deep_crawl"],
     },
     ToolGroupInfo {
         name: "group:admin",

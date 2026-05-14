@@ -8,17 +8,32 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
+use crate::policy::{FileAccessMode, FilesystemScope};
 
 /// Tool for editing files via unified diff format with fuzzy matching.
 pub struct DiffEditTool {
     base_dir: PathBuf,
+    filesystem_scope: FilesystemScope,
+    file_access: FileAccessMode,
 }
 
 impl DiffEditTool {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
+            file_access: FileAccessMode::ReadWrite,
         }
+    }
+
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
+    }
+
+    pub fn with_file_access(mut self, file_access: FileAccessMode) -> Self {
+        self.file_access = file_access;
+        self
     }
 }
 
@@ -81,8 +96,20 @@ impl Tool for DiffEditTool {
         let input: DiffEditInput =
             serde_json::from_value(args.clone()).wrap_err("invalid diff_edit input")?;
 
+        if !self.file_access.allows_write() {
+            return Ok(ToolResult {
+                output: "diff_edit is not permitted by read-only filesystem access".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Resolve path (with traversal protection)
-        let path = match super::resolve_path(&self.base_dir, &input.path) {
+        let path = match super::resolve_path_with_scope(
+            &self.base_dir,
+            &input.path,
+            self.filesystem_scope,
+        ) {
             Ok(p) => p,
             Err(_) => {
                 return Ok(ToolResult {

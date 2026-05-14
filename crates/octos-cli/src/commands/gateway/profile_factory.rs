@@ -742,7 +742,7 @@ impl ProfileActorFactoryBuilder {
 
             tools.set_base_tools([
                 "run_pipeline",
-                "deep_search",
+                "search",
                 "deep_crawl",
                 "web_search",
                 "web_fetch",

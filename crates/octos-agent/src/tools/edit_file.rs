@@ -8,11 +8,16 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::{ConcurrencyClass, Tool, ToolContext, ToolResult};
+use crate::policy::{FileAccessMode, FilesystemScope};
 
 /// Tool for editing files via string replacement.
 pub struct EditFileTool {
     /// Base directory for resolving relative paths.
     base_dir: PathBuf,
+    /// Effective filesystem scope.
+    filesystem_scope: FilesystemScope,
+    /// Whether writes are permitted.
+    file_access: FileAccessMode,
 }
 
 impl EditFileTool {
@@ -20,7 +25,21 @@ impl EditFileTool {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
+            file_access: FileAccessMode::ReadWrite,
         }
+    }
+
+    /// Set the effective filesystem scope.
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
+    }
+
+    /// Set the effective file access mode.
+    pub fn with_file_access(mut self, file_access: FileAccessMode) -> Self {
+        self.file_access = file_access;
+        self
     }
 }
 
@@ -87,8 +106,20 @@ impl Tool for EditFileTool {
         let input: EditFileInput =
             serde_json::from_value(args.clone()).wrap_err("invalid edit_file tool input")?;
 
+        if !self.file_access.allows_write() {
+            return Ok(ToolResult {
+                output: "edit_file is not permitted by read-only filesystem access".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Resolve path (with traversal protection)
-        let path = match super::resolve_path(&self.base_dir, &input.path) {
+        let path = match super::resolve_path_with_scope(
+            &self.base_dir,
+            &input.path,
+            self.filesystem_scope,
+        ) {
             Ok(p) => p,
             Err(_) => {
                 return Ok(ToolResult {

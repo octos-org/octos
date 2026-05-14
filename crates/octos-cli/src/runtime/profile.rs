@@ -596,6 +596,67 @@ impl ProfileRuntime {
         tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
 
+        // REG-7 follow-up: register `run_pipeline` at profile scope so
+        // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
+        // it just like the gateway path does at
+        // `crates/octos-cli/src/session_actor.rs:2283-2305`. The serve
+        // path is the one `octos serve` mounts for web clients; prior
+        // to this, only the gateway (octos chat / bus channels)
+        // registered `run_pipeline`, so the LLM in serve mode received
+        // `"No tools matched"` when it tried `activate_tools(["run_pipeline"])`
+        // for `深度研究X` queries (per PR #930's ACT-DIRECTLY rule).
+        //
+        // The original M11-D split-out at `e01a07e4` (PR #764) called
+        // this gap out as a follow-up but never landed; PR #903
+        // restored 6 of 10 regressions and explicitly deferred this
+        // one. PR #930's prompt rewrite — which makes the LLM call
+        // `run_pipeline` directly rather than wrapping it in `spawn`
+        // — turned the latent gap into an observable production
+        // failure on the dspfac profile (May 13 2026).
+        //
+        // Profile scope is sufficient: `RunPipelineTool` only captures
+        // `llm` / `memory` / `data_dir` / `plugin_dirs` / optional
+        // `adaptive_router` / `provider_policy`, all of which are
+        // profile-level. Per-session workspace context is threaded
+        // separately via `PipelineHostContext` at execute time (see
+        // `crates/octos-pipeline/src/tool.rs::execute`).
+        //
+        // `mark_spawn_only` keeps the tool out of LRU eviction and
+        // tells the execution loop to background the call so the chat
+        // bubble doesn't block on the long-running pipeline. The
+        // message text mirrors session_actor.rs:2287-2291 verbatim.
+        {
+            // `RunPipelineTool::with_provider_router` takes
+            // `octos_llm::ProviderRouter` (a sub-provider routing
+            // registry assembled from `config.sub_providers` in the
+            // gateway path). The serve path doesn't build that table
+            // — the adaptive router that lives on `ProfileRuntime`
+            // is `AdaptiveRouter`, a distinct concrete type for
+            // top-level multi-provider QoS routing. Skipping
+            // `with_provider_router` here is correct; the
+            // `default_provider` we hand in (`llm`) is already wrapped
+            // by `RetryProvider` → `ProviderChain` → `AdaptiveRouter`
+            // when adaptive is configured, so per-node calls still
+            // fan out through the adaptive layer.
+            let pt = octos_pipeline::RunPipelineTool::new(
+                llm.clone(),
+                memory.clone(),
+                data_dir.to_path_buf(),
+                data_dir.to_path_buf(),
+            )
+            .with_provider_policy(config.tool_policy.clone())
+            .with_plugin_dirs(plugin_dirs.clone())
+            .with_octos_home(effective_octos_home.clone());
+            tools.register(pt);
+            tools.mark_spawn_only(
+                "run_pipeline",
+                Some(
+                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
+                        .to_string(),
+                ),
+            );
+        }
+
         // M11-F regression fix REG-2: restore the CronTool registration.
         //
         // Pre-M11-F `serve.rs::try_create_agent` built one `CronService`

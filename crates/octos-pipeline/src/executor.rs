@@ -822,7 +822,23 @@ impl PipelineExecutor {
         handlers: HandlerRegistry,
     ) -> Result<PipelineResult> {
         // Parse and validate
-        let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        let mut graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+
+        // Replace the historical pipeline-guard plugin's
+        // before_tool_call hook with an in-process pass that fills
+        // `node.model` / `node.planner_model` for any node the LLM
+        // left unset, using the profile's `model_catalog.json` /
+        // `pipeline_models.json`.
+        //
+        // The plugin form has been observed to silently degrade when
+        // its manifest fails to parse on daemon bootstrap (load order
+        // race); since this assignment is correctness-critical for
+        // strong-vs-fast cost/quality routing across nodes, moving it
+        // in-process makes the behavior deterministic. See
+        // `book/src/skill-development.md`'s "Before You Start: Skill
+        // vs. Workspace Contract" rubric and the pipeline-guard case
+        // study for the full rationale.
+        crate::model_assignment::assign_from_catalog_dir(&mut graph, &self.config.working_dir);
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph

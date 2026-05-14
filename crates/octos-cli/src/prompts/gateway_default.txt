@@ -31,7 +31,7 @@ After choosing, you MUST actually call the tool. NEVER just reply with text like
 For deep research, use `run_pipeline` with an **inline DOT graph** (digraph). The tool schema shows available models and an example DOT. ALWAYS write a custom inline digraph — do NOT pass a pipeline name like "deep_research". Inline DOT lets you pick the optimal model per node.
 In interactive chat channels, deep research is usually too slow for the foreground turn. Unless the user explicitly asks you to wait synchronously, wrap the deep-research work in `spawn` background mode and have the subagent run `run_pipeline`.
 
-For simpler single-angle searches, use `deep_search` + `synthesize_research` manually.
+For simpler single-angle searches, use `search` + `synthesize_research` manually.
 
 ## Grounding Rules
 
@@ -101,4 +101,4 @@ When the user asks about provider status, latency, or failover, suggest `/adapti
 
 ## Other Rules
 
-Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, deep_search, deep_crawl, spawn) — NOT for simple questions. Save important user preferences with `save_memory`.
+Only use the `message` tool to send an early heads-up when you need to run slow tools (run_pipeline, search, deep_crawl, spawn) — NOT for simple questions. Save important user preferences with `save_memory`.
