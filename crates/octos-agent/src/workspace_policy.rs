@@ -771,6 +771,20 @@ impl WorkspacePolicy {
             // `bgm_placeholder_line_*.wav` — those filenames are emitted
             // by mofa-podcast as intentionally-silent inter-segment pauses
             // and would never pass a non-silent ratio check.
+            //
+            // Stale-segment concern: this glob does NOT apply the
+            // `task_started_at` look-back filter that `resolve_artifacts`
+            // uses (the validator runner doesn't see that timestamp).
+            // Same caveat applies to the pre-existing whole-file
+            // `AudioNonSilent` above (`skill-output/mofa-podcast/*.mp3`),
+            // so this is a shared harness invariant rather than a
+            // regression. In practice mofa-skills #59 clears
+            // `<output_dir>/segments/` at the start of every invocation
+            // (`generate_podcast::seg_dir` cleanup), so stale segments
+            // only matter for unusual concurrent-run workflows. A future
+            // follow-up can plumb `task_started_at` into the validator
+            // runner to filter per-file matches by mtime, which would
+            // close the gap for both validators in one shot.
             on_completion: vec![
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                     glob: "skill-output/mofa-podcast/*.mp3".into(),
