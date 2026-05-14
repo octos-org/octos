@@ -447,7 +447,12 @@ impl ServeCommand {
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(self.port, auth_token.clone()),
+                .with_serve_config(self.port, auth_token.clone())
+                // Section B (codex review round-5 P1.2): every spawned
+                // gateway inherits the host's strict-signing policy via
+                // an env var. `Config::from_file` OR-merges it onto the
+                // gateway's effective `plugins.require_signed`.
+                .with_host_plugins_require_signed(config.plugins.require_signed),
         );
         process_manager.set_self_ref();
 

@@ -284,6 +284,11 @@ impl PluginLoader {
         let manifest_path = plugin_dir.join("manifest.json");
         let content = std::fs::read_to_string(&manifest_path)
             .map_err(|e| eyre::eyre!("no manifest.json: {e}"))?;
+        // Section C (codex review round-5 P1.1): compute manifest digest at
+        // load time so the pre-spawn re-hash gate can detect manifest
+        // tampering between load and invocation. Strict mode propagates
+        // this hash to `PluginTool` below; permissive mode discards it.
+        let manifest_load_hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         let manifest: PluginManifest = serde_json::from_str(&content)
             .map_err(|e| eyre::eyre!("invalid manifest.json: {e}"))?;
 
@@ -550,6 +555,16 @@ impl PluginLoader {
                 // unconditionally (`require_signed` propagated to the tool).
                 if manifest.sha256.is_some() || require_signed {
                     tool = tool.with_verified_sha256(load_time_hash.clone(), require_signed);
+                }
+                // Section C (codex review round-5 P1.1): also stash the
+                // manifest digest under strict mode so a runtime manifest
+                // swap (changing `risk`, `env`, schemas) is detected at
+                // the pre-spawn gate.
+                if require_signed {
+                    tool = tool.with_manifest_sha256(
+                        manifest_load_hash.clone(),
+                        manifest_path.clone(),
+                    );
                 }
                 if let Some(dir) = work_dir {
                     tool = tool.with_work_dir(dir.to_path_buf());
@@ -1446,6 +1461,59 @@ mod tests {
         assert!(
             result.output.contains("hash mismatch"),
             "refusal message must explain the cause; got: {}",
+            result.output
+        );
+    }
+
+    /// Section C (codex review round-5 P1.1): under strict signing, a
+    /// manifest tampered with between load and invocation is detected by
+    /// the pre-spawn gate. We swap the manifest.json bytes on disk
+    /// AFTER `load_into` returns and assert the next `execute()` refuses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_spawn_rehash_detects_manifest_swap_under_strict() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("manifest-swap");
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let exec_content = b"#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'";
+        let hash = format!("{:x}", Sha256::digest(exec_content));
+        let manifest = format!(
+            r#"{{"name": "manifest-swap", "version": "1.0", "sha256": "{hash}", "tools": [{{"name": "ms_tool", "description": "d"}}]}}"#
+        );
+        std::fs::write(plugin_dir.join("manifest.json"), &manifest).unwrap();
+        let exec_path = plugin_dir.join("manifest-swap");
+        std::fs::write(&exec_path, exec_content).unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        PluginLoader::load_into_with_options(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions {
+                work_dir: None,
+                synthesis_config: None,
+                require_signed: true,
+            },
+        )
+        .unwrap();
+
+        // Swap manifest.json on disk to a different value. Note: we keep
+        // the same `name` so registry lookup still works, but altered
+        // `version` ensures the bytes differ.
+        let tampered = manifest.replace("\"version\": \"1.0\"", "\"version\": \"99.9\"");
+        std::fs::write(plugin_dir.join("manifest.json"), tampered).unwrap();
+
+        let tool = registry.get("ms_tool").expect("tool registered");
+        let result = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(!result.success, "tampered manifest must not succeed");
+        assert!(
+            result.output.contains("manifest.json hash mismatch"),
+            "refusal message must call out the manifest mismatch; got: {}",
             result.output
         );
     }

@@ -98,6 +98,19 @@ pub struct PluginTool {
     /// swapped between load and exec (closes the load→exec TOCTOU window).
     /// `None` when no hash was computed (legacy code paths).
     verified_exe_sha256: Option<String>,
+    /// Section C (codex review round-5 P1.1): SHA-256 (lowercase hex) of
+    /// the manifest.json bytes computed at load time. Under strict
+    /// signing this acts as a "load-time tamper anchor" — manifest
+    /// declarations (`risk`, `env`, tool schemas) are NOT covered by
+    /// `manifest.sha256`, so we hash the manifest separately at load
+    /// time and re-check on every invocation. A mismatch catches runtime
+    /// tampering of the manifest after the runtime started. Tampering
+    /// BEFORE the loader runs remains an operator responsibility
+    /// (filesystem integrity tooling).
+    manifest_sha256: Option<String>,
+    /// Section C: the resolved manifest.json path so the pre-spawn
+    /// re-hash gate can rehash it. Set alongside `manifest_sha256`.
+    manifest_path: Option<PathBuf>,
     /// Section C: when `true`, the pre-spawn re-hash gate ALWAYS fires (and
     /// `verified_exe_sha256` must be `Some`). When `false`, the gate is
     /// skipped on unverified plugins to keep the legacy path cheap.
@@ -119,6 +132,8 @@ impl PluginTool {
             timeout: Self::DEFAULT_TIMEOUT,
             synthesis_config: None,
             verified_exe_sha256: None,
+            manifest_sha256: None,
+            manifest_path: None,
             require_signed: false,
         }
     }
@@ -131,6 +146,18 @@ impl PluginTool {
     pub fn with_verified_sha256(mut self, hash: String, require_signed: bool) -> Self {
         self.verified_exe_sha256 = Some(hash);
         self.require_signed = require_signed;
+        self
+    }
+
+    /// Section C (codex review round-5 P1.1): attach the load-time
+    /// SHA-256 of the manifest.json bytes. Only consulted under
+    /// `require_signed`. A mismatch at invocation refuses to spawn —
+    /// catches manifest tampering between load and invocation (which
+    /// could otherwise reduce `risk`, expand `env`, or alter tool
+    /// schemas without invalidating the executable hash).
+    pub fn with_manifest_sha256(mut self, hash: String, manifest_path: PathBuf) -> Self {
+        self.manifest_sha256 = Some(hash);
+        self.manifest_path = Some(manifest_path);
         self
     }
 
@@ -176,6 +203,103 @@ impl PluginTool {
         Ok(format!("{:x}", Sha256::digest(&bytes)))
     }
 
+    /// Section C (codex review round-5 P2 + P1.1): single source of truth
+    /// for the pre-spawn re-hash gate. Returns `Some(ToolResult)` when
+    /// the gate refuses (executable mismatch / manifest mismatch /
+    /// missing hash under strict mode / I/O error); `None` when the
+    /// gate passes or is intentionally skipped.
+    ///
+    /// Called twice in `execute()`: once before the approval round-trip
+    /// (so a tampered-at-load binary or manifest is detected
+    /// immediately) and once immediately before `cmd.spawn()` (so the
+    /// approval delay window cannot be used to swap either file).
+    fn check_verified_exe_hash(&self) -> Option<ToolResult> {
+        // Executable check.
+        if let Some(expected) = &self.verified_exe_sha256 {
+            match Self::rehash_verified_exe(&self.executable) {
+                Ok(actual) if actual == *expected => {
+                    tracing::debug!(
+                        plugin = %self.plugin_name,
+                        tool = %self.tool_def.name,
+                        "pre-spawn re-hash matched"
+                    );
+                }
+                Ok(actual) => {
+                    return Some(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: verified executable hash mismatch \
+                             (expected {expected}, got {actual}). The on-disk binary changed \
+                             between load and invocation.",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                Err(err) => {
+                    return Some(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: failed to re-hash verified executable: {err}",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        } else if self.require_signed {
+            // Fail closed: strict policy is on but the load-time hash was
+            // never recorded. This indicates a wiring bug — never let an
+            // unhashed plugin invoke under `require_signed = true`.
+            return Some(ToolResult {
+                output: format!(
+                    "Plugin '{}' refused to spawn: `plugins.require_signed` is enabled but \
+                     no load-time hash was recorded for this tool (internal wiring error).",
+                    self.plugin_name
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        // Section C (codex review round-5 P1.1): manifest check. Under
+        // strict signing, we hashed manifest.json at load time and
+        // stored the digest. A mismatch now means the manifest was
+        // tampered with between load and invocation — refuse to spawn
+        // because `manifest.tools[].risk` / `env` / schemas may have
+        // been altered to bypass the approval gate or to widen the env
+        // allowlist.
+        if let (Some(expected), Some(path)) = (&self.manifest_sha256, &self.manifest_path) {
+            match Self::rehash_verified_exe(path) {
+                Ok(actual) if actual == *expected => {}
+                Ok(actual) => {
+                    return Some(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: manifest.json hash mismatch \
+                             (expected {expected}, got {actual}). The manifest changed \
+                             between load and invocation.",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                Err(err) => {
+                    return Some(ToolResult {
+                        output: format!(
+                            "Plugin '{}' refused to spawn: failed to re-hash manifest.json: {err}",
+                            self.plugin_name
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
     /// Create a copy of this plugin tool with a different work directory.
     /// Used to give each user session its own workspace for plugin output.
     pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
@@ -189,6 +313,8 @@ impl PluginTool {
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
             verified_exe_sha256: self.verified_exe_sha256.clone(),
+            manifest_sha256: self.manifest_sha256.clone(),
+            manifest_path: self.manifest_path.clone(),
             require_signed: self.require_signed,
         }
     }
@@ -926,53 +1052,13 @@ impl Tool for PluginTool {
         // `require_signed = false`) the gate is skipped so the legacy
         // unverified path stays cheap. Under `require_signed = true` the
         // loader guarantees `verified_exe_sha256` is populated for every
-        // tool that reached the registry — the assertion below is a
-        // belt-and-braces hard error if something slipped past it.
-        if let Some(expected) = &self.verified_exe_sha256 {
-            match Self::rehash_verified_exe(&self.executable) {
-                Ok(actual) if actual == *expected => {
-                    tracing::debug!(
-                        plugin = %self.plugin_name,
-                        tool = %self.tool_def.name,
-                        "pre-spawn re-hash matched"
-                    );
-                }
-                Ok(actual) => {
-                    return Ok(ToolResult {
-                        output: format!(
-                            "Plugin '{}' refused to spawn: verified executable hash mismatch \
-                             (expected {expected}, got {actual}). The on-disk binary changed \
-                             between load and invocation.",
-                            self.plugin_name
-                        ),
-                        success: false,
-                        ..Default::default()
-                    });
-                }
-                Err(err) => {
-                    return Ok(ToolResult {
-                        output: format!(
-                            "Plugin '{}' refused to spawn: failed to re-hash verified executable: {err}",
-                            self.plugin_name
-                        ),
-                        success: false,
-                        ..Default::default()
-                    });
-                }
-            }
-        } else if self.require_signed {
-            // Fail closed: strict policy is on but the load-time hash was
-            // never recorded. This indicates a wiring bug — never let an
-            // unhashed plugin invoke under `require_signed = true`.
-            return Ok(ToolResult {
-                output: format!(
-                    "Plugin '{}' refused to spawn: `plugins.require_signed` is enabled but \
-                     no load-time hash was recorded for this tool (internal wiring error).",
-                    self.plugin_name
-                ),
-                success: false,
-                ..Default::default()
-            });
+        // tool that reached the registry.
+        //
+        // First call: detect a tampered-at-load binary before we issue an
+        // approval prompt that the user might wait on for minutes. Cheap
+        // up-front rejection of obvious tampering.
+        if let Some(refusal) = self.check_verified_exe_hash() {
+            return Ok(refusal);
         }
 
         // M6 req 4: enforce manifest-declared `risk` field (UPCR-2026-001).
@@ -1132,6 +1218,16 @@ impl Tool for PluginTool {
         }
 
         let effective_args = self.prepare_effective_args(args, ctx.as_ref());
+
+        // Section C (codex review round-5 P2): RE-CHECK the verified-exe
+        // hash immediately before spawn. The approval round-trip above
+        // can take arbitrarily long; if the verified copy on disk was
+        // swapped while the user was being prompted, we must NOT spawn
+        // the swapped bytes. This second check closes the
+        // approval→spawn TOCTOU window.
+        if let Some(refusal) = self.check_verified_exe_hash() {
+            return Ok(refusal);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(child) => child,

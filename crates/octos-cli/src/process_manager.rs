@@ -47,6 +47,12 @@ pub struct ProcessManager {
     admin_token: Option<String>,
     /// Weak self-reference for auto-restart from spawned tasks.
     self_ref: std::sync::Mutex<Option<std::sync::Weak<ProcessManager>>>,
+    /// Section B (codex review round-5 P1.2): host-level
+    /// `plugins.require_signed` policy that spawned gateway processes
+    /// must inherit. When `true`, every gateway gets
+    /// `OCTOS_PLUGINS_REQUIRE_SIGNED=1` in its env so its `Config::from_file`
+    /// OR-merges the flag onto whatever the profile JSON declared.
+    host_plugins_require_signed: bool,
 }
 
 struct GatewayProcess {
@@ -128,7 +134,17 @@ impl ProcessManager {
             serve_port: None,
             admin_token: None,
             self_ref: std::sync::Mutex::new(None),
+            host_plugins_require_signed: false,
         }
+    }
+
+    /// Section B (codex review round-5 P1.2): mirror the host's
+    /// `plugins.require_signed` onto every spawned gateway via
+    /// `OCTOS_PLUGINS_REQUIRE_SIGNED=1`. Default is `false` (legacy
+    /// permissive path).
+    pub fn with_host_plugins_require_signed(mut self, require_signed: bool) -> Self {
+        self.host_plugins_require_signed = require_signed;
+        self
     }
 
     /// Store a weak self-reference for auto-restart from spawned monitor tasks.
@@ -310,6 +326,15 @@ impl ProcessManager {
             if let Some(ref token) = self.admin_token {
                 cmd.env("OCTOS_ADMIN_TOKEN", token);
             }
+        }
+
+        // Section B (codex review round-5 P1.2): mirror the host's
+        // strict-signing policy to every spawned gateway. `Config::from_file`
+        // OR-merges `OCTOS_PLUGINS_REQUIRE_SIGNED` onto whatever the
+        // profile JSON declares so a host-only `plugins.require_signed = true`
+        // still propagates to managed sub-gateways.
+        if self.host_plugins_require_signed {
+            cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
         }
 
         // Inject email config as env vars for the send_email plugin.

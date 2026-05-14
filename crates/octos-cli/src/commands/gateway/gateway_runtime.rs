@@ -166,7 +166,7 @@ impl GatewayRuntime {
             cmd.profile.as_deref().map(|p| p.display().to_string())
         );
         let mut admin_mode = false;
-        let config = if let Some(ref profile_path) = cmd.profile {
+        let mut config = if let Some(ref profile_path) = cmd.profile {
             // Load config from profile JSON (single source of truth)
             let content = std::fs::read_to_string(profile_path)
                 .wrap_err_with(|| format!("failed to read profile: {}", profile_path.display()))?;
@@ -216,6 +216,12 @@ impl GatewayRuntime {
         } else {
             Config::load(&cwd, &data_dir)?
         };
+        // Section B (codex review round-5 P1.2): the `--profile` path
+        // bypasses `Config::from_file`, so call the same env-var OR-merge
+        // helper here. A host-level `plugins.require_signed = true`
+        // propagates to spawned gateways via
+        // `OCTOS_PLUGINS_REQUIRE_SIGNED=1` (set by `ProcessManager`).
+        crate::config::merge_env_plugin_policy_pub(&mut config);
 
         // Track whether any CLI override (`--model`, `--provider`,
         // `--base-url`) was supplied; `ProfileRuntime::bootstrap` is
@@ -289,10 +295,20 @@ impl GatewayRuntime {
         let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
             resolved_profile.as_ref().filter(|_| !cli_llm_override)
         {
-            // Section B (codex review round-3): thread the host's
-            // `plugins.require_signed` into the per-profile bootstrap so
-            // strict signing applies even when the profile JSON omits
-            // the flag.
+            // Section B (codex review round-3 + round-5 P1.2): thread the
+            // host's `plugins.require_signed` into the per-profile
+            // bootstrap so strict signing applies even when the profile
+            // JSON omits the flag.
+            //
+            // In the `--profile` managed path `config` is derived from the
+            // profile JSON, so `config.plugins.require_signed` mirrors
+            // whatever the profile declared. The host-level policy
+            // reaches this branch via `OCTOS_PLUGINS_REQUIRE_SIGNED`
+            // (set by `ProcessManager` in `octos serve`), which
+            // `Config::from_file` already OR-merges onto `config.plugins`
+            // for the `--config` path. We forward `config.plugins` here
+            // and `bootstrap_with_host_plugins` then OR-merges it onto
+            // the profile-derived config, closing the loop.
             match ProfileRuntime::bootstrap_with_host_plugins(
                 profile,
                 &data_dir,
