@@ -1769,4 +1769,188 @@ mod tests {
         );
         assert!(warn.is_soft_warning());
     }
+
+    /// Helper used by the `podcast_generate` per-file-non-silent e2e
+    /// tests. PCM WAV with a sine wave loud enough to clear the
+    /// validator's non-silent-sample floor.
+    fn write_sine_wav_at(path: &std::path::Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create_dir_all");
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        let amplitude = i16::MAX / 2;
+        for index in 0..samples {
+            let phase = (index as f32) * std::f32::consts::TAU * 440.0 / 8000.0;
+            let value = (phase.sin() * amplitude as f32) as i16;
+            // Keep value away from zero crossings to ensure non-silent floor.
+            let value = if value.abs() < 4_000 { 4_000 } else { value };
+            writer.write_sample(value).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    /// Companion to [`write_sine_wav_at`]: a WAV filled with PCM zeros so
+    /// the validator's non-silent ratio drops to 0.0. Used to drive the
+    /// per-file failure path.
+    fn write_silent_wav_at(path: &std::path::Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create_dir_all");
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        for _ in 0..samples {
+            writer.write_sample(0i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    /// Rewire the `podcast_generate` contract's MP3-targeted whole-file
+    /// validators to WAV equivalents so we can drive the gate with real
+    /// `hound` output (without requiring the `audio_mp3` feature). Keeps
+    /// the `PerFileNonSilent` validator unchanged so the segment-level
+    /// gate runs as configured.
+    fn retarget_podcast_contract_to_wav(policy: &mut crate::WorkspacePolicy) {
+        use crate::workspace_policy::{MagicByteKind, SpawnTaskValidatorSpec, ValidatorSpec};
+        let task = policy
+            .spawn_tasks
+            .get_mut("podcast_generate")
+            .expect("podcast_generate must exist in for_session policy");
+        for entry in task.on_completion.iter_mut() {
+            if let SpawnTaskValidatorSpec::Bare(spec) = entry {
+                match spec {
+                    ValidatorSpec::AudioNonSilent { glob, .. } => {
+                        *glob = "skill-output/mofa-podcast/*.wav".into();
+                    }
+                    ValidatorSpec::MagicBytes { glob, format } => {
+                        *glob = "skill-output/mofa-podcast/*.wav".into();
+                        *format = MagicByteKind::Wav;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Wave-3b end-to-end: when every preserved segment WAV is non-silent
+    /// AND the assembled artifact is non-silent, the combined contract
+    /// gate (MagicBytes + AudioNonSilent whole-file + PerFileNonSilent
+    /// per-segment) must satisfy.
+    #[tokio::test]
+    async fn podcast_contract_satisfies_when_all_segments_and_final_mix_are_non_silent() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = crate::WorkspacePolicy::for_session();
+        retarget_podcast_contract_to_wav(&mut policy);
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        // The assembled (whole-file) artifact. Drives MagicBytes + the
+        // whole-file AudioNonSilent.
+        let assembled = temp.path().join("skill-output/mofa-podcast/podcast.wav");
+        // 16-bit mono PCM at 8 kHz needs ~2000+ samples to clear the
+        // `file_size_min:$artifact:4096` policy gate.
+        write_sine_wav_at(&assembled, 4_000);
+
+        // The preserved per-segment WAVs that mofa-skills #59 leaves on
+        // disk after successful assembly. The PerFileNonSilent glob
+        // (`**/segments/seg_*.wav`) scopes to JUST these — placeholder
+        // pause/BGM files share the directory but are excluded.
+        let seg_dir = temp
+            .path()
+            .join("skill-output/mofa-podcast/episode_001/segments");
+        write_sine_wav_at(&seg_dir.join("seg_000_alice.wav"), 800);
+        write_sine_wav_at(&seg_dir.join("seg_001_bob.wav"), 800);
+        write_silent_wav_at(&seg_dir.join("pause_after_000.wav"), 400);
+        write_silent_wav_at(&seg_dir.join("pause_line_001.wav"), 400);
+        write_silent_wav_at(&seg_dir.join("bgm_placeholder_line_001.wav"), 400);
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "podcast_generate",
+            "tool-call-podcast-happy",
+            std::slice::from_ref(&assembled),
+            UNIX_EPOCH,
+            None,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { .. } => {}
+            other => panic!("expected satisfied, got {other:?}"),
+        }
+
+        // Both gates must have fired and persisted to the ledger so
+        // operators can confirm the combined contract ran. We assert on
+        // the typed `kind` discriminator so a future refactor of the
+        // reason string doesn't break this contract.
+        let ledger_path = temp.path().join(".octos").join("validator_outcomes.jsonl");
+        let ledger = crate::validators::ValidatorLedger::open(&ledger_path).unwrap();
+        let outcomes = ledger.read_all().unwrap();
+        assert!(
+            outcomes.iter().any(|o| o.kind == "audio_non_silent"),
+            "whole-file AudioNonSilent must have fired: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.kind == "per_file_non_silent"),
+            "per-segment PerFileNonSilent must have fired: {outcomes:?}"
+        );
+    }
+
+    /// Adversarial e2e: one segment WAV is silent. The whole-file
+    /// AudioNonSilent still passes (the silent gap is averaged out by
+    /// the surrounding loud assembled audio), but PerFileNonSilent
+    /// rejects the spawn task at the gate and surfaces the offending
+    /// segment basename in the typed failure error. This is the bug
+    /// class the variant was introduced to catch.
+    #[tokio::test]
+    async fn podcast_contract_fails_when_a_single_segment_is_silent_even_if_final_mix_is_loud() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = crate::WorkspacePolicy::for_session();
+        retarget_podcast_contract_to_wav(&mut policy);
+        write_workspace_policy(temp.path(), &policy).unwrap();
+
+        // Final mix is fully loud — whole-file AudioNonSilent would
+        // accept it on its own.
+        let assembled = temp.path().join("skill-output/mofa-podcast/podcast.wav");
+        // 16-bit mono PCM at 8 kHz needs ~2000+ samples to clear the
+        // `file_size_min:$artifact:4096` policy gate.
+        write_sine_wav_at(&assembled, 4_000);
+
+        let seg_dir = temp
+            .path()
+            .join("skill-output/mofa-podcast/episode_002/segments");
+        write_sine_wav_at(&seg_dir.join("seg_000_alice.wav"), 800);
+        // The bad apple. PerFileNonSilent must catch this even though
+        // the whole-file validator above does not.
+        write_silent_wav_at(&seg_dir.join("seg_001_bob.wav"), 800);
+        write_sine_wav_at(&seg_dir.join("seg_002_alice.wav"), 800);
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "podcast_generate",
+            "tool-call-podcast-silent-seg",
+            std::slice::from_ref(&assembled),
+            UNIX_EPOCH,
+            None,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("per_file_non_silent") && error.contains("seg_001_bob.wav"),
+                    "failure must surface the offending segment filename: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Podcast generation failed"));
+            }
+            other => panic!("expected failure, got {other:?}"),
+        }
+    }
 }
