@@ -522,6 +522,19 @@ impl ValidatorRunner {
                 ValidatorSpec::AudioNonSilent { glob, min_ratio } => self.run_audio_non_silent(
                     invocation, validator, glob, *min_ratio, started_at, started,
                 ),
+                ValidatorSpec::PerFileNonSilent {
+                    glob,
+                    min_ratio,
+                    require_at_least,
+                } => self.run_per_file_non_silent(
+                    invocation,
+                    validator,
+                    glob,
+                    *min_ratio,
+                    *require_at_least,
+                    started_at,
+                    started,
+                ),
                 ValidatorSpec::MagicBytes { glob, format } => {
                     self.run_magic_bytes(invocation, validator, glob, *format, started_at, started)
                 }
@@ -1164,6 +1177,122 @@ impl ValidatorRunner {
                 validator,
                 ValidatorStatus::Fail,
                 format!("audio_non_silent failed: {}", failures.join("; ")),
+                started_at,
+                started,
+            )
+        }
+    }
+
+    /// Run a [`ValidatorSpec::PerFileNonSilent`] validator: every matched
+    /// file must independently pass the non-silent ratio threshold, and the
+    /// match count must meet `require_at_least`.
+    ///
+    /// Complements [`Self::run_audio_non_silent`], which only requires a
+    /// single match. Reuses the WAV/MP3 decoder via
+    /// [`decode_non_silent_ratio`]. Failure messages include the file's
+    /// basename (NOT the full path) so an LLM logger can reason about which
+    /// segment failed without leaking workspace layout.
+    #[allow(clippy::too_many_arguments)]
+    fn run_per_file_non_silent(
+        &self,
+        invocation: &ValidatorInvocation,
+        validator: &Validator,
+        pattern: &str,
+        min_ratio: f32,
+        require_at_least: usize,
+        started_at: DateTime<Utc>,
+        started: Instant,
+    ) -> ValidatorOutcome {
+        // Interpolate `${args.X}` ONLY (rejects path-traversal segments and
+        // absolute-path arg values). `${output.X}` is intentionally not
+        // supported here — callers wanting tool-output-driven globs should
+        // use the whole-file `AudioNonSilent` variant.
+        let resolved_pattern = match interpolate_args_path(pattern, invocation.input_args.as_ref())
+        {
+            Ok(value) => value,
+            Err(reason) => {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    reason,
+                    started_at,
+                    started,
+                );
+            }
+        };
+        let matches = match glob_files(&invocation.workspace_root, &resolved_pattern) {
+            Ok(matches) => matches,
+            Err(reason) => {
+                return self.make_outcome(
+                    invocation,
+                    validator,
+                    ValidatorStatus::Error,
+                    reason,
+                    started_at,
+                    started,
+                );
+            }
+        };
+
+        // Enforce `require_at_least` as a hard floor on matched count
+        // FIRST — that lets us distinguish "tool emitted zero artifacts"
+        // (a true contract failure when the operator declared a minimum)
+        // from "tool emitted artifacts but one is silent" (the per-file
+        // gate below). The two failure modes warrant different remediation
+        // hints in the ledger.
+        if matches.len() < require_at_least {
+            return self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!(
+                    "per_file_non_silent: expected >={require_at_least} audio files, found {}",
+                    matches.len()
+                ),
+                started_at,
+                started,
+            );
+        }
+
+        let mut failures = Vec::new();
+        for path in &matches {
+            // Per-file basename for diagnostics. We deliberately avoid
+            // emitting the full absolute path so the failure message stays
+            // stable across hosts and doesn't surface a workspace temp
+            // directory (which leaks across CI runs).
+            let label = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unnamed>")
+                .to_string();
+            match decode_non_silent_ratio(path) {
+                Ok(ratio) if ratio >= min_ratio => {}
+                Ok(ratio) => failures.push(format!(
+                    "{label}: non_silent_ratio={ratio:.3} < min_ratio={min_ratio:.3}"
+                )),
+                Err(reason) => failures.push(format!("{label}: {reason}")),
+            }
+        }
+
+        if failures.is_empty() {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Pass,
+                format!(
+                    "per_file_non_silent: all {} match(es) met min_ratio={min_ratio:.3}",
+                    matches.len()
+                ),
+                started_at,
+                started,
+            )
+        } else {
+            self.make_outcome(
+                invocation,
+                validator,
+                ValidatorStatus::Fail,
+                format!("per_file_non_silent failed: {}", failures.join("; ")),
                 started_at,
                 started,
             )
@@ -2121,6 +2250,7 @@ fn validator_kind_label(spec: &ValidatorSpec) -> &'static str {
         ValidatorSpec::HttpProbe { .. } => "http_probe",
         ValidatorSpec::OminixVoiceExists { .. } => "ominix_voice_exists",
         ValidatorSpec::AudioNonSilent { .. } => "audio_non_silent",
+        ValidatorSpec::PerFileNonSilent { .. } => "per_file_non_silent",
         ValidatorSpec::MagicBytes { .. } => "magic_bytes",
         ValidatorSpec::HttpProbeUntil { .. } => "http_probe_until",
         ValidatorSpec::Sha256Match { .. } => "sha256_match",
@@ -2299,6 +2429,14 @@ mod tests {
                 min_ratio: 0.3
             }),
             "audio_non_silent"
+        );
+        assert_eq!(
+            validator_kind_label(&ValidatorSpec::PerFileNonSilent {
+                glob: "**/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            }),
+            "per_file_non_silent"
         );
         assert_eq!(
             validator_kind_label(&ValidatorSpec::MagicBytes {
@@ -3680,5 +3818,224 @@ mod tests {
         assert!(outcomes[0].required, "hard-required must serialize as true");
         assert_eq!(outcomes[0].required_tier, "hard");
         assert!(!outcomes[0].required_gate_passed());
+    }
+
+    // --- PerFileNonSilent --------------------------------------------------
+
+    /// Happy path: three sine-wave segments, all loud. The validator must
+    /// pass and the count of matched files must be surfaced in the reason
+    /// so operators can confirm the glob landed on the expected segments.
+    #[tokio::test]
+    async fn per_file_non_silent_passes_when_all_segments_are_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_sine_wav(&seg_dir.join("seg_000_alice.wav"), 800);
+        write_sine_wav(&seg_dir.join("seg_001_bob.wav"), 800);
+        write_sine_wav(&seg_dir.join("seg_002_alice.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_loud",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("3 match"),
+            "reason should surface match count: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Adversarial path: one of three segments is silent. The validator
+    /// must fail AND surface the offending filename (basename) so an
+    /// operator/LLM can localize which segment to regenerate.
+    #[tokio::test]
+    async fn per_file_non_silent_fails_when_one_segment_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_sine_wav(&seg_dir.join("seg_000_alice.wav"), 800);
+        // The bad apple — silent samples drag the per-file ratio to 0.0.
+        write_silent_wav(&seg_dir.join("seg_001_bob.wav"), 800);
+        write_sine_wav(&seg_dir.join("seg_002_alice.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_silent_segment",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        // Must name the offending file so the failure is actionable.
+        assert!(
+            outcomes[0].reason.contains("seg_001_bob.wav"),
+            "failure must name the silent segment: {}",
+            outcomes[0].reason
+        );
+        // Must include BOTH the measured ratio and the threshold for
+        // ledger diagnostics — this mirrors the AudioNonSilent contract.
+        assert!(
+            outcomes[0].reason.contains("non_silent_ratio")
+                && outcomes[0].reason.contains("min_ratio"),
+            "failure must include measured and threshold ratios: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Zero matches with a positive `require_at_least` must fail with a
+    /// message that surfaces both the expected minimum and the actual
+    /// count. Distinguishes "tool emitted zero artifacts" from
+    /// "tool emitted artifacts but one was silent".
+    #[tokio::test]
+    async fn per_file_non_silent_fails_when_match_count_below_require_at_least() {
+        let dir = tempfile::tempdir().unwrap();
+        // No segments dir at all.
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_min_count",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        // Message must surface BOTH the expected minimum and the actual
+        // count so operators see "expected >=1, found 0" verbatim.
+        assert!(
+            outcomes[0].reason.contains(">=1") && outcomes[0].reason.contains("found 0"),
+            "match-count failure must surface expected vs actual: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// `require_at_least = 0` (the serde default) is a deliberate escape
+    /// hatch: a per-file gate that doesn't ALSO demand a minimum count.
+    /// Zero matches must still be a Pass under that policy so a spawn
+    /// task can declare per-file invariants on optional intermediate
+    /// artifacts without forcing every run to produce them.
+    #[tokio::test]
+    async fn per_file_non_silent_passes_when_require_at_least_zero_and_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_optional",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 0,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// `${args.X}` interpolation must resolve against the spawn task's
+    /// input args, with path-traversal segments rejected. The happy path
+    /// here probes that the interpolated glob actually matches.
+    #[tokio::test]
+    async fn per_file_non_silent_glob_interpolates_args_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("episode42/segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        write_sine_wav(&seg_dir.join("seg_000_host.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_interp",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "${args.episode_dir}/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"episode_dir": "episode42"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// Path-traversal in an arg value (`..`) must be rejected with an
+    /// Error outcome — not silently followed. Mirrors the
+    /// `interpolate_args_path` contract used by Sha256Match.
+    #[tokio::test]
+    async fn per_file_non_silent_rejects_path_traversal_arg_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_traversal",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "${args.episode_dir}/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf())
+            .with_input_args(serde_json::json!({"episode_dir": "../etc"}));
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Error, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains(".."),
+            "error must surface the rejected segment: {}",
+            outcomes[0].reason
+        );
+    }
+
+    /// Confirms the placeholder filenames emitted by mofa-podcast
+    /// (`pause_after_*`, `pause_line_*`, `bgm_placeholder_line_*`) do NOT
+    /// fall under the `**/segments/seg_*.wav` glob, even though they
+    /// share the `segments/` directory. Without this exclusion the per-
+    /// file gate would fire on the intentionally-silent pause WAVs and
+    /// the podcast contract would never pass.
+    #[tokio::test]
+    async fn per_file_non_silent_glob_excludes_placeholder_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg_dir = dir.path().join("segments");
+        std::fs::create_dir_all(&seg_dir).unwrap();
+        // One valid (loud) dialogue segment.
+        write_sine_wav(&seg_dir.join("seg_000_host.wav"), 800);
+        // Inter-speaker pause + line pause + BGM placeholder — all are
+        // legitimately silent because they ARE the pauses.
+        write_silent_wav(&seg_dir.join("pause_after_000.wav"), 800);
+        write_silent_wav(&seg_dir.join("pause_line_001.wav"), 800);
+        write_silent_wav(&seg_dir.join("bgm_placeholder_line_002.wav"), 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_segment_pattern",
+            ValidatorSpec::PerFileNonSilent {
+                glob: "**/segments/seg_*.wav".into(),
+                min_ratio: 0.3,
+                require_at_least: 1,
+            },
+        );
+        let outcomes = runner
+            .run_all(&dummy_invocation(dir.path().to_path_buf()), &[validator])
+            .await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("1 match"),
+            "glob must match exactly 1 dialogue segment, not the 4 files on disk: {}",
+            outcomes[0].reason
+        );
     }
 }

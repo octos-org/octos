@@ -313,6 +313,41 @@ pub enum ValidatorSpec {
         #[serde(default = "default_non_silent_ratio")]
         min_ratio: f32,
     },
+    /// Assert that EVERY file matching `glob` independently meets
+    /// `non_silent_samples / total_samples >= min_ratio`, and that at least
+    /// `require_at_least` files were matched.
+    ///
+    /// Complements [`ValidatorSpec::AudioNonSilent`], which only requires a
+    /// single match to pass. The whole-file variant cannot catch a single
+    /// silent segment in a multi-segment podcast — the silent gap gets
+    /// averaged out by the surrounding speech in the final mix. By validating
+    /// each intermediate segment independently, `PerFileNonSilent` rejects a
+    /// silent segment before delivery, surfacing the offending filename in
+    /// the failure message so the spawn task can rerun the failing TTS call
+    /// on the next round.
+    ///
+    /// `${args.<key>}` interpolation is supported in the glob via
+    /// `interpolate_args_path` (path-traversal segments are rejected,
+    /// absolute-path values are rejected). `${output.<key>}` substitution is
+    /// intentionally NOT supported in this variant — see the
+    /// `decode_non_silent_ratio` doc-string for rationale.
+    ///
+    /// Field semantics:
+    /// * `glob` — workspace-relative glob matched via [`glob::glob`]. WAV and
+    ///   MP3 extensions are decoded; other extensions yield per-file errors.
+    /// * `min_ratio` — applied to EACH matched file. Defaults to
+    ///   [`default_non_silent_ratio`] (0.3).
+    /// * `require_at_least` — minimum number of files that MUST match.
+    ///   `0` (the serde default) disables the minimum so the validator can
+    ///   still pass when no files matched (consistent with optional
+    ///   intermediate artifacts that may not exist in every run).
+    PerFileNonSilent {
+        glob: String,
+        #[serde(default = "default_non_silent_ratio")]
+        min_ratio: f32,
+        #[serde(default)]
+        require_at_least: usize,
+    },
     /// Assert each file matching `glob` has the magic-byte prefix for the
     /// declared `format`. Catches "tool wrote 0 bytes" or "tool wrote an
     /// HTML error page in place of an MP3".
@@ -717,10 +752,39 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:Podcast generation failed".into()],
-            // Catch the two user-visible failure modes from the silent-MP3
-            // bug class: tool wrote zero bytes / an HTML error page in
-            // place of audio (MagicBytes), or tool generated a valid MP3
-            // header but a silent decoded stream (AudioNonSilent).
+            // Catch the three user-visible failure modes from the silent-MP3
+            // bug class:
+            //   1. tool wrote zero bytes / an HTML error page in place of
+            //      audio (MagicBytes).
+            //   2. tool generated a valid MP3 header but a silent decoded
+            //      stream (AudioNonSilent — whole final mix).
+            //   3. one of the intermediate segment WAVs is silent but the
+            //      surrounding non-silent segments mask the gap in the
+            //      assembled MP3 (PerFileNonSilent on the preserved
+            //      `<output_dir>/segments/seg_*.wav` files — mofa-podcast
+            //      preserves segments after successful assembly via the
+            //      Result-aware `SegmentDirCleanup` RAII guard introduced
+            //      in mofa-skills #59).
+            //
+            // The per-file glob `**/segments/seg_*.wav` deliberately
+            // EXCLUDES `pause_after_*.wav`, `pause_line_*.wav`, and
+            // `bgm_placeholder_line_*.wav` — those filenames are emitted
+            // by mofa-podcast as intentionally-silent inter-segment pauses
+            // and would never pass a non-silent ratio check.
+            //
+            // Stale-segment concern: this glob does NOT apply the
+            // `task_started_at` look-back filter that `resolve_artifacts`
+            // uses (the validator runner doesn't see that timestamp).
+            // Same caveat applies to the pre-existing whole-file
+            // `AudioNonSilent` above (`skill-output/mofa-podcast/*.mp3`),
+            // so this is a shared harness invariant rather than a
+            // regression. In practice mofa-skills #59 clears
+            // `<output_dir>/segments/` at the start of every invocation
+            // (`generate_podcast::seg_dir` cleanup), so stale segments
+            // only matter for unusual concurrent-run workflows. A future
+            // follow-up can plumb `task_started_at` into the validator
+            // runner to filter per-file matches by mtime, which would
+            // close the gap for both validators in one shot.
             on_completion: vec![
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                     glob: "skill-output/mofa-podcast/*.mp3".into(),
@@ -729,6 +793,11 @@ impl WorkspacePolicy {
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
                     glob: "skill-output/mofa-podcast/*.mp3".into(),
                     min_ratio: default_non_silent_ratio(),
+                }),
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
+                    glob: "skill-output/mofa-podcast/**/segments/seg_*.wav".into(),
+                    min_ratio: default_non_silent_ratio(),
+                    require_at_least: 1,
                 }),
             ],
         };
@@ -1738,7 +1807,7 @@ ignore = []
             .spawn_tasks
             .get("podcast_generate")
             .expect("podcast contract");
-        // The two new domain validators should be declared so the
+        // The two whole-file domain validators must be declared so the
         // "silent MP3" / "wrote HTML instead of MP3" failure modes are
         // caught at the contract gate.
         assert!(podcast.on_completion.iter().any(|entry| matches!(
@@ -1749,6 +1818,40 @@ ignore = []
             entry,
             SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes { .. })
         )));
+        // The per-segment gate (PerFileNonSilent) catches the silent-
+        // segment failure mode that the whole-file AudioNonSilent cannot
+        // detect: one bad seg_NNN_<voice>.wav whose silent gap gets
+        // averaged out by the surrounding speech in the assembled MP3.
+        // mofa-skills #59 preserves segments after successful assembly
+        // via the Result-aware `SegmentDirCleanup` RAII guard so this
+        // glob actually matches when the harness runs.
+        let per_file = podcast
+            .on_completion
+            .iter()
+            .find_map(|entry| match entry {
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
+                    glob,
+                    min_ratio,
+                    require_at_least,
+                }) => Some((glob.clone(), *min_ratio, *require_at_least)),
+                _ => None,
+            })
+            .expect("podcast_generate must declare PerFileNonSilent on segments");
+        assert!(
+            per_file.0.contains("segments/seg_*.wav"),
+            "PerFileNonSilent glob must scope to segment WAVs to exclude pause/BGM placeholders: {}",
+            per_file.0
+        );
+        assert!(
+            per_file.1 >= 0.3,
+            "min_ratio should be at least the harness default (0.3): {}",
+            per_file.1
+        );
+        assert!(
+            per_file.2 >= 1,
+            "require_at_least must enforce a non-zero floor so an empty segments dir surfaces as a contract failure (got {})",
+            per_file.2,
+        );
 
         let voice_save = policy
             .spawn_tasks
@@ -2028,6 +2131,70 @@ ignore = []
                 assert_eq!(sha256, "${args.expected_sha256}");
             }
             ref other => panic!("expected Sha256Match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_file_non_silent_roundtrips_through_toml() {
+        // Operator-visible TOML shape. `require_at_least` is the
+        // distinguishing field vs. AudioNonSilent — defaulted via serde so
+        // an operator can omit it and still get sensible behaviour.
+        let toml = r#"
+            id = "podcast_segments_non_silent"
+            kind = "per_file_non_silent"
+            glob = "**/segments/seg_*.wav"
+            min_ratio = 0.3
+            require_at_least = 1
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        match parsed.spec {
+            ValidatorSpec::PerFileNonSilent {
+                ref glob,
+                min_ratio,
+                require_at_least,
+            } => {
+                assert_eq!(glob, "**/segments/seg_*.wav");
+                assert!((min_ratio - 0.3).abs() < f32::EPSILON);
+                assert_eq!(require_at_least, 1);
+            }
+            ref other => panic!("expected PerFileNonSilent, got {other:?}"),
+        }
+        // Round-trip the validator through TOML to confirm fields survive.
+        let rendered = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: Validator = toml::from_str(&rendered).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn per_file_non_silent_defaults_require_at_least_and_min_ratio_when_omitted() {
+        // `require_at_least` and `min_ratio` are both `#[serde(default)]`
+        // so operator policies can declare just the glob and inherit the
+        // harness-wide defaults (0 / 0.3). This keeps the TOML shape
+        // minimal for the common "optional intermediate artifact" case.
+        let toml = r#"
+            id = "podcast_segments_non_silent"
+            kind = "per_file_non_silent"
+            glob = "**/segments/seg_*.wav"
+        "#;
+        let parsed: Validator = toml::from_str(toml).unwrap();
+        match parsed.spec {
+            ValidatorSpec::PerFileNonSilent {
+                ref glob,
+                min_ratio,
+                require_at_least,
+            } => {
+                assert_eq!(glob, "**/segments/seg_*.wav");
+                assert!(
+                    (min_ratio - default_non_silent_ratio()).abs() < f32::EPSILON,
+                    "min_ratio must default to {} when omitted, got {min_ratio}",
+                    default_non_silent_ratio()
+                );
+                assert_eq!(
+                    require_at_least, 0,
+                    "require_at_least must default to 0 when omitted"
+                );
+            }
+            ref other => panic!("expected PerFileNonSilent, got {other:?}"),
         }
     }
 
