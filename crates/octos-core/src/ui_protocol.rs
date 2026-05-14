@@ -799,6 +799,27 @@ pub mod methods {
     pub const CONTENT_DELETE: &str = "content/delete";
     /// Replaces `POST /api/my/content/bulk-delete` — bulk-content deletion.
     pub const CONTENT_BULK_DELETE: &str = "content/bulk_delete";
+
+    // ---- Wave4-A: adaptive routing + queue state ----
+
+    /// Wave4-A `router/status` — adaptive routing snapshot notification.
+    /// Emitted by the server adjacent to `turn/started` and `turn/completed`
+    /// so the client always has a fresh status without polling.
+    pub const ROUTER_STATUS: &str = "router/status";
+    /// Wave4-A `router/failover` — adaptive router crossed lanes.
+    pub const ROUTER_FAILOVER: &str = "router/failover";
+    /// Wave4-A `router/set_mode` — runtime mode toggle command. Mode
+    /// change is session-scoped, not process-global.
+    pub const ROUTER_SET_MODE: &str = "router/set_mode";
+    /// Wave4-A `router/get_metrics` — on-demand snapshot of the
+    /// `AdaptiveStatus` plus full lane scores / breaker map. Returns
+    /// the same payload shape as the `router/status` notification but
+    /// as an RPC result.
+    pub const ROUTER_GET_METRICS: &str = "router/get_metrics";
+    /// Wave4-A `queue/state` — pending-queue snapshot. Client-emitted
+    /// today; the constant is defined so type-checked code paths across
+    /// the workspace can reference one source of truth.
+    pub const QUEUE_STATE: &str = "queue/state";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -838,6 +859,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CONTENT_LIST,
     methods::CONTENT_DELETE,
     methods::CONTENT_BULK_DELETE,
+    methods::ROUTER_SET_MODE,
+    methods::ROUTER_GET_METRICS,
 ];
 
 /// Notification methods defined by the v1alpha1 protocol model.
@@ -863,6 +886,9 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::TURN_SPAWN_COMPLETE,
     methods::FILE_ATTACHED,
     methods::SESSION_EVENT,
+    methods::ROUTER_STATUS,
+    methods::ROUTER_FAILOVER,
+    methods::QUEUE_STATE,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -895,6 +921,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CONTENT_LIST,
     methods::CONTENT_DELETE,
     methods::CONTENT_BULK_DELETE,
+    methods::ROUTER_SET_MODE,
+    methods::ROUTER_GET_METRICS,
 ];
 
 /// Protocol methods known but not implemented by the first server/runtime slice.
@@ -2236,6 +2264,50 @@ pub struct ContentBulkDeleteResult {
     pub deleted: usize,
 }
 
+// ----- Wave4-A `router/*` + `queue/state` -----
+
+/// Wave4-A `router/set_mode` params. `mode` is the lowercase string
+/// rendering of `octos_llm::AdaptiveMode` — `"off"`, `"hedge"`, or
+/// `"lane"`. The string is intentional (a) so the wire stays decoupled
+/// from `octos-llm`'s enum variant numeric layout and (b) so client
+/// implementations don't have to negotiate over numeric values.
+///
+/// Mode change is session-scoped — it persists for the lifetime of the
+/// `AdaptiveRouter` (process lifetime today), not across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterSetModeParams {
+    pub session_id: SessionKey,
+    pub mode: String,
+}
+
+/// Wave4-A `router/set_mode` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterSetModeResult {
+    /// New mode actually committed by the router (echo of `params.mode`
+    /// when the call succeeded). Returned so clients can confirm the
+    /// transition before swapping their pill state.
+    pub mode: String,
+}
+
+/// Wave4-A `router/get_metrics` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterGetMetricsParams {
+    pub session_id: SessionKey,
+}
+
+/// Wave4-A `router/get_metrics` result. Identical wire shape to
+/// [`RouterStatusEvent`] (excluding the redundant `session_id` echo)
+/// so a client can use the same code path for both — the notification
+/// is a push variant of the same snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterGetMetricsResult {
+    pub provider_name: String,
+    pub mode: String,
+    pub qos_ranking: bool,
+    pub lane_scores: BTreeMap<String, f64>,
+    pub circuit_breakers: BTreeMap<String, String>,
+}
+
 // ----- UPCR-2026-012 `message/persisted` -----
 
 /// Open registry for `MessagePersistedEvent.source`. Future variants must be
@@ -2632,6 +2704,9 @@ pub enum UiCommand {
     ContentList(ContentListParams),
     ContentDelete(ContentDeleteParams),
     ContentBulkDelete(ContentBulkDeleteParams),
+    // ---- Wave4-A: adaptive router controls ----
+    RouterSetMode(RouterSetModeParams),
+    RouterGetMetrics(RouterGetMetricsParams),
 }
 
 impl UiCommand {
@@ -2665,6 +2740,8 @@ impl UiCommand {
             Self::ContentList(_) => methods::CONTENT_LIST,
             Self::ContentDelete(_) => methods::CONTENT_DELETE,
             Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
+            Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
+            Self::RouterGetMetrics(_) => methods::ROUTER_GET_METRICS,
         }
     }
 
@@ -2702,6 +2779,8 @@ impl UiCommand {
             Self::ContentList(params) => serde_json::to_value(params),
             Self::ContentDelete(params) => serde_json::to_value(params),
             Self::ContentBulkDelete(params) => serde_json::to_value(params),
+            Self::RouterSetMode(params) => serde_json::to_value(params),
+            Self::RouterGetMetrics(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcRequest::new(id, method, params))
@@ -2770,6 +2849,10 @@ impl UiCommand {
             methods::CONTENT_DELETE => Ok(Self::ContentDelete(decode_params(method, params)?)),
             methods::CONTENT_BULK_DELETE => {
                 Ok(Self::ContentBulkDelete(decode_params(method, params)?))
+            }
+            methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
+            methods::ROUTER_GET_METRICS => {
+                Ok(Self::RouterGetMetrics(decode_params(method, params)?))
             }
             _ => Err(RpcError::method_not_found(method)),
         }
@@ -3900,6 +3983,70 @@ pub struct SessionEventBridgedEvent {
     pub topic: Option<String>,
 }
 
+/// Wave4-A — adaptive router status snapshot pushed alongside `turn/started`
+/// and `turn/completed`. Mirrors `octos_llm::AdaptiveStatus` plus the
+/// information needed by clients to render the routing pill / lane debug
+/// view.
+///
+/// `lane_scores` carries one entry per active lane keyed by
+/// `"<provider_name>/<model_id>"` (the same key used in
+/// `model_catalog.json`). `circuit_breakers` carries the same keys mapped
+/// to a string-rendered breaker state (`"closed"`, `"open"`, `"half_open"`)
+/// so the wire shape stays stable when the underlying enum gains variants.
+///
+/// `BTreeMap` is intentional — deterministic wire order keeps the
+/// web-client diff path stable across re-renders.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterStatusEvent {
+    pub session_id: SessionKey,
+    /// Currently selected provider, in `"<provider_name>/<model_id>"` form.
+    pub provider_name: String,
+    /// Active adaptive mode (`off` | `hedge` | `lane`).
+    pub mode: String,
+    /// QoS quality-ranking toggle (orthogonal to mode).
+    pub qos_ranking: bool,
+    /// Per-lane scores, sorted by lane key for deterministic wire output.
+    pub lane_scores: BTreeMap<String, f64>,
+    /// Per-lane circuit-breaker state — `"closed"`, `"open"`, or
+    /// `"half_open"`. Lanes absent from this map have no breaker
+    /// observed yet (cold start).
+    pub circuit_breakers: BTreeMap<String, String>,
+}
+
+/// Wave4-A — emitted when the adaptive router fails over from one lane
+/// to another. `from_provider` / `to_provider` use the same
+/// `"<provider_name>/<model_id>"` key shape as
+/// [`RouterStatusEvent::lane_scores`]. `reason` is free-text from the
+/// router (e.g. "circuit_breaker_open", "score_drop"). `elapsed_ms` is
+/// the wall time from initial provider attempt to failover decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterFailoverEvent {
+    pub session_id: SessionKey,
+    pub from_provider: String,
+    pub to_provider: String,
+    pub reason: String,
+    pub elapsed_ms: u64,
+}
+
+/// Wave4-A — current send-queue depth observed by the client/server
+/// FIFO. `head_client_message_id` identifies the in-flight turn whose
+/// completion will release the next queued frame. `None` when the queue
+/// is empty (after the in-flight turn lands).
+///
+/// **Server emission status:** the queue itself is client-side today
+/// (`octos-web/src/runtime/ui-protocol-send.ts` per-session FIFO). The
+/// server never emits this variant — the web bridge manufactures it
+/// locally using the existing DOM event pattern so other clients can
+/// observe queue state uniformly. The variant is defined here so the
+/// type shape is identical across client implementations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueStateEvent {
+    pub session_id: SessionKey,
+    pub pending_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_client_message_id: Option<String>,
+}
+
 /// Draft notification payloads for UI protocol v1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -3935,6 +4082,18 @@ pub enum UiNotification {
     /// `/api/sessions/:id/events/stream` SSE frames bridged onto the
     /// unified v1 ledger.
     SessionEventBridged(SessionEventBridgedEvent),
+    /// Wave4-A: adaptive routing snapshot emitted on `turn/started` and
+    /// `turn/completed` so clients can render the routing pill / lane
+    /// debug view without polling.
+    RouterStatus(RouterStatusEvent),
+    /// Wave4-A: adaptive router crossed a lane (failover). The status
+    /// emitted at the next turn boundary will reflect the new lane, but
+    /// clients that want to surface the transition itself (toast, status
+    /// pill flash) subscribe to this notification.
+    RouterFailover(RouterFailoverEvent),
+    /// Wave4-A: queue-state snapshot. Client-manufactured today — server
+    /// never emits this. See [`QueueStateEvent`] docs.
+    QueueState(QueueStateEvent),
 }
 
 impl UiNotification {
@@ -3961,6 +4120,9 @@ impl UiNotification {
             Self::TurnSpawnComplete(_) => methods::TURN_SPAWN_COMPLETE,
             Self::FileAttached(_) => methods::FILE_ATTACHED,
             Self::SessionEventBridged(_) => methods::SESSION_EVENT,
+            Self::RouterStatus(_) => methods::ROUTER_STATUS,
+            Self::RouterFailover(_) => methods::ROUTER_FAILOVER,
+            Self::QueueState(_) => methods::QUEUE_STATE,
         }
     }
 
@@ -3988,6 +4150,9 @@ impl UiNotification {
             Self::TurnSpawnComplete(params) => serde_json::to_value(params),
             Self::FileAttached(params) => serde_json::to_value(params),
             Self::SessionEventBridged(params) => serde_json::to_value(params),
+            Self::RouterStatus(params) => serde_json::to_value(params),
+            Self::RouterFailover(params) => serde_json::to_value(params),
+            Self::QueueState(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -4037,6 +4202,9 @@ impl UiNotification {
             }
             methods::FILE_ATTACHED => Ok(Self::FileAttached(decode_params(method, params)?)),
             methods::SESSION_EVENT => Ok(Self::SessionEventBridged(decode_params(method, params)?)),
+            methods::ROUTER_STATUS => Ok(Self::RouterStatus(decode_params(method, params)?)),
+            methods::ROUTER_FAILOVER => Ok(Self::RouterFailover(decode_params(method, params)?)),
+            methods::QUEUE_STATE => Ok(Self::QueueState(decode_params(method, params)?)),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -4416,6 +4584,8 @@ mod tests {
                 "content/list",
                 "content/delete",
                 "content/bulk_delete",
+                "router/set_mode",
+                "router/get_metrics",
             ]
         );
         assert_eq!(
@@ -4442,6 +4612,9 @@ mod tests {
                 "turn/spawn_complete",
                 "file/attached",
                 "session/event",
+                "router/status",
+                "router/failover",
+                "queue/state",
             ]
         );
         assert_eq!(
@@ -4475,6 +4648,8 @@ mod tests {
                 "content/list",
                 "content/delete",
                 "content/bulk_delete",
+                "router/set_mode",
+                "router/get_metrics",
             ]
         );
         assert!(UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS.is_empty());
@@ -4525,7 +4700,9 @@ mod tests {
                     "system/status.get",
                     "content/list",
                     "content/delete",
-                    "content/bulk_delete"
+                    "content/bulk_delete",
+                    "router/set_mode",
+                    "router/get_metrics"
                 ],
                 "supported_notifications": [
                     "session/open",
@@ -4548,7 +4725,10 @@ mod tests {
                     "message/persisted",
                     "turn/spawn_complete",
                     "file/attached",
-                    "session/event"
+                    "session/event",
+                    "router/status",
+                    "router/failover",
+                    "queue/state"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
@@ -7767,6 +7947,236 @@ mod tests {
         assert!(
             UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
             "projection.envelope.v1 must be registered for capability negotiation"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Wave4-A: router/status, router/failover, queue/state, router/set_mode,
+    // router/get_metrics round-trip + wire-shape tests.
+    // ------------------------------------------------------------------
+
+    /// Wave4-A: `router/status` notification round-trips through JSON-RPC
+    /// with deterministic `BTreeMap` ordering and the correct wire tag.
+    #[test]
+    fn router_status_notification_round_trips_with_deterministic_order() {
+        let mut lane_scores = BTreeMap::new();
+        lane_scores.insert("zai/glm-5-turbo".into(), 0.21);
+        lane_scores.insert("dashscope/qwen3.5-plus".into(), 0.41);
+        lane_scores.insert("ollama/llama3.2".into(), 0.62);
+
+        let mut breakers = BTreeMap::new();
+        breakers.insert("zai/glm-5-turbo".into(), "closed".into());
+        breakers.insert("dashscope/qwen3.5-plus".into(), "half_open".into());
+        breakers.insert("ollama/llama3.2".into(), "open".into());
+
+        let notif = UiNotification::RouterStatus(RouterStatusEvent {
+            session_id: SessionKey("local:demo".into()),
+            provider_name: "zai/glm-5-turbo".into(),
+            mode: "lane".into(),
+            qos_ranking: true,
+            lane_scores: lane_scores.clone(),
+            circuit_breakers: breakers.clone(),
+        });
+
+        // Method tag matches the constant.
+        assert_eq!(notif.method(), methods::ROUTER_STATUS);
+
+        // Round-trip through JSON-RPC notification envelope.
+        let rpc = notif
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize router/status");
+        assert_eq!(rpc.method, methods::ROUTER_STATUS);
+
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str rpc");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed_rpc).expect("decode router/status");
+        assert_eq!(decoded, notif);
+
+        // BTreeMap ordering is deterministic — the first key in the wire
+        // payload must be the lex-smallest, so a re-serialization byte-
+        // matches.
+        let wire_keys: Vec<String> = serde_json::to_value(&notif)
+            .expect("value")
+            .get("lane_scores")
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        assert_eq!(
+            wire_keys,
+            vec![
+                "dashscope/qwen3.5-plus".to_string(),
+                "ollama/llama3.2".to_string(),
+                "zai/glm-5-turbo".to_string(),
+            ],
+            "lane_scores keys must be in BTreeMap (lex-sorted) order"
+        );
+    }
+
+    /// Wave4-A: `router/failover` round-trips with the failover metadata
+    /// the AdaptiveRouter emits when it crosses a lane.
+    #[test]
+    fn router_failover_notification_round_trips() {
+        let notif = UiNotification::RouterFailover(RouterFailoverEvent {
+            session_id: SessionKey("local:demo".into()),
+            from_provider: "zai/glm-5-turbo".into(),
+            to_provider: "dashscope/qwen3.5-plus".into(),
+            reason: "circuit_breaker_open".into(),
+            elapsed_ms: 12_345,
+        });
+        assert_eq!(notif.method(), methods::ROUTER_FAILOVER);
+
+        let rpc = notif
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize router/failover");
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed_rpc).expect("decode router/failover");
+        assert_eq!(decoded, notif);
+    }
+
+    /// Wave4-A: `queue/state` round-trips with `head_client_message_id`
+    /// both populated (in-flight) and absent (queue idle).
+    #[test]
+    fn queue_state_notification_round_trips_with_and_without_head() {
+        // In-flight: head_client_message_id present.
+        let notif_active = UiNotification::QueueState(QueueStateEvent {
+            session_id: SessionKey("local:demo".into()),
+            pending_count: 3,
+            head_client_message_id: Some("cmid-12345".into()),
+        });
+        assert_eq!(notif_active.method(), methods::QUEUE_STATE);
+        let rpc = notif_active
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize active");
+        let json = serde_json::to_string(&rpc).expect("to_string active");
+        // head_client_message_id is on the wire when populated.
+        assert!(json.contains("head_client_message_id"));
+        assert!(json.contains("cmid-12345"));
+
+        let parsed: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str active");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed).expect("decode queue/state active");
+        assert_eq!(decoded, notif_active);
+
+        // Empty queue: head_client_message_id absent.
+        let notif_empty = UiNotification::QueueState(QueueStateEvent {
+            session_id: SessionKey("local:demo".into()),
+            pending_count: 0,
+            head_client_message_id: None,
+        });
+        let rpc = notif_empty
+            .clone()
+            .into_rpc_notification()
+            .expect("serialize empty");
+        let json = serde_json::to_string(&rpc).expect("to_string empty");
+        assert!(
+            !json.contains("head_client_message_id"),
+            "head_client_message_id must be omitted when None — got {json}"
+        );
+
+        let parsed: RpcNotification<Value> = serde_json::from_str(&json).expect("from_str empty");
+        let decoded =
+            UiNotification::from_rpc_notification(parsed).expect("decode queue/state empty");
+        assert_eq!(decoded, notif_empty);
+    }
+
+    /// Wave4-A: `router/set_mode` command round-trips and dispatches
+    /// through the standard `UiCommand` request shape.
+    #[test]
+    fn router_set_mode_command_round_trips() {
+        let command = UiCommand::RouterSetMode(RouterSetModeParams {
+            session_id: SessionKey("local:demo".into()),
+            mode: "hedge".into(),
+        });
+        assert_eq!(command.method(), methods::ROUTER_SET_MODE);
+
+        let rpc = command
+            .clone()
+            .into_rpc_request("req-set-mode")
+            .expect("serialize router/set_mode");
+        assert_eq!(rpc.method, methods::ROUTER_SET_MODE);
+        assert_eq!(rpc.params["mode"], json!("hedge"));
+
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+        let decoded = UiCommand::from_rpc_request(parsed_rpc).expect("decode router/set_mode");
+        assert_eq!(decoded, command);
+    }
+
+    /// Wave4-A: `router/get_metrics` request + result round-trip. Mirrors
+    /// the wire shape of the `router/status` notification so clients can
+    /// reuse the deserializer.
+    #[test]
+    fn router_get_metrics_command_and_result_round_trip() {
+        let command = UiCommand::RouterGetMetrics(RouterGetMetricsParams {
+            session_id: SessionKey("local:demo".into()),
+        });
+        assert_eq!(command.method(), methods::ROUTER_GET_METRICS);
+
+        let rpc = command
+            .clone()
+            .into_rpc_request("req-get-metrics")
+            .expect("serialize router/get_metrics");
+        let json = serde_json::to_string(&rpc).expect("to_string");
+        let parsed_rpc: RpcRequest<Value> = serde_json::from_str(&json).expect("from_str");
+        let decoded = UiCommand::from_rpc_request(parsed_rpc).expect("decode router/get_metrics");
+        assert_eq!(decoded, command);
+
+        // Result round-trips with deterministic BTreeMap order.
+        let mut lane_scores = BTreeMap::new();
+        lane_scores.insert("a/b".into(), 0.1);
+        lane_scores.insert("c/d".into(), 0.2);
+        let mut breakers = BTreeMap::new();
+        breakers.insert("a/b".into(), "closed".into());
+        breakers.insert("c/d".into(), "closed".into());
+        let result = RouterGetMetricsResult {
+            provider_name: "a/b".into(),
+            mode: "lane".into(),
+            qos_ranking: false,
+            lane_scores: lane_scores.clone(),
+            circuit_breakers: breakers.clone(),
+        };
+        let json = serde_json::to_string(&result).expect("serialize result");
+        let parsed: RouterGetMetricsResult =
+            serde_json::from_str(&json).expect("deserialize result");
+        assert_eq!(parsed.provider_name, result.provider_name);
+        assert_eq!(parsed.lane_scores, lane_scores);
+        assert_eq!(parsed.circuit_breakers, breakers);
+    }
+
+    /// Wave4-A: capability advertisement carries the three new notification
+    /// methods (`router/status`, `router/failover`, `queue/state`) so
+    /// clients that negotiate at handshake time can subscribe.
+    #[test]
+    fn wave4a_router_methods_are_in_capabilities() {
+        let caps = UiProtocolCapabilities::first_server_slice();
+        assert!(
+            caps.supported_notifications
+                .contains(&methods::ROUTER_STATUS.to_owned()),
+            "router/status must be advertised as a supported notification"
+        );
+        assert!(
+            caps.supported_notifications
+                .contains(&methods::ROUTER_FAILOVER.to_owned()),
+            "router/failover must be advertised as a supported notification"
+        );
+        assert!(
+            caps.supported_notifications
+                .contains(&methods::QUEUE_STATE.to_owned()),
+            "queue/state must be advertised as a supported notification"
+        );
+        assert!(
+            caps.supports_method(methods::ROUTER_SET_MODE),
+            "router/set_mode must be a supported command method"
+        );
+        assert!(
+            caps.supports_method(methods::ROUTER_GET_METRICS),
+            "router/get_metrics must be a supported command method"
         );
     }
 }

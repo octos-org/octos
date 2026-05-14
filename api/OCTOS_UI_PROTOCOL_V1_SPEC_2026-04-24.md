@@ -1145,3 +1145,164 @@ negotiated.
 
 The capability schema version remains `2`; this is an additive feature
 flag and does not bump the schema version.
+
+## 15. Wave4-A — Adaptive Router + Queue Surface
+
+The router/queue notifications and commands ship without a feature
+flag — they are additive on the existing capabilities envelope. Clients
+that don't recognize the methods drop them at the JSON-RPC parser. The
+schema version remains `2`.
+
+### 15.1 `router/status` (notification)
+
+Adaptive routing snapshot pushed adjacent to `turn/started` and
+`turn/completed`. No-op on connections whose session profile has no
+`AdaptiveRouter` attached (single-provider config or
+`adaptive_routing.enabled = false`).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "router/status",
+  "params": {
+    "kind": "router_status",
+    "session_id": "local:demo",
+    "provider_name": "zai/glm-5-turbo",
+    "mode": "lane",
+    "qos_ranking": true,
+    "lane_scores": { "ollama/llama3.2": 0.62, "zai/glm-5-turbo": 0.21 },
+    "circuit_breakers": { "ollama/llama3.2": "closed", "zai/glm-5-turbo": "closed" }
+  }
+}
+```
+
+`lane_scores` keys are deterministic (`BTreeMap` lex-sorted) so a client
+that diffs successive snapshots gets stable key order. `mode` is the
+lowercase string rendering of `AdaptiveMode` (`off` | `hedge` | `lane`).
+`circuit_breakers` values are `"closed"` / `"open"` / `"half_open"` (the
+last is reserved for a future tri-state breaker).
+
+### 15.2 `router/failover` (notification)
+
+Adaptive router crossed lanes. Emitted as durable so a reconnecting
+client can catch up.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "router/failover",
+  "params": {
+    "kind": "router_failover",
+    "session_id": "local:demo",
+    "from_provider": "zai/glm-5-turbo",
+    "to_provider": "ollama/llama3.2",
+    "reason": "chat_error: 429 rate limited",
+    "elapsed_ms": 12345
+  }
+}
+```
+
+`reason` is free-text from `AdaptiveRouter`. `elapsed_ms` is the wall
+time from initial provider attempt to failover decision.
+
+### 15.3 `queue/state` (notification — client-emitted today)
+
+Pending-queue snapshot. The queue is client-side (`octos-web`
+`runtime/ui-protocol-send.ts`); the server never emits this variant.
+The wire shape is defined here so a future server-side queue (or a TUI
+client) can publish into the same DOM event channel:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "queue/state",
+  "params": {
+    "kind": "queue_state",
+    "session_id": "local:demo",
+    "pending_count": 3,
+    "head_client_message_id": "cmid-12345"
+  }
+}
+```
+
+`head_client_message_id` is omitted when the queue is empty (the
+in-flight turn has landed).
+
+### 15.4 `router/set_mode` (RPC request)
+
+Runtime mode toggle. Mode change is session-scoped — it persists for
+the lifetime of the `AdaptiveRouter` (process lifetime today), not
+across restarts.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-set-mode",
+  "method": "router/set_mode",
+  "params": {
+    "session_id": "local:demo",
+    "mode": "hedge"
+  }
+}
+```
+
+Response (success):
+
+```json
+{ "jsonrpc": "2.0", "id": "req-set-mode", "result": { "mode": "hedge" } }
+```
+
+Errors:
+
+- `INVALID_PARAMS` with no `data` — unknown mode string. The valid set
+  is `off` / `hedge` / `lane`.
+- `INVALID_PARAMS` with `data: { "kind": "runtime_unavailable" }` —
+  this session's profile has no `AdaptiveRouter` attached.
+
+### 15.5 `router/get_metrics` (RPC request)
+
+On-demand snapshot mirroring `router/status` (same payload shape minus
+the `session_id` echo). Lets a client poll without subscribing to the
+push channel.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-get-metrics",
+  "method": "router/get_metrics",
+  "params": { "session_id": "local:demo" }
+}
+```
+
+Response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req-get-metrics",
+  "result": {
+    "provider_name": "zai/glm-5-turbo",
+    "mode": "lane",
+    "qos_ranking": true,
+    "lane_scores": { "zai/glm-5-turbo": 0.21 },
+    "circuit_breakers": { "zai/glm-5-turbo": "closed" }
+  }
+}
+```
+
+Error shape identical to `router/set_mode` (`runtime_unavailable` data
+tag when no router is attached).
+
+### 15.6 Behavioral guarantees
+
+- `router/status` emitted at `turn/started` and `turn/completed`. Never
+  in the middle of a turn (use `router/get_metrics` to poll).
+- `router/failover` published per-attempt — emitting BEFORE the retry,
+  so a transition is observable even when the retry itself fails.
+- The router's failover broadcast channel is **non-blocking**: slow
+  subscribers observe `RecvError::Lagged` and skip; the router NEVER
+  stalls on a stuck client.
+- `adaptive_routing.enabled = false` (or absence of the block) means
+  no `AdaptiveRouter` is built — `router/*` methods return
+  `runtime_unavailable`. This was a config-correctness fix in Wave4-A
+  (the previous behavior was silent default-ON).
