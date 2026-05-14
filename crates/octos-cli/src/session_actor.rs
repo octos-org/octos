@@ -109,9 +109,10 @@ const BACKGROUND_RESULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wave-4 B3.4 — debounce window for adaptive-router failover push messages.
 /// At most one failover line lands on the channel per window so a thrashing
-/// router does not spam the bus. Long enough to capture a clear "we
-/// switched" beat, short enough that follow-up escalations still surface.
-const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(15);
+/// router does not spam the bus. Short enough that fallback-to-tertiary or
+/// recovery-to-primary inside an incident still surface within a few
+/// seconds; long enough to absorb back-to-back retries on the same lane.
+const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PersistedSessionMessage {
@@ -2648,6 +2649,126 @@ async fn outbound_forwarder(params: ForwarderParams) {
     }
 }
 
+/// Wave-4 B3.4 — params for the per-actor failover forwarder task.
+struct FailoverForwarderParams {
+    rx: tokio::sync::broadcast::Receiver<FailoverEvent>,
+    out_tx: mpsc::Sender<OutboundMessage>,
+    /// `SessionKey::to_string()` — used to filter the broadcast stream
+    /// to events whose `originating_session_id` matches this session.
+    session_id: String,
+    /// The actor's full session key — passed for log spans only.
+    session_key: SessionKey,
+    channel: String,
+    chat_id: String,
+}
+
+/// Wave-4 B3.4 — long-lived task that forwards `RouterFailoverEvent`
+/// notices from the adaptive router onto the bus channel for this
+/// session. Runs *concurrently* with the actor's main loop so the push
+/// lands *mid-conversation* — the actor's outer select is not polled
+/// while `process_inbound().await` runs, so an in-loop branch could not
+/// deliver during a turn.
+///
+/// Filtering rules:
+/// - Events stamped with `originating_session_id == Some(other_session)`
+///   are dropped (we're not this session).
+/// - Events stamped with `None` are also dropped — the gateway agent
+///   call MUST wrap in `with_router_context` so its failovers are
+///   attributable. `None` would otherwise leak failovers across every
+///   session on a profile-scoped router.
+/// - Events with our own `session_id` go through the debounce.
+///
+/// Lifecycle: terminates when the broadcast channel closes (Closed) or
+/// the actor's `out_tx` closes (send returns Err). `Lagged(n)` is logged
+/// but DOES NOT terminate — the next `recv()` returns the next live
+/// event.
+async fn forward_router_failovers(params: FailoverForwarderParams) {
+    use tokio::sync::broadcast::error::RecvError;
+    let FailoverForwarderParams {
+        mut rx,
+        out_tx,
+        session_id,
+        session_key,
+        channel,
+        chat_id,
+    } = params;
+    let mut last_push: Option<std::time::Instant> = None;
+    loop {
+        let event = match rx.recv().await {
+            Ok(event) => event,
+            Err(RecvError::Lagged(skipped)) => {
+                // Slow consumer fell behind — broadcast::Receiver
+                // re-syncs on the next recv(). The router keeps publishing
+                // either way; we just lose visibility on the older events.
+                warn!(
+                    session = %session_key,
+                    skipped,
+                    "failover forwarder lagged; broadcast channel skipped events"
+                );
+                continue;
+            }
+            Err(RecvError::Closed) => {
+                debug!(
+                    session = %session_key,
+                    "failover broadcast closed; forwarder exiting"
+                );
+                break;
+            }
+        };
+
+        // Strict per-session filter: drop None-originator events too.
+        // None-originator means the publisher did not call
+        // `with_router_context`, so we cannot prove the event belongs
+        // to this session. Leaking it to every session on a shared
+        // profile-scoped router was a real bug (codex review).
+        let Some(ref originator) = event.originating_session_id else {
+            debug!(
+                session = %session_key,
+                from = %event.from_provider,
+                to = %event.to_provider,
+                "skipping failover with no originator stamp"
+            );
+            continue;
+        };
+        if originator != &session_id {
+            continue;
+        }
+
+        // Debounce: at most one push per FAILOVER_PUSH_DEBOUNCE window.
+        let now = std::time::Instant::now();
+        if let Some(last) = last_push {
+            if now.duration_since(last) < FAILOVER_PUSH_DEBOUNCE {
+                debug!(
+                    session = %session_key,
+                    from = %event.from_provider,
+                    to = %event.to_provider,
+                    "skipping failover push under debounce"
+                );
+                continue;
+            }
+        }
+        last_push = Some(now);
+
+        let outbound = OutboundMessage {
+            channel: channel.clone(),
+            chat_id: chat_id.clone(),
+            content: format_failover_push(&event),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        };
+        if out_tx.send(outbound).await.is_err() {
+            // Actor's outbound proxy was dropped — actor is shutting
+            // down. Stop forwarding.
+            debug!(
+                session = %session_key,
+                "outbound channel closed; failover forwarder exiting"
+            );
+            break;
+        }
+    }
+}
+
 // ── Router chat-command formatters ──────────────────────────────────────────
 //
 // Free functions so unit tests can verify the exact bus-message shape without
@@ -2969,22 +3090,31 @@ impl SessionActor {
         self.emit_resume_hook().await;
         // Wave-4 B3.4 — surface adaptive-router failovers on the bus so
         // operators on a chat channel SEE when the router escalated
-        // mid-conversation. `subscribe_failover()` is a broadcast channel
-        // so other subscribers (API ledger, telemetry) are unaffected.
-        let mut failover_rx = self
-            .adaptive_router
-            .as_ref()
-            .map(|router| router.subscribe_failover());
-        // Per-actor failover-push debounce — at most one push per
-        // `FAILOVER_PUSH_DEBOUNCE` window. Avoids spam when the router
-        // thrashes between lanes during a degradation incident.
-        let mut last_failover_push: Option<std::time::Instant> = None;
-        // Match shape used by `RouterContext` publisher (api/ui_protocol.rs):
-        // `SessionKey::to_string()` for filtering. Defensive — gateway
-        // path doesn't stamp RouterContext today, but we still want to
-        // ignore None-attributed events from other concurrent sessions on
-        // a shared profile-scoped router.
-        let session_filter = self.session_key.to_string();
+        // *mid-conversation*. Spawn a dedicated forwarder task so the
+        // push lands while `process_inbound().await` is still running —
+        // if the loop checked failover_rx inline, the outer select!
+        // would not poll the branch until the turn completed, which
+        // defeats the "mid-conversation" requirement (codex review).
+        //
+        // The forwarder owns its own broadcast receiver, debounce state,
+        // and a clone of `out_tx`; the actor itself drops out at shutdown
+        // and the forwarder follows when its receiver closes.
+        let failover_forwarder = self.adaptive_router.as_ref().map(|router| {
+            let rx = router.subscribe_failover();
+            let out_tx = self.out_tx.clone();
+            let session_id = self.session_key.to_string();
+            let channel = self.channel.clone();
+            let chat_id = self.chat_id.clone();
+            let session_key = self.session_key.clone();
+            tokio::spawn(forward_router_failovers(FailoverForwarderParams {
+                rx,
+                out_tx,
+                session_id,
+                session_key,
+                channel,
+                chat_id,
+            }))
+        });
         loop {
             tokio::select! {
                 msg = self.inbox.recv() => {
@@ -3176,48 +3306,6 @@ impl SessionActor {
                     debug!(session = %self.session_key, "idle timeout, shutting down actor");
                     break;
                 }
-                // Wave-4 B3.4 — router failover broadcast. The branch is
-                // conditional on `failover_rx.is_some()` so actors without
-                // an adaptive router never poll a placeholder future.
-                event = async {
-                    match failover_rx.as_mut() {
-                        Some(rx) => rx.recv().await.ok(),
-                        None => std::future::pending().await,
-                    }
-                }, if failover_rx.is_some() => {
-                    let Some(event) = event else {
-                        // broadcast channel closed; drop the subscription
-                        // so future iterations skip the branch entirely.
-                        failover_rx = None;
-                        continue;
-                    };
-                    // Filter to this session's events when the publisher
-                    // stamped a session id. Events with no originator
-                    // (e.g. CLI smoke without `with_router_context`) fall
-                    // through to every subscriber — accepted because the
-                    // gateway path is single-tenant per actor.
-                    if let Some(ref originator) = event.originating_session_id {
-                        if originator != &session_filter {
-                            continue;
-                        }
-                    }
-                    // Debounce: at most one push per FAILOVER_PUSH_DEBOUNCE
-                    // window so a thrashing router does not flood the channel.
-                    let now = std::time::Instant::now();
-                    if let Some(last) = last_failover_push {
-                        if now.duration_since(last) < FAILOVER_PUSH_DEBOUNCE {
-                            debug!(
-                                session = %self.session_key,
-                                from = %event.from_provider,
-                                to = %event.to_provider,
-                                "skipping failover push under debounce"
-                            );
-                            continue;
-                        }
-                    }
-                    last_failover_push = Some(now);
-                    self.send_reply(&format_failover_push(&event)).await;
-                }
             }
 
             if self.global_shutdown.load(Ordering::Acquire)
@@ -3234,6 +3322,14 @@ impl SessionActor {
         // was the only one that escalated.
         if let Some(ref router) = self.adaptive_router {
             router.forget_session(&self.session_key.to_string());
+        }
+
+        // Wave-4 B3.4 — stop the failover forwarder so it doesn't outlive
+        // the actor. The task exits naturally once `out_tx` is dropped
+        // (every send returns Err and we break the loop), but we abort
+        // proactively to release the broadcast subscription immediately.
+        if let Some(handle) = failover_forwarder {
+            handle.abort();
         }
 
         debug!(session = %self.session_key, "actor exiting");
@@ -4715,6 +4811,13 @@ impl SessionActor {
         let attachments = self.build_turn_attachment_context(attachment_media, attachment_prompt);
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
+        // Wave-4 B3.4 — stamp session_id / turn_id into the task-local
+        // `RouterContext` so AdaptiveRouter::publish_failover attributes
+        // every emitted FailoverEvent to this session. The forwarder
+        // task filters strictly on `originating_session_id`, so without
+        // this stamp the gateway's failover surfacing would never fire.
+        let router_session_id = self.session_key.to_string();
+        let router_turn_id = client_message_id.clone();
 
         // The agent receives the history snapshot (which includes the user
         // message we saved above). The agent will prepend its own system
@@ -4740,14 +4843,20 @@ impl SessionActor {
 
         let mut agent_task = tokio::spawn(async move {
             let start = Instant::now();
-            let result = tokio::time::timeout(
-                session_timeout,
-                agent.process_message_tracked_with_attachments(
-                    &content,
-                    &history_for_agent,
-                    media,
-                    attachments,
-                    &tracker,
+            let result = octos_llm::with_router_context(
+                octos_llm::RouterContext {
+                    session_id: Some(router_session_id),
+                    turn_id: router_turn_id,
+                },
+                tokio::time::timeout(
+                    session_timeout,
+                    agent.process_message_tracked_with_attachments(
+                        &content,
+                        &history_for_agent,
+                        media,
+                        attachments,
+                        &tracker,
+                    ),
                 ),
             )
             .await;
@@ -5761,12 +5870,24 @@ impl SessionActor {
             };
 
             // ── Run agent with task-local reporter override ─────────────────
+            //
+            // Wave-4 B3.4 — stamp `RouterContext` so the overflow agent's
+            // failovers are attributed to this session. The forwarder
+            // task filters strictly on `originating_session_id`.
             let reporter_for_scope = overflow_reporter.clone();
+            let router_ctx_session = session_key.to_string();
+            let router_ctx_turn = overflow_client_message_id.clone();
             let result = octos_agent::TASK_REPORTER
                 .scope(reporter_for_scope, async {
-                    tokio::time::timeout(
-                        session_timeout,
-                        agent.process_message_tracked(&content, &history, vec![], &tracker),
+                    octos_llm::with_router_context(
+                        octos_llm::RouterContext {
+                            session_id: Some(router_ctx_session),
+                            turn_id: router_ctx_turn,
+                        },
+                        tokio::time::timeout(
+                            session_timeout,
+                            agent.process_message_tracked(&content, &history, vec![], &tracker),
+                        ),
                     )
                     .await
                 })
@@ -6205,16 +6326,29 @@ impl SessionActor {
             None
         };
 
-        // Process through agent (potentially long LLM call)
+        // Process through agent (potentially long LLM call).
+        //
+        // Wave-4 B3.4 — stamp `RouterContext` so AdaptiveRouter's failover
+        // publisher attributes events to this session. The gateway-side
+        // failover forwarder filters strictly on `originating_session_id`
+        // (a `None` stamp would leak failovers to every concurrent
+        // session on a shared profile-scoped router), so we MUST set it
+        // here.
         let llm_start = Instant::now();
-        let result = tokio::time::timeout(
-            self.session_timeout,
-            self.agent.process_message_tracked_with_attachments(
-                &inbound.content,
-                &history,
-                image_media,
-                self.build_turn_attachment_context(attachment_media, attachment_prompt),
-                &token_tracker,
+        let result = octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(self.session_key.to_string()),
+                turn_id: client_message_id.clone(),
+            },
+            tokio::time::timeout(
+                self.session_timeout,
+                self.agent.process_message_tracked_with_attachments(
+                    &inbound.content,
+                    &history,
+                    image_media,
+                    self.build_turn_attachment_context(attachment_media, attachment_prompt),
+                    &token_tracker,
+                ),
             ),
         )
         .await;
@@ -12358,7 +12492,25 @@ mod tests {
         // the broadcast channel before we publish.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        router.publish_failover_for_subscribers("primary/p1", "secondary/p2", "test_synthetic", 42);
+        // Stamp the originating session via RouterContext so the
+        // forwarder's strict per-session filter accepts the event. In
+        // production the gateway's agent call wraps in `with_router_context`
+        // around `process_inbound`; the test mirrors that.
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers(
+                    "primary/p1",
+                    "secondary/p2",
+                    "test_synthetic",
+                    42,
+                );
+            },
+        )
+        .await;
 
         let push = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
@@ -12401,14 +12553,23 @@ mod tests {
 
         // Three rapid failovers within ~50ms — well inside the debounce
         // window — must produce at most one push.
-        for i in 0..3 {
-            router.publish_failover_for_subscribers(
-                "primary/p1",
-                "secondary/p2",
-                "burst",
-                i as u64,
-            );
-        }
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(SessionKey::new("cli", "test").to_string()),
+                turn_id: None,
+            },
+            async {
+                for i in 0..3 {
+                    router.publish_failover_for_subscribers(
+                        "primary/p1",
+                        "secondary/p2",
+                        "burst",
+                        i as u64,
+                    );
+                }
+            },
+        )
+        .await;
 
         // First push arrives.
         let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -12492,6 +12653,46 @@ mod tests {
             first.content.contains("`mine`"),
             "stranger session's failover leaked through: {}",
             first.content
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// B3.4 (codex P1 fix) — failovers stamped with `None` originator
+    /// MUST be dropped silently rather than leaked to every subscriber.
+    /// A `None` originator means the publisher did not call
+    /// `with_router_context`, so the event is not attributable to any
+    /// particular session; broadcasting it to all of them on a
+    /// profile-scoped router was the original bug.
+    #[tokio::test]
+    async fn router_failover_drops_events_without_originator() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::ZERO, make_response("noop"))],
+        ));
+        let router = make_test_router();
+        let (tx, mut rx, handle, _session_mgr) = setup_actor_with_mode(
+            agent_llm,
+            QueueMode::Followup,
+            Some(router.clone()),
+            false,
+            &dir,
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Publish WITHOUT a router_context wrapper — `originating_session_id`
+        // will be `None` and the forwarder must reject it.
+        router.publish_failover_for_subscribers("primary/p1", "secondary/p2", "unattributed", 5);
+
+        let push = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            push.is_err(),
+            "None-originator events must NOT leak to the bus; got: {:?}",
+            push.ok().flatten().map(|m| m.content)
         );
 
         drop(tx);

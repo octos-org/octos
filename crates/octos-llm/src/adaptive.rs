@@ -886,13 +886,15 @@ impl AdaptiveRouter {
 
     /// Wave-4 B3: synthesize and broadcast a `FailoverEvent` to all
     /// `subscribe_failover()` listeners. Wraps the internal
-    /// `publish_failover` so out-of-band callers — gateway tests, manual
-    /// triggers, and synthetic monitoring — can drive the failover stream
-    /// without going through the chat loop.
+    /// `publish_failover` so out-of-band callers — gateway tests,
+    /// synthetic monitoring — can drive the failover stream without
+    /// going through the chat loop.
     ///
-    /// `#[doc(hidden)]` because the stable public API is `subscribe`;
-    /// production publishing comes from the router itself.
-    #[doc(hidden)]
+    /// **Gated behind `feature = "test-utils"`** so production builds
+    /// can never synthesize false failovers. Downstream crates that
+    /// need the helper in their integration tests enable the feature
+    /// via `[dev-dependencies] octos-llm = { features = ["test-utils"] }`.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn publish_failover_for_subscribers(
         &self,
         from_provider: &str,
