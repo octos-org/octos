@@ -88,15 +88,27 @@ impl ConfigWatcher {
 
     /// Parse config from the first non-empty buffer.
     /// Tries `Config` format first, then `UserProfile` format (for --profile mode).
+    ///
+    /// Section B (codex review round-7 P2): apply the same
+    /// `OCTOS_PLUGINS_REQUIRE_SIGNED` env-merge that `Config::from_file`
+    /// does so the diff doesn't see spurious "plugins changed from true
+    /// to false" transitions on a hot edit. Without this, a gateway
+    /// spawned with the env-forced policy would emit a bogus restart on
+    /// every unrelated edit.
     fn parse_first(buffers: &[(PathBuf, Vec<u8>)]) -> Option<Config> {
         let (path, bytes) = buffers.first()?;
         // Try Config format first
-        if let Ok(c) = serde_json::from_slice::<Config>(bytes) {
+        if let Ok(mut c) = serde_json::from_slice::<Config>(bytes) {
+            crate::config::merge_env_plugin_policy_pub(&mut c);
             return Some(c);
         }
         // Try UserProfile format (for --profile mode)
         match serde_json::from_slice::<UserProfile>(bytes) {
-            Ok(profile) => Some(crate::profiles::config_from_profile(&profile, None, None)),
+            Ok(profile) => {
+                let mut c = crate::profiles::config_from_profile(&profile, None, None);
+                crate::config::merge_env_plugin_policy_pub(&mut c);
+                Some(c)
+            }
             Err(e) => {
                 warn!("config reload failed for {}: {e}", path.display());
                 None

@@ -306,6 +306,21 @@ impl ProcessManager {
                             .iter()
                             .any(|blocked| key.eq_ignore_ascii_case(blocked))
                         {
+                            // Section B (codex review round-7 P3): the
+                            // host's strict-signing env var is reserved
+                            // for the parent serve. Refuse a parent
+                            // profile env_vars entry that would override
+                            // it (sub-account inheritance otherwise lets
+                            // a parent silently flip strict signing on).
+                            if key.eq_ignore_ascii_case("OCTOS_PLUGINS_REQUIRE_SIGNED") {
+                                tracing::warn!(
+                                    profile = %profile.id,
+                                    parent = %parent_id,
+                                    var = %key,
+                                    "skipping parent env var that would override host plugin policy"
+                                );
+                                continue;
+                            }
                             cmd.env(key, value);
                         }
                     }
