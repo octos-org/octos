@@ -209,6 +209,17 @@ pub struct Config {
 /// introduced. Set `require_signed = true` to enforce strict signature
 /// verification — plugins without `manifest.sha256` will be rejected at
 /// load time and re-hash gates apply on every invocation.
+///
+/// # Bundled / first-party skills caveat
+///
+/// First-party skills shipped under `crates/app-skills/*/manifest.json` and
+/// `crates/platform-skills/*/manifest.json` currently do NOT declare
+/// `sha256`. Enabling `require_signed = true` on a clean install will
+/// therefore drop those tools (deep-search, weather, send-email, voice,
+/// etc.) until the manifests are populated with the binaries' digests as
+/// part of the release process. Production deployments that depend on
+/// first-party skills should defer enabling this flag until the bundled
+/// manifests ship `sha256`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PluginsConfig {
@@ -217,6 +228,9 @@ pub struct PluginsConfig {
     /// before every invocation (pre-spawn re-hash closes the load→exec
     /// TOCTOU window). When `false` (default), unsigned plugins still load
     /// with a warning to preserve backward compatibility.
+    ///
+    /// See the [`PluginsConfig`] struct docs for a note on bundled
+    /// first-party skills that ship without `sha256` today.
     #[serde(default)]
     pub require_signed: bool,
 }

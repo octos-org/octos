@@ -328,14 +328,9 @@ impl ProcessManager {
             }
         }
 
-        // Section B (codex review round-5 P1.2): mirror the host's
-        // strict-signing policy to every spawned gateway. `Config::from_file`
-        // OR-merges `OCTOS_PLUGINS_REQUIRE_SIGNED` onto whatever the
-        // profile JSON declares so a host-only `plugins.require_signed = true`
-        // still propagates to managed sub-gateways.
-        if self.host_plugins_require_signed {
-            cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
-        }
+        // (Section B host-signing env is set AFTER the profile env loop
+        // below so a profile cannot silently override it — see
+        // `cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1")` further down.)
 
         // Inject email config as env vars for the send_email plugin.
         // The dashboard sets email config in the profile JSON, but the
@@ -366,7 +361,28 @@ impl ProcessManager {
                 );
                 continue;
             }
+            // Section B (codex review round-6 P1): the host's strict-signing
+            // env is reserved for the parent serve to control. A profile
+            // env_vars entry with this key would otherwise silently turn
+            // off the host policy in the spawned gateway — refuse it.
+            if key.eq_ignore_ascii_case("OCTOS_PLUGINS_REQUIRE_SIGNED") {
+                tracing::warn!(
+                    profile = %profile.id,
+                    var = %key,
+                    "skipping profile env var that would override host plugin policy"
+                );
+                continue;
+            }
             cmd.env(key, value);
+        }
+
+        // Section B (codex review round-5 P1.2 + round-6 P1): mirror the
+        // host's strict-signing policy to every spawned gateway AFTER the
+        // profile env loop so a profile env_vars entry can never silently
+        // disable the host policy. `Config::from_file` OR-merges the env
+        // var onto whatever the profile JSON declares.
+        if self.host_plugins_require_signed {
+            cmd.env("OCTOS_PLUGINS_REQUIRE_SIGNED", "1");
         }
 
         tracing::debug!(profile = %profile.id, "start: spawning gateway subprocess");

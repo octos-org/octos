@@ -1708,6 +1708,13 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     if oc.credential_pool != nc.credential_pool {
         restart_fields.push("credential_pool".into());
     }
+    // Section B (codex review round-6): plugin loader policy changes
+    // (e.g. flipping `plugins.require_signed`) only take effect during
+    // bootstrap, so a toggle must trigger a gateway restart to flush
+    // the stale plugin registry and apply the new gate.
+    if oc.plugins != nc.plugins {
+        restart_fields.push("plugins".into());
+    }
 
     if !restart_fields.is_empty() {
         return ProfileChange::RestartRequired(restart_fields);

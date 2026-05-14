@@ -129,6 +129,13 @@ impl ConfigWatcher {
         if old.hooks != new.hooks {
             restart_fields.push("hooks".into());
         }
+        // Section B (codex review round-6 P2): plugin loader policy
+        // (`plugins.require_signed`) is consumed only during plugin
+        // load. A toggle in a running gateway must trigger a restart
+        // so the stale registry is flushed and the new gate applies.
+        if old.plugins != new.plugins {
+            restart_fields.push("plugins".into());
+        }
 
         // Queue mode change requires restart (affects message processing loop)
         let old_queue_mode = old.gateway.as_ref().map(|g| &g.queue_mode);
