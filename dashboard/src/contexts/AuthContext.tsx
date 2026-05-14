@@ -1,11 +1,18 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
-import type { User } from '../types'
+import type { ScopedAuthTarget, User } from '../types'
 import { authApi } from '../api'
 
 interface AuthContextValue {
   user: User | null
   token: string | null
   isAdmin: boolean
+  /** Tenant scope derived from the request host (server's
+   *  `host_scoped_profile_id`). `null` on the root domain / direct IP
+   *  / localhost; populated when the dashboard is loaded from a
+   *  tenant subdomain (e.g. `dspfac.ocean.ominix.io`). Used by the
+   *  Sidebar to hide admin-global navigation while operating inside a
+   *  tenant scope — Option Y, issue #315. */
+  scopedProfile: ScopedAuthTarget | null
   loading: boolean
   sendOtp: (email: string) => Promise<{ ok: boolean; message?: string }>
   verifyOtp: (email: string, code: string) => Promise<boolean>
@@ -18,6 +25,7 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
+  const [scopedProfile, setScopedProfile] = useState<ScopedAuthTarget | null>(null)
   const [token, setToken] = useState<string | null>(
     () => localStorage.getItem('octos_session_token') || localStorage.getItem('octos_auth_token')
   )
@@ -35,12 +43,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     authApi.me()
       .then((res) => {
         setUser(res.user)
+        setScopedProfile(res.scoped_profile ?? null)
       })
       .catch(() => {
         // Token invalid — clear it
         localStorage.removeItem('octos_session_token')
         setToken(null)
         setUser(null)
+        setScopedProfile(null)
       })
       .finally(() => setLoading(false))
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -56,6 +66,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       localStorage.setItem('octos_session_token', res.token)
       setToken(res.token)
       if (res.user) setUser(res.user)
+      // Refresh the host scope after a successful verify — the OTP
+      // flow doesn't return it, but `/api/auth/me` does.
+      try {
+        const me = await authApi.me()
+        setScopedProfile(me.scoped_profile ?? null)
+      } catch {
+        // best-effort
+      }
       return true
     }
     return false
@@ -68,6 +86,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await authApi.me()
       setToken(adminToken)
       setUser(res.user)
+      setScopedProfile(res.scoped_profile ?? null)
       return true
     } catch {
       localStorage.removeItem('octos_auth_token')
@@ -90,11 +109,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem('octos_auth_token')
     setToken(null)
     setUser(null)
+    setScopedProfile(null)
   }, [])
 
   return (
     <AuthContext.Provider
-      value={{ user, token, isAdmin, loading, sendOtp, verifyOtp, loginWithToken, swapToken, logout }}
+      value={{ user, token, isAdmin, scopedProfile, loading, sendOtp, verifyOtp, loginWithToken, swapToken, logout }}
     >
       {children}
     </AuthContext.Provider>

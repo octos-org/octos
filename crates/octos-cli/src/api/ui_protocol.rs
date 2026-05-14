@@ -2038,11 +2038,26 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::ContentDelete(params) => {
-                handle_content_delete(&ws, &state, connection_identity.as_ref(), id, params).await;
+                handle_content_delete(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::ContentBulkDelete(params) => {
-                handle_content_bulk_delete(&ws, &state, connection_identity.as_ref(), id, params)
-                    .await;
+                handle_content_bulk_delete(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::RouterSetMode(params) => {
                 handle_router_set_mode(&ws, &state, routed_profile_id, id, params).await;
@@ -5541,6 +5556,7 @@ async fn handle_content_list(
 async fn handle_content_delete(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     id: String,
     params: ContentDeleteParams,
@@ -5561,6 +5577,7 @@ async fn handle_content_delete(
     let content_id = params.id.clone();
     let result = super::auth_handlers::delete_my_content(
         State(state.clone()),
+        headers.clone(),
         Extension(identity),
         axum_path(params.id),
     )
@@ -5594,6 +5611,7 @@ async fn handle_content_delete(
 async fn handle_content_bulk_delete(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     id: String,
     params: ContentBulkDeleteParams,
@@ -5635,6 +5653,7 @@ async fn handle_content_bulk_delete(
     }
     let result = super::auth_handlers::bulk_delete_my_content(
         State(state.clone()),
+        headers.clone(),
         Extension(identity),
         axum::Json(super::auth_handlers::BulkDeleteRequest { ids: params.ids }),
     )
