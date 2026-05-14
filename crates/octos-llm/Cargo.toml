@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 description = "LLM provider abstraction for octos"
 
+[features]
+default = []
+# Exposes test-only helpers (e.g. `AdaptiveRouter::publish_failover_for_subscribers`)
+# for downstream crates' integration tests. Production builds must NOT enable
+# this — synthetic failover broadcasts would otherwise be visible on the
+# stable public API.
+test-utils = []
+
 [dependencies]
 octos-core = { workspace = true }
 async-trait = { workspace = true }

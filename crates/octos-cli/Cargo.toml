@@ -93,3 +93,7 @@ workspace = true
 tokio-test = { workspace = true }
 tower = { workspace = true }
 axum = { workspace = true }
+# Wave-4 B3.4 — enable `test-utils` for octos-llm so the gateway's
+# failover-surfacing tests can call `publish_failover_for_subscribers`.
+# Production builds don't see this; only `cargo test -p octos-cli`.
+octos-llm = { workspace = true, features = ["test-utils"] }
