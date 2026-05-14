@@ -481,6 +481,28 @@ pub trait Tool: Send + Sync {
         self.execute(args).await
     }
 
+    /// Pre-flight argument validation that runs synchronously in the
+    /// foreground before the `spawn_only` intercept dispatches the tool to
+    /// the background.
+    ///
+    /// Returning `Err(msg)` causes the spawn_only intercept to surface the
+    /// error as a normal tool_result `Message` (mirroring the policy-deny
+    /// path) so the LLM sees the failure in its next iteration and can
+    /// retry with corrected arguments. Without this, an LLM-generated bad
+    /// argument (e.g. a structurally invalid DOT graph for `run_pipeline`)
+    /// fails inside the background task with no chance for the agent to
+    /// re-engage — the user sees an error bubble but the LLM thinks it
+    /// succeeded.
+    ///
+    /// Default: no pre-flight check (returns `Ok`). Override in tools whose
+    /// arguments are LLM-generated and cheap to validate, where catching
+    /// malformed input synchronously avoids a wasted background round-trip.
+    /// Keep the check fast (parse + structural validation, no network /
+    /// long-running work) since it blocks the agent's foreground turn.
+    async fn pre_flight_validate(&self, _args: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Downcast support for concrete tool access (e.g. wiring ActivateToolsTool).
     fn as_any(&self) -> &dyn std::any::Any {
         // Default: no downcasting. Override in tools that need it.

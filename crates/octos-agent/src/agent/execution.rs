@@ -348,6 +348,47 @@ impl Agent {
                     }
                 }
 
+                // Pre-flight validation: catch known-bad arguments (e.g.
+                // structurally invalid DOT for `run_pipeline`) synchronously
+                // so the LLM gets the error as a tool_result in this
+                // iteration and can retry with corrected input. Without
+                // this, the foreground would return "started in background"
+                // to the LLM, the background task would fail validation,
+                // and the LLM-side conversation would never see the error.
+                // The pre-flight hook is opt-in per tool — default impl is
+                // Ok(()). See `Tool::pre_flight_validate`.
+                if let Some(tool) = tools.get(&tc_name) {
+                    if let Err(msg) = tool.pre_flight_validate(&effective_args).await {
+                        tracing::warn!(
+                            tool = %tc_name,
+                            error = %msg,
+                            "spawn_only pre-flight validation failed"
+                        );
+                        let err_msg = format!(
+                            "[VALIDATION FAILED] Tool '{tc_name}' rejected input: {msg}\n\n\
+                             Fix the input and retry."
+                        );
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: err_msg,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                client_message_id: None,
+                                thread_id: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            false,
+                            None,
+                        );
+                    }
+                }
+
                 tracing::info!(
                     tool = %tc_name,
                     "running spawn_only tool in background"
