@@ -121,14 +121,23 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
             session_input_tokens,
             session_output_tokens,
             session_cost,
+            model,
             ..
         } => {
-            serde_json::json!({
+            // Always serialize the cost_update payload as an object so we
+            // can attach the optional `model` identifier without
+            // disturbing the historical field order. Clients without the
+            // new field continue to ignore unknown keys.
+            let mut payload = serde_json::json!({
                 "type": "cost_update",
                 "input_tokens": session_input_tokens,
                 "output_tokens": session_output_tokens,
                 "session_cost": session_cost,
-            })
+            });
+            if let Some(model) = model.as_deref() {
+                payload["model"] = serde_json::Value::String(model.to_string());
+            }
+            payload
         }
         ProgressEvent::Thinking { iteration } => {
             serde_json::json!({"type": "thinking", "iteration": iteration})
@@ -299,12 +308,17 @@ mod tests {
             session_output_tokens: 50,
             response_cost: Some(0.001),
             session_cost: Some(0.005),
+            model: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "cost_update");
         assert_eq!(json["input_tokens"], 100);
         assert_eq!(json["output_tokens"], 50);
         assert_eq!(json["session_cost"], 0.005);
+        assert!(
+            json.get("model").is_none(),
+            "model must be omitted when the reporter has no model id, got {json}",
+        );
     }
 
     #[test]
@@ -314,10 +328,29 @@ mod tests {
             session_output_tokens: 100,
             response_cost: None,
             session_cost: None,
+            model: None,
         };
         let json = event_to_json(&event, None);
         assert_eq!(json["type"], "cost_update");
         assert!(json["session_cost"].is_null());
+    }
+
+    /// New: when the agent emit layer populates `model`, the JSON wire
+    /// payload must carry the identifier so the UI Protocol mapper can
+    /// thread it through to `metadata.token_cost.model`. This is the
+    /// first link in the chain that ends with the chat bubble footer.
+    #[test]
+    fn event_to_json_cost_update_carries_model_when_set() {
+        let event = ProgressEvent::CostUpdate {
+            session_input_tokens: 12,
+            session_output_tokens: 7,
+            response_cost: None,
+            session_cost: None,
+            model: Some("deepseek-v4-pro".into()),
+        };
+        let json = event_to_json(&event, None);
+        assert_eq!(json["type"], "cost_update");
+        assert_eq!(json["model"], "deepseek-v4-pro");
     }
 
     #[test]
@@ -393,6 +426,7 @@ mod tests {
                     session_output_tokens: 0,
                     response_cost: None,
                     session_cost: None,
+                    model: None,
                 },
                 "cost_update",
             ),

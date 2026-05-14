@@ -175,14 +175,25 @@ impl ProgressReporter for ChannelStreamReporter {
                 session_input_tokens,
                 session_output_tokens,
                 session_cost,
+                model,
                 ..
             } => {
+                // Codex round-1 P2: every wire-shape mapper for
+                // `cost_update` must carry `model` so the chat bubble
+                // footer (`model · tokens_in / tokens_out · duration`)
+                // works regardless of which reporter the turn uses.
+                // Without this, channel-stream consumers see naked
+                // token counts even after the agent emit layer
+                // attached a model id.
                 let mut payload = serde_json::json!({
                     "type": "cost_update",
                     "input_tokens": session_input_tokens,
                     "output_tokens": session_output_tokens,
                     "session_cost": session_cost,
                 });
+                if let Some(model) = model.as_deref() {
+                    payload["model"] = serde_json::Value::String(model.to_string());
+                }
                 inject_thread_id(&mut payload, thread_id);
                 StreamProgressEvent::RawSse {
                     json: payload.to_string(),
@@ -910,6 +921,7 @@ mod tests {
             session_output_tokens: 20,
             response_cost: None,
             session_cost: None,
+            model: None,
         });
 
         let mut raw_payloads: Vec<String> = Vec::new();
@@ -937,6 +949,64 @@ mod tests {
                 "payload `{json}` missing `thread_id` field",
             );
         }
+    }
+
+    /// The channel stream reporter feeds API/channel clients that read
+    /// the wire payload directly. Codex round-1 P2 — when the agent
+    /// emit layer attaches a `model` id to `CostUpdate`, this reporter
+    /// must thread it through so the chat bubble footer (`model ·
+    /// tokens_in / tokens_out · duration`) works for channel
+    /// consumers, not just the UI-protocol bridge.
+    #[test]
+    fn cost_update_carries_model_into_raw_sse_payload() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 12,
+            session_output_tokens: 7,
+            response_cost: None,
+            session_cost: None,
+            model: Some("deepseek-v4-pro".into()),
+        });
+
+        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+            panic!("expected RawSse for CostUpdate");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "cost_update");
+        assert_eq!(parsed["model"], "deepseek-v4-pro");
+    }
+
+    /// Symmetric to the test above: a `CostUpdate` without `model`
+    /// must not synthesise a `model` field on the wire — the field is
+    /// strictly opt-in so legacy parsers that key on field presence
+    /// don't trip.
+    #[test]
+    fn cost_update_omits_model_when_absent() {
+        use octos_agent::progress::ProgressEvent;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reporter = ChannelStreamReporter::new(tx);
+
+        reporter.report(ProgressEvent::CostUpdate {
+            session_input_tokens: 12,
+            session_output_tokens: 7,
+            response_cost: None,
+            session_cost: None,
+            model: None,
+        });
+
+        let StreamProgressEvent::RawSse { json } = rx.try_recv().unwrap() else {
+            panic!("expected RawSse for CostUpdate");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.get("model").is_none(),
+            "model field must be omitted when the emit layer didn't set one, got {parsed}",
+        );
     }
 
     /// When the reporter is constructed without a thread_id (or with an
