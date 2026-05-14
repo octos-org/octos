@@ -371,6 +371,12 @@ fn map_cost_update(context: &ProgressMappingContext, event: &Value) -> UiProgres
     update.response_cost = f64_field(event, &["response_cost"]);
     update.session_cost = f64_field(event, &["session_cost"]);
     update.currency = string_field(event, &["currency"]);
+    // Carry the model id forward when the agent emit layer populated it
+    // — the chat client renders `model · tokens_in / tokens_out · duration`
+    // footers from `metadata.token_cost.model`. Legacy clients that
+    // sniff `metadata.label` continue to work (we still emit the field
+    // omitted when absent).
+    update.model = string_field(event, &["model"]);
 
     let mut metadata = UiProgressMetadata::token_cost(update);
     metadata.message = string_field(event, &["message", "status"]);
@@ -669,6 +675,37 @@ mod tests {
         assert_eq!(cost.input_tokens, Some(10));
         assert_eq!(cost.output_tokens, Some(4));
         assert_eq!(cost.session_cost, Some(0.0012));
+        // Back-compat: payloads without a `model` field land with
+        // `cost.model = None` and the client can fall back to the
+        // historical `metadata.label` sniff.
+        assert_eq!(cost.model, None);
+    }
+
+    /// New: chat bubble footer needs the model id to render
+    /// `model · tokens_in / tokens_out · duration`. The cost_update
+    /// mapper must thread the field from the wire payload into
+    /// `metadata.token_cost.model` so the UI Protocol consumer can
+    /// read it without going through the legacy `metadata.label`
+    /// sidecar.
+    #[test]
+    fn ui_protocol_progress_cost_update_carries_model_into_token_cost_metadata() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "cost_update",
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "model": "deepseek-v4-pro"
+            }),
+        );
+
+        let status = mapping.status.expect("cost status");
+        let cost = status
+            .event
+            .metadata
+            .token_cost
+            .expect("token cost metadata");
+        assert_eq!(cost.model.as_deref(), Some("deepseek-v4-pro"));
     }
 
     #[test]

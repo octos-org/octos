@@ -1004,6 +1004,7 @@ mod tests {
                     session_output_tokens: 110,
                     response_cost: Some(0.0008),
                     session_cost: Some(0.0008),
+                    model: Some("claude-sonnet".into()),
                 });
             })
             .await;

@@ -243,21 +243,38 @@ impl Agent {
         ))
     }
 
-    pub(super) fn emit_cost_update(
-        &self,
-        total_usage: &TokenUsage,
-        response_usage: &octos_llm::TokenUsage,
-    ) {
-        let pricing = octos_llm::pricing::model_pricing(self.llm.model_id());
+    pub(super) fn emit_cost_update(&self, total_usage: &TokenUsage, response: &ChatResponse) {
+        let response_usage = &response.usage;
+        // Codex round-1 P2: for failover / routed responses the slot that
+        // produced this response may not match `self.llm.model_id()`
+        // (which exposes the chain's "active" slot). Resolve via
+        // `provider_metadata_for_index` so the footer reflects the model
+        // that actually answered. `provider_metadata_for_index` falls
+        // back to the active slot's metadata when `provider_index` is
+        // `None`, matching the legacy `model_id()` behaviour.
+        let metadata = self
+            .llm
+            .provider_metadata_for_index(response.provider_index);
+        let pricing = octos_llm::pricing::model_pricing(&metadata.model);
         let response_cost =
             pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens));
         let session_cost =
             pricing.map(|p| p.cost(total_usage.input_tokens, total_usage.output_tokens));
+        // Carry the model id so chat clients can render
+        // `model · tokens_in / tokens_out · duration` footers. Skip the
+        // synthesis if the provider returns an empty identifier — empty
+        // strings would only confuse the client renderer.
+        let model = if metadata.model.is_empty() {
+            None
+        } else {
+            Some(metadata.model.clone())
+        };
         self.reporter().report(ProgressEvent::CostUpdate {
             session_input_tokens: total_usage.input_tokens,
             session_output_tokens: total_usage.output_tokens,
             response_cost,
             session_cost,
+            model,
         });
     }
 
