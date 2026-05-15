@@ -7,17 +7,25 @@ use eyre::Result;
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
+use crate::policy::FilesystemScope;
 
 /// List contents of a directory.
 pub struct ListDirTool {
     base_dir: PathBuf,
+    filesystem_scope: FilesystemScope,
 }
 
 impl ListDirTool {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
         }
+    }
+
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
     }
 }
 
@@ -56,7 +64,11 @@ impl Tool for ListDirTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input = serde_json::from_value(args.clone())?;
 
-        let target = match super::resolve_path(&self.base_dir, &input.path) {
+        let target = match super::resolve_path_with_scope(
+            &self.base_dir,
+            &input.path,
+            self.filesystem_scope,
+        ) {
             Ok(p) => p,
             Err(_) => {
                 return Ok(ToolResult {

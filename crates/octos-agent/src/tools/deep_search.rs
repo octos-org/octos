@@ -69,7 +69,7 @@ fn default_max_chars_per_page() -> usize {
 #[async_trait]
 impl Tool for DeepSearchTool {
     fn name(&self) -> &str {
-        "deep_search"
+        "search"
     }
 
     fn description(&self) -> &str {
@@ -102,8 +102,7 @@ impl Tool for DeepSearchTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let input: Input =
-            serde_json::from_value(args.clone()).wrap_err("invalid deep_search input")?;
+        let input: Input = serde_json::from_value(args.clone()).wrap_err("invalid search input")?;
 
         let count = input.count.clamp(1, 10);
         let max_chars = input.max_chars_per_page.clamp(1000, 200_000);

@@ -805,7 +805,7 @@ mod tests {
             &json!({
                 "type": "task_updated",
                 "task_id": "01900000-0000-7000-8000-000000000002",
-                "title": "deep_search",
+                "title": "search",
                 "state": "verifying",
                 "runtime_detail": "checking outputs"
             }),
@@ -818,7 +818,7 @@ mod tests {
             updated.task_id.to_string(),
             "01900000-0000-7000-8000-000000000002"
         );
-        assert_eq!(updated.title, "deep_search");
+        assert_eq!(updated.title, "search");
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
     }
@@ -949,7 +949,7 @@ mod tests {
     fn background_task_progress_json_uses_stable_detail() {
         let task = octos_agent::BackgroundTask {
             id: "01900000-0000-7000-8000-000000000003".into(),
-            tool_name: "deep_search".into(),
+            tool_name: "search".into(),
             tool_call_id: "call-1".into(),
             parent_session_key: Some("local:demo".into()),
             child_session_key: None,
@@ -981,7 +981,7 @@ mod tests {
         let event = background_task_to_progress_json(&task);
         assert_eq!(event["type"], "task_updated");
         assert_eq!(event["task_id"], "01900000-0000-7000-8000-000000000003");
-        assert_eq!(event["title"], "deep_search");
+        assert_eq!(event["title"], "search");
         assert_eq!(event["state"], "verifying");
         assert_eq!(event["runtime_detail"], "Writing report");
     }

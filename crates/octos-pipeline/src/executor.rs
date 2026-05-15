@@ -382,6 +382,94 @@ pub(crate) fn report_progress(message: &str) {
     }
 }
 
+/// Shared status snapshot updated by the pipeline executor and read by the
+/// periodic heartbeat task. Lets the chat bubble see a refreshing status
+/// chip during long-running phases (`plan_and_search` 13min, `analyze`
+/// 9min) where existing milestone-only emits leave a 5+ min gap between
+/// visible updates.
+#[derive(Clone, Debug)]
+pub(crate) struct PipelineStatusSnapshot {
+    pub(crate) pipeline_id: String,
+    pub(crate) current_node: String,
+    pub(crate) nodes_done: usize,
+    pub(crate) nodes_total: usize,
+    pub(crate) start: Instant,
+}
+
+/// RAII guard around the heartbeat `JoinHandle` so the spawned task is
+/// aborted on every return path of `run_with_handlers` (Ok, Err, early
+/// returns inside the main loop, panics that unwind through).
+struct HeartbeatGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Spawn the heartbeat. Captures `reporter` + `tool_id` from `TOOL_CTX`
+/// synchronously (tokio::spawn would otherwise lose the task-local), then
+/// ticks every `interval` and emits a refreshing `ToolProgress` event.
+/// Returns `None` when no `TOOL_CTX` is active (out-of-band callers / unit
+/// tests) — in that case the heartbeat would be silent anyway.
+fn spawn_pipeline_heartbeat(
+    status: Arc<std::sync::Mutex<PipelineStatusSnapshot>>,
+    interval_secs: u64,
+) -> Option<HeartbeatGuard> {
+    let ctx = TOOL_CTX.try_with(|c| c.clone()).ok()?;
+    let reporter = ctx.reporter.clone();
+    let tool_id = ctx.tool_id.clone();
+    tracing::info!(
+        target: "octos::pipeline::heartbeat",
+        tool_id = %tool_id,
+        interval_secs,
+        "spawn_pipeline_heartbeat: spawned"
+    );
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        // Skip the immediate first tick — the executor itself emits a
+        // `"Pipeline '...' started"` event at T+0, and we don't want a
+        // duplicate before it lands.
+        interval.tick().await;
+        let mut tick_count: u64 = 0;
+        loop {
+            interval.tick().await;
+            tick_count += 1;
+            let snap = match status.lock() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            };
+            let elapsed = snap.start.elapsed().as_secs();
+            let message = if snap.nodes_total > 0 {
+                format!(
+                    "Pipeline '{}' running: {} ({}/{} nodes, {}s elapsed)",
+                    snap.pipeline_id, snap.current_node, snap.nodes_done, snap.nodes_total, elapsed,
+                )
+            } else {
+                format!(
+                    "Pipeline '{}' running: {} ({}s elapsed)",
+                    snap.pipeline_id, snap.current_node, elapsed,
+                )
+            };
+            tracing::info!(
+                target: "octos::pipeline::heartbeat",
+                tick = tick_count,
+                elapsed_s = elapsed,
+                node = %snap.current_node,
+                "heartbeat tick: {message}"
+            );
+            reporter.report(ProgressEvent::ToolProgress {
+                name: "run_pipeline".to_string(),
+                tool_id: tool_id.clone(),
+                message,
+            });
+        }
+    });
+    Some(HeartbeatGuard { handle })
+}
+
 /// Resolve an LLM provider from a model key using an optional router.
 fn resolve_provider(
     default: &Arc<dyn LlmProvider>,
@@ -822,7 +910,23 @@ impl PipelineExecutor {
         handlers: HandlerRegistry,
     ) -> Result<PipelineResult> {
         // Parse and validate
-        let graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+        let mut graph = parse_dot(dot_content).wrap_err("failed to parse pipeline DOT")?;
+
+        // Replace the historical pipeline-guard plugin's
+        // before_tool_call hook with an in-process pass that fills
+        // `node.model` / `node.planner_model` for any node the LLM
+        // left unset, using the profile's `model_catalog.json` /
+        // `pipeline_models.json`.
+        //
+        // The plugin form has been observed to silently degrade when
+        // its manifest fails to parse on daemon bootstrap (load order
+        // race); since this assignment is correctness-critical for
+        // strong-vs-fast cost/quality routing across nodes, moving it
+        // in-process makes the behavior deterministic. See
+        // `book/src/skill-development.md`'s "Before You Start: Skill
+        // vs. Workspace Contract" rubric and the pipeline-guard case
+        // study for the full rationale.
+        crate::model_assignment::assign_from_catalog_dir(&mut graph, &self.config.working_dir);
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph
@@ -1367,7 +1471,31 @@ impl PipelineExecutor {
             graph.nodes.len()
         ));
 
+        // Periodic heartbeat (issue #964 follow-up): a fresh `ToolProgress`
+        // event every 5s with the current node + nodes-done counter +
+        // elapsed seconds. Existing milestone-only emits leave 5+ min gaps
+        // (analyze can run 9 min between events) — without the heartbeat
+        // the chat bubble appears frozen for entire pipeline phases.
+        let heartbeat_status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: graph.id.clone(),
+            current_node: current_node_id.clone(),
+            nodes_done: 0,
+            nodes_total: graph.nodes.len(),
+            start: Instant::now(),
+        }));
+        let _heartbeat = spawn_pipeline_heartbeat(heartbeat_status.clone(), 5);
+
         loop {
+            // Refresh the heartbeat snapshot at every iteration so the
+            // periodic chip reflects the node currently executing. The
+            // counter increments after each handler completes (see the
+            // `parallel_executed` short-circuit + the post-handler block
+            // further down where `completed.insert(...)` runs).
+            if let Ok(mut g) = heartbeat_status.lock() {
+                g.current_node = current_node_id.clone();
+                g.nodes_done = completed.len();
+            }
+
             let node = graph
                 .nodes
                 .get(&current_node_id)
@@ -2999,5 +3127,155 @@ mod tests {
             result.is_ok(),
             "fan-out below cap should complete: {result:?}"
         );
+    }
+
+    // ── Heartbeat (#964 follow-up) ─────────────────────────────────────
+    //
+    // Verifies that `spawn_pipeline_heartbeat` ticks at the configured
+    // interval, reads the shared `PipelineStatusSnapshot` each tick, and
+    // emits `ProgressEvent::ToolProgress` events through the captured
+    // reporter. The guard's `Drop` aborts the task so it doesn't outlive
+    // the surrounding `run_with_handlers` call.
+
+    /// Capturing reporter — collects every emitted `ProgressEvent` into a
+    /// `Vec` so the test can assert on the messages.
+    #[derive(Default, Clone)]
+    struct CapturingReporter {
+        events: Arc<std::sync::Mutex<Vec<octos_agent::progress::ProgressEvent>>>,
+    }
+
+    impl octos_agent::progress::ProgressReporter for CapturingReporter {
+        fn report(&self, event: octos_agent::progress::ProgressEvent) {
+            if let Ok(mut g) = self.events.lock() {
+                g.push(event);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_emits_periodic_progress_with_current_node() {
+        let reporter = CapturingReporter::default();
+        let captured = reporter.events.clone();
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-heartbeat".to_string(),
+            reporter: Arc::new(reporter),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: "research".to_string(),
+            current_node: "plan_and_search".to_string(),
+            nodes_done: 0,
+            nodes_total: 3,
+            start: Instant::now(),
+        }));
+
+        // Run the heartbeat inside TOOL_CTX.scope so the spawn helper can
+        // capture reporter + tool_id synchronously. The 1s interval keeps
+        // the test fast while still proving the periodic shape.
+        let status_for_advance = status.clone();
+        TOOL_CTX
+            .scope(ctx, async move {
+                let _guard = spawn_pipeline_heartbeat(status_for_advance.clone(), 1)
+                    .expect("heartbeat should spawn when TOOL_CTX is set");
+                // Wait long enough for ≥2 ticks: first tick is consumed
+                // by `interval.tick().await` (the skip-immediate guard),
+                // the next two fire at +1s and +2s. Sleep 2.4s real time.
+                tokio::time::sleep(Duration::from_millis(2_400)).await;
+
+                // Update the snapshot mid-flight so the next tick
+                // reflects the new node — guards against a stale snapshot
+                // baked at spawn time.
+                if let Ok(mut g) = status_for_advance.lock() {
+                    g.current_node = "analyze".to_string();
+                    g.nodes_done = 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1_100)).await;
+                // Guard drops here — heartbeat task aborts.
+            })
+            .await;
+
+        let events = captured.lock().unwrap();
+        // Expect ≥2 ticks (sleep 2.4s skips first immediate tick, then
+        // fires at +1s and +2s) plus possibly +3.5s for the post-update
+        // tick. Lower bound: 2.
+        assert!(
+            events.len() >= 2,
+            "expected ≥2 heartbeat events in 3.5s; got {}: {:?}",
+            events.len(),
+            events,
+        );
+
+        let messages: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                octos_agent::progress::ProgressEvent::ToolProgress { message, .. } => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages.len(),
+            events.len(),
+            "heartbeat must emit ToolProgress events only — got: {:?}",
+            events,
+        );
+
+        let combined = messages.join("\n");
+        assert!(
+            combined.contains("research"),
+            "heartbeat must include the pipeline id; got: {combined}",
+        );
+        assert!(
+            combined.contains("plan_and_search") || combined.contains("analyze"),
+            "heartbeat must surface the current_node from the snapshot; got: {combined}",
+        );
+        // Each tick should also include an elapsed-seconds suffix so
+        // every message is unique — protects against SPA dedup-by-message
+        // that would otherwise collapse identical chips.
+        assert!(
+            combined.contains("s elapsed"),
+            "heartbeat message must contain '<N>s elapsed'; got: {combined}",
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_guard_drop_stops_emission() {
+        let reporter = CapturingReporter::default();
+        let captured = reporter.events.clone();
+
+        let ctx = octos_agent::tools::ToolContext {
+            tool_id: "tc-heartbeat-stop".to_string(),
+            reporter: Arc::new(reporter),
+            ..octos_agent::tools::ToolContext::zero()
+        };
+
+        let status = Arc::new(std::sync::Mutex::new(PipelineStatusSnapshot {
+            pipeline_id: "p".to_string(),
+            current_node: "n".to_string(),
+            nodes_done: 0,
+            nodes_total: 1,
+            start: Instant::now(),
+        }));
+
+        TOOL_CTX
+            .scope(ctx, async move {
+                {
+                    let _guard = spawn_pipeline_heartbeat(status.clone(), 1).unwrap();
+                    tokio::time::sleep(Duration::from_millis(1_200)).await;
+                    // _guard drops here when block exits.
+                }
+                let count_at_drop = captured.lock().unwrap().len();
+                // Sleep past 2 more theoretical tick intervals.
+                tokio::time::sleep(Duration::from_millis(2_500)).await;
+                let count_after_drop = captured.lock().unwrap().len();
+                assert_eq!(
+                    count_at_drop, count_after_drop,
+                    "no new heartbeat events should fire after the guard drops; got {count_at_drop} -> {count_after_drop}",
+                );
+            })
+            .await;
     }
 }

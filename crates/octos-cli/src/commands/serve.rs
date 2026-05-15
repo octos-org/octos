@@ -218,6 +218,10 @@ pub struct ServeCommand {
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
+    /// Run AppUI JSON-RPC over stdin/stdout instead of binding HTTP.
+    #[arg(long)]
+    pub stdio: bool,
+
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
@@ -630,6 +634,13 @@ impl ServeCommand {
             // `api/ui_protocol.rs::session_tool_registry`.
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
         });
+
+        if self.stdio {
+            crate::api::ui_protocol::stdio_connection(state).await?;
+            tracing::info!("stopping all gateway child processes");
+            let _ = process_manager.stop_all().await;
+            return Ok(());
+        }
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();

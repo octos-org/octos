@@ -1852,7 +1852,7 @@ mod tests {
     #[test]
     fn should_apply_harness_progress_event_and_notify() {
         let supervisor = TaskSupervisor::new();
-        let id = supervisor.register("deep_search", "call-9", Some("api:session"));
+        let id = supervisor.register("search", "call-9", Some("api:session"));
         supervisor.mark_running(&id);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1894,8 +1894,7 @@ mod tests {
 
         let supervisor = TaskSupervisor::new();
         supervisor.enable_persistence(&ledger_path).unwrap();
-        let id =
-            supervisor.register_with_lineage("deep_search", "call-9", Some("api:session"), None);
+        let id = supervisor.register_with_lineage("search", "call-9", Some("api:session"), None);
         supervisor.mark_running(&id);
 
         let event = crate::harness_events::HarnessEvent::progress(
@@ -2030,7 +2029,7 @@ mod tests {
         supervisor.enable_persistence(&ledger_path).unwrap();
 
         let task_id =
-            supervisor.register_with_lineage("deep_search", "call-1", Some("api:session"), None);
+            supervisor.register_with_lineage("search", "call-1", Some("api:session"), None);
         supervisor.mark_running(&task_id);
         supervisor.mark_runtime_state(
             &task_id,
@@ -3111,7 +3110,7 @@ mod tests {
         let supervisor = TaskSupervisor::new();
         supervisor.enable_persistence(&ledger_path).unwrap();
         let task_a =
-            supervisor.register_with_lineage("deep_search", "call-a", Some("api:session"), None);
+            supervisor.register_with_lineage("search", "call-a", Some("api:session"), None);
         supervisor.mark_running(&task_a);
         let task_b =
             supervisor.register_with_lineage("fm_tts", "call-b", Some("api:session"), None);

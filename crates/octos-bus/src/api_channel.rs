@@ -4694,7 +4694,7 @@ mod tests {
                 .add_message_with_seq(
                     &key,
                     assistant_tool_call_message(
-                        "deep_search",
+                        "search",
                         serde_json::json!({"query": "John Ternus 背景"}),
                     ),
                 )

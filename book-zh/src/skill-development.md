@@ -6,6 +6,120 @@
 
 ---
 
+## 开始前：技能 vs. Workspace 契约
+
+写技能之前，先判断逻辑应该放在**插件工具**（外部二进制，本指南覆盖的形式）还是**进程内 workspace 契约**框架（`workspace_policy.toml` + `ValidatorSpec` 变体）。
+
+两者看起来都能"管住"工具行为，但关注点完全不同，可靠性特征也不同。把逻辑放错位置是我们最常见的设计错误。
+
+### 决策矩阵
+
+| 维度 | Workspace 契约（宿主进程内，Rust） | 插件工具 / 生命周期 hook（外部二进制） |
+|---|---|---|
+| **正确性关键度** | 关键路径 — 必须每次都运行 | 锦上添花；hook 加载失败也不影响工具执行 |
+| **稳定性** | 形态稳定，跨部署一致 | 经常按 profile / 部署定制 |
+| **性能** | 热路径；每次工具调用都跑，进程内 | 冷路径；触发时启子进程 + JSON IPC |
+| **失败语义** | 类型化失败 `SpawnTaskContractResult::Failed` 直接挂掉工具 | 失败仅记日志；执行继续 |
+| **横切覆盖面** | 通用 — 适用多个工具（文件格式、完整性、内容校验） | 工具专属行为或能力实现 |
+| **定制范围** | 系统不变量，用户不可调 | 用户可配；独立于宿主版本 |
+
+如果 5 个维度都指向同一列，就建在那一列。维度分裂时用下面的两条决胜规则。
+
+**决胜 A — "用户能否安全禁用？"**
+- 能 → 插件（用户可控，影响半径小）
+- 不能（系统不变量）→ workspace 契约
+
+**决胜 B — "语言 / 运行时是否受限？"**
+- 纯 Rust 数据处理、文件 I/O、HTTP — 宿主（workspace 契约）
+- 需要 Python 生态、原生 CLI、GPU/Metal、带复杂鉴权的云 SDK — 插件
+
+### 现有功能各归各位
+
+下列属于 **workspace 契约**（`workspace_policy.toml`，详见 `crates/octos-agent/src/workspace_policy.rs::ValidatorSpec`）：
+
+- **`AudioNonSilent`** / **`PerFileNonSilent`** — TTS 输出内容不变量。系统必须拒绝把静音 `.wav` 当作"成功生成"。适用于任何 TTS skill，不分厂商。
+- **`MagicBytes`** — 文件格式完整性校验。适用所有产出文件的工具。
+- **`Sha256Match`** — 供应链 / artefact 完整性，必须始终核验。
+- **`HttpProbeUntil`** — 发布后的健康门控 / 部署 gate。
+- **`FileExists`** — 基础交付物契约。
+
+下列属于 **插件工具**（本指南）：
+
+- **`fm_tts`**、**`mofa_slides`**、**`mofa_publish`**、**`search`**（原 `deep_search`）— 能力本身。每个都是具体实现，常包装外部运行时（Python、Chromium、原生 CLI），版本独立于宿主。
+- **`qwen-tts`** 声音克隆 — 包装外部 HTTP API + 鉴权；按租户凭据；无需重编 octos 即可更新。
+
+下列才适合作为**插件 hook**（仅在它属于**可选增强**、缺失也不影响工具本身的情况下）：
+
+- **指标 / 审计** hooks（after_tool_call）：把 cost / latency 上报到外部系统。失败也没事 — 工具该跑还是跑了。
+- **频道侧通知**：完成时 ping Slack。可选。
+
+### pipeline-guard 案例研究（以及我们会怎么重做）
+
+**`pipeline-guard`** 目前作为插件存放在 `crates/app-skills/pipeline-guard/`，用 `before_tool_call` hook 修改 LLM 为 `run_pipeline` 编写的 DOT 图 — 根据实时 QoS catalog 给 `dynamic_parallel` 的 worker 注入 `model="cheap"`，给 `synthesize` 节点注入 `model="strong"`。
+
+按矩阵打分：
+
+| 维度 | pipeline-guard 评分 |
+|---|---|
+| 正确性关键度 | **关键** — 没它，每个 pipeline 节点都用同一个默认 model，无视成本 / 质量差异 |
+| 稳定性 | 稳定 — 形态固定；逻辑就是"从 `model_catalog.json` 填 `node.model`" |
+| 性能 | 热路径 — 每次 `run_pipeline` 调用都跑 |
+| 失败语义 | **目前失败静默** — manifest 解析失败或二进制缺失时，静悄悄退化到"不分配 model"，用户看不到任何错误 |
+| 横切覆盖面 | run_pipeline 专属 |
+| 定制范围 | 系统不变量 — 用户不挑哪些 DOT 节点用哪个 model |
+| 语言约束 | 纯 Rust，对已解析的 `PipelineGraph` 做数据操作 |
+
+**5 个主维度（加上两条决胜规则）全都指向宿主 / 进程内 — 不是插件。** 用生命周期 hook 是类别错位。实际线上也证实了这一点：每次守护进程启动 manifest 解析报错；解析失败时 hook 就静默不跑。
+
+**正确的归属是 `octos-pipeline` 内联。** 推荐形态（截稿时尚未落地）：
+
+```rust
+// 在 RunPipelineTool::execute 中，parse_dot 之后：
+octos_pipeline::model_assignment::assign_from_catalog(
+    &mut graph,
+    &model_catalog, // 由 ProfileRuntime → RunPipelineTool 传入
+)?;
+```
+
+一个约 50 行的进程内确定性函数 + 单元测试，胜过另起一个二进制 + JSON IPC + 插件加载器 + manifest 解析器。要让正确性关键、不可定制、永远不需要独立发版的逻辑在最可靠的通道上跑。
+
+**推广** — 如果将来其他工具也需要类似的调用前参数加工（比如 `mofa_slides` 强制套用默认 style），应该让 workspace 契约框架新增变体，而不是每个工具自己加一个 hook 插件：
+
+```rust
+pub enum ValidatorSpec {
+    // 现有的执行后校验器...
+    AudioNonSilent { ... },
+    MagicBytes { ... },
+    HttpProbeUntil { ... },
+
+    // 提议：调用前参数变换器
+    PreCall {
+        mutate_args: PreCallMutator,
+    },
+}
+```
+
+完整性关键逻辑收拢到一个进程内通道、带类型化失败路径，胜过散落在多个插件二进制里、以"尽力而为"语义工作。
+
+### 速查规则
+
+```
+   关键路径吗？
+        ┌──────┴──────┐
+       是             否
+        │             │
+   形态稳定吗？       插件 hook（尽力而为）
+        ┌──┴──┐
+       是     否
+        │     │
+   workspace 插件工具
+   契约     （可定制能力）
+```
+
+如果你正准备用插件 hook 来强制一个用户绝不能覆盖的不变量 — 停下，去 `octos-agent` 提个 issue，看看是不是该加一个 workspace 契约变体作为更合适的家。
+
+---
+
 ## 架构概览
 
 应用技能是一个**独立的可执行二进制文件**，通过简单的 **stdin/stdout JSON 协议**与 octos 网关通信。网关为每次工具调用将技能二进制文件作为子进程启动，通过 stdin 传递 JSON 参数，并从 stdout 读取 JSON 结果。

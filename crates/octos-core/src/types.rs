@@ -574,6 +574,7 @@ fn is_channel_name(value: &str) -> bool {
             | "discord"
             | "email"
             | "feishu"
+            | "local"
             | "matrix"
             | "qq-bot"
             | "slack"
@@ -786,6 +787,15 @@ mod tests {
         assert_eq!(key.profile_id(), Some("weather"));
         assert_eq!(key.channel(), "qq-bot");
         assert_eq!(key.chat_id(), "group:123");
+    }
+
+    #[test]
+    fn test_session_key_with_profile_supports_local_channel() {
+        let key = SessionKey::with_profile_topic("dspfac", "local", "tui", "coding");
+        assert_eq!(key.profile_id(), Some("dspfac"));
+        assert_eq!(key.channel(), "local");
+        assert_eq!(key.chat_id(), "tui");
+        assert_eq!(key.topic(), Some("coding"));
     }
 
     #[test]

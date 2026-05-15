@@ -467,7 +467,7 @@ mod tests {
             "name": "p",
             "version": "1",
             "tools": [{
-                "name": "deep_search",
+                "name": "search",
                 "description": "Research",
                 "input_schema": {
                     "type": "object",

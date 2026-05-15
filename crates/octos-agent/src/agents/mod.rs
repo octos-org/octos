@@ -505,7 +505,7 @@ mod tests {
         // adds `shell` to the tool list.
         write(
             &tmp.path().join("research-worker.json"),
-            r#"{"name":"research-worker","version":1,"tools":["deep_search","shell"]}"#,
+            r#"{"name":"research-worker","version":1,"tools":["search","shell"]}"#,
         );
         // Add a brand-new local-only definition.
         write(
@@ -570,7 +570,7 @@ mod tests {
             .get("research-worker")
             .expect("research-worker built-in");
         assert_eq!(def.name, "research-worker");
-        assert!(def.tools.contains(&"deep_search".to_string()));
+        assert!(def.tools.contains(&"search".to_string()));
         assert!(def.tools.contains(&"web_fetch".to_string()));
         assert!(def.tools.contains(&"web_search".to_string()));
         // Research worker explicitly denies shell/write/edit.
@@ -598,6 +598,6 @@ mod tests {
             );
         }
         // Repo editor denies deep_search.
-        assert!(def.disallowed_tools.contains(&"deep_search".to_string()));
+        assert!(def.disallowed_tools.contains(&"search".to_string()));
     }
 }

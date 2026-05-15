@@ -12,8 +12,8 @@ use eyre::{Result, WrapErr};
 use octos_agent::sandbox::create_sandbox;
 use octos_agent::workspace_policy::{WorkspacePolicy, write_workspace_policy_if_absent};
 use octos_agent::{
-    Agent, AgentConfig, AgentSummaryGenerator, FileStateCache, SandboxConfig, SubAgentOutputRouter,
-    ToolRegistry,
+    Agent, AgentConfig, AgentSummaryGenerator, EffectivePermissions, FileStateCache, SandboxConfig,
+    SubAgentOutputRouter, ToolRegistry,
 };
 use octos_bus::SessionManager;
 use octos_core::{AgentId, SessionKey};
@@ -99,6 +99,11 @@ pub struct SessionRuntime {
     /// supplied an override at bootstrap.
     pub sandbox: SandboxConfig,
 
+    /// The effective permission profile for this session. This is the
+    /// runtime source of truth used to build shell policy, sandbox behavior,
+    /// file-tool scope, and approval behavior.
+    pub permissions: EffectivePermissions,
+
     /// The session's [`ToolRegistry`] — a clone of the profile's
     /// base [`ProfileRuntime::tool_specs`] template that has been
     /// (a) bound to [`Self::workspace_root`] and (b) filtered
@@ -179,6 +184,24 @@ impl SessionRuntime {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_with_permissions(
+            profile,
+            session_key,
+            workspace_hint,
+            EffectivePermissions::workspace_write(),
+        )
+        .await
+    }
+
+    /// Construct a [`SessionRuntime`] with an explicit effective permission
+    /// profile. AppUI integration should resolve and gate requested permission
+    /// profiles before calling this hook.
+    pub async fn bootstrap_with_permissions(
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        permissions: EffectivePermissions,
+    ) -> Result<Arc<Self>> {
         // Step 1: resolve workspace_root.
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
@@ -221,10 +244,12 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = profile.default_sandbox.clone();
-        let mut tools = profile
-            .tool_specs
-            .rebind_cwd(&workspace_root, create_sandbox(&sandbox));
+        let sandbox = permissions.apply_to_sandbox(&profile.default_sandbox);
+        let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
+            &workspace_root,
+            create_sandbox(&sandbox),
+            permissions,
+        );
         tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
         tools.rebind_plugin_work_dirs(&plugin_work_dir);
         // M11-F regression fix REG-1 follow-up round 2 (codex review):
@@ -342,6 +367,7 @@ impl SessionRuntime {
             workspace_root,
             plugin_work_dir,
             sandbox,
+            permissions,
             tools,
             agent,
             sessions,
@@ -462,7 +488,10 @@ mod tests {
     use octos_agent::workspace_policy::{
         WORKSPACE_POLICY_FILE, WorkspacePolicy, read_workspace_policy,
     };
-    use octos_agent::{SandboxConfig, ToolRegistry};
+    use octos_agent::{
+        ApprovalPolicy, EffectivePermissions, PermissionProfile, RuntimeMode, SandboxConfig,
+        SandboxMode, ToolRegistry,
+    };
     use octos_core::Message;
     use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::{EpisodeStore, MemoryStore};
@@ -956,5 +985,112 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_never_workspace_permissions_keeps_sandbox_and_workspace_scope() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let workspace = tmp.path().join("workspace-never");
+        let outside = tmp.path().join("outside-never.txt");
+        std::fs::write(&outside, "outside\n").unwrap();
+
+        let permissions =
+            EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
+        let rt = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            SessionKey::new("api", "never-workspace"),
+            Some(workspace),
+            permissions,
+        )
+        .await
+        .expect("bootstrap");
+
+        assert_eq!(rt.permissions.approval_policy, ApprovalPolicy::Never);
+        assert!(rt.sandbox.enabled);
+        assert_eq!(rt.sandbox.mode, SandboxMode::Auto);
+
+        let ask_result = rt
+            .tools
+            .execute(
+                "shell",
+                &serde_json::json!({ "command": "sudo printf nope" }),
+            )
+            .await
+            .expect("shell result");
+        assert!(!ask_result.success);
+        assert!(ask_result.output.contains("approval_policy is never"));
+
+        let outside_write = rt
+            .tools
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "blocked\n"
+                }),
+            )
+            .await
+            .expect("write_file result");
+        assert!(!outside_write.success);
+        assert!(outside_write.output.contains("outside working directory"));
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_dangerous_solo_permissions_disables_sandbox_and_uses_host_scope() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+        let workspace = tmp.path().join("workspace-danger");
+        let outside = tmp.path().join("outside-danger.txt");
+
+        let permissions = EffectivePermissions::for_runtime(
+            PermissionProfile::DangerFullAccess,
+            RuntimeMode::Solo,
+        )
+        .expect("solo dangerous permissions");
+        let rt = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            SessionKey::new("api", "dangerous-solo"),
+            Some(workspace),
+            permissions,
+        )
+        .await
+        .expect("bootstrap");
+
+        assert_eq!(
+            rt.permissions.permission_profile,
+            PermissionProfile::DangerFullAccess
+        );
+        assert!(!rt.sandbox.enabled);
+        assert_eq!(rt.sandbox.mode, SandboxMode::None);
+        assert!(rt.sandbox.allow_network);
+
+        let shell = rt
+            .tools
+            .execute(
+                "shell",
+                &serde_json::json!({ "command": "printf danger-ok # rm -rf /" }),
+            )
+            .await
+            .expect("shell result");
+        assert!(shell.success, "shell failed: {}", shell.output);
+        assert!(shell.output.contains("danger-ok"));
+
+        let write = rt
+            .tools
+            .execute(
+                "write_file",
+                &serde_json::json!({
+                    "path": outside.to_string_lossy(),
+                    "content": "host\n"
+                }),
+            )
+            .await
+            .expect("write_file result");
+        assert!(write.success, "write_file failed: {}", write.output);
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "host\n");
     }
 }

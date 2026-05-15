@@ -114,6 +114,23 @@ pub struct BackgroundResultPayload {
     /// `read_task_output` against it). `None` for legacy callers and
     /// tests that do not register tasks with the supervisor.
     pub task_id: Option<String>,
+    /// Issue #960 fix (M10 Phase 4 plumbing): the originating user
+    /// message's `client_message_id` (cmid) — the same value the
+    /// supervisor records as
+    /// [`crate::task_supervisor::BackgroundTask::originating_client_message_id`]
+    /// and that the M8.9 recovery path threads onto its synthetic turn.
+    /// Surfaces on the wire as
+    /// [`octos_core::ui_protocol::TurnSpawnCompleteEvent::response_to_client_message_id`]
+    /// so the SPA reducer can anchor the new assistant bubble to the
+    /// parent user prompt instead of falling back to thread-map heuristics
+    /// (the bundle's `subSpawnComplete` handler bails when that lookup
+    /// misses — issue #960 root cause). For gateway-style channels the
+    /// reporter binds the real per-user `cmid`; for the WS standalone-turn
+    /// path the reporter binds the originating `TurnId` (a UUID) and the
+    /// SPA already keys its thread-map on that same value, so the wire
+    /// identity round-trips correctly in both shapes. `None` for legacy
+    /// callers and tests that do not track origination.
+    pub originating_client_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2974,6 +2991,13 @@ impl Tool for SpawnTool {
                         envelope_media: vec![],
                         originating_thread_id: originating_thread_id.clone(),
                         task_id: tracked_task_id.clone(),
+                        // Issue #960: same value as `originating_thread_id`
+                        // — the reporter's `thread_id()` is the user's
+                        // `client_message_id` on the gateway/cmid-bound
+                        // path and the `TurnId` UUID on the WS path; the
+                        // SPA reducer's thread-map keys on whichever shape
+                        // its parent prompt row carries.
+                        originating_client_message_id: originating_thread_id.clone(),
                     },
                 )
                 .await
@@ -3984,6 +4008,7 @@ PY
             envelope_media: vec![],
             originating_thread_id: None,
             task_id: None,
+            originating_client_message_id: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);
@@ -4303,7 +4328,7 @@ PY
         apply_agent_definition(&mut input, &registry).expect("apply");
 
         // Research-worker manifest lists deep_search + web_fetch + web_search.
-        for expected in ["deep_search", "web_fetch", "web_search"] {
+        for expected in ["search", "web_fetch", "web_search"] {
             assert!(
                 input.allowed_tools.contains(&expected.to_string()),
                 "manifest tool {expected} did not flow into allowed_tools"

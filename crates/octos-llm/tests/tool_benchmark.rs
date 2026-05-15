@@ -354,7 +354,7 @@ fn generate_tools(count: usize) -> Vec<ToolSpec> {
             }),
         ),
         (
-            "deep_search",
+            "search",
             "Deep multi-engine web search with synthesis",
             serde_json::json!({
                 "type": "object",

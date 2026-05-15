@@ -50,12 +50,11 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
     ),
     // voice-skill removed — voice TTS/ASR is handled by platform-skill "voice".
     // Voice cloning is handled by mofa-fm.
-    (
-        "pipeline-guard",
-        "pipeline-guard",
-        include_str!("../../app-skills/pipeline-guard/SKILL.md"),
-        include_str!("../../app-skills/pipeline-guard/manifest.json"),
-    ),
+    // pipeline-guard removed — its before_tool_call hook was a category
+    // mismatch for correctness-critical logic. The model-assignment work it
+    // did is now in-process at `octos_pipeline::model_assignment` (see
+    // `book/src/skill-development.md` "Before You Start: Skill vs. Workspace
+    // Contract" for the rubric and PR #962 for the inline replacement).
     (
         "skill-evolve",
         "skill-evolve",

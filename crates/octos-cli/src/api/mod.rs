@@ -19,7 +19,7 @@ pub mod purge;
 mod router;
 mod static_files;
 pub mod swarm;
-mod ui_protocol;
+pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha3_bridge;
 mod ui_protocol_alpha4_bridge;

@@ -16,6 +16,7 @@ pub mod handler;
 pub mod host_context;
 pub mod human_gate;
 pub mod manager;
+pub mod model_assignment;
 pub mod parser;
 pub mod recovery;
 pub mod run_dir;

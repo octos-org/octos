@@ -46,15 +46,16 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand,
     UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem,
     UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
+    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::AppState;
 use super::metrics::MetricsReporter;
@@ -102,9 +103,62 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
+const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
+    octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
+const APPUI_METHOD_SESSION_STATUS_READ: &str =
+    octos_core::ui_protocol::methods::SESSION_STATUS_READ;
+const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str =
+    octos_core::ui_protocol::methods::PROFILE_LOCAL_CREATE;
+const APPUI_METHOD_PROFILE_LLM_LIST: &str = "profile/llm/list";
+const APPUI_METHOD_PROFILE_LLM_SELECT: &str = "profile/llm/select";
+const APPUI_METHOD_MCP_STATUS_LIST: &str = "mcp/status/list";
+const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
+const APPUI_METHOD_AUTH_STATUS: &str = "auth/status";
+const APPUI_METHOD_AUTH_SEND_CODE: &str = "auth/send_code";
+const APPUI_METHOD_AUTH_VERIFY: &str = "auth/verify";
+const APPUI_METHOD_AUTH_ME: &str = "auth/me";
+const APPUI_METHOD_AUTH_LOGOUT: &str = "auth/logout";
+const APPUI_METHOD_PROFILE_LLM_CATALOG: &str = "profile/llm/catalog";
+const APPUI_METHOD_PROFILE_LLM_UPSERT: &str = "profile/llm/upsert";
+const APPUI_METHOD_PROFILE_LLM_DELETE: &str = "profile/llm/delete";
+const APPUI_METHOD_PROFILE_LLM_TEST: &str = "profile/llm/test";
+const APPUI_METHOD_PROFILE_LLM_FETCH_MODELS: &str = "profile/llm/fetch_models";
+const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
+const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
+const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
+const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
+const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
+const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
+const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
+const APPUI_EXTRA_METHODS: &[&str] = &[
+    APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+    APPUI_METHOD_SESSION_STATUS_READ,
+    APPUI_METHOD_PROFILE_LOCAL_CREATE,
+    APPUI_METHOD_PROFILE_LLM_LIST,
+    APPUI_METHOD_PROFILE_LLM_SELECT,
+    APPUI_METHOD_MCP_STATUS_LIST,
+    APPUI_METHOD_TOOL_STATUS_LIST,
+    APPUI_METHOD_AUTH_STATUS,
+    APPUI_METHOD_AUTH_SEND_CODE,
+    APPUI_METHOD_AUTH_VERIFY,
+    APPUI_METHOD_AUTH_ME,
+    APPUI_METHOD_AUTH_LOGOUT,
+    APPUI_METHOD_PROFILE_LLM_CATALOG,
+    APPUI_METHOD_PROFILE_LLM_UPSERT,
+    APPUI_METHOD_PROFILE_LLM_DELETE,
+    APPUI_METHOD_PROFILE_LLM_TEST,
+    APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+    APPUI_METHOD_PROFILE_SKILLS_LIST,
+    APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+    APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+    APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+];
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
 type SharedConnectionTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, TurnId>>>;
+type DynamicProfileRuntimeMap =
+    tokio::sync::RwLock<HashMap<String, Arc<crate::runtime::ProfileRuntime>>>;
 
 /// Per-connection registry of live ledger-forwarder tasks keyed by session.
 /// Each entry pumps `LedgeredUiProtocolEvent`s from the ledger broadcast
@@ -530,6 +584,59 @@ impl SessionWorkspaceStore {
     }
 }
 
+#[derive(Default)]
+struct SessionPermissionProfileStore {
+    selections: std::sync::Mutex<HashMap<SessionKey, StoredSessionPermissionProfile>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoredSessionPermissionProfile {
+    selection: octos_core::ui_protocol::PermissionProfileSelection,
+    approval_policy: Option<octos_agent::ApprovalPolicy>,
+}
+
+impl Default for StoredSessionPermissionProfile {
+    fn default() -> Self {
+        Self {
+            selection: octos_core::ui_protocol::PermissionProfileSelection::default(),
+            approval_policy: None,
+        }
+    }
+}
+
+impl SessionPermissionProfileStore {
+    fn get(&self, session_id: &SessionKey) -> octos_core::ui_protocol::PermissionProfileSelection {
+        self.get_state(session_id).selection
+    }
+
+    fn get_state(&self, session_id: &SessionKey) -> StoredSessionPermissionProfile {
+        self.selections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn set(
+        &self,
+        session_id: SessionKey,
+        selection: octos_core::ui_protocol::PermissionProfileSelection,
+        approval_policy: Option<octos_agent::ApprovalPolicy>,
+    ) {
+        self.selections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                session_id,
+                StoredSessionPermissionProfile {
+                    selection,
+                    approval_policy,
+                },
+            );
+    }
+}
+
 /// Per-turn lifecycle state tracked by the registry under a single `Mutex`
 /// guard. Together with the `interrupt_tx` signalling channel, this is the
 /// boundary that makes interrupt-vs-natural-completion atomic and ensures
@@ -705,6 +812,22 @@ impl ConnectionUiFeatures {
         }
     }
 
+    fn stdio_defaults() -> Self {
+        Self {
+            typed_approvals: true,
+            pane_snapshots: true,
+            session_workspace_cwd: true,
+            harness_task_control: true,
+            session_hydrate: true,
+            thread_graph: true,
+            turn_state_get: true,
+            message_persisted: true,
+            spawn_complete: true,
+            auxiliary_rest_to_ws_v1: true,
+            header_present: true,
+        }
+    }
+
     /// Build the `UiProtocolCapabilities` payload to advertise on
     /// `SessionOpened` per UPCR-2026-007 § 4 capability negotiation. When
     /// the client sent no feature header at all, the server returns the
@@ -750,6 +873,58 @@ impl ConnectionUiFeatures {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
+    }
+
+    fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
+        let mut capabilities = self.negotiated_capabilities();
+        for method in APPUI_EXTRA_METHODS {
+            if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
+                && !supports_local_solo_profile_create(state)
+            {
+                continue;
+            }
+            if is_profile_skill_appui_method(*method) && state.profile_store.is_none() {
+                continue;
+            }
+            if !capabilities
+                .supported_methods
+                .iter()
+                .any(|existing| existing == method)
+            {
+                capabilities.supported_methods.push((*method).into());
+            }
+        }
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            APPUI_FEATURE_PERMISSION_PROFILE_V1,
+        );
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1,
+        );
+        if supports_local_solo_profile_create(state) {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1,
+            );
+        }
+        capabilities
+    }
+}
+
+fn is_profile_skill_appui_method(method: &str) -> bool {
+    matches!(
+        method,
+        APPUI_METHOD_PROFILE_SKILLS_LIST
+            | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
+            | APPUI_METHOD_PROFILE_SKILLS_INSTALL
+            | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+    )
+}
+
+fn push_capability_feature(features: &mut Vec<String>, feature: &str) {
+    if !features.iter().any(|existing| existing == feature) {
+        features.push(feature.to_owned());
     }
 }
 
@@ -849,6 +1024,14 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
     static SESSION_WORKSPACES: OnceLock<Arc<SessionWorkspaceStore>> = OnceLock::new();
     SESSION_WORKSPACES
         .get_or_init(|| Arc::new(SessionWorkspaceStore::default()))
+        .clone()
+}
+
+fn session_permission_profiles() -> Arc<SessionPermissionProfileStore> {
+    static SESSION_PERMISSION_PROFILES: OnceLock<Arc<SessionPermissionProfileStore>> =
+        OnceLock::new();
+    SESSION_PERMISSION_PROFILES
+        .get_or_init(|| Arc::new(SessionPermissionProfileStore::default()))
         .clone()
 }
 
@@ -1241,6 +1424,19 @@ impl octos_agent::ProgressReporter for BoundedChannelReporter {
                 "progress event dropped before reaching ws layer"
             );
         }
+    }
+
+    /// Issue #960 fix: expose the per-turn `thread_id` bound at
+    /// construction (`with_thread_id(Some(turn_id.0.to_string()))`) so
+    /// `agent/execution.rs`'s spawn_only intercept can capture it as
+    /// `bg_originating_client_message_id` and surface it on the
+    /// `turn/spawn_complete` envelope's
+    /// `response_to_client_message_id`. Without this override the
+    /// default `None` implementation strips the binding even though the
+    /// struct field is populated, and the SPA reducer's thread-map
+    /// lookup falls through and silently drops the completion bubble.
+    fn thread_id(&self) -> Option<&str> {
+        self.thread_id.as_deref()
     }
 }
 
@@ -1804,6 +2000,18 @@ async fn ui_protocol_connection(
             }
         };
         let id = request.id.clone();
+        if handle_raw_appui_rpc(
+            &ws,
+            &state,
+            features,
+            connection_profile_id,
+            id.clone(),
+            &request,
+        )
+        .await
+        {
+            continue;
+        }
         let command = match route_rpc_command(request, features) {
             Ok(command) => command,
             Err(error) => {
@@ -1813,6 +2021,17 @@ async fn ui_protocol_connection(
         };
 
         match command {
+            UiCommand::ProfileLocalCreate(params) => {
+                match create_or_get_local_solo_profile(&state, params) {
+                    Ok(result) => {
+                        let _ =
+                            send_ui_rpc_result(&ws, id, UiRpcResult::ProfileLocalCreate(result));
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                    }
+                }
+            }
             UiCommand::SessionOpen(params) => {
                 handle_session_open(
                     &ws,
@@ -1926,18 +2145,31 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
-            UiCommand::PermissionProfileList(_) | UiCommand::PermissionProfileSet(_) => {
-                // `permission/profile/*` RPCs are declared in the core
-                // protocol type registry but not yet wired in the v1
-                // server slice. Reply with `method_not_supported` so
-                // clients negotiate around them rather than hang.
-                let _ = send_rpc_error(
-                    &ws,
-                    Some(id),
-                    RpcError::method_not_supported(
-                        "permission/profile/* not yet implemented in server",
-                    ),
-                );
+            UiCommand::PermissionProfileList(params) => {
+                let result = permission_profile_list_result(&state, params);
+                let _ = send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileList(result));
+            }
+            UiCommand::PermissionProfileSet(params) => {
+                let session_id = params.session_id.clone();
+                let profile_id = session_id
+                    .profile_id()
+                    .or(connection_profile_id)
+                    .map(ToOwned::to_owned);
+                match permission_profile_set_result(&state, params) {
+                    Ok(result) => {
+                        if let Some(profile_id) = profile_id {
+                            state
+                                .session_cache
+                                .invalidate(&(profile_id, session_id))
+                                .await;
+                        }
+                        let _ =
+                            send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                    }
+                }
             }
             // -------- M12 Phase D-1 auxiliary REST → WS dispatchers --------
             //
@@ -2083,6 +2315,375 @@ async fn ui_protocol_connection(
     let _ = writer_handle.await;
 }
 
+pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
+    let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+    let mut writer_handle = tokio::spawn(stdio_writer_loop(writer_rx));
+    let ws = WsConnection::new(writer_tx);
+    let active_turns = active_turns_registry();
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let contracts = contract_stores();
+    let ledger = event_ledger(&state).await;
+    let _ = diff_preview_store(&state, contracts.as_ref()).await;
+    let features = ConnectionUiFeatures::stdio_defaults();
+    let connection_headers = HeaderMap::new();
+    let mut connection_profile_id_owned: Option<String> = None;
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let text = tokio::select! {
+            line = lines.next_line() => {
+                match line? {
+                    Some(text) => text,
+                    None => break,
+                }
+            }
+            writer_result = &mut writer_handle => {
+                return match writer_result {
+                    Ok(Ok(())) => Err(eyre::eyre!("AppUI stdio writer stopped before stdin closed")),
+                    Ok(Err(error)) => Err(eyre::eyre!("AppUI stdio writer failed: {error}")),
+                    Err(error) => Err(eyre::eyre!("AppUI stdio writer task failed: {error}")),
+                };
+            }
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let request = match parse_ws_text_frame(text.as_str()) {
+            Ok(ParsedFrame::Request(request)) => request,
+            Ok(ParsedFrame::Notification(method)) => {
+                if !is_known_inbound_notification(&method) {
+                    tracing::debug!(
+                        target: "octos::ui_protocol::stdio",
+                        method = %method,
+                        "ignoring unknown inbound notification"
+                    );
+                }
+                continue;
+            }
+            Err(error) => {
+                let _ = send_rpc_error(&ws, None, error);
+                continue;
+            }
+        };
+        let id = request.id.clone();
+        let connection_profile_id = connection_profile_id_owned.as_deref();
+
+        if handle_raw_appui_rpc(
+            &ws,
+            &state,
+            features,
+            connection_profile_id,
+            id.clone(),
+            &request,
+        )
+        .await
+        {
+            continue;
+        }
+
+        let command = match route_rpc_command(request, features) {
+            Ok(command) => command,
+            Err(error) => {
+                let _ = send_rpc_error(&ws, Some(id), error);
+                continue;
+            }
+        };
+
+        match command {
+            UiCommand::ProfileLocalCreate(params) => {
+                match create_or_get_local_solo_profile(&state, params) {
+                    Ok(result) => {
+                        let _ =
+                            send_ui_rpc_result(&ws, id, UiRpcResult::ProfileLocalCreate(result));
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                    }
+                }
+            }
+            UiCommand::SessionOpen(params) => {
+                if connection_profile_id_owned.is_none() {
+                    connection_profile_id_owned = params
+                        .profile_id
+                        .clone()
+                        .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
+                }
+                handle_session_open(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts.approvals,
+                    &live_forwarders,
+                    connection_profile_id_owned.as_deref(),
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TurnStart(params) => {
+                handle_turn_start(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts,
+                    &active_turns,
+                    &connection_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TurnInterrupt(params) => {
+                handle_turn_interrupt(&ws, &ledger, &active_turns, &contracts, id, params).await;
+            }
+            UiCommand::ApprovalRespond(params) => {
+                handle_approval_respond(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::ApprovalScopesList(params) => {
+                handle_approval_scopes_list(
+                    &ws,
+                    &contracts.scopes,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::DiffPreviewGet(params) => {
+                let store = diff_preview_store(&state, contracts.as_ref()).await;
+                handle_diff_preview_get(
+                    &ws,
+                    store.as_ref(),
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TaskOutputRead(params) => {
+                handle_task_output_read(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TaskList(params) => {
+                handle_task_list(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TaskCancel(params) => {
+                handle_task_cancel(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TaskRestartFromNode(params) => {
+                handle_task_restart_from_node(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::SessionHydrate(params) => {
+                handle_session_hydrate(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts.approvals,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::ThreadGraphGet(params) => {
+                handle_thread_graph_get(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TurnStateGet(params) => {
+                handle_turn_state_get(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &active_turns,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::PermissionProfileList(params) => {
+                let result = permission_profile_list_result(&state, params);
+                let _ = send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileList(result));
+            }
+            UiCommand::PermissionProfileSet(params) => {
+                let session_id = params.session_id.clone();
+                let profile_id = session_id
+                    .profile_id()
+                    .or(connection_profile_id_owned.as_deref())
+                    .map(ToOwned::to_owned);
+                match permission_profile_set_result(&state, params) {
+                    Ok(result) => {
+                        if let Some(profile_id) = profile_id {
+                            state
+                                .session_cache
+                                .invalidate(&(profile_id, session_id))
+                                .await;
+                        }
+                        let _ =
+                            send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(&ws, Some(id), error);
+                    }
+                }
+            }
+            UiCommand::SessionList(params) => {
+                handle_session_list(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionSnapshot(params) => {
+                handle_session_snapshot(&ws, &state, &connection_headers, None, id, params).await;
+            }
+            UiCommand::SessionMessagesPage(params) => {
+                handle_session_messages_page(&ws, &state, &connection_headers, None, id, params)
+                    .await;
+            }
+            UiCommand::SessionStatusGet(params) => {
+                handle_session_status_get(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionFilesList(params) => {
+                handle_session_files_list(&ws, &state, &connection_headers, None, id, params).await;
+            }
+            UiCommand::SessionTasksList(params) => {
+                handle_session_tasks_list(&ws, &state, &connection_headers, id, params).await;
+            }
+            UiCommand::SessionWorkspaceGet(params) => {
+                handle_session_workspace_get(&ws, &state, &connection_headers, None, id, params)
+                    .await;
+            }
+            UiCommand::SessionTitleSet(params) => {
+                handle_session_title_set(&ws, &state, &connection_headers, None, id, params).await;
+            }
+            UiCommand::SessionDelete(params) => {
+                handle_session_delete(&ws, &state, &connection_headers, None, id, params).await;
+            }
+            UiCommand::SystemStatusGet(params) => {
+                handle_system_status_get(&ws, &state, id, params).await;
+            }
+            UiCommand::ContentList(params) => {
+                handle_content_list(&ws, &state, &connection_headers, None, id, params).await;
+            }
+            UiCommand::ContentDelete(params) => {
+                handle_content_delete(&ws, &state, &connection_headers, None, id, params).await;
+            }
+            UiCommand::ContentBulkDelete(params) => {
+                handle_content_bulk_delete(&ws, &state, &connection_headers, None, id, params)
+                    .await;
+            }
+            UiCommand::RouterSetMode(_) | UiCommand::RouterGetMetrics(_) => {
+                // `router/*` RPCs require the full WebSocket connection's
+                // `routed_profile_id` context which stdio_connection does
+                // not carry. Reply with `method_not_supported` so clients
+                // negotiate around them rather than hang — mirrors the
+                // pattern from PR #858 for `permission/profile/*`.
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::method_not_supported("router/* not supported on stdio transport"),
+                );
+            }
+        }
+    }
+
+    abort_connection_turns(
+        &active_turns,
+        &connection_turns,
+        &contracts.scopes,
+        &ledger,
+        &contracts.approvals,
+    )
+    .await;
+    abort_live_forwarders(&live_forwarders, &ledger).await;
+    drop(ws);
+    match writer_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(eyre::eyre!("AppUI stdio writer failed: {error}")),
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(eyre::eyre!("AppUI stdio writer task failed: {error}")),
+    }
+    Ok(())
+}
+
+async fn stdio_writer_loop(rx: mpsc::Receiver<WsMessage>) -> std::io::Result<()> {
+    let stdout = tokio::io::stdout();
+    stdio_writer_loop_to(rx, stdout).await
+}
+
+async fn stdio_writer_loop_to<W>(
+    mut rx: mpsc::Receiver<WsMessage>,
+    writer: W,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut stdout = BufWriter::new(writer);
+    while let Some(message) = rx.recv().await {
+        match message {
+            WsMessage::Text(text) => {
+                stdout.write_all(text.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            WsMessage::Close(_) => break,
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+        }
+    }
+    Ok(())
+}
+
 async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiProtocolLedger) {
     let drained: Vec<(SessionKey, tokio::task::JoinHandle<()>)> = {
         let mut guard = forwarders.lock().await;
@@ -2181,6 +2782,1526 @@ fn is_known_inbound_notification(method: &str) -> bool {
     matches!(method, "ping")
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileSkillsListParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileSkillsRegistrySearchParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default, alias = "query")]
+    q: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProfileSkillsInstallParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    repo: String,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawProfileSkillsRemoveParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLlmRoute {
+    #[serde(default)]
+    route_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    api_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLlmSelection {
+    #[serde(default)]
+    family_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    route: RawLlmRoute,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProfileLlmUpsertParams {
+    #[serde(default)]
+    profile_id: Option<String>,
+    selection: RawLlmSelection,
+    #[serde(default)]
+    api_key: Option<Value>,
+    #[serde(default)]
+    set_primary: bool,
+}
+
+fn parse_raw_params<T>(request: &RpcRequest<Value>) -> Result<T, RpcError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(request.params.clone())
+        .map_err(|err| RpcError::invalid_params(format!("{} params: {err}", request.method)))
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn secret_from_value(value: Option<Value>) -> Option<String> {
+    match value? {
+        Value::String(secret) => nonempty(Some(secret)),
+        Value::Object(mut object) => object
+            .remove("value")
+            .or_else(|| object.remove("secret"))
+            .or_else(|| object.remove("api_key"))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .and_then(|value| nonempty(Some(value))),
+        _ => None,
+    }
+}
+
+fn raw_profile_id(params: &RawProfileParams, connection_profile_id: Option<&str>) -> String {
+    nonempty(params.profile_id.clone())
+        .or_else(|| {
+            params
+                .session_id
+                .as_ref()
+                .and_then(|session_id| session_id.profile_id().map(ToOwned::to_owned))
+        })
+        .or_else(|| connection_profile_id.map(ToOwned::to_owned))
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
+}
+
+fn supports_local_solo_profile_create(state: &AppState) -> bool {
+    state.deployment_mode == crate::config::DeploymentMode::Local
+        && state.profile_store.is_some()
+        && state.user_store.is_some()
+}
+
+fn local_profile_error(kind: &str, message: impl Into<String>) -> RpcError {
+    RpcError::invalid_params(message).with_data(json!({ "kind": kind }))
+}
+
+fn local_profile_permission_error(
+    kind: &str,
+    message: impl Into<String>,
+    state: &AppState,
+) -> RpcError {
+    RpcError::permission_denied(message).with_data(json!({
+        "kind": kind,
+        "runtime_mode": runtime_mode_for_state(state),
+    }))
+}
+
+fn runtime_mode_for_state(state: &AppState) -> &'static str {
+    match state.deployment_mode {
+        crate::config::DeploymentMode::Local => "solo",
+        crate::config::DeploymentMode::Tenant | crate::config::DeploymentMode::Cloud => {
+            "multi_tenant"
+        }
+    }
+}
+
+fn validate_local_name(name: &str) -> Result<String, RpcError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(local_profile_error(
+            "profile_local_invalid_name",
+            "name is required",
+        ));
+    }
+    if trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+        return Err(local_profile_error(
+            "profile_local_invalid_name",
+            "name must be 1-128 printable characters",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn validate_local_email(email: &str) -> Result<String, RpcError> {
+    let trimmed = email.trim().to_ascii_lowercase();
+    let mut parts = trimmed.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    if local.is_empty()
+        || domain.is_empty()
+        || parts.next().is_some()
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return Err(local_profile_error(
+            "profile_local_invalid_email",
+            "email must be a valid address",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn normalize_local_username(username: &str) -> Result<String, RpcError> {
+    let trimmed = username.trim();
+    if trimmed.is_empty() {
+        return Err(local_profile_error(
+            "profile_local_invalid_username",
+            "username is required",
+        ));
+    }
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut last_was_hyphen = false;
+    for c in trimmed.chars() {
+        if c.is_ascii_alphanumeric() {
+            normalized.push(c.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if matches!(c, '-' | '_' | '.') {
+            if !last_was_hyphen {
+                normalized.push('-');
+                last_was_hyphen = true;
+            }
+        } else {
+            return Err(local_profile_error(
+                "profile_local_invalid_username",
+                "username may contain only ASCII letters, digits, hyphen, underscore, or dot",
+            ));
+        }
+    }
+    let normalized = normalized.trim_matches('-').to_owned();
+    if normalized.is_empty() || normalized.len() > 64 {
+        return Err(local_profile_error(
+            "profile_local_invalid_username",
+            "normalized username must be 1-64 characters",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn user_store(state: &AppState) -> Result<Arc<crate::user_store::UserStore>, RpcError> {
+    state
+        .user_store
+        .clone()
+        .ok_or_else(|| runtime_unavailable_error("user store not available"))
+}
+
+fn profile_metadata_from_file(
+    store: &crate::profiles::ProfileStore,
+    profile_id: &str,
+) -> Result<(Option<String>, Option<String>), RpcError> {
+    let path = store.profile_path(profile_id);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((None, None));
+        }
+        Err(error) => {
+            return Err(runtime_unavailable_error(format!(
+                "failed to read profile metadata: {error}"
+            )));
+        }
+    };
+    let value: Value = serde_json::from_str(&content).map_err(|error| {
+        runtime_unavailable_error(format!("failed to parse profile metadata: {error}"))
+    })?;
+    let username = value
+        .get("username")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let email = value
+        .get("email")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok((username, email))
+}
+
+fn write_local_profile_metadata(
+    store: &crate::profiles::ProfileStore,
+    profile: &crate::profiles::UserProfile,
+    username: &str,
+    email: &str,
+) -> Result<(), RpcError> {
+    let path = store.profile_path(&profile.id);
+    let mut value = serde_json::to_value(profile).map_err(|error| {
+        runtime_unavailable_error(format!("failed to serialize profile metadata: {error}"))
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(runtime_unavailable_error(
+            "serialized profile metadata was not an object",
+        ));
+    };
+    object.insert("username".to_owned(), Value::String(username.to_owned()));
+    object.insert("email".to_owned(), Value::String(email.to_owned()));
+    let content = serde_json::to_string_pretty(&value).map_err(|error| {
+        runtime_unavailable_error(format!("failed to encode profile metadata: {error}"))
+    })?;
+    std::fs::write(&path, content)
+        .map_err(|error| runtime_unavailable_error(format!("failed to write profile: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(&path, perms);
+    }
+    Ok(())
+}
+
+fn profile_collision_error(profile_id: &str, reason: &str) -> RpcError {
+    local_profile_error(
+        "profile_local_collision",
+        format!("local profile '{profile_id}' already exists with different {reason}"),
+    )
+    .with_data(json!({
+        "kind": "profile_local_collision",
+        "profile_id": profile_id,
+        "reason": reason,
+    }))
+}
+
+fn ensure_existing_local_profile_matches(
+    profile_id: &str,
+    user: Option<&crate::user_store::User>,
+    profile: Option<&crate::profiles::UserProfile>,
+    expected_name: &str,
+    expected_email: &str,
+) -> Result<(), RpcError> {
+    if let Some(user) = user {
+        if user.name != expected_name {
+            return Err(profile_collision_error(profile_id, "name"));
+        }
+        if !user.email.eq_ignore_ascii_case(expected_email) {
+            return Err(profile_collision_error(profile_id, "email"));
+        }
+    }
+    if let Some(profile) = profile {
+        if profile.name != expected_name {
+            return Err(profile_collision_error(profile_id, "name"));
+        }
+    }
+    Ok(())
+}
+
+fn create_or_get_local_solo_profile(
+    state: &AppState,
+    params: octos_core::ui_protocol::ProfileLocalCreateParams,
+) -> Result<octos_core::ui_protocol::ProfileLocalCreateResult, RpcError> {
+    if !supports_local_solo_profile_create(state) {
+        return Err(local_profile_permission_error(
+            "profile_local_unsupported",
+            "profile/local/create is available only in local solo mode",
+            state,
+        ));
+    }
+
+    let name = validate_local_name(&params.name)?;
+    let profile_id = normalize_local_username(&params.username)?;
+    let email = validate_local_email(&params.email)?;
+    let username = profile_id.clone();
+    let profile_store = profile_store(state)?;
+    let user_store = user_store(state)?;
+
+    if let Some(existing_email_user) = user_store
+        .get_by_email(&email)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read users: {error}")))?
+    {
+        if existing_email_user.id != profile_id {
+            return Err(profile_collision_error(&profile_id, "email"));
+        }
+    }
+
+    let existing_user = user_store
+        .get(&profile_id)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read user: {error}")))?;
+    let existing_profile = profile_store
+        .get(&profile_id)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?;
+
+    ensure_existing_local_profile_matches(
+        &profile_id,
+        existing_user.as_ref(),
+        existing_profile.as_ref(),
+        &name,
+        &email,
+    )?;
+
+    if let Some(profile) = existing_profile.as_ref() {
+        let (stored_username, stored_email) =
+            profile_metadata_from_file(&profile_store, &profile_id)?;
+        if stored_username
+            .as_deref()
+            .is_some_and(|stored| stored != username)
+        {
+            return Err(profile_collision_error(&profile_id, "username"));
+        }
+        if stored_email
+            .as_deref()
+            .is_some_and(|stored| !stored.eq_ignore_ascii_case(&email))
+        {
+            return Err(profile_collision_error(&profile_id, "email"));
+        }
+        if existing_user.is_some() {
+            write_local_profile_metadata(&profile_store, profile, &username, &email)?;
+            return Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
+                profile_id: profile_id.clone(),
+                user_id: profile_id,
+                name,
+                username,
+                email,
+                created: false,
+                runtime_mode: "solo".to_owned(),
+            });
+        }
+        if stored_username.as_deref() != Some(username.as_str())
+            || stored_email
+                .as_deref()
+                .is_none_or(|stored| !stored.eq_ignore_ascii_case(&email))
+        {
+            return Err(profile_collision_error(&profile_id, "owner metadata"));
+        }
+    }
+
+    let now = Utc::now();
+    let user = crate::user_store::User {
+        id: profile_id.clone(),
+        email: email.clone(),
+        name: name.clone(),
+        role: crate::user_store::UserRole::Admin,
+        created_at: now,
+        last_login_at: None,
+    };
+    user_store
+        .save(&user)
+        .map_err(|error| runtime_unavailable_error(format!("failed to save user: {error}")))?;
+
+    let mut profile = existing_profile.unwrap_or_else(|| crate::profiles::UserProfile {
+        id: profile_id.clone(),
+        name: name.clone(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: now,
+        updated_at: now,
+    });
+    profile.name = name.clone();
+    profile.updated_at = now;
+    profile_store
+        .save(&profile)
+        .map_err(|error| runtime_unavailable_error(format!("failed to save profile: {error}")))?;
+    write_local_profile_metadata(&profile_store, &profile, &username, &email)?;
+
+    Ok(octos_core::ui_protocol::ProfileLocalCreateResult {
+        profile_id: profile_id.clone(),
+        user_id: profile_id,
+        name,
+        username,
+        email,
+        created: true,
+        runtime_mode: "solo".to_owned(),
+    })
+}
+
+fn default_profile(profile_id: &str) -> crate::profiles::UserProfile {
+    let now = Utc::now();
+    crate::profiles::UserProfile {
+        id: profile_id.to_owned(),
+        name: profile_id.to_owned(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn profile_store(state: &AppState) -> Result<Arc<crate::profiles::ProfileStore>, RpcError> {
+    state
+        .profile_store
+        .clone()
+        .ok_or_else(|| runtime_unavailable_error("profile store not available"))
+}
+
+fn configured_provider_json(
+    selection: &crate::profiles::LlmModelSelectionConfig,
+    env_vars: &HashMap<String, String>,
+    selected: bool,
+) -> Value {
+    let route = selection.route.clone().unwrap_or_default();
+    let family_id = selection.family_id.clone();
+    let model_id = selection.model_id.clone();
+    let route_id = route.route_id.clone();
+    let api_key_env = route.api_key_env.clone();
+    json!({
+        "provider": family_id.clone().unwrap_or_default(),
+        "model": model_id.clone().unwrap_or_default(),
+        "family_id": family_id,
+        "model_id": model_id,
+        "route": route,
+        "route_id": route_id,
+        "base_url": route.base_url,
+        "api_key_env": api_key_env,
+        "has_api_key": api_key_env
+            .as_deref()
+            .is_some_and(|key| env_vars.get(key).is_some_and(|value| !value.is_empty())),
+        "selected": selected,
+        "available": true,
+    })
+}
+
+fn permission_profile_supported_selections(
+    state: &AppState,
+) -> Vec<octos_core::ui_protocol::PermissionProfileSelection> {
+    use octos_core::ui_protocol::{
+        PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+        PermissionProfileSelection as Selection,
+    };
+
+    let mut profiles = vec![
+        Selection {
+            mode: Mode::ReadOnly,
+            network: Network::Deny,
+        },
+        Selection {
+            mode: Mode::WorkspaceWrite,
+            network: Network::Deny,
+        },
+    ];
+    if state.deployment_mode == crate::config::DeploymentMode::Local {
+        profiles.push(Selection {
+            mode: Mode::DangerFullAccess,
+            network: Network::Allow,
+        });
+    }
+    profiles
+}
+
+fn permission_selection_policy_fields(
+    selection: octos_core::ui_protocol::PermissionProfileSelection,
+    approval_policy: Option<octos_agent::ApprovalPolicy>,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    use octos_core::ui_protocol::{
+        PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+    };
+
+    let approval_policy = if selection.mode == Mode::DangerFullAccess
+        || approval_policy == Some(octos_agent::ApprovalPolicy::Never)
+    {
+        "never"
+    } else {
+        "on-request"
+    };
+    let network = if selection.network == Network::Allow {
+        "allowed"
+    } else {
+        "blocked"
+    };
+
+    match selection.mode {
+        Mode::DangerFullAccess => (
+            approval_policy,
+            "danger-full-access",
+            "danger_full_access",
+            "host",
+            network,
+        ),
+        Mode::ReadOnly => (
+            approval_policy,
+            "read-only",
+            "read_only",
+            "workspace",
+            network,
+        ),
+        Mode::WorkspaceWrite => (
+            approval_policy,
+            "workspace-write",
+            "workspace_write",
+            "workspace",
+            network,
+        ),
+    }
+}
+
+fn parse_permission_approval_policy(
+    value: Option<&str>,
+) -> Result<Option<octos_agent::ApprovalPolicy>, RpcError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value {
+        "never" => Ok(Some(octos_agent::ApprovalPolicy::Never)),
+        "ask" | "on-request" | "on_request" => Ok(Some(octos_agent::ApprovalPolicy::Ask)),
+        other => Err(
+            RpcError::invalid_params(format!("unsupported approval_policy '{other}'")).with_data(
+                json!({
+                    "kind": "permission_profile_invalid_approval_policy",
+                    "approval_policy": other,
+                }),
+            ),
+        ),
+    }
+}
+
+fn permission_profile_disallowed_error(
+    state: &AppState,
+    selection: octos_core::ui_protocol::PermissionProfileSelection,
+    approval_policy: Option<octos_agent::ApprovalPolicy>,
+) -> RpcError {
+    let (approval_policy, _, permission_profile, _, network) =
+        permission_selection_policy_fields(selection, approval_policy);
+    RpcError::permission_denied(
+        "requested permission profile is not allowed outside local solo mode",
+    )
+    .with_data(json!({
+        "kind": "permission_profile_disallowed",
+        "runtime_mode": runtime_mode_for_state(state),
+        "permission_profile": permission_profile,
+        "approval_policy": approval_policy,
+        "network": network,
+    }))
+}
+
+fn permission_selection_allowed(
+    state: &AppState,
+    selection: octos_core::ui_protocol::PermissionProfileSelection,
+    approval_policy: Option<octos_agent::ApprovalPolicy>,
+) -> bool {
+    use octos_core::ui_protocol::{
+        PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+    };
+
+    state.deployment_mode == crate::config::DeploymentMode::Local
+        || (selection.mode != Mode::DangerFullAccess
+            && selection.network != Network::Allow
+            && approval_policy != Some(octos_agent::ApprovalPolicy::Never))
+}
+
+fn effective_permissions_for_session(
+    state: &AppState,
+    session_id: &SessionKey,
+) -> Result<octos_agent::EffectivePermissions, RpcError> {
+    use octos_core::ui_protocol::{
+        PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+    };
+
+    let permission_state = session_permission_profiles().get_state(session_id);
+    let requested = match permission_state.selection.mode {
+        Mode::ReadOnly => octos_agent::PermissionProfile::ReadOnly,
+        Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
+        Mode::DangerFullAccess => octos_agent::PermissionProfile::DangerFullAccess,
+    };
+    let runtime_mode = match state.deployment_mode {
+        crate::config::DeploymentMode::Local => octos_agent::RuntimeMode::Solo,
+        crate::config::DeploymentMode::Tenant => octos_agent::RuntimeMode::Tenant,
+        crate::config::DeploymentMode::Cloud => octos_agent::RuntimeMode::Cloud,
+    };
+    let mut permissions = octos_agent::EffectivePermissions::for_runtime(requested, runtime_mode)
+        .map_err(|err| {
+        RpcError::permission_denied(err.to_string()).with_data(json!({
+            "kind": "permission_profile_disallowed",
+            "runtime_mode": runtime_mode_for_state(state),
+            "permission_profile": format!("{:?}", requested),
+        }))
+    })?;
+    if let Some(approval_policy) = permission_state.approval_policy {
+        permissions = permissions.with_approval_policy(approval_policy);
+    }
+    if permission_state.selection.network == Network::Allow {
+        permissions.network = octos_agent::NetworkPolicy::Allowed;
+    }
+    Ok(permissions)
+}
+
+fn permission_profile_list_result(
+    state: &AppState,
+    params: octos_core::ui_protocol::PermissionProfileListParams,
+) -> octos_core::ui_protocol::PermissionProfileListResult {
+    let store = session_permission_profiles();
+    let current = store.get(&params.session_id);
+    octos_core::ui_protocol::PermissionProfileListResult {
+        session_id: params.session_id,
+        current,
+        profiles: permission_profile_supported_selections(state),
+    }
+}
+
+fn permission_profile_set_result(
+    state: &AppState,
+    params: octos_core::ui_protocol::PermissionProfileSetParams,
+) -> Result<octos_core::ui_protocol::PermissionProfileSetResult, RpcError> {
+    let store = session_permission_profiles();
+    let previous_state = store.get_state(&params.session_id);
+    let previous = previous_state.selection;
+    let approval_policy =
+        parse_permission_approval_policy(params.update.approval_policy.as_deref())?
+            .or(previous_state.approval_policy);
+    let requested = params.update.apply_to(previous);
+    if !permission_selection_allowed(state, requested, approval_policy) {
+        return Err(permission_profile_disallowed_error(
+            state,
+            requested,
+            approval_policy,
+        ));
+    }
+    store.set(params.session_id.clone(), requested, approval_policy);
+    Ok(octos_core::ui_protocol::PermissionProfileSetResult {
+        session_id: params.session_id,
+        current: requested,
+        applied: requested != previous || approval_policy != previous_state.approval_policy,
+    })
+}
+
+fn runtime_policy_stamp_for_profile(
+    state: &AppState,
+    profile_id: &str,
+    session_id: Option<&SessionKey>,
+    profile: Option<&crate::profiles::UserProfile>,
+) -> Value {
+    let runtime = state.profiles.get(profile_id);
+    let primary = profile.and_then(|profile| profile.config.primary_llm());
+    let model = runtime
+        .map(|runtime| runtime.primary_model_id.clone())
+        .or_else(|| primary.and_then(|selection| selection.model_id.clone()));
+    let provider = runtime
+        .map(|runtime| runtime.provider_name.clone())
+        .or_else(|| primary.and_then(|selection| selection.family_id.clone()));
+    let permission_state = session_id
+        .map(|session_id| session_permission_profiles().get_state(session_id))
+        .unwrap_or_default();
+    let (approval_policy, sandbox_mode, permission_profile, filesystem_scope, network) =
+        permission_selection_policy_fields(
+            permission_state.selection,
+            permission_state.approval_policy,
+        );
+    let workspace_root = session_id
+        .and_then(|session_id| session_workspaces().get(session_id))
+        .map(|path| path.to_string_lossy().to_string());
+    json!({
+        "runtime_mode": runtime_mode_for_state(state),
+        "profile_id": profile_id,
+        "workspace_root": workspace_root,
+        "approval_policy": approval_policy,
+        "sandbox_mode": sandbox_mode,
+        "permission_profile": permission_profile,
+        "filesystem_scope": filesystem_scope,
+        "network": network,
+        "model": model,
+        "provider": provider,
+        "tool_policy_id": "profile",
+        "mcp_servers": [],
+        "memory_scope": "profile-session",
+        "qoe_policy": "profile",
+        "queue_mode": "adaptive",
+    })
+}
+
+fn profile_llm_list_result(
+    state: &AppState,
+    profile_id: &str,
+    profile: Option<&crate::profiles::UserProfile>,
+) -> Value {
+    let primary = profile.and_then(|profile| {
+        profile
+            .config
+            .primary_llm()
+            .map(|selection| configured_provider_json(selection, &profile.config.env_vars, true))
+    });
+    let fallbacks = profile
+        .and_then(|profile| profile.config.llm.as_ref().map(|llm| (profile, llm)))
+        .map(|(profile, llm)| {
+            llm.fallbacks
+                .iter()
+                .map(|selection| {
+                    configured_provider_json(selection, &profile.config.env_vars, false)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "profile_id": profile_id,
+        "primary": primary.clone(),
+        "fallbacks": fallbacks.clone(),
+        "llm": {
+            "primary": primary,
+            "fallbacks": fallbacks,
+        },
+        "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, profile_id, None, profile),
+    })
+}
+
+fn model_list_result(
+    state: &AppState,
+    session_id: SessionKey,
+    profile_id: &str,
+    profile: Option<&crate::profiles::UserProfile>,
+) -> Value {
+    let primary = profile_llm_list_result(state, profile_id, profile)
+        .get("primary")
+        .cloned()
+        .filter(|value| !value.is_null());
+    let models = primary
+        .into_iter()
+        .map(|provider| {
+            json!({
+                "model": provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown"),
+                "provider": provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
+                "title": format!(
+                    "{} / {}",
+                    provider.get("family_id").and_then(Value::as_str).unwrap_or("unknown"),
+                    provider.get("model_id").and_then(Value::as_str).unwrap_or("unknown")
+                ),
+                "family": provider.get("family_id").cloned(),
+                "route": provider.get("route_id").cloned(),
+                "selected": true,
+                "available": true,
+                "queue_mode": "adaptive",
+                "qoe_policy": "profile",
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "session_id": session_id, "models": models })
+}
+
+fn raw_catalog_result() -> Result<Value, RpcError> {
+    let families = serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON).map_err(|err| {
+        RpcError::internal_error(format!("dashboard provider catalog was not JSON: {err}"))
+    })?;
+    Ok(json!({ "families": families }))
+}
+
+fn raw_session_status_result(
+    state: &AppState,
+    request: &RpcRequest<Value>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileParams = parse_raw_params(request)?;
+    let Some(session_id) = params.session_id.clone() else {
+        return Err(RpcError::invalid_params("session_id is required"));
+    };
+    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile = state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.get(&profile_id).ok().flatten());
+    let policy =
+        runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref());
+    Ok(json!({
+        "session_id": session_id,
+        "profile_id": profile_id,
+        "runtime_policy_stamp": policy,
+        "model": {
+            "model": policy.get("model").cloned().unwrap_or(Value::Null),
+            "provider": policy.get("provider").cloned().unwrap_or(Value::Null),
+            "selected": true
+        },
+        "permission_profile": policy.get("permission_profile").cloned().unwrap_or(Value::Null),
+        "sandbox": policy.get("sandbox_mode").cloned().unwrap_or(Value::Null),
+        "health": { "status": "ok" },
+        "mcp_summary": { "connected": 0, "connecting": 0, "failed": 0, "disabled": 0 },
+        "tool_summary": { "visible": 0, "enabled": 0, "denied": 0, "policy_id": "profile" },
+        "usage": {},
+        "cursor": { "healthy": true, "replay_supported": true },
+        "capabilities": features.advertised_capabilities(state),
+    }))
+}
+
+fn raw_profile_skill_profile_id(
+    profile_id: Option<String>,
+    connection_profile_id: Option<&str>,
+) -> Result<String, RpcError> {
+    let requested = nonempty(profile_id);
+    if let Some(connection_profile_id) = connection_profile_id {
+        if requested
+            .as_deref()
+            .is_some_and(|requested| requested != connection_profile_id)
+        {
+            return Err(RpcError::permission_denied(
+                "profile_id is outside the authenticated profile",
+            )
+            .with_data(json!({
+                "kind": "auth_scope_violation",
+                "connection_profile_id": connection_profile_id,
+                "requested_profile_id": requested,
+            })));
+        }
+        return Ok(connection_profile_id.to_owned());
+    }
+    Ok(requested.unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()))
+}
+
+fn raw_profile_skills_dir(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<std::path::PathBuf, RpcError> {
+    let store = profile_store(state)?;
+    crate::commands::skills::resolve_profile_skills_dir(store.as_ref(), profile_id).map_err(|err| {
+        RpcError::invalid_params(format!("profile skills unavailable: {err}")).with_data(json!({
+            "kind": "profile_skills_unavailable",
+            "profile_id": profile_id,
+        }))
+    })
+}
+
+fn skill_entry_with_status(skill: crate::commands::skills::SkillEntry) -> Result<Value, RpcError> {
+    let mut value = serde_json::to_value(skill)
+        .map_err(|err| RpcError::internal_error(format!("failed to encode skill: {err}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("installed".into(), Value::Bool(true));
+        object.insert("status".into(), Value::String("installed".into()));
+    }
+    Ok(value)
+}
+
+fn raw_profile_skills_list(
+    state: &AppState,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSkillsListParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
+    let skills = crate::commands::skills::list_skills(&skills_dir)
+        .map_err(|err| RpcError::internal_error(format!("failed to list skills: {err}")))?
+        .into_iter()
+        .map(skill_entry_with_status)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "profile_id": profile_id,
+        "count": skills.len(),
+        "skills": skills,
+    }))
+}
+
+async fn raw_profile_skills_registry_search(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSkillsRegistrySearchParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
+    let installed = crate::commands::skills::list_skills(&skills_dir)
+        .map_err(|err| RpcError::internal_error(format!("failed to list skills: {err}")))?;
+    let installed_names: HashSet<String> = installed.into_iter().map(|skill| skill.name).collect();
+    let q = params.q;
+    let packages = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::search_registry(q.as_deref(), None)
+    })
+    .await
+    .map_err(|err| RpcError::internal_error(format!("registry search join error: {err}")))?
+    .map_err(|err| RpcError::internal_error(format!("failed to search skill registry: {err}")))?;
+
+    let packages = packages
+        .into_iter()
+        .map(|package| {
+            let mut installed_skills = package
+                .skills
+                .iter()
+                .filter(|skill| installed_names.contains(*skill))
+                .cloned()
+                .collect::<Vec<_>>();
+            if installed_skills.is_empty() && installed_names.contains(&package.name) {
+                installed_skills.push(package.name.clone());
+            }
+            let mut value = serde_json::to_value(package).map_err(|err| {
+                RpcError::internal_error(format!("failed to encode registry package: {err}"))
+            })?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "installed".into(),
+                    Value::Bool(!installed_skills.is_empty()),
+                );
+                object.insert("installed_skills".into(), json!(installed_skills));
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, RpcError>>()?;
+
+    Ok(json!({
+        "profile_id": profile_id,
+        "packages": packages,
+    }))
+}
+
+async fn raw_profile_skills_install(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSkillsInstallParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
+    let repo =
+        nonempty(Some(params.repo)).ok_or_else(|| RpcError::invalid_params("repo is required"))?;
+    let branch = nonempty(params.branch).unwrap_or_else(|| "main".into());
+    let force = params.force;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::commands::skills::install_skill(&skills_dir, &repo, force, &branch)
+    })
+    .await
+    .map_err(|err| RpcError::internal_error(format!("skill install join error: {err}")))?
+    .map_err(|err| RpcError::invalid_params(format!("failed to install skill: {err}")))?;
+    Ok(json!({
+        "profile_id": profile_id,
+        "ok": true,
+        "installed": result.installed,
+        "skipped": result.skipped,
+        "deps_installed": result.deps_installed,
+    }))
+}
+
+async fn raw_profile_skills_remove(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileSkillsRemoveParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_skill_profile_id(params.profile_id, connection_profile_id)?;
+    let skills_dir = raw_profile_skills_dir(state, &profile_id)?;
+    let name =
+        nonempty(Some(params.name)).ok_or_else(|| RpcError::invalid_params("name is required"))?;
+    let removed = name.clone();
+    tokio::task::spawn_blocking(move || crate::commands::skills::remove_skill(&skills_dir, &name))
+        .await
+        .map_err(|err| RpcError::internal_error(format!("skill remove join error: {err}")))?
+        .map_err(|err| RpcError::invalid_params(format!("failed to remove skill: {err}")))?;
+    Ok(json!({
+        "profile_id": profile_id,
+        "ok": true,
+        "removed": removed,
+        "message": format!("Removed skill: {removed}"),
+    }))
+}
+
+async fn raw_profile_llm_upsert(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_id(
+        &RawProfileParams {
+            profile_id: params.profile_id.clone(),
+            session_id: None,
+        },
+        connection_profile_id,
+    );
+    let store = profile_store(state)?;
+    let mut profile = store
+        .get(&profile_id)
+        .map_err(|err| RpcError::internal_error(format!("failed to read profile: {err}")))?
+        .unwrap_or_else(|| default_profile(&profile_id));
+
+    let family_id = nonempty(params.selection.family_id)
+        .ok_or_else(|| RpcError::invalid_params("selection.family_id is required"))?;
+    let model_id = nonempty(params.selection.model_id)
+        .ok_or_else(|| RpcError::invalid_params("selection.model_id is required"))?;
+    let route = crate::profiles::LlmRouteConfig {
+        route_id: nonempty(params.selection.route.route_id),
+        label: nonempty(params.selection.route.label),
+        base_url: nonempty(params.selection.route.base_url),
+        api_key_env: nonempty(params.selection.route.api_key_env)
+            .or_else(|| dashboard_family_api_key_env(&family_id)),
+        api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
+    };
+    if let (Some(api_key_env), Some(api_key)) = (
+        route.api_key_env.as_ref(),
+        secret_from_value(params.api_key),
+    ) {
+        profile.config.env_vars.insert(api_key_env.clone(), api_key);
+    }
+
+    let selection = crate::profiles::LlmModelSelectionConfig {
+        family_id: Some(family_id),
+        model_id: Some(model_id),
+        route: Some(route),
+        ..Default::default()
+    };
+
+    let mut llm = profile.config.llm.take().unwrap_or_default();
+    if params.set_primary || llm.primary.is_none() {
+        llm.primary = Some(selection);
+    } else {
+        upsert_llm_fallback(&mut llm.fallbacks, selection);
+    }
+    profile.config.llm = Some(llm);
+    profile.updated_at = Utc::now();
+    store
+        .save_with_merge(&mut profile)
+        .map_err(|err| RpcError::internal_error(format!("failed to save profile: {err}")))?;
+    if let Err(error) = ensure_session_profile_runtime(state, Some(&profile_id)).await {
+        tracing::warn!(
+            profile_id = %profile_id,
+            error = %error.message,
+            "profile/llm/upsert saved provider config but runtime bootstrap is not ready yet",
+        );
+    }
+    Ok(profile_llm_mutation_result(
+        state,
+        &profile_id,
+        Some(&profile),
+        true,
+    ))
+}
+
+fn upsert_llm_fallback(
+    fallbacks: &mut Vec<crate::profiles::LlmModelSelectionConfig>,
+    selection: crate::profiles::LlmModelSelectionConfig,
+) {
+    if let Some(existing) = fallbacks
+        .iter_mut()
+        .find(|fallback| same_llm_selection_identity(fallback, &selection))
+    {
+        *existing = selection;
+    } else {
+        fallbacks.push(selection);
+    }
+}
+
+fn same_llm_selection_identity(
+    left: &crate::profiles::LlmModelSelectionConfig,
+    right: &crate::profiles::LlmModelSelectionConfig,
+) -> bool {
+    left.family_id == right.family_id
+        && left.model_id == right.model_id
+        && left
+            .route
+            .as_ref()
+            .and_then(|route| route.route_id.as_ref())
+            == right
+                .route
+                .as_ref()
+                .and_then(|route| route.route_id.as_ref())
+        && left
+            .route
+            .as_ref()
+            .and_then(|route| route.base_url.as_ref())
+            == right
+                .route
+                .as_ref()
+                .and_then(|route| route.base_url.as_ref())
+}
+
+async fn raw_profile_llm_test(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_id(
+        &RawProfileParams {
+            profile_id: params.profile_id.clone(),
+            session_id: None,
+        },
+        connection_profile_id,
+    );
+    let profile = state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.get(&profile_id).ok().flatten());
+
+    let family_id = nonempty(params.selection.family_id)
+        .ok_or_else(|| RpcError::invalid_params("selection.family_id is required"))?;
+    let model_id = nonempty(params.selection.model_id)
+        .ok_or_else(|| RpcError::invalid_params("selection.model_id is required"))?;
+    let route = crate::profiles::LlmRouteConfig {
+        route_id: nonempty(params.selection.route.route_id),
+        label: nonempty(params.selection.route.label),
+        base_url: nonempty(params.selection.route.base_url),
+        api_key_env: nonempty(params.selection.route.api_key_env)
+            .or_else(|| dashboard_family_api_key_env(&family_id)),
+        api_type: nonempty(params.selection.route.api_type).or_else(|| Some("openai".into())),
+    };
+
+    let Some(api_key) = secret_from_value(params.api_key).or_else(|| {
+        route
+            .api_key_env
+            .as_ref()
+            .and_then(|env_name| profile.as_ref()?.config.env_vars.get(env_name).cloned())
+    }) else {
+        return Ok(profile_llm_test_result(
+            state,
+            &profile_id,
+            profile.as_ref(),
+            false,
+            "Provider connection failed",
+            Some("No API key provided".into()),
+        ));
+    };
+
+    let provider =
+        match build_test_llm_provider(&family_id, &model_id, route.base_url.clone(), &api_key) {
+            Ok(provider) => provider,
+            Err(error) => {
+                return Ok(profile_llm_test_result(
+                    state,
+                    &profile_id,
+                    profile.as_ref(),
+                    false,
+                    "Provider connection failed",
+                    Some(error),
+                ));
+            }
+        };
+
+    let messages = vec![Message {
+        role: MessageRole::User,
+        content: "Say OK".into(),
+        media: vec![],
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        client_message_id: None,
+        thread_id: None,
+        timestamp: Utc::now(),
+    }];
+    let max_tokens = if family_id == "gemini" { 128 } else { 16 };
+    let config = octos_llm::ChatConfig {
+        max_tokens: Some(max_tokens),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        provider.chat(&messages, &[], &config),
+    )
+    .await
+    {
+        Ok(Ok(_response)) => {
+            info!(
+                provider = %family_id,
+                model = %model_id,
+                "AppUI profile/llm/test succeeded"
+            );
+            Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                true,
+                "Provider connection verified",
+                None,
+            ))
+        }
+        Ok(Err(error)) => {
+            warn!(
+                provider = %family_id,
+                model = %model_id,
+                error = %error,
+                "AppUI profile/llm/test failed"
+            );
+            Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+                "Provider connection failed",
+                Some(format!("{error:#}")),
+            ))
+        }
+        Err(_) => {
+            warn!(
+                provider = %family_id,
+                model = %model_id,
+                "AppUI profile/llm/test timed out"
+            );
+            Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+                "Provider connection timed out",
+                Some("Request timed out after 30 seconds".into()),
+            ))
+        }
+    }
+}
+
+fn build_test_llm_provider(
+    family_id: &str,
+    model_id: &str,
+    base_url: Option<String>,
+    api_key: &str,
+) -> Result<Arc<dyn octos_llm::LlmProvider>, String> {
+    let params = octos_llm::registry::CreateParams {
+        api_key: Some(api_key.to_owned()),
+        model: Some(model_id.to_owned()),
+        base_url: base_url.clone(),
+        model_hints: None,
+        llm_timeout_secs: None,
+        llm_connect_timeout_secs: None,
+    };
+    match octos_llm::registry::lookup(family_id) {
+        Some(entry) => (entry.create)(params).map_err(|error| format!("provider error: {error:#}")),
+        None => {
+            let url = base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+            Ok(Arc::new(
+                octos_llm::openai::OpenAIProvider::new(api_key, model_id)
+                    .with_base_url(url)
+                    .with_provider_label(family_id),
+            ))
+        }
+    }
+}
+
+fn dashboard_family_api_key_env(family_id: &str) -> Option<String> {
+    serde_json::from_str::<Value>(DASHBOARD_PROVIDERS_JSON)
+        .ok()
+        .and_then(|catalog| {
+            catalog
+                .get(family_id)?
+                .get("env")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .and_then(|env| nonempty(Some(env)))
+}
+
+fn profile_llm_mutation_result(
+    state: &AppState,
+    profile_id: &str,
+    profile: Option<&crate::profiles::UserProfile>,
+    applied: bool,
+) -> Value {
+    let mut result = profile_llm_list_result(state, profile_id, profile);
+    if let Value::Object(ref mut object) = result {
+        object.insert("applied".into(), Value::Bool(applied));
+    }
+    result
+}
+
+fn profile_llm_test_result(
+    state: &AppState,
+    profile_id: &str,
+    profile: Option<&crate::profiles::UserProfile>,
+    applied: bool,
+    message: &str,
+    error: Option<String>,
+) -> Value {
+    let mut result = profile_llm_mutation_result(state, profile_id, profile, applied);
+    if let Value::Object(ref mut object) = result {
+        object.insert("message".into(), Value::String(message.to_owned()));
+        if let Some(error) = error {
+            object.insert("error".into(), Value::String(error));
+        }
+    }
+    result
+}
+
+async fn handle_raw_appui_rpc(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    id: String,
+    request: &RpcRequest<Value>,
+) -> bool {
+    let result = match request.method.as_str() {
+        APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
+            Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
+        }
+        APPUI_METHOD_SESSION_STATUS_READ => {
+            raw_session_status_result(state, request, features, connection_profile_id)
+        }
+        APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(),
+        APPUI_METHOD_PROFILE_LLM_LIST => {
+            let params: RawProfileParams = match parse_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            let profile_id = raw_profile_id(&params, connection_profile_id);
+            let profile = state
+                .profile_store
+                .as_ref()
+                .and_then(|store| store.get(&profile_id).ok().flatten());
+            if let Some(session_id) = params.session_id {
+                Ok(model_list_result(
+                    state,
+                    session_id,
+                    &profile_id,
+                    profile.as_ref(),
+                ))
+            } else {
+                Ok(profile_llm_list_result(
+                    state,
+                    &profile_id,
+                    profile.as_ref(),
+                ))
+            }
+        }
+        APPUI_METHOD_PROFILE_LLM_UPSERT => {
+            raw_profile_llm_upsert(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_PROFILE_LLM_TEST => {
+            raw_profile_llm_test(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_PROFILE_LLM_SELECT => {
+            let params: RawProfileParams = match parse_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            let profile_id = raw_profile_id(&params, connection_profile_id);
+            let profile = state
+                .profile_store
+                .as_ref()
+                .and_then(|store| store.get(&profile_id).ok().flatten());
+            let session_id = params.session_id.unwrap_or_else(|| {
+                SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding")
+            });
+            let models =
+                model_list_result(state, session_id.clone(), &profile_id, profile.as_ref());
+            let selected = models
+                .get("models")
+                .and_then(Value::as_array)
+                .and_then(|models| models.first())
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "model": "unknown",
+                        "provider": "unknown",
+                        "selected": true
+                    })
+                });
+            Ok(json!({
+                "session_id": session_id,
+                "selected": selected,
+                "applied": true,
+                "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref()),
+            }))
+        }
+        APPUI_METHOD_PROFILE_LLM_DELETE => {
+            let params: RawProfileParams = match parse_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            let profile_id = raw_profile_id(&params, connection_profile_id);
+            let profile = state
+                .profile_store
+                .as_ref()
+                .and_then(|store| store.get(&profile_id).ok().flatten());
+            Ok(profile_llm_mutation_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+            ))
+        }
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => Ok(json!({ "models": [] })),
+        APPUI_METHOD_PROFILE_SKILLS_LIST => {
+            raw_profile_skills_list(state, request, connection_profile_id)
+        }
+        APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
+            raw_profile_skills_registry_search(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_PROFILE_SKILLS_INSTALL => {
+            raw_profile_skills_install(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_PROFILE_SKILLS_REMOVE => {
+            raw_profile_skills_remove(state, request, connection_profile_id).await
+        }
+        APPUI_METHOD_AUTH_STATUS => Ok(json!({
+            "bootstrap_mode": false,
+            "email_login_enabled": true,
+            "admin_token_login_enabled": false,
+            "allow_self_registration": true,
+            "authenticated": true,
+            "email_otp": true,
+            "token_login": false,
+            "profile_id": connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+            "scoped_profile": {
+                "id": connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+                "name": connection_profile_id.unwrap_or(MAIN_PROFILE_ID),
+                "email_login_enabled": true
+            }
+        })),
+        APPUI_METHOD_AUTH_ME => Ok(json!({
+            "email": "unknown account",
+            "profile_id": connection_profile_id.unwrap_or(MAIN_PROFILE_ID)
+        })),
+        APPUI_METHOD_AUTH_SEND_CODE => {
+            Ok(json!({ "ok": true, "message": "OTP code accepted in local AppUI mode" }))
+        }
+        APPUI_METHOD_AUTH_VERIFY => Ok(json!({
+            "ok": true,
+            "token": "local-appui-token",
+            "user": { "email": "unknown account" },
+            "message": "verified"
+        })),
+        APPUI_METHOD_AUTH_LOGOUT => Ok(json!({ "ok": true })),
+        APPUI_METHOD_MCP_STATUS_LIST | APPUI_METHOD_TOOL_STATUS_LIST => {
+            let params: RawProfileParams = match parse_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            let Some(session_id) = params.session_id else {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params("session_id is required"),
+                );
+                return true;
+            };
+            if request.method == APPUI_METHOD_MCP_STATUS_LIST {
+                Ok(json!({ "session_id": session_id, "servers": [] }))
+            } else {
+                Ok(json!({ "session_id": session_id, "policy_id": "profile", "tools": [] }))
+            }
+        }
+        _ => return false,
+    };
+
+    match result {
+        Ok(result) => {
+            let _ = send_rpc_result(ws, id, result);
+        }
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+    true
+}
+
 fn route_rpc_command(
     request: RpcRequest<Value>,
     features: ConnectionUiFeatures,
@@ -2274,7 +4395,9 @@ fn route_rpc_command(
 }
 
 fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
-    octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec()
+    let mut methods = octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec();
+    methods.extend(APPUI_EXTRA_METHODS.iter().copied());
+    methods
 }
 
 fn frame_too_large_error() -> RpcError {
@@ -2682,6 +4805,7 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
+    ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
     let requested_workspace =
         validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
     // M11-F deliverable D: re-introduce the
@@ -2735,9 +4859,15 @@ async fn open_session_result(
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
         let hint = effective_workspace_hint.clone();
+        let permissions = effective_permissions_for_session(state, &params.session_id)?;
         match state
             .session_cache
-            .get_or_init(&profile_runtime, params.session_id.clone(), hint)
+            .get_or_init_with_permissions(
+                &profile_runtime,
+                params.session_id.clone(),
+                hint,
+                permissions,
+            )
             .await
         {
             Ok(runtime) => {
@@ -2802,7 +4932,7 @@ async fn open_session_result(
     // UPCR-2026-007: advertise the negotiated capability set in-band so
     // clients don't have to rely on out-of-band knowledge of which feature
     // tokens the server honours.
-    let capabilities = features.negotiated_capabilities();
+    let capabilities = features.advertised_capabilities(state);
     // Tag the broadcast with our connection id so the live forwarder
     // installed below skips this event (we direct-send it inline at the
     // call site). Other connections still observe the broadcast.
@@ -2986,7 +5116,77 @@ fn resolve_session_profile_runtime(
     active_profile_id: Option<&str>,
 ) -> Option<Arc<crate::runtime::ProfileRuntime>> {
     let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    state.profiles.get(candidate).cloned()
+    state.profiles.get(candidate).cloned().or_else(|| {
+        let key = dynamic_profile_runtime_key(state, candidate)?;
+        dynamic_profile_runtimes()
+            .try_read()
+            .ok()
+            .and_then(|runtimes| runtimes.get(&key).cloned())
+    })
+}
+
+fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
+    static RUNTIMES: OnceLock<DynamicProfileRuntimeMap> = OnceLock::new();
+    RUNTIMES.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<String> {
+    let store = state.profile_store.as_ref()?;
+    Some(format!(
+        "{}::{profile_id}",
+        store.octos_home_dir().to_string_lossy()
+    ))
+}
+
+async fn ensure_session_profile_runtime(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
+    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
+    if let Some(runtime) = state.profiles.get(profile_id) {
+        return Ok(Some(runtime.clone()));
+    }
+    let Some(store) = state.profile_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(key) = dynamic_profile_runtime_key(state, profile_id) else {
+        return Ok(None);
+    };
+
+    if let Some(runtime) = dynamic_profile_runtimes().read().await.get(&key).cloned() {
+        return Ok(Some(runtime));
+    }
+
+    let profile = store
+        .get(profile_id)
+        .map_err(|error| runtime_unavailable_error(format!("failed to read profile: {error}")))?;
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+    if !profile.enabled || profile.parent_id.is_some() || !profile.config.has_llm_selection() {
+        return Ok(None);
+    }
+
+    let profile_data_dir = store.resolve_data_dir(&profile);
+    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+        &profile,
+        &profile_data_dir,
+        Some(store.octos_home_dir()),
+        crate::runtime::BootstrapRole::Serve,
+    )
+    .await
+    .map_err(|error| {
+        runtime_unavailable_error(format!(
+            "failed to bootstrap ProfileRuntime for profile '{profile_id}': {error}"
+        ))
+    })?;
+
+    let mut runtimes = dynamic_profile_runtimes().write().await;
+    let runtime = runtimes
+        .entry(key)
+        .or_insert_with(|| runtime.clone())
+        .clone();
+    Ok(Some(runtime))
 }
 
 /// Resolve the canonical `SessionManager` handle for read operations
@@ -3022,9 +5222,10 @@ pub(crate) async fn resolve_sessions_for_lookup(
         .or(routed_profile_id);
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let hint = session_workspaces().get(session_id);
+        let permissions = effective_permissions_for_session(state, session_id).ok()?;
         if let Ok(runtime) = state
             .session_cache
-            .get_or_init(&profile_runtime, session_id.clone(), hint)
+            .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
             .await
         {
             return Some(runtime.sessions.clone());
@@ -6424,9 +8625,27 @@ async fn run_standalone_turn(
     // use that as the `workspace_hint`. Otherwise the bootstrap default
     // Tier-3 (`<profile_data_dir>/users/.../workspace`) wins.
     let hint = session_workspaces().get(&session_id);
+    let permissions = match effective_permissions_for_session(&state, &session_id) {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            let message = error.message.clone();
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some(("permission_denied", message.as_str())),
+            )
+            .await;
+            contracts.scopes.evict_turn(&session_id, &turn_id);
+            return;
+        }
+    };
     let session_runtime = match state
         .session_cache
-        .get_or_init(&profile_runtime, session_id.clone(), hint)
+        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
         .await
     {
         Ok(rt) => rt,
@@ -6590,19 +8809,33 @@ async fn run_standalone_turn(
                 let kind = payload.kind;
                 let raw_content = payload.content.clone();
                 let task_id = payload.task_id.clone();
+                // Issue #960 fix: pull the originating user cmid out of
+                // the payload BEFORE we move into the async block so the
+                // `TurnSpawnCompleteEvent` consumer can stamp
+                // `response_to_client_message_id`. Empty strings collapse
+                // to `None` so the SPA reducer never sees an `""` cmid
+                // that would silently fail an `===` thread-map lookup.
+                let originating_client_message_id = payload
+                    .originating_client_message_id
+                    .clone()
+                    .filter(|s| !s.is_empty());
                 let turn_id = payload_turn_id.clone();
                 let ledger = payload_ledger.clone();
                 Box::pin(async move {
+                    // `trim().is_empty()` so a whitespace-only `raw_content`
+                    // (e.g. an emitter that printed just "\n") gets the
+                    // friendly "delivered/completed" fallback bubble instead
+                    // of a chat row containing just a newline.
                     let content_text = match kind {
                         BackgroundResultKind::Notification => {
-                            if raw_content.is_empty() && !media.is_empty() {
+                            if raw_content.trim().is_empty() && !media.is_empty() {
                                 format!("✅ {} delivered.", task_label)
                             } else {
                                 raw_content
                             }
                         }
                         BackgroundResultKind::Report => {
-                            if raw_content.is_empty() && !media.is_empty() {
+                            if raw_content.trim().is_empty() && !media.is_empty() {
                                 format!("✅ {} completed.", task_label)
                             } else if raw_content.len() > 1000 {
                                 let preview: String = raw_content.chars().take(300).collect();
@@ -6679,21 +8912,29 @@ async fn run_standalone_turn(
                             turn_id: Some(turn_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             task_id: task_id_value,
-                            // Codex rounds 2/6: leave this `None`. In
-                            // the standalone-turn path the reporter
-                            // binds `thread_id = turn_id.0.to_string()`
-                            // (a TurnId UUID), so `originating_thread_id`
-                            // here is NOT the user's `client_message_id`
-                            // the field is documented to carry. Phase 4
-                            // plumbing will add a typed
-                            // `originating_client_message_id` to
-                            // `BackgroundResultPayload` and populate
-                            // this from there. Today the SPA reducer
-                            // already anchors via `thread_id` (which
-                            // matches the user-prompt row's thread_id
-                            // through the M8.10 root-on-cmid
-                            // invariant), so this `None` is safe.
-                            response_to_client_message_id: None,
+                            // Issue #960 fix: M10 Phase 4 plumbing —
+                            // surface the originating user prompt's
+                            // `client_message_id` (captured at the
+                            // spawn_only intercept in
+                            // `agent/execution.rs` from
+                            // `bg_reporter.thread_id()`) so the SPA's
+                            // `subSpawnComplete` handler can anchor the
+                            // new assistant bubble against the parent
+                            // prompt. Without this, the bundle's
+                            // thread-map lookup misses and the
+                            // background-completion bubble (e.g.
+                            // `"Background work started for
+                            // run_pipeline…"`) is silently dropped from
+                            // the rendered chat even though the row was
+                            // persisted to the session ledger. On the
+                            // gateway/cmid-bound path the value IS the
+                            // user's cmid directly; on the WS
+                            // standalone-turn path the reporter binds
+                            // `turn_id.0.to_string()` and the SPA keys
+                            // its thread-map on that same UUID, so the
+                            // wire identity round-trips correctly in
+                            // both shapes.
+                            response_to_client_message_id: originating_client_message_id.clone(),
                             seq: meta.committed_seq as u64,
                             // Reuse the `MessageCommitObserver`-style
                             // wire id for the same durable row — see
@@ -6849,6 +9090,13 @@ async fn run_standalone_turn(
     let progress_workspace_root = workspace_root
         .clone()
         .or_else(|| tool_registry.workspace_root().map(Path::to_path_buf));
+    // Wrap the per-turn `ToolRegistry` in an `Arc` here so we retain a
+    // handle after `Agent::new_shared` consumes its own clone. The
+    // post-terminal drain task (issue #961) inspects
+    // `spawn_only_was_invoked()` to decide whether to continue forwarding
+    // background progress events after the agent's main loop emitted
+    // `done`/`error`.
+    let tool_registry = Arc::new(tool_registry);
 
     let (progress_tx, mut progress_rx) =
         tokio::sync::mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
@@ -6891,7 +9139,7 @@ async fn run_standalone_turn(
     let mut request_agent = Agent::new_shared(
         AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
         llm_provider.clone(),
-        Arc::new(tool_registry),
+        tool_registry.clone(),
         memory_store.clone(),
     )
     .with_config(agent_config.clone())
@@ -7117,64 +9365,17 @@ async fn run_standalone_turn(
                 break;
             }
             _ => {
-                if let Some(delta) =
-                    task_output_delta_tracker.observe_progress_event(&session_id, &event)
-                {
-                    // task/output/delta is durable: drops surface as
-                    // protocol/replay_lossy so the client can resync.
-                    let _ = send_notification_durable(
-                        &ws,
-                        &ledger,
-                        UiNotification::TaskOutputDelta(delta),
-                    );
-                }
-                let mut mapping = map_progress_json(&progress_context, &event);
-                apply_progress_contract_side_effects(
-                    &contracts,
+                forward_progress_event(
+                    &ws,
+                    &ledger,
+                    &session_id,
                     &progress_context,
+                    contracts.as_ref(),
                     progress_workspace_root.as_deref(),
+                    &mut task_output_delta_tracker,
+                    &mut saw_delta,
                     &event,
-                    &mut mapping,
                 );
-                for notification in mapping.notifications {
-                    match notification {
-                        UiNotification::MessageDelta(_) => {
-                            saw_delta = true;
-                            let _ = send_notification_ephemeral(&ws, &ledger, notification);
-                        }
-                        UiNotification::ApprovalRequested(request) => {
-                            if send_notification_durable(
-                                &ws,
-                                &ledger,
-                                UiNotification::ApprovalRequested(request.clone()),
-                            )
-                            .is_err()
-                            {
-                                cancel_approval_after_request_send_failure(
-                                    contracts.as_ref(),
-                                    &ws,
-                                    &ledger,
-                                    &request.session_id,
-                                    &request.approval_id,
-                                    &request.turn_id,
-                                );
-                            }
-                        }
-                        notification => {
-                            let _ = send_notification_durable(&ws, &ledger, notification);
-                        }
-                    }
-                }
-                if let Some(warning) = mapping.warning {
-                    let _ =
-                        send_notification_durable(&ws, &ledger, UiNotification::Warning(warning));
-                }
-                if let Some(status) = mapping.status {
-                    // Tag with this connection's id so its forwarder skips
-                    // the broadcast copy after the direct send below.
-                    let event = ledger.append_progress_from(status.event, ws.connection_id);
-                    let _ = send_ledger_event_durable(&ws, &ledger, event.event);
-                }
             }
         }
     }
@@ -7247,6 +9448,63 @@ async fn run_standalone_turn(
     // turn — without the await, the forwarder could keep forwarding
     // to a half-torn-down writer.
     stop_failover_forwarder(failover_forwarder).await;
+
+    // Issue #961: when the LLM invoked a `spawn_only` tool (e.g.
+    // `run_pipeline`), the agent's main loop emits `done`/`error` and the
+    // function would otherwise return — but the spawned background task
+    // continues running for minutes, emitting `tool/progress` and
+    // `task/updated` events via the supervisor's `set_on_change` hook.
+    // Those events would be silently rejected with `Closed(..)` because
+    // `progress_rx` is about to drop. Hand the receiver to a detached
+    // drain task that keeps forwarding events until every sender clone
+    // is released (which happens when the spawn task's `bg_reporter` Arc
+    // drops at completion).
+    //
+    // We intentionally do NOT drain on `interrupt_observed`: the user
+    // asked us to stop, so further progress is moot. We also do NOT
+    // handle `done`/`error` event types in the drain — those are
+    // agent-main-loop terminal signals that have already been emitted
+    // above; the drain is strictly post-terminal.
+    if !interrupt_observed && tool_registry.spawn_only_was_invoked() {
+        let drain_ws = ws.clone();
+        let drain_ledger = ledger.clone();
+        let drain_session_id = session_id.clone();
+        let drain_progress_context = progress_context.clone();
+        let drain_contracts = contracts.clone();
+        let drain_workspace_root = progress_workspace_root.clone();
+        tokio::spawn(async move {
+            let mut drain_tracker = task_output_delta_tracker;
+            let mut drain_saw_delta = false;
+            while let Some(data) = progress_rx.recv().await {
+                let event: Value = match serde_json::from_str(&data) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                match event.get("type").and_then(Value::as_str) {
+                    // Already emitted by the agent's main-loop terminal
+                    // path. Skip silently in the drain.
+                    Some("done") | Some("error") => continue,
+                    _ => {
+                        forward_progress_event(
+                            &drain_ws,
+                            &drain_ledger,
+                            &drain_session_id,
+                            &drain_progress_context,
+                            drain_contracts.as_ref(),
+                            drain_workspace_root.as_deref(),
+                            &mut drain_tracker,
+                            &mut drain_saw_delta,
+                            &event,
+                        );
+                    }
+                }
+            }
+            // `drain_saw_delta` only matters when callers want to backfill
+            // the terminal `done`'s assistant content; the drain runs
+            // post-terminal so the flag is intentionally discarded here.
+            let _ = drain_saw_delta;
+        });
+    }
 
     // FIX-06: a turn that ends — for any reason — must drop its
     // `approve_for_turn` policy entries so a subsequent turn can't reuse
@@ -7343,6 +9601,82 @@ async fn try_emit_terminal(
 
     if let Some(ack) = ack {
         let _ = ack.send(());
+    }
+}
+
+/// Dispatch a single non-terminal progress JSON value out to the WS / ledger.
+///
+/// Extracted from `run_standalone_turn` so the spawn_only post-terminal drain
+/// task (issue #961) can reuse the same fan-out as the main `select!` loop.
+/// The function only handles `_ =>` (non-`done`/`error`) events; callers must
+/// route `"done"` and `"error"` through their own terminal paths.
+///
+/// `saw_delta` is updated to `true` if a `MessageDelta` notification was
+/// produced (callers in the main loop use it to backfill the final assistant
+/// content on the terminal). The drain task passes a discard reference since
+/// it runs strictly after the terminal has already been emitted.
+#[allow(clippy::too_many_arguments)]
+fn forward_progress_event(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    progress_context: &ProgressMappingContext,
+    contracts: &UiProtocolContractStores,
+    progress_workspace_root: Option<&Path>,
+    task_output_delta_tracker: &mut TaskOutputDeltaTracker,
+    saw_delta: &mut bool,
+    event: &Value,
+) {
+    if let Some(delta) = task_output_delta_tracker.observe_progress_event(session_id, event) {
+        // task/output/delta is durable: drops surface as
+        // protocol/replay_lossy so the client can resync.
+        let _ = send_notification_durable(ws, ledger, UiNotification::TaskOutputDelta(delta));
+    }
+    let mut mapping = map_progress_json(progress_context, event);
+    apply_progress_contract_side_effects(
+        contracts,
+        progress_context,
+        progress_workspace_root,
+        event,
+        &mut mapping,
+    );
+    for notification in mapping.notifications {
+        match notification {
+            UiNotification::MessageDelta(_) => {
+                *saw_delta = true;
+                let _ = send_notification_ephemeral(ws, ledger, notification);
+            }
+            UiNotification::ApprovalRequested(request) => {
+                if send_notification_durable(
+                    ws,
+                    ledger,
+                    UiNotification::ApprovalRequested(request.clone()),
+                )
+                .is_err()
+                {
+                    cancel_approval_after_request_send_failure(
+                        contracts,
+                        ws,
+                        ledger,
+                        &request.session_id,
+                        &request.approval_id,
+                        &request.turn_id,
+                    );
+                }
+            }
+            notification => {
+                let _ = send_notification_durable(ws, ledger, notification);
+            }
+        }
+    }
+    if let Some(warning) = mapping.warning {
+        let _ = send_notification_durable(ws, ledger, UiNotification::Warning(warning));
+    }
+    if let Some(status) = mapping.status {
+        // Tag with this connection's id so its forwarder skips
+        // the broadcast copy after the direct send below.
+        let event = ledger.append_progress_from(status.event, ws.connection_id);
+        let _ = send_ledger_event_durable(ws, ledger, event.event);
     }
 }
 
@@ -7814,6 +10148,13 @@ fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), S
     ws.send_lifecycle(frame)
 }
 
+fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Result<(), SendError> {
+    let value = result
+        .into_result_value()
+        .map_err(|_| SendError::LifecycleFailure("typed rpc result serialization".into()))?;
+    send_rpc_result(ws, id, value)
+}
+
 fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
     let frame = frame_for(&RpcErrorResponse::new(id, error))
         .ok_or_else(|| SendError::LifecycleFailure("rpc error serialization".into()))?;
@@ -8113,6 +10454,629 @@ mod tests {
         DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
         approval_scopes, methods, rpc_error_codes,
     };
+
+    fn local_profile_state(dir: &Path) -> AppState {
+        AppState {
+            profile_store: Some(Arc::new(crate::profiles::ProfileStore::open(dir).unwrap())),
+            user_store: Some(Arc::new(crate::user_store::UserStore::open(dir).unwrap())),
+            deployment_mode: crate::config::DeploymentMode::Local,
+            ..AppState::empty_for_tests()
+        }
+    }
+
+    fn local_profile_params(
+        name: &str,
+        username: &str,
+        email: &str,
+    ) -> octos_core::ui_protocol::ProfileLocalCreateParams {
+        octos_core::ui_protocol::ProfileLocalCreateParams {
+            name: name.into(),
+            username: username.into(),
+            email: email.into(),
+        }
+    }
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "writer closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_writer_loop_propagates_write_errors() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(WsMessage::Text("{}".into()))
+            .await
+            .expect("queue stdio response");
+        drop(tx);
+
+        let error = stdio_writer_loop_to(rx, FailingWriter)
+            .await
+            .expect_err("write failure is propagated");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn profile_local_create_creates_user_and_profile_without_otp() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let result = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ADA@example.com"),
+        )
+        .expect("create local profile");
+
+        assert_eq!(result.profile_id, "ada");
+        assert_eq!(result.user_id, "ada");
+        assert_eq!(result.email, "ada@example.com");
+        assert!(result.created);
+        assert_eq!(result.runtime_mode, "solo");
+
+        let user = state
+            .user_store
+            .as_ref()
+            .unwrap()
+            .get("ada")
+            .unwrap()
+            .expect("user");
+        assert_eq!(user.name, "Ada Lovelace");
+        assert_eq!(user.email, "ada@example.com");
+        assert_eq!(user.role, crate::user_store::UserRole::Admin);
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("ada")
+            .unwrap()
+            .expect("profile");
+        assert_eq!(profile.id, "ada");
+        assert_eq!(profile.name, "Ada Lovelace");
+
+        let profile_json: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("profiles/ada.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(profile_json["username"], json!("ada"));
+        assert_eq!(profile_json["email"], json!("ada@example.com"));
+    }
+
+    #[test]
+    fn profile_local_create_is_idempotent_for_same_local_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let params = local_profile_params("Ada Lovelace", "Ada", "ada@example.com");
+
+        let first = create_or_get_local_solo_profile(&state, params.clone()).unwrap();
+        let second = create_or_get_local_solo_profile(&state, params).unwrap();
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(second.profile_id, "ada");
+        assert_eq!(state.user_store.as_ref().unwrap().list().unwrap().len(), 1);
+        assert_eq!(
+            state.profile_store.as_ref().unwrap().list().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn profile_local_create_rejects_username_collision_with_different_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .unwrap();
+
+        let error = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Byron", "ada", "ada@example.com"),
+        )
+        .expect_err("collision rejected");
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_collision"))
+        );
+
+        let error = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "other@example.com"),
+        )
+        .expect_err("email collision rejected");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_collision"))
+        );
+    }
+
+    #[test]
+    fn profile_local_create_returns_typed_errors_for_invalid_or_nonlocal_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let invalid = create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "bad username", "ada@example.com"),
+        )
+        .expect_err("invalid username");
+        assert_eq!(invalid.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            invalid.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_invalid_username"))
+        );
+
+        let tenant_state = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            profile_store: state.profile_store.clone(),
+            user_store: state.user_store.clone(),
+            ..AppState::empty_for_tests()
+        };
+        let unsupported = create_or_get_local_solo_profile(
+            &tenant_state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect_err("tenant mode rejected");
+        assert_eq!(unsupported.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            unsupported.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_unsupported"))
+        );
+    }
+
+    #[test]
+    fn permission_profile_handlers_are_server_owned_and_reject_danger_outside_local() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+        let session_id = SessionKey("local:permission-profile-test".into());
+        let listed = permission_profile_list_result(
+            &local,
+            octos_core::ui_protocol::PermissionProfileListParams {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(
+            listed
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess)
+        );
+
+        let tenant = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            ..AppState::empty_for_tests()
+        };
+        let tenant_list = permission_profile_list_result(
+            &tenant,
+            octos_core::ui_protocol::PermissionProfileListParams {
+                session_id: session_id.clone(),
+            },
+        );
+        assert!(
+            !tenant_list
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess)
+        );
+
+        let denied = permission_profile_set_result(
+            &tenant,
+            PermissionProfileSetParams {
+                session_id,
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+            },
+        )
+        .expect_err("danger rejected outside local");
+        assert_eq!(denied.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            denied.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_local_solo_profile_create_only_when_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile_state(dir.path());
+        let local_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&local);
+        assert!(
+            local_capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == methods::PROFILE_LOCAL_CREATE)
+        );
+        assert!(local_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+        assert!(local_capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
+        assert!(local_capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
+        for method in [
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
+            APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+        ] {
+            assert!(
+                local_capabilities
+                    .supported_methods
+                    .iter()
+                    .any(|advertised| advertised == method),
+                "{method} should be advertised with a profile store"
+            );
+        }
+
+        let no_profile_store = AppState::empty_for_tests();
+        let no_profile_capabilities =
+            ConnectionUiFeatures::default().advertised_capabilities(&no_profile_store);
+        assert!(
+            !no_profile_capabilities
+                .supported_methods
+                .iter()
+                .any(|method| is_profile_skill_appui_method(method))
+        );
+
+        let tenant = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            profile_store: local.profile_store.clone(),
+            user_store: local.user_store.clone(),
+            ..AppState::empty_for_tests()
+        };
+        let tenant_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&tenant);
+        assert!(
+            !tenant_capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == methods::PROFILE_LOCAL_CREATE)
+        );
+        assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+    }
+
+    #[tokio::test]
+    async fn profile_skills_appui_installs_lists_and_removes_local_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create profile");
+
+        let source = dir.path().join("fixture-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: fixture-skill\nversion: 1.2.3\n---\n# Fixture skill\n",
+        )
+        .unwrap();
+
+        let install = RpcRequest::new(
+            "install",
+            APPUI_METHOD_PROFILE_SKILLS_INSTALL,
+            json!({
+                "profile_id": "ada",
+                "repo": source.to_string_lossy(),
+                "force": true
+            }),
+        );
+        let installed = raw_profile_skills_install(&state, &install, None)
+            .await
+            .expect("install skill");
+        assert_eq!(installed["profile_id"], json!("ada"));
+        assert_eq!(installed["ok"], json!(true));
+        assert_eq!(installed["installed"], json!(["fixture-skill"]));
+
+        let list = RpcRequest::new(
+            "list",
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
+            json!({ "profile_id": "ada" }),
+        );
+        let listed = raw_profile_skills_list(&state, &list, None).expect("list skills");
+        assert_eq!(listed["count"], json!(1));
+        assert_eq!(listed["skills"][0]["name"], json!("fixture-skill"));
+        assert_eq!(listed["skills"][0]["version"], json!("1.2.3"));
+        assert_eq!(listed["skills"][0]["installed"], json!(true));
+        assert_eq!(listed["skills"][0]["status"], json!("installed"));
+
+        let remove = RpcRequest::new(
+            "remove",
+            APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+            json!({ "profile_id": "ada", "name": "fixture-skill" }),
+        );
+        let removed = raw_profile_skills_remove(&state, &remove, None)
+            .await
+            .expect("remove skill");
+        assert_eq!(removed["ok"], json!(true));
+        assert_eq!(removed["removed"], json!("fixture-skill"));
+
+        let listed = raw_profile_skills_list(&state, &list, None).expect("list after remove");
+        assert_eq!(listed["count"], json!(0));
+        assert!(listed["skills"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn profile_skills_appui_rejects_cross_profile_under_authenticated_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let request = RpcRequest::new(
+            "list",
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
+            json!({ "profile_id": "other" }),
+        );
+
+        let error =
+            raw_profile_skills_list(&state, &request, Some("ada")).expect_err("scope violation");
+
+        assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("auth_scope_violation"))
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_llm_test_without_api_key_returns_not_applied() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let request = RpcRequest::new(
+            "1",
+            APPUI_METHOD_PROFILE_LLM_TEST,
+            json!({
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "custom-model",
+                    "route": {
+                        "route_id": "custom",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_type": "openai"
+                    }
+                }
+            }),
+        );
+
+        let result = raw_profile_llm_test(&state, &request, Some("ada"))
+            .await
+            .expect("test result");
+
+        assert_eq!(result["profile_id"], json!("ada"));
+        assert_eq!(result["applied"], json!(false));
+        assert_eq!(result["message"], json!("Provider connection failed"));
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("No API key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_llm_upsert_adds_multiple_fallbacks_when_not_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+
+        let primary = RpcRequest::new(
+            "1",
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            json!({
+                "profile_id": "ada",
+                "set_primary": true,
+                "selection": {
+                    "family_id": "moonshot",
+                    "model_id": "kimi-k2.5",
+                    "route": {
+                        "route_id": "autodl",
+                        "base_url": "https://www.autodl.art/api/v1",
+                        "api_key_env": "AUTODL_API_KEY",
+                        "api_type": "openai"
+                    }
+                },
+                "api_key": "sk-primary"
+            }),
+        );
+        raw_profile_llm_upsert(&state, &primary, None)
+            .await
+            .expect("primary upsert");
+        assert!(
+            resolve_session_profile_runtime(&state, Some("ada")).is_some(),
+            "profile/llm/upsert should register a ProfileRuntime for same-process AppUI session/open"
+        );
+
+        let fallback_one = RpcRequest::new(
+            "2",
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            json!({
+                "profile_id": "ada",
+                "set_primary": false,
+                "selection": {
+                    "family_id": "minimax",
+                    "model_id": "MiniMax-M2.5-highspeed",
+                    "route": {
+                        "route_id": "wisemodel",
+                        "base_url": "https://open.ospreyai.cn/v1",
+                        "api_key_env": "WISEMODEL_API_KEY",
+                        "api_type": "openai"
+                    }
+                },
+                "api_key": "sk-fallback-one"
+            }),
+        );
+        raw_profile_llm_upsert(&state, &fallback_one, None)
+            .await
+            .expect("first fallback upsert");
+
+        let fallback_two = RpcRequest::new(
+            "3",
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            json!({
+                "profile_id": "ada",
+                "set_primary": false,
+                "selection": {
+                    "family_id": "deepseek",
+                    "model_id": "deepseek-reasoner",
+                    "route": {
+                        "route_id": "deepseek",
+                        "api_key_env": "DEEPSEEK_API_KEY",
+                        "api_type": "openai"
+                    }
+                },
+                "api_key": "sk-fallback-two"
+            }),
+        );
+        let result = raw_profile_llm_upsert(&state, &fallback_two, None)
+            .await
+            .expect("second fallback upsert");
+
+        let fallbacks = result["llm"]["fallbacks"]
+            .as_array()
+            .expect("fallback array");
+        assert_eq!(fallbacks.len(), 2);
+        assert_eq!(fallbacks[0]["family_id"], json!("minimax"));
+        assert_eq!(fallbacks[1]["family_id"], json!("deepseek"));
+
+        let profile = state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("ada")
+            .unwrap()
+            .expect("profile");
+        let llm = profile.config.llm.expect("llm config");
+        assert_eq!(llm.primary.unwrap().family_id.as_deref(), Some("moonshot"));
+        assert_eq!(llm.fallbacks.len(), 2);
+        assert_eq!(
+            profile.config.env_vars.get("WISEMODEL_API_KEY"),
+            Some(&"sk-fallback-one".to_owned())
+        );
+        assert_eq!(
+            profile.config.env_vars.get("DEEPSEEK_API_KEY"),
+            Some(&"sk-fallback-two".to_owned())
+        );
+        assert_eq!(
+            llm.fallbacks[1]
+                .route
+                .as_ref()
+                .and_then(|route| route.api_key_env.as_deref()),
+            Some("DEEPSEEK_API_KEY")
+        );
+    }
+
+    #[tokio::test]
+    async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create profile");
+
+        let primary = RpcRequest::new(
+            "1",
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+            json!({
+                "profile_id": "ada",
+                "set_primary": true,
+                "selection": {
+                    "family_id": "deepseek",
+                    "model_id": "deepseek-reasoner",
+                    "route": {
+                        "route_id": "deepseek",
+                        "api_key_env": "DEEPSEEK_API_KEY",
+                        "api_type": "openai"
+                    }
+                },
+                "api_key": "sk-test"
+            }),
+        );
+        raw_profile_llm_upsert(&state, &primary, None)
+            .await
+            .expect("primary upsert registers runtime");
+
+        let workspace = tempfile::tempdir().unwrap();
+        let params = SessionOpenParams {
+            session_id: SessionKey::with_profile_topic("ada", "local", "tui", "coding"),
+            profile_id: Some("ada".into()),
+            cwd: Some(workspace.path().to_string_lossy().into_owned()),
+            after: None,
+        };
+
+        let requested_workspace = validate_requested_session_cwd(
+            &state,
+            ConnectionUiFeatures::stdio_defaults(),
+            Some("ada"),
+            &params,
+        )
+        .expect("newly created local profile has registered runtime");
+
+        assert_eq!(
+            requested_workspace.as_deref(),
+            Some(workspace.path().canonicalize().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn runtime_policy_stamp_exposes_effective_permission_fields() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSelection as Selection,
+        };
+
+        let state = AppState::empty_for_tests();
+        let session_id = SessionKey("local:policy-stamp-test".into());
+        let workspace = tempfile::tempdir().unwrap();
+        session_workspaces().set(session_id.clone(), workspace.path().to_path_buf());
+        session_permission_profiles().set(
+            session_id.clone(),
+            Selection {
+                mode: Mode::DangerFullAccess,
+                network: Network::Allow,
+            },
+            Some(octos_agent::ApprovalPolicy::Never),
+        );
+
+        let stamp = runtime_policy_stamp_for_profile(&state, "ada", Some(&session_id), None);
+        assert_eq!(stamp["runtime_mode"], json!("solo"));
+        assert_eq!(stamp["profile_id"], json!("ada"));
+        assert_eq!(
+            stamp["workspace_root"],
+            json!(workspace.path().to_string_lossy())
+        );
+        assert_eq!(stamp["approval_policy"], json!("never"));
+        assert_eq!(stamp["sandbox_mode"], json!("danger-full-access"));
+        assert_eq!(stamp["permission_profile"], json!("danger_full_access"));
+        assert_eq!(stamp["filesystem_scope"], json!("host"));
+        assert_eq!(stamp["network"], json!("allowed"));
+    }
 
     #[test]
     fn parses_turn_start_rpc_request() {
@@ -12645,7 +15609,7 @@ mod tests {
     ) -> octos_agent::BackgroundTask {
         octos_agent::BackgroundTask {
             id: id.into(),
-            tool_name: "deep_search".into(),
+            tool_name: "search".into(),
             tool_call_id: "call-1".into(),
             parent_session_key: Some("local:test".into()),
             child_session_key: None,

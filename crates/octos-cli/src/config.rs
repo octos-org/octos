@@ -44,6 +44,10 @@ pub struct Config {
     #[serde(default)]
     pub api_key_env: Option<String>,
 
+    /// Profile-scoped environment values, including API keys persisted by the dashboard/AppUI.
+    #[serde(default)]
+    pub env_vars: std::collections::HashMap<String, String>,
+
     /// Override auto-detected model behavior hints for the OpenAI provider.
     /// Useful for custom/unknown models behind OpenAI-compatible proxies.
     #[serde(default)]
@@ -1097,12 +1101,12 @@ impl Config {
                 .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
 
-        // M11-F: per-profile API keys live on
-        // `ProfileRuntime::credentials`; consumers that need them
-        // read off the profile runtime directly. `Config::get_api_key`
-        // falls straight through to the process environment, which
-        // matches every non-serve entry point (`octos chat`,
-        // `octos gateway`).
+        if let Some(value) = self.env_vars.get(&env_var).and_then(|value| {
+            crate::auth::keychain::resolve_value(&env_var, value).filter(|value| !value.is_empty())
+        }) {
+            return Ok(value);
+        }
+
         std::env::var(&env_var).wrap_err_with(|| {
             format!("{env_var} not set. Run `octos auth login -p {provider}` or set the env var")
         })

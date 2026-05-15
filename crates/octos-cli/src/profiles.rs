@@ -1022,8 +1022,11 @@ impl ProfileStore {
         }
 
         let path = self.profile_path(&normalized.id);
+        let mut serialized =
+            serde_json::to_value(&normalized).wrap_err("failed to serialize profile")?;
+        preserve_local_owner_metadata(&path, &mut serialized);
         let content =
-            serde_json::to_string_pretty(&normalized).wrap_err("failed to serialize profile")?;
+            serde_json::to_string_pretty(&serialized).wrap_err("failed to serialize profile")?;
 
         // Atomic write: write to temp file, then rename to avoid partial writes
         // if the process is interrupted or concurrent saves race.
@@ -1228,6 +1231,28 @@ impl ProfileStore {
     }
 }
 
+fn preserve_local_owner_metadata(path: &Path, serialized: &mut serde_json::Value) {
+    let Some(object) = serialized.as_object_mut() else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(existing)) =
+        serde_json::from_str::<serde_json::Value>(&content)
+    else {
+        return;
+    };
+    for key in ["username", "email"] {
+        if object.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = existing.get(key).filter(|value| value.is_string()) {
+            object.insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
 /// Resolve the effective config for a profile. If it's a sub-account,
 /// LLM provider fields are inherited from the parent.
 pub fn resolve_effective_profile(
@@ -1409,6 +1434,7 @@ pub(crate) fn config_from_profile(
                 .as_ref()
                 .and_then(|route| route.api_key_env.clone())
         }),
+        env_vars: profile.config.env_vars.clone(),
         api_type: primary.and_then(|selection| {
             selection
                 .route
@@ -1833,6 +1859,44 @@ mod tests {
 
         assert!(store.delete("test").unwrap());
         assert!(store.get("test").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_save_preserves_local_owner_metadata_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+        let mut profile = UserProfile {
+            id: "ada".into(),
+            name: "Ada Lovelace".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        store.save(&profile).unwrap();
+        let path = store.profile_path("ada");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("username".into(), serde_json::json!("ada"));
+        raw.as_object_mut()
+            .unwrap()
+            .insert("email".into(), serde_json::json!("ada@example.com"));
+        std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+        profile.name = "Ada Byron".into();
+        store.save(&profile).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["username"], serde_json::json!("ada"));
+        assert_eq!(saved["email"], serde_json::json!("ada@example.com"));
+        assert_eq!(saved["name"], serde_json::json!("Ada Byron"));
     }
 
     #[test]

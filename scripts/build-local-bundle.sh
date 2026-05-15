@@ -61,7 +61,7 @@ fi
 TARBALL="octos-bundle-${TRIPLE}.tar.gz"
 rm -rf dist && mkdir dist
 for b in octos news_fetch deep-search deep_crawl send_email account_manager \
-         voice clock weather pipeline-guard; do
+         voice clock weather; do
     cp "target/release/$b" dist/ 2>/dev/null || true
 done
 (cd dist && tar czf "../scripts/${TARBALL}" ./*)

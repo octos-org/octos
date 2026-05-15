@@ -77,7 +77,7 @@ pub fn tool_output_limit(tool_name: &str) -> usize {
         "grep" => 30_000,
         "web_fetch" => 40_000,
         "web_search" => 20_000,
-        "deep_search" => 50_000,
+        "search" => 50_000,
         "deep_research" => 50_000,
         "spawn" => 50_000,
         _ => 50_000, // global default

@@ -287,7 +287,7 @@ mod tests {
             "child bot should expose normal-mode web_search"
         );
         assert!(
-            registry.get("deep_search").is_some(),
+            registry.get("search").is_some(),
             "child bot should expose bundled deep_search skill"
         );
         assert!(

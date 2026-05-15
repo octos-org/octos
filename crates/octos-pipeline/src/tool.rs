@@ -285,6 +285,46 @@ impl Tool for RunPipelineTool {
         })
     }
 
+    /// Synchronously parse and structurally validate the DOT graph before
+    /// the spawn_only intercept dispatches the actual run to the background.
+    ///
+    /// Without this pre-flight, an LLM-generated invalid DOT (e.g. multiple
+    /// dangling roots → `rule 1: ambiguous start`) failed inside the
+    /// background task and surfaced only as a user-visible error bubble —
+    /// the agent's foreground turn already returned "started in background"
+    /// to the LLM, so the model thought it succeeded and never retried.
+    /// Catching the bad shape here turns the failure into a tool_result the
+    /// LLM can react to in its next iteration.
+    ///
+    /// Scope is deliberately limited to `parse_dot` + the same `validate::`
+    /// lint pass the executor runs — model assignment is skipped because
+    /// the topology checks (`ambiguous start`, dangling refs, etc.) are
+    /// what the LLM gets wrong; model fields are auto-filled by the
+    /// executor and never the failure source.
+    async fn pre_flight_validate(&self, args: &serde_json::Value) -> Result<(), String> {
+        let input: Input = serde_json::from_value(args.clone())
+            .map_err(|e| format!("invalid run_pipeline input: {e}"))?;
+        let dot_content = self
+            .resolve_with_fallback(&input.pipeline)
+            .await
+            .map_err(|e| format!("failed to resolve pipeline DOT: {e}"))?;
+        let graph = crate::parser::parse_dot(&dot_content)
+            .map_err(|e| format!("failed to parse pipeline DOT: {e}"))?;
+        let diags = crate::validate::validate(&graph);
+        if crate::validate::has_errors(&diags) {
+            let errors: Vec<_> = diags
+                .iter()
+                .filter(|d| d.severity == crate::validate::Severity::Error)
+                .map(|d| format!("rule {}: {}", d.rule, d.message))
+                .collect();
+            return Err(format!(
+                "pipeline validation failed:\n{}",
+                errors.join("\n")
+            ));
+        }
+        Ok(())
+    }
+
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid run_pipeline input")?;

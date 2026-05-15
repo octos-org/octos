@@ -702,6 +702,9 @@ where
 }
 
 pub mod methods {
+    pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
+    pub const SESSION_STATUS_READ: &str = "session/status/read";
+    pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
     pub const SESSION_OPEN: &str = "session/open";
     pub const TURN_START: &str = "turn/start";
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
@@ -831,6 +834,7 @@ pub mod approval_cancelled_reasons {
 
 /// All command methods defined by the v1alpha1 protocol model.
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
+    methods::PROFILE_LOCAL_CREATE,
     methods::SESSION_OPEN,
     methods::TURN_START,
     methods::TURN_INTERRUPT,
@@ -1166,6 +1170,7 @@ impl RpcError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiResultKind {
+    ProfileLocalCreate,
     SessionOpen,
     TurnStart,
     TurnInterrupt,
@@ -1186,6 +1191,7 @@ pub enum UiResultKind {
 
 pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind> {
     match method {
+        methods::PROFILE_LOCAL_CREATE => Some(UiResultKind::ProfileLocalCreate),
         methods::SESSION_OPEN => Some(UiResultKind::SessionOpen),
         methods::TURN_START => Some(UiResultKind::TurnStart),
         methods::TURN_INTERRUPT => Some(UiResultKind::TurnInterrupt),
@@ -1415,10 +1421,12 @@ pub struct ApprovalScopeEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum PermissionProfileMode {
+    #[serde(rename = "read_only", alias = "read-only")]
     ReadOnly,
+    #[serde(rename = "workspace_write", alias = "workspace-write")]
     WorkspaceWrite,
+    #[serde(rename = "danger_full_access", alias = "danger-full-access")]
     DangerFullAccess,
 }
 
@@ -1473,12 +1481,17 @@ impl PermissionProfileSelection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PermissionProfileUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<PermissionProfileMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<PermissionNetworkPolicy>,
+    /// Optional approval behavior override. Accepted values are currently
+    /// `on-request`/`on_request`/`ask` and `never`. Unknown values are rejected
+    /// by the server-side policy resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
 }
 
 impl PermissionProfileUpdate {
@@ -1515,6 +1528,24 @@ pub struct PermissionProfileSetResult {
     pub session_id: SessionKey,
     pub current: PermissionProfileSelection,
     pub applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLocalCreateParams {
+    pub name: String,
+    pub username: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLocalCreateResult {
+    pub profile_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub username: String,
+    pub email: String,
+    pub created: bool,
+    pub runtime_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2675,6 +2706,7 @@ pub struct Envelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiCommand {
+    ProfileLocalCreate(ProfileLocalCreateParams),
     SessionOpen(SessionOpenParams),
     TurnStart(TurnStartParams),
     TurnInterrupt(TurnInterruptParams),
@@ -2712,6 +2744,7 @@ pub enum UiCommand {
 impl UiCommand {
     pub fn method(&self) -> &'static str {
         match self {
+            Self::ProfileLocalCreate(_) => methods::PROFILE_LOCAL_CREATE,
             Self::SessionOpen(_) => methods::SESSION_OPEN,
             Self::TurnStart(_) => methods::TURN_START,
             Self::TurnInterrupt(_) => methods::TURN_INTERRUPT,
@@ -2751,6 +2784,7 @@ impl UiCommand {
     ) -> Result<RpcRequest<Value>, serde_json::Error> {
         let method = self.method();
         let params = match self {
+            Self::ProfileLocalCreate(params) => serde_json::to_value(params),
             Self::SessionOpen(params) => serde_json::to_value(params),
             Self::TurnStart(params) => serde_json::to_value(params),
             Self::TurnInterrupt(params) => serde_json::to_value(params),
@@ -2800,6 +2834,9 @@ impl UiCommand {
 
     pub fn from_method_and_params(method: &str, params: Value) -> Result<Self, RpcError> {
         match method {
+            methods::PROFILE_LOCAL_CREATE => {
+                Ok(Self::ProfileLocalCreate(decode_params(method, params)?))
+            }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_params(method, params)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_params(method, params)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_params(method, params)?)),
@@ -3130,6 +3167,7 @@ impl TurnInterruptResult {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum UiRpcResult {
+    ProfileLocalCreate(ProfileLocalCreateResult),
     SessionOpen(SessionOpenResult),
     TurnStart(TurnStartResult),
     TurnInterrupt(TurnInterruptResult),
@@ -3151,6 +3189,7 @@ pub enum UiRpcResult {
 impl UiRpcResult {
     pub fn kind(&self) -> UiResultKind {
         match self {
+            Self::ProfileLocalCreate(_) => UiResultKind::ProfileLocalCreate,
             Self::SessionOpen(_) => UiResultKind::SessionOpen,
             Self::TurnStart(_) => UiResultKind::TurnStart,
             Self::TurnInterrupt(_) => UiResultKind::TurnInterrupt,
@@ -3172,6 +3211,7 @@ impl UiRpcResult {
 
     pub fn method(&self) -> Option<&str> {
         match self {
+            Self::ProfileLocalCreate(_) => Some(methods::PROFILE_LOCAL_CREATE),
             Self::SessionOpen(_) => Some(methods::SESSION_OPEN),
             Self::TurnStart(_) => Some(methods::TURN_START),
             Self::TurnInterrupt(_) => Some(methods::TURN_INTERRUPT),
@@ -3193,6 +3233,7 @@ impl UiRpcResult {
 
     pub fn into_result_value(self) -> Result<Value, serde_json::Error> {
         match self {
+            Self::ProfileLocalCreate(result) => serde_json::to_value(result),
             Self::SessionOpen(result) => serde_json::to_value(result),
             Self::TurnStart(result) => serde_json::to_value(result),
             Self::TurnInterrupt(result) => serde_json::to_value(result),
@@ -3231,6 +3272,9 @@ impl UiRpcResult {
             return Ok(Self::UnsupportedCapability(parsed));
         }
         match method {
+            methods::PROFILE_LOCAL_CREATE => {
+                Ok(Self::ProfileLocalCreate(decode_result(method, result)?))
+            }
             methods::SESSION_OPEN => Ok(Self::SessionOpen(decode_result(method, result)?)),
             methods::TURN_START => Ok(Self::TurnStart(decode_result(method, result)?)),
             methods::TURN_INTERRUPT => Ok(Self::TurnInterrupt(decode_result(method, result)?)),
@@ -4563,6 +4607,7 @@ mod tests {
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
             &[
+                "profile/local/create",
                 "session/open",
                 "turn/start",
                 "turn/interrupt",
