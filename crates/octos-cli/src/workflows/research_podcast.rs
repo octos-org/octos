@@ -10,7 +10,7 @@ pub fn build() -> WorkflowInstance {
             .to_string(),
         current_phase: WorkflowPhase::new("research"),
         allowed_tools: vec![
-            "deep_search".into(),
+            "search".into(),
             "news_fetch".into(),
             "write_file".into(),
             "read_file".into(),

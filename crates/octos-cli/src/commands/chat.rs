@@ -765,7 +765,7 @@ pub(crate) fn create_provider(
 ) -> Result<Arc<dyn LlmProvider>> {
     let provider =
         create_provider_with_api_type(name, config, model, base_url, config.api_type.as_deref())?;
-    println!("{}: {}", "Model".green(), provider.model_id());
+    eprintln!("{}: {}", "Model".green(), provider.model_id());
     Ok(provider)
 }
 

@@ -7,11 +7,14 @@ use eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
+use crate::policy::FilesystemScope;
 
 /// Tool for finding files matching a glob pattern.
 pub struct GlobTool {
     /// Base directory for searches.
     base_dir: PathBuf,
+    /// Effective filesystem scope.
+    filesystem_scope: FilesystemScope,
 }
 
 impl GlobTool {
@@ -19,7 +22,14 @@ impl GlobTool {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
         }
+    }
+
+    /// Set the effective filesystem scope.
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
     }
 }
 
@@ -74,9 +84,10 @@ impl Tool for GlobTool {
         let base_dir = self.base_dir.clone();
         let pattern = input.pattern.clone();
         let limit = input.limit;
+        let filesystem_scope = self.filesystem_scope;
 
         // Reject absolute patterns and parent traversal
-        if pattern.starts_with('/') || pattern.contains("..") {
+        if !filesystem_scope.is_host() && (pattern.starts_with('/') || pattern.contains("..")) {
             return Ok(ToolResult {
                 output: "Absolute paths and '..' are not allowed in glob patterns".to_string(),
                 success: false,
@@ -86,7 +97,12 @@ impl Tool for GlobTool {
 
         // Run glob in blocking task
         let result = tokio::task::spawn_blocking(move || {
-            let full_pattern = format!("{}/{}", base_dir.display(), pattern);
+            let full_pattern =
+                if filesystem_scope.is_host() && PathBuf::from(&pattern).is_absolute() {
+                    pattern.clone()
+                } else {
+                    format!("{}/{}", base_dir.display(), pattern)
+                };
 
             let mut files: Vec<String> = Vec::new();
 

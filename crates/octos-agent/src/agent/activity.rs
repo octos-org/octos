@@ -79,6 +79,22 @@ impl ProgressReporter for ActivityTrackingReporter {
         self.activity.mark_activity();
         self.delegate.report(event);
     }
+
+    /// Issue #960 fix: forward the inner reporter's bound `thread_id`
+    /// (typically the per-turn `TurnId` / `client_message_id`) so the
+    /// spawn_only intercept in `agent/execution.rs` can capture it as
+    /// `bg_originating_client_message_id` for `BackgroundResultPayload`.
+    /// `ActivityTrackingReporter` is installed as `TASK_REPORTER` for
+    /// every loop iteration (`agent/loop_runner.rs::scope`), so the
+    /// activity decorator sits between every reporter consumer and the
+    /// underlying channel-bound reporter. Without this forward, the
+    /// default `None` would strip the thread binding at the top of the
+    /// stack and `turn/spawn_complete`'s
+    /// `response_to_client_message_id` would always serialise as
+    /// absent.
+    fn thread_id(&self) -> Option<&str> {
+        self.delegate.thread_id()
+    }
 }
 
 #[cfg(test)]

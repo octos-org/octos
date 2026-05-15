@@ -666,7 +666,7 @@ mod tests {
         tc_id: &str,
         body: &str,
     ) -> String {
-        let task_id = supervisor.register("deep_search", tc_id, Some("session-A"));
+        let task_id = supervisor.register("search", tc_id, Some("session-A"));
         supervisor.mark_running(&task_id);
         let session_id = format!("agent:{tc_id}");
         router
@@ -821,7 +821,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (supervisor, router, tool) = make_tool(dir.path());
         // Register a task under a DIFFERENT session.
-        let task_id = supervisor.register("deep_search", "tc-x", Some("session-OTHER"));
+        let task_id = supervisor.register("search", "tc-x", Some("session-OTHER"));
         let session_id = "agent:tc-x";
         router.append(session_id, &task_id, b"x\n").unwrap();
 
@@ -1202,7 +1202,7 @@ mod tests {
     async fn tail_reads_from_end_for_logs_larger_than_max_read_bytes() {
         let dir = tempdir().unwrap();
         let (supervisor, router, tool) = make_tool(dir.path());
-        let task_id = supervisor.register("deep_search", "tc-big", Some("session-A"));
+        let task_id = supervisor.register("search", "tc-big", Some("session-A"));
         supervisor.mark_running(&task_id);
 
         // Build a body well over MAX_READ_BYTES with a unique line near the

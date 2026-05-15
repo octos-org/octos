@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eyre::Result;
+use octos_agent::EffectivePermissions;
 use octos_core::SessionKey;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -256,6 +257,26 @@ impl SessionRuntimeCache {
         session_key: SessionKey,
         workspace_hint: Option<PathBuf>,
     ) -> Result<Arc<SessionRuntime>> {
+        self.get_or_init_with_permissions(
+            profile,
+            session_key,
+            workspace_hint,
+            EffectivePermissions::workspace_write(),
+        )
+        .await
+    }
+
+    /// Look up or build a session runtime using explicit effective
+    /// permissions. Callers should invalidate a cached session before changing
+    /// permission policy; cache hits intentionally keep the first bootstrapped
+    /// runtime for a session key.
+    pub async fn get_or_init_with_permissions(
+        &self,
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+        permissions: EffectivePermissions,
+    ) -> Result<Arc<SessionRuntime>> {
         let key = (profile.profile_id.clone(), session_key.clone());
 
         loop {
@@ -341,9 +362,13 @@ impl SessionRuntimeCache {
                     continue;
                 }
                 InflightOutcome::OwnGuard(guard) => {
-                    let result =
-                        SessionRuntime::bootstrap(profile, session_key.clone(), workspace_hint)
-                            .await;
+                    let result = SessionRuntime::bootstrap_with_permissions(
+                        profile,
+                        session_key.clone(),
+                        workspace_hint,
+                        permissions,
+                    )
+                    .await;
                     match result {
                         Ok(runtime) => {
                             // `insert_with_eviction` returns the

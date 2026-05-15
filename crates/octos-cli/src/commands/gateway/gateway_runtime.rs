@@ -1042,7 +1042,7 @@ impl GatewayRuntime {
         // Mark base tools that should never be auto-evicted by LRU.
         tools.set_base_tools([
             "run_pipeline",
-            "deep_search",
+            "search",
             "deep_crawl",
             "web_search",
             "web_fetch",

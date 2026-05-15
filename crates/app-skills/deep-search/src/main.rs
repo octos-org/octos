@@ -554,6 +554,26 @@ async fn run_deep_search(
     }
 
     // -----------------------------------------------------------------------
+    // Fail loudly if every search round + crawl + chase + site-crawl
+    // phase produced zero sources. Without this guard the synthesizer
+    // would still run with `sources=0` and the LLM would happily write
+    // a fabricated report from prior knowledge — which is the worst
+    // kind of silent failure (the user sees authoritative-looking prose
+    // with no actual evidence behind it). Surface the failure so the
+    // calling agent can pick a different engine, rephrase the query,
+    // or tell the user instead of laundering the model's priors.
+    if saved_files.is_empty() {
+        let engines_attempted = search_queries.len();
+        return Output {
+            output: format!(
+                "Deep search failed: 0 usable sources across {engines_attempted} search round(s) for query \"{query}\".\n\nThis usually means the search engine returned no results, returned only blocked domains, or the page extraction was unable to parse the SERP. Refusing to synthesize a report from prior knowledge — try a different `search_engine`, rephrase the query, or switch to `run_pipeline` with multiple search nodes."
+            ),
+            success: false,
+            ..Default::default()
+        };
+    }
+
+    // -----------------------------------------------------------------------
     // Synthesize an answer from the raw search dump + crawled excerpts.
     //
     // This is the W3.C1 "highest user-impact" change: instead of returning
@@ -1418,10 +1438,18 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
 
     // Use Bing instead of Google — Google CAPTCHAs automated requests from datacenter IPs.
     // Bing is much more lenient with headless Chrome scraping.
+    //
+    // Force the locale based on the query script so a Chinese query from a
+    // US-geolocated datacenter doesn't get routed into English synonym-mode
+    // (Bing has been observed returning thesaurus.com synonyms for "hates"
+    // when handed `美国和伊朗和谈` without an `mkt` hint).
+    let locale = detect_bing_locale(query);
     let search_url = format!(
-        "https://www.bing.com/search?q={}&count={}",
+        "https://www.bing.com/search?q={}&count={}&mkt={}&setlang={}",
         urlencoded(query),
-        count.min(10)
+        count.min(10),
+        locale,
+        locale,
     );
 
     let input = serde_json::json!({
@@ -1496,32 +1524,13 @@ async fn bing_cdp_search(query: &str, count: u8) -> SearchResult {
         };
     }
 
-    // Extract URLs from the crawled text (Google SERP contains result URLs)
-    let mut results = Vec::new();
-    let mut current_title = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Lines with URLs
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            if !trimmed.contains("bing.com")
-                && !trimmed.contains("microsoft.com")
-                && !trimmed.contains("google.com")
-                && !trimmed.contains("gstatic.com")
-            {
-                let title = if current_title.is_empty() {
-                    trimmed.to_string()
-                } else {
-                    std::mem::take(&mut current_title)
-                };
-                results.push(format!("- {}\n  {}", title, trimmed));
-            }
-        } else if trimmed.len() > 10 && !trimmed.contains("Google") && !trimmed.contains("Bing") {
-            current_title = trimmed.to_string();
-        }
-    }
+    // Extract URLs from the crawled text. Bing's modern SERP often
+    // inlines the URL inside the same line as the domain and title
+    // (e.g. `thesaurus.comhttps://www.thesaurus.com › browse › hates`),
+    // so the previous "line.starts_with(http)" heuristic missed every
+    // result. Switch to a substring scan that finds URLs anywhere in
+    // the line and uses the text *before* the URL as the title.
+    let results = extract_bing_results(text);
 
     if results.is_empty() {
         // Fall back to returning the raw text which may have useful content
@@ -2142,17 +2151,36 @@ fn decode_html_entities(s: &str) -> String {
 }
 
 fn extract_urls(output: &str) -> Vec<String> {
+    use regex::Regex;
+    // Pre-compile shouldn't be necessary in this hot path's scale; one-shot is fine.
+    // Captures the URL inside `[text](url)` Markdown link syntax — the canonical
+    // shape Serper and Tavily emit by default in their organic-results formatter.
+    let md_link = Regex::new(r"\[[^\]]*\]\((https?://[^\s\)]+)\)").expect("static md-link regex");
     let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in output.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        // Case 1: raw URL on its own line
+        if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+            && seen.insert(trimmed.to_string())
+        {
             urls.push(trimmed.to_string());
         }
+        // Case 2: legacy `[title] url` reference style (kept for backward compat)
         if let Some(rest) = trimmed.strip_prefix('[') {
             if let Some(after_bracket) = rest.find("] ") {
                 let url = &rest[after_bracket + 2..];
-                if url.starts_with("http") {
+                if url.starts_with("http") && seen.insert(url.to_string()) {
                     urls.push(url.to_string());
+                }
+            }
+        }
+        // Case 3 (NEW): Markdown link `[text](url)` — Serper/Tavily default shape
+        for cap in md_link.captures_iter(line) {
+            if let Some(m) = cap.get(1) {
+                let url = m.as_str().to_string();
+                if seen.insert(url.clone()) {
+                    urls.push(url);
                 }
             }
         }
@@ -2209,6 +2237,124 @@ fn truncate_utf8(s: &str, max_chars: usize, suffix: &str) -> String {
     let mut result = s[..end].to_string();
     result.push_str(suffix);
     result
+}
+
+/// Extract `(title, url)` pairs from a Bing SERP text dump.
+///
+/// Bing's rendered SERP collapses each result onto a long line shaped
+/// roughly like `<domain><url>›<crumb>...<title><snippet>`, e.g.
+/// `thesaurus.comhttps://www.thesaurus.com › browse › hatesHATES Synonyms...`.
+/// The old line-prefix heuristic only found URLs that started a line and
+/// so missed every inline match. This pass uses a regex to find every
+/// `http(s)://` occurrence, walks back to the most recent newline or `>`
+/// breadcrumb separator to seed a title, strips Bing/MS noise domains,
+/// and de-duplicates by normalized URL.
+///
+/// The returned strings are pre-formatted into the same
+/// `- <title>\n  <url>` shape the upstream `web_search` extractor and
+/// later `extract_urls` walker already expect.
+fn extract_bing_results(text: &str) -> Vec<String> {
+    use regex::Regex;
+    // URL terminator set chosen empirically against Bing's inline SERP:
+    // whitespace, common HTML chars, fenced punctuation, parentheses, and
+    // the `›` Bing breadcrumb glyph that follows the URL.
+    let re = Regex::new(r#"https?://[^\s<>"\)\(›]+"#).expect("static URL regex");
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for m in re.find_iter(text) {
+        let mut raw = m.as_str();
+        while let Some(stripped) =
+            raw.strip_suffix(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')'))
+        {
+            raw = stripped;
+        }
+        if raw.is_empty() {
+            continue;
+        }
+        let url = raw.to_string();
+        let lower = url.to_lowercase();
+        if lower.contains("bing.com")
+            || lower.contains("microsoft.com")
+            || lower.contains("google.com")
+            || lower.contains("gstatic.com")
+            || lower.contains("msn.com/spartan")
+        {
+            continue;
+        }
+        if !seen.insert(normalize_url(&url)) {
+            continue;
+        }
+        // Build a title from the text immediately before this URL on the
+        // same logical line. Bing's domain prefix (`thesaurus.com` ahead
+        // of `https://...`) is the closest thing to a title we get, so
+        // we grab the last 80 chars of the prefix up to the previous
+        // separator. Falls back to the bare URL when no prefix exists.
+        let start = m.start();
+        // The `›` Bing breadcrumb glyph is 3 bytes in UTF-8 (U+203A), so a
+        // naive `i + 1` after `rfind` lands inside the glyph and `&str`
+        // indexing panics. Step past the *full* UTF-8 width of whichever
+        // separator we hit.
+        let prefix_start = text[..start]
+            .rfind(['\n', '›', '|'])
+            .map(|i| {
+                let sep_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                i + sep_len
+            })
+            .unwrap_or(0);
+        let raw_prefix = text[prefix_start..start].trim();
+        let title = if raw_prefix.is_empty() {
+            url.clone()
+        } else {
+            // Cap title length so we don't drag in adjacent results.
+            let mut s = raw_prefix.to_string();
+            if s.len() > 80 {
+                let mut cut = 80;
+                while cut > 0 && !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                s.truncate(cut);
+            }
+            s
+        };
+        results.push(format!("- {}\n  {}", title, url));
+    }
+    results
+}
+
+/// Pick a Bing locale tag (`mkt`/`setlang` value) from the query script.
+///
+/// Bing has been observed returning English-locale synonym pages (e.g.
+/// thesaurus.com "hates" synonyms for `美国和伊朗和谈`) when handed a CJK
+/// query from a US-geolocated IP without any locale hint. Forcing
+/// `mkt=zh-CN&setlang=zh-CN` for CJK input keeps the results aligned with
+/// the user's actual language.
+///
+/// Detection uses a single pass over the chars, ordered by precedence:
+/// Hangul → Korean, Hiragana/Katakana → Japanese, CJK Unified → Chinese.
+/// Any other script falls through to `en-US`.
+fn detect_bing_locale(query: &str) -> &'static str {
+    let mut has_cjk_unified = false;
+    let mut has_kana = false;
+    let mut has_hangul = false;
+    for ch in query.chars() {
+        let c = ch as u32;
+        if (0xAC00..=0xD7AF).contains(&c) {
+            has_hangul = true;
+        } else if (0x3040..=0x309F).contains(&c) || (0x30A0..=0x30FF).contains(&c) {
+            has_kana = true;
+        } else if (0x4E00..=0x9FFF).contains(&c) {
+            has_cjk_unified = true;
+        }
+    }
+    if has_hangul {
+        "ko-KR"
+    } else if has_kana {
+        "ja-JP"
+    } else if has_cjk_unified {
+        "zh-CN"
+    } else {
+        "en-US"
+    }
 }
 
 fn research_dir(slug: &str) -> PathBuf {
@@ -2950,6 +3096,51 @@ mod tests {
     }
 
     #[test]
+    fn extract_bing_results_finds_inline_serp_urls() {
+        // Reproduces the actual Bing SERP dump observed on mini5 for a
+        // CJK query — domain prefix glued to the URL, breadcrumbs, then
+        // title and snippet all on one logical line. Previous extractor
+        // only saw `https://...` when it started a line and so returned
+        // empty for this entire SERP.
+        let sample = "About 50 results...thesaurus.comhttps://www.thesaurus.com › browse › hatesHATES Synonyms - 113 wordsthesaurus.comhttps://www.thesaurus.comSynonyms and Antonyms of Words | Thesaurus.com";
+        let results = extract_bing_results(sample);
+        // We expect at least the two thesaurus.com URLs to come through
+        // (de-duplication keeps only the deeper one because the second
+        // hit normalizes to a prefix of the first under our rules — the
+        // exact dedup count isn't load-bearing, but ≥1 is required).
+        assert!(!results.is_empty(), "expected inline URLs to be extracted");
+        // Result rows must be in "- <title>\n  <url>" shape so the
+        // outer `extract_urls` pass picks them up.
+        for row in &results {
+            assert!(row.contains("https://"), "row missing URL: {row}");
+            assert!(row.starts_with("- "), "row missing title prefix: {row}");
+        }
+        // Noise-domain filter must drop bing.com / google.com / etc.
+        let noisy = "bing.com results bing.comhttps://www.bing.com/results microsoft.comhttps://microsoft.com/help https://example.com/real";
+        let only_real = extract_bing_results(noisy);
+        assert_eq!(only_real.len(), 1, "expected only example.com to survive");
+        assert!(only_real[0].contains("example.com"));
+    }
+
+    #[test]
+    fn detect_bing_locale_routes_cjk_scripts_distinctly() {
+        // Chinese → zh-CN: prevents Bing from interpreting `美国和伊朗和谈`
+        // as English "hates" and returning thesaurus.com synonym pages.
+        assert_eq!(detect_bing_locale("美国和伊朗和谈"), "zh-CN");
+        assert_eq!(detect_bing_locale("深度研究"), "zh-CN");
+        // Korean (Hangul) takes precedence so the U+4E00 fallback never
+        // misroutes mixed CJK loanwords back to Chinese.
+        assert_eq!(detect_bing_locale("미국과 이란 협상"), "ko-KR");
+        // Japanese (Hiragana/Katakana) likewise routes to ja-JP even when
+        // the query also contains Han characters.
+        assert_eq!(detect_bing_locale("アメリカとイラン"), "ja-JP");
+        assert_eq!(detect_bing_locale("米国とイラン交渉"), "ja-JP");
+        // English / Latin defaults to en-US.
+        assert_eq!(detect_bing_locale("US Iran peace talks 2026"), "en-US");
+        assert_eq!(detect_bing_locale(""), "en-US");
+    }
+
+    #[test]
     fn should_save_report_with_topic_named_filename() {
         // Issue #897: deep_search no longer hardcodes `_report.md`. The
         // canonical report file inside `research/<slug>/` is named after
@@ -3027,6 +3218,27 @@ mod tests {
         let output = "Results:\n   https://example.com/page\n  [1] https://other.com\n";
         let urls = extract_urls(output);
         assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn extract_urls_handles_markdown_paren_links() {
+        let output = "1. [Title One](https://a.example.com)\n2. [Title Two](https://b.example.com)";
+        let urls = extract_urls(output);
+        assert_eq!(urls.len(), 2);
+        assert!(urls.iter().any(|u| u == "https://a.example.com"));
+        assert!(urls.iter().any(|u| u == "https://b.example.com"));
+    }
+
+    #[test]
+    fn extract_urls_dedups_repeated_urls() {
+        // Same URL appearing in raw form and inside a Markdown link should
+        // yield a single entry — the dedup guard in `extract_urls` collapses
+        // duplicates via a HashSet of normalized strings.
+        let output =
+            "https://dup.example.com\n[Same Link](https://dup.example.com)\n[Same Link](https://dup.example.com)";
+        let urls = extract_urls(output);
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "https://dup.example.com");
     }
 
     #[test]

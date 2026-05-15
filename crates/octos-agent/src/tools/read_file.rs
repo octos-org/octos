@@ -8,11 +8,14 @@ use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
 use crate::file_state_cache::{CacheEntry, FileStateCache, format_file_unchanged_stub};
+use crate::policy::FilesystemScope;
 
 /// Tool for reading file contents.
 pub struct ReadFileTool {
     /// Base directory for resolving relative paths.
     base_dir: PathBuf,
+    /// Effective filesystem scope.
+    filesystem_scope: FilesystemScope,
 }
 
 impl ReadFileTool {
@@ -20,7 +23,14 @@ impl ReadFileTool {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
         }
+    }
+
+    /// Set the effective filesystem scope.
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
     }
 }
 
@@ -95,7 +105,11 @@ impl Tool for ReadFileTool {
         }
 
         // Resolve path (with traversal protection)
-        let path = match super::resolve_path(&self.base_dir, &input.path) {
+        let path = match super::resolve_path_with_scope(
+            &self.base_dir,
+            &input.path,
+            self.filesystem_scope,
+        ) {
             Ok(p) => p,
             Err(_) => {
                 return Ok(ToolResult {

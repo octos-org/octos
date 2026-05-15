@@ -7201,7 +7201,7 @@ mod tests {
         let task_ledger_path = data_dir.join("tasks.jsonl");
         supervisor.enable_persistence(&task_ledger_path).unwrap();
         let task_id = supervisor.register_with_lineage(
-            "deep_search",
+            "search",
             "call-1",
             Some("api:session"),
             Some(task_ledger_path.to_str().unwrap()),
@@ -12055,7 +12055,7 @@ mod tests {
     ) -> octos_agent::BackgroundTask {
         octos_agent::BackgroundTask {
             id: id.into(),
-            tool_name: "deep_search".into(),
+            tool_name: "search".into(),
             tool_call_id: "call-1".into(),
             parent_session_key: Some("local:test".into()),
             child_session_key: None,

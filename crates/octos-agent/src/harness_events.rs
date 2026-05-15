@@ -1967,7 +1967,7 @@ mod tests {
     #[test]
     fn subagent_progress_event_integrates_with_supervisor() {
         let supervisor = TaskSupervisor::new();
-        let task_id = supervisor.register("deep_search", "call-1", Some("api:session"));
+        let task_id = supervisor.register("search", "call-1", Some("api:session"));
         supervisor.mark_running(&task_id);
 
         let event = HarnessEvent::subagent_progress(
@@ -2016,8 +2016,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sink_reader_ignores_mismatched_task_or_session() {
         let supervisor = Arc::new(TaskSupervisor::new());
-        let task_id = supervisor.register("deep_search", "call-1", Some("api:session"));
-        let other_task_id = supervisor.register("deep_search", "call-2", Some("api:session"));
+        let task_id = supervisor.register("search", "call-1", Some("api:session"));
+        let other_task_id = supervisor.register("search", "call-2", Some("api:session"));
         supervisor.mark_running(&task_id);
         supervisor.mark_running(&other_task_id);
 

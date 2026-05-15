@@ -14,7 +14,7 @@ use super::{
     ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
     ToolResult,
 };
-use crate::policy::{CommandPolicy, Decision, SafePolicy};
+use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
@@ -26,6 +26,8 @@ pub struct ShellTool {
     cwd: std::path::PathBuf,
     /// Policy for command approval.
     policy: Arc<dyn CommandPolicy>,
+    /// Runtime approval behavior for commands that request approval.
+    approval_policy: ApprovalPolicy,
     /// Sandbox for command isolation.
     sandbox: Box<dyn Sandbox>,
 }
@@ -37,6 +39,7 @@ impl ShellTool {
             timeout: Duration::from_secs(120),
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
+            approval_policy: ApprovalPolicy::Ask,
             sandbox: Box::new(NoSandbox),
         }
     }
@@ -50,6 +53,12 @@ impl ShellTool {
     /// Set a custom command policy.
     pub fn with_policy(mut self, policy: Arc<dyn CommandPolicy>) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Set the runtime approval behavior.
+    pub fn with_approval_policy(mut self, approval_policy: ApprovalPolicy) -> Self {
+        self.approval_policy = approval_policy;
         self
     }
 
@@ -205,6 +214,21 @@ impl Tool for ShellTool {
                 });
             }
             Decision::Ask => {
+                if !self.approval_policy.allows_prompt() {
+                    tracing::warn!(
+                        command = %input.command,
+                        "command requires approval but approval policy is never"
+                    );
+                    return Ok(ToolResult {
+                        output: format!(
+                            "Command requires approval but approval_policy is never: {}",
+                            input.command
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+
                 let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
                 let Some(requester) = requester else {
                     tracing::warn!(command = %input.command, "command requires approval — denied (no interactive approval available)");
@@ -437,6 +461,19 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("requires approval"));
+    }
+
+    #[tokio::test]
+    async fn approval_policy_never_fails_directly_without_prompt() {
+        let tool = ShellTool::new(std::env::temp_dir()).with_approval_policy(ApprovalPolicy::Never);
+        let result = tool
+            .execute(&serde_json::json!({"command": "sudo printf nope"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("approval_policy is never"));
+        assert!(!result.output.contains("without interactive approval"));
     }
 
     #[tokio::test]

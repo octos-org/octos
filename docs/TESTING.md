@@ -127,6 +127,59 @@ The M9 Playwright harness reads `OCTOS_LIVE_URL`, `OCTOS_LIVE_TOKEN` (or
 `OCTOS_AUTH_TOKEN`), and optional `OCTOS_LIVE_PROFILE`. The fixture flags keep
 approval/replay cases deterministic for the protocol gate.
 
+### M12 Solo AppUI Soak
+
+Use this gate for M12 solo-mode runtime evidence. The runner records AppUI
+stdio/WebSocket transcripts and policy artifacts without requiring a model
+provider. Live transports require an API-enabled `octos` binary with the
+`serve` subcommand; set `OCTOS_BIN` if it is not `target/debug/octos`:
+
+```bash
+# Offline artifact schema and no-OTP assertion.
+./scripts/m12-solo-appui-soak.sh self-test
+
+# Live stdio dry-run against the current local backend.
+OCTOS_M12_SOAK_TRANSPORT=stdio ./scripts/m12-solo-appui-soak.sh run
+
+# Live stdio + WebSocket matrix.
+OCTOS_M12_SOAK_TRANSPORT=both ./scripts/m12-solo-appui-soak.sh run
+```
+
+Artifacts are written under `e2e/test-results-m12-solo-soak/<run-id>/`. Each
+transport directory contains:
+
+- `server.log`
+- `appui-transcript.jsonl`
+- `runtime-policy-stamp.json`
+- `tool-registry-snapshot.json`
+- `approval-events.jsonl`
+- `filesystem-probe.json`
+- `soak-summary.json`
+- `summary.env`
+
+The runner calls `profile/local/create` for local no-OTP onboarding and fails if
+the retained transcript contains `auth/send_code` or `auth/verify`. Until
+Workers M12-A/C land their backend methods, non-strict runs may finish with
+`"status": "blocked"` and detailed blockers in `soak-summary.json`. Set
+`OCTOS_M12_SOAK_STRICT=1` once those workers land to require a fully passing
+run.
+
+On shared 249/mini hosts, prefer an explicit run id and port to avoid collisions:
+
+```bash
+OCTOS_M12_SOAK_RUN_ID="$(hostname)-$(date -u +%Y%m%dT%H%M%SZ)" \
+OCTOS_M12_SOAK_PORT=50249 \
+OCTOS_M12_SOAK_ARTIFACT_ROOT="$PWD/e2e/test-results-m12-solo-soak" \
+OCTOS_M12_SOAK_TRANSPORT=both \
+  ./scripts/m12-solo-appui-soak.sh run
+```
+
+The focused fixture test is:
+
+```bash
+npm --prefix e2e run test -- --workers=1 tests/m12-solo-soak-artifacts.spec.ts
+```
+
 ---
 
 ## CI Pipeline

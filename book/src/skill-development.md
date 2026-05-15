@@ -25,6 +25,120 @@ This guide covers the full lifecycle of an Octos skill — from development to p
 
 ---
 
+## Before You Start: Skill vs. Workspace Contract
+
+Before writing a skill, decide whether the logic belongs in a **plugin tool** (external binary, what this guide covers) or in the **in-process workspace contract** framework (`workspace_policy.toml` + `ValidatorSpec` variants).
+
+These two surfaces look similar — both gate tool behavior — but they serve different concerns and have very different reliability characteristics. Putting logic in the wrong place is the most common mistake we see.
+
+### Decision matrix
+
+| Axis | Workspace contract (host, in-process Rust) | Plugin tool / lifecycle hook (external binary) |
+|---|---|---|
+| **Correctness criticality** | Load-bearing — must always run | Best-effort enrichment; tool still works if hook fails to load |
+| **Stability** | Stable contract; same shape across deployments | Frequently customized per-profile / per-deployment |
+| **Performance** | Hot path; runs on every tool call, in-process | Cold / occasional; spawns a subprocess + JSON IPC |
+| **Failure semantics** | Fails the tool with a typed `SpawnTaskContractResult::Failed` | Failure is logged; execution proceeds |
+| **Cross-cutting reach** | Generic — applies to many tools (file format, integrity, content) | Tool-specific behavior or capability implementation |
+| **Customization scope** | System invariant, not user-tunable | User-configurable; ships and versions independently of host |
+
+If **all five** axes point to the same column, build there. Mixed signals → use the two tiebreakers below.
+
+**Tiebreaker A — "Can the user disable it safely?"**
+- Yes → plugin (user-controllable, low blast radius)
+- No (system invariant) → workspace contract
+
+**Tiebreaker B — "Is the language / runtime constrained?"**
+- Pure Rust data ops, file I/O, HTTP — host (workspace contract)
+- Needs Python ecosystem, native CLI, GPU/Metal, cloud SDK with hairy auth — plugin
+
+### Where existing surface lives
+
+These belong in **workspace contract** (`workspace_policy.toml`, see `crates/octos-agent/src/workspace_policy.rs::ValidatorSpec`):
+
+- **`AudioNonSilent`** / **`PerFileNonSilent`** — TTS output content invariant. The system MUST refuse to claim "audio generated" if the `.wav` is silent. Applies to every TTS-emitting skill regardless of vendor.
+- **`MagicBytes`** — file format integrity. Applies to every tool that emits files.
+- **`Sha256Match`** — supply-chain / artifact integrity. Must always verify.
+- **`HttpProbeUntil`** — deploy / health gate after a publish step.
+- **`FileExists`** — basic deliverable contract.
+
+These belong as **plugin tools** (this guide):
+
+- **`fm_tts`**, **`mofa_slides`**, **`mofa_publish`**, **`search`** (formerly `deep_search`) — the work itself. Each is the capability implementation, often wraps an external runtime (Python, Chromium, native CLI), ships versioned independently of the host.
+- **`qwen-tts`** voice clone — wraps an external HTTP API with auth; per-tenant credentials; ergonomic to update without recompiling octos.
+
+These belong as **plugin hooks** ONLY when they are **optional enrichment** (the tool would still work without them):
+
+- **Metrics / audit** hooks (after_tool_call): log cost / latency to an external system. Failure is fine — the tool still ran.
+- **Channel-side notifications**: ping Slack on completion. Optional.
+
+### The pipeline-guard case study (and what we'd build differently)
+
+**`pipeline-guard`** today is shipped as a plugin (`crates/app-skills/pipeline-guard/`) with a `before_tool_call` hook that mutates the DOT graph the LLM authored for `run_pipeline` — injecting `model="cheap"` on `dynamic_parallel` workers and `model="strong"` on `synthesize` nodes from the live QoS catalog.
+
+Score it against the matrix:
+
+| Axis | pipeline-guard score |
+|---|---|
+| Correctness criticality | **Load-bearing** — without it, every pipeline node hits the same default model regardless of cost/quality |
+| Stability | Stable — same shape on every deploy; logic is "fill in `node.model` from `model_catalog.json`" |
+| Performance | Hot path — runs on every `run_pipeline` call |
+| Failure semantics | **Currently silent on failure** — manifest-parse failures or missing binary degrade to "no model assignment" with no user-visible error |
+| Cross-cutting reach | run_pipeline-specific |
+| Customization scope | System invariant — users don't pick which DOT nodes get which model |
+| Language constraint | Pure Rust data ops on a parsed `PipelineGraph` |
+
+**All five primary axes (and both tiebreakers) point to host / in-process — not plugin.** The lifecycle-hook plumbing is a category mismatch. In practice it's been the failure surface: manifest-parse errors fire on every daemon start, and when they do, the hook silently doesn't run.
+
+**The correct home is inline in `octos-pipeline` itself.** Recommended shape (not yet landed at time of writing):
+
+```rust
+// In RunPipelineTool::execute, after parse_dot:
+octos_pipeline::model_assignment::assign_from_catalog(
+    &mut graph,
+    &model_catalog, // passed via ProfileRuntime → RunPipelineTool
+)?;
+```
+
+A small (~50-line) deterministic in-process function with unit tests beats a separate binary + JSON IPC + plugin loader + manifest parser, for logic that is correctness-critical, non-customizable, and never needs to ship independently of the host.
+
+**Generalization** — if future tools need similar pre-call mutation (e.g. `mofa_slides` enforcing a style default), the workspace contract framework should grow a new variant rather than each tool adding its own hook plugin:
+
+```rust
+pub enum ValidatorSpec {
+    // existing post-execution validators...
+    AudioNonSilent { ... },
+    MagicBytes { ... },
+    HttpProbeUntil { ... },
+
+    // proposed: pre-call argument mutator
+    PreCall {
+        mutate_args: PreCallMutator,
+    },
+}
+```
+
+This keeps integrity-critical logic in one in-process channel with a typed failure path, instead of scattered across plugin binaries with best-effort semantics.
+
+### Quick rubric
+
+```
+   correctness-critical?
+        ┌──────┴──────┐
+       yes            no
+        │             │
+   stable shape?     plugin hook (best-effort)
+        ┌──┴──┐
+       yes   no
+        │    │
+   workspace plugin tool
+   contract  (customized capability)
+```
+
+If you find yourself reaching for a plugin hook to enforce an invariant the user must never override — stop, file an issue against `octos-agent`, and consider whether a workspace contract variant is the right home instead.
+
+---
+
 ## Part 1: Develop
 
 ### Architecture

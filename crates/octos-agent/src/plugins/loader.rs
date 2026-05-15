@@ -1524,7 +1524,7 @@ edition = "2021"
               "name": "research-plugin",
               "version": "1.0",
               "tools": [{
-                "name": "deep_search",
+                "name": "search",
                 "description": "Research",
                 "input_schema": {
                   "type": "object",

@@ -48,6 +48,9 @@ If an M8 runtime surface is still non-authoritative, the protocol should either:
 Recommended transport:
 
 - JSON-RPC 2.0 over WebSocket
+- JSON-RPC 2.0 over stdio for trusted local-process clients, governed by
+  accepted
+  [UPCR-2026-016](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_016_STDIO_TRANSPORT.md)
 
 Why:
 
@@ -60,6 +63,23 @@ REST remains useful for:
 - initial session lists
 - artifact/file hydrate
 - compatibility during migration
+
+Stdio transport rules:
+
+- `octos serve --stdio` reads one newline-delimited JSON-RPC object per line
+  from stdin and writes one newline-delimited JSON-RPC response or notification
+  per line to stdout.
+- stdout is protocol-only. Logs and diagnostics must go to stderr.
+- Stdio is a local trusted transport. It does not carry HTTP headers,
+  WebSocket Origin checks, or bearer-token headers.
+- Stdio clients must send one complete UTF-8 JSON object per line. Servers and
+  clients may reject frames larger than `MAX_TEXT_FRAME_BYTES` with
+  `frame_too_large`.
+- Because stdio has no `X-Profile-Id` header, profile-scoped methods resolve
+  identity in this order: explicit `params.profile_id`, profile encoded in
+  `params.session_id`, profile bound by the first successful `session/open`,
+  then the server default profile. Clients should pass `profile_id` explicitly
+  before `session/open`.
 
 ## 4. Versioning
 
@@ -213,6 +233,25 @@ Current M9 sandbox-parity decision:
   `message/persisted`, `tool/*`, and `turn/completed` notifications
   continue to flow on connections that do not negotiate this feature
   until `M9-γ-3` deletes them.
+- The additive stdio AppUI transport is governed by accepted
+  [UPCR-2026-016](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_016_STDIO_TRANSPORT.md).
+  It changes only framing and process launch. Method names, params, results,
+  notifications, errors, and capability semantics remain shared with the
+  WebSocket transport.
+- The additive runtime/auth/LLM-profile inspection methods
+  (`config/capabilities/list`, `session/status/read`, `auth/*`,
+  `profile/llm/*`, `mcp/status/list`, `tool/status/list`) are governed by
+  accepted
+  [UPCR-2026-017](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_017_RUNTIME_PROFILE_INSPECTION.md).
+  They let TUI and other non-web clients render dashboard-equivalent login,
+  provider, model, MCP, tool, and runtime status from server truth.
+- The additive local solo onboarding and permission-policy inspection methods
+  (`profile/local/create`, `permission/profile/list`,
+  `permission/profile/set`, and the extended `session/status/read` runtime
+  policy stamp) are governed by accepted
+  [UPCR-2026-018](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_018_LOCAL_SOLO_ONBOARDING_AND_POLICY.md).
+  They let local clients create a no-OTP solo owner profile and render the
+  server's effective sandbox/approval/filesystem/network policy.
 
 ## 5. Identity Model
 
@@ -220,6 +259,10 @@ These ids need to be stable and client-visible:
 
 - `session_id`
   Uses Octos session identity. For now this can map to existing `SessionKey`.
+  Profile-qualified local TUI/coding sessions use
+  `{profile_id}:local:{client_id}#{topic}`; `local` is a recognized channel
+  name for profile extraction, so stdio clients can recover profile scope from
+  `session_id` after the initial `session/open`.
 - `turn_id`
   One user-visible interaction turn. This is the primary correlation id for live output.
 - `tool_call_id`
@@ -266,15 +309,26 @@ The logical command/event names are:
 
 Commands:
 
+- `config/capabilities/list` (accepted `UPCR-2026-017`)
+- `profile/local/create` (accepted `UPCR-2026-018`)
 - `session/open`
+- `session/status/read` (accepted `UPCR-2026-017`)
 - `turn/start`
 - `turn/interrupt`
 - `approval/respond`
+- `permission/profile/list`, `permission/profile/set`
+  (accepted `UPCR-2026-018`)
 - `diff/preview/get`
 - `task/output/read`
 - `task/list` (capability-gated, accepted `UPCR-2026-005`)
 - `task/cancel` (capability-gated, accepted `UPCR-2026-005`)
 - `task/restart_from_node` (capability-gated, accepted `UPCR-2026-005`)
+- `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
+  (accepted `UPCR-2026-017`)
+- `profile/llm/catalog`, `profile/llm/list`, `profile/llm/upsert`,
+  `profile/llm/select`, `profile/llm/delete`, `profile/llm/test`,
+  `profile/llm/fetch_models` (accepted `UPCR-2026-017`)
+- `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 
 Notifications:
 
@@ -597,6 +651,149 @@ Errors follow the v1 taxonomy (see § 10):
 - `invalid_params` (with the same `expected_profile_id` / `actual_profile_id`
   data fields documented for `task/cancel`) when the connection profile does
   not match the requested `session_id` or `profile_id`
+
+### Runtime, Auth, And LLM Profile Inspection
+
+Accepted `UPCR-2026-017` adds the dashboard-equivalent inspection and
+onboarding command surface below. These commands are additive and appear in
+`UiProtocolCapabilities.supported_methods` only when implemented by the server.
+Clients must use that method list to enable or disable slash commands.
+
+`config/capabilities/list`:
+
+- returns the same `UiProtocolCapabilities` schema advertised by
+  `session/open`, but without requiring a session to be opened first
+- servers that support local solo onboarding advertise
+  `profile/local/create` in `supported_methods` and
+  `profile.local_create.v1` in `supported_features`
+- servers that support server-owned permission inspection advertise
+  `permission.profile.v1`; servers that expose the extended runtime policy
+  stamp advertise `runtime.policy_stamp.v1`
+
+`profile/local/create`:
+
+- local-only no-OTP solo onboarding command
+- request:
+
+  ```json
+  {
+    "name": "Ada Lovelace",
+    "username": "ada",
+    "email": "ada@example.com"
+  }
+  ```
+
+- result:
+
+  ```json
+  {
+    "profile_id": "ada",
+    "user_id": "ada",
+    "name": "Ada Lovelace",
+    "username": "ada",
+    "email": "ada@example.com",
+    "created": true,
+    "runtime_mode": "solo"
+  }
+  ```
+
+- the server creates or returns one local owner `User` plus matching
+  `UserProfile`; `profile_id` is derived from the normalized username
+- email is metadata only; this command MUST NOT call `auth/send_code`,
+  `auth/verify`, SMTP, or any `AuthManager` OTP flow
+- idempotent for the same normalized username, name, and email
+- rejects username collisions with different local owner metadata using
+  `invalid_params` and `data.kind = "profile_local_collision"`
+- rejects invalid name, username, or email using `invalid_params` and
+  `data.kind` values `profile_local_invalid_name`,
+  `profile_local_invalid_username`, or `profile_local_invalid_email`
+- rejects non-local/non-solo runtimes using `permission_denied` and
+  `data.kind = "profile_local_unsupported"`
+
+`session/status/read`:
+
+- returns runtime status for the selected profile/session plus a runtime policy
+  stamp containing provider/model/profile/tool/sandbox-visible state
+- `runtime_policy_stamp` contains the server-effective values:
+
+  ```json
+  {
+    "runtime_mode": "solo",
+    "profile_id": "ada",
+    "workspace_root": "/Users/ada/project",
+    "approval_policy": "never",
+    "sandbox_mode": "danger-full-access",
+    "permission_profile": "danger_full_access",
+    "filesystem_scope": "host",
+    "network": "allowed",
+    "tool_policy_id": "profile",
+    "mcp_servers": [],
+    "memory_scope": "profile-session"
+  }
+  ```
+
+`permission/profile/list`:
+
+- request includes `session_id`
+- returns `current` plus server-supported permission profiles
+- local solo servers MAY include `danger_full_access`; tenant/cloud servers
+  must omit it or reject attempts to select it
+
+`permission/profile/set`:
+
+- request includes `session_id` and partial `update`
+- accepted `mode` values are `read_only`, `workspace_write`, and
+  `danger_full_access`
+- accepted `update.approval_policy` values are `on-request`, `on_request`,
+  `ask`, and `never`; clients use `on-request` to clear a previous `never`
+  selection and return to approval-gated behavior
+- `danger_full_access` means `approval_policy=never`,
+  `sandbox_mode=danger-full-access`, `filesystem_scope=host`, and
+  `network=allowed`
+- dangerous full-host access is rejected outside local solo mode using
+  `permission_denied` and `data.kind = "permission_profile_disallowed"`
+
+`auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`:
+
+- expose the email OTP login flow used by the dashboard
+- use structured errors for invalid OTP, expired OTP, and unauthenticated state
+
+`profile/llm/catalog`:
+
+- returns the dashboard provider catalog, including model family, model name,
+  official provider routes, alternate provider routes such as AutoDL or
+  WiseModel, and custom OpenAI-compatible route support
+
+`profile/llm/upsert`:
+
+- persists the selected family/model/route into dashboard-compatible profile
+  JSON under `config.llm.primary`
+- stores secret material only through `config.env_vars` keys; user-facing
+  artifacts and captures must redact secret values
+- when `set_primary: false` and the profile already has a primary model, the
+  server appends or replaces the selection under `config.llm.fallbacks[]`.
+  Replacements match by family, model, route id, and base URL. If the profile
+  has no primary model yet, the server promotes the first upsert to primary so
+  coding sessions always have an effective default model.
+
+`profile/llm/list`, `profile/llm/select`, `profile/llm/delete`,
+`profile/llm/test`, `profile/llm/fetch_models`:
+
+- provide the model/provider management surface used by TUI onboarding and
+  slash-command flows
+- `profile/llm/test` must execute a minimal provider API probe using either
+  the supplied raw `api_key` or the saved `route.api_key_env` value from the
+  profile. It returns the same mutation-shaped provider state as
+  `profile/llm/upsert`, but `applied` means “connection verified”, not
+  “profile saved”. Failed probes return `applied: false` plus optional
+  `message` and `error` fields; clients must clear in-flight test state and
+  keep the provider editable/retryable.
+
+`mcp/status/list` and `tool/status/list`:
+
+- return server-owned MCP and tool state so clients do not inspect backend
+  config, provider config, MCP config, tool registry, memory, or sandbox state
+  directly
 
 ## 8. Event Semantics
 

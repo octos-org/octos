@@ -10,11 +10,11 @@ always: true
 
 ## Overview
 
-The `deep_search` tool performs deep multi-round web research. It iteratively searches from multiple angles, fetches pages in parallel, chases the most-referenced external sources, and produces a structured research report.
+The `search` tool performs deep multi-round web research. It iteratively searches from multiple angles, fetches pages in parallel, chases the most-referenced external sources, and produces a structured research report.
 
 ## Usage
 
-Call `deep_search` with a query and optional depth. The tool will:
+Call `search` with a query and optional depth. The tool will:
 
 1. **Round 1**: Search the web using Perplexity Sonar (preferred) or other available engines
 2. **Rounds 2+**: Generate follow-up queries from different angles (time-qualified, subtopic-focused, controversy/analysis)

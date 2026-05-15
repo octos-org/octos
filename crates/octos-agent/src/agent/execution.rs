@@ -348,6 +348,47 @@ impl Agent {
                     }
                 }
 
+                // Pre-flight validation: catch known-bad arguments (e.g.
+                // structurally invalid DOT for `run_pipeline`) synchronously
+                // so the LLM gets the error as a tool_result in this
+                // iteration and can retry with corrected input. Without
+                // this, the foreground would return "started in background"
+                // to the LLM, the background task would fail validation,
+                // and the LLM-side conversation would never see the error.
+                // The pre-flight hook is opt-in per tool — default impl is
+                // Ok(()). See `Tool::pre_flight_validate`.
+                if let Some(tool) = tools.get(&tc_name) {
+                    if let Err(msg) = tool.pre_flight_validate(&effective_args).await {
+                        tracing::warn!(
+                            tool = %tc_name,
+                            error = %msg,
+                            "spawn_only pre-flight validation failed"
+                        );
+                        let err_msg = format!(
+                            "[VALIDATION FAILED] Tool '{tc_name}' rejected input: {msg}\n\n\
+                             Fix the input and retry."
+                        );
+                        return (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: err_msg,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: Some(tc_id),
+                                reasoning_content: None,
+                                client_message_id: None,
+                                thread_id: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            false,
+                            None,
+                        );
+                    }
+                }
+
                 tracing::info!(
                     tool = %tc_name,
                     "running spawn_only tool in background"
@@ -366,6 +407,21 @@ impl Agent {
                 // correct turn even after subsequent unrelated user turns
                 // have advanced the per-chat sticky thread_id.
                 let bg_originating_thread_id = bg_reporter.thread_id().map(str::to_string);
+                // Issue #960 fix (M10 Phase 4 plumbing): the originating
+                // user prompt's `client_message_id`. Today the reporter's
+                // `thread_id()` IS the cmid on gateway-bound paths and IS
+                // the originating `TurnId` UUID on the WS standalone-turn
+                // path — the SPA reducer's thread-map keys on whichever
+                // shape the parent user-prompt row carries, so threading
+                // the same value through under both names lets the
+                // `turn/spawn_complete` envelope's
+                // `response_to_client_message_id` round-trip correctly.
+                // The field is documented separately on
+                // `BackgroundResultPayload` so a follow-up that decouples
+                // the two on the WS path (e.g. surfacing the SPA's
+                // pre-`turn/start` cmid) only has to update the capture
+                // site here.
+                let bg_originating_client_message_id = bg_originating_thread_id.clone();
                 // Issue #738 fix: thread the originating cmid into task
                 // registration so any SpawnOnlyFailureSignal emitted for
                 // this task carries it to the M8.9 synthetic recovery
@@ -573,29 +629,39 @@ impl Agent {
                             .await
                             {
                                 SpawnTaskContractResult::Satisfied { output_files } => {
-                                    // Wave-3b regression guard: when a contract
-                                    // declares no artifact (e.g. `mofa_publish`,
-                                    // whose deliverable is a live URL, not a
-                                    // file), `output_files` is empty. Falling
-                                    // through with `content: String::new()`
-                                    // would drop the tool's stdout text (the
-                                    // deploy URL itself, in the publish case)
-                                    // and the user would see a blank completion.
-                                    // Surface the tool's text output as content
-                                    // when there are no files to attach —
-                                    // matches the legacy text-fallback path for
-                                    // contracts that don't declare artifacts.
-                                    let satisfied_content =
-                                        satisfied_completion_content(&output_files, &r.output);
+                                    // When the tool emitted real text output
+                                    // (run_pipeline synthesize summary, plugin
+                                    // structured result), surface it in the
+                                    // chat bubble alongside any file
+                                    // attachments — otherwise the user sees an
+                                    // empty bubble with a `.md` attachment for
+                                    // research pipelines that explicitly
+                                    // produced a ~1000-word summary as their
+                                    // final text response.
+                                    //
+                                    // Empty / whitespace-only output falls back
+                                    // to `satisfied_completion_content`, which
+                                    // preserves the Wave-3b mofa_publish path
+                                    // (no files + URL text -> emit URL) and
+                                    // the legacy fm_tts / podcast_generate
+                                    // path (files + no text -> empty bubble,
+                                    // files carry the deliverable).
+                                    let bubble_content = if r.output.trim().is_empty() {
+                                        satisfied_completion_content(&output_files, &r.output)
+                                    } else {
+                                        r.output.clone()
+                                    };
                                     let result_persisted = if let Some(ref sender) = bg_sender {
                                         sender(BackgroundResultPayload {
                                             task_label: bg_name.clone(),
-                                            content: satisfied_content,
+                                            content: bubble_content,
                                             kind: BackgroundResultKind::Notification,
                                             media: output_files.clone(),
                                             envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
                                             task_id: Some(task_id.clone()),
+                                            originating_client_message_id:
+                                                bg_originating_client_message_id.clone(),
                                         })
                                         .await
                                     } else {
@@ -610,25 +676,56 @@ impl Agent {
                                         // to re-validate file contents.
                                         bg_supervisor
                                             .mark_completed(&task_id, output_files.clone());
-                                        if let Some(ref sender) = bg_sender {
-                                            if let Some(produced_msg) =
-                                                build_spawn_only_produced_files_message(
-                                                    &bg_name,
-                                                    &output_files,
-                                                    bg_tools.workspace_root(),
-                                                )
-                                            {
-                                                let _ = sender(BackgroundResultPayload {
-                                                    task_label: bg_name.clone(),
-                                                    content: produced_msg,
-                                                    kind: BackgroundResultKind::Notification,
-                                                    media: vec![],
-                                                    envelope_media: vec![],
-                                                    originating_thread_id: bg_originating_thread_id
-                                                        .clone(),
-                                                    task_id: Some(task_id.clone()),
-                                                })
-                                                .await;
+                                        // Only emit the auto-generated
+                                        // "<tool> produced files: …" follow-up
+                                        // when the first payload carried no
+                                        // text — otherwise the chat would
+                                        // render TWO assistant bubbles in a
+                                        // row (summary, then a redundant
+                                        // file-list notice). For run_pipeline
+                                        // the synthesize node already supplied
+                                        // a user-readable executive summary
+                                        // in `r.output`, so we suppress the
+                                        // file-list bubble. For tools whose
+                                        // `r.output` was empty (some
+                                        // plugin-only flows that deliver via
+                                        // files alone) the fallback notice
+                                        // still fires.
+                                        //
+                                        // `trim().is_empty()` so whitespace-only
+                                        // output (e.g. a stray "\n" from a
+                                        // tool that meant to emit no summary)
+                                        // is NOT treated as a real summary —
+                                        // otherwise we'd suppress the file-list
+                                        // bubble and the user would see no
+                                        // signal that the task completed.
+                                        let already_sent_summary = !r.output.trim().is_empty();
+                                        if !already_sent_summary {
+                                            if let Some(ref sender) = bg_sender {
+                                                if let Some(produced_msg) =
+                                                    build_spawn_only_produced_files_message(
+                                                        &bg_name,
+                                                        &output_files,
+                                                        bg_tools.workspace_root(),
+                                                    )
+                                                {
+                                                    let _ =
+                                                        sender(BackgroundResultPayload {
+                                                            task_label: bg_name.clone(),
+                                                            content: produced_msg,
+                                                            kind:
+                                                                BackgroundResultKind::Notification,
+                                                            media: vec![],
+                                                            envelope_media: vec![],
+                                                            originating_thread_id:
+                                                                bg_originating_thread_id.clone(),
+                                                            task_id: Some(task_id.clone()),
+                                                            originating_client_message_id:
+                                                                bg_originating_client_message_id
+                                                                    .clone(),
+                                                        })
+                                                        .await;
+                                                }
                                             }
                                         }
                                     } else {
@@ -668,6 +765,8 @@ impl Agent {
                                             envelope_media: vec![],
                                             originating_thread_id: bg_originating_thread_id.clone(),
                                             task_id: Some(task_id.clone()),
+                                            originating_client_message_id:
+                                                bg_originating_client_message_id.clone(),
                                         })
                                         .await;
                                     }
@@ -694,6 +793,8 @@ impl Agent {
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
                                             })
                                             .await;
                                         }
@@ -749,6 +850,8 @@ impl Agent {
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
                                                     task_id: Some(task_id.clone()),
+                                                    originating_client_message_id:
+                                                        bg_originating_client_message_id.clone(),
                                                 })
                                                 .await;
                                             }
@@ -783,6 +886,8 @@ impl Agent {
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
                                             })
                                             .await;
                                         }
@@ -915,6 +1020,8 @@ impl Agent {
                                                 originating_thread_id: bg_originating_thread_id
                                                     .clone(),
                                                 task_id: Some(task_id.clone()),
+                                                originating_client_message_id:
+                                                    bg_originating_client_message_id.clone(),
                                             })
                                             .await;
                                         }
@@ -977,18 +1084,53 @@ impl Agent {
                                                 // wire shapes correctly
                                                 // without regressing
                                                 // either.
+                                                // Mirror the
+                                                // `Satisfied`-branch fix
+                                                // above: when the tool has
+                                                // produced a real textual
+                                                // result (e.g. run_pipeline's
+                                                // synthesize node returning a
+                                                // 5K-char executive summary
+                                                // in `r.output`), surface
+                                                // that as the chat bubble
+                                                // content. Without this, the
+                                                // user gets the bare ack
+                                                // `"✓ run_pipeline completed
+                                                // (research.md)"` while the
+                                                // summary lives only inside
+                                                // the attached file. The
+                                                // `NotConfigured` branch
+                                                // fires when the tool
+                                                // doesn't declare a
+                                                // workspace_policy.toml
+                                                // contract — which is the
+                                                // default for spawn_only
+                                                // tools whose deliverable is
+                                                // text + a file rather than
+                                                // a fixed-shape artifact.
+                                                // `trim().is_empty()` so a
+                                                // whitespace-only `r.output`
+                                                // doesn't masquerade as a real
+                                                // summary — without trim, the
+                                                // user would get a chat bubble
+                                                // containing just "\n" instead
+                                                // of the "✓ completed" notice.
+                                                let bubble_content = if r.output.trim().is_empty() {
+                                                    format!("✓ {} completed{}", bg_name, file_info)
+                                                } else {
+                                                    r.output.clone()
+                                                };
                                                 let _ = sender(BackgroundResultPayload {
                                                     task_label: bg_name.clone(),
-                                                    content: format!(
-                                                        "✓ {} completed{}",
-                                                        bg_name, file_info
-                                                    ),
+                                                    content: bubble_content,
                                                     kind: BackgroundResultKind::Notification,
                                                     media: vec![],
                                                     envelope_media: sent_files.clone(),
                                                     originating_thread_id: bg_originating_thread_id
                                                         .clone(),
                                                     task_id: Some(task_id.clone()),
+                                                    originating_client_message_id:
+                                                        bg_originating_client_message_id.clone(),
                                                 })
                                                 .await;
 
@@ -1017,24 +1159,54 @@ impl Agent {
                                                 // non-empty (the helper
                                                 // returns None and we
                                                 // skip otherwise).
-                                                if let Some(produced_msg) =
-                                                    build_spawn_only_produced_files_message(
-                                                        &bg_name,
-                                                        &sent_files,
-                                                        bg_tools.workspace_root(),
-                                                    )
-                                                {
-                                                    let _ = sender(BackgroundResultPayload {
-                                                        task_label: bg_name.clone(),
-                                                        content: produced_msg,
-                                                        kind: BackgroundResultKind::Notification,
-                                                        media: vec![],
-                                                        envelope_media: vec![],
-                                                        originating_thread_id:
-                                                            bg_originating_thread_id.clone(),
-                                                        task_id: Some(task_id.clone()),
-                                                    })
-                                                    .await;
+                                                //
+                                                // Mirroring the `Satisfied`
+                                                // branch above: when the
+                                                // tool emitted real summary
+                                                // text in `r.output` we
+                                                // already used it as the
+                                                // primary bubble content,
+                                                // so suppressing this
+                                                // file-path notice keeps
+                                                // the chat from rendering
+                                                // two trailing assistant
+                                                // bubbles (summary, then a
+                                                // redundant file-list).
+                                                //
+                                                // `trim().is_empty()` so a
+                                                // whitespace-only `r.output`
+                                                // (e.g. a stray "\n") doesn't
+                                                // suppress the file-path
+                                                // notice — without trim, the
+                                                // LLM loses its stable
+                                                // filename reference for the
+                                                // next turn.
+                                                let already_sent_summary =
+                                                    !r.output.trim().is_empty();
+                                                if !already_sent_summary {
+                                                    if let Some(produced_msg) =
+                                                        build_spawn_only_produced_files_message(
+                                                            &bg_name,
+                                                            &sent_files,
+                                                            bg_tools.workspace_root(),
+                                                        )
+                                                    {
+                                                        let _ = sender(BackgroundResultPayload {
+                                                            task_label: bg_name.clone(),
+                                                            content: produced_msg,
+                                                            kind:
+                                                                BackgroundResultKind::Notification,
+                                                            media: vec![],
+                                                            envelope_media: vec![],
+                                                            originating_thread_id:
+                                                                bg_originating_thread_id.clone(),
+                                                            task_id: Some(task_id.clone()),
+                                                            originating_client_message_id:
+                                                                bg_originating_client_message_id
+                                                                    .clone(),
+                                                        })
+                                                        .await;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1059,6 +1231,8 @@ impl Agent {
                                     envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
                                     task_id: Some(task_id.clone()),
+                                    originating_client_message_id: bg_originating_client_message_id
+                                        .clone(),
                                 })
                                 .await;
                             }
@@ -1079,6 +1253,8 @@ impl Agent {
                                     envelope_media: vec![],
                                     originating_thread_id: bg_originating_thread_id.clone(),
                                     task_id: Some(task_id.clone()),
+                                    originating_client_message_id: bg_originating_client_message_id
+                                        .clone(),
                                 })
                                 .await;
                             }
@@ -1712,12 +1888,12 @@ mod tests {
             "/tmp/ws/research/x/x.md".to_string(),
             "/tmp/ws/research/x/_search_results.md".to_string(),
         ];
-        let msg = build_spawn_only_produced_files_message("deep_search", &files, Some(&root))
+        let msg = build_spawn_only_produced_files_message("search", &files, Some(&root))
             .expect("non-empty file list must yield Some(message)");
 
         // Format pinning: header + bulleted workspace-relative paths.
         assert!(
-            msg.starts_with("`deep_search` produced files:"),
+            msg.starts_with("`search` produced files:"),
             "expected header line, got: {msg}"
         );
         assert!(
@@ -1740,7 +1916,7 @@ mod tests {
         // Token-budget invariant: never persist a stub message when the
         // tool produced no files (e.g. failed run, text-only result).
         assert!(
-            build_spawn_only_produced_files_message("deep_search", &[], None).is_none(),
+            build_spawn_only_produced_files_message("search", &[], None).is_none(),
             "empty files must return None so caller suppresses follow-up"
         );
     }
@@ -1766,7 +1942,7 @@ mod tests {
         let files: Vec<String> = (1..=10)
             .map(|i| format!("/tmp/ws/research/topic/{i:02}_source.md"))
             .collect();
-        let msg = build_spawn_only_produced_files_message("deep_search", &files, Some(&root))
+        let msg = build_spawn_only_produced_files_message("search", &files, Some(&root))
             .expect("non-empty");
         // Stays small: 10 paths × ~40 chars + header ≈ ~500 bytes.
         assert!(

@@ -6,8 +6,8 @@
   "timeout_secs": 600,
   "tools": [
     {
-      "name": "deep_search",
-      "description": "Perform deep multi-round web research on a topic. Searches from multiple angles (follow-up queries, time-qualified, controversy), fetches all pages in parallel, chases most-referenced external sources, and produces a structured research report saved to disk. The report file path is printed at the end of the output.",
+      "name": "search",
+      "description": "Single-binary research pipeline (one synthesis model, fixed flow): searches a focused topic from multiple angles, fetches pages in parallel, chases references, and writes one structured report.\n\nWHEN TO USE: focused single-topic lookups where one report suffices and you don't need parallel sub-queries or per-node model control.\n\nWHEN TO USE `run_pipeline` INSTEAD (PREFERRED for 深度研究 / deep research / comprehensive analysis): the user asks for multi-perspective research, comparative analysis across topics, or any query phrased as 深度研究/深入调研/深度分析/comprehensive/thorough — write an inline DOT graph with `run_pipeline` so each perspective gets its own search node (run in parallel), its own analysis node, and a final synthesis node. This gives you parallel fan-out, per-node model selection (cheap models for search, strong models for synthesis), and a much richer output than this single-binary tool.\n\nReport file path is printed at end of output.",
       "concurrency_class": "exclusive",
       "entrypoint": "target/release/deep-search",
       "env": [

@@ -893,7 +893,7 @@ impl Tool for PluginTool {
                     "timeout_secs".to_string(),
                     serde_json::json!({
                         "type": "integer",
-                        "description": "Timeout in seconds. Estimate based on real execution times: single deep_search (depth=2) ~3min → 300s; single deep_search (depth=3) ~5min → 400s; research pipeline with 3 topics ~8min → 600s; research pipeline with 5-7 topics ~15-20min → 1200s; very complex multi-source analysis ~25min → 1500s. Max: 1800. Default: 600"
+                        "description": "Timeout in seconds. Estimate based on real execution times: single search (depth=2) ~3min → 300s; single search (depth=3) ~5min → 400s; research pipeline with 3 topics ~8min → 600s; research pipeline with 5-7 topics ~15-20min → 1200s; very complex multi-source analysis ~25min → 1500s. Max: 1800. Default: 600"
                     }),
                 );
             }
@@ -1746,7 +1746,7 @@ mod tests {
 
     fn deep_search_def_with_opt_in() -> PluginToolDef {
         PluginToolDef {
-            name: "deep_search".to_string(),
+            name: "search".to_string(),
             description: "Deep research".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2273,7 +2273,7 @@ mod tests {
         let (ctx, events) = make_capturing_ctx();
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             r#"{"type":"progress","stage":"searching","message":"round 1/3","progress":0.25}"#,
         );
@@ -2288,7 +2288,7 @@ mod tests {
         let (ctx, events) = make_capturing_ctx();
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             r#"{"type":"phase","phase":"synthesizing","message":"calling LLM"}"#,
         );
@@ -2302,7 +2302,7 @@ mod tests {
         let (ctx, events) = make_capturing_ctx();
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             r#"{"type":"cost","provider":"deepseek","model":"deepseek-chat","tokens_in":1024,"tokens_out":256,"usd":0.0034}"#,
         );
@@ -2319,7 +2319,7 @@ mod tests {
         let (ctx, events) = make_capturing_ctx();
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             r#"{"type":"log","level":"warn","message":"low disk"}"#,
         );
@@ -2332,7 +2332,7 @@ mod tests {
         let (ctx, events) = make_capturing_ctx();
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             r#"{"type":"artifact","path":"/tmp/x.md","kind":"report","message":"final"}"#,
         );
@@ -2361,7 +2361,7 @@ mod tests {
         let (ctx, events) = make_capturing_ctx();
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             "[1/3] Searching: \"foo\"",
         );
@@ -2439,7 +2439,7 @@ mod tests {
 
         PluginTool::dispatch_stderr_line(
             "deep-search",
-            "deep_search",
+            "search",
             Some(&ctx),
             r#"{"type":"cost","provider":"deepseek","model":"deepseek-chat","tokens_in":1024,"tokens_out":256,"usd":0.0034}"#,
         );
@@ -2449,7 +2449,7 @@ mod tests {
         assert!(body.contains(r#""tokens_in":1024"#), "got: {body}");
         assert!(body.contains(r#""tokens_out":256"#), "got: {body}");
         assert!(body.contains(r#""cost_usd":0.0034"#), "got: {body}");
-        assert!(body.contains(r#""contract_id":"plugin:deep-search:deep_search""#));
+        assert!(body.contains(r#""contract_id":"plugin:deep-search:search""#));
         assert!(body.contains(r#""provider":"deepseek""#));
 
         // Cleanup the sink registration.

@@ -1,7 +1,7 @@
-//! Synthesize research tool: reads deep_search source files and produces a
+//! Synthesize research tool: reads search source files and produces a
 //! comprehensive analysis via map-reduce LLM calls.
 //!
-//! After `deep_search` saves source files to disk (up to 20K chars each),
+//! After `search` saves source files to disk (up to 20K chars each),
 //! this tool reads them all, batches into context-window-sized chunks,
 //! extracts key findings per batch, then merges into a final synthesis.
 
@@ -47,10 +47,10 @@ impl Tool for SynthesizeResearchTool {
     }
 
     fn description(&self) -> &str {
-        "Read all source files from a deep_search research directory and produce a comprehensive \
+        "Read all source files from a search research directory and produce a comprehensive \
          synthesis using map-reduce analysis. This reads the FULL content of every saved source \
          page (up to 20K chars each) — much more thorough than the truncated previews returned \
-         by deep_search. Use this after deep_search completes to get a detailed, data-rich report."
+         by search. Use this after search completes to get a detailed, data-rich report."
     }
 
     fn tags(&self) -> &[&str] {
@@ -63,7 +63,7 @@ impl Tool for SynthesizeResearchTool {
             "properties": {
                 "research_dir": {
                     "type": "string",
-                    "description": "Path to the research directory from deep_search output (e.g. './research/topic-name' or 'research/topic-name')"
+                    "description": "Path to the research directory from search output (e.g. './research/topic-name' or 'research/topic-name')"
                 },
                 "query": {
                     "type": "string",
@@ -87,7 +87,7 @@ impl Tool for SynthesizeResearchTool {
             Some(d) => d,
             None => {
                 return Ok(ToolResult {
-                    output: "Research directory not found. Run deep_search first.".into(),
+                    output: "Research directory not found. Run search first.".into(),
                     success: false,
                     ..Default::default()
                 });
