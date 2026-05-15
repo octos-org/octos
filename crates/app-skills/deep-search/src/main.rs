@@ -2161,10 +2161,10 @@ fn extract_urls(output: &str) -> Vec<String> {
     for line in output.lines() {
         let trimmed = line.trim();
         // Case 1: raw URL on its own line
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            if seen.insert(trimmed.to_string()) {
-                urls.push(trimmed.to_string());
-            }
+        if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+            && seen.insert(trimmed.to_string())
+        {
+            urls.push(trimmed.to_string());
         }
         // Case 2: legacy `[title] url` reference style (kept for backward compat)
         if let Some(rest) = trimmed.strip_prefix('[') {
@@ -2295,7 +2295,7 @@ fn extract_bing_results(text: &str) -> Vec<String> {
         // indexing panics. Step past the *full* UTF-8 width of whichever
         // separator we hit.
         let prefix_start = text[..start]
-            .rfind(|c: char| c == '\n' || c == '›' || c == '|')
+            .rfind(['\n', '›', '|'])
             .map(|i| {
                 let sep_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
                 i + sep_len

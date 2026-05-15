@@ -150,6 +150,11 @@ pub fn assign_from_catalog_dir(graph: &mut PipelineGraph, data_dir: &Path) {
 
 /// Test-friendly entry point that takes pre-built pools directly so we
 /// can exercise the assignment logic without touching the filesystem.
+///
+/// `#[cfg(test)]` so `cargo clippy --workspace --all-targets -- -D warnings`
+/// doesn't flag the lib-target as unused (the function is referenced only
+/// from the inline `#[cfg(test)] mod tests` block below).
+#[cfg(test)]
 pub(crate) fn assign_with_pools_for_test(graph: &mut PipelineGraph, pools: ModelPoolsArg) {
     let pools = ModelPools {
         strong: pools.strong,
@@ -161,6 +166,7 @@ pub(crate) fn assign_with_pools_for_test(graph: &mut PipelineGraph, pools: Model
 }
 
 /// Pre-built pool argument exposed to tests via `assign_with_pools_for_test`.
+#[cfg(test)]
 pub struct ModelPoolsArg {
     pub strong: Vec<String>,
     pub fast: Vec<String>,
