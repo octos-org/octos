@@ -2617,10 +2617,23 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                 handle_content_list(&ws, &state, &connection_headers, None, id, params).await;
             }
             UiCommand::ContentDelete(params) => {
-                handle_content_delete(&ws, &state, None, id, params).await;
+                handle_content_delete(&ws, &state, &connection_headers, None, id, params).await;
             }
             UiCommand::ContentBulkDelete(params) => {
-                handle_content_bulk_delete(&ws, &state, None, id, params).await;
+                handle_content_bulk_delete(&ws, &state, &connection_headers, None, id, params)
+                    .await;
+            }
+            UiCommand::RouterSetMode(_) | UiCommand::RouterGetMetrics(_) => {
+                // `router/*` RPCs require the full WebSocket connection's
+                // `routed_profile_id` context which stdio_connection does
+                // not carry. Reply with `method_not_supported` so clients
+                // negotiate around them rather than hang — mirrors the
+                // pattern from PR #858 for `permission/profile/*`.
+                let _ = send_rpc_error(
+                    &ws,
+                    Some(id),
+                    RpcError::method_not_supported("router/* not supported on stdio transport"),
+                );
             }
         }
     }
