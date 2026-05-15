@@ -20,6 +20,10 @@ let
     unique
     ;
 
+  src = cleanSource ../../.;
+  cargoToml = builtins.fromTOML (builtins.readFile (src + "/crates/octos-cli/Cargo.toml"));
+  workspaceToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+
   supportedChannels = [
     "discord"
     "email"
@@ -41,11 +45,11 @@ let
 in
 
 rustPlatform.buildRustPackage {
-  pname = "octos-cli";
-  version = "0.1.1";
-  src = cleanSource ../../.;
+  inherit src;
+  pname = cargoToml.package.name;
+  version = workspaceToml.workspace.package.version or cargoToml.package.version;
 
-  cargoLock.lockFile = ../../Cargo.lock;
+  cargoLock.lockFile = src + "/Cargo.lock";
 
   doCheck = false;
 

@@ -2,12 +2,18 @@
   buildNpmPackage,
   importNpmLock,
 }:
-buildNpmPackage {
-  pname = "octos-admin-dashboard";
-  version = "0.1.0";
-  src = ../../dashboard;
 
-  npmDeps = importNpmLock { npmRoot = ../../dashboard; };
+let
+  src = ../../dashboard;
+  packageJson = builtins.fromJSON (builtins.readFile (src + "/package.json"));
+in
+
+buildNpmPackage {
+  inherit src;
+  pname = packageJson.name;
+  version = packageJson.version;
+
+  npmDeps = importNpmLock { npmRoot = src; };
   npmConfigHook = importNpmLock.npmConfigHook;
 
   doCheck = false;
