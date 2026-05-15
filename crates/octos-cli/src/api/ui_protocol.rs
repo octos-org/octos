@@ -8396,6 +8396,10 @@ async fn run_m9_fixture_turn(
                         UiNotification::TaskUpdated(TaskUpdatedEvent {
                             session_id: session_id.clone(),
                             task_id: task_id.clone(),
+                            // Synthetic M9 fixture: no originating LLM
+                            // tool call. Carrying `None` keeps the wire
+                            // shape forward-compatible.
+                            tool_call_id: None,
                             title: "M9 task output fixture".to_owned(),
                             state: UiTaskRuntimeState::Running,
                             runtime_detail: Some(
@@ -8419,6 +8423,10 @@ async fn run_m9_fixture_turn(
                         UiNotification::TaskUpdated(TaskUpdatedEvent {
                             session_id: session_id.clone(),
                             task_id,
+                            // Synthetic M9 fixture: no originating LLM
+                            // tool call. Carrying `None` keeps the wire
+                            // shape forward-compatible.
+                            tool_call_id: None,
                             title: "M9 task output fixture".to_owned(),
                             state: UiTaskRuntimeState::Completed,
                             runtime_detail: Some("fixture complete".to_owned()),
@@ -8819,6 +8827,20 @@ async fn run_standalone_turn(
                     .originating_client_message_id
                     .clone()
                     .filter(|s| !s.is_empty());
+                // Originating LLM `tool_call_id`. The supervisor stores it
+                // on `BackgroundTask.tool_call_id`; the agent's spawn_only
+                // branch threads it through to the payload so the
+                // `turn/spawn_complete` envelope can carry it on the wire.
+                // The client uses it to flip the in-flight chip from
+                // spinner to checkmark without a race against a
+                // `task/updated` watcher that builds
+                // `task_id → tool_call_id` post-hoc. Empty strings collapse
+                // to `None` for the same reason as
+                // `originating_client_message_id`.
+                let originating_tool_call_id = payload
+                    .tool_call_id
+                    .clone()
+                    .filter(|s| !s.is_empty());
                 let turn_id = payload_turn_id.clone();
                 let ledger = payload_ledger.clone();
                 Box::pin(async move {
@@ -8912,6 +8934,7 @@ async fn run_standalone_turn(
                             turn_id: Some(turn_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             task_id: task_id_value,
+                            tool_call_id: originating_tool_call_id.clone(),
                             // Issue #960 fix: M10 Phase 4 plumbing —
                             // surface the originating user prompt's
                             // `client_message_id` (captured at the
@@ -11233,6 +11256,7 @@ mod tests {
                 turn_id: None,
                 thread_id: None,
                 task_id: "task-1".into(),
+                tool_call_id: None,
                 response_to_client_message_id: None,
                 seq: 1,
                 message_id: "msg-1".into(),
@@ -16221,6 +16245,7 @@ mod tests {
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             task_id: "task_abc".into(),
+            tool_call_id: Some("call_abc".into()),
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 2,
             message_id: spawn_ack_message_id.clone(),
@@ -16380,6 +16405,7 @@ mod tests {
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             task_id: "task_x".into(),
+            tool_call_id: None,
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 1,
             message_id: format!("{}:1:0", session_id.0),
@@ -16903,6 +16929,7 @@ mod tests {
             turn_id: Some(TurnId::new()),
             thread_id: Some("thread-1".into()),
             task_id: "task_abc123".into(),
+            tool_call_id: Some("call_abc123".into()),
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 0,
             message_id: "msg-spawn".into(),

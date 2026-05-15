@@ -2462,6 +2462,15 @@ pub struct TurnSpawnCompleteEvent {
     /// populated — a `turn/spawn_complete` without a task_id is a server
     /// bug.
     pub task_id: String,
+    /// Originating tool call id (the spawn_only tool invocation that
+    /// produced this background task). Carrying it on the wire eliminates
+    /// the client-side race where a stale `task_id → tool_call_id` map
+    /// (built from `task/updated` watchers) would fail to flip the
+    /// in-flight chip from spinner to checkmark on completion. Optional
+    /// so legacy daemons and synthetic / fallback emission paths that
+    /// cannot resolve the originating call still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// The originating user message's `client_message_id`, i.e. the
     /// user-prompt anchor under which the new assistant bubble should be
     /// rendered. `None` only for legacy callers that did not propagate
@@ -3929,6 +3938,16 @@ pub enum TaskRuntimeState {
 pub struct TaskUpdatedEvent {
     pub session_id: SessionKey,
     pub task_id: TaskId,
+    /// Originating tool call id. Carrying it on the wire alongside
+    /// `task_id` lets the client flip the in-flight chip from spinner
+    /// to checkmark without a race against a `task/updated` -> watcher
+    /// -> TaskStore lookup chain (the chain that previously stayed cold
+    /// because the client bridge rejected `task/updated` envelopes that
+    /// lacked `turn_id`). Optional so legacy daemons and synthetic /
+    /// fallback emission paths that cannot resolve the originating call
+    /// still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub title: String,
     pub state: TaskRuntimeState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4989,6 +5008,7 @@ mod tests {
         let task_cancelled = UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
             task_id: task_id.clone(),
+            tool_call_id: None,
             title: "spawn_only_runner".into(),
             state: TaskRuntimeState::Cancelled,
             runtime_detail: Some("user cancelled".into()),
@@ -6671,6 +6691,7 @@ mod tests {
         let event = UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
             task_id: TaskId(Uuid::from_u128(7)),
+            tool_call_id: None,
             title: "spawn_only_runner".into(),
             state: TaskRuntimeState::Cancelled,
             runtime_detail: Some("user cancelled".into()),
@@ -6951,6 +6972,7 @@ mod tests {
             turn_id: Some(sample_turn_id()),
             thread_id: Some("thread-1".into()),
             task_id: "task_abc123".into(),
+            tool_call_id: Some("call_abc123".into()),
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 42,
             message_id: "msg-spawn-1".into(),
@@ -6968,6 +6990,7 @@ mod tests {
         // top-level object with snake_case keys; absent optional fields
         // omit cleanly.
         assert_eq!(value.get("task_id"), Some(&json!("task_abc123")));
+        assert_eq!(value.get("tool_call_id"), Some(&json!("call_abc123")));
         assert_eq!(
             value.get("response_to_client_message_id"),
             Some(&json!("cmid-user-1")),
@@ -6988,6 +7011,7 @@ mod tests {
             turn_id: None,
             thread_id: None,
             task_id: "task_zzz".into(),
+            tool_call_id: None,
             response_to_client_message_id: None,
             seq: 1,
             message_id: "msg-bare".into(),
@@ -7003,6 +7027,10 @@ mod tests {
         let bare_v = serde_json::to_value(&bare).expect("serialize bare");
         assert!(bare_v.get("turn_id").is_none(), "absent turn_id omits");
         assert!(bare_v.get("thread_id").is_none(), "absent thread_id omits");
+        assert!(
+            bare_v.get("tool_call_id").is_none(),
+            "absent tool_call_id omits",
+        );
         assert!(
             bare_v.get("response_to_client_message_id").is_none(),
             "absent response_to_client_message_id omits",
@@ -7021,6 +7049,106 @@ mod tests {
         assert_eq!(rpc.method, methods::TURN_SPAWN_COMPLETE);
         let decoded = UiNotification::from_rpc_notification(rpc).expect("notification deserialize");
         assert_eq!(decoded, notif);
+    }
+
+    /// Asserts the new `tool_call_id` field round-trips through serde on
+    /// both `task/updated` and `turn/spawn_complete`. The chip-flip
+    /// race in the client browser hinged on having this field on the
+    /// wire, so a regression here would silently re-introduce the bug
+    /// even if the constructors still type-check.
+    #[test]
+    fn task_updated_and_spawn_complete_events_round_trip_tool_call_id() {
+        // `TaskUpdatedEvent` with `tool_call_id` set.
+        let task_event = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(0xDEADBEEF)),
+            tool_call_id: Some("call_podcast_generate_42".into()),
+            title: "podcast_generate".into(),
+            state: TaskRuntimeState::Completed,
+            runtime_detail: Some("rendered output.mp3".into()),
+        };
+        let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
+        assert_eq!(
+            task_value.get("tool_call_id"),
+            Some(&json!("call_podcast_generate_42")),
+            "tool_call_id must appear on the wire",
+        );
+        let parsed_task: TaskUpdatedEvent =
+            serde_json::from_value(task_value).expect("deserialize task_updated");
+        assert_eq!(parsed_task, task_event);
+
+        // `TaskUpdatedEvent` with `tool_call_id == None` omits on the wire
+        // (legacy daemons / synthetic paths).
+        let task_legacy = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(1)),
+            tool_call_id: None,
+            title: "legacy".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+        };
+        let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");
+        assert!(
+            legacy_value.get("tool_call_id").is_none(),
+            "absent tool_call_id must omit so legacy daemons parse",
+        );
+        // Defensive: a JSON payload from an even-older daemon that lacks
+        // the field entirely still parses via `#[serde(default)]`.
+        let bare_legacy_json = json!({
+            "session_id": "local:demo",
+            "task_id": TaskId(Uuid::from_u128(1)),
+            "title": "legacy",
+            "state": "running",
+        });
+        let parsed_legacy: TaskUpdatedEvent =
+            serde_json::from_value(bare_legacy_json).expect("deserialize legacy bare");
+        assert_eq!(parsed_legacy.tool_call_id, None);
+
+        // `TurnSpawnCompleteEvent` with `tool_call_id` set.
+        let spawn_event = TurnSpawnCompleteEvent {
+            session_id: SessionKey("local:demo".into()),
+            turn_id: None,
+            thread_id: None,
+            task_id: "task_podcast_42".into(),
+            tool_call_id: Some("call_podcast_generate_42".into()),
+            response_to_client_message_id: None,
+            seq: 7,
+            message_id: "msg-spawn-7".into(),
+            source: "background".into(),
+            cursor: UiCursor {
+                stream: "local:demo".into(),
+                seq: 7,
+            },
+            persisted_at: sample_persisted_at(),
+            content: "🎙 podcast delivered".into(),
+            media: vec!["output.mp3".into()],
+        };
+        let spawn_value = serde_json::to_value(&spawn_event).expect("serialize spawn_complete");
+        assert_eq!(
+            spawn_value.get("tool_call_id"),
+            Some(&json!("call_podcast_generate_42")),
+            "tool_call_id must appear on the wire",
+        );
+        let parsed_spawn: TurnSpawnCompleteEvent =
+            serde_json::from_value(spawn_value).expect("deserialize spawn_complete");
+        assert_eq!(parsed_spawn, spawn_event);
+
+        // Defensive: a `turn/spawn_complete` payload from an older daemon
+        // that lacks the field entirely still parses via
+        // `#[serde(default)]`.
+        let bare_spawn_json = json!({
+            "session_id": "local:demo",
+            "task_id": "task_legacy",
+            "seq": 1,
+            "message_id": "msg-legacy",
+            "source": "background",
+            "cursor": { "stream": "local:demo", "seq": 1 },
+            "persisted_at": "2026-01-01T00:00:00Z",
+            "content": "done",
+        });
+        let parsed_legacy_spawn: TurnSpawnCompleteEvent =
+            serde_json::from_value(bare_spawn_json).expect("deserialize legacy spawn bare");
+        assert_eq!(parsed_legacy_spawn.tool_call_id, None);
     }
 
     #[test]

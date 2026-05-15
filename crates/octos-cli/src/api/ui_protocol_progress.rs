@@ -155,6 +155,7 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
             TaskUpdatedEvent {
                 session_id: context.session_id.clone(),
                 task_id,
+                tool_call_id: string_field(event, &["tool_call_id"]),
                 title: string_field(event, &["title"]).unwrap_or_else(|| "Task".into()),
                 state: UiTaskRuntimeState::Running,
                 runtime_detail: Some("task started".into()),
@@ -213,6 +214,7 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
     UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(TaskUpdatedEvent {
         session_id: context.session_id.clone(),
         task_id,
+        tool_call_id: string_field(event, &["tool_call_id"]),
         title,
         state,
         runtime_detail: string_field(event, &["runtime_detail", "message", "status_message"]),
@@ -489,9 +491,14 @@ fn ui_task_runtime_state(state: &str) -> Option<UiTaskRuntimeState> {
 }
 
 pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTask) -> Value {
+    // Carry `tool_call_id` on every `task_updated` snapshot so the
+    // mapper below threads it onto `TaskUpdatedEvent`. The client uses
+    // the wire-side mapping instead of racing a `task/updated` watcher
+    // to build `task_id → tool_call_id` post-hoc.
     json!({
         "type": "task_updated",
         "task_id": task.id,
+        "tool_call_id": task.tool_call_id,
         "title": task.tool_name,
         "state": task.lifecycle_state(),
         "runtime_detail": stable_task_runtime_detail(task),

@@ -662,6 +662,7 @@ impl Agent {
                                             task_id: Some(task_id.clone()),
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
+                                            tool_call_id: Some(bg_tc_id.clone()),
                                         })
                                         .await
                                     } else {
@@ -723,6 +724,7 @@ impl Agent {
                                                             originating_client_message_id:
                                                                 bg_originating_client_message_id
                                                                     .clone(),
+                                                            tool_call_id: Some(bg_tc_id.clone()),
                                                         })
                                                         .await;
                                                 }
@@ -767,6 +769,7 @@ impl Agent {
                                             task_id: Some(task_id.clone()),
                                             originating_client_message_id:
                                                 bg_originating_client_message_id.clone(),
+                                            tool_call_id: Some(bg_tc_id.clone()),
                                         })
                                         .await;
                                     }
@@ -795,6 +798,7 @@ impl Agent {
                                                 task_id: Some(task_id.clone()),
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
                                             })
                                             .await;
                                         }
@@ -852,6 +856,7 @@ impl Agent {
                                                     task_id: Some(task_id.clone()),
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
+                                                    tool_call_id: Some(bg_tc_id.clone()),
                                                 })
                                                 .await;
                                             }
@@ -888,6 +893,7 @@ impl Agent {
                                                 task_id: Some(task_id.clone()),
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
                                             })
                                             .await;
                                         }
@@ -1022,6 +1028,7 @@ impl Agent {
                                                 task_id: Some(task_id.clone()),
                                                 originating_client_message_id:
                                                     bg_originating_client_message_id.clone(),
+                                                tool_call_id: Some(bg_tc_id.clone()),
                                             })
                                             .await;
                                         }
@@ -1131,6 +1138,7 @@ impl Agent {
                                                     task_id: Some(task_id.clone()),
                                                     originating_client_message_id:
                                                         bg_originating_client_message_id.clone(),
+                                                    tool_call_id: Some(bg_tc_id.clone()),
                                                 })
                                                 .await;
 
@@ -1204,6 +1212,7 @@ impl Agent {
                                                             originating_client_message_id:
                                                                 bg_originating_client_message_id
                                                                     .clone(),
+                                                            tool_call_id: Some(bg_tc_id.clone()),
                                                         })
                                                         .await;
                                                     }
@@ -1233,6 +1242,7 @@ impl Agent {
                                     task_id: Some(task_id.clone()),
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
+                                    tool_call_id: Some(bg_tc_id.clone()),
                                 })
                                 .await;
                             }
@@ -1255,6 +1265,7 @@ impl Agent {
                                     task_id: Some(task_id.clone()),
                                     originating_client_message_id: bg_originating_client_message_id
                                         .clone(),
+                                    tool_call_id: Some(bg_tc_id.clone()),
                                 })
                                 .await;
                             }
