@@ -85,6 +85,12 @@ qq-bot = ["octos-bus/qq-bot"]
 wechat = ["octos-bus/wechat"]
 git = ["octos-agent/git"]
 ast = ["octos-agent/ast"]
+# Mp3 decode for the AudioNonSilent workspace-contract validator (.mp3 files).
+# Without it, validators on .mp3 artifacts return "feature not enabled" — see
+# `crates/octos-agent/src/validators.rs`. Fleet builds that ship the podcast
+# / fm_tts skills should enable this so the contract layer accepts the mp3
+# outputs they produce.
+audio_mp3 = ["octos-agent/audio_mp3"]
 
 [lints]
 workspace = true
