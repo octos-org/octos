@@ -421,14 +421,22 @@ fn spawn_pipeline_heartbeat(
     let ctx = TOOL_CTX.try_with(|c| c.clone()).ok()?;
     let reporter = ctx.reporter.clone();
     let tool_id = ctx.tool_id.clone();
+    tracing::info!(
+        target: "octos::pipeline::heartbeat",
+        tool_id = %tool_id,
+        interval_secs,
+        "spawn_pipeline_heartbeat: spawned"
+    );
     let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         // Skip the immediate first tick — the executor itself emits a
         // `"Pipeline '...' started"` event at T+0, and we don't want a
         // duplicate before it lands.
         interval.tick().await;
+        let mut tick_count: u64 = 0;
         loop {
             interval.tick().await;
+            tick_count += 1;
             let snap = match status.lock() {
                 Ok(g) => g.clone(),
                 Err(p) => p.into_inner().clone(),
@@ -449,6 +457,13 @@ fn spawn_pipeline_heartbeat(
                     snap.pipeline_id, snap.current_node, elapsed,
                 )
             };
+            tracing::info!(
+                target: "octos::pipeline::heartbeat",
+                tick = tick_count,
+                elapsed_s = elapsed,
+                node = %snap.current_node,
+                "heartbeat tick: {message}"
+            );
             reporter.report(ProgressEvent::ToolProgress {
                 name: "run_pipeline".to_string(),
                 tool_id: tool_id.clone(),
