@@ -445,11 +445,7 @@ fn spawn_pipeline_heartbeat(
             let message = if snap.nodes_total > 0 {
                 format!(
                     "Pipeline '{}' running: {} ({}/{} nodes, {}s elapsed)",
-                    snap.pipeline_id,
-                    snap.current_node,
-                    snap.nodes_done,
-                    snap.nodes_total,
-                    elapsed,
+                    snap.pipeline_id, snap.current_node, snap.nodes_done, snap.nodes_total, elapsed,
                 )
             } else {
                 format!(

@@ -41,11 +41,7 @@ async fn make_tool() -> (RunPipelineTool, tempfile::TempDir, tempfile::TempDir) 
     let working = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let memory_dir = data.path().join("episodes");
-    let memory = Arc::new(
-        octos_memory::EpisodeStore::open(&memory_dir)
-            .await
-            .unwrap(),
-    );
+    let memory = Arc::new(octos_memory::EpisodeStore::open(&memory_dir).await.unwrap());
     let tool = RunPipelineTool::new(
         Arc::new(MockProvider) as Arc<dyn octos_llm::LlmProvider>,
         memory,
