@@ -133,8 +133,22 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     // itself 307'd back here, and the browser hit
     // `ERR_TOO_MANY_REDIRECTS`. Short-circuit to 503 so the failure is
     // diagnosable instead of an infinite loop.
+    //
+    // Bug 3 (regression #958 → mini5 deploy 2026-05-13): a binary built
+    // from a checkout where the committed `admin/index.html` references
+    // hash-named JS/CSS that were never produced by a local
+    // `build-dashboard.sh` (the tracked `index.html` survives the
+    // ephemeral-bundle gitignore) embeds an `index.html` whose `<script
+    // src="/admin/assets/index-XXX.js">` resolves to a 200 SPA-fallback
+    // body (i.e. itself), so the browser's module loader silently fails
+    // and the user sees a blank page. Detect that case at serve time
+    // and return 503 with a structured `bundle_inconsistent` body so
+    // the operator gets a diagnostic instead of a silent blank UI.
     if path == "admin" || path.starts_with("admin/") {
         if let Some(data) = assets.get("admin/index.html") {
+            if let Some(missing) = admin_index_missing_assets(assets, &data) {
+                return admin_bundle_inconsistent_response(missing);
+            }
             return serve_file("admin/index.html", &data);
         }
         return admin_bundle_missing_response();
@@ -144,6 +158,65 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     // dashboard. Must also guard on `admin/index.html` — otherwise the
     // redirect target itself 307s and the browser loops.
     redirect_to_admin_or_503(assets)
+}
+
+/// Scan an embedded `admin/index.html` body for `/admin/assets/index-*.{js,css}`
+/// references and return the list of asset paths that are NOT present in the
+/// embedded asset store. Returns `None` when every reference resolves
+/// (or when there are no asset references, e.g. a stub HTML used in tests).
+///
+/// Defensive guard against Bug 3 — when the deploy binary's `index.html`
+/// references hash-named bundles that were never produced (a tracked
+/// `index.html` survives the ephemeral-bundle gitignore even after the
+/// matching `assets/*` are untracked), the SPA falls back to itself at
+/// 200, the browser's `<script type="module">` errors silently, and the
+/// user sees a blank `<div id="root">`. Surfacing the mismatch as 503
+/// gives the operator a clear `bundle_inconsistent` diagnostic.
+fn admin_index_missing_assets<A: AssetStore>(assets: &A, html: &[u8]) -> Option<Vec<String>> {
+    let html = std::str::from_utf8(html).ok()?;
+    let mut missing = Vec::new();
+    // We don't pull in `regex` here — the structure of a Vite-emitted
+    // `index.html` is stable enough that scan-and-extract on the literal
+    // prefix `/admin/assets/` is both sufficient and zero-dep.
+    let needle = "/admin/assets/";
+    let mut cursor = 0;
+    while let Some(rel) = html[cursor..].find(needle) {
+        let start = cursor + rel + 1; // strip the leading '/'
+        let tail = &html[start..];
+        // Scan to the first character that can't appear in an asset path
+        // — quote, angle-bracket, whitespace, or end-of-string. The
+        // hash-named filenames are `index-<base64ish>.{js,css}`.
+        let end = tail
+            .find(|c: char| c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let asset_path = &tail[..end];
+        if !asset_path.is_empty() && assets.get(asset_path).is_none() {
+            missing.push(asset_path.to_string());
+        }
+        cursor = start + end;
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing)
+    }
+}
+
+fn admin_bundle_inconsistent_response(missing: Vec<String>) -> Response {
+    let body = serde_json::json!({
+        "error": "admin_bundle_inconsistent",
+        "message":
+            "The embedded admin/index.html references asset files that are not in the bundle. \
+             Run ./scripts/build-dashboard.sh + rebuild octos-cli (do NOT pass --skip-dashboard) \
+             so index.html and assets/ are produced together.",
+        "missing": missing,
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Redirect to `/admin/` when the admin bundle is present; otherwise
@@ -476,5 +549,93 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert_eq!(location, "/admin/");
+    }
+
+    /// Bug 3 regression (PR #958 → mini5 2026-05-13 blank `/admin/my`):
+    /// when the embedded `admin/index.html` references asset files that
+    /// are NOT in the bundle, the SPA fallback used to return 200 + the
+    /// HTML body for every nested path — including `/admin/assets/index-X.js`
+    /// itself — so the browser's `<script type="module" src=...>` request
+    /// resolved to an HTML body that errored at parse time and produced
+    /// a silent blank `<div id="root">`. The handler must detect that
+    /// mismatch and surface it as `503 admin_bundle_inconsistent` with
+    /// the missing asset paths so operators can diagnose.
+    #[tokio::test]
+    async fn should_return_503_when_admin_index_references_missing_assets() {
+        let state = AppState::empty_for_tests();
+        let html = br#"<!DOCTYPE html><html><head>
+            <script type="module" crossorigin src="/admin/assets/index-D7CZ_N_x.js"></script>
+            <link rel="stylesheet" crossorigin href="/admin/assets/index-LY6r_9yZ.css">
+        </head><body><div id="root"></div></body></html>"#;
+        // Only the css is present; the js is the missing one.
+        let assets = StubAssets::with(&[
+            ("admin/index.html", html.as_slice()),
+            ("admin/assets/index-LY6r_9yZ.css", b"/* css */"),
+        ]);
+
+        let resp = serve_with(&assets, &state, "/admin/my").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "admin_bundle_inconsistent");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("build-dashboard.sh"),
+            "diagnostic must name the fix script; got {}",
+            body["message"]
+        );
+        let missing = body["missing"]
+            .as_array()
+            .expect("missing must be a JSON array");
+        assert_eq!(missing.len(), 1, "only the js is missing");
+        assert_eq!(missing[0], "admin/assets/index-D7CZ_N_x.js");
+    }
+
+    /// Bug 3 complement: when the embedded `admin/index.html` references
+    /// asset paths that ARE all present, the SPA fallback continues to
+    /// serve `index.html` at 200 — i.e. the new defensive check must
+    /// not regress the happy path.
+    #[tokio::test]
+    async fn should_serve_admin_index_when_all_referenced_assets_present() {
+        let state = AppState::empty_for_tests();
+        let html = br#"<!DOCTYPE html><html><head>
+            <script type="module" crossorigin src="/admin/assets/index-AAA.js"></script>
+            <link rel="stylesheet" crossorigin href="/admin/assets/index-BBB.css">
+        </head><body><div id="root"></div></body></html>"#;
+        let assets = StubAssets::with(&[
+            ("admin/index.html", html.as_slice()),
+            ("admin/assets/index-AAA.js", b"export {};"),
+            ("admin/assets/index-BBB.css", b"/* css */"),
+        ]);
+
+        let resp = serve_with(&assets, &state, "/admin/my").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
+
+    /// Stub `admin/index.html` bodies used in the rest of this suite
+    /// (e.g. `b"<html/>"`, `b"<html>admin</html>"`) contain zero
+    /// `/admin/assets/` references — the consistency check must treat
+    /// "no references" as "no missing assets" and let the happy-path
+    /// branches stand. Lock that down so we don't accidentally start
+    /// 503ing on minimal index.html shapes.
+    #[tokio::test]
+    async fn should_treat_index_without_asset_refs_as_consistent() {
+        let assets = StubAssets::with(&[("admin/index.html", b"<html/>")]);
+        let html = b"<html/>";
+        assert!(admin_index_missing_assets(&assets, html).is_none());
     }
 }
