@@ -114,6 +114,15 @@ pub struct BackgroundResultPayload {
     /// `read_task_output` against it). `None` for legacy callers and
     /// tests that do not register tasks with the supervisor.
     pub task_id: Option<String>,
+    /// Originating `tool_call_id` (the spawn_only tool invocation that
+    /// produced this background task). Surfaced on the wire as
+    /// [`octos_core::ui_protocol::TurnSpawnCompleteEvent::tool_call_id`]
+    /// so the client can flip the in-flight chip from spinner to
+    /// checkmark directly off the envelope, without a race against a
+    /// `task/updated` watcher that builds `task_id → tool_call_id`
+    /// post-hoc. `None` for legacy callers and tests that do not track
+    /// the originating call.
+    pub tool_call_id: Option<String>,
     /// Issue #960 fix (M10 Phase 4 plumbing): the originating user
     /// message's `client_message_id` (cmid) — the same value the
     /// supervisor records as
@@ -2355,6 +2364,19 @@ impl Tool for SpawnTool {
             // which after fast-follow-up turns is the WRONG turn's
             // thread_id (cf. live mini3 trace, 2026-04-29).
             let originating_thread_id = ctx.reporter.thread_id().map(str::to_string);
+            // Snapshot the originating LLM `tool_call_id` (carried on
+            // `ToolContext.tool_id`) so the late-arriving terminal payload
+            // surfaces it on `TurnSpawnCompleteEvent.tool_call_id`. The
+            // client uses this to flip the in-flight chip from spinner to
+            // checkmark without a race against a `task/updated` watcher.
+            // Empty when the caller invoked the tool from a non-LLM
+            // context (synthetic harness, recovery path); in that case
+            // the field stays `None` on the wire.
+            let originating_tool_call_id = if ctx.tool_id.is_empty() {
+                None
+            } else {
+                Some(ctx.tool_id.clone())
+            };
             // M8 Runtime Parity W2.B1: capture parent caches into the
             // detached background closure so the bg child Agent gets the
             // same FileStateCache + Router + SummaryGenerator as the sync
@@ -2998,6 +3020,7 @@ impl Tool for SpawnTool {
                         // SPA reducer's thread-map keys on whichever shape
                         // its parent prompt row carries.
                         originating_client_message_id: originating_thread_id.clone(),
+                        tool_call_id: originating_tool_call_id.clone(),
                     },
                 )
                 .await
@@ -4009,6 +4032,7 @@ PY
             originating_thread_id: None,
             task_id: None,
             originating_client_message_id: None,
+            tool_call_id: None,
         };
 
         assert!(deliver_background_result(Some(sender), payload.clone()).await);
