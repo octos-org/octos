@@ -12,6 +12,9 @@ let
     concatMapStringsSep
     ;
 
+  src = cleanSource ../../.;
+  workspaceToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+
   skillCrates = [
     "news_fetch"
     "deep-search"
@@ -33,11 +36,11 @@ let
 in
 
 rustPlatform.buildRustPackage {
+  inherit src;
   pname = "octos-app-skills";
-  version = "1.0.0";
-  src = cleanSource ../../.;
+  version = workspaceToml.workspace.package.version;
 
-  cargoLock.lockFile = ../../Cargo.lock;
+  cargoLock.lockFile = src + "/Cargo.lock";
 
   doCheck = false;
 
