@@ -20,7 +20,7 @@ use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use super::auth_handlers::ADMIN_PROFILE_ID;
+use super::auth_handlers::{ADMIN_PROFILE_ID, is_authorized_for_profile};
 use super::router::AuthIdentity;
 use crate::project_templates::{
     BuildOutputDirError, SiteProjectMetadata, read_site_project_metadata,
@@ -2151,14 +2151,33 @@ pub fn preview_build_error_response(template: &str, error: SiteBuildError) -> Re
 }
 
 /// GET /api/site-preview/{session_id}/{site_slug} — serve the preview root for a site session.
+///
+/// Codex review of PR #1001 (issue #994 follow-up): this route is a
+/// parallel preview surface to `/api/preview/{profile_id}/...` (which
+/// PR #1001 hardened by moving onto `chat_api` + asserting ownership).
+/// Unlike that route, `/api/site-preview/*` has no `profile_id` URL
+/// segment, and the legacy implementation derived the profile via
+/// [`resolve_profile_data_dir`] which preferred the `X-Profile-Id`
+/// header over the authenticated identity. With a valid bearer token
+/// plus a spoofed `X-Profile-Id`, an authenticated tenant A could read
+/// tenant B's preview through this side door.
+///
+/// Fix: route via [`resolve_site_preview_data_dir`] which mirrors the
+/// `/api/my/*` flow:
+///   1. authenticated identity required (401 if missing),
+///   2. host-routed profile (subdomain) is honored only when the
+///      identity is authorized for it (`is_authorized_for_profile`),
+///   3. otherwise the profile id is derived directly from the
+///      identity (`User { id }` or the admin profile),
+///   4. `X-Profile-Id` is NEVER trusted for profile routing on this
+///      route. The header is ignored.
 pub async fn serve_site_preview_root(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path((session_id, site_slug)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    let identity = identity.as_ref().map(|ext| &ext.0);
-    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+    let data_dir = match resolve_site_preview_data_dir(&state, &headers, identity.as_ref()) {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
@@ -2166,6 +2185,8 @@ pub async fn serve_site_preview_root(
 }
 
 /// GET /api/site-preview/{session_id}/{site_slug}/{*path} — serve built preview assets.
+///
+/// See [`serve_site_preview_root`] for the security model.
 pub async fn serve_site_preview_path(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2176,33 +2197,156 @@ pub async fn serve_site_preview_path(
         String,
     )>,
 ) -> Response {
-    let identity = identity.as_ref().map(|ext| &ext.0);
-    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+    let data_dir = match resolve_site_preview_data_dir(&state, &headers, identity.as_ref()) {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
     serve_site_preview_impl(data_dir, session_id, site_slug, request_path).await
 }
 
-/// GET /api/preview/{profile_id}/{session_id}/{site_slug} — public preview root for site iframes.
-pub async fn serve_public_site_preview_root(
+/// Identity-first profile-data-dir resolver for `/api/site-preview/*`.
+///
+/// Codex flagged the legacy [`resolve_profile_data_dir`] path as
+/// unsafe for routes that lack an authoritative `profile_id` URL
+/// segment: it falls back to `X-Profile-Id` and treats the header as
+/// trusted, so an authed tenant A spoofing `X-Profile-Id: tenant-b`
+/// reads tenant B's preview. This helper deliberately ignores the
+/// header for profile routing and instead:
+///
+/// 1. Requires an `AuthIdentity` (the route is wrapped in
+///    `user_auth_middleware`, so reaching here with `None` is a
+///    routing bug — fail closed with 401).
+/// 2. If the request's host resolves to a tenant profile via the
+///    subdomain (e.g. `tenant-a.api.ominix.io`), honor it only when
+///    [`is_authorized_for_profile`] passes for the authenticated
+///    identity — otherwise 403 (mirrors `/api/my/*` host-scoping).
+/// 3. Otherwise, use the identity's own profile id: regular users
+///    map to their own user id, admin token maps to the admin
+///    profile.
+/// 4. Resolve the data dir from the now-authoritative profile id.
+#[allow(clippy::result_large_err)] // matches sibling `resolve_profile_data_dir_by_id`
+fn resolve_site_preview_data_dir(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&Extension<AuthIdentity>>,
+) -> Result<std::path::PathBuf, Response> {
+    let Some(Extension(identity)) = identity else {
+        tracing::warn!(
+            "site-preview route reached without AuthIdentity — routing bug? failing closed"
+        );
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    };
+
+    // Host-routed profile takes precedence (e.g. tenant subdomain),
+    // but ONLY when the authenticated identity is allowed to see
+    // that profile. Otherwise 403 — never silently fall through to
+    // another profile.
+    if let Some(host) = request_host(headers) {
+        if !is_local_request_host(&host) {
+            if let Some(candidate) = host.split('.').next() {
+                if let Some(host_profile_id) = resolve_profile_id_candidate(state, candidate) {
+                    if !is_authorized_for_profile(state, identity, &host_profile_id) {
+                        tracing::warn!(
+                            identity = ?identity,
+                            host_profile_id = %host_profile_id,
+                            "site-preview host-scope denied — identity not authorized for the tenant subdomain"
+                        );
+                        return Err(StatusCode::FORBIDDEN.into_response());
+                    }
+                    return resolve_profile_data_dir_by_id(state, &host_profile_id);
+                }
+            }
+        }
+    }
+
+    // No host-routed profile: derive purely from the authenticated
+    // identity. Crucially we do NOT read `X-Profile-Id` for profile
+    // routing — that's the codex-flagged side door.
+    let identity_profile_id = match identity {
+        AuthIdentity::Admin => ADMIN_PROFILE_ID,
+        AuthIdentity::User { id, .. } => id.as_str(),
+    };
+
+    // Defence in depth: if the caller DID send `X-Profile-Id`, treat
+    // any value that doesn't match the authenticated identity's
+    // profile (and that the identity isn't otherwise authorized for)
+    // as an explicit cross-tenant spoofing attempt → 403. This makes
+    // the rejection signal unambiguous in logs and tests, mirroring
+    // the response shape `/api/preview/{profile_id}/*` returns when
+    // identity does not own the route's profile_id segment.
+    if let Some(header_value) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+        let trimmed = header_value.trim();
+        if !trimmed.is_empty()
+            && let Some(spoofed) = resolve_profile_id_candidate(state, trimmed)
+            && !is_authorized_for_profile(state, identity, &spoofed)
+        {
+            tracing::warn!(
+                identity = ?identity,
+                spoofed_profile_id = %spoofed,
+                "site-preview denied — X-Profile-Id requests a profile the identity is not authorized for (codex follow-up to PR #1001 / issue #994)"
+            );
+            return Err(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+
+    resolve_profile_data_dir_by_id(state, identity_profile_id)
+}
+
+/// GET /api/preview/{profile_id}/{session_id}/{site_slug} —
+/// auth-and-ownership-gated preview root for site iframes.
+///
+/// Issue #994 (P0 sev2 cross-tenant data read): prior to this commit
+/// the route lived on the unauthenticated public router branch and
+/// resolved both `profile_id` and `session_id` purely from the URL
+/// tuple. The tuple is moderately guessable (subdomain + short
+/// timestamp + small slug allow-list), so any caller who could guess
+/// it could read another tenant's built site.
+///
+/// The fix:
+/// 1. Route now requires user auth (`user_auth_middleware` in
+///    `router.rs`). An unauthenticated request is rejected at the
+///    middleware with `401 Unauthorized` before the handler runs.
+/// 2. Handler asserts the authenticated identity is authorized for
+///    the route's `profile_id` via [`is_authorized_for_profile`].
+///    Cross-tenant mismatch → `403 Forbidden`.
+/// 3. Handler verifies the route's `session_id` resolves to a
+///    workspace under the profile's data directory. A session that
+///    does not exist in that tree (e.g. crafted / harvested) → `403
+///    Forbidden` (NOT 404 — we never disclose whether the slot is
+///    empty vs forbidden).
+///
+/// Interaction with issue #995: when the X-Profile-Id strip lands,
+/// the authenticated identity's profile becomes authoritative and
+/// the route's `profile_id` segment is only trusted after
+/// `is_authorized_for_profile` confirms the match. The order is
+/// important — never use the route segment to look up data before
+/// the ownership check passes.
+pub async fn serve_owned_site_preview_root(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path((profile_id, session_id, site_slug)): axum::extract::Path<(
         String,
         String,
         String,
     )>,
 ) -> Response {
-    let data_dir = match resolve_profile_data_dir_by_id(&state, &profile_id) {
-        Ok(data_dir) => data_dir,
-        Err(response) => return response,
-    };
-    serve_site_preview_impl(data_dir, session_id, site_slug, String::new()).await
+    serve_owned_site_preview(
+        state,
+        identity,
+        profile_id,
+        session_id,
+        site_slug,
+        String::new(),
+    )
+    .await
 }
 
-/// GET /api/preview/{profile_id}/{session_id}/{site_slug}/{*path} — public preview assets.
-pub async fn serve_public_site_preview_path(
+/// GET /api/preview/{profile_id}/{session_id}/{site_slug}/{*path} —
+/// auth-and-ownership-gated preview assets. See
+/// [`serve_owned_site_preview_root`] for the security model.
+pub async fn serve_owned_site_preview_path(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path((profile_id, session_id, site_slug, request_path)): axum::extract::Path<(
         String,
         String,
@@ -2210,10 +2354,85 @@ pub async fn serve_public_site_preview_path(
         String,
     )>,
 ) -> Response {
+    serve_owned_site_preview(
+        state,
+        identity,
+        profile_id,
+        session_id,
+        site_slug,
+        request_path,
+    )
+    .await
+}
+
+/// Shared implementation for [`serve_owned_site_preview_root`] and
+/// [`serve_owned_site_preview_path`]. Performs the auth + profile +
+/// session-ownership checks then delegates to the existing
+/// `serve_site_preview_impl` for the build / serve path.
+async fn serve_owned_site_preview(
+    state: Arc<AppState>,
+    identity: Option<Extension<AuthIdentity>>,
+    profile_id: String,
+    session_id: String,
+    site_slug: String,
+    request_path: String,
+) -> Response {
+    // 1. Auth identity must be present. The router wraps this route in
+    //    `user_auth_middleware`, which rejects unauthenticated
+    //    requests with 401 before the handler runs — so reaching here
+    //    with `identity = None` is a routing bug, not user error. Fail
+    //    closed with 401 just in case.
+    let Some(Extension(identity)) = identity else {
+        tracing::warn!(
+            profile_id = %profile_id,
+            "preview route reached without AuthIdentity — routing bug? failing closed"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // 2. The authenticated identity must be authorized for the route's
+    //    `profile_id`. Admin (token or admin-role user) is authorized
+    //    for any profile; a regular user is authorized for their own
+    //    profile and any sub-accounts they own. Cross-tenant => 403.
+    if !is_authorized_for_profile(&state, &identity, &profile_id) {
+        tracing::warn!(
+            identity = ?identity,
+            route_profile_id = %profile_id,
+            "preview route denied — identity not authorized for route's profile_id (issue #994)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // 3. Now that ownership is confirmed, resolve the data directory
+    //    by the (authoritative) route profile_id. A non-existent
+    //    profile is a 404 (the profile literally does not exist) but
+    //    `is_authorized_for_profile` already passed for sub-account
+    //    paths, so this is mostly a sanity check.
     let data_dir = match resolve_profile_data_dir_by_id(&state, &profile_id) {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
+
+    // 4. Session ownership: the route's `session_id` must resolve to
+    //    a workspace under this profile's data directory. We mirror
+    //    the search `serve_site_preview_impl` performs below, but
+    //    return 403 (not 404) when no candidate exists so the
+    //    response is indistinguishable from the cross-tenant denial.
+    let session_owned = api_session_workspace_dirs(&data_dir, &session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("sites").join(&site_slug))
+        .any(|candidate| candidate.exists());
+    if !session_owned {
+        tracing::warn!(
+            identity = ?identity,
+            route_profile_id = %profile_id,
+            session_id = %session_id,
+            site_slug = %site_slug,
+            "preview route denied — session/site does not exist under profile's data dir (issue #994)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     serve_site_preview_impl(data_dir, session_id, site_slug, request_path).await
 }
 
