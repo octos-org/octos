@@ -643,6 +643,17 @@ impl ServeCommand {
             preview_tokens: Arc::new(crate::api::PreviewTokens::new()),
         });
 
+        // Codex NEEDS-FOLLOWUP 6: spawn the background sweeper for the
+        // signed-preview token cache. Without it, an idle daemon (no
+        // sign/serve traffic) accumulates expired entries indefinitely
+        // because the lazy sweep only fires on `issue`/`consume`. The
+        // JoinHandle is dropped intentionally — the task runs for the
+        // lifetime of the process and exits on shutdown.
+        let _preview_sweeper = crate::api::PreviewTokens::spawn_background_sweeper(
+            state.preview_tokens.clone(),
+            crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
+        );
+
         if self.stdio {
             crate::api::ui_protocol::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");

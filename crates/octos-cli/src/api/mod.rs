@@ -39,7 +39,10 @@ pub mod webhook_proxy;
 
 pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
-pub use preview_tokens::{PreviewTokens, SharedPreviewTokens, SignedPreviewResponse};
+pub use preview_tokens::{
+    DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewTokens,
+    SharedPreviewTokens, SignedPreviewResponse,
+};
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 
 /// Test-only re-exports for the build_output_dir validation suite.

@@ -21,6 +21,9 @@
 //!  - 6: GET signed-preview after expiry → 404 (short test TTL)
 //!  - 7: GET signed-preview after issuer bearer revoked → 403
 //!  - 8: path traversal in `{*path}` → 404 (relies on PR #1000's symlink-safe walk)
+//!  - 9: per-bearer cap reached → 429 (codex GAP 8: DoS protection)
+//!  - 10: background sweeper removes expired tokens (codex NEEDS-FOLLOWUP 6:
+//!    idle daemons must not accumulate expired entries indefinitely)
 
 #![cfg(feature = "api")]
 
@@ -551,5 +554,122 @@ async fn test_8_path_traversal_in_signed_preview_is_blocked() {
         ),
         "path traversal must be refused (404 or 400), not 200; got: {}",
         resp.status()
+    );
+}
+
+/// Codex GAP 8 (blocking): an authenticated user can mint unbounded
+/// preview tokens, each held 10 min in memory. DoS vector — a hostile
+/// (or buggy) client could pump the in-memory map to OOM the daemon.
+///
+/// Fix: cap concurrent grants per `(issuer_bearer)` at
+/// `MAX_PER_BEARER` (64). When the cap is reached, the next mint
+/// returns HTTP 429 instead of growing the map.
+///
+/// This test mints `MAX_PER_BEARER` tokens via the HTTP surface, asserts
+/// every one returns 200, then asserts mint number `MAX_PER_BEARER + 1`
+/// returns 429. The TTL is long enough that the lazy expiry sweep
+/// won't open up a slot mid-test.
+#[tokio::test]
+async fn test_9_per_bearer_cap_returns_429() {
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let cap = octos_cli::api::PreviewTokens::MAX_PER_BEARER;
+
+    // Mint up to the cap — every one must succeed.
+    for i in 0..cap {
+        let resp = sign_preview_request(
+            app.clone(),
+            Some(&fx.token_a),
+            "tenant-a",
+            &fx.session_a_id,
+            &fx.site_slug,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "mint #{i} (within per-bearer cap of {cap}) must succeed; got {}",
+            resp.status()
+        );
+    }
+
+    // Cap + 1: must be 429 (rate limited).
+    let resp = sign_preview_request(
+        app.clone(),
+        Some(&fx.token_a),
+        "tenant-a",
+        &fx.session_a_id,
+        &fx.site_slug,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "mint #{cap}+1 must be 429 (per-bearer cap reached); got {}",
+        resp.status()
+    );
+}
+
+/// Codex NEEDS-FOLLOWUP 6: expired tokens are only swept on
+/// `issue`/`consume`. An idle daemon (no preview activity for hours)
+/// accumulates expired entries indefinitely.
+///
+/// Fix: `PreviewTokens::spawn_background_sweeper` starts a tokio task
+/// that calls `sweep_expired_all` every ~60s in production. The
+/// sweeper accepts a configurable interval for tests so we don't have
+/// to wait 60s in CI.
+///
+/// This test:
+///   1. Builds a cache with a tiny TTL (50ms).
+///   2. Mints a token (cache.len() == 1).
+///   3. Spawns the background sweeper with a 20ms interval.
+///   4. Waits past TTL + a couple sweep cycles.
+///   5. Asserts the cache is empty — the background sweeper removed
+///      the expired grant WITHOUT any `issue`/`consume` traffic.
+#[tokio::test]
+async fn test_10_background_sweeper_removes_expired() {
+    use std::time::Duration;
+
+    let cache = std::sync::Arc::new(octos_cli::api::PreviewTokens::with_ttl(
+        Duration::from_millis(50),
+    ));
+
+    // Seed the cache with one token. We use the in-process API directly
+    // (no HTTP) — the background-sweeper contract is on the cache type,
+    // not on the routing layer.
+    let signed = cache
+        .issue(
+            "BEARER-A".into(),
+            octos_cli::api::TestAuthIdentity::User {
+                id: "tenant-a".into(),
+                role: octos_cli::user_store::UserRole::User,
+            },
+            "tenant-a".into(),
+            "session-1".into(),
+            "site-a".into(),
+        )
+        .await
+        .expect("issue");
+    assert_eq!(cache.len().await, 1, "fresh token must be cached");
+
+    // Spawn the background sweeper with a 20ms interval (fast enough to
+    // sweep the 50ms-TTL token within the test's 250ms wait window).
+    let _handle = octos_cli::api::PreviewTokens::spawn_background_sweeper(
+        cache.clone(),
+        Duration::from_millis(20),
+    );
+
+    // Wait past TTL + several sweep cycles. 250ms = 5x TTL = ~12x
+    // sweep interval, well over the minimum to guarantee at least one
+    // sweep after the token expires.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert_eq!(
+        cache.len().await,
+        0,
+        "background sweeper MUST have removed the expired token \
+         (was: token {} still present after 250ms with 50ms TTL + 20ms sweep)",
+        signed.token
     );
 }

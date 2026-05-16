@@ -3266,7 +3266,11 @@ pub async fn sign_preview(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // (5) Mint the token.
+    // (5) Mint the token. Codex GAP 8: distinguish OS-level entropy
+    //     failures (503) from rate-limit refusals (429) so the SPA can
+    //     differentiate "retry the daemon" from "you're holding too
+    //     many previews open already".
+    use crate::api::preview_tokens::IssueError;
     match state
         .preview_tokens
         .issue(
@@ -3279,9 +3283,27 @@ pub async fn sign_preview(
         .await
     {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
-        Err(err) => {
+        Err(IssueError::Random(err)) => {
             tracing::error!(error = %err, "sign_preview: getrandom failed");
             (StatusCode::SERVICE_UNAVAILABLE, "token mint failed").into_response()
+        }
+        Err(IssueError::PerBearerLimitReached) => {
+            tracing::warn!("sign_preview: per-bearer cap reached (codex GAP 8 backpressure)");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many outstanding preview tokens for this session — wait for expiry or close some iframes",
+            )
+                .into_response()
+        }
+        Err(IssueError::GlobalLimitReached) => {
+            tracing::error!(
+                "sign_preview: GLOBAL preview-token cap reached — possible DoS or runaway client"
+            );
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "preview-token cache is full; daemon is rate-limiting",
+            )
+                .into_response()
         }
     }
 }
