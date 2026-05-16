@@ -158,3 +158,143 @@ async fn valid_pptx_passes_slides_kind_project_scope_validator_gate() {
         octos_agent::validators::ValidatorStatus::Pass
     );
 }
+
+#[tokio::test]
+async fn project_root_validators_write_to_project_ledger_without_manual_seeding() {
+    // octos #997 (round-2 fix): the load-bearing test for codex's review.
+    //
+    // Codex flagged that pre-round-2, the validator was DECLARED at the
+    // slides-kind project policy but never RUN at the project root —
+    // production decks that genuinely produce a valid PPTX would still
+    // surface `ready = false` because `inspect_workspace_contract` reads
+    // `<session>/slides/<slug>/.octos/validator_outcomes.jsonl` but the
+    // production code path only wrote to `<session>/.octos/...`. The 9
+    // fixture sites that manually `ledger.append(...)` a `Pass` were
+    // masking the gap.
+    //
+    // This test exercises the production code path WITHOUT manually
+    // seeding the ledger:
+    //
+    // 1. Build a slides workspace with a real PPTX and a project-scope
+    //    `WorkspacePolicy::for_kind(Slides)` (which declares the
+    //    hard-required `slides.mofa_slides.pptx_magic_bytes` validator).
+    // 2. Invoke `run_project_root_validators` — the helper wired into the
+    //    spawn completion path in this commit.
+    // 3. Assert the project-root ledger file exists and contains a `Pass`
+    //    for the slides-kind PPTX MagicBytes validator id.
+    // 4. Assert `inspect_workspace_contract_at_root` reports `ready = true`
+    //    against that project — proving the contract gate sees the run.
+    //
+    // PRE-FIX FAILURE QUOTE (verified by stubbing
+    // `run_project_root_validators` to return an empty report — i.e.
+    // mirroring the pre-round-2 state where nothing ran validators at the
+    // project root):
+    //
+    //     assertion `left == right` failed: expected exactly one slides
+    //     project to have run validators; got report =
+    //     ProjectRootValidatorReport { projects_run: 0, failures: [] }
+    //       left: 0
+    //      right: 1
+    //
+    // i.e. the production code path never runs the declared validator at
+    // the project root, so the ledger file never exists, and the
+    // inspect-contract gate stays `ready = false` even with a genuine deck.
+    use octos_agent::ToolRegistry;
+    use octos_agent::inspect_workspace_contract_at_root;
+    use octos_agent::validators::{ValidatorLedger, ValidatorStatus};
+    use octos_agent::workspace_contract::run_project_root_validators;
+    use octos_agent::workspace_policy::write_workspace_policy;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let session_root = dir.path();
+    let project_root = session_root.join("slides").join("demo");
+    let output_dir = project_root.join("output");
+    let imgs_dir = output_dir.join("imgs");
+    std::fs::create_dir_all(&imgs_dir).unwrap();
+
+    // The slides-kind policy declares the hard-required PPTX MagicBytes
+    // validator (octos #997). Persist it under the project root, as
+    // `create_slides_project` would in production.
+    write_workspace_policy(
+        &project_root,
+        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+    )
+    .unwrap();
+
+    // Required source files (turn-end checks) + a genuine PPTX (the
+    // success case mofa_slides produces).
+    std::fs::write(project_root.join("script.js"), "// slides").unwrap();
+    std::fs::write(project_root.join("memory.md"), "# memory").unwrap();
+    std::fs::write(project_root.join("changelog.md"), "# changelog").unwrap();
+    let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
+    pptx_bytes.extend_from_slice(&[0u8; 64]);
+    std::fs::write(output_dir.join("deck.pptx"), &pptx_bytes).unwrap();
+    std::fs::write(imgs_dir.join("slide-01.png"), b"png").unwrap();
+
+    // PRE-CONDITION: no validator outcome exists at the project root.
+    // (Production code path has not been exercised yet.)
+    let ledger_path = project_root.join(".octos").join("validator_outcomes.jsonl");
+    assert!(
+        !ledger_path.exists(),
+        "ledger should not exist before the project-root validator run — \
+         otherwise the test would not prove the production path writes it"
+    );
+
+    // ACT: invoke the production code path. This is what the spawn loop
+    // calls after a successful `run_task` for slides workflows. No manual
+    // ledger seeding.
+    let registry = Arc::new(ToolRegistry::new());
+    let report =
+        run_project_root_validators(&registry, session_root, Some(WorkspaceProjectKind::Slides))
+            .await;
+
+    // The slides project should have been picked up + run.
+    assert_eq!(
+        report.projects_run, 1,
+        "expected exactly one slides project to have run validators; got report = {report:?}"
+    );
+    assert!(
+        report.failures.is_empty(),
+        "genuine PPTX should not produce failures; got failures = {:?}",
+        report.failures
+    );
+
+    // ASSERT 1: the project-root ledger file MUST exist after the
+    // production code path runs (without manual seeding).
+    assert!(
+        ledger_path.exists(),
+        "project ledger must exist at {} after the production code path \
+         runs (no manual seeding) — this is the gap codex flagged",
+        ledger_path.display()
+    );
+
+    // ASSERT 2: the ledger must contain a `Pass` for the slides-kind
+    // PPTX MagicBytes validator id (the one declared by `for_kind(Slides)`).
+    let ledger = ValidatorLedger::open(&ledger_path).expect("open project ledger");
+    let entries = ledger.read_all().expect("read project ledger entries");
+    let pptx_pass = entries
+        .iter()
+        .find(|o| {
+            o.validator_id == "slides.mofa_slides.pptx_magic_bytes"
+                && o.status == ValidatorStatus::Pass
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "project ledger must contain a Pass for \
+                 slides.mofa_slides.pptx_magic_bytes; got entries = {entries:?}"
+            )
+        });
+    assert_eq!(pptx_pass.kind, "magic_bytes");
+
+    // ASSERT 3: the contract gate reads the ledger we just wrote and now
+    // reports `ready = true`. This is the user-visible behaviour the gap
+    // was suppressing.
+    let status = inspect_workspace_contract_at_root(&project_root)
+        .expect("inspect_workspace_contract_at_root must succeed");
+    assert!(
+        status.ready,
+        "contract gate must report ready = true after project-root \
+         validators run; status = {status:?}"
+    );
+}

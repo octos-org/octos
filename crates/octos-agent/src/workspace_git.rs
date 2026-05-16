@@ -31,7 +31,7 @@ impl WorkspaceProjectKind {
         }
     }
 
-    fn directory_name(self) -> &'static str {
+    pub(crate) fn directory_name(self) -> &'static str {
         match self {
             Self::Slides => "slides",
             Self::Sites => "sites",
@@ -993,8 +993,9 @@ fn is_git_index_lock_error(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
+    use crate::ToolRegistry;
     use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+    use std::sync::Arc;
 
     /// Minimal PPTX magic-bytes prefix: ZIP local-file-header signature
     /// (`PK\x03\x04`) used by `MagicByteKind::Pptx`. Plus padding so a
@@ -1004,34 +1005,29 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    /// Seed a `Pass` outcome for the slides-kind PPTX `MagicBytes` validator
-    /// declared in `WorkspacePolicy::for_kind(Slides)` (octos #997). Tests
-    /// that rely on `inspect_workspace_contract` reporting `ready = true`
-    /// against a ready slides workspace must seed this outcome, since
-    /// `inspect_workspace_contract` only reads the persisted ledger — it
-    /// does not actually run validators.
-    fn seed_slides_pptx_pass(project_root: &Path, repo_label: &str) {
-        let ledger_path = workspace_validator_ledger_path(project_root);
-        if let Some(parent) = ledger_path.parent() {
-            std::fs::create_dir_all(parent).expect("create ledger dir");
-        }
-        let ledger = ValidatorLedger::open(&ledger_path).expect("open validator ledger");
-        let outcome = ValidatorOutcome {
-            schema_version: VALIDATOR_RESULT_SCHEMA_VERSION,
-            validator_id: "slides.mofa_slides.pptx_magic_bytes".into(),
-            phase: crate::validators::ValidatorPhase::Completion,
-            kind: "magic_bytes".into(),
-            repo_label: repo_label.to_string(),
-            required: true,
-            required_tier: "hard".into(),
-            status: ValidatorStatus::Pass,
-            reason: "seeded for test fixture".into(),
-            duration_ms: 0,
-            evidence_path: None,
-            stderr: None,
-            started_at: chrono::Utc::now(),
-        };
-        ledger.append(&outcome).expect("seed validator outcome");
+    /// octos #997 (round-2 fix): exercise the PRODUCTION code path that
+    /// writes the slides-kind PPTX `MagicBytes` validator outcome to the
+    /// project-root ledger. Pre-round-2 the inspect-contract tests manually
+    /// seeded a `Pass` row via `ledger.append(...)` — but codex pointed out
+    /// that masked the gap (the validator was declared but never RUN at the
+    /// project root in production). Calling `run_project_root_validators`
+    /// mirrors the spawn completion path so a regression in either the
+    /// wiring or the validator itself surfaces here. Sync wrapper so the
+    /// existing `#[test]` callers don't have to switch to `#[tokio::test]`.
+    fn run_slides_project_root_validators_sync(workspace_root: &Path) {
+        let registry = Arc::new(ToolRegistry::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime for fixture validator run");
+        runtime.block_on(async {
+            let _ = crate::workspace_contract::run_project_root_validators(
+                &registry,
+                workspace_root,
+                Some(WorkspaceProjectKind::Slides),
+            )
+            .await;
+        });
     }
 
     #[test]
@@ -1204,16 +1200,20 @@ mod tests {
         policy.validation.on_turn_end = vec!["file_exists:$deck".into()];
         policy.validation.on_completion = vec!["file_exists:$previews".into()];
         write_workspace_policy(&slides_root, &policy).unwrap();
+        // octos #997 (round-2): run the production project-root validator
+        // before committing so the resulting Pass row in
+        // `.octos/validator_outcomes.jsonl` is part of the committed state.
+        // Pre-round-2 this test seeded a fake `Pass` directly via
+        // `ledger.append(...)`, masking the gap that codex flagged: the
+        // validator was declared at the project policy but never RUN at the
+        // project root in production. Now we exercise the real helper.
+        run_slides_project_root_validators_sync(temp.path());
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
             "Initialize slides workspace",
         )
         .unwrap();
-        // octos #997: the slides-kind policy now declares a required PPTX
-        // MagicBytes validator. `inspect_workspace_contract` reads the
-        // ledger — seed a Pass so `ready` reflects this fixture's intent.
-        seed_slides_pptx_pass(&slides_root, "slides/deck-bundle");
 
         let statuses = inspect_workspace_contracts(temp.path()).unwrap();
         let status = &statuses[0];
@@ -1284,12 +1284,15 @@ mod tests {
             &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
         )
         .unwrap();
-        // octos #997: slides-kind policy now declares a required PPTX
-        // MagicBytes validator; seed a Pass outcome BEFORE the initial
-        // commit so the ledger entry is part of the committed state and
-        // `status.dirty` remains false. (Real harness runs the validator
-        // after a turn and persists this file via the same ledger API.)
-        seed_slides_pptx_pass(&slides_root, "slides/deck-e");
+        // octos #997 (round-2): run the production project-root validator
+        // BEFORE the initial commit so the ledger entry is part of the
+        // committed state and `status.dirty` remains false. Pre-round-2 this
+        // test manually seeded a `Pass` row via `ledger.append(...)`, which
+        // masked the gap codex flagged: the validator was declared at the
+        // project policy but never RUN at the project root in production.
+        // The helper writes a real `Pass` to the same ledger path the real
+        // harness writes after `run_task` succeeds.
+        run_slides_project_root_validators_sync(temp.path());
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
