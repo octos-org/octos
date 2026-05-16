@@ -38,7 +38,7 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use octos_cli::api::{
     AppState, TestAuthIdentity, TestSessionMessagesPaginationParams, build_router,
-    test_session_messages,
+    test_session_files, test_session_messages, test_session_workspace_contract,
 };
 use tempfile::TempDir;
 use tower::util::ServiceExt;
@@ -843,5 +843,137 @@ async fn should_serve_session_messages_when_admin_with_cross_tenant_header_on_tr
         body_str.contains(TENANT_B_MARKER),
         "admin response must contain tenant B's marker `{TENANT_B_MARKER}`; \
          got body: {body_str}"
+    );
+}
+
+/// **Issue #999 — `session/files.list` GATEWAY-MODE TENANT LEAK.**
+///
+/// Pre-fix `handlers.rs::session_files` short-circuited to
+/// `state.sessions.lock().data_dir()` whenever a `SessionManager` was
+/// wired — the gateway/standalone top-level — BEFORE checking the
+/// host-routed profile. An authenticated non-admin user on a TRUSTED
+/// hop with `X-Profile-Id: <victim>` walked straight past the routing
+/// layer into whatever workspaces lived under that data_dir, with
+/// **`200 OK`** as the response. The correct fix mirrors
+/// `session_messages` (#1002): the
+/// `authorized_routed_profile_id_from_headers` gate runs FIRST and
+/// rejects a cross-tenant header with `403` regardless of which side
+/// of the sessions / no-sessions branch ultimately resolves the
+/// `data_dir` below.
+///
+/// Pre-fix expectation: this test returns `200` (the bypass shape).
+/// Post-fix expectation: `403` BEFORE any filesystem walk runs.
+#[tokio::test]
+async fn should_reject_session_files_list_cross_tenant() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "web-tenant-b-files";
+    // Reuse the tenant-B harness — `state.sessions` is wired and the
+    // SessionManager already has tenant B's marker message persisted.
+    // The shape under test is `session_files` (workspace filesystem
+    // listing) not `session_messages`, but the AppState shape and the
+    // bypass surface are identical.
+    let state = build_state_with_sessions_for_tenant_b(
+        &dir,
+        &[("alice", None), ("bob", None)],
+        "bob",
+        session_id,
+    )
+    .await;
+
+    // Plant a marker file under the path the pre-fix walker would
+    // enumerate. `api_session_workspace_dirs` walks
+    // `<data_dir>/users/<encoded_session_key>/workspace/` — by
+    // dropping a file there we can prove a pre-fix 200 response
+    // would have leaked that file's name, while the post-fix path
+    // returns 403 before any filesystem walk runs. The plant is
+    // best-effort; the contract under test is `status == 403`
+    // regardless of whether the plant path is reachable.
+    let bare_key = octos_core::SessionKey::new("api", session_id);
+    let encoded = octos_bus::session::encode_path_component(bare_key.base_key());
+    let workspace = dir.path().join("users").join(&encoded).join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("tenant-b-leak-marker.txt"), b"leak").unwrap();
+
+    let identity = Some(Extension(TestAuthIdentity::User {
+        id: "alice".into(),
+        role: octos_cli::user_store::UserRole::User,
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-profile-id", HeaderValue::from_static("bob"));
+
+    let response = test_session_files(
+        axum::extract::State(state),
+        headers,
+        identity,
+        axum::extract::Path(session_id.to_string()),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "authenticated non-admin user with cross-tenant X-Profile-Id \
+         must be 403 BEFORE the handler walks `state.sessions.data_dir()` \
+         — issue #999. Pre-fix this returned 200 with the workspace \
+         listing under the gateway top-level data dir."
+    );
+
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&body).unwrap_or("<non-utf8>");
+    assert!(
+        !body_str.contains("tenant-b-leak-marker"),
+        "403 response body must NOT contain the planted marker filename; \
+         got: {body_str}"
+    );
+}
+
+/// **Issue #999 — `session/workspace.get` GATEWAY-MODE TENANT LEAK.**
+///
+/// Sibling test to `should_reject_session_files_list_cross_tenant`
+/// targeting `handlers.rs::session_workspace_contract`. The pre-fix
+/// shape is identical: `state.sessions.is_some()` bypassed
+/// host-routing entirely and walked
+/// `<gateway top-level data_dir>/users/.../workspace/` for repo
+/// contracts. Same Layer-2 gate, same contract: cross-tenant header
+/// on a TRUSTED hop is `403`.
+#[tokio::test]
+async fn should_reject_session_workspace_get_cross_tenant() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "web-tenant-b-workspace";
+    let state = build_state_with_sessions_for_tenant_b(
+        &dir,
+        &[("alice", None), ("bob", None)],
+        "bob",
+        session_id,
+    )
+    .await;
+
+    let identity = Some(Extension(TestAuthIdentity::User {
+        id: "alice".into(),
+        role: octos_cli::user_store::UserRole::User,
+    }));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-profile-id", HeaderValue::from_static("bob"));
+
+    let response = test_session_workspace_contract(
+        axum::extract::State(state),
+        headers,
+        identity,
+        axum::extract::Path(session_id.to_string()),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "authenticated non-admin user with cross-tenant X-Profile-Id \
+         must be 403 BEFORE `session_workspace_contract` walks any \
+         repository under `state.sessions.data_dir()` — issue #999. \
+         Pre-fix this returned 200 with the workspace-contract \
+         statuses from the gateway top-level data dir."
     );
 }

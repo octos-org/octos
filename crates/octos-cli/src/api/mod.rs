@@ -59,10 +59,18 @@ pub mod testing {
 // here for that purpose, plus `AuthIdentity` so tests can construct
 // non-admin and admin identities directly without booting a real auth
 // middleware stack.
+//
+// Issue #999 — `session_files` and `session_workspace_contract` are
+// exposed via the same harness for the same reason: the legacy REST
+// routes `GET /api/sessions/{id}/files` and
+// `GET /api/sessions/{id}/workspace-contract` were retired, so the
+// only way to exercise the gateway-mode tenant-leak bypass shape end
+// -to-end is to call the WS handlers directly.
 #[doc(hidden)]
 pub use handlers::{
-    PaginationParams as TestSessionMessagesPaginationParams,
+    PaginationParams as TestSessionMessagesPaginationParams, session_files as test_session_files,
     session_messages as test_session_messages,
+    session_workspace_contract as test_session_workspace_contract,
 };
 #[doc(hidden)]
 pub use router::AuthIdentity as TestAuthIdentity;

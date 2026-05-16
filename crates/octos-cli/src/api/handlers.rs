@@ -998,12 +998,28 @@ pub async fn session_files(
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+
+    // Issue #999 — gateway-mode tenant-leak guard. Pre-fix the
+    // `state.sessions.is_some()` branch short-circuited to
+    // `sess.data_dir()` (the gateway/standalone top-level) BEFORE
+    // checking the host-routed profile. An authenticated non-admin
+    // user on a TRUSTED hop with a cross-tenant `X-Profile-Id` (or a
+    // host-routed cross-tenant subdomain) walked straight into the
+    // victim profile's workspace listing. Layer-2 authorization runs
+    // up-front now, mirroring `session_messages` (#1002): a forged
+    // cross-tenant header is `403` regardless of which side of the
+    // sessions / no-sessions branch resolves the data_dir below.
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
+
     let data_dir = if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         sess.data_dir()
     } else {
-        let identity = identity.as_ref().map(|ext| &ext.0);
-        match resolve_profile_data_dir(&state, &headers, identity).await {
+        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
             Ok(data_dir) => data_dir,
             Err(response) => return response,
         }
@@ -1036,12 +1052,26 @@ pub async fn session_workspace_contract(
     identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+
+    // Issue #999 — gateway-mode tenant-leak guard. Same shape as the
+    // companion `session_files` handler above: pre-fix the
+    // `state.sessions.is_some()` branch short-circuited to
+    // `sess.data_dir()` BEFORE checking the host-routed profile, so a
+    // cross-tenant header on a TRUSTED hop exposed the victim
+    // profile's workspace-contract statuses. The Layer-2 gate runs
+    // up-front; `state.sessions.data_dir()` only resolves when the
+    // routed profile is authorized (admin / owner / self).
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
+
     let data_dir = if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         sess.data_dir()
     } else {
-        let identity = identity.as_ref().map(|ext| &ext.0);
-        match resolve_profile_data_dir(&state, &headers, identity).await {
+        match resolve_profile_data_dir(&state, &headers, identity_ref).await {
             Ok(data_dir) => data_dir,
             Err(response) => return response,
         }
