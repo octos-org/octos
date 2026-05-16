@@ -768,3 +768,73 @@ async fn should_block_command_validator_with_dangerous_pattern() {
             || outcome.reason.to_lowercase().contains("policy")
     );
 }
+
+#[tokio::test]
+async fn should_bind_files_to_send_to_artifact_for_mofa_slides_contract() {
+    // Issue #998 (P0 functional): `mofa_slides_contract` declared no artifact
+    // source in `for_session()`, so when the plugin reports `files_to_send`
+    // (auto-detected by `PluginTool::detect_output_file` for "Generated PPTX:
+    // <path>" stdout lines — see `plugins/tool.rs:2064-2103`), the contract
+    // layer entered `bind_explicit_files_to_artifacts` with an empty
+    // `artifact_sources()` list and returned "workspace contract has no
+    // artifact source" (`workspace_contract.rs:333-336`), failing every
+    // successful slides run at the post-tool gate.
+    //
+    // The contract must now bind the reported PPTX into a named artifact so
+    // `resolve_artifacts` produces a populated `ActionContext` and the typed
+    // MagicBytes(Pptx) validator runs against real artifact paths.
+    use octos_agent::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
+    use octos_agent::workspace_policy::WorkspacePolicy;
+    use std::time::UNIX_EPOCH;
+
+    let dir = tempdir().unwrap();
+    // Write the default session policy unmodified — this is the policy the
+    // bundled mofa_slides spawn task runs against today.
+    let policy = WorkspacePolicy::for_session();
+    octos_agent::workspace_policy::write_workspace_policy(dir.path(), &policy).unwrap();
+
+    // Lay down a real PPTX-shaped file under the slides plugin's typical
+    // output path so the MagicBytes(Pptx) validator declared on the
+    // `on_completion` list of `mofa_slides_contract` passes. The first two
+    // bytes of a real PPTX (a ZIP container) are `PK`, matching `0x50 0x4B`.
+    let out_dir = dir.path().join("output");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let pptx_path = out_dir.join("deck.pptx");
+    let mut pptx = vec![0u8; 64];
+    pptx[0] = 0x50; // 'P'
+    pptx[1] = 0x4B; // 'K'
+    pptx[2] = 0x03;
+    pptx[3] = 0x04;
+    std::fs::write(&pptx_path, &pptx).unwrap();
+
+    let registry = ToolRegistry::with_builtins(dir.path());
+    // Pass the PPTX through `files_to_send` exactly as `PluginTool` does at
+    // `plugins/tool.rs:1321-1329` after parsing the plugin envelope.
+    let files_to_send = vec![pptx_path.clone()];
+    let result = enforce_spawn_task_contract(
+        &registry,
+        "mofa_slides",
+        "tool-call-slides-1",
+        &files_to_send,
+        UNIX_EPOCH,
+        None,
+    )
+    .await;
+
+    match result {
+        SpawnTaskContractResult::Satisfied { output_files } => {
+            assert!(
+                output_files
+                    .iter()
+                    .any(|p| p.ends_with("deck.pptx") || p.ends_with("output/deck.pptx")),
+                "satisfied result must surface the reported PPTX, got {output_files:?}"
+            );
+        }
+        SpawnTaskContractResult::Failed { error, .. } => panic!(
+            "mofa_slides contract must accept a valid PPTX via files_to_send, got Failed: {error}"
+        ),
+        SpawnTaskContractResult::NotConfigured { reason, .. } => panic!(
+            "mofa_slides contract must be configured in for_session policy, got NotConfigured: {reason:?}"
+        ),
+    }
+}

@@ -728,6 +728,19 @@ impl WorkspacePolicy {
         let mut artifacts = BTreeMap::new();
         artifacts.insert("primary_audio".into(), "*.mp3".into());
         artifacts.insert("podcast_audio".into(), "**/podcast_full_*.*".into());
+        // Issue #998: `mofa_slides` plugin emits a `.pptx` via `files_to_send`
+        // (auto-detected by `PluginTool::detect_output_file` from the
+        // skill's "Generated PPTX: <path>" stdout marker or an explicit
+        // `out` arg — see `plugins/tool.rs:550-625, 1321-1361`). The
+        // contract layer's `bind_explicit_files_to_artifacts` requires a
+        // named artifact source to bind the reported file into
+        // `ActionContext`; without one it returns "workspace contract has
+        // no artifact source" (`workspace_contract.rs:333-336`) on every
+        // successful slides run. Declaring the artifact here gives the
+        // mofa_slides contract a target name to reference and matches the
+        // recursive `**/*.pptx` glob already used by the MagicBytes(Pptx)
+        // validator on `on_completion`.
+        artifacts.insert("slides_pptx".into(), "**/*.pptx".into());
 
         let tts_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
@@ -860,8 +873,22 @@ impl WorkspacePolicy {
         // the local-file-header / end-of-central-directory ZIP signature
         // is present at byte 0. The glob runs recursively so the policy
         // also catches slides written to nested subdirectories.
+        //
+        // Issue #998: the slides plugin reports its generated PPTX via
+        // `files_to_send` (parsed at `plugins/tool.rs:1321-1361` from a
+        // JSON envelope OR auto-detected from a "Generated PPTX: <path>"
+        // stdout marker — see `plugins/tool.rs:550-625` and the test at
+        // `plugins/tool.rs:2064-2103`). The contract layer's
+        // `bind_explicit_files_to_artifacts` (`workspace_contract.rs:329-357`)
+        // requires `artifact_sources()` to be non-empty so it can bind the
+        // reported PPTX into a named slot in `ActionContext`. Declaring
+        // `artifact: Some("slides_pptx")` matches the artifact entry
+        // registered above (`for_session` artifacts map) whose glob
+        // (`**/*.pptx`) is the same recursive pattern the on-completion
+        // MagicBytes validator uses, so the two checks see a consistent
+        // set of paths.
         let mofa_slides_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("slides_pptx".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
