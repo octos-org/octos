@@ -633,6 +633,14 @@ impl ServeCommand {
             // `with_builtins_and_sandbox(serve_cwd)`. See
             // `api/ui_protocol.rs::session_tool_registry`.
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
+            // Issue #1001 follow-up: in-memory signed-preview token
+            // cache backs `POST /api/my/preview/sign` /
+            // `GET /api/preview-signed/...` so the SPA iframe can drop
+            // the `Authorization: Bearer ...` header that the closed
+            // `/api/preview/...` route now requires. Daemon restart
+            // invalidates every grant (see
+            // `crate::api::preview_tokens` for the design rationale).
+            preview_tokens: Arc::new(crate::api::PreviewTokens::new()),
         });
 
         if self.stdio {
