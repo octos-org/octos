@@ -12,7 +12,9 @@
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
-use octos_agent::workspace_policy::WorkspacePolicyWorkspace;
+use octos_agent::workspace_policy::{
+    MagicByteKind, Validator, ValidatorPhaseKind, ValidatorSpec, WorkspacePolicyWorkspace,
+};
 use octos_agent::{
     ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
     WorkspaceSnapshotTrigger, WorkspaceTrackingPolicy, WorkspaceVersionControlPolicy,
@@ -85,7 +87,24 @@ pub fn workspace_policy() -> WorkspacePolicy {
                 "file_exists:output/deck.pptx".into(),
                 "file_exists:output/**/slide-*.png".into(),
             ],
-            validators: Vec::new(),
+            // octos #997: mirror the slides-kind project-scope validator
+            // wired in `WorkspacePolicy::for_kind(Slides)`. Project-init
+            // (`project_templates::create_slides_project`) persists this
+            // policy to `.octos-workspace.toml`, so the on-disk policy
+            // must also gate on the PPTX magic-bytes signature — otherwise
+            // an HTML "success" deck (the mofa_slides failure mode) slips
+            // past the contract that the SPA / TUI inspect.
+            validators: vec![Validator {
+                id: "slides.mofa_slides.pptx_magic_bytes".into(),
+                required: true,
+                soft_fail: false,
+                timeout_ms: None,
+                phase: ValidatorPhaseKind::Completion,
+                spec: ValidatorSpec::MagicBytes {
+                    glob: "**/*.pptx".into(),
+                    format: MagicByteKind::Pptx,
+                },
+            }],
         },
         artifacts: WorkspaceArtifactsPolicy {
             entries: BTreeMap::from([

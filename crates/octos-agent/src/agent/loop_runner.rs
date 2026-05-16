@@ -1445,6 +1445,26 @@ impl Agent {
                         // false` and the failing validators are appended to
                         // the result output so the caller (or LLM next turn)
                         // sees the contract failure.
+                        //
+                        // octos #997 (round-2 fix): RUN declared project-root
+                        // validators BEFORE inspecting the contract. The
+                        // contract gate reads
+                        // `<kind>/<slug>/.octos/validator_outcomes.jsonl` — a
+                        // path that was never written to in production
+                        // pre-round-2 because the declared validator chain
+                        // was only invoked at the SESSION root. Without this
+                        // call, a real valid deck whose project policy
+                        // declares a hard-required validator (octos #997:
+                        // `slides.mofa_slides.pptx_magic_bytes`) shows
+                        // `ready = false` purely because the persisted
+                        // outcome is missing.
+                        let _project_root_report =
+                            crate::workspace_contract::run_project_root_validators(
+                                self.tools.as_ref(),
+                                &task.context.working_dir,
+                                None,
+                            )
+                            .await;
                         let contract_failures =
                             inspect_workspace_contract_failures(&task.context.working_dir);
 
@@ -4408,6 +4428,15 @@ printf '{"output":"voice saved","success":true}\n'
         }
     }
 
+    /// Build a slides workspace fixture, optionally fully-ready.
+    ///
+    /// Pure-filesystem setup. Callers that want a "ready" deck must also
+    /// invoke [`run_managed_slides_workspace_validators`] (async) or
+    /// [`run_managed_slides_workspace_validators_sync`] (blocking) to
+    /// exercise the PRODUCTION project-root validator helper. Splitting
+    /// the helper this way avoids the "Cannot start a runtime from within a
+    /// runtime" panic when async tests call the fixture inside their own
+    /// Tokio runtime.
     fn make_managed_slides_workspace(tmp_root: &std::path::Path, slug: &str, ready: bool) {
         use crate::workspace_git::WorkspaceProjectKind;
         use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
@@ -4425,9 +4454,45 @@ printf '{"output":"voice saved","success":true}\n'
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
         if ready {
             std::fs::create_dir_all(repo_root.join("output/imgs")).unwrap();
-            std::fs::write(repo_root.join("output/deck.pptx"), "fake-deck").unwrap();
+            // octos #997: write real PPTX magic bytes so the project-scope
+            // PPTX `MagicBytes` validator wired in
+            // `WorkspacePolicy::for_kind(Slides)` does not fail the gate.
+            let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
+            pptx.extend_from_slice(&[0u8; 32]);
+            std::fs::write(repo_root.join("output/deck.pptx"), &pptx).unwrap();
             std::fs::write(repo_root.join("output/imgs/slide-01.png"), "fake-png").unwrap();
+            // NOTE: caller must invoke
+            // `run_managed_slides_workspace_validators[_sync]` to write the
+            // slides-kind PPTX MagicBytes Pass row.
         }
+    }
+
+    /// octos #997 (round-2 fix): async variant — exercise the production
+    /// project-root validator helper so the ready fixture writes a Pass row
+    /// into the same project ledger that the spawn loop writes to in
+    /// production. Pre-round-2 the fixture manually `ledger.append(...)`ed a
+    /// fake Pass; codex flagged that as masking the gap (the validator was
+    /// declared but never RUN at the project root in production).
+    async fn run_managed_slides_workspace_validators(tmp_root: &std::path::Path) {
+        use crate::workspace_git::WorkspaceProjectKind;
+        let registry = std::sync::Arc::new(crate::ToolRegistry::new());
+        let _ = crate::workspace_contract::run_project_root_validators(
+            &registry,
+            tmp_root,
+            Some(WorkspaceProjectKind::Slides),
+        )
+        .await;
+    }
+
+    /// Sync variant of [`run_managed_slides_workspace_validators`] for
+    /// non-async `#[test]` callers that don't already have a Tokio runtime
+    /// (and can therefore build one without nesting).
+    fn run_managed_slides_workspace_validators_sync(tmp_root: &std::path::Path) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime for fixture validator run");
+        runtime.block_on(run_managed_slides_workspace_validators(tmp_root));
     }
 
     #[test]
@@ -4443,6 +4508,7 @@ printf '{"output":"voice saved","success":true}\n'
     fn should_return_none_when_all_managed_repos_are_ready() {
         let tmp = tempfile::tempdir().unwrap();
         make_managed_slides_workspace(tmp.path(), "demo", true);
+        run_managed_slides_workspace_validators_sync(tmp.path());
 
         let failures = inspect_workspace_contract_failures(tmp.path());
         assert!(
@@ -4477,6 +4543,7 @@ printf '{"output":"voice saved","success":true}\n'
         let tmp = tempfile::tempdir().unwrap();
         make_managed_slides_workspace(tmp.path(), "ready-deck", true);
         make_managed_slides_workspace(tmp.path(), "broken-deck", false);
+        run_managed_slides_workspace_validators_sync(tmp.path());
 
         let failures = inspect_workspace_contract_failures(tmp.path())
             .expect("at least one broken repo must produce failures");
@@ -4558,6 +4625,7 @@ printf '{"output":"voice saved","success":true}\n'
         let dir = tempfile::tempdir().unwrap();
         // Fully-ready workspace.
         make_managed_slides_workspace(dir.path(), "ready", true);
+        run_managed_slides_workspace_validators(dir.path()).await;
 
         let tools = ToolRegistry::with_builtins(dir.path());
         let provider: Arc<dyn LlmProvider> = Arc::new(EndTurnOnlyProvider);
