@@ -551,6 +551,17 @@ async fn spawn_only_mofa_slides_writes_project_ledger() {
 /// check (`tools/spawn.rs:2087-2113`). Pre-round-3 it never invokes
 /// `run_project_root_validators`, so a slides workflow that dispatches
 /// through MCP completes without writing the project ledger.
+///
+/// octos #997 (round-4 fix): omitting `terminal_output` masks the
+/// real production gap because `workflow_uses_contract_terminal_delivery`
+/// returns `false` when `required_artifact_kind` is absent, so the
+/// `resolve_contract_terminal_files` block is skipped entirely. The
+/// production `slides_delivery` workflow ALWAYS sets
+/// `terminal_output.required_artifact_kind = "presentation"`, which makes
+/// `resolve_contract_terminal_files` run BEFORE the project-root
+/// validator (round-3 ordering) and early-return on
+/// `inspect_workspace_contract_at_root` failure — leaving the ledger
+/// empty. Re-ordering ensures the validator runs FIRST.
 #[tokio::test]
 async fn agent_mcp_slides_writes_project_ledger() {
     use async_trait::async_trait;
@@ -658,15 +669,22 @@ async fn agent_mcp_slides_writes_project_ledger() {
 
     // ── Dispatch through the agent_mcp branch. ─────────────────────
     //
-    // Omit `terminal_output` so this test isolates the bypass at
-    // spawn.rs:2087-2113. With `terminal_output.required_artifact_kind =
-    // "presentation"`, the earlier `resolve_contract_terminal_files`
-    // gate (spawn.rs:2061) calls `inspect_workspace_contract_at_root`
-    // against `self.working_dir`, which fails with
+    // octos #997 (round-4 fix): set `terminal_output.required_artifact_kind`
+    // to match production `slides_delivery` shape. This makes
+    // `workflow_uses_contract_terminal_delivery` return `true` so the
+    // `resolve_contract_terminal_files` block at `spawn.rs:2059` runs.
+    // Pre-fix that block ran BEFORE the project-root validator, calling
+    // `inspect_workspace_contract_at_root(self.working_dir = session_root)`
+    // which errors with
     // "unsupported workspace project root for git snapshot: <session_root>"
-    // because the session root's parent is not `slides/sites` — that's a
-    // separate, pre-existing edge in the agent_mcp wiring orthogonal to
-    // #997's project-ledger bypass.
+    // (the session root's parent is not `slides/sites`) — the early-return
+    // at `spawn.rs:2068-2073` returns `Status: FAILED` BEFORE the
+    // project-root validator at `:2128` ever executes. Result: the project
+    // ledger is empty.
+    //
+    // Post-fix: the project-root validator runs FIRST and writes the
+    // ledger; the orthogonal terminal-files error still demotes the
+    // dispatch result, but the ledger persists.
     let result = spawn_tool
         .execute(&serde_json::json!({
             "task": "make a deck",
@@ -676,34 +694,45 @@ async fn agent_mcp_slides_writes_project_ledger() {
             "allowed_tools": [],
             "workflow": {
                 "workflow_kind": "slides",
-                "current_phase": "design"
+                "current_phase": "design",
+                "terminal_output": {
+                    "deliver_final_artifact_only": true,
+                    "forbid_intermediate_files": true,
+                    "required_artifact_kind": "presentation"
+                }
             }
         }))
         .await
         .expect("agent_mcp dispatch must not error");
 
-    // Sanity: the dispatch succeeded.
-    assert!(
-        result.success,
-        "agent_mcp dispatch must succeed; got output = {}",
-        result.output
-    );
-
     // ── Load-bearing assertion: project ledger must exist. ───────────
     //
-    // PRE-FIX (round-2 HEAD 5457c184) FAILURE QUOTE:
+    // PRE-FIX (round-3 HEAD dbc74780) FAILURE QUOTE:
     //   project ledger must exist at
     //   <session>/slides/demo/.octos/validator_outcomes.jsonl after
-    //   the agent_mcp branch completes — that branch only invokes the
-    //   session-scope validator (lines 2087-2113) and never calls
-    //   run_project_root_validators
+    //   the agent_mcp branch completes — pre-round-4 the
+    //   `resolve_contract_terminal_files` block ran BEFORE the project-root
+    //   validator and early-returned on the orthogonal terminal-files
+    //   error, leaving the project ledger empty
+    //
+    // The dispatch result itself may fail because
+    // `inspect_workspace_contract_at_root(session_root)` errors when the
+    // session root's parent is not `slides/sites` — that's a separate,
+    // pre-existing edge in the agent_mcp wiring orthogonal to #997's
+    // project-ledger bypass. The load-bearing invariant is that the
+    // project-root validator runs FIRST and the ledger is populated
+    // regardless of the downstream gate outcome.
     let ledger_path = project_root.join(".octos").join("validator_outcomes.jsonl");
     assert!(
         ledger_path.exists(),
         "project ledger must exist at {} after the agent_mcp branch completes \
-         — that branch only invokes the session-scope validator (spawn.rs:2087-2113) \
-         and never calls run_project_root_validators",
-        ledger_path.display()
+         — pre-round-4 the `resolve_contract_terminal_files` block ran BEFORE \
+         the project-root validator and early-returned on the orthogonal \
+         terminal-files error, leaving the project ledger empty. \
+         result.success={}, result.output={}",
+        ledger_path.display(),
+        result.success,
+        result.output
     );
 
     let ledger = octos_agent::ValidatorLedger::open(&ledger_path).expect("open project ledger");

@@ -2052,29 +2052,6 @@ impl Tool for SpawnTool {
             // `commit` above consumed it successfully, or Drop refunds.
             drop(reservation);
 
-            let mut files_to_send = response.files_to_send.clone();
-            // Workflow contract families always gate outputs through the
-            // workspace contract. The dispatch response is advisory; the
-            // final delivery path remains owned by the runtime.
-            if let Some(workflow_meta) = workflow.as_ref() {
-                if workflow_uses_contract_terminal_delivery(workflow_meta) {
-                    match resolve_contract_terminal_files(
-                        self.working_dir.as_path(),
-                        Some(workflow_meta),
-                    ) {
-                        Ok(Some(contract_files)) => files_to_send = contract_files,
-                        Ok(None) => {}
-                        Err(error) => {
-                            return Ok(ToolResult {
-                                output: format!("Status: FAILED\n{error}"),
-                                success: false,
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-            }
-
             // Review A F-004: for the agent_mcp dispatch path the child
             // session runs inside the remote backend and never touches the
             // parent's ValidatorRunner. Before, the parent trusted the
@@ -2084,6 +2061,23 @@ impl Tool for SpawnTool {
             // here, against the parent's workspace root, restores the
             // invariant: any required validator failure demotes the
             // response to a typed failure before it leaves the tool.
+            //
+            // octos #997 (round-4 fix): run both the session-scope and
+            // project-scope validator blocks BEFORE
+            // `resolve_contract_terminal_files`. With
+            // `terminal_output.required_artifact_kind = "presentation"`
+            // (real `slides_delivery` shape),
+            // `resolve_contract_terminal_files` calls
+            // `inspect_workspace_contract_at_root` which reads the project
+            // ledger at
+            // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+            // If validators run AFTER that gate, the gate returns
+            // `ready = false` (empty ledger) and the agent_mcp branch
+            // early-returns at `Err(error) => return Ok(...)` before
+            // either validator block executes. Re-ordering ensures the
+            // project ledger is populated first, so the contract gate
+            // inside `resolve_contract_terminal_files` sees the real
+            // `Pass` rows.
             let mut mcp_success = success;
             let mut mcp_output_override: Option<String> = None;
             if mcp_success {
@@ -2136,6 +2130,37 @@ impl Tool for SpawnTool {
                     mcp_output_override = Some(format!(
                         "Status: FAILED\nremote_agent_mcp: project-scope validator rejected child artifact: {reason}"
                     ));
+                }
+            }
+
+            // Workflow contract families always gate outputs through the
+            // workspace contract. The dispatch response is advisory; the
+            // final delivery path remains owned by the runtime.
+            //
+            // Runs LAST so the validator blocks above have already written
+            // the session + project ledgers; `inspect_workspace_contract_at_root`
+            // (inside `resolve_contract_terminal_files`) reads those ledgers
+            // to decide `ready`. Skipped on validator failure — empty
+            // `files_to_send` is correct for a failed result.
+            let mut files_to_send = response.files_to_send.clone();
+            if mcp_success {
+                if let Some(workflow_meta) = workflow.as_ref() {
+                    if workflow_uses_contract_terminal_delivery(workflow_meta) {
+                        match resolve_contract_terminal_files(
+                            self.working_dir.as_path(),
+                            Some(workflow_meta),
+                        ) {
+                            Ok(Some(contract_files)) => files_to_send = contract_files,
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Ok(ToolResult {
+                                    output: format!("Status: FAILED\n{error}"),
+                                    success: false,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
                 }
             }
 
