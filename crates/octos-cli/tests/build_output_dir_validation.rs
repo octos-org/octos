@@ -464,3 +464,189 @@ fn should_reject_symlink_swap_after_validation() {
         "symlink-swapped ancestor must be rejected; got served bytes: {served:?}",
     );
 }
+
+// ── Codex round-2 follow-up tests ──────────────────────────────────────────
+
+/// Codex round-2 BLOCKING #2: an LLM that puts `metadata.template:
+/// "phantom-template"` and `build_output_dir: "docs"` in
+/// `mofa-site-session.json` must NOT validate. Pre-followup,
+/// `SiteTemplate::from_slug` returned `Docs` on any unknown slug,
+/// so the per-template-equality gate let this through (because
+/// `Docs::output_dir() == "docs"`). Post-followup the validator uses
+/// `from_slug_strict` and surfaces `UnknownTemplate` on miss; the
+/// handler maps that to HTTP 400 via `SiteBuildError::InvalidMetadata`.
+#[test]
+fn should_reject_unknown_template() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path();
+    std::fs::create_dir_all(project_dir.join("docs")).unwrap();
+
+    // Phantom template — not one of `astro-site` / `nextjs-app` /
+    // `react-vite` / `quarto-lesson`. Paired with `docs`, which
+    // pre-followup matched the `Docs` fallback's output_dir.
+    let metadata = site_metadata("phantom-template", "docs");
+    let result = validated_build_output_dir(&metadata, project_dir);
+    match result {
+        Err(BuildOutputDirError::UnknownTemplate(slug)) => {
+            assert_eq!(
+                slug, "phantom-template",
+                "UnknownTemplate must carry the offending slug verbatim",
+            );
+        }
+        other => panic!("phantom-template must be rejected as UnknownTemplate, got: {other:?}",),
+    }
+
+    // Belt-and-braces: every variant of an unknown slug paired with
+    // every allow-listed output dir must reject — the previous fix
+    // was sensitive to the exact pairing.
+    for value in ["dist", "out", "docs"] {
+        let metadata = site_metadata("anything-goes", value);
+        let result = validated_build_output_dir(&metadata, project_dir);
+        assert!(
+            matches!(result, Err(BuildOutputDirError::UnknownTemplate(_))),
+            "anything-goes/{value} must be rejected, got: {result:?}",
+        );
+    }
+}
+
+/// Codex round-2 BLOCKING #1 follow-up: simulate the handler-shaped
+/// race end-to-end. Validate against a real `dist/`, then swap
+/// `dist` for a symlink to an outside dir, then call
+/// `serve_preview_no_follow_blocking` against the leaf that the
+/// handler would have computed. The new `openat`-walk
+/// implementation must refuse — must NOT return 200 with the
+/// escaped file's content. The round-1 `symlink_metadata` walk
+/// could be raced through (multi-syscall window between stat and
+/// open); the round-2 walk anchors each step to the previous fd so
+/// the swap cannot be observed by the next openat.
+///
+/// Skipped on Windows where `O_NOFOLLOW` and `openat` are absent;
+/// the non-Unix fallback retains the documented residual race.
+#[cfg(unix)]
+#[test]
+fn should_reject_handler_toctou_swap() {
+    use std::os::unix::fs::symlink;
+
+    use octos_cli::api::preview::serve_preview_no_follow_blocking;
+
+    let tmp_project = tempfile::tempdir().unwrap();
+    let tmp_outside = tempfile::tempdir().unwrap();
+    let project_dir = tmp_project.path();
+    let dist = project_dir.join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), b"<html>real</html>").unwrap();
+    std::fs::write(tmp_outside.path().join("index.html"), b"SECRET").unwrap();
+
+    // Phase 1: validator passes against a real dist/.
+    let metadata = site_metadata("astro-site", "dist");
+    let validated = validated_build_output_dir(&metadata, project_dir)
+        .expect("phase-1 validation must pass against a real dist/");
+    let leaf = validated.join("index.html");
+
+    // Phase 2: between validation and serve, an attacker swaps
+    // `dist` for a symlink pointing at `tmp_outside`. The leaf path
+    // (as a string) is unchanged.
+    std::fs::remove_dir_all(&dist).unwrap();
+    symlink(tmp_outside.path(), &dist).unwrap();
+
+    // Phase 3: the serve must refuse. Crucially, it must NOT return
+    // `Ok(b"SECRET")` — that's the pre-fix exploit shape: handler
+    // returns HTTP 200 with the escaped content.
+    //
+    // CRITICAL: pass `project_dir` (not the canonical output dir)
+    // as the walk root, matching the handler's wiring (see
+    // `serve_preview_file` in handlers.rs). The walk must therefore
+    // re-traverse `dist` (now a symlink) as an ancestor component
+    // and refuse on the `O_NOFOLLOW` open of that step.
+    let result = serve_preview_no_follow_blocking(project_dir, &leaf);
+    assert!(
+        result.is_err(),
+        "post-swap serve must refuse — round-1's symlink_metadata walk had a TOCTOU window the openat walk closes; got: {result:?}",
+    );
+    if let Ok(ref bytes) = result {
+        assert_ne!(
+            bytes.as_slice(),
+            b"SECRET",
+            "served bytes from outside the project — TOCTOU race not closed",
+        );
+    }
+}
+
+/// Codex round-2 test gap: an explicit HTTP status assertion at the
+/// handler-error-mapping layer. The handler maps
+/// `SiteBuildError::InvalidMetadata` (which now wraps
+/// `BuildOutputDirError::UnknownTemplate`) to HTTP 400, not 200.
+/// The previous error-response shape returned 200 with a
+/// "Preview Build Failed" page; the round-1 fix moved validation
+/// errors to 4xx. Pin the contract here so the status doesn't
+/// regress to 200 silently.
+#[tokio::test]
+async fn should_return_400_not_200_on_invalid() {
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use octos_cli::api::testing::{SiteBuildError, preview_build_error_response};
+
+    // 1. UnknownTemplate (the new variant) must map to HTTP 400.
+    let resp = preview_build_error_response(
+        "phantom-template",
+        SiteBuildError::InvalidMetadata(BuildOutputDirError::UnknownTemplate(
+            "phantom-template".to_string(),
+        )),
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "UnknownTemplate must surface as HTTP 400, not 200 or 500",
+    );
+    let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(
+        body_text.contains("Preview Build Rejected"),
+        "response body should explain the rejection, got: {body_text}",
+    );
+    assert!(
+        !body_text.contains("/private/") && !body_text.contains("/Users/"),
+        "response body must not leak on-disk project paths, got: {body_text}",
+    );
+
+    // 2. Cross-check every InvalidMetadata variant — they all
+    //    represent LLM-controlled metadata problems and must be 400.
+    for reason in [
+        BuildOutputDirError::Empty,
+        BuildOutputDirError::Absolute,
+        BuildOutputDirError::ParentEscape,
+        BuildOutputDirError::NotAllowListed,
+        BuildOutputDirError::TemplateMismatch,
+        BuildOutputDirError::UnknownTemplate("x".into()),
+        BuildOutputDirError::OutsideProject,
+    ] {
+        let resp = preview_build_error_response(
+            "astro-site",
+            SiteBuildError::InvalidMetadata(reason.clone()),
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "InvalidMetadata({reason:?}) must map to HTTP 400",
+        );
+    }
+
+    // 3. The post-build re-validation variant (same family of
+    //    errors but caught after the build step) also maps to 400.
+    let resp = preview_build_error_response(
+        "astro-site",
+        SiteBuildError::PostBuildValidation(BuildOutputDirError::OutsideProject),
+    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. UnsupportedTemplate stays 400 (defence-in-depth branch).
+    let resp = preview_build_error_response("astro-site", SiteBuildError::UnsupportedTemplate);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5. Genuine build-tool failures stay 5xx — they are NOT
+    //    LLM-controlled, so HTTP 500 is the right surface.
+    let resp = preview_build_error_response("astro-site", SiteBuildError::BuildCommandFailed);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let resp = preview_build_error_response("astro-site", SiteBuildError::OutputArtifactMissing);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}

@@ -1796,8 +1796,13 @@ fn run_build_command(command: &mut std::process::Command, label: &str) -> Result
 /// missing-artifact variants to HTTP 5xx with the project path
 /// stripped out — previously every error returned 200 with a "Build
 /// Failed" page and leaked the full project path in the body.
+///
+/// `pub` (re-exported only via the `#[doc(hidden)]` `testing` module
+/// in `crate::api`) so the build_output_dir test suite can directly
+/// induce each variant and assert the HTTP status mapping via
+/// [`preview_build_error_response`].
 #[derive(Debug)]
-enum SiteBuildError {
+pub enum SiteBuildError {
     /// The LLM-controlled metadata failed validation (allow-list,
     /// per-template equality, `..` escape, etc.). 4xx surface.
     InvalidMetadata(BuildOutputDirError),
@@ -1963,23 +1968,33 @@ fn resolve_preview_asset_path(
     Some(canonical_resolved)
 }
 
-/// Serve a preview file with TOCTOU-safe semantics. Codex BLOCKING
-/// #1: the previous body called `tokio::fs::read`, which follows
-/// symlinks — an attacker who could swap `<output_dir>` (or any
-/// ancestor) for a symlink between the canonical-descendant check
-/// in [`resolve_preview_asset_path`] and the read here would escape
-/// the project dir even though the validator passed.
+/// Serve a preview file with TOCTOU-safe semantics. Codex round-1
+/// BLOCKING #1: the previous body called `tokio::fs::read`, which
+/// follows symlinks — an attacker who could swap `<output_dir>` (or
+/// any ancestor) for a symlink between the canonical-descendant
+/// check in [`resolve_preview_asset_path`] and the read here would
+/// escape the project dir even though the validator passed.
 ///
-/// The replacement routes through
-/// [`crate::api::preview::serve_preview_no_follow`], which:
-/// 1. canonicalises both root and leaf,
-/// 2. checks descendant-of-root,
-/// 3. walks every ancestor with `symlink_metadata` and refuses any
-///    symlink,
-/// 4. opens the leaf with `O_NOFOLLOW` on Unix (or a
-///    pre-open `symlink_metadata` check on non-Unix).
-async fn serve_preview_file(output_dir: &std::path::Path, path: std::path::PathBuf) -> Response {
-    let project_root = output_dir.to_path_buf();
+/// Codex round-2 BLOCKING #1: the round-1 fix used a
+/// `symlink_metadata` ancestor walk + final `O_NOFOLLOW` open. That
+/// left a multi-syscall TOCTOU window — an attacker could swap an
+/// ancestor between the stat and the open. The replacement routes
+/// through [`crate::api::preview::serve_preview_no_follow`], which
+/// walks every component with `rustix::fs::openat` so each step is
+/// anchored to a parent fd that already passed `O_NOFOLLOW`.
+///
+/// The validation chain rooted here is:
+///   `project_dir` (caller-trusted scaffold)
+///     → `output_dir` component (allow-listed per-template)
+///     → asset-relative path (resolved by `resolve_preview_asset_path`).
+/// We pass `project_dir`, not `output_dir`, as the walk root so
+/// every component — including the `output_dir` name itself — is
+/// re-validated by the `openat` walk on each request. The previous
+/// shape passed `output_dir` and the walk only re-checked the
+/// asset-relative segment, missing the swap-`output_dir`-itself
+/// variant.
+async fn serve_preview_file(project_dir: &std::path::Path, path: std::path::PathBuf) -> Response {
+    let project_root = project_dir.to_path_buf();
     let leaf_for_headers = path.clone();
     let data = match crate::api::preview::serve_preview_no_follow(project_root, path).await {
         Ok(data) => data,
@@ -2079,14 +2094,27 @@ async fn serve_site_preview_impl(
         );
     };
 
-    serve_preview_file(&output_dir, path).await
+    // Codex round-2 BLOCKING #1: pass `project_dir` (not
+    // `output_dir`) as the symlink-safe walk root, so the openat
+    // chain re-validates `output_dir`'s component name on every
+    // request as well. The round-1 wiring passed `output_dir`, which
+    // meant a swap of the `output_dir` directory name itself between
+    // build and serve was only caught by the canonical-descendant
+    // check inside the helper — and that check is vulnerable to the
+    // same TOCTOU shape it's supposed to fix.
+    serve_preview_file(&project_dir, path).await
 }
 
 /// Map a `SiteBuildError` to a scrubbed HTTP response. Codex
 /// BLOCKING #2: validation failures are 4xx (the LLM messed up the
 /// metadata, not the server), build failures are 5xx, neither leaks
 /// the project path in the response body.
-fn preview_build_error_response(template: &str, error: SiteBuildError) -> Response {
+///
+/// `pub` (re-exported only via the `#[doc(hidden)]` `testing` module
+/// in `crate::api`) so the build_output_dir test suite can assert
+/// the status-code mapping at the handler layer without spinning up
+/// the full Axum router. Codex round-2 follow-up.
+pub fn preview_build_error_response(template: &str, error: SiteBuildError) -> Response {
     match error {
         SiteBuildError::InvalidMetadata(reason) => site_preview_html(
             StatusCode::BAD_REQUEST,

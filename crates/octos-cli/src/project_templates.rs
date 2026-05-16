@@ -674,6 +674,15 @@ pub enum BuildOutputDirError {
     /// Pinned by codex's NEEDS-FOLLOWUP on the original fix: a global
     /// allow-list lets `astro-site + docs` slip through. Issue #996.
     TemplateMismatch,
+    /// `metadata.template` did not match any in-tree SiteTemplate
+    /// variant (`astro-site`, `nextjs-app`, `react-vite`,
+    /// `quarto-lesson`). Pinned by codex round-2 BLOCKING #2 (issue
+    /// #996 follow-up): the previous `SiteTemplate::from_slug`
+    /// fallback to `Docs` was default-allow — a phantom template
+    /// paired with `build_output_dir: "docs"` slipped past the
+    /// per-template-equality gate. The validator now uses
+    /// `from_slug_strict` and surfaces this variant on miss.
+    UnknownTemplate(String),
     /// Canonicalising `project_dir.join(value)` failed or resolved
     /// outside `project_dir` (e.g. through a symlink).
     OutsideProject,
@@ -694,6 +703,10 @@ impl std::fmt::Display for BuildOutputDirError {
             Self::TemplateMismatch => write!(
                 f,
                 "build_output_dir does not match the expected output for this template"
+            ),
+            Self::UnknownTemplate(slug) => write!(
+                f,
+                "metadata.template `{slug}` is not a known site template (must be one of: astro-site, nextjs-app, react-vite, quarto-lesson)"
             ),
             Self::OutsideProject => {
                 write!(f, "build_output_dir resolves outside the project directory")
@@ -766,10 +779,18 @@ fn validated_build_output_dir_form(
     // "astro-site"` (which controls the build command) while pointing
     // `build_output_dir` at `docs` (which controls what the preview
     // serves), enabling cross-template surface mismatches.
-    let expected =
-        crate::workflow_runtime::workflow_families::SiteTemplate::from_slug(&metadata.template)
-            .output_dir();
-    if raw != expected {
+    //
+    // Codex round-2 BLOCKING #2: use `from_slug_strict` (not the
+    // lossy `from_slug`) — an unknown template slug like
+    // `"phantom-template"` previously coerced to `SiteTemplate::Docs`
+    // and let `build_output_dir: "docs"` validate. The strict variant
+    // returns `None` on miss so we surface `UnknownTemplate` and the
+    // handler can map it to HTTP 400.
+    let template_slug = metadata.template.trim();
+    let template =
+        crate::workflow_runtime::workflow_families::SiteTemplate::from_slug_strict(template_slug)
+            .ok_or_else(|| BuildOutputDirError::UnknownTemplate(template_slug.to_string()))?;
+    if raw != template.output_dir() {
         return Err(BuildOutputDirError::TemplateMismatch);
     }
 
