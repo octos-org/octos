@@ -222,13 +222,20 @@ async fn resolve_api_port_authorized(
     Ok(pm.first_api_port().await)
 }
 
-fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String {
-    routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
-}
-
-/// #995 follow-up — authorization-aware variant of
-/// [`api_profile_id_from_headers`]. Returns `Err(403)` when the header
-/// resolves to a profile the identity is not authorized for.
+/// #995 follow-up round 3 — authorization-aware profile resolver for
+/// the API channel. Returns `Err(403)` when the header resolves to a
+/// profile the identity is not authorized for; falls back to
+/// `MAIN_PROFILE_ID` when no header is present (matching the legacy
+/// `api_profile_id_from_headers` contract, retired in this round).
+///
+/// The raw (unauthorized) variant was deleted because the only
+/// remaining caller — the standalone candidate walk in
+/// [`standalone_api_session_key_candidates_with_topic`] — is now
+/// reachable on a trusted hop AND must therefore reject cross-tenant
+/// headers up-front. Codex round-2 review called out the raw variant
+/// as bypass-prone for exactly this reason; the function now exists
+/// only in its `_authorized` form so future call sites can't
+/// reintroduce the same bug.
 #[allow(clippy::result_large_err)]
 fn api_profile_id_from_headers_authorized(
     state: &AppState,
@@ -299,14 +306,28 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
 /// The dedup pass collapses duplicates when the topic is empty (in
 /// which case the bare-key and raw-id forms coincide with their
 /// no-topic counterparts).
+///
+/// **#995 follow-up round 3 — authorization is REQUIRED**. This helper
+/// now uses [`api_profile_id_from_headers_authorized`] internally, so
+/// a cross-tenant `X-Profile-Id` on a trusted hop produces an `Err`
+/// `Response` (403) instead of resolving to the victim profile id.
+/// Every caller already authorized via
+/// [`authorized_routed_profile_id_from_headers`] at the handler
+/// entry, so this is defense-in-depth: if a future caller is added
+/// that forgets to gate up-front, the candidate walk itself rejects
+/// the cross-tenant header rather than building candidates against
+/// the victim profile. Codex round-2 review specifically called out
+/// the standalone `session_messages` path as bypass-prone for exactly
+/// this reason.
+#[allow(clippy::result_large_err)]
 fn standalone_api_session_key_candidates_with_topic(
     state: &AppState,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     session_id: &str,
     topic: Option<&str>,
-) -> Vec<SessionKey> {
-    let profile_id = api_profile_id_from_headers(state, headers);
+) -> Result<Vec<SessionKey>, Response> {
+    let profile_id = api_profile_id_from_headers_authorized(state, headers, identity)?;
     let topic = topic.unwrap_or_default();
 
     // Always probe the resolved profile's own canonical key first.
@@ -356,7 +377,7 @@ fn standalone_api_session_key_candidates_with_topic(
         }
     }
     candidates.dedup_by(|left, right| left.0 == right.0);
-    candidates
+    Ok(candidates)
 }
 
 fn encode_api_session_path_id(id: &str) -> String {
@@ -552,6 +573,23 @@ pub async fn session_messages(
     // source=full: always proxy to gateway, which owns the canonical JSONL history.
     let use_full = params.source.as_deref() == Some("full");
 
+    // #995 follow-up round 3 — Layer-2 authorization gate BEFORE any
+    // standalone-store candidate walk. Pre-fix, the standalone path at
+    // lines 587-620 built candidate `SessionKey`s using the raw
+    // `api_profile_id_from_headers` (which trusts whatever
+    // `X-Profile-Id` the request carries on a trusted hop) and returned
+    // messages from those candidates before ever hitting the gateway
+    // gate at the bottom of this function. The result: an authenticated
+    // non-admin user on a loopback hop could read another tenant's
+    // session messages by forging `X-Profile-Id`. Codex round-2 quote:
+    // "Passing `identity` only affects fallback breadth; it does not
+    // reject cross-tenant headers." This call rejects cross-tenant
+    // headers up-front; admin / owner / self continue past it.
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
+
     // Try standalone store first in local mode.
     if !use_full {
         if let Some(sessions) = &state.sessions {
@@ -587,13 +625,16 @@ pub async fn session_messages(
             // unlocks the unprofiled fallbacks even when the request
             // resolved to a hosted profile (admin already has read-all
             // privileges, so this is no privilege escalation).
-            let candidate_keys = standalone_api_session_key_candidates_with_topic(
+            let candidate_keys = match standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
                 identity_ref,
                 &id,
                 params.topic.as_deref(),
-            );
+            ) {
+                Ok(keys) => keys,
+                Err(response) => return response,
+            };
             let mut sess = sessions.lock().await;
             let mut chosen: Option<&SessionKey> = None;
             for key in &candidate_keys {
@@ -1102,8 +1143,16 @@ pub async fn update_session_title(
             Ok(pid) => pid,
             Err(response) => return response,
         };
-    let candidates =
-        standalone_api_session_key_candidates_with_topic(&state, &headers, identity_ref, &id, None);
+    let candidates = match standalone_api_session_key_candidates_with_topic(
+        &state,
+        &headers,
+        identity_ref,
+        &id,
+        None,
+    ) {
+        Ok(keys) => keys,
+        Err(response) => return response,
+    };
 
     // #924 BLOCK 3: each candidate `SessionKey` may belong to a
     // different profile (the candidate set includes the resolved
@@ -1184,8 +1233,16 @@ pub async fn delete_session(
             Ok(pid) => pid,
             Err(response) => return response,
         };
-    let candidates =
-        standalone_api_session_key_candidates_with_topic(&state, &headers, identity_ref, &id, None);
+    let candidates = match standalone_api_session_key_candidates_with_topic(
+        &state,
+        &headers,
+        identity_ref,
+        &id,
+        None,
+    ) {
+        Ok(keys) => keys,
+        Err(response) => return response,
+    };
 
     // #924 BLOCK 3: route each candidate through the profile-aware
     // SessionManager resolver — turn persistence writes to the
@@ -3450,7 +3507,8 @@ mod tests {
             Some(&AuthIdentity::Admin),
             "telegram:123",
             None,
-        );
+        )
+        .expect("admin identity is always authorized");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         assert!(
             !keys.iter().any(|k| *k == "telegram:123"),
@@ -3574,7 +3632,8 @@ mod tests {
         // is returned.
         let candidates = standalone_api_session_key_candidates_with_topic(
             &state, &headers, None, "web-7c9e", None,
-        );
+        )
+        .expect("unauthenticated → no header authorization check required");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         // Profiled key must come first so existing chat-history reads keep
         // hitting the canonical write target before walking fallbacks.

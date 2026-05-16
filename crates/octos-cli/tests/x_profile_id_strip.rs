@@ -32,10 +32,14 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use axum::Extension;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{Request, StatusCode};
-use octos_cli::api::{AppState, build_router};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+use octos_cli::api::{
+    AppState, TestAuthIdentity, TestSessionMessagesPaginationParams, build_router,
+    test_session_messages,
+};
 use tempfile::TempDir;
 use tower::util::ServiceExt;
 
@@ -625,5 +629,219 @@ async fn ws_upgrade_with_cross_tenant_header_on_trusted_hop_is_403() {
         "WS upgrade with cross-tenant X-Profile-Id on TRUSTED hop must \
          be denied before any frames are exchanged — GAP-6 of #995 \
          follow-up review"
+    );
+}
+
+/// Marker content stored in tenant B's session — used by the admin
+/// happy-path test to confirm the response body actually carries B's
+/// data (not an empty page from a cross-tenant 403 silently mapped to
+/// `[]`, and not an accidental fall-through to tenant A's history).
+const TENANT_B_MARKER: &str = "tenant-b-session-marker-payload";
+
+/// Build an `AppState` wired with a real `SessionManager` + a
+/// `profile_store`. Persists a single user message with
+/// [`TENANT_B_MARKER`] under tenant B's canonical
+/// `<profile>:api:<session_id>` key so `session_messages` can return
+/// it when authorized. Returns `(state, session_id)`.
+async fn build_state_with_sessions_for_tenant_b(
+    dir: &TempDir,
+    profiles: &[(&str, Option<&str>)],
+    tenant_b_id: &str,
+    session_id: &str,
+) -> Arc<AppState> {
+    let profile_store = Arc::new(octos_cli::profiles::ProfileStore::open(dir.path()).unwrap());
+    for (id, parent) in profiles {
+        let profile = octos_cli::profiles::UserProfile {
+            id: (*id).into(),
+            name: (*id).into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: parent.map(|p| p.into()),
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profile_store.save(&profile).unwrap();
+    }
+
+    let sessions_dir = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let manager = octos_bus::SessionManager::open(&sessions_dir).unwrap();
+    let sessions = Arc::new(tokio::sync::Mutex::new(manager));
+
+    // Persist tenant B's marker message under the canonical profiled
+    // key — the same shape `session_messages` probes first. Use a
+    // dedicated scope so the lock drops before we hand the manager to
+    // the AppState (the helper holds an exclusive lock during seed).
+    {
+        let key = octos_core::SessionKey::with_profile(tenant_b_id, "api", session_id);
+        let mut sess = sessions.lock().await;
+        sess.add_message(&key, octos_core::Message::user(TENANT_B_MARKER))
+            .await
+            .unwrap();
+    }
+
+    Arc::new(AppState {
+        profile_store: Some(profile_store),
+        sessions: Some(sessions),
+        auth_token: Some("admin-secret".into()),
+        ..AppState::empty_for_tests()
+    })
+}
+
+/// **#995 follow-up ROUND 3 — `session_messages` STANDALONE PATH.**
+///
+/// Codex round-2 review flagged the standalone `session_messages`
+/// path (`handlers.rs:306` → `api_profile_id_from_headers` raw) as
+/// the last bypass-prone surface in this PR:
+///
+/// > Passing `identity` only affects fallback breadth; it does not
+/// > reject cross-tenant headers. WS upgrade likely mitigates current
+/// > external reachability, but the handler remains bypass-prone /
+/// > re-exposure fragile.
+///
+/// This test reproduces the exact bypass shape: authenticated
+/// non-admin user `alice` on a TRUSTED (loopback) hop with
+/// `X-Profile-Id: bob`. Pre-fix, the handler built candidate
+/// `SessionKey`s using bob's profile id (the forged header) and
+/// returned bob's messages with `200 OK`. Post-fix, the
+/// `authorized_routed_profile_id_from_headers` gate at the top of
+/// `session_messages` (and the matching gate inside
+/// `standalone_api_session_key_candidates_with_topic` for
+/// defense-in-depth) rejects the request with `403` before any
+/// candidate is constructed.
+#[tokio::test]
+async fn should_reject_session_messages_cross_tenant_header_on_trusted_hop() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "web-tenant-b-secret";
+    let state = build_state_with_sessions_for_tenant_b(
+        &dir,
+        &[("alice", None), ("bob", None)],
+        "bob",
+        session_id,
+    )
+    .await;
+
+    // Non-admin user identity for `alice`. `AuthIdentity::User` with
+    // `UserRole::User` so `is_authorized_for_profile` does not
+    // short-circuit on the admin-role branch.
+    let identity = Some(Extension(TestAuthIdentity::User {
+        id: "alice".into(),
+        role: octos_cli::user_store::UserRole::User,
+    }));
+
+    // The strip-middleware Layer 1 isn't relevant here (we're calling
+    // the handler directly, which is what the WS dispatcher does
+    // post-upgrade with the original headers preserved on a trusted
+    // hop). What matters is Layer 2: the handler MUST reject the
+    // cross-tenant header even though the request appears to come
+    // from loopback / a trusted proxy.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-profile-id", HeaderValue::from_static("bob"));
+
+    let response = test_session_messages(
+        axum::extract::State(state),
+        headers,
+        identity,
+        axum::extract::Path(session_id.to_string()),
+        axum::extract::Query(TestSessionMessagesPaginationParams {
+            limit: 100,
+            offset: 0,
+            source: None,
+            since_seq: None,
+            topic: None,
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "authenticated non-admin user with X-Profile-Id pointing to a \
+         different tenant must be rejected with 403 BEFORE any session \
+         candidate is built. Got {} — this is the bypass shape codex \
+         round-2 flagged.",
+        response.status()
+    );
+
+    // Belt-and-suspenders: drain the body and confirm the response is
+    // NOT carrying tenant B's marker. A status-only check would miss
+    // a future regression where the 403 path accidentally serializes
+    // the candidate payload.
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&body).unwrap_or("<non-utf8>");
+    assert!(
+        !body_str.contains(TENANT_B_MARKER),
+        "403 response body must NOT contain tenant B's marker; got: {body_str}"
+    );
+}
+
+/// **#995 follow-up ROUND 3 — admin happy path on standalone
+/// `session_messages`.**
+///
+/// Admin auth + a cross-tenant `X-Profile-Id` on a TRUSTED hop is the
+/// legitimate per-tenant narrowing flow Caddy uses (admin token in
+/// front of a tenant subdomain). `is_authorized_for_profile`
+/// short-circuits to `true` on `AuthIdentity::Admin`, so the request
+/// MUST proceed past the new authorization gate and actually return
+/// tenant B's messages with `200 OK`.
+///
+/// Codex round 2 specifically flagged the predecessor test ("only
+/// asserts not 403/401"). This test goes further: it asserts
+/// `StatusCode::OK` AND that the response body literally contains
+/// [`TENANT_B_MARKER`], so a regression that silently substitutes
+/// tenant A's data (or returns an empty page) is caught.
+#[tokio::test]
+async fn should_serve_session_messages_when_admin_with_cross_tenant_header_on_trusted_hop() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "web-tenant-b-canonical";
+    let state = build_state_with_sessions_for_tenant_b(
+        &dir,
+        &[("alice", None), ("bob", None)],
+        "bob",
+        session_id,
+    )
+    .await;
+
+    let identity = Some(Extension(TestAuthIdentity::Admin));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-profile-id", HeaderValue::from_static("bob"));
+
+    let response = test_session_messages(
+        axum::extract::State(state),
+        headers,
+        identity,
+        axum::extract::Path(session_id.to_string()),
+        axum::extract::Query(TestSessionMessagesPaginationParams {
+            limit: 100,
+            offset: 0,
+            source: None,
+            since_seq: None,
+            topic: None,
+        }),
+    )
+    .await;
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&body).unwrap_or("<non-utf8>");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin + cross-tenant X-Profile-Id on TRUSTED hop must serve \
+         the targeted tenant's messages with 200 OK (legitimate Caddy \
+         narrowing flow). Got status {status}, body {body_str}"
+    );
+    assert!(
+        body_str.contains(TENANT_B_MARKER),
+        "admin response must contain tenant B's marker `{TENANT_B_MARKER}`; \
+         got body: {body_str}"
     );
 }

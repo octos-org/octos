@@ -49,6 +49,23 @@ pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_doma
 pub mod testing {
     pub use super::handlers::{SiteBuildError, preview_build_error_response};
 }
+
+// #995 follow-up round 3 — Integration tests in
+// `crates/octos-cli/tests/x_profile_id_strip.rs` need to drive
+// `handlers::session_messages` directly: the REST route
+// `GET /api/sessions/{id}/messages` was retired in M12 Phase D-5, so
+// there's no `build_router` path to hit the bypass shape codex flagged.
+// The function (already `pub`) and its query params type are exposed
+// here for that purpose, plus `AuthIdentity` so tests can construct
+// non-admin and admin identities directly without booting a real auth
+// middleware stack.
+#[doc(hidden)]
+pub use handlers::{
+    PaginationParams as TestSessionMessagesPaginationParams,
+    session_messages as test_session_messages,
+};
+#[doc(hidden)]
+pub use router::AuthIdentity as TestAuthIdentity;
 pub use swarm::{
     BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
     SubtaskView, SwarmBudgetSpec, SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest,
