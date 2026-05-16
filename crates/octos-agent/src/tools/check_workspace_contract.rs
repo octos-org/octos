@@ -125,8 +125,47 @@ impl Tool for CheckWorkspaceContractTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_git::WorkspaceProjectKind;
+    use crate::validators::{
+        VALIDATOR_RESULT_SCHEMA_VERSION, ValidatorLedger, ValidatorOutcome, ValidatorPhase,
+        ValidatorStatus,
+    };
+    use crate::workspace_git::{WorkspaceProjectKind, workspace_validator_ledger_path};
     use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+
+    /// Minimal PPTX magic-bytes prefix: ZIP local-file-header signature.
+    /// Required so `MagicByteKind::Pptx` (wired into the slides-kind policy
+    /// by octos #997) accepts the placeholder deck.
+    const PPTX_MAGIC_BYTES: &[u8] = &[
+        0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Seed a `Pass` outcome for the slides-kind PPTX `MagicBytes` validator
+    /// (octos #997) so `inspect_workspace_contract` — which reads only the
+    /// ledger — reports `ready = true` for a fully-ready fixture.
+    fn seed_slides_pptx_pass(project_root: &std::path::Path, slug: &str) {
+        let ledger_path = workspace_validator_ledger_path(project_root);
+        if let Some(parent) = ledger_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let ledger = ValidatorLedger::open(&ledger_path).unwrap();
+        let outcome = ValidatorOutcome {
+            schema_version: VALIDATOR_RESULT_SCHEMA_VERSION,
+            validator_id: "slides.mofa_slides.pptx_magic_bytes".into(),
+            phase: ValidatorPhase::Completion,
+            kind: "magic_bytes".into(),
+            repo_label: format!("slides/{slug}"),
+            required: true,
+            required_tier: "hard".into(),
+            status: ValidatorStatus::Pass,
+            reason: "seeded for test fixture".into(),
+            duration_ms: 0,
+            evidence_path: None,
+            stderr: None,
+            started_at: chrono::Utc::now(),
+        };
+        ledger.append(&outcome).unwrap();
+    }
 
     fn write_file(path: impl AsRef<std::path::Path>, contents: &str) {
         let path = path.as_ref();
@@ -134,6 +173,14 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, contents).unwrap();
+    }
+
+    fn write_pptx_bytes(path: impl AsRef<std::path::Path>) {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, PPTX_MAGIC_BYTES).unwrap();
     }
 
     #[tokio::test]
@@ -149,8 +196,11 @@ mod tests {
         write_file(repo_root.join("script.js"), "// slides");
         write_file(repo_root.join("memory.md"), "# memory");
         write_file(repo_root.join("changelog.md"), "# changelog");
-        write_file(repo_root.join("output/deck.pptx"), "deck");
+        // octos #997: write real PPTX magic bytes + seed the validator pass
+        // outcome so the slides-kind project-scope gate is satisfied.
+        write_pptx_bytes(repo_root.join("output/deck.pptx"));
         write_file(repo_root.join("output/imgs/slide-01.png"), "png");
+        seed_slides_pptx_pass(&repo_root, "demo");
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool
@@ -182,8 +232,11 @@ mod tests {
             write_file(root.join("memory.md"), "# memory");
             write_file(root.join("changelog.md"), "# changelog");
         }
-        write_file(ready_root.join("output/deck.pptx"), "deck");
+        // octos #997: only the "ready" workspace gets the PPTX magic bytes
+        // and a seeded validator pass; "broken" stays unready.
+        write_pptx_bytes(ready_root.join("output/deck.pptx"));
         write_file(ready_root.join("output/imgs/slide-01.png"), "png");
+        seed_slides_pptx_pass(&ready_root, "ready");
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool

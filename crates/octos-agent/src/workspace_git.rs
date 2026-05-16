@@ -993,7 +993,46 @@ fn is_git_index_lock_error(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION;
     use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+
+    /// Minimal PPTX magic-bytes prefix: ZIP local-file-header signature
+    /// (`PK\x03\x04`) used by `MagicByteKind::Pptx`. Plus padding so a
+    /// downstream `file_size_min` check sees a reasonable file size.
+    const PPTX_MAGIC_BYTES: &[u8] = &[
+        0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Seed a `Pass` outcome for the slides-kind PPTX `MagicBytes` validator
+    /// declared in `WorkspacePolicy::for_kind(Slides)` (octos #997). Tests
+    /// that rely on `inspect_workspace_contract` reporting `ready = true`
+    /// against a ready slides workspace must seed this outcome, since
+    /// `inspect_workspace_contract` only reads the persisted ledger — it
+    /// does not actually run validators.
+    fn seed_slides_pptx_pass(project_root: &Path, repo_label: &str) {
+        let ledger_path = workspace_validator_ledger_path(project_root);
+        if let Some(parent) = ledger_path.parent() {
+            std::fs::create_dir_all(parent).expect("create ledger dir");
+        }
+        let ledger = ValidatorLedger::open(&ledger_path).expect("open validator ledger");
+        let outcome = ValidatorOutcome {
+            schema_version: VALIDATOR_RESULT_SCHEMA_VERSION,
+            validator_id: "slides.mofa_slides.pptx_magic_bytes".into(),
+            phase: crate::validators::ValidatorPhase::Completion,
+            kind: "magic_bytes".into(),
+            repo_label: repo_label.to_string(),
+            required: true,
+            required_tier: "hard".into(),
+            status: ValidatorStatus::Pass,
+            reason: "seeded for test fixture".into(),
+            duration_ms: 0,
+            evidence_path: None,
+            stderr: None,
+            started_at: chrono::Utc::now(),
+        };
+        ledger.append(&outcome).expect("seed validator outcome");
+    }
 
     #[test]
     fn detects_slides_repo_from_changed_path() {
@@ -1158,7 +1197,7 @@ mod tests {
         std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
-        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), PPTX_MAGIC_BYTES).unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
 
         let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
@@ -1171,6 +1210,10 @@ mod tests {
             "Initialize slides workspace",
         )
         .unwrap();
+        // octos #997: the slides-kind policy now declares a required PPTX
+        // MagicBytes validator. `inspect_workspace_contract` reads the
+        // ledger — seed a Pass so `ready` reflects this fixture's intent.
+        seed_slides_pptx_pass(&slides_root, "slides/deck-bundle");
 
         let statuses = inspect_workspace_contracts(temp.path()).unwrap();
         let status = &statuses[0];
@@ -1234,13 +1277,19 @@ mod tests {
         std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
-        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), PPTX_MAGIC_BYTES).unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
         write_workspace_policy(
             &slides_root,
             &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
         )
         .unwrap();
+        // octos #997: slides-kind policy now declares a required PPTX
+        // MagicBytes validator; seed a Pass outcome BEFORE the initial
+        // commit so the ledger entry is part of the committed state and
+        // `status.dirty` remains false. (Real harness runs the validator
+        // after a turn and persists this file via the same ledger API.)
+        seed_slides_pptx_pass(&slides_root, "slides/deck-e");
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
@@ -1302,6 +1351,10 @@ mod tests {
         policy.artifacts.entries.clear();
         policy.validation.on_turn_end = vec!["file_count_eq:output/*.png:2".into()];
         policy.validation.on_completion = vec!["any_exists:output/*.png|output/*.pdf".into()];
+        // This test exercises PNG file-count semantics, not the slides-kind
+        // PPTX MagicBytes validator (octos #997). Clear the validator list so
+        // the gate does not require a PPTX fixture that isn't relevant here.
+        policy.validation.validators = Vec::new();
         write_workspace_policy(&slides_root, &policy).unwrap();
         initialize_and_commit(
             &slides_root,

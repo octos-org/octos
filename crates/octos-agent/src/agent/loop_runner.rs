@@ -4409,7 +4409,11 @@ printf '{"output":"voice saved","success":true}\n'
     }
 
     fn make_managed_slides_workspace(tmp_root: &std::path::Path, slug: &str, ready: bool) {
-        use crate::workspace_git::WorkspaceProjectKind;
+        use crate::validators::{
+            VALIDATOR_RESULT_SCHEMA_VERSION, ValidatorLedger, ValidatorOutcome, ValidatorPhase,
+            ValidatorStatus,
+        };
+        use crate::workspace_git::{WorkspaceProjectKind, workspace_validator_ledger_path};
         use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
         let repo_root = tmp_root.join("slides").join(slug);
         std::fs::create_dir_all(&repo_root).unwrap();
@@ -4425,8 +4429,39 @@ printf '{"output":"voice saved","success":true}\n'
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
         if ready {
             std::fs::create_dir_all(repo_root.join("output/imgs")).unwrap();
-            std::fs::write(repo_root.join("output/deck.pptx"), "fake-deck").unwrap();
+            // octos #997: write real PPTX magic bytes so the project-scope
+            // PPTX `MagicBytes` validator wired in
+            // `WorkspacePolicy::for_kind(Slides)` does not fail the gate.
+            let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
+            pptx.extend_from_slice(&[0u8; 32]);
+            std::fs::write(repo_root.join("output/deck.pptx"), &pptx).unwrap();
             std::fs::write(repo_root.join("output/imgs/slide-01.png"), "fake-png").unwrap();
+            // octos #997: seed a `Pass` outcome for the slides-kind PPTX
+            // MagicBytes validator. `inspect_workspace_contract` reads only
+            // the persisted ledger — it does not actually run validators —
+            // so a fully-ready fixture must seed this entry to mirror what
+            // the real harness writes after `run_declared_validators`.
+            let ledger_path = workspace_validator_ledger_path(&repo_root);
+            if let Some(parent) = ledger_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let ledger = ValidatorLedger::open(&ledger_path).unwrap();
+            let outcome = ValidatorOutcome {
+                schema_version: VALIDATOR_RESULT_SCHEMA_VERSION,
+                validator_id: "slides.mofa_slides.pptx_magic_bytes".into(),
+                phase: ValidatorPhase::Completion,
+                kind: "magic_bytes".into(),
+                repo_label: format!("slides/{slug}"),
+                required: true,
+                required_tier: "hard".into(),
+                status: ValidatorStatus::Pass,
+                reason: "seeded for test fixture".into(),
+                duration_ms: 0,
+                evidence_path: None,
+                stderr: None,
+                started_at: chrono::Utc::now(),
+            };
+            ledger.append(&outcome).unwrap();
         }
     }
 

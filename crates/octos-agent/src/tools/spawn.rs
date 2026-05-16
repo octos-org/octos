@@ -3222,8 +3222,35 @@ mod tests {
         std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
         std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        // octos #997: write real PPTX magic bytes + seed the slides-kind
+        // MagicBytes validator pass so the contract-gated terminal delivery
+        // step actually surfaces `output/deck.pptx`.
+        let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx.extend_from_slice(b"final");
+        std::fs::write(repo_root.join("output/deck.pptx"), pptx).unwrap();
         std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+        let ledger_path = crate::workspace_git::workspace_validator_ledger_path(&repo_root);
+        if let Some(parent) = ledger_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let validator_ledger = crate::validators::ValidatorLedger::open(&ledger_path).unwrap();
+        validator_ledger
+            .append(&crate::validators::ValidatorOutcome {
+                schema_version: crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION,
+                validator_id: "slides.mofa_slides.pptx_magic_bytes".into(),
+                phase: crate::validators::ValidatorPhase::Completion,
+                kind: "magic_bytes".into(),
+                repo_label: "slides/demo".into(),
+                required: true,
+                required_tier: "hard".into(),
+                status: crate::validators::ValidatorStatus::Pass,
+                reason: "seeded for test fixture".into(),
+                duration_ms: 0,
+                evidence_path: None,
+                stderr: None,
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new());
         supervisor.enable_persistence(&ledger).unwrap();
@@ -3816,10 +3843,40 @@ PY
         std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
         std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        // octos #997: real PPTX magic bytes so the slides-kind project-scope
+        // `MagicBytes` validator does not block delivery on a fake-bytes deck.
+        let mut pptx_final = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_final.extend_from_slice(b"final");
+        std::fs::write(repo_root.join("output/deck.pptx"), pptx_final).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(repo_root.join("output/deck-draft.pptx"), "draft").unwrap();
+        let mut pptx_draft = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_draft.extend_from_slice(b"draft");
+        std::fs::write(repo_root.join("output/deck-draft.pptx"), pptx_draft).unwrap();
         std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+        // octos #997: seed the slides-kind PPTX MagicBytes validator pass so
+        // `inspect_workspace_contract_at_root` reports `ready = true`.
+        let ledger_path = crate::workspace_git::workspace_validator_ledger_path(&repo_root);
+        if let Some(parent) = ledger_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let ledger = crate::validators::ValidatorLedger::open(&ledger_path).unwrap();
+        ledger
+            .append(&crate::validators::ValidatorOutcome {
+                schema_version: crate::validators::VALIDATOR_RESULT_SCHEMA_VERSION,
+                validator_id: "slides.mofa_slides.pptx_magic_bytes".into(),
+                phase: crate::validators::ValidatorPhase::Completion,
+                kind: "magic_bytes".into(),
+                repo_label: "slides/demo".into(),
+                required: true,
+                required_tier: "hard".into(),
+                status: crate::validators::ValidatorStatus::Pass,
+                reason: "seeded for test fixture".into(),
+                duration_ms: 0,
+                evidence_path: None,
+                stderr: None,
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
 
         let workflow = WorkflowMetadata {
             workflow_kind: "slides".to_string(),
