@@ -15,6 +15,7 @@ mod events_harness;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;
+pub mod preview;
 pub mod purge;
 mod router;
 mod static_files;
@@ -38,6 +39,16 @@ pub mod webhook_proxy;
 pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
+
+/// Test-only re-exports for the build_output_dir validation suite.
+/// Not part of the public API — used by
+/// `crates/octos-cli/tests/build_output_dir_validation.rs` to assert
+/// the handler-layer HTTP status mapping without spinning up the
+/// full Axum router. Codex round-2 follow-up to issue #996.
+#[doc(hidden)]
+pub mod testing {
+    pub use super::handlers::{SiteBuildError, preview_build_error_response};
+}
 pub use swarm::{
     BroadcasterSwarmEventSink, CostAttributionView, CostAttributionsResponse, DispatchIndexRow,
     SubtaskView, SwarmBudgetSpec, SwarmContextSpec, SwarmDispatchDetail, SwarmDispatchRequest,
