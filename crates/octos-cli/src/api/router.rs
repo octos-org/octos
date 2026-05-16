@@ -153,6 +153,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/site-preview/{session_id}/{site_slug}/{*path}",
             get(handlers::serve_site_preview_path),
         )
+        // Issue #994 (P0 sev2 cross-tenant data read): these routes
+        // used to live on the unauthenticated `public` branch below
+        // and resolved profile + session purely from the URL tuple.
+        // They now require user auth and the handler asserts that
+        // the authenticated identity owns the route's `profile_id`
+        // AND the route's `session_id` resolves to a workspace under
+        // that profile's data directory — see
+        // [`handlers::serve_owned_site_preview_root`].
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}",
+            get(handlers::serve_owned_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/",
+            get(handlers::serve_owned_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}",
+            get(handlers::serve_owned_site_preview_path),
+        )
         .route("/api/files/list", get(handlers::list_content_files))
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
@@ -557,21 +577,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         Router::new().route("/api/internal/frps-auth", post(frps_plugin::frps_auth));
 
     // Unauthenticated routes (static files + auth endpoints + webhook proxy + internal)
+    //
+    // Issue #994 (P0 sev2 cross-tenant data read): `/api/preview/...`
+    // used to live here. It now sits on the authenticated `chat_api`
+    // group above — the handler asserts identity-owns-profile +
+    // session-belongs-to-profile, so the URL tuple is no longer
+    // sufficient to read another tenant's built site.
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
-        .route(
-            "/api/preview/{profile_id}/{session_id}/{site_slug}",
-            get(handlers::serve_public_site_preview_root),
-        )
-        .route(
-            "/api/preview/{profile_id}/{session_id}/{site_slug}/",
-            get(handlers::serve_public_site_preview_root),
-        )
-        .route(
-            "/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}",
-            get(handlers::serve_public_site_preview_path),
-        )
         .route(
             "/api/register/setup-script/{id}/{auth_token}",
             get(admin::register_setup_script_public),
