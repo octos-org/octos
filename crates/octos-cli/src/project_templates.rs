@@ -668,6 +668,12 @@ pub enum BuildOutputDirError {
     /// The value did not match a per-template scaffold output dir
     /// (`dist`, `out`, or `docs`).
     NotAllowListed,
+    /// The value was on the global allow-list but did NOT match the
+    /// expected output dir for `metadata.template`. The closed contract
+    /// is per-template, not global — `astro-site` ↦ `dist` only, etc.
+    /// Pinned by codex's NEEDS-FOLLOWUP on the original fix: a global
+    /// allow-list lets `astro-site + docs` slip through. Issue #996.
+    TemplateMismatch,
     /// Canonicalising `project_dir.join(value)` failed or resolved
     /// outside `project_dir` (e.g. through a symlink).
     OutsideProject,
@@ -685,6 +691,10 @@ impl std::fmt::Display for BuildOutputDirError {
                 f,
                 "build_output_dir is not an allow-listed template output (dist, out, docs)"
             ),
+            Self::TemplateMismatch => write!(
+                f,
+                "build_output_dir does not match the expected output for this template"
+            ),
             Self::OutsideProject => {
                 write!(f, "build_output_dir resolves outside the project directory")
             }
@@ -695,15 +705,28 @@ impl std::fmt::Display for BuildOutputDirError {
 impl std::error::Error for BuildOutputDirError {}
 
 /// Per-template scaffold output directories. The values come from
-/// [`crate::workflow_families::site::SiteTemplate::output_dir`] — keep
-/// the two lists in sync. Updating an existing template's output dir
-/// requires updating both.
+/// [`crate::workflow_runtime::workflow_families::SiteTemplate::output_dir`]
+/// — keep the two lists in sync. Updating an existing template's
+/// output dir requires updating both.
+///
+/// NOTE: this constant is the *global* allow-list and is kept as a
+/// defence-in-depth gate. The authoritative check is per-template
+/// equality against
+/// [`crate::workflow_runtime::workflow_families::SiteTemplate::output_dir`]
+/// — see [`validated_build_output_dir_form`] for the strict-equality
+/// pass.
 const ALLOWED_BUILD_OUTPUT_DIRS: &[&str] = &["dist", "out", "docs"];
 
 /// Validate the structural form of `metadata.build_output_dir`
 /// without touching disk. Returns the joined `project_dir.join(value)`
 /// on success — caller may further enforce canonical-descendant via
 /// [`canonical_descendant_check`] once the output dir exists on disk.
+///
+/// Per-template equality: the value must equal
+/// `SiteTemplate::from_slug(metadata.template).output_dir()`. This
+/// closes the codex-flagged "astro-site + docs" gap where a global
+/// allow-list let cross-template values slip through. Issue #996
+/// follow-up.
 fn validated_build_output_dir_form(
     metadata: &SiteProjectMetadata,
     project_dir: &Path,
@@ -734,6 +757,20 @@ fn validated_build_output_dir_form(
 
     if !ALLOWED_BUILD_OUTPUT_DIRS.contains(&raw) {
         return Err(BuildOutputDirError::NotAllowListed);
+    }
+
+    // Per-template equality: the codex review's NEEDS-FOLLOWUP. The
+    // closed contract is per template, not global — `astro-site` MUST
+    // resolve to `dist`, never `docs`, and so on. Without this gate a
+    // malicious `mofa-site-session.json` could keep `template:
+    // "astro-site"` (which controls the build command) while pointing
+    // `build_output_dir` at `docs` (which controls what the preview
+    // serves), enabling cross-template surface mismatches.
+    let expected =
+        crate::workflow_runtime::workflow_families::SiteTemplate::from_slug(&metadata.template)
+            .output_dir();
+    if raw != expected {
+        return Err(BuildOutputDirError::TemplateMismatch);
     }
 
     Ok(project_dir.join(value_path))
