@@ -1790,10 +1790,39 @@ fn run_build_command(command: &mut std::process::Command, label: &str) -> Result
     }
 }
 
+/// Categorised reason `ensure_site_build_output` rejected a preview
+/// build. Codex BLOCKING #2 (issue #996 follow-up): the caller maps
+/// `InvalidMetadata` to HTTP 400 with a scrubbed body and the build/
+/// missing-artifact variants to HTTP 5xx with the project path
+/// stripped out — previously every error returned 200 with a "Build
+/// Failed" page and leaked the full project path in the body.
+#[derive(Debug)]
+enum SiteBuildError {
+    /// The LLM-controlled metadata failed validation (allow-list,
+    /// per-template equality, `..` escape, etc.). 4xx surface.
+    InvalidMetadata(BuildOutputDirError),
+    /// The template slug is not one we know how to build (post
+    /// metadata-validation; the validator already rejects unknown
+    /// templates via the `TemplateMismatch` path because their
+    /// `output_dir()` defaults to `docs`, but keep this branch for
+    /// defence-in-depth). 4xx surface.
+    UnsupportedTemplate,
+    /// The build tool (npm / quarto) exited non-zero. 5xx surface,
+    /// scrubbed body.
+    BuildCommandFailed,
+    /// The build claimed to succeed but the expected output dir was
+    /// not created. 5xx surface, scrubbed body.
+    OutputArtifactMissing,
+    /// Post-build re-validation tripped — typically a symlink that
+    /// the build step left behind. 4xx surface (it's a contract
+    /// violation by the build step, not a server hiccup).
+    PostBuildValidation(BuildOutputDirError),
+}
+
 fn ensure_site_build_output(
     project_dir: &std::path::Path,
     metadata: &SiteProjectMetadata,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<std::path::PathBuf, SiteBuildError> {
     fn site_build_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
         static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
         LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1815,8 +1844,8 @@ fn ensure_site_build_output(
     let _build_guard = build_lock.lock().unwrap();
     // Validate the LLM-controlled metadata field before we trust it
     // to derive the build output path. Issue #996.
-    let output_dir = output_dir_for_site(project_dir, metadata)
-        .map_err(|err| format!("invalid build_output_dir: {err}"))?;
+    let output_dir =
+        output_dir_for_site(project_dir, metadata).map_err(SiteBuildError::InvalidMetadata)?;
     if !site_build_needed(project_dir, &output_dir) {
         return Ok(output_dir);
     }
@@ -1825,35 +1854,34 @@ fn ensure_site_build_output(
         "quarto-lesson" => {
             let mut render = std::process::Command::new("quarto");
             render.current_dir(project_dir).arg("render");
-            run_build_command(&mut render, "quarto render")?;
+            run_build_command(&mut render, "quarto render")
+                .map_err(|_| SiteBuildError::BuildCommandFailed)?;
         }
         "astro-site" | "nextjs-app" | "react-vite" => {
             if !project_dir.join("node_modules").exists() {
                 let mut install = std::process::Command::new("npm");
                 install.current_dir(project_dir).arg("install");
                 apply_site_build_env(&mut install, project_dir);
-                run_build_command(&mut install, "npm install")?;
+                run_build_command(&mut install, "npm install")
+                    .map_err(|_| SiteBuildError::BuildCommandFailed)?;
             }
             let mut build = std::process::Command::new("npm");
             build.current_dir(project_dir).arg("run").arg("build");
             apply_site_build_env(&mut build, project_dir);
-            run_build_command(&mut build, "npm run build")?;
+            run_build_command(&mut build, "npm run build")
+                .map_err(|_| SiteBuildError::BuildCommandFailed)?;
         }
-        other => return Err(format!("unsupported site template: {other}")),
+        _ => return Err(SiteBuildError::UnsupportedTemplate),
     }
 
     if !output_dir.exists() {
-        return Err(format!(
-            "site build completed but {} was not created",
-            output_dir.display()
-        ));
+        return Err(SiteBuildError::OutputArtifactMissing);
     }
 
     // Re-validate now that the output dir exists on disk — this
     // re-runs the canonical-descendant check and catches symlinks
     // that the build step might have left behind.
-    output_dir_for_site(project_dir, metadata)
-        .map_err(|err| format!("invalid build_output_dir after build: {err}"))
+    output_dir_for_site(project_dir, metadata).map_err(SiteBuildError::PostBuildValidation)
 }
 
 fn safe_preview_join(root: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
@@ -1935,13 +1963,31 @@ fn resolve_preview_asset_path(
     Some(canonical_resolved)
 }
 
-async fn serve_preview_file(path: std::path::PathBuf) -> Response {
-    let data = match tokio::fs::read(&path).await {
+/// Serve a preview file with TOCTOU-safe semantics. Codex BLOCKING
+/// #1: the previous body called `tokio::fs::read`, which follows
+/// symlinks — an attacker who could swap `<output_dir>` (or any
+/// ancestor) for a symlink between the canonical-descendant check
+/// in [`resolve_preview_asset_path`] and the read here would escape
+/// the project dir even though the validator passed.
+///
+/// The replacement routes through
+/// [`crate::api::preview::serve_preview_no_follow`], which:
+/// 1. canonicalises both root and leaf,
+/// 2. checks descendant-of-root,
+/// 3. walks every ancestor with `symlink_metadata` and refuses any
+///    symlink,
+/// 4. opens the leaf with `O_NOFOLLOW` on Unix (or a
+///    pre-open `symlink_metadata` check on non-Unix).
+async fn serve_preview_file(output_dir: &std::path::Path, path: std::path::PathBuf) -> Response {
+    let project_root = output_dir.to_path_buf();
+    let leaf_for_headers = path.clone();
+    let data = match crate::api::preview::serve_preview_no_follow(project_root, path).await {
         Ok(data) => data,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let cache_control = if path.extension().and_then(|ext| ext.to_str()) == Some("html") {
+    let cache_control = if leaf_for_headers.extension().and_then(|ext| ext.to_str()) == Some("html")
+    {
         "no-cache, no-store, must-revalidate"
     } else {
         "public, max-age=30"
@@ -1952,7 +1998,7 @@ async fn serve_preview_file(path: std::path::PathBuf) -> Response {
         [
             (
                 axum::http::header::CONTENT_TYPE,
-                preview_content_type(&path),
+                preview_content_type(&leaf_for_headers),
             ),
             (axum::http::header::CACHE_CONTROL, cache_control),
         ],
@@ -1983,13 +2029,14 @@ async fn serve_site_preview_impl(
     };
 
     let Some(metadata) = read_site_project_metadata(&project_dir) else {
+        // Codex BLOCKING #2: don't leak `project_dir` in the error
+        // body. The session/slug names came from the URL so are
+        // safe to echo; the on-disk path is not.
         return site_preview_html(
             StatusCode::NOT_FOUND,
             "Missing Site Metadata",
             &format!(
-                "The project exists at `{}` but `{}` is missing or invalid.",
-                project_dir.display(),
-                "mofa-site-session.json",
+                "The scaffold for `{session_id}` / `{site_slug}` is missing or its `mofa-site-session.json` is invalid.",
             ),
         );
     };
@@ -2002,38 +2049,77 @@ async fn serve_site_preview_impl(
 
     let output_dir = match build_task.await {
         Ok(Ok(output_dir)) => output_dir,
-        Ok(Err(error)) => {
+        Ok(Err(error)) => return preview_build_error_response(&metadata.template, error),
+        Err(_join_error) => {
+            // Worker panicked — server-internal, no useful detail
+            // for the client.
             return site_preview_html(
-                StatusCode::OK,
-                "Preview Build Failed",
-                &format!(
-                    "Octos could not build the preview for `{}`.\n\n{}",
-                    metadata.template, error
-                ),
-            );
-        }
-        Err(error) => {
-            return site_preview_html(
-                StatusCode::OK,
-                "Preview Build Failed",
-                &format!("The preview worker crashed: {error}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Preview Worker Crashed",
+                "The preview build worker crashed. Please retry; if this persists check server logs.",
             );
         }
     };
 
     let Some(path) = resolve_preview_asset_path(&output_dir, &request_path) else {
+        // Codex BLOCKING #2: drop `output_dir.display()` — that's
+        // the project path. The request path is user-supplied so
+        // safe to echo.
         return site_preview_html(
             StatusCode::NOT_FOUND,
             "Preview Asset Missing",
             &format!(
-                "The built preview exists, but `{}` was not found under `{}`.",
-                request_path,
-                output_dir.display(),
+                "The built preview exists, but no asset was found for `{}`.",
+                if request_path.is_empty() {
+                    "/"
+                } else {
+                    request_path.as_str()
+                },
             ),
         );
     };
 
-    serve_preview_file(path).await
+    serve_preview_file(&output_dir, path).await
+}
+
+/// Map a `SiteBuildError` to a scrubbed HTTP response. Codex
+/// BLOCKING #2: validation failures are 4xx (the LLM messed up the
+/// metadata, not the server), build failures are 5xx, neither leaks
+/// the project path in the response body.
+fn preview_build_error_response(template: &str, error: SiteBuildError) -> Response {
+    match error {
+        SiteBuildError::InvalidMetadata(reason) => site_preview_html(
+            StatusCode::BAD_REQUEST,
+            "Preview Build Rejected",
+            &format!(
+                "Octos rejected the preview build for template `{template}`: {reason}.\n\nThe `mofa-site-session.json` metadata is invalid. Restore the original `build_output_dir` value (or scaffold the site again) and reload.",
+            ),
+        ),
+        SiteBuildError::UnsupportedTemplate => site_preview_html(
+            StatusCode::BAD_REQUEST,
+            "Preview Build Rejected",
+            &format!("Unsupported site template `{template}`."),
+        ),
+        SiteBuildError::PostBuildValidation(reason) => site_preview_html(
+            StatusCode::BAD_REQUEST,
+            "Preview Build Rejected",
+            &format!(
+                "Octos rejected the preview build for template `{template}` after the build step: {reason}.\n\nThe build artifact left an unsafe output directory. Re-scaffold or clean the build cache.",
+            ),
+        ),
+        SiteBuildError::BuildCommandFailed => site_preview_html(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Preview Build Failed",
+            &format!(
+                "The build tool failed for template `{template}`. Check server logs for the full build output.",
+            ),
+        ),
+        SiteBuildError::OutputArtifactMissing => site_preview_html(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Preview Build Failed",
+            "Preview build artifact missing — the build claimed success but produced no output.",
+        ),
+    }
 }
 
 /// GET /api/site-preview/{session_id}/{site_slug} — serve the preview root for a site session.
