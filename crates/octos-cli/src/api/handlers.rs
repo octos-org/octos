@@ -1428,6 +1428,65 @@ fn infer_profile_id_from_data_dir(data_dir: &std::path::Path) -> String {
         .to_string()
 }
 
+/// Decision: which profile id should the request resolve to, given the
+/// header-derived candidate (post-middleware — already stripped if the
+/// connection was untrusted), an identity-derived id, and the auth
+/// identity for an authorization check?
+///
+/// **Auth bypass fix (#995)**: the legacy precedence
+/// `header.or(identity)` let an authenticated request set
+/// `X-Profile-Id: <victim>` and read the victim's data dir. The current
+/// precedence is identity-first; if a header is *also* present (i.e.
+/// from a trusted proxy after the strip middleware ran), it must name
+/// a profile the identity is authorized to act on — otherwise we
+/// return `403`, never silently override.
+///
+/// - Unauthenticated request + header: legacy hint, pass through.
+/// - Authenticated + header MATCHES identity scope: use that profile
+///   (lets per-tenant Caddy ingress narrow admin auth to a tenant).
+/// - Authenticated + header is unauthorized: `403`.
+/// - Authenticated + no header: use identity's own profile.
+/// - Neither header nor identity: `BAD_REQUEST`.
+//
+// `clippy::result_large_err` is consistent with `resolve_profile_data_dir`
+// and the rest of this handler module — boxing the response just for this
+// helper would diverge from the surrounding style.
+#[allow(clippy::result_large_err)]
+pub(crate) fn decide_resolved_profile_id(
+    state: &AppState,
+    identity: Option<&AuthIdentity>,
+    header_profile_id: Option<&str>,
+    identity_profile_id: Option<&str>,
+) -> Result<String, Response> {
+    match (identity, header_profile_id) {
+        (Some(identity), Some(pid)) => {
+            if super::auth_handlers::is_authorized_for_profile(state, identity, pid) {
+                return Ok(pid.to_string());
+            }
+            tracing::warn!(
+                target: "octos::api::auth",
+                identity = ?identity,
+                requested_profile = %pid,
+                "X-Profile-Id denied — authenticated identity not authorized for the requested profile"
+            );
+            Err((StatusCode::FORBIDDEN, "forbidden").into_response())
+        }
+        (Some(_), None) => identity_profile_id.map(str::to_string).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing X-Profile-Id and no authenticated profile context",
+            )
+                .into_response()
+        }),
+        (None, Some(pid)) => Ok(pid.to_string()),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            "missing X-Profile-Id and no authenticated profile context",
+        )
+            .into_response()),
+    }
+}
+
 async fn resolve_profile_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -1442,26 +1501,25 @@ async fn resolve_profile_data_dir(
                 None => None,
             };
 
-            if let Some(pid) = header_profile_id.as_deref().or(identity_profile_id) {
-                match ps.get(pid) {
-                    Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
-                    Ok(None) => {
-                        return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
-                    }
-                    Err(error) => {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("profile lookup failed: {error}"),
-                        )
-                            .into_response());
-                    }
+            let pid = decide_resolved_profile_id(
+                state,
+                identity,
+                header_profile_id.as_deref(),
+                identity_profile_id,
+            )?;
+            match ps.get(&pid) {
+                Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
+                Ok(None) => {
+                    return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
+                }
+                Err(error) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("profile lookup failed: {error}"),
+                    )
+                        .into_response());
                 }
             }
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "missing X-Profile-Id and no authenticated profile context",
-            )
-                .into_response());
         }
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no profile store").into_response());
     }
@@ -4022,4 +4080,174 @@ mod tests {
     // The `appui_default_session_cwd` workspace-hint forwarding the
     // M11-F regression-fix test asserted is now exercised directly
     // through the WS turn dispatcher (`ui_protocol::run_standalone_turn`).
+
+    // ── #995 — `decide_resolved_profile_id` precedence + auth ──────────
+    //
+    // The legacy precedence was `header.or(identity)` (handlers.rs:1442
+    // before the fix), letting any authenticated request set
+    // `X-Profile-Id: <victim>` and walk into the victim's data dir. The
+    // current logic is identity-first; if a header is also present
+    // (i.e. coming from a trusted reverse proxy after the strip
+    // middleware ran) it must name a profile the identity is authorized
+    // for — otherwise we return `403`, never silently override.
+
+    use crate::api::auth_handlers::ADMIN_PROFILE_ID;
+    use crate::profiles::{ProfileStore, UserProfile};
+    use crate::user_store::UserRole;
+
+    fn make_profile(id: &str, parent_id: Option<&str>) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: parent_id.map(Into::into),
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Build a minimal `AppState` for `decide_resolved_profile_id` unit
+    /// tests with a profile_store containing the listed profiles.
+    fn state_with_profiles(profiles: &[(&str, Option<&str>)]) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open(dir.path()).unwrap();
+        for (id, parent) in profiles {
+            ps.save(&make_profile(id, *parent)).unwrap();
+        }
+        let state = AppState {
+            profile_store: Some(Arc::new(ps)),
+            ..AppState::empty_for_tests()
+        };
+        (dir, state)
+    }
+
+    #[test]
+    fn decide_uses_identity_when_no_header_present() {
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        };
+        let pid = decide_resolved_profile_id(&state, Some(&identity), None, Some("alice")).unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_uses_header_when_identity_is_authorized_admin() {
+        // Admin token can be narrowed to a specific tenant via X-Profile-Id
+        // when the request comes from the loopback Caddy ingress. This is
+        // the legitimate post-fix behaviour for hosted subdomains.
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let identity = AuthIdentity::Admin;
+        let pid = decide_resolved_profile_id(
+            &state,
+            Some(&identity),
+            Some("alice"),
+            Some(ADMIN_PROFILE_ID),
+        )
+        .unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_uses_header_when_identity_owns_sub_account_named_in_header() {
+        let (_dir, state) = state_with_profiles(&[("owner", None), ("owner-sub", Some("owner"))]);
+        let identity = AuthIdentity::User {
+            id: "owner".into(),
+            role: UserRole::User,
+        };
+        let pid =
+            decide_resolved_profile_id(&state, Some(&identity), Some("owner-sub"), Some("owner"))
+                .unwrap();
+        assert_eq!(pid, "owner-sub");
+    }
+
+    #[test]
+    fn decide_rejects_header_when_authenticated_identity_unauthorized_for_it() {
+        // #995 pre-fix bypass: authenticated as alice, header says bob.
+        // Pre-fix: `header.or(identity)` returned "bob" silently.
+        // Post-fix: 403, no leak.
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        };
+        let err = decide_resolved_profile_id(&state, Some(&identity), Some("bob"), Some("alice"))
+            .expect_err("must reject cross-tenant header");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn decide_rejects_header_pointing_to_unrelated_sub_account() {
+        // Owner authenticated → cannot use header to act as another
+        // owner's sub-account (parent_id mismatch).
+        let (_dir, state) = state_with_profiles(&[
+            ("owner-a", None),
+            ("owner-b", None),
+            ("owner-b-sub", Some("owner-b")),
+        ]);
+        let identity = AuthIdentity::User {
+            id: "owner-a".into(),
+            role: UserRole::User,
+        };
+        let err = decide_resolved_profile_id(
+            &state,
+            Some(&identity),
+            Some("owner-b-sub"),
+            Some("owner-a"),
+        )
+        .expect_err("must reject foreign sub-account");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn decide_allows_user_with_admin_role_to_target_any_profile() {
+        // A user account flagged as `UserRole::Admin` is fully
+        // privileged — `is_authorized_for_profile` short-circuits to
+        // `true` in that branch. Codify the contract so a future
+        // refactor can't quietly break the admin path.
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::Admin,
+        };
+        let pid = decide_resolved_profile_id(&state, Some(&identity), Some("bob"), Some("alice"))
+            .unwrap();
+        assert_eq!(pid, "bob");
+    }
+
+    #[test]
+    fn decide_falls_back_to_header_when_unauthenticated() {
+        // Pre-auth callers (e.g. webhook proxies, public preview) still
+        // use the header as a hint. Their handlers do their own
+        // authorization downstream; the contract here is only
+        // "don't 403 just because no identity is present."
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let pid = decide_resolved_profile_id(&state, None, Some("alice"), None).unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_returns_bad_request_when_no_signal_at_all() {
+        let (_dir, state) = state_with_profiles(&[]);
+        let err = decide_resolved_profile_id(&state, None, None, None)
+            .expect_err("no identity AND no header must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decide_returns_bad_request_when_authenticated_but_no_identity_profile_id_resolved() {
+        // Edge case: identity is `Some(_)` but the caller could not
+        // resolve a profile id for it (e.g. admin in a setup-wizard
+        // state where `ensure_admin_profile` hasn't run yet). We must
+        // not fall through to a stripped-empty header.
+        let (_dir, state) = state_with_profiles(&[]);
+        let identity = AuthIdentity::Admin;
+        let err = decide_resolved_profile_id(&state, Some(&identity), None, None)
+            .expect_err("must signal missing context");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
 }
