@@ -22,11 +22,20 @@ use octos_cli::project_templates::{
 };
 
 fn site_metadata_with_build_output(build_output_dir: &str) -> SiteProjectMetadata {
+    site_metadata("astro-site", build_output_dir)
+}
+
+/// Build a metadata fixture with a caller-chosen template and
+/// `build_output_dir`. Used by the per-template-equality tests added
+/// for the codex follow-up: `astro-site` ↦ `dist`, `nextjs-app` ↦
+/// `out`, `quarto-lesson` ↦ `docs`. Any other pairing is now a
+/// `TemplateMismatch`.
+fn site_metadata(template: &str, build_output_dir: &str) -> SiteProjectMetadata {
     SiteProjectMetadata {
         version: 1,
         command: "/new site astro".to_string(),
         preset_key: "astro".to_string(),
-        template: "astro-site".to_string(),
+        template: template.to_string(),
         site_kind: "docs".to_string(),
         site_name: "Test Site".to_string(),
         description: "Test fixture".to_string(),
@@ -58,18 +67,26 @@ fn should_accept_allow_listed_dist_value() {
     assert!(resolved.ends_with("dist"));
 }
 
-/// Test 1b: every per-template scaffold value (`dist`, `out`, `docs`)
-/// is accepted as documented in the allow-list.
+/// Test 1b: every per-template scaffold pairing (`astro-site` ↦
+/// `dist`, `nextjs-app` ↦ `out`, `react-vite` ↦ `dist`,
+/// `quarto-lesson` ↦ `docs`) is accepted. Updated for the
+/// per-template-equality follow-up — a global allow-list alone is
+/// not enough; the value must match `SiteTemplate::output_dir()` for
+/// the declared template.
 #[test]
 fn should_accept_each_template_scaffold_value() {
-    for value in ["dist", "out", "docs"] {
+    for (template, value) in [
+        ("astro-site", "dist"),
+        ("nextjs-app", "out"),
+        ("react-vite", "dist"),
+        ("quarto-lesson", "docs"),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path();
         std::fs::create_dir_all(project_dir.join(value)).unwrap();
-        let metadata = site_metadata_with_build_output(value);
-        validated_build_output_dir(&metadata, project_dir).unwrap_or_else(|err| {
-            panic!("scaffold value `{value}` must validate but got: {err:?}")
-        });
+        let metadata = site_metadata(template, value);
+        validated_build_output_dir(&metadata, project_dir)
+            .unwrap_or_else(|err| panic!("`{template}`/`{value}` must validate but got: {err:?}"));
     }
 }
 
@@ -105,11 +122,13 @@ fn should_reject_post_normalization_escape() {
     assert_eq!(result, Err(BuildOutputDirError::ParentEscape));
 }
 
-/// Test 5: a symlink placed at `<project_dir>/output -> /tmp` is
+/// Test 5: a symlink placed at `<project_dir>/docs -> /tmp` is
 /// rejected by the canonical-descendant check. Allow-listed names
-/// alone aren't enough — `output` itself is on the allow-list
-/// historically used elsewhere in the scaffold, so even if the value
-/// passes the allow-list it must canonicalise inside the project.
+/// alone aren't enough — even if the value passes the per-template
+/// equality gate it must canonicalise inside the project. We pair
+/// `quarto-lesson` with `docs` (its scaffold output) so the symlink
+/// check is the gate the test actually exercises (not the new
+/// TemplateMismatch gate).
 /// Skipped on Windows where `std::os::unix::fs::symlink` is absent.
 #[cfg(unix)]
 #[test]
@@ -120,12 +139,12 @@ fn should_reject_symlink_escape_after_build() {
     let tmp_outside = tempfile::tempdir().unwrap();
     let project_dir = tmp_project.path();
 
-    // `docs` is an allow-listed scaffold value. Plant a symlink at
+    // `docs` is the `quarto-lesson` scaffold value. Plant a symlink at
     // `<project>/docs -> <outside>` to simulate a malicious symlink
     // left by the build step.
     symlink(tmp_outside.path(), project_dir.join("docs")).unwrap();
 
-    let metadata = site_metadata_with_build_output("docs");
+    let metadata = site_metadata("quarto-lesson", "docs");
     let result = validated_build_output_dir(&metadata, project_dir);
     assert_eq!(
         result,
@@ -249,4 +268,199 @@ fn missing_project_dir_does_not_bypass_validation() {
     // project dir even though we couldn't canonicalise either side.
     assert!(result.ends_with("dist"));
     let _ = Path::new(&result);
+}
+
+// ── Codex round-2 follow-up tests ──────────────────────────────────────────
+
+/// Codex GAP fix: a `null` JSON value in `mofa-site-session.json`
+/// must NOT make it past `read_site_project_metadata` and bypass the
+/// validator. We don't synthesise a `null` `SiteProjectMetadata` —
+/// such a value would fail serde deserialisation against
+/// `pub build_output_dir: String` long before reaching the validator.
+/// This test pins that contract: writing a session file with a
+/// `build_output_dir: null` payload causes
+/// `read_site_project_metadata` to return `None`, so the preview
+/// handler never gets a metadata struct to mis-trust.
+#[test]
+fn should_reject_null_json_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("sites").join("evil");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Hand-rolled JSON because serde won't let us serialise a typed
+    // metadata with a null `build_output_dir`.
+    let malicious = serde_json::json!({
+        "version": 1,
+        "command": "/new site astro",
+        "preset_key": "astro",
+        "template": "astro-site",
+        "site_kind": "docs",
+        "site_name": "Test Site",
+        "description": "Test fixture",
+        "accent": "#000000",
+        "reference": "/tmp",
+        "reference_label": "tmp",
+        "site_slug": "test-site",
+        "preview_base_path": "/api/preview/p/s/test-site",
+        "preview_url": "/api/preview/p/s/test-site/index.html",
+        "build_output_dir": serde_json::Value::Null,
+        "project_dir": "sites/test-site",
+        "pages": [],
+    });
+    std::fs::write(
+        project_dir.join("mofa-site-session.json"),
+        serde_json::to_string_pretty(&malicious).unwrap(),
+    )
+    .unwrap();
+
+    // The metadata reader uses strongly-typed serde — a null where a
+    // String is expected fails to deserialise. The preview handler
+    // already short-circuits on `None` with a 404 "Missing Site
+    // Metadata" page, so the validator is never reached.
+    let read_back = read_site_project_metadata(&project_dir);
+    assert!(
+        read_back.is_none(),
+        "null build_output_dir must fail serde deserialisation, got: {read_back:?}",
+    );
+}
+
+/// Codex GAP fix: percent-encoded and unicode-escaped `..` variants
+/// must be rejected. The allow-list is exact-match against the raw
+/// metadata string — the preview HTTP handler operates on the
+/// already-decoded `build_output_dir` field, not URL-encoded form, so
+/// a metadata value of `..%2Fescape` or `..\u{2f}escape` is matched
+/// literally by the allow-list (no `dist`/`out`/`docs`) and rejected
+/// before any decode step could happen. Pin both shapes explicitly.
+#[test]
+fn should_reject_unicode_dot_dot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // Percent-encoded slash: `..%2Fescape` is NOT `../escape` to
+    // path-component parsing, but it is also not an allow-listed
+    // value and contains characters outside the allow-list — must
+    // reject (NotAllowListed or TemplateMismatch are both acceptable
+    // gates; both prevent the value from being served).
+    let metadata = site_metadata_with_build_output("..%2Fescape");
+    let result = validated_build_output_dir(&metadata, project_dir);
+    assert!(
+        matches!(
+            result,
+            Err(BuildOutputDirError::NotAllowListed
+                | BuildOutputDirError::TemplateMismatch
+                | BuildOutputDirError::ParentEscape)
+        ),
+        "percent-encoded `..` must be rejected, got: {result:?}",
+    );
+
+    // Unicode-escaped `..` segment: `..\u{2f}escape` evaluates to
+    // `../escape` at the source-string level because `\u{2f}` is `/`,
+    // so this collapses to the standard ParentEscape case. The
+    // explicit pin keeps both shapes covered even if the validator
+    // ever stops normalising path separators.
+    let metadata = site_metadata_with_build_output("..\u{2f}escape");
+    let result = validated_build_output_dir(&metadata, project_dir);
+    assert_eq!(
+        result,
+        Err(BuildOutputDirError::ParentEscape),
+        "unicode-escaped `..` (literal `../escape`) must hit the ParentEscape gate",
+    );
+
+    // Backslash variant (`..\\escape`) — on Unix `\\` is a single
+    // path component, not a separator, so the whole value fails the
+    // allow-list. On Windows `\\` IS a separator and the leading
+    // `..` makes it `ParentEscape`. Accept either outcome — both
+    // reject.
+    let metadata = site_metadata_with_build_output("..\\escape");
+    let result = validated_build_output_dir(&metadata, project_dir);
+    assert!(
+        matches!(
+            result,
+            Err(BuildOutputDirError::NotAllowListed
+                | BuildOutputDirError::TemplateMismatch
+                | BuildOutputDirError::ParentEscape)
+        ),
+        "backslash `..` variant must be rejected, got: {result:?}",
+    );
+}
+
+/// Codex NEEDS-FOLLOWUP fix: `astro-site` with `build_output_dir:
+/// "docs"` must be rejected as `TemplateMismatch`. Pre-followup, the
+/// global allow-list let this through because `docs` was on the
+/// list. Post-followup the per-template gate enforces strict
+/// equality against `SiteTemplate::output_dir()`.
+#[test]
+fn should_reject_template_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path();
+    // Create both candidate dirs so the canonical-descendant phase
+    // can't be the reason for rejection — we want to prove the
+    // *equality* gate is what catches this.
+    std::fs::create_dir_all(project_dir.join("dist")).unwrap();
+    std::fs::create_dir_all(project_dir.join("docs")).unwrap();
+
+    let metadata = site_metadata("astro-site", "docs");
+    let result = validated_build_output_dir(&metadata, project_dir);
+    assert_eq!(
+        result,
+        Err(BuildOutputDirError::TemplateMismatch),
+        "astro-site + docs must be rejected by per-template equality",
+    );
+
+    // And the symmetric case: `nextjs-app` ↦ `out`, not `dist`.
+    let metadata = site_metadata("nextjs-app", "dist");
+    let result = validated_build_output_dir(&metadata, project_dir);
+    assert_eq!(
+        result,
+        Err(BuildOutputDirError::TemplateMismatch),
+        "nextjs-app + dist must be rejected by per-template equality",
+    );
+}
+
+/// Codex BLOCKING #1 fix: even after `validated_build_output_dir`
+/// returns a canonical path, the actual file serve must refuse to
+/// follow symlinks on the leaf or any ancestor between the project
+/// root and the resolved asset. This pins the symlink-after-validate
+/// TOCTOU window: validate succeeds against a real `dist/` dir, then
+/// the attacker swaps `dist` for a symlink to `/tmp/escape`. The
+/// serve helper [`octos_cli::api::preview::serve_preview_no_follow`]
+/// re-walks the path with `symlink_metadata` and refuses.
+///
+/// Skipped on Windows where `std::os::unix::fs::symlink` is absent.
+#[cfg(unix)]
+#[test]
+fn should_reject_symlink_swap_after_validation() {
+    use std::os::unix::fs::symlink;
+
+    use octos_cli::api::preview::serve_preview_no_follow_blocking;
+
+    let tmp_project = tempfile::tempdir().unwrap();
+    let tmp_outside = tempfile::tempdir().unwrap();
+    let project_dir = tmp_project.path();
+    let dist = project_dir.join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), b"<html>real</html>").unwrap();
+    std::fs::write(tmp_outside.path().join("escape"), b"SECRET").unwrap();
+
+    // Phase 1: validation succeeds because `dist` is a real
+    // directory at this moment.
+    let metadata = site_metadata("astro-site", "dist");
+    let validated = validated_build_output_dir(&metadata, project_dir)
+        .expect("phase-1 validation must pass against a real dist/");
+    assert!(validated.ends_with("dist"));
+
+    // Phase 2: attacker swaps `dist` for a symlink between
+    // validation and the file serve.
+    std::fs::remove_dir_all(&dist).unwrap();
+    symlink(tmp_outside.path(), &dist).unwrap();
+
+    // Phase 3: the serve helper must refuse — the canonical path
+    // resolves OUTSIDE `project_dir`, and the ancestor walk catches
+    // the swapped symlink even if the canonical form lies.
+    let candidate = dist.join("escape");
+    let served = serve_preview_no_follow_blocking(project_dir, &candidate);
+    assert!(
+        served.is_err(),
+        "symlink-swapped ancestor must be rejected; got served bytes: {served:?}",
+    );
 }
