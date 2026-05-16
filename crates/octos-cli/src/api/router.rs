@@ -594,12 +594,187 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(version_routes)
         .merge(internal_routes);
 
+    // Layer 1 defence for issue #995 — the strip middleware runs OUTSIDE
+    // every other route layer so an unauthenticated request can never
+    // see an attacker-supplied `X-Profile-Id` on its way to a handler
+    // (handler-level Layer 2 in `handlers::decide_resolved_profile_id`
+    // is the second line of defence). Loopback / private connections are
+    // considered trusted; everything else has the header stripped before
+    // any handler / auth middleware runs.
     public
         .merge(protected)
         .fallback(static_files::static_handler)
+        .layer(middleware::from_fn(strip_untrusted_profile_id_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Cached parsed list of trusted-proxy CIDRs from `OCTOS_TRUSTED_PROXY_CIDRS`.
+///
+/// Initialised once on first call. Empty if the env var is unset or no
+/// entries parse. Each entry is `(network address as 16-byte big-endian, prefix bits)`,
+/// with IPv4 mapped into the IPv4-in-IPv6 prefix (`::ffff:0:0/96`) so the
+/// matcher can run a single big-endian bit comparison regardless of family.
+fn trusted_proxy_cidrs() -> &'static [TrustedProxyCidr] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<TrustedProxyCidr>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var("OCTOS_TRUSTED_PROXY_CIDRS").unwrap_or_default();
+            let mut out = Vec::new();
+            for entry in raw.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                match parse_cidr(entry) {
+                    Some(cidr) => out.push(cidr),
+                    None => tracing::warn!(
+                        target: "octos::api::auth",
+                        cidr = %entry,
+                        "OCTOS_TRUSTED_PROXY_CIDRS entry could not be parsed; ignoring"
+                    ),
+                }
+            }
+            out
+        })
+        .as_slice()
+}
+
+/// Parsed trusted-proxy CIDR — IPv4 entries are normalised into the
+/// IPv4-mapped-IPv6 space so a single 128-bit big-endian comparison
+/// handles both families.
+#[derive(Clone, Copy, Debug)]
+struct TrustedProxyCidr {
+    network: [u8; 16],
+    prefix_bits: u8,
+}
+
+fn parse_cidr(entry: &str) -> Option<TrustedProxyCidr> {
+    let (addr, prefix) = entry.split_once('/')?;
+    let addr: std::net::IpAddr = addr.trim().parse().ok()?;
+    let prefix: u8 = prefix.trim().parse().ok()?;
+
+    let (octets, max_prefix) = match addr {
+        std::net::IpAddr::V4(v4) => {
+            // Map IPv4 into ::ffff:V4 (16 bytes, big-endian).
+            let mut buf = [0u8; 16];
+            buf[10] = 0xff;
+            buf[11] = 0xff;
+            buf[12..16].copy_from_slice(&v4.octets());
+            (buf, 32u8)
+        }
+        std::net::IpAddr::V6(v6) => (v6.octets(), 128u8),
+    };
+
+    if prefix > max_prefix {
+        return None;
+    }
+
+    // For IPv4 entries the prefix is on the last 32 bits, so add the
+    // 96-bit IPv4-mapped prefix.
+    let effective_prefix = match addr {
+        std::net::IpAddr::V4(_) => 96 + prefix,
+        std::net::IpAddr::V6(_) => prefix,
+    };
+
+    Some(TrustedProxyCidr {
+        network: mask_to_prefix(octets, effective_prefix),
+        prefix_bits: effective_prefix,
+    })
+}
+
+fn mask_to_prefix(octets: [u8; 16], prefix_bits: u8) -> [u8; 16] {
+    let mut out = octets;
+    let full_bytes = (prefix_bits / 8) as usize;
+    let remaining_bits = prefix_bits % 8;
+    for byte in out.iter_mut().skip(full_bytes) {
+        *byte = 0;
+    }
+    if full_bytes < 16 && remaining_bits > 0 {
+        let mask = 0xffu8 << (8 - remaining_bits);
+        out[full_bytes] = octets[full_bytes] & mask;
+    }
+    out
+}
+
+fn ip_matches_cidr(ip: std::net::IpAddr, cidr: &TrustedProxyCidr) -> bool {
+    let octets = match ip {
+        std::net::IpAddr::V4(v4) => {
+            let mut buf = [0u8; 16];
+            buf[10] = 0xff;
+            buf[11] = 0xff;
+            buf[12..16].copy_from_slice(&v4.octets());
+            buf
+        }
+        std::net::IpAddr::V6(v6) => v6.octets(),
+    };
+    mask_to_prefix(octets, cidr.prefix_bits) == cidr.network
+}
+
+/// Decide whether a remote address is a trusted reverse-proxy.
+///
+/// The wildcard Caddy ingress in `scripts/install.sh` runs on the same
+/// host as the daemon and `reverse_proxy localhost:NN`, so the
+/// `X-Profile-Id` it sets always arrives over loopback. The fleet's
+/// trust model is therefore: loopback ⇒ trusted, anything else ⇒ untrusted
+/// unless the operator explicitly opts in via `OCTOS_TRUSTED_PROXY_CIDRS`
+/// (a comma-separated list of CIDRs).
+///
+/// `None` for the remote addr means we couldn't read `ConnectInfo` —
+/// e.g. axum tests built with `into_make_service()` rather than
+/// `into_make_service_with_connect_info()`. In production this never
+/// happens (`commands::serve` always uses the connect-info variant); in
+/// tests we treat missing connect-info as untrusted so the strip path
+/// is exercised. Tests that want to simulate a loopback hop must use
+/// `into_make_service_with_connect_info::<SocketAddr>()`.
+pub(crate) fn is_trusted_proxy_addr(addr: Option<std::net::IpAddr>) -> bool {
+    let Some(addr) = addr else {
+        return false;
+    };
+    if addr.is_loopback() {
+        return true;
+    }
+    let cidrs = trusted_proxy_cidrs();
+    cidrs.iter().any(|cidr| ip_matches_cidr(addr, cidr))
+}
+
+/// Middleware: strip `X-Profile-Id` from requests that did not originate
+/// from a trusted proxy.
+///
+/// This is the Layer 1 defence for issue #995. The header is meant to be
+/// set by the operator's Caddy ingress, which talks to the daemon over
+/// loopback — so anything not from loopback / a configured trusted
+/// proxy is treated as forged and the header is removed before any
+/// handler or downstream middleware can see it.
+async fn strip_untrusted_profile_id_middleware(
+    mut req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let remote_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    if !is_trusted_proxy_addr(remote_ip) && req.headers().contains_key("x-profile-id") {
+        let raw = req
+            .headers()
+            .get("x-profile-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        req.headers_mut().remove("x-profile-id");
+        tracing::warn!(
+            target: "octos::api::auth",
+            remote_addr = ?remote_ip,
+            stripped_value = %raw,
+            uri = %req.uri(),
+            "X-Profile-Id stripped: request not from a trusted proxy (#995 hardening)"
+        );
+    }
+
+    next.run(req).await
 }
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens (no length leak).
@@ -721,15 +896,20 @@ async fn user_auth_middleware(
     // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
     // The reverse proxy (Caddy) sets this header to identify the profile,
     // so requests through the proxy are implicitly authenticated.
-    // SECURITY: Only accept this header from loopback addresses to prevent
-    // profile impersonation via misconfigured reverse proxy or SSRF.
-    let is_loopback = req
+    // SECURITY: Only accept this header from a TRUSTED proxy address —
+    // loopback by default, plus any CIDR listed in
+    // `OCTOS_TRUSTED_PROXY_CIDRS`. The Layer-1 strip middleware uses
+    // the SAME helper (`is_trusted_proxy_addr`), so operators who run
+    // an off-host reverse proxy can opt the auth path in via the same
+    // env var that controls the strip path — keeping the two layers
+    // consistent (#995 follow-up).
+    let remote_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
+        .map(|ci| ci.0.ip());
+    let is_trusted_hop = is_trusted_proxy_addr(remote_ip);
 
-    if !profile_id.is_empty() && is_loopback {
+    if !profile_id.is_empty() && is_trusted_hop {
         // Validate that the profile actually exists to prevent spoofing.
         if let Some(ref store) = state.profile_store {
             if store.get(&profile_id).ok().flatten().is_none() {
@@ -759,10 +939,10 @@ async fn user_auth_middleware(
         }
     }
 
-    if !profile_id.is_empty() && !is_loopback {
+    if !profile_id.is_empty() && !is_trusted_hop {
         tracing::warn!(
             profile_id = %profile_id,
-            "X-Profile-Id header rejected: request not from loopback address"
+            "X-Profile-Id header rejected: request not from a trusted proxy address (#995 follow-up)"
         );
     }
 
@@ -1169,5 +1349,103 @@ mod tests {
         let list = cors_allowlist_for_base_domain(Some("bot.ominix.io"));
         assert!(!list.iter().any(|s| s.contains("evil.example.com")));
         assert!(!list.iter().any(|s| s.contains("ocean.ominix.io")));
+    }
+
+    // ── #995 — `is_trusted_proxy_addr` + CIDR parser ───────────────────
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn is_trusted_proxy_addr_accepts_ipv4_loopback() {
+        assert!(is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_accepts_ipv6_loopback() {
+        assert!(is_trusted_proxy_addr(Some(IpAddr::V6(Ipv6Addr::LOCALHOST))));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_rejects_public_ipv4() {
+        // 1.1.1.1 (Cloudflare DNS) is not in any default-trusted block,
+        // so without `OCTOS_TRUSTED_PROXY_CIDRS` it must be rejected.
+        assert!(!is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        )))));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_rejects_missing_connect_info() {
+        // Tests using `into_make_service()` (no ConnectInfo) end up here.
+        // We treat missing ConnectInfo as untrusted so the strip path
+        // actually fires under unit tests. Production wires
+        // `into_make_service_with_connect_info::<SocketAddr>()`.
+        assert!(!is_trusted_proxy_addr(None));
+    }
+
+    #[test]
+    fn is_trusted_proxy_addr_rejects_rfc1918_when_env_unset() {
+        // Defence-in-depth: by default we only trust loopback. RFC1918
+        // private blocks are NOT auto-trusted because a corp VPN may
+        // assign them to attacker workstations. Operators with a real
+        // upstream proxy on the LAN can opt in via
+        // `OCTOS_TRUSTED_PROXY_CIDRS`.
+        assert!(!is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        )))));
+        assert!(!is_trusted_proxy_addr(Some(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 1
+        )))));
+    }
+
+    #[test]
+    fn parse_cidr_accepts_ipv4_block() {
+        let cidr = parse_cidr("10.0.0.0/8").expect("valid CIDR");
+        assert!(ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7)),
+            &cidr
+        ));
+        assert!(!ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1)),
+            &cidr
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_accepts_single_ipv4_with_32_bit_prefix() {
+        let cidr = parse_cidr("192.168.42.7/32").expect("valid CIDR");
+        assert!(ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 42, 7)),
+            &cidr
+        ));
+        assert!(!ip_matches_cidr(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 42, 8)),
+            &cidr
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_oversize_prefix() {
+        // /33 is illegal for IPv4 — parse_cidr must return None rather
+        // than constructing a CIDR that vacuously matches everything.
+        assert!(parse_cidr("10.0.0.0/33").is_none());
+    }
+
+    #[test]
+    fn parse_cidr_accepts_ipv6_block() {
+        let cidr = parse_cidr("fd00::/8").expect("valid CIDR");
+        assert!(ip_matches_cidr("fd12::1".parse::<IpAddr>().unwrap(), &cidr));
+        assert!(!ip_matches_cidr(
+            "2001:db8::1".parse::<IpAddr>().unwrap(),
+            &cidr
+        ));
+    }
+
+    #[test]
+    fn parse_cidr_rejects_malformed_entry() {
+        assert!(parse_cidr("not-an-ip").is_none());
+        assert!(parse_cidr("10.0.0.0").is_none()); // missing prefix
+        assert!(parse_cidr("10.0.0.0/abc").is_none()); // non-numeric prefix
+        assert!(parse_cidr("").is_none());
     }
 }
