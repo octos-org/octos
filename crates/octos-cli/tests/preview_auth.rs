@@ -35,6 +35,11 @@ use tower::util::ServiceExt;
 
 const STATIC_TOKEN_A: &str = "STATIC-TEST-TOKEN-FOR-USER-A";
 const STATIC_TOKEN_B: &str = "STATIC-TEST-TOKEN-FOR-USER-B";
+/// Bootstrap admin bearer wired into `AppState.auth_token` so the
+/// auth middleware resolves it to `AuthIdentity::Admin`. Used by the
+/// codex-follow-up tests 9-11 below to pin the admin cross-tenant
+/// design contract (see test comments for the design intent).
+const ADMIN_BEARER_TOKEN: &str = "STATIC-TEST-TOKEN-FOR-ADMIN";
 
 struct Fixture {
     _tempdir: TempDir,
@@ -42,6 +47,11 @@ struct Fixture {
     session_a_id: String,
     session_a_other_id: String,
     session_b_id: String,
+    /// A session id seeded ONLY under the `admin` profile (NOT under
+    /// `tenant-a` or `tenant-b`). When the admin bearer queries this
+    /// id without host-routing, the response should resolve to admin's
+    /// own data dir — proving `X-Profile-Id` did not cross-tenant.
+    session_admin_id: String,
     site_slug: String,
     token_a: String,
     token_b: String,
@@ -88,11 +98,32 @@ async fn build_fixture() -> Fixture {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    // Admin profile. Required so the codex-follow-up tests can
+    // exercise the `AuthIdentity::Admin` cross-tenant matrix
+    // (header-only vs. host-routed vs. both). Without an `admin`
+    // profile row, `resolve_profile_data_dir_by_id(state, "admin")`
+    // returns 404 and the test cannot positively assert "admin served
+    // their OWN view." See tests 9-11 for the design contract.
+    let profile_admin = UserProfile {
+        id: "admin".into(),
+        name: "Admin".into(),
+        public_subdomain: None,
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        config: ProfileConfig::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
     profile_store.save(&profile_a).expect("save profile a");
     profile_store.save(&profile_b).expect("save profile b");
+    profile_store
+        .save(&profile_admin)
+        .expect("save profile admin");
 
     let data_dir_a = profile_store.resolve_data_dir(&profile_a);
     let data_dir_b = profile_store.resolve_data_dir(&profile_b);
+    let data_dir_admin = profile_store.resolve_data_dir(&profile_admin);
 
     // 2. User store: a User per profile, with `id` matching the
     //    profile id so `is_authorized_for_profile` accepts the
@@ -156,13 +187,19 @@ async fn build_fixture() -> Fixture {
     let session_a_id = "site-A-1234567890-abcdef";
     let session_a_other_id = "site-A-OTHER-7766554433";
     let session_b_id = "site-B-9876543210-fedcba";
+    // Admin-owned session, used by the codex-follow-up tests 9-11 to
+    // positively assert "admin served their own view, NOT tenant B's"
+    // when only `X-Profile-Id` (and no host routing) is supplied.
+    let session_admin_id = "site-ADMIN-1111111111-aaaaaa";
 
     let key_a = SessionKey::with_profile(&profile_a.id, "api", session_a_id);
     let key_a_other = SessionKey::with_profile(&profile_a.id, "api", session_a_other_id);
     let key_b = SessionKey::with_profile(&profile_b.id, "api", session_b_id);
+    let key_admin = SessionKey::with_profile(&profile_admin.id, "api", session_admin_id);
     let encoded_a = octos_bus::session::encode_path_component(key_a.base_key());
     let encoded_a_other = octos_bus::session::encode_path_component(key_a_other.base_key());
     let encoded_b = octos_bus::session::encode_path_component(key_b.base_key());
+    let encoded_admin = octos_bus::session::encode_path_component(key_admin.base_key());
 
     let ws_a = data_dir_a
         .join("users")
@@ -182,17 +219,32 @@ async fn build_fixture() -> Fixture {
         .join("workspace")
         .join("sites")
         .join(site_slug);
+    let ws_admin = data_dir_admin
+        .join("users")
+        .join(&encoded_admin)
+        .join("workspace")
+        .join("sites")
+        .join(site_slug);
     seed_built_site(&ws_a, "<<<A-CONTENT>>>");
     seed_built_site(&ws_a_other, "<<<A-OTHER-CONTENT>>>");
     seed_built_site(&ws_b, "<<<B-CONTENT>>>");
+    seed_built_site(&ws_admin, "<<<ADMIN-CONTENT>>>");
 
     // 5. AppState wiring. `process_manager`/`session_cache` are not
     //    needed by the preview handler — it only consults
     //    `profile_store` and the on-disk session workspace.
+    //
+    //    `auth_token = Some(ADMIN_BEARER_TOKEN)` lights up the
+    //    bootstrap-admin path in `resolve_identity` (no rotated
+    //    `admin_token.json` exists for the empty test store, so the
+    //    bootstrap token is authoritative). Required by the codex
+    //    follow-up tests 9-11 which assert admin cross-tenant
+    //    semantics on `/api/site-preview/*`.
     let state = Arc::new(AppState {
         profile_store: Some(profile_store.clone()),
         user_store: Some(user_store.clone()),
         auth_manager: Some(auth_manager.clone()),
+        auth_token: Some(ADMIN_BEARER_TOKEN.into()),
         ..AppState::empty_for_tests()
     });
 
@@ -202,6 +254,7 @@ async fn build_fixture() -> Fixture {
         session_a_id: session_a_id.into(),
         session_a_other_id: session_a_other_id.into(),
         session_b_id: session_b_id.into(),
+        session_admin_id: session_admin_id.into(),
         site_slug: site_slug.into(),
         token_a,
         token_b,
@@ -605,5 +658,200 @@ async fn test_8_serve_other_session_under_same_profile() {
     assert!(
         body_str.contains("<<<A-OTHER-CONTENT>>>"),
         "expected the other A-session's marker, got: {body_str}"
+    );
+}
+
+// ---------------------------------------------------------------
+// Codex round-2 re-review follow-ups (admin cross-tenant matrix).
+//
+// Codex flagged: "Admin + `X-Profile-Id: tenant-b` is allowed past the
+// spoof check, but the header is not used for routing; it falls
+// through to `ADMIN_PROFILE_ID`, so it will not serve tenant B unless
+// host-routing selected B earlier."
+//
+// This is the current behavior and an INTENTIONAL design choice (not
+// a bug). Tests 9-11 below pin the three corners of the matrix so the
+// contract is enforced by CI:
+//
+// | host routing | X-Profile-Id | result                          |
+// |--------------|--------------|---------------------------------|
+// | no           | tenant-b     | serves admin's OWN view (T9)    |
+// | tenant-b     | (absent)     | serves tenant B (T10)           |
+// | tenant-b     | tenant-b     | serves tenant B (T11 sanity)    |
+//
+// Design intent: admin cross-tenant access flows ONLY through
+// host-routing (audit-friendly: each tenant has its own subdomain in
+// the access log). `X-Profile-Id` is NOT honored as a cross-tenant
+// switch for admin — that path would be too easily masqueraded by
+// misbehaving tooling or an SSRF that controls headers but not host.
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn test_9_admin_with_forged_x_profile_id_does_not_cross_tenant_via_header() {
+    // Design intent: header alone is not sufficient for cross-tenant
+    // admin access; host routing is required.
+    //
+    // Admin authenticates with the bootstrap admin bearer and sends
+    // `X-Profile-Id: tenant-b`, with NO host-routing (the default
+    // tower-oneshot request has no `Host` header → `request_host`
+    // returns `None`). The route then falls through to
+    // `identity_profile_id = ADMIN_PROFILE_ID`, resolving admin's own
+    // data dir. The defense-in-depth spoof check (handlers.rs:2146)
+    // does not 403 here because `is_authorized_for_profile(Admin, *)`
+    // is unconditionally true — but the header is still ignored for
+    // routing.
+    //
+    // We request `session_admin_id` (seeded ONLY under admin's data
+    // dir). If the header were honored we'd resolve tenant-b's dir,
+    // not find the admin session, and 404. The fact that we serve
+    // 200 with `<<<ADMIN-CONTENT>>>` proves the header did NOT switch
+    // the routed tenant.
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let uri = format!(
+        "/api/site-preview/{}/{}/index.html",
+        fx.session_admin_id, fx.site_slug
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {ADMIN_BEARER_TOKEN}"))
+                .header("x-profile-id", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin + X-Profile-Id: tenant-b (no host routing) MUST resolve to admin's \
+         own data dir and serve 200 for an admin-owned session; got status {}. \
+         If this flips to 404, X-Profile-Id likely started routing the request \
+         and that is the regression this test guards against.",
+        resp.status()
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("<<<ADMIN-CONTENT>>>"),
+        "expected admin's own marker — header must NOT switch tenants; got: {body_str}"
+    );
+    assert!(
+        !body_str.contains("<<<B-CONTENT>>>"),
+        "cross-tenant body leak: admin + forged X-Profile-Id returned tenant B's marker"
+    );
+}
+
+#[tokio::test]
+async fn test_10_admin_host_routed_does_cross_tenant() {
+    // Design intent: admin cross-tenant access uses host routing.
+    //
+    // Admin authenticates with the bootstrap admin bearer. The Host
+    // header is set to a subdomain that resolves to `tenant-b` via
+    // `ProfileStore::resolve_routable_profile_id`. No `X-Profile-Id`
+    // is sent — host alone is the cross-tenant switch.
+    //
+    // The handler resolves the subdomain candidate `tenant-b` against
+    // the profile store, finds the top-level profile (no
+    // `public_subdomain`, no `parent_id` ⇒ the immutable internal id
+    // is routable), checks `is_authorized_for_profile(Admin, "tenant-b")
+    // = true`, and serves tenant B's data dir. The request URL points
+    // at B's session id (`session_b_id`), which exists under B's data
+    // dir, so the handler returns B's seeded marker.
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let uri = format!(
+        "/api/site-preview/{}/{}/index.html",
+        fx.session_b_id, fx.site_slug
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {ADMIN_BEARER_TOKEN}"))
+                // `request_host` reads `host`/`x-forwarded-host`,
+                // strips the port, lowercases, and takes the first
+                // dot-segment as the candidate. `tenant-b` resolves
+                // through `resolve_routable_profile_id` because the
+                // tenant-b profile is top-level with no
+                // `public_subdomain` set.
+                .header("host", "tenant-b.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin + host-routed to tenant-b (no X-Profile-Id) MUST serve tenant B's \
+         data dir for an existing tenant-b session; got status {}",
+        resp.status()
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("<<<B-CONTENT>>>"),
+        "expected tenant B's marker via host routing, got: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_11_admin_with_host_and_matching_x_profile_id() {
+    // Sanity check: when the consistent host AND `X-Profile-Id` both
+    // point at the same tenant, the request still serves that tenant
+    // (i.e. the defense-in-depth spoof check at handlers.rs:2146 does
+    // not regress and reject a consistent header). Host routing is
+    // authoritative; a matching header is a no-op.
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let uri = format!(
+        "/api/site-preview/{}/{}/index.html",
+        fx.session_b_id, fx.site_slug
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {ADMIN_BEARER_TOKEN}"))
+                .header("host", "tenant-b.example.com")
+                .header("x-profile-id", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin + host=tenant-b + X-Profile-Id=tenant-b (consistent) MUST serve \
+         tenant B; got status {}",
+        resp.status()
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("<<<B-CONTENT>>>"),
+        "expected tenant B's marker, got: {body_str}"
     );
 }
