@@ -3784,6 +3784,7 @@ dependencies = [
  "image",
  "keyring",
  "lettre",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "octos-agent",

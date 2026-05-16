@@ -15,6 +15,7 @@ mod events_harness;
 mod frps_plugin;
 mod handlers;
 pub mod metrics;
+pub mod preview;
 pub mod purge;
 mod router;
 mod static_files;

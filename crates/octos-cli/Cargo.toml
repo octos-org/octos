@@ -61,6 +61,13 @@ rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW for the symlink-safe preview file serve in
+# `src/api/preview.rs`. Pinned by issue #996 BLOCKING #1: previously
+# `tokio::fs::read` followed symlinks between the canonical-descendant
+# check and the read, opening a TOCTOU window.
+libc = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
