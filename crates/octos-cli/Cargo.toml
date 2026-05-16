@@ -61,6 +61,22 @@ rand = { workspace = true, optional = true }
 teloxide = { workspace = true, optional = true }
 sysinfo = { version = "0.34", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW for the symlink-safe preview file serve in
+# `src/api/preview.rs`. Pinned by issue #996 BLOCKING #1: previously
+# `tokio::fs::read` followed symlinks between the canonical-descendant
+# check and the read, opening a TOCTOU window.
+libc = { workspace = true }
+# `rustix::fs::openat` for the component-by-component path walk in
+# `src/api/preview.rs::open_no_follow_walk`. Codex round-2 BLOCKING #1
+# (issue #996): the previous `symlink_metadata`-then-`open` ancestor
+# walk left a multi-syscall TOCTOU window — an attacker could swap
+# any ancestor for a symlink between the stat and the open. Rustix's
+# safe `openat` wrapper (workspace-wide `deny(unsafe_code)` rules out
+# raw `libc::openat`) anchors each step to a parent fd so the
+# relationship survives mid-walk swaps.
+rustix = { version = "1.1", features = ["fs"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
