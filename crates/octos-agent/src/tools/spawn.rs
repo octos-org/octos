@@ -2112,6 +2112,33 @@ impl Tool for SpawnTool {
                 }
             }
 
+            // octos #997 (round-3 fix): the session-scope validator block above
+            // runs against `self.working_dir` (the session root) and writes the
+            // session ledger only. The project-scope contract gate
+            // (`inspect_workspace_contract`) reads
+            // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`. Without
+            // this run, an `agent_mcp` slides dispatch that produces a valid
+            // PPTX would leave the project ledger empty and a downstream
+            // contract gate would surface `ready = false`. Mirror the sync
+            // (`:2312`) and background (`:2680`) spawn fixes so the agent_mcp
+            // branch closes the same bypass.
+            if mcp_success {
+                let expected_kind = workflow.as_ref().and_then(workflow_contract_project_kind);
+                let registry_for_validators = ToolRegistry::with_builtins(&self.working_dir);
+                let report = crate::workspace_contract::run_project_root_validators(
+                    &registry_for_validators,
+                    &self.working_dir,
+                    expected_kind,
+                )
+                .await;
+                if let Some(reason) = report.first_failure_reason() {
+                    mcp_success = false;
+                    mcp_output_override = Some(format!(
+                        "Status: FAILED\nremote_agent_mcp: project-scope validator rejected child artifact: {reason}"
+                    ));
+                }
+            }
+
             return Ok(ToolResult {
                 output: mcp_output_override.unwrap_or_else(|| {
                     if mcp_success {

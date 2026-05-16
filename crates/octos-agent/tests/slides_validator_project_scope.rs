@@ -298,3 +298,427 @@ async fn project_root_validators_write_to_project_ledger_without_manual_seeding(
          validators run; status = {status:?}"
     );
 }
+
+// octos #997 (round-3 fix): codex flagged TWO more bypass paths still
+// uncovered by the round-2 wiring. These tests drive the production
+// code paths end-to-end so the spawn loop ACTUALLY writes the
+// `<session>/slides/<slug>/.octos/validator_outcomes.jsonl` row that
+// `inspect_workspace_contract` reads.
+//
+// Pre-round-3 these tests FAIL with messages like:
+//     project ledger must exist at .../slides/demo/.octos/validator_outcomes.jsonl
+//     after the spawn_only completion path runs
+// because the spawn_only completion path at `agent/execution.rs:619`
+// only calls `enforce_spawn_task_contract_with_args_and_output` (which
+// runs validators at the SESSION root, not the project root) and the
+// agent_mcp branch at `tools/spawn.rs:2087` does the same.
+
+/// BLOCKING bypass #1 — spawn_only direct invocation.
+///
+/// A direct `mofa_slides(out=slides/demo/output/deck.pptx, ...)` runs
+/// through the spawn_only intercept at `agent/execution.rs:307`. On
+/// success the path calls ONLY
+/// `enforce_spawn_task_contract_with_args_and_output` (which runs
+/// validators at SESSION root and writes the session ledger). Pre-fix
+/// the project ledger at
+/// `<session>/slides/<slug>/.octos/validator_outcomes.jsonl` is NEVER
+/// written.
+#[tokio::test]
+async fn spawn_only_mofa_slides_writes_project_ledger() {
+    use async_trait::async_trait;
+    use octos_agent::{
+        Agent, AgentConfig, Tool, ToolRegistry, ToolResult, WorkspacePolicy, WorkspaceProjectKind,
+        write_workspace_policy,
+    };
+    use octos_core::{AgentId, Message, MessageRole, ToolCall};
+    use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
+    use octos_memory::EpisodeStore;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    // ── Scripted LLM: invoke mofa_slides once, then EndTurn. ──────────────
+    struct ScriptedLlm(std::sync::Mutex<Vec<ChatResponse>>);
+    #[async_trait]
+    impl LlmProvider for ScriptedLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let mut r = self.0.lock().unwrap();
+            if r.is_empty() {
+                eyre::bail!("ScriptedLlm: out of responses");
+            }
+            Ok(r.remove(0))
+        }
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+        fn model_id(&self) -> &str {
+            "spawn-only-slides-test"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    // ── Mock mofa_slides tool: reports the PPTX via `files_to_send`. ────
+    struct FakeMofaSlides {
+        pptx_abs_path: PathBuf,
+    }
+    #[async_trait]
+    impl Tool for FakeMofaSlides {
+        fn name(&self) -> &str {
+            "mofa_slides"
+        }
+        fn description(&self) -> &str {
+            "fake mofa_slides for #997 round-3 test"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "Generated PPTX: ok\n".into(),
+                files_to_send: vec![self.pptx_abs_path.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    // ── Workspace setup (session root + slides/demo project). ──────────
+    let dir = TempDir::new().unwrap();
+    let session_root = dir.path();
+    let project_root = session_root.join("slides").join("demo");
+    let output_dir = project_root.join("output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    // Session-scope policy (carries `spawn_tasks.mofa_slides`).
+    write_workspace_policy(session_root, &WorkspacePolicy::for_session()).unwrap();
+    // Project-scope policy (carries the hard-required PPTX MagicBytes
+    // validator — the round-3 fix is what gets this RUN).
+    write_workspace_policy(
+        &project_root,
+        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+    )
+    .unwrap();
+    // Turn-end "required source file" checks (slides project policy).
+    std::fs::write(project_root.join("script.js"), "// slides").unwrap();
+    std::fs::write(project_root.join("memory.md"), "# memory").unwrap();
+    std::fs::write(project_root.join("changelog.md"), "# changelog").unwrap();
+    // Real PPTX (ZIP local-file-header magic). MagicBytes only inspects
+    // the leading 4 bytes.
+    let pptx_path = output_dir.join("deck.pptx");
+    let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
+    pptx_bytes.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&pptx_path, &pptx_bytes).unwrap();
+
+    // ── Tool registry + spawn_only mofa_slides. ───────────────────────
+    let mut tools = ToolRegistry::with_builtins(session_root);
+    tools.register(FakeMofaSlides {
+        pptx_abs_path: pptx_path.clone(),
+    });
+    tools.mark_spawn_only("mofa_slides", None);
+    let supervisor = tools.supervisor();
+
+    // ── Agent. ─────────────────────────────────────────────────────────
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join(".octos-mem"))
+            .await
+            .unwrap(),
+    );
+    let llm: Arc<dyn LlmProvider> = Arc::new(ScriptedLlm(std::sync::Mutex::new(vec![
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-slides-1".into(),
+                name: "mofa_slides".into(),
+                arguments: serde_json::json!({"task": "make a deck"}),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider_index: None,
+        },
+        ChatResponse {
+            content: Some("done".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 5,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            provider_index: None,
+        },
+    ])));
+    let agent = Agent::new(AgentId::new("slides-spawn-only"), llm, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            suppress_auto_send_files: true,
+            ..Default::default()
+        },
+    );
+
+    let response = agent
+        .process_message("make slides", &[], vec![])
+        .await
+        .expect("agent loop must succeed");
+    // Sanity: the spawn_only intercept fires synchronously — the foreground
+    // turn returns a Tool message for the spawn_only call.
+    assert!(
+        response
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, MessageRole::Tool)
+                && m.tool_call_id.as_deref() == Some("call-slides-1")),
+        "expected a synthetic Tool message for the spawn_only call; got: {:#?}",
+        response.messages
+    );
+
+    // ── Wait for the background spawn_only task to reach terminal state.
+    let ledger_path = project_root.join(".octos").join("validator_outcomes.jsonl");
+    let mut completed = false;
+    for _ in 0..100 {
+        for task in supervisor.get_all_tasks() {
+            if task.tool_name == "mofa_slides"
+                && matches!(
+                    task.status,
+                    octos_agent::TaskStatus::Completed | octos_agent::TaskStatus::Failed
+                )
+            {
+                completed = true;
+                break;
+            }
+        }
+        if completed && ledger_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        completed,
+        "background spawn_only mofa_slides must reach terminal status"
+    );
+
+    // ── Load-bearing assertion: the project ledger must exist. ───────────
+    //
+    // PRE-FIX (round-2 HEAD 5457c184) FAILURE QUOTE:
+    //   project ledger must exist at
+    //   <session>/slides/demo/.octos/validator_outcomes.jsonl after the
+    //   spawn_only completion path runs — the spawn loop only invokes
+    //   enforce_spawn_task_contract_with_args_and_output (session scope)
+    //   and never calls run_project_root_validators
+    assert!(
+        ledger_path.exists(),
+        "project ledger must exist at {} after the spawn_only completion path runs \
+         — the spawn loop only invokes enforce_spawn_task_contract_with_args_and_output \
+         (session scope) and never calls run_project_root_validators",
+        ledger_path.display()
+    );
+
+    // The ledger must contain the slides-kind PPTX MagicBytes Pass row.
+    let ledger = octos_agent::ValidatorLedger::open(&ledger_path).expect("open project ledger");
+    let entries = ledger.read_all().expect("read project ledger entries");
+    let pass = entries
+        .iter()
+        .find(|o| {
+            o.validator_id == "slides.mofa_slides.pptx_magic_bytes"
+                && o.status == octos_agent::ValidatorStatus::Pass
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "project ledger must contain a Pass for slides.mofa_slides.pptx_magic_bytes; \
+                 got entries = {entries:?}"
+            )
+        });
+    assert_eq!(pass.kind, "magic_bytes");
+}
+
+/// BLOCKING bypass #2 — `agent_mcp` branch in `tools/spawn.rs`.
+///
+/// The `agent_mcp` branch returns after the SESSION-scope validator
+/// check (`tools/spawn.rs:2087-2113`). Pre-round-3 it never invokes
+/// `run_project_root_validators`, so a slides workflow that dispatches
+/// through MCP completes without writing the project ledger.
+#[tokio::test]
+async fn agent_mcp_slides_writes_project_ledger() {
+    use async_trait::async_trait;
+    use octos_agent::tools::SpawnTool;
+    use octos_agent::{
+        DispatchOutcome, DispatchRequest, DispatchResponse, McpAgentBackend, SharedBackend, Tool,
+        WorkspacePolicy, WorkspaceProjectKind, write_workspace_policy,
+    };
+    use octos_core::Message;
+    use octos_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason, TokenUsage, ToolSpec};
+    use octos_memory::EpisodeStore;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    // ── Fake MCP backend that returns a contract-shaped Success. ─────
+    struct FakeBackend {
+        pptx_abs_path: PathBuf,
+    }
+    #[async_trait]
+    impl McpAgentBackend for FakeBackend {
+        fn backend_label(&self) -> &'static str {
+            "local"
+        }
+        fn endpoint_label(&self) -> String {
+            "fake".into()
+        }
+        async fn dispatch(&self, _request: DispatchRequest) -> DispatchResponse {
+            DispatchResponse {
+                outcome: DispatchOutcome::Success,
+                output: "Generated PPTX: ok".into(),
+                files_to_send: vec![self.pptx_abs_path.clone()],
+                error: None,
+            }
+        }
+    }
+
+    // ── Workspace setup. ─────────────────────────────────────────────
+    let dir = TempDir::new().unwrap();
+    let session_root = dir.path();
+    let project_root = session_root.join("slides").join("demo");
+    let output_dir = project_root.join("output");
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    write_workspace_policy(session_root, &WorkspacePolicy::for_session()).unwrap();
+    write_workspace_policy(
+        &project_root,
+        &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
+    )
+    .unwrap();
+    std::fs::write(project_root.join("script.js"), "// slides").unwrap();
+    std::fs::write(project_root.join("memory.md"), "# memory").unwrap();
+    std::fs::write(project_root.join("changelog.md"), "# changelog").unwrap();
+    let pptx_path = output_dir.join("deck.pptx");
+    let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
+    pptx_bytes.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&pptx_path, &pptx_bytes).unwrap();
+
+    // ── SpawnTool wired with the fake MCP backend. ──────────────────
+    struct UnusedLlm;
+    #[async_trait]
+    impl LlmProvider for UnusedLlm {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            Ok(ChatResponse {
+                content: Some("unused".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+        fn model_id(&self) -> &str {
+            "unused"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    let memory = Arc::new(
+        EpisodeStore::open(dir.path().join(".octos-mem"))
+            .await
+            .unwrap(),
+    );
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+    let backend: SharedBackend = Arc::new(FakeBackend {
+        pptx_abs_path: pptx_path.clone(),
+    });
+    let spawn_tool = SpawnTool::new(
+        Arc::new(UnusedLlm),
+        memory,
+        session_root.to_path_buf(),
+        in_tx,
+    )
+    .with_mcp_agent_backend(backend, Some("run_task".into()));
+
+    // ── Dispatch through the agent_mcp branch. ─────────────────────
+    //
+    // Omit `terminal_output` so this test isolates the bypass at
+    // spawn.rs:2087-2113. With `terminal_output.required_artifact_kind =
+    // "presentation"`, the earlier `resolve_contract_terminal_files`
+    // gate (spawn.rs:2061) calls `inspect_workspace_contract_at_root`
+    // against `self.working_dir`, which fails with
+    // "unsupported workspace project root for git snapshot: <session_root>"
+    // because the session root's parent is not `slides/sites` — that's a
+    // separate, pre-existing edge in the agent_mcp wiring orthogonal to
+    // #997's project-ledger bypass.
+    let result = spawn_tool
+        .execute(&serde_json::json!({
+            "task": "make a deck",
+            "label": "slides-mcp",
+            "mode": "sync",
+            "backend": "agent_mcp",
+            "allowed_tools": [],
+            "workflow": {
+                "workflow_kind": "slides",
+                "current_phase": "design"
+            }
+        }))
+        .await
+        .expect("agent_mcp dispatch must not error");
+
+    // Sanity: the dispatch succeeded.
+    assert!(
+        result.success,
+        "agent_mcp dispatch must succeed; got output = {}",
+        result.output
+    );
+
+    // ── Load-bearing assertion: project ledger must exist. ───────────
+    //
+    // PRE-FIX (round-2 HEAD 5457c184) FAILURE QUOTE:
+    //   project ledger must exist at
+    //   <session>/slides/demo/.octos/validator_outcomes.jsonl after
+    //   the agent_mcp branch completes — that branch only invokes the
+    //   session-scope validator (lines 2087-2113) and never calls
+    //   run_project_root_validators
+    let ledger_path = project_root.join(".octos").join("validator_outcomes.jsonl");
+    assert!(
+        ledger_path.exists(),
+        "project ledger must exist at {} after the agent_mcp branch completes \
+         — that branch only invokes the session-scope validator (spawn.rs:2087-2113) \
+         and never calls run_project_root_validators",
+        ledger_path.display()
+    );
+
+    let ledger = octos_agent::ValidatorLedger::open(&ledger_path).expect("open project ledger");
+    let entries = ledger.read_all().expect("read project ledger entries");
+    let pass = entries
+        .iter()
+        .find(|o| {
+            o.validator_id == "slides.mofa_slides.pptx_magic_bytes"
+                && o.status == octos_agent::ValidatorStatus::Pass
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "project ledger must contain a Pass for slides.mofa_slides.pptx_magic_bytes; \
+                 got entries = {entries:?}"
+            )
+        });
+    assert_eq!(pass.kind, "magic_bytes");
+}
