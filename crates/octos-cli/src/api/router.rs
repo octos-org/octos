@@ -283,7 +283,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/register/setup-script",
             get(admin::register_setup_script),
-        );
+        )
+        // Issue #1001 follow-up: signed-preview minting. Sits on the
+        // authenticated `my_api` branch — the SPA dashboard already
+        // has the user's bearer when it renders the iframe, so we
+        // require auth at the mint step. The actual preview content
+        // is served via the PUBLIC `/api/preview-signed/{token}/...`
+        // route registered below (no auth middleware — the token IS
+        // the credential). See
+        // [`handlers::sign_preview`] for the auth/authorisation flow.
+        .route("/api/my/preview/sign", post(handlers::sign_preview));
 
     // Admin API routes (admin auth only, 1MB body limit)
     let admin_api = Router::new()
@@ -583,12 +592,33 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // group above — the handler asserts identity-owns-profile +
     // session-belongs-to-profile, so the URL tuple is no longer
     // sufficient to read another tenant's built site.
+    //
+    // Issue #1001 follow-up: the signed-URL preview route
+    // `/api/preview-signed/{token}/{*path}` lives here so the SPA
+    // iframe can GET it without `Authorization: Bearer ...`. The
+    // token itself is the credential — `handlers::serve_signed_preview`
+    // looks the token up in `AppState.preview_tokens`, re-validates the
+    // issuer bearer, and re-checks identity ↔ profile authorisation
+    // before serving content. Daemon restart drops the token cache and
+    // every outstanding preview link invalidates with it.
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
         .route(
             "/api/register/setup-script/{id}/{auth_token}",
             get(admin::register_setup_script_public),
+        )
+        .route(
+            "/api/preview-signed/{token}",
+            get(handlers::serve_signed_preview_root),
+        )
+        .route(
+            "/api/preview-signed/{token}/",
+            get(handlers::serve_signed_preview_root),
+        )
+        .route(
+            "/api/preview-signed/{token}/{*path}",
+            get(handlers::serve_signed_preview),
         )
         .merge(webhook_routes)
         .merge(version_routes)
@@ -816,6 +846,19 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
     } else {
         query_token.to_string()
     }
+}
+
+/// Crate-public wrapper around [`resolve_identity`].
+///
+/// Exposed for the signed-preview re-validation in
+/// [`crate::api::handlers::serve_signed_preview`]: the public
+/// `/api/preview-signed/{token}/...` route lives OUTSIDE
+/// `user_auth_middleware`, so it must re-resolve the issuer bearer
+/// stored in the `PreviewTokens` grant on every request. A revoked
+/// session ⇒ `None` ⇒ 403, which is how logout / session-delete
+/// invalidates outstanding previews "for free".
+pub(crate) async fn resolve_identity_public(state: &AppState, token: &str) -> Option<AuthIdentity> {
+    resolve_identity(state, token).await
 }
 
 /// Resolve token to an AuthIdentity.

@@ -16,6 +16,7 @@ mod frps_plugin;
 mod handlers;
 pub mod metrics;
 pub mod preview;
+pub mod preview_tokens;
 pub mod purge;
 mod router;
 mod static_files;
@@ -38,6 +39,10 @@ pub mod webhook_proxy;
 
 pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
+pub use preview_tokens::{
+    DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewTokens,
+    SharedPreviewTokens, SignedPreviewResponse,
+};
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 
 /// Test-only re-exports for the build_output_dir validation suite.
@@ -271,6 +276,18 @@ pub struct AppState {
     /// serve cwd under launchd is `~`, outside the profile root, and
     /// `/api/files` would 403 anything written there).
     pub appui_default_session_cwd: Option<PathBuf>,
+    /// In-memory signed-preview token cache (issue #1001 follow-up).
+    ///
+    /// The SPA mints a token via `POST /api/my/preview/sign` and serves
+    /// the iframe at `GET /api/preview-signed/{token}/{*path}` — that
+    /// public route consumes the token as its auth credential, so the
+    /// iframe can drop the missing `Authorization: Bearer ...` header
+    /// that the post-PR-#1001 `/api/preview/...` route requires.
+    ///
+    /// Cache is process-local (no disk persistence) so a daemon restart
+    /// invalidates every outstanding grant. See
+    /// [`crate::api::preview_tokens`] for full design rationale.
+    pub preview_tokens: SharedPreviewTokens,
 }
 
 impl AppState {
@@ -327,6 +344,7 @@ impl AppState {
             content_classifier: None,
             task_query_store: None,
             appui_default_session_cwd: None,
+            preview_tokens: Arc::new(PreviewTokens::new()),
         }
     }
 }

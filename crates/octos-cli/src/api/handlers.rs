@@ -3157,6 +3157,276 @@ pub async fn health() -> Json<serde_json::Value> {
     }))
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+//  Issue #1001 follow-up: signed-URL preview endpoint.
+//
+//  PR #1001 required `Authorization: Bearer ...` on
+//  `/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}`. The SPA's
+//  `<iframe src=/api/preview/...>` cannot inject headers, so the iframe
+//  401-loops after PR #1001 landed.
+//
+//  Codex design: mint a 256-bit random token via
+//  `POST /api/my/preview/sign`, store a server-side grant
+//  `{issuer_bearer, identity_snapshot, profile_id, session_id, site_slug,
+//  expires_at}` in `AppState.preview_tokens`, and serve the preview via
+//  PUBLIC route `GET /api/preview-signed/{token}/{*path}`. The token IS the
+//  auth credential.
+//
+//  Revocation: `serve_signed_preview` re-resolves the issuer bearer on
+//  every request — logout / session-delete invalidate naturally because
+//  `resolve_identity` will return `None` for a revoked bearer. Daemon
+//  restart drops the in-memory `PreviewTokens` cache, invalidating every
+//  outstanding grant.
+//
+//  See `crates/octos-cli/src/api/preview_tokens.rs` for full design
+//  rationale on the token-cache module itself.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Body for `POST /api/my/preview/sign`.
+#[derive(Deserialize)]
+pub struct SignPreviewRequest {
+    pub profile_id: String,
+    pub session_id: String,
+    pub site_slug: String,
+}
+
+/// `POST /api/my/preview/sign` — mint an opaque signed-preview token.
+///
+/// Flow:
+/// 1. Auth middleware has already populated `Extension<AuthIdentity>` — if
+///    it's missing the router routed an unauthenticated request into this
+///    handler, which is a routing bug. Fail closed with 401.
+/// 2. Extract the bearer that the auth middleware accepted (we re-validate
+///    it on every `serve_signed_preview` call, so we need to store the
+///    same string here). Falling back to query `?token=` matches
+///    `extract_token` in `router.rs`.
+/// 3. Identity must be authorized for the requested `profile_id`. Codex
+///    design: this is the same `is_authorized_for_profile` gate the
+///    `/api/preview/...` route uses, so the signing surface is no looser
+///    than the route it bridges to.
+/// 4. Validate that `<data_dir>/users/<encoded_session_key>/workspace/sites/<slug>`
+///    exists. Without this check, a caller who legitimately owns
+///    `profile_id` could mint a token for a nonexistent session — not a
+///    security boundary (the serve handler would 404 anyway), but it lets
+///    the SPA surface a useful error at the sign step rather than the
+///    serve step.
+/// 5. Issue the token via `state.preview_tokens.issue(...)`.
+pub async fn sign_preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    Json(req): Json<SignPreviewRequest>,
+) -> Response {
+    // (1) Auth identity must be present (routing-bug guard).
+    let Some(Extension(identity)) = identity else {
+        tracing::warn!(
+            "POST /api/my/preview/sign reached without AuthIdentity — routing bug? failing closed"
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // (2) Extract the bearer string. Mirrors the precedence
+    // `router.rs::extract_token` uses: Authorization header first, then
+    // `?token=`/`?_token=` query param. We need this verbatim so we can
+    // re-validate it via `resolve_identity` later.
+    let Some(bearer) = extract_bearer_from_request(&headers) else {
+        tracing::warn!("sign_preview: no bearer token on request");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    // (3) Identity must own the requested profile.
+    if !is_authorized_for_profile(&state, &identity, &req.profile_id) {
+        tracing::warn!(
+            identity = ?identity,
+            requested_profile = %req.profile_id,
+            "sign_preview denied — identity not authorized for requested profile"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // (4) Resolve the data dir and confirm the site exists. Errors map
+    //     to the same status codes as the existing preview route so the
+    //     SPA can render a meaningful message.
+    let data_dir = match resolve_profile_data_dir_by_id(&state, &req.profile_id) {
+        Ok(d) => d,
+        Err(response) => return response,
+    };
+    let site_exists = api_session_workspace_dirs(&data_dir, &req.session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("sites").join(&req.site_slug))
+        .any(|candidate| candidate.exists());
+    if !site_exists {
+        tracing::warn!(
+            identity = ?identity,
+            profile_id = %req.profile_id,
+            session_id = %req.session_id,
+            site_slug = %req.site_slug,
+            "sign_preview: site does not exist under profile's data dir"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // (5) Mint the token. Codex GAP 8: distinguish OS-level entropy
+    //     failures (503) from rate-limit refusals (429) so the SPA can
+    //     differentiate "retry the daemon" from "you're holding too
+    //     many previews open already".
+    use crate::api::preview_tokens::IssueError;
+    match state
+        .preview_tokens
+        .issue(
+            bearer,
+            identity,
+            req.profile_id,
+            req.session_id,
+            req.site_slug,
+        )
+        .await
+    {
+        Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
+        Err(IssueError::Random(err)) => {
+            tracing::error!(error = %err, "sign_preview: getrandom failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "token mint failed").into_response()
+        }
+        Err(IssueError::PerBearerLimitReached) => {
+            tracing::warn!("sign_preview: per-bearer cap reached (codex GAP 8 backpressure)");
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many outstanding preview tokens for this session — wait for expiry or close some iframes",
+            )
+                .into_response()
+        }
+        Err(IssueError::GlobalLimitReached) => {
+            tracing::error!(
+                "sign_preview: GLOBAL preview-token cap reached — possible DoS or runaway client"
+            );
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "preview-token cache is full; daemon is rate-limiting",
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /api/preview-signed/{token}/{*path}` — serve a previewed asset
+/// using the opaque token as the auth credential.
+///
+/// The route lives on the PUBLIC branch (no `user_auth_middleware`)
+/// because the iframe cannot inject `Authorization`. The token IS the
+/// credential — codex's design re-validates it three ways here:
+///   1. Token must resolve to a non-expired grant in the in-memory cache.
+///      Unknown / expired => 404 (don't leak whether the token ever
+///      existed).
+///   2. The `issuer_bearer` recorded at sign time must still resolve to
+///      an `AuthIdentity` — `resolve_identity` returns `None` for
+///      revoked sessions, deleted users, or daemon restart. Refusal =>
+///      403 (the token IS known, but its bearer is no longer valid).
+///   3. The re-resolved identity must still be authorized for the
+///      grant's `profile_id`. Refusal => 403 (defense in depth — closes
+///      the corner case where a user's role changes between sign and
+///      serve).
+///
+/// Response carries `Referrer-Policy: no-referrer` per codex's design so
+/// outbound links from the previewed site cannot leak the signed URL
+/// (which contains the token) to third parties via the Referer header.
+pub async fn serve_signed_preview(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((token, request_path)): axum::extract::Path<(String, String)>,
+) -> Response {
+    serve_signed_preview_impl(state, token, request_path).await
+}
+
+/// Variant of `serve_signed_preview` for routes WITHOUT a `{*path}`
+/// segment (e.g. `GET /api/preview-signed/{token}/`). Hands the empty
+/// string as the request path so the underlying preview impl serves the
+/// `index.html` root.
+pub async fn serve_signed_preview_root(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    serve_signed_preview_impl(state, token, String::new()).await
+}
+
+async fn serve_signed_preview_impl(
+    state: Arc<AppState>,
+    token: String,
+    request_path: String,
+) -> Response {
+    // (1) Consume the token. Unknown or expired => 404.
+    let Some(grant) = state.preview_tokens.consume(&token).await else {
+        // 404 (NOT 401) — codex design: don't leak whether the token
+        // ever existed.
+        tracing::debug!("serve_signed_preview: token unknown or expired");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // (2) Re-resolve the issuer bearer. If the user logged out or the
+    // session was deleted, `resolve_identity` returns None.
+    let Some(identity) = super::router::resolve_identity_public(&state, &grant.issuer_bearer).await
+    else {
+        tracing::warn!(
+            profile_id = %grant.profile_id,
+            "serve_signed_preview: issuer bearer no longer resolves to an identity (logout / session-delete?)"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    };
+
+    // (3) Defense in depth: even if the bearer still resolves, re-check
+    // the identity-vs-profile authorisation. Closes the corner case
+    // where the user's role changes between sign and serve.
+    if !is_authorized_for_profile(&state, &identity, &grant.profile_id) {
+        tracing::warn!(
+            identity = ?identity,
+            grant_profile = %grant.profile_id,
+            "serve_signed_preview: identity no longer authorized for grant's profile"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // (4) Resolve the profile's data dir and delegate to the same
+    // symlink-safe serve path that `/api/preview/...` and
+    // `/api/site-preview/...` use. PR #1000's `serve_preview_no_follow`
+    // is invoked inside `serve_site_preview_impl`; we must NOT inline a
+    // fresh serve path here or we re-introduce the traversal bug.
+    let data_dir = match resolve_profile_data_dir_by_id(&state, &grant.profile_id) {
+        Ok(d) => d,
+        Err(response) => return response,
+    };
+
+    let mut resp =
+        serve_site_preview_impl(data_dir, grant.session_id, grant.site_slug, request_path).await;
+
+    // (5) Codex design: set `Referrer-Policy: no-referrer` so a click on
+    // any outbound link from the previewed site cannot leak the signed
+    // URL (which contains the token) to third parties via Referer.
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    resp
+}
+
+/// Extract a bearer token from the request headers OR the URL query
+/// string. Mirrors `crate::api::router::extract_token` but takes a
+/// `&HeaderMap` so the sign_preview handler can call it from a typed
+/// extractor signature without re-receiving the raw axum Request.
+///
+/// NOTE: The query-string branch is omitted here because `/api/my/preview/sign`
+/// is POST-only and clients should send the bearer via the
+/// `Authorization` header — query-string fallback is a holdover for
+/// EventSource and `<img src=...>` which neither apply to the sign
+/// surface. If a future client needs it we'll revisit; keeping the
+/// surface narrow at sign time reduces the bearer's exposure in access
+/// logs.
+fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
