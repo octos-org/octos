@@ -127,6 +127,47 @@ pub(crate) fn routed_profile_id_from_headers(
         .and_then(|candidate| resolve_profile_id_candidate(state, candidate))
 }
 
+/// #995 follow-up — authorization-aware wrapper around
+/// [`routed_profile_id_from_headers`].
+///
+/// On TRUSTED hops (loopback by default, or
+/// `OCTOS_TRUSTED_PROXY_CIDRS`-matched addresses) the strip middleware
+/// preserves the operator-set `X-Profile-Id`, so authenticated requests
+/// can still smuggle a victim-profile id past the routing layer. This
+/// helper closes that gap: when both a header-resolved profile id AND
+/// an authenticated identity are present, the identity MUST be
+/// authorized for the target profile. Admin tokens (`AuthIdentity::Admin`)
+/// and admin-role user sessions short-circuit to `Ok`; owner→sub-account
+/// is also permitted via the parent_id check in
+/// [`super::auth_handlers::is_authorized_for_profile`]. Mismatch is a
+/// hard `403`.
+///
+/// Unauthenticated requests pass through unchanged — the call site is
+/// responsible for its own downstream authorization (e.g. webhook
+/// proxies or public preview routes).
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorized_routed_profile_id_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<Option<String>, Response> {
+    let Some(profile_id) = routed_profile_id_from_headers(state, headers) else {
+        return Ok(None);
+    };
+    if let Some(identity) = identity {
+        if !super::auth_handlers::is_authorized_for_profile(state, identity, &profile_id) {
+            tracing::warn!(
+                target: "octos::api::auth",
+                identity = ?identity,
+                requested_profile = %profile_id,
+                "routed_profile_id denied — authenticated identity not authorized for the requested profile (#995 follow-up)"
+            );
+            return Err((StatusCode::FORBIDDEN, "forbidden").into_response());
+        }
+    }
+    Ok(Some(profile_id))
+}
+
 /// Resolve API port for a specific profile, or fall back to first available.
 /// Profile is identified by X-Profile-Id header (set by Caddy from subdomain).
 async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(String, u16)> {
@@ -143,8 +184,68 @@ async fn resolve_api_port(state: &AppState, headers: &HeaderMap) -> Option<(Stri
     pm.first_api_port().await
 }
 
-fn api_profile_id_from_headers(state: &AppState, headers: &HeaderMap) -> String {
-    routed_profile_id_from_headers(state, headers).unwrap_or_else(|| MAIN_PROFILE_ID.to_string())
+/// #995 follow-up — authorization-aware wrapper around
+/// [`resolve_api_port`]. Returns `Err(403)` when the header-resolved
+/// profile is not one the authenticated identity is authorized for.
+///
+/// The header authorization check runs FIRST — even if no
+/// `process_manager` is wired (standalone mode) the call site still
+/// needs to authorize a cross-tenant `X-Profile-Id`, because the
+/// authorization gate is the only thing keeping a forged header from
+/// reaching the standalone path's storage helpers downstream.
+///
+/// Falls back to the gateway's first available port when no header
+/// resolved to a profile, matching the legacy `resolve_api_port`
+/// contract — that fallback never touches a tenant-scoped route, so
+/// there is no header to authorize.
+#[allow(clippy::result_large_err)]
+async fn resolve_api_port_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<Option<(String, u16)>, Response> {
+    let authorized_profile_id =
+        authorized_routed_profile_id_from_headers(state, headers, identity)?;
+
+    let pm = match state.process_manager.as_ref() {
+        Some(pm) => pm,
+        None => return Ok(None),
+    };
+
+    if let Some(profile_id) = authorized_profile_id {
+        if let Some(port) = pm.api_port(&profile_id).await {
+            return Ok(Some((profile_id, port)));
+        }
+        tracing::warn!(profile = profile_id, "no API port for requested profile");
+    }
+
+    Ok(pm.first_api_port().await)
+}
+
+/// #995 follow-up round 3 — authorization-aware profile resolver for
+/// the API channel. Returns `Err(403)` when the header resolves to a
+/// profile the identity is not authorized for; falls back to
+/// `MAIN_PROFILE_ID` when no header is present (matching the legacy
+/// `api_profile_id_from_headers` contract, retired in this round).
+///
+/// The raw (unauthorized) variant was deleted because the only
+/// remaining caller — the standalone candidate walk in
+/// [`standalone_api_session_key_candidates_with_topic`] — is now
+/// reachable on a trusted hop AND must therefore reject cross-tenant
+/// headers up-front. Codex round-2 review called out the raw variant
+/// as bypass-prone for exactly this reason; the function now exists
+/// only in its `_authorized` form so future call sites can't
+/// reintroduce the same bug.
+#[allow(clippy::result_large_err)]
+fn api_profile_id_from_headers_authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+) -> Result<String, Response> {
+    Ok(
+        authorized_routed_profile_id_from_headers(state, headers, identity)?
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_string()),
+    )
 }
 
 /// Returns `true` when `session_id` is a bare SPA id whose raw form is
@@ -205,14 +306,28 @@ fn is_safe_bare_session_id(session_id: &str) -> bool {
 /// The dedup pass collapses duplicates when the topic is empty (in
 /// which case the bare-key and raw-id forms coincide with their
 /// no-topic counterparts).
+///
+/// **#995 follow-up round 3 — authorization is REQUIRED**. This helper
+/// now uses [`api_profile_id_from_headers_authorized`] internally, so
+/// a cross-tenant `X-Profile-Id` on a trusted hop produces an `Err`
+/// `Response` (403) instead of resolving to the victim profile id.
+/// Every caller already authorized via
+/// [`authorized_routed_profile_id_from_headers`] at the handler
+/// entry, so this is defense-in-depth: if a future caller is added
+/// that forgets to gate up-front, the candidate walk itself rejects
+/// the cross-tenant header rather than building candidates against
+/// the victim profile. Codex round-2 review specifically called out
+/// the standalone `session_messages` path as bypass-prone for exactly
+/// this reason.
+#[allow(clippy::result_large_err)]
 fn standalone_api_session_key_candidates_with_topic(
     state: &AppState,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
     session_id: &str,
     topic: Option<&str>,
-) -> Vec<SessionKey> {
-    let profile_id = api_profile_id_from_headers(state, headers);
+) -> Result<Vec<SessionKey>, Response> {
+    let profile_id = api_profile_id_from_headers_authorized(state, headers, identity)?;
     let topic = topic.unwrap_or_default();
 
     // Always probe the resolved profile's own canonical key first.
@@ -262,7 +377,7 @@ fn standalone_api_session_key_candidates_with_topic(
         }
     }
     candidates.dedup_by(|left, right| left.0 == right.0);
-    candidates
+    Ok(candidates)
 }
 
 fn encode_api_session_path_id(id: &str) -> String {
@@ -295,13 +410,27 @@ fn is_internal_session_topic(topic: &str) -> bool {
 // Helper for `ui_protocol::handle_session_list` (M12 Phase D-5).
 // The REST route `GET /api/sessions` was retired; this function survives
 // as the implementation backing the WS `session/list` RPC method.
-pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+
+    // #995 follow-up — Layer-2 authorization for the routed profile.
+    // Pre-fix this prefix went straight to `routed_profile_id_from_headers`,
+    // so a trusted-hop request with `X-Profile-Id: <victim>` listed the
+    // victim's sessions even when authenticated as another tenant.
+    let profile_id = match api_profile_id_from_headers_authorized(&state, &headers, identity_ref) {
+        Ok(pid) => pid,
+        Err(response) => return response,
+    };
 
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
-        let prefix = format!("{}:api:", api_profile_id_from_headers(&state, &headers));
+        let prefix = format!("{profile_id}:api:");
         // Use `list_top_level_sessions` (skips `child-*` and `*.tasks` at the
         // directory walk) so a user dir with tens of thousands of spawn
         // children does not turn this listing into an O(N) hang. The
@@ -326,7 +455,14 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>, headers: HeaderMa
     }
 
     // Also fetch from gateway if available.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — routed_profile_id used to walk the per-profile
+    // gateway is authorized above; the `resolve_api_port_authorized`
+    // call re-checks header authorization belt-and-suspenders.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let proxy_resp = super::webhook_proxy::api_get_proxy(&state, port, "/sessions").await;
         if proxy_resp.status().is_success() {
             if let Ok(body) = axum::body::to_bytes(proxy_resp.into_body(), 10 * 1024 * 1024).await {
@@ -432,9 +568,27 @@ pub async fn session_messages(
 ) -> Response {
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
 
     // source=full: always proxy to gateway, which owns the canonical JSONL history.
     let use_full = params.source.as_deref() == Some("full");
+
+    // #995 follow-up round 3 — Layer-2 authorization gate BEFORE any
+    // standalone-store candidate walk. Pre-fix, the standalone path at
+    // lines 587-620 built candidate `SessionKey`s using the raw
+    // `api_profile_id_from_headers` (which trusts whatever
+    // `X-Profile-Id` the request carries on a trusted hop) and returned
+    // messages from those candidates before ever hitting the gateway
+    // gate at the bottom of this function. The result: an authenticated
+    // non-admin user on a loopback hop could read another tenant's
+    // session messages by forging `X-Profile-Id`. Codex round-2 quote:
+    // "Passing `identity` only affects fallback breadth; it does not
+    // reject cross-tenant headers." This call rejects cross-tenant
+    // headers up-front; admin / owner / self continue past it.
+    if let Err(response) = authorized_routed_profile_id_from_headers(&state, &headers, identity_ref)
+    {
+        return response;
+    }
 
     // Try standalone store first in local mode.
     if !use_full {
@@ -471,14 +625,16 @@ pub async fn session_messages(
             // unlocks the unprofiled fallbacks even when the request
             // resolved to a hosted profile (admin already has read-all
             // privileges, so this is no privilege escalation).
-            let identity_ref = identity.as_ref().map(|ext| &ext.0);
-            let candidate_keys = standalone_api_session_key_candidates_with_topic(
+            let candidate_keys = match standalone_api_session_key_candidates_with_topic(
                 &state,
                 &headers,
                 identity_ref,
                 &id,
                 params.topic.as_deref(),
-            );
+            ) {
+                Ok(keys) => keys,
+                Err(response) => return response,
+            };
             let mut sess = sessions.lock().await;
             let mut chosen: Option<&SessionKey> = None;
             for key in &candidate_keys {
@@ -512,7 +668,13 @@ pub async fn session_messages(
     } // !use_full
 
     // Proxy to gateway.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — authorize routed profile against identity
+    // before walking the gateway.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = session_messages_proxy_path(
             &id,
             limit,
@@ -552,11 +714,20 @@ pub struct MessageInfo {
 pub async fn session_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
-    // Proxy to gateway (session actors live there)
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // Proxy to gateway (session actors live there).
+    // #995 follow-up — authorize routed profile against identity
+    // before walking the gateway. Pre-fix the gateway routing read the
+    // raw header.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let encoded_id = encode_api_session_path_id(&id);
         let mut path = format!("/sessions/{encoded_id}/status");
         append_topic_query(&mut path, params.topic.as_deref());
@@ -578,11 +749,18 @@ pub async fn session_status(
 pub async fn session_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<TopicQueryParams>,
 ) -> Response {
-    // Proxy to gateway (task supervisor lives there)
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // Proxy to gateway (task supervisor lives there).
+    // #995 follow-up — authorize routed profile against identity.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let encoded_id = encode_api_session_path_id(&id);
         let mut path = format!("/sessions/{encoded_id}/tasks");
         append_topic_query(&mut path, params.topic.as_deref());
@@ -608,10 +786,19 @@ pub async fn session_tasks(
 pub async fn cancel_task(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
 ) -> Response {
-    // Gateway-mode: forward to the gateway process that owns the supervisor.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
+    // Gateway-mode: forward to the gateway process that owns the
+    // supervisor. #995 follow-up — authorize routed profile against
+    // identity before forwarding (a forged header could otherwise
+    // cancel a victim's task on a TRUSTED hop).
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!("/tasks/{}/cancel", encode_api_session_path_id(&task_id));
         return super::webhook_proxy::api_post_proxy_json(
             &state,
@@ -682,12 +869,21 @@ pub struct RestartFromNodeRequest {
 pub async fn restart_task_from_node(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     body: Option<Json<RestartFromNodeRequest>>,
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    let identity_ref = identity.as_ref().map(|ext| &ext.0);
 
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — authorize routed profile against identity. A
+    // forged header could otherwise relaunch a victim's task on a
+    // TRUSTED hop.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!(
             "/tasks/{}/restart-from-node",
             encode_api_session_path_id(&task_id)
@@ -936,9 +1132,27 @@ pub async fn update_session_title(
 
     let mut updated = false;
     let identity_ref = identity.as_ref().map(|ext| &ext.0);
-    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
-    let candidates =
-        standalone_api_session_key_candidates_with_topic(&state, &headers, identity_ref, &id, None);
+    // #995 follow-up — authorize routed profile against identity
+    // before using it as `SessionManager` routing context. Pre-fix the
+    // raw header value flowed straight into `resolve_sessions_for_lookup`
+    // and the gateway proxy below, letting a forged
+    // `X-Profile-Id: <victim>` rename a victim's sessions on a TRUSTED
+    // hop.
+    let routed_profile_id =
+        match authorized_routed_profile_id_from_headers(&state, &headers, identity_ref) {
+            Ok(pid) => pid,
+            Err(response) => return response,
+        };
+    let candidates = match standalone_api_session_key_candidates_with_topic(
+        &state,
+        &headers,
+        identity_ref,
+        &id,
+        None,
+    ) {
+        Ok(keys) => keys,
+        Err(response) => return response,
+    };
 
     // #924 BLOCK 3: each candidate `SessionKey` may belong to a
     // different profile (the candidate set includes the resolved
@@ -976,7 +1190,12 @@ pub async fn update_session_title(
 
     // Proxy to gateway too, since the session may live in the per-profile
     // SessionManager rather than the serve-process store.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — same `resolve_api_port_authorized` gate.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!("/sessions/{}/title", encode_api_session_path_id(&id));
         let body_json = serde_json::json!({ "title": title }).to_string();
         let _ = super::webhook_proxy::api_patch_proxy(&state, port, &path, body_json).await;
@@ -1005,9 +1224,25 @@ pub async fn delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let identity_ref = identity.as_ref().map(|ext| &ext.0);
-    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
-    let candidates =
-        standalone_api_session_key_candidates_with_topic(&state, &headers, identity_ref, &id, None);
+    // #995 follow-up — authorize routed profile against identity
+    // before using it as `SessionManager` routing context. Pre-fix a
+    // forged `X-Profile-Id: <victim>` would delete victim's sessions
+    // on a TRUSTED hop.
+    let routed_profile_id =
+        match authorized_routed_profile_id_from_headers(&state, &headers, identity_ref) {
+            Ok(pid) => pid,
+            Err(response) => return response,
+        };
+    let candidates = match standalone_api_session_key_candidates_with_topic(
+        &state,
+        &headers,
+        identity_ref,
+        &id,
+        None,
+    ) {
+        Ok(keys) => keys,
+        Err(response) => return response,
+    };
 
     // #924 BLOCK 3: route each candidate through the profile-aware
     // SessionManager resolver — turn persistence writes to the
@@ -1039,7 +1274,12 @@ pub async fn delete_session(
 
     // Also proxy delete to gateway — sessions may live in the gateway's
     // SessionManager (per-profile data dir), not just the serve process's store.
-    if let Some((_profile_id, port)) = resolve_api_port(&state, &headers).await {
+    // #995 follow-up — same `resolve_api_port_authorized` gate.
+    let api_port = match resolve_api_port_authorized(&state, &headers, identity_ref).await {
+        Ok(port) => port,
+        Err(response) => return response,
+    };
+    if let Some((_profile_id, port)) = api_port {
         let path = format!("/sessions/{}", encode_api_session_path_id(&id));
         let _ = super::webhook_proxy::api_delete_proxy(&state, port, &path).await;
     }
@@ -1428,6 +1668,65 @@ fn infer_profile_id_from_data_dir(data_dir: &std::path::Path) -> String {
         .to_string()
 }
 
+/// Decision: which profile id should the request resolve to, given the
+/// header-derived candidate (post-middleware — already stripped if the
+/// connection was untrusted), an identity-derived id, and the auth
+/// identity for an authorization check?
+///
+/// **Auth bypass fix (#995)**: the legacy precedence
+/// `header.or(identity)` let an authenticated request set
+/// `X-Profile-Id: <victim>` and read the victim's data dir. The current
+/// precedence is identity-first; if a header is *also* present (i.e.
+/// from a trusted proxy after the strip middleware ran), it must name
+/// a profile the identity is authorized to act on — otherwise we
+/// return `403`, never silently override.
+///
+/// - Unauthenticated request + header: legacy hint, pass through.
+/// - Authenticated + header MATCHES identity scope: use that profile
+///   (lets per-tenant Caddy ingress narrow admin auth to a tenant).
+/// - Authenticated + header is unauthorized: `403`.
+/// - Authenticated + no header: use identity's own profile.
+/// - Neither header nor identity: `BAD_REQUEST`.
+//
+// `clippy::result_large_err` is consistent with `resolve_profile_data_dir`
+// and the rest of this handler module — boxing the response just for this
+// helper would diverge from the surrounding style.
+#[allow(clippy::result_large_err)]
+pub(crate) fn decide_resolved_profile_id(
+    state: &AppState,
+    identity: Option<&AuthIdentity>,
+    header_profile_id: Option<&str>,
+    identity_profile_id: Option<&str>,
+) -> Result<String, Response> {
+    match (identity, header_profile_id) {
+        (Some(identity), Some(pid)) => {
+            if super::auth_handlers::is_authorized_for_profile(state, identity, pid) {
+                return Ok(pid.to_string());
+            }
+            tracing::warn!(
+                target: "octos::api::auth",
+                identity = ?identity,
+                requested_profile = %pid,
+                "X-Profile-Id denied — authenticated identity not authorized for the requested profile"
+            );
+            Err((StatusCode::FORBIDDEN, "forbidden").into_response())
+        }
+        (Some(_), None) => identity_profile_id.map(str::to_string).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "missing X-Profile-Id and no authenticated profile context",
+            )
+                .into_response()
+        }),
+        (None, Some(pid)) => Ok(pid.to_string()),
+        (None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            "missing X-Profile-Id and no authenticated profile context",
+        )
+            .into_response()),
+    }
+}
+
 async fn resolve_profile_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -1442,26 +1741,25 @@ async fn resolve_profile_data_dir(
                 None => None,
             };
 
-            if let Some(pid) = header_profile_id.as_deref().or(identity_profile_id) {
-                match ps.get(pid) {
-                    Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
-                    Ok(None) => {
-                        return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
-                    }
-                    Err(error) => {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("profile lookup failed: {error}"),
-                        )
-                            .into_response());
-                    }
+            let pid = decide_resolved_profile_id(
+                state,
+                identity,
+                header_profile_id.as_deref(),
+                identity_profile_id,
+            )?;
+            match ps.get(&pid) {
+                Ok(Some(profile)) => return Ok(ps.resolve_data_dir(&profile)),
+                Ok(None) => {
+                    return Err((StatusCode::NOT_FOUND, "profile not found").into_response());
+                }
+                Err(error) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("profile lookup failed: {error}"),
+                    )
+                        .into_response());
                 }
             }
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "missing X-Profile-Id and no authenticated profile context",
-            )
-                .into_response());
         }
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no profile store").into_response());
     }
@@ -3209,7 +3507,8 @@ mod tests {
             Some(&AuthIdentity::Admin),
             "telegram:123",
             None,
-        );
+        )
+        .expect("admin identity is always authorized");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         assert!(
             !keys.iter().any(|k| *k == "telegram:123"),
@@ -3333,7 +3632,8 @@ mod tests {
         // is returned.
         let candidates = standalone_api_session_key_candidates_with_topic(
             &state, &headers, None, "web-7c9e", None,
-        );
+        )
+        .expect("unauthenticated → no header authorization check required");
         let keys: Vec<&str> = candidates.iter().map(|k| k.0.as_str()).collect();
         // Profiled key must come first so existing chat-history reads keep
         // hitting the canonical write target before walking fallbacks.
@@ -3662,7 +3962,7 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new()).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -3720,7 +4020,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new()).await;
+        let response = list_sessions(State(state), HeaderMap::new(), None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -3859,6 +4159,7 @@ mod tests {
         let response = cancel_task(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path(task_id.clone()),
         )
         .await;
@@ -3881,6 +4182,7 @@ mod tests {
         let response = cancel_task(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path("does-not-exist".to_string()),
         )
         .await;
@@ -3903,8 +4205,13 @@ mod tests {
             task_query_store: Some(store),
             ..AppState::empty_for_tests()
         });
-        let response =
-            cancel_task(State(state), HeaderMap::new(), axum::extract::Path(task_id)).await;
+        let response = cancel_task(
+            State(state),
+            HeaderMap::new(),
+            None,
+            axum::extract::Path(task_id),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
@@ -3914,6 +4221,7 @@ mod tests {
         let response = cancel_task(
             State(Arc::clone(&state)),
             HeaderMap::new(),
+            None,
             axum::extract::Path("any".to_string()),
         )
         .await;
@@ -3940,6 +4248,7 @@ mod tests {
         let response = restart_task_from_node(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path(task_id.clone()),
             Some(Json(RestartFromNodeRequest {
                 node_id: Some("design".into()),
@@ -3978,6 +4287,7 @@ mod tests {
         let response = restart_task_from_node(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path("nope".into()),
             Some(Json(RestartFromNodeRequest::default())),
         )
@@ -3996,6 +4306,7 @@ mod tests {
         let response = restart_task_from_node(
             State(state),
             HeaderMap::new(),
+            None,
             axum::extract::Path(task_id),
             Some(Json(RestartFromNodeRequest::default())),
         )
@@ -4022,4 +4333,174 @@ mod tests {
     // The `appui_default_session_cwd` workspace-hint forwarding the
     // M11-F regression-fix test asserted is now exercised directly
     // through the WS turn dispatcher (`ui_protocol::run_standalone_turn`).
+
+    // ── #995 — `decide_resolved_profile_id` precedence + auth ──────────
+    //
+    // The legacy precedence was `header.or(identity)` (handlers.rs:1442
+    // before the fix), letting any authenticated request set
+    // `X-Profile-Id: <victim>` and walk into the victim's data dir. The
+    // current logic is identity-first; if a header is also present
+    // (i.e. coming from a trusted reverse proxy after the strip
+    // middleware ran) it must name a profile the identity is authorized
+    // for — otherwise we return `403`, never silently override.
+
+    use crate::api::auth_handlers::ADMIN_PROFILE_ID;
+    use crate::profiles::{ProfileStore, UserProfile};
+    use crate::user_store::UserRole;
+
+    fn make_profile(id: &str, parent_id: Option<&str>) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: parent_id.map(Into::into),
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Build a minimal `AppState` for `decide_resolved_profile_id` unit
+    /// tests with a profile_store containing the listed profiles.
+    fn state_with_profiles(profiles: &[(&str, Option<&str>)]) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open(dir.path()).unwrap();
+        for (id, parent) in profiles {
+            ps.save(&make_profile(id, *parent)).unwrap();
+        }
+        let state = AppState {
+            profile_store: Some(Arc::new(ps)),
+            ..AppState::empty_for_tests()
+        };
+        (dir, state)
+    }
+
+    #[test]
+    fn decide_uses_identity_when_no_header_present() {
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        };
+        let pid = decide_resolved_profile_id(&state, Some(&identity), None, Some("alice")).unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_uses_header_when_identity_is_authorized_admin() {
+        // Admin token can be narrowed to a specific tenant via X-Profile-Id
+        // when the request comes from the loopback Caddy ingress. This is
+        // the legitimate post-fix behaviour for hosted subdomains.
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let identity = AuthIdentity::Admin;
+        let pid = decide_resolved_profile_id(
+            &state,
+            Some(&identity),
+            Some("alice"),
+            Some(ADMIN_PROFILE_ID),
+        )
+        .unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_uses_header_when_identity_owns_sub_account_named_in_header() {
+        let (_dir, state) = state_with_profiles(&[("owner", None), ("owner-sub", Some("owner"))]);
+        let identity = AuthIdentity::User {
+            id: "owner".into(),
+            role: UserRole::User,
+        };
+        let pid =
+            decide_resolved_profile_id(&state, Some(&identity), Some("owner-sub"), Some("owner"))
+                .unwrap();
+        assert_eq!(pid, "owner-sub");
+    }
+
+    #[test]
+    fn decide_rejects_header_when_authenticated_identity_unauthorized_for_it() {
+        // #995 pre-fix bypass: authenticated as alice, header says bob.
+        // Pre-fix: `header.or(identity)` returned "bob" silently.
+        // Post-fix: 403, no leak.
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::User,
+        };
+        let err = decide_resolved_profile_id(&state, Some(&identity), Some("bob"), Some("alice"))
+            .expect_err("must reject cross-tenant header");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn decide_rejects_header_pointing_to_unrelated_sub_account() {
+        // Owner authenticated → cannot use header to act as another
+        // owner's sub-account (parent_id mismatch).
+        let (_dir, state) = state_with_profiles(&[
+            ("owner-a", None),
+            ("owner-b", None),
+            ("owner-b-sub", Some("owner-b")),
+        ]);
+        let identity = AuthIdentity::User {
+            id: "owner-a".into(),
+            role: UserRole::User,
+        };
+        let err = decide_resolved_profile_id(
+            &state,
+            Some(&identity),
+            Some("owner-b-sub"),
+            Some("owner-a"),
+        )
+        .expect_err("must reject foreign sub-account");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn decide_allows_user_with_admin_role_to_target_any_profile() {
+        // A user account flagged as `UserRole::Admin` is fully
+        // privileged — `is_authorized_for_profile` short-circuits to
+        // `true` in that branch. Codify the contract so a future
+        // refactor can't quietly break the admin path.
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let identity = AuthIdentity::User {
+            id: "alice".into(),
+            role: UserRole::Admin,
+        };
+        let pid = decide_resolved_profile_id(&state, Some(&identity), Some("bob"), Some("alice"))
+            .unwrap();
+        assert_eq!(pid, "bob");
+    }
+
+    #[test]
+    fn decide_falls_back_to_header_when_unauthenticated() {
+        // Pre-auth callers (e.g. webhook proxies, public preview) still
+        // use the header as a hint. Their handlers do their own
+        // authorization downstream; the contract here is only
+        // "don't 403 just because no identity is present."
+        let (_dir, state) = state_with_profiles(&[("alice", None)]);
+        let pid = decide_resolved_profile_id(&state, None, Some("alice"), None).unwrap();
+        assert_eq!(pid, "alice");
+    }
+
+    #[test]
+    fn decide_returns_bad_request_when_no_signal_at_all() {
+        let (_dir, state) = state_with_profiles(&[]);
+        let err = decide_resolved_profile_id(&state, None, None, None)
+            .expect_err("no identity AND no header must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decide_returns_bad_request_when_authenticated_but_no_identity_profile_id_resolved() {
+        // Edge case: identity is `Some(_)` but the caller could not
+        // resolve a profile id for it (e.g. admin in a setup-wizard
+        // state where `ensure_admin_profile` hasn't run yet). We must
+        // not fall through to a stripped-empty header.
+        let (_dir, state) = state_with_profiles(&[]);
+        let identity = AuthIdentity::Admin;
+        let err = decide_resolved_profile_id(&state, Some(&identity), None, None)
+            .expect_err("must signal missing context");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
 }
