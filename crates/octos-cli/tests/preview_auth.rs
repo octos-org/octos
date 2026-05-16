@@ -40,6 +40,7 @@ struct Fixture {
     _tempdir: TempDir,
     state: Arc<AppState>,
     session_a_id: String,
+    session_a_other_id: String,
     session_b_id: String,
     site_slug: String,
     token_a: String,
@@ -153,16 +154,25 @@ async fn build_fixture() -> Fixture {
     //    false.
     let site_slug = "test-site";
     let session_a_id = "site-A-1234567890-abcdef";
+    let session_a_other_id = "site-A-OTHER-7766554433";
     let session_b_id = "site-B-9876543210-fedcba";
 
     let key_a = SessionKey::with_profile(&profile_a.id, "api", session_a_id);
+    let key_a_other = SessionKey::with_profile(&profile_a.id, "api", session_a_other_id);
     let key_b = SessionKey::with_profile(&profile_b.id, "api", session_b_id);
     let encoded_a = octos_bus::session::encode_path_component(key_a.base_key());
+    let encoded_a_other = octos_bus::session::encode_path_component(key_a_other.base_key());
     let encoded_b = octos_bus::session::encode_path_component(key_b.base_key());
 
     let ws_a = data_dir_a
         .join("users")
         .join(&encoded_a)
+        .join("workspace")
+        .join("sites")
+        .join(site_slug);
+    let ws_a_other = data_dir_a
+        .join("users")
+        .join(&encoded_a_other)
         .join("workspace")
         .join("sites")
         .join(site_slug);
@@ -173,6 +183,7 @@ async fn build_fixture() -> Fixture {
         .join("sites")
         .join(site_slug);
     seed_built_site(&ws_a, "<<<A-CONTENT>>>");
+    seed_built_site(&ws_a_other, "<<<A-OTHER-CONTENT>>>");
     seed_built_site(&ws_b, "<<<B-CONTENT>>>");
 
     // 5. AppState wiring. `process_manager`/`session_cache` are not
@@ -189,6 +200,7 @@ async fn build_fixture() -> Fixture {
         _tempdir: tempdir,
         state,
         session_a_id: session_a_id.into(),
+        session_a_other_id: session_a_other_id.into(),
         session_b_id: session_b_id.into(),
         site_slug: site_slug.into(),
         token_a,
@@ -431,4 +443,167 @@ async fn test_5_authed_user_b_serves_own_preview() {
         .unwrap();
     let body_str = String::from_utf8_lossy(&body);
     assert!(body_str.contains("<<<B-CONTENT>>>"));
+}
+
+#[tokio::test]
+async fn test_6_reject_site_preview_with_forged_x_profile_id() {
+    // Codex review of PR #1001 caught this: `/api/site-preview/*` is a
+    // PARALLEL preview surface to `/api/preview/*` (which this PR
+    // hardened). Both endpoints can serve the same on-disk content,
+    // but `/api/site-preview/*` lacks a `profile_id` URL segment and
+    // historically derived the profile via `resolve_profile_data_dir`,
+    // which reads the `X-Profile-Id` header. An authenticated tenant A
+    // who spoofs `X-Profile-Id: tenant-b` could therefore read
+    // tenant B's preview through this side door even after PR #1001
+    // closed `/api/preview/*`.
+    //
+    // Post-fix the handler MUST ignore the header for profile-routing
+    // and assert ownership via the authenticated identity (mirroring
+    // `serve_owned_site_preview`). Cross-tenant header => 403.
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    // User A authenticates with their own bearer token, but spoofs
+    // `X-Profile-Id: tenant-b` AND points at B's session. Pre-fix the
+    // handler resolved tenant B's data dir from the header, found B's
+    // workspace, and returned `<<<B-CONTENT>>>`.
+    let uri = format!(
+        "/api/site-preview/{}/{}/index.html",
+        fx.session_b_id, fx.site_slug
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {}", fx.token_a))
+                .header("x-profile-id", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "user A spoofing X-Profile-Id: tenant-b MUST be 403, not 200 with B's data; \
+         got status {} (this is the codex-flagged /api/site-preview/* side door)",
+        resp.status()
+    );
+
+    // Defence in depth: even if status check misfired, B's marker
+    // must not leak.
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        !body_str.contains("<<<B-CONTENT>>>"),
+        "cross-tenant body leak via /api/site-preview/* with forged X-Profile-Id: \
+         response contains tenant B's marker"
+    );
+}
+
+#[tokio::test]
+async fn test_7_serve_site_preview_with_authenticated_identity() {
+    // Codex review companion to test 6. With `/api/site-preview/*` no
+    // longer trusting `X-Profile-Id`, an authenticated user A hitting
+    // their OWN session and no `X-Profile-Id` header must still get
+    // 200 — the handler derives the profile from the authenticated
+    // identity instead.
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let uri = format!(
+        "/api/site-preview/{}/{}/index.html",
+        fx.session_a_id, fx.site_slug
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {}", fx.token_a))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "user A authenticated against their own session without X-Profile-Id MUST be 200; \
+         got status {}",
+        resp.status()
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("<<<A-CONTENT>>>"),
+        "expected user A's preview body to contain '<<<A-CONTENT>>>', got: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn test_8_serve_other_session_under_same_profile() {
+    // Codex review §3 "session-ownership semantics" clarification.
+    //
+    // `/api/site-preview/*` is intentionally profile-scoped, NOT
+    // per-session-owner: any session that lives under the
+    // authenticated identity's profile is reachable, even one the
+    // user didn't directly originate from this browser. This is the
+    // current product semantic — multiple browsers / devices for the
+    // same tenant should all be able to load the tenant's previews.
+    //
+    // Test 3 above already pinned "session that does NOT exist under
+    // the profile -> 403". This test pins the complementary case:
+    // session that DOES exist under user A's profile (different
+    // `web-<id>` than the user's "current" session) -> 200. If the
+    // product later switches to per-session-owner semantics, this
+    // test should flip and capture the intent change.
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    // session_a_other_id is pre-seeded under tenant-a's data dir but
+    // is a DIFFERENT id from `session_a_id`. With token A and no
+    // X-Profile-Id, the handler must resolve tenant-a's data dir from
+    // the identity and serve the other session under the same profile.
+    let uri = format!(
+        "/api/site-preview/{}/{}/index.html",
+        fx.session_a_other_id, fx.site_slug
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("authorization", format!("Bearer {}", fx.token_a))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "user A hitting another of A's profile-owned sessions via /api/site-preview/* \
+         MUST be 200 (profile-scoped semantic); got status {}",
+        resp.status()
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("<<<A-OTHER-CONTENT>>>"),
+        "expected the other A-session's marker, got: {body_str}"
+    );
 }
