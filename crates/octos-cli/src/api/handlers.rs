@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use super::auth_handlers::ADMIN_PROFILE_ID;
 use super::router::AuthIdentity;
-use crate::project_templates::{SiteProjectMetadata, read_site_project_metadata};
+use crate::project_templates::{
+    BuildOutputDirError, SiteProjectMetadata, read_site_project_metadata,
+    validated_build_output_dir,
+};
 
 /// Legacy `POST /api/chat` retired.
 ///
@@ -1659,11 +1662,18 @@ fn preview_content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Resolve the build output directory for a site preview.
+///
+/// Issue #996: the metadata file is LLM-writable via `edit_file`, so
+/// the `build_output_dir` field is **untrusted on read** — we route
+/// every read through [`validated_build_output_dir`]. Callers must
+/// surface the typed error to the user (e.g. as a 4xx-equivalent
+/// preview page), not silently fall back to the raw join.
 fn output_dir_for_site(
     project_dir: &std::path::Path,
     metadata: &SiteProjectMetadata,
-) -> std::path::PathBuf {
-    project_dir.join(&metadata.build_output_dir)
+) -> Result<std::path::PathBuf, BuildOutputDirError> {
+    validated_build_output_dir(metadata, project_dir)
 }
 
 fn newest_tree_mtime(
@@ -1803,7 +1813,10 @@ fn ensure_site_build_output(
 
     let build_lock = site_build_lock(project_dir);
     let _build_guard = build_lock.lock().unwrap();
-    let output_dir = output_dir_for_site(project_dir, metadata);
+    // Validate the LLM-controlled metadata field before we trust it
+    // to derive the build output path. Issue #996.
+    let output_dir = output_dir_for_site(project_dir, metadata)
+        .map_err(|err| format!("invalid build_output_dir: {err}"))?;
     if !site_build_needed(project_dir, &output_dir) {
         return Ok(output_dir);
     }
@@ -1836,7 +1849,11 @@ fn ensure_site_build_output(
         ));
     }
 
-    Ok(output_dir)
+    // Re-validate now that the output dir exists on disk — this
+    // re-runs the canonical-descendant check and catches symlinks
+    // that the build step might have left behind.
+    output_dir_for_site(project_dir, metadata)
+        .map_err(|err| format!("invalid build_output_dir after build: {err}"))
 }
 
 fn safe_preview_join(root: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {

@@ -651,6 +651,159 @@ pub fn read_site_project_metadata(project_dir: &Path) -> Option<SiteProjectMetad
     serde_json::from_str(&raw).ok()
 }
 
+/// Reason a metadata `build_output_dir` was rejected by
+/// [`validated_build_output_dir`]. Issue #996 — the LLM may rewrite
+/// `mofa-site-session.json` (the metadata source) via `edit_file`, so
+/// every consumer that joins the value onto `project_dir` must route
+/// through the validator to keep the preview confined to the site
+/// scaffold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildOutputDirError {
+    /// The metadata field was empty or whitespace-only.
+    Empty,
+    /// The path was absolute (e.g. `/etc/passwd`).
+    Absolute,
+    /// The path contained a `..` component, before or after normalisation.
+    ParentEscape,
+    /// The value did not match a per-template scaffold output dir
+    /// (`dist`, `out`, or `docs`).
+    NotAllowListed,
+    /// Canonicalising `project_dir.join(value)` failed or resolved
+    /// outside `project_dir` (e.g. through a symlink).
+    OutsideProject,
+}
+
+impl std::fmt::Display for BuildOutputDirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "build_output_dir is empty"),
+            Self::Absolute => write!(f, "build_output_dir must be a relative path"),
+            Self::ParentEscape => {
+                write!(f, "build_output_dir must not contain `..` segments")
+            }
+            Self::NotAllowListed => write!(
+                f,
+                "build_output_dir is not an allow-listed template output (dist, out, docs)"
+            ),
+            Self::OutsideProject => {
+                write!(f, "build_output_dir resolves outside the project directory")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BuildOutputDirError {}
+
+/// Per-template scaffold output directories. The values come from
+/// [`crate::workflow_families::site::SiteTemplate::output_dir`] — keep
+/// the two lists in sync. Updating an existing template's output dir
+/// requires updating both.
+const ALLOWED_BUILD_OUTPUT_DIRS: &[&str] = &["dist", "out", "docs"];
+
+/// Validate the structural form of `metadata.build_output_dir`
+/// without touching disk. Returns the joined `project_dir.join(value)`
+/// on success — caller may further enforce canonical-descendant via
+/// [`canonical_descendant_check`] once the output dir exists on disk.
+fn validated_build_output_dir_form(
+    metadata: &SiteProjectMetadata,
+    project_dir: &Path,
+) -> Result<PathBuf, BuildOutputDirError> {
+    let raw = metadata.build_output_dir.trim();
+    if raw.is_empty() {
+        return Err(BuildOutputDirError::Empty);
+    }
+
+    let value_path = Path::new(raw);
+    if value_path.is_absolute() {
+        return Err(BuildOutputDirError::Absolute);
+    }
+
+    // Reject ParentDir components anywhere in the value — even if
+    // normalisation would collapse to a safe path, we don't want to
+    // allow the LLM to construct paths like `dist/../../../etc`.
+    for component in value_path.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return Err(BuildOutputDirError::ParentEscape),
+            // Absolute prefixes (Windows drive letters etc.) and the
+            // root component were already excluded by `is_absolute`,
+            // but treat any unexpected component as an escape too.
+            _ => return Err(BuildOutputDirError::Absolute),
+        }
+    }
+
+    if !ALLOWED_BUILD_OUTPUT_DIRS.contains(&raw) {
+        return Err(BuildOutputDirError::NotAllowListed);
+    }
+
+    Ok(project_dir.join(value_path))
+}
+
+/// Validate the `build_output_dir` field of a site metadata record
+/// before joining it onto `project_dir`. Returns the joined path on
+/// success; if `project_dir` and the joined output dir both exist on
+/// disk, the result is canonicalised and confirmed to be a strict
+/// descendant of `project_dir`.
+///
+/// Security: the metadata file (`mofa-site-session.json`) is writable
+/// by the LLM via `edit_file`, so the field is **untrusted on read**
+/// even though the scaffold populates it from a closed allow-list. We
+/// enforce the allow-list (`dist` / `out` / `docs`) AND structural
+/// checks (no absolute paths, no `..` components, canonical-descendant
+/// of `project_dir`) as defence-in-depth. See issue #996.
+///
+/// Two-phase validation rationale:
+/// - Form checks (allow-list, no `..`, not absolute, not empty) are
+///   total — they always run.
+/// - Canonical-descendant only runs when both sides exist, because the
+///   site build flow creates the output dir lazily on first preview.
+///   When the dir is missing we accept the joined path so the build
+///   can produce it, then the caller (preview handler) MUST re-check
+///   the resolved asset path via the canonical check below.
+pub fn validated_build_output_dir(
+    metadata: &SiteProjectMetadata,
+    project_dir: &Path,
+) -> Result<PathBuf, BuildOutputDirError> {
+    let joined = validated_build_output_dir_form(metadata, project_dir)?;
+
+    let canonical_root = match std::fs::canonicalize(project_dir) {
+        Ok(p) => p,
+        Err(_) => {
+            // project_dir not yet realised; form-check is the strongest
+            // we can offer. Return the joined raw path.
+            return Ok(joined);
+        }
+    };
+    let canonical_joined = match std::fs::canonicalize(&joined) {
+        Ok(p) => p,
+        Err(_) => {
+            // output dir does not exist yet — form checks already
+            // ruled out escape via `..` or absolute paths, and the
+            // value is allow-listed. Return the joined path; the
+            // canonical-descendant check happens once the build
+            // populates the directory.
+            return Ok(canonical_root.join(Path::new(metadata.build_output_dir.trim())));
+        }
+    };
+
+    canonical_descendant_check(&canonical_root, &canonical_joined)?;
+    Ok(canonical_joined)
+}
+
+/// Enforce that `candidate` is a strict descendant of `root`. Both
+/// inputs are expected to be canonicalised paths. Used as the second
+/// phase of build_output_dir validation after the output dir exists
+/// on disk.
+pub fn canonical_descendant_check(
+    root: &Path,
+    candidate: &Path,
+) -> Result<(), BuildOutputDirError> {
+    if candidate == root || !candidate.starts_with(root) {
+        return Err(BuildOutputDirError::OutsideProject);
+    }
+    Ok(())
+}
+
 fn write_site_support_files(
     project_dir: &Path,
     metadata: &SiteProjectMetadata,
