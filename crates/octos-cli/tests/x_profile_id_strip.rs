@@ -29,13 +29,38 @@
 
 #![cfg(feature = "api")]
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use octos_cli::api::{AppState, build_router};
 use tempfile::TempDir;
 use tower::util::ServiceExt;
+
+/// Loopback `SocketAddr` for tests that need a TRUSTED hop (Caddy
+/// ingress is `127.0.0.1:NN` in production). `is_trusted_proxy_addr`
+/// returns `true` for any address whose `is_loopback()` is `true`,
+/// without consulting `OCTOS_TRUSTED_PROXY_CIDRS`.
+fn loopback_socket_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 65432)
+}
+
+/// External `SocketAddr` for tests that need an UNTRUSTED hop. Cloudflare's
+/// `1.1.1.1` is outside any default-trusted block.
+fn external_socket_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 4444)
+}
+
+/// Inject a `ConnectInfo<SocketAddr>` extension into the request. axum
+/// normally wires this up via `into_make_service_with_connect_info`,
+/// but for `tower::ServiceExt::oneshot` we have to attach the value
+/// manually so the strip middleware + auth middleware see a remote IP.
+fn with_connect_info(mut req: Request<Body>, addr: SocketAddr) -> Request<Body> {
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
 
 /// Build an `AppState` with a `profile_store` containing the listed
 /// profiles. The store is shared with the auth manager (so OTP login
@@ -63,6 +88,84 @@ fn build_state(_dir: &TempDir, profiles: &[(&str, Option<&str>)]) -> Arc<AppStat
         auth_token: Some("admin-secret".into()),
         ..AppState::empty_for_tests()
     })
+}
+
+/// Build an `AppState` wired with a real `AuthManager` + `UserStore`
+/// + `ProfileStore`. Used by the trusted-hop tests that need a
+/// non-admin authenticated identity. `users` describes
+/// `(user_id, email, role)`, and `profiles` describes
+/// `(profile_id, parent_id)` matching the `build_state` helper.
+fn build_state_with_users(
+    dir: &TempDir,
+    users: &[(&str, &str, octos_cli::user_store::UserRole)],
+    profiles: &[(&str, Option<&str>)],
+) -> (Arc<AppState>, Arc<octos_cli::otp::AuthManager>) {
+    let profile_store = Arc::new(octos_cli::profiles::ProfileStore::open(dir.path()).unwrap());
+    for (id, parent) in profiles {
+        let profile = octos_cli::profiles::UserProfile {
+            id: (*id).into(),
+            name: (*id).into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: parent.map(|p| p.into()),
+            public_subdomain: None,
+            config: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        profile_store.save(&profile).unwrap();
+    }
+
+    let user_store = Arc::new(octos_cli::user_store::UserStore::open(dir.path()).unwrap());
+    for (id, email, role) in users {
+        let user = octos_cli::user_store::User {
+            id: (*id).into(),
+            email: (*email).into(),
+            name: (*id).into(),
+            role: role.clone(),
+            created_at: chrono::Utc::now(),
+            last_login_at: None,
+        };
+        user_store.save(&user).unwrap();
+    }
+
+    // Use a static token so we don't need an SMTP send round-trip to
+    // mint a session.
+    let auth_config = octos_cli::otp::DashboardAuthConfig {
+        smtp: octos_cli::otp::SmtpConfig {
+            host: "unused".into(),
+            port: 587,
+            username: "unused@example.com".into(),
+            password_env: "UNUSED_PASSWORD".into(),
+            from_address: "unused@example.com".into(),
+        },
+        session_expiry_hours: 24,
+        allow_self_registration: false,
+        static_tokens: vec!["e2e-static-bypass".into()],
+    };
+    let auth_manager = Arc::new(octos_cli::otp::AuthManager::new(
+        Some(auth_config),
+        user_store.clone(),
+    ));
+
+    let state = Arc::new(AppState {
+        profile_store: Some(profile_store),
+        user_store: Some(user_store),
+        auth_manager: Some(auth_manager.clone()),
+        auth_token: Some("admin-secret".into()),
+        ..AppState::empty_for_tests()
+    });
+    (state, auth_manager)
+}
+
+/// Mint a session token for `email` via the configured static-token
+/// bypass. Panics if the static token is not configured on the auth
+/// manager (test setup bug).
+async fn mint_session_token(mgr: &octos_cli::otp::AuthManager, email: &str) -> String {
+    mgr.verify_otp_with_registration(email, "e2e-static-bypass", false)
+        .await
+        .expect("verify must succeed under static-token bypass")
+        .expect("session token must be issued")
 }
 
 /// Sanity smoke: building the router with the strip middleware doesn't
@@ -237,5 +340,290 @@ async fn ws_upgrade_attempt_without_auth_with_forged_x_profile_id_fails() {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "WS upgrade with forged header on untrusted hop must be 401"
+    );
+}
+
+// ── #995 follow-up — trusted-hop coverage ───────────────────────────
+//
+// The original PR only tested the untrusted hop (no ConnectInfo → the
+// strip middleware fires and erases the header). Codex pointed out
+// that Layer-2 (`decide_resolved_profile_id` + `is_authorized_for_profile`)
+// was untested end-to-end because the admin-token harness short-circuits
+// authorization in `is_authorized_for_profile`. These tests fix that
+// by attaching a `ConnectInfo` (loopback or external) and using a
+// non-admin authenticated identity.
+
+/// **TRUSTED + PRESERVE.** A request originating from `127.0.0.1`
+/// with a matching `X-Profile-Id` passes the strip middleware
+/// unchanged. The auth middleware's proxy-auth branch (header-as-auth)
+/// then accepts it and the request resolves to that profile. No 401,
+/// no 403 — this is the production Caddy-on-loopback flow.
+#[tokio::test]
+async fn loopback_request_preserves_x_profile_id_and_authorizes_as_proxy() {
+    let dir = TempDir::new().unwrap();
+    let state = build_state(&dir, &[("alice", None)]);
+    let app = build_router(state).into_service();
+
+    // No `Authorization` header — the auth middleware will fall through
+    // to the proxy-auth branch which accepts the `X-Profile-Id` because
+    // the hop is trusted. The handler will hit a 503 (no
+    // process_manager) which is fine; the contract here is "no 401 / no
+    // 403", i.e. the strip middleware did NOT strip and the proxy-auth
+    // branch did accept.
+    let req = with_connect_info(
+        Request::builder()
+            .method("GET")
+            .uri("/api/files/list")
+            .header("x-profile-id", "alice")
+            .body(Body::empty())
+            .unwrap(),
+        loopback_socket_addr(),
+    );
+
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "loopback hop must not strip the legitimate X-Profile-Id; \
+         expected proxy-auth to accept and the handler to run"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "no identity is even authenticated yet, so 403 would be wrong; \
+         got {}",
+        resp.status()
+    );
+}
+
+/// **TRUSTED + AUTHENTICATED USER + CROSS-TENANT HEADER.** This is the
+/// exact bypass shape from #995, exercised through the full router
+/// (Layer 1 PASS + Layer 2 must DENY). A real OTP-issued session for
+/// `alice` attaches `X-Profile-Id: bob` on a loopback hop. The strip
+/// middleware preserves the header (trusted hop), the auth middleware
+/// promotes the bearer to `AuthIdentity::User { id: "alice", role: User }`,
+/// the handler's `decide_resolved_profile_id` (or
+/// `authorized_routed_profile_id_from_headers`) sees the cross-tenant
+/// header, calls `is_authorized_for_profile`, and returns `403`.
+///
+/// The pre-fix code path returned the victim's data dir contents
+/// silently. The non-admin identity is critical here — the admin
+/// short-circuit in `is_authorized_for_profile` would have masked the
+/// bug.
+#[tokio::test]
+async fn authenticated_non_admin_with_cross_tenant_header_on_trusted_hop_is_403() {
+    let dir = TempDir::new().unwrap();
+    let (state, auth_manager) = build_state_with_users(
+        &dir,
+        &[
+            (
+                "alice",
+                "alice@example.com",
+                octos_cli::user_store::UserRole::User,
+            ),
+            (
+                "bob",
+                "bob@example.com",
+                octos_cli::user_store::UserRole::User,
+            ),
+        ],
+        &[("alice", None), ("bob", None)],
+    );
+    let token = mint_session_token(&auth_manager, "alice@example.com").await;
+    let app = build_router(state).into_service();
+
+    // Target a route that authorizes the routed profile via
+    // `resolve_api_port_authorized` (cancel_task uses that gate first,
+    // independent of whether a `process_manager` is wired).
+    let req = with_connect_info(
+        Request::builder()
+            .method("POST")
+            .uri("/api/tasks/some-task-id/cancel")
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-profile-id", "bob")
+            .body(Body::empty())
+            .unwrap(),
+        loopback_socket_addr(),
+    );
+
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "authenticated non-admin user with X-Profile-Id pointing to \
+         a different tenant on a TRUSTED hop must be 403 — this is the \
+         exact #995 bypass shape"
+    );
+}
+
+/// **TRUSTED + ADMIN + CROSS-TENANT HEADER.** Admin tokens are
+/// legitimately allowed to narrow scope via `X-Profile-Id` on a
+/// loopback hop — that's how the operator's Caddy ingress
+/// authenticates the per-tenant subdomain. The admin
+/// short-circuit in `is_authorized_for_profile` returns `true`, so
+/// the request proceeds past Layer 2 authorization. The handler then
+/// hits a 503 because no `process_manager` is wired in the test
+/// fixture, but the contract here is "must NOT be 403" — admin is
+/// always allowed.
+#[tokio::test]
+async fn admin_with_cross_tenant_header_on_trusted_hop_is_not_403() {
+    let dir = TempDir::new().unwrap();
+    let state = build_state(&dir, &[("alice", None), ("bob", None)]);
+    let app = build_router(state).into_service();
+
+    // Target a route that authorizes the routed profile via
+    // `resolve_api_port_authorized` so the admin short-circuit in
+    // `is_authorized_for_profile` is what's under test (admin must
+    // PASS the gate, not be denied).
+    let req = with_connect_info(
+        Request::builder()
+            .method("POST")
+            .uri("/api/tasks/some-task-id/cancel")
+            .header("authorization", "Bearer admin-secret")
+            .header("x-profile-id", "bob")
+            .body(Body::empty())
+            .unwrap(),
+        loopback_socket_addr(),
+    );
+
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "admin auth + cross-tenant header on TRUSTED hop must NOT be \
+         403 — this is the legitimate per-tenant narrowing flow that \
+         Caddy uses. Got {}",
+        resp.status()
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "admin auth must be honored, not rejected; got {}",
+        resp.status()
+    );
+}
+
+/// **EXTERNAL HOP + AUTHENTICATED USER + CROSS-TENANT HEADER.** When
+/// the request comes from a non-trusted address (e.g. an attacker who
+/// somehow reached the daemon directly), the Layer-1 strip middleware
+/// removes the header BEFORE the auth middleware sees it. The auth
+/// middleware then promotes the bearer to alice's identity, no
+/// `X-Profile-Id` is left for the handler to honor, and the request
+/// resolves to alice's own profile — never bob's. This exercises both
+/// Layer 1 (strip on untrusted hop) and Layer 2 (authorization)
+/// passing.
+#[tokio::test]
+async fn authenticated_non_admin_with_cross_tenant_header_on_external_hop_is_stripped() {
+    let dir = TempDir::new().unwrap();
+    let (state, auth_manager) = build_state_with_users(
+        &dir,
+        &[
+            (
+                "alice",
+                "alice@example.com",
+                octos_cli::user_store::UserRole::User,
+            ),
+            (
+                "bob",
+                "bob@example.com",
+                octos_cli::user_store::UserRole::User,
+            ),
+        ],
+        &[("alice", None), ("bob", None)],
+    );
+    let token = mint_session_token(&auth_manager, "alice@example.com").await;
+    let app = build_router(state).into_service();
+
+    let req = with_connect_info(
+        Request::builder()
+            .method("POST")
+            .uri("/api/tasks/some-task-id/cancel")
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-profile-id", "bob")
+            .body(Body::empty())
+            .unwrap(),
+        external_socket_addr(),
+    );
+
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+
+    // The header was stripped on the external hop, so the handler
+    // resolves to alice's own profile (the identity path), not bob.
+    // The standalone path (no `process_manager`) returns 503 from the
+    // task supervisor; the contract here is the negative one: must
+    // NOT be 403 (no cross-tenant header reached the handler), must
+    // NOT succeed (no task with that id exists in this fixture, so
+    // even a properly-scoped lookup fails closed).
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "header was stripped before auth, so there is no cross-tenant \
+         header to deny; got {}",
+        resp.status()
+    );
+    assert!(
+        !resp.status().is_success(),
+        "external hop must never succeed in reading another tenant's \
+         data via a forged header; got {}",
+        resp.status()
+    );
+}
+
+/// **WS UPGRADE + TRUSTED + AUTHENTICATED USER + CROSS-TENANT HEADER.**
+/// The WS upgrade in `ui_protocol.rs:ws_handler` stashes
+/// `routed_profile_id_from_headers(...)` on the connection. On a
+/// TRUSTED hop the strip middleware preserves the header, so without
+/// the GAP-6 fix the connection would carry alice's identity AND bob's
+/// `routed_profile_id` into every downstream RPC. After the fix the
+/// upgrade returns 403 at the authorization gate, never completing the
+/// websocket handshake.
+#[tokio::test]
+async fn ws_upgrade_with_cross_tenant_header_on_trusted_hop_is_403() {
+    let dir = TempDir::new().unwrap();
+    let (state, auth_manager) = build_state_with_users(
+        &dir,
+        &[
+            (
+                "alice",
+                "alice@example.com",
+                octos_cli::user_store::UserRole::User,
+            ),
+            (
+                "bob",
+                "bob@example.com",
+                octos_cli::user_store::UserRole::User,
+            ),
+        ],
+        &[("alice", None), ("bob", None)],
+    );
+    let token = mint_session_token(&auth_manager, "alice@example.com").await;
+    let app = build_router(state).into_service();
+
+    let req = with_connect_info(
+        Request::builder()
+            .method("GET")
+            .uri("/api/ui-protocol/ws")
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-profile-id", "bob")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .unwrap(),
+        loopback_socket_addr(),
+    );
+
+    let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "WS upgrade with cross-tenant X-Profile-Id on TRUSTED hop must \
+         be denied before any frames are exchanged — GAP-6 of #995 \
+         follow-up review"
     );
 }

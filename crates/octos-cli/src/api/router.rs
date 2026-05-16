@@ -896,15 +896,20 @@ async fn user_auth_middleware(
     // 2. Accept X-Profile-Id header for chat API routes (proxy auth).
     // The reverse proxy (Caddy) sets this header to identify the profile,
     // so requests through the proxy are implicitly authenticated.
-    // SECURITY: Only accept this header from loopback addresses to prevent
-    // profile impersonation via misconfigured reverse proxy or SSRF.
-    let is_loopback = req
+    // SECURITY: Only accept this header from a TRUSTED proxy address —
+    // loopback by default, plus any CIDR listed in
+    // `OCTOS_TRUSTED_PROXY_CIDRS`. The Layer-1 strip middleware uses
+    // the SAME helper (`is_trusted_proxy_addr`), so operators who run
+    // an off-host reverse proxy can opt the auth path in via the same
+    // env var that controls the strip path — keeping the two layers
+    // consistent (#995 follow-up).
+    let remote_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().is_loopback())
-        .unwrap_or(false);
+        .map(|ci| ci.0.ip());
+    let is_trusted_hop = is_trusted_proxy_addr(remote_ip);
 
-    if !profile_id.is_empty() && is_loopback {
+    if !profile_id.is_empty() && is_trusted_hop {
         // Validate that the profile actually exists to prevent spoofing.
         if let Some(ref store) = state.profile_store {
             if store.get(&profile_id).ok().flatten().is_none() {
@@ -934,10 +939,10 @@ async fn user_auth_middleware(
         }
     }
 
-    if !profile_id.is_empty() && !is_loopback {
+    if !profile_id.is_empty() && !is_trusted_hop {
         tracing::warn!(
             profile_id = %profile_id,
-            "X-Profile-Id header rejected: request not from loopback address"
+            "X-Profile-Id header rejected: request not from a trusted proxy address (#995 follow-up)"
         );
     }
 

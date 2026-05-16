@@ -1833,7 +1833,7 @@ pub async fn ws_handler(
     identity: Option<Extension<AuthIdentity>>,
     headers: HeaderMap,
     uri: Uri,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     // #923.3 + #924 BLOCK 5: gate the upgrade on Origin. See
     // `decide_ws_origin_gate` for the full decision table.
@@ -1866,7 +1866,39 @@ pub async fn ws_handler(
     // connection so per-session resolution (notably plugin work_dir →
     // file-API root) can pick the right profile data dir even for admin
     // sessions originated from a hosted subdomain.
+    //
+    // #995 follow-up — when the request carries an authenticated
+    // identity AND the headers (Host or surviving `X-Profile-Id`)
+    // resolve to a tenant profile, the identity MUST be authorized for
+    // that profile. Pre-fix, an authenticated user-A could open a WS
+    // upgrade against a TRUSTED hop with `X-Profile-Id: B` and have
+    // `routed_profile_id` propagate through session/gateway routing.
+    // Mismatch is a hard `403` — the upgrade does NOT proceed.
+    //
+    // The `WebSocketUpgrade` extractor is wrapped in `Result<…>` so
+    // the authorization gate runs even when the upgrade prerequisites
+    // are missing (notably under `tower::oneshot` in tests, which has
+    // no `hyper::upgrade::OnUpgrade` extension). In production the
+    // upgrade extractor never fails on a real WS request; the wrapper
+    // is purely so the 403 can be observed end-to-end in unit tests.
     let routed_profile_id = super::handlers::routed_profile_id_from_headers(&state, &headers);
+    if let (Some(Extension(identity_inner)), Some(profile_id)) =
+        (identity.as_ref(), routed_profile_id.as_ref())
+    {
+        if !super::auth_handlers::is_authorized_for_profile(&state, identity_inner, profile_id) {
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                identity = ?identity_inner,
+                requested_profile = %profile_id,
+                "WS upgrade denied — authenticated identity not authorized for the routed profile (#995 follow-up)"
+            );
+            return (axum::http::StatusCode::FORBIDDEN, "forbidden").into_response();
+        }
+    }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
     // M12 Phase D-1: auxiliary REST→WS dispatchers reuse the same REST
     // handlers in `handlers.rs` for business logic, which means they
@@ -2181,7 +2213,15 @@ async fn ui_protocol_connection(
             // JSON body as the WS RPC result. No business logic is
             // duplicated; the REST endpoints stay unchanged.
             UiCommand::SessionList(params) => {
-                handle_session_list(&ws, &state, &connection_headers, id, params).await;
+                handle_session_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionSnapshot(params) => {
                 handle_session_snapshot(
@@ -2206,7 +2246,15 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::SessionStatusGet(params) => {
-                handle_session_status_get(&ws, &state, &connection_headers, id, params).await;
+                handle_session_status_get(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionFilesList(params) => {
                 handle_session_files_list(
@@ -2220,7 +2268,15 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::SessionTasksList(params) => {
-                handle_session_tasks_list(&ws, &state, &connection_headers, id, params).await;
+                handle_session_tasks_list(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionWorkspaceGet(params) => {
                 handle_session_workspace_get(
@@ -2582,7 +2638,7 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                 }
             }
             UiCommand::SessionList(params) => {
-                handle_session_list(&ws, &state, &connection_headers, id, params).await;
+                handle_session_list(&ws, &state, &connection_headers, None, id, params).await;
             }
             UiCommand::SessionSnapshot(params) => {
                 handle_session_snapshot(&ws, &state, &connection_headers, None, id, params).await;
@@ -2592,13 +2648,13 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                     .await;
             }
             UiCommand::SessionStatusGet(params) => {
-                handle_session_status_get(&ws, &state, &connection_headers, id, params).await;
+                handle_session_status_get(&ws, &state, &connection_headers, None, id, params).await;
             }
             UiCommand::SessionFilesList(params) => {
                 handle_session_files_list(&ws, &state, &connection_headers, None, id, params).await;
             }
             UiCommand::SessionTasksList(params) => {
-                handle_session_tasks_list(&ws, &state, &connection_headers, id, params).await;
+                handle_session_tasks_list(&ws, &state, &connection_headers, None, id, params).await;
             }
             UiCommand::SessionWorkspaceGet(params) => {
                 handle_session_workspace_get(&ws, &state, &connection_headers, None, id, params)
@@ -7248,10 +7304,13 @@ async fn handle_session_list(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     _params: SessionListParams,
 ) {
-    let response = super::handlers::list_sessions(State(state.clone()), headers.clone()).await;
+    let identity_ext = identity.cloned().map(Extension);
+    let response =
+        super::handlers::list_sessions(State(state.clone()), headers.clone(), identity_ext).await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
     // Collection endpoint — no addressable session id. Treat any
     // (unexpected) 404 as a generic resource-not-found rather than
@@ -7271,6 +7330,7 @@ async fn handle_session_status_get(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     params: SessionStatusGetParams,
 ) {
@@ -7278,9 +7338,11 @@ async fn handle_session_status_get(
         topic: params.topic.clone(),
     });
     let session_id_str = params.session_id.clone();
+    let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::session_status(
         State(state.clone()),
         headers.clone(),
+        identity_ext,
         axum_path(params.session_id),
         topic_params,
     )
@@ -7330,6 +7392,7 @@ async fn handle_session_tasks_list(
     ws: &WsConnection,
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
     id: String,
     params: SessionTasksListParams,
 ) {
@@ -7337,9 +7400,11 @@ async fn handle_session_tasks_list(
         topic: params.topic.clone(),
     });
     let session_id_str = params.session_id.clone();
+    let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::session_tasks(
         State(state.clone()),
         headers.clone(),
+        identity_ext,
         axum_path(params.session_id),
         topic_params,
     )
@@ -7405,6 +7470,7 @@ async fn handle_session_snapshot(
     let status_fut = super::handlers::session_status(
         State(state.clone()),
         headers.clone(),
+        identity.cloned().map(Extension),
         axum_path(params.session_id.clone()),
         axum::extract::Query(super::handlers::TopicQueryParams {
             topic: params.topic.clone(),
@@ -7419,6 +7485,7 @@ async fn handle_session_snapshot(
     let tasks_fut = super::handlers::session_tasks(
         State(state.clone()),
         headers.clone(),
+        identity.cloned().map(Extension),
         axum_path(params.session_id),
         topic_params,
     );
