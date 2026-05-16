@@ -629,6 +629,38 @@ impl Agent {
                             .await
                             {
                                 SpawnTaskContractResult::Satisfied { output_files } => {
+                                    // octos #997 (round-3 fix): the session-scope
+                                    // contract above runs validators at the SESSION
+                                    // root and writes
+                                    // `<session>/.octos/validator_outcomes.jsonl`,
+                                    // but `inspect_workspace_contract` reads
+                                    // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+                                    // Without this call, a direct spawn_only
+                                    // invocation of `mofa_slides` (or any kind-
+                                    // managed tool) lands in the project workspace
+                                    // but never writes the project ledger — so a
+                                    // subsequent contract gate surfaces
+                                    // `ready = false` even when the hard-required
+                                    // validator (octos #997:
+                                    // `slides.mofa_slides.pptx_magic_bytes`)
+                                    // would have passed at the project root.
+                                    //
+                                    // Kind-agnostic: the helper iterates every
+                                    // slides/sites project beneath
+                                    // `workspace_root` and runs each project's
+                                    // own declared completion-phase validators.
+                                    // Non-slides/sites tools simply find no
+                                    // projects to validate and the helper
+                                    // returns an empty report.
+                                    if let Some(workspace_root) = bg_tools.workspace_root() {
+                                        let _project_root_report =
+                                            crate::workspace_contract::run_project_root_validators(
+                                                &bg_tools,
+                                                workspace_root,
+                                                None,
+                                            )
+                                            .await;
+                                    }
                                     // When the tool emitted real text output
                                     // (run_pipeline synthesize summary, plugin
                                     // structured result), surface it in the

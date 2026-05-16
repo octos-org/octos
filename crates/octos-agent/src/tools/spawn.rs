@@ -2052,29 +2052,6 @@ impl Tool for SpawnTool {
             // `commit` above consumed it successfully, or Drop refunds.
             drop(reservation);
 
-            let mut files_to_send = response.files_to_send.clone();
-            // Workflow contract families always gate outputs through the
-            // workspace contract. The dispatch response is advisory; the
-            // final delivery path remains owned by the runtime.
-            if let Some(workflow_meta) = workflow.as_ref() {
-                if workflow_uses_contract_terminal_delivery(workflow_meta) {
-                    match resolve_contract_terminal_files(
-                        self.working_dir.as_path(),
-                        Some(workflow_meta),
-                    ) {
-                        Ok(Some(contract_files)) => files_to_send = contract_files,
-                        Ok(None) => {}
-                        Err(error) => {
-                            return Ok(ToolResult {
-                                output: format!("Status: FAILED\n{error}"),
-                                success: false,
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
-            }
-
             // Review A F-004: for the agent_mcp dispatch path the child
             // session runs inside the remote backend and never touches the
             // parent's ValidatorRunner. Before, the parent trusted the
@@ -2084,6 +2061,23 @@ impl Tool for SpawnTool {
             // here, against the parent's workspace root, restores the
             // invariant: any required validator failure demotes the
             // response to a typed failure before it leaves the tool.
+            //
+            // octos #997 (round-4 fix): run both the session-scope and
+            // project-scope validator blocks BEFORE
+            // `resolve_contract_terminal_files`. With
+            // `terminal_output.required_artifact_kind = "presentation"`
+            // (real `slides_delivery` shape),
+            // `resolve_contract_terminal_files` calls
+            // `inspect_workspace_contract_at_root` which reads the project
+            // ledger at
+            // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+            // If validators run AFTER that gate, the gate returns
+            // `ready = false` (empty ledger) and the agent_mcp branch
+            // early-returns at `Err(error) => return Ok(...)` before
+            // either validator block executes. Re-ordering ensures the
+            // project ledger is populated first, so the contract gate
+            // inside `resolve_contract_terminal_files` sees the real
+            // `Pass` rows.
             let mut mcp_success = success;
             let mut mcp_output_override: Option<String> = None;
             if mcp_success {
@@ -2107,6 +2101,64 @@ impl Tool for SpawnTool {
                             mcp_output_override = Some(format!(
                                 "Status: FAILED\nremote_agent_mcp: completion validator rejected child artifact: {reason}"
                             ));
+                        }
+                    }
+                }
+            }
+
+            // octos #997 (round-3 fix): the session-scope validator block above
+            // runs against `self.working_dir` (the session root) and writes the
+            // session ledger only. The project-scope contract gate
+            // (`inspect_workspace_contract`) reads
+            // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`. Without
+            // this run, an `agent_mcp` slides dispatch that produces a valid
+            // PPTX would leave the project ledger empty and a downstream
+            // contract gate would surface `ready = false`. Mirror the sync
+            // (`:2312`) and background (`:2680`) spawn fixes so the agent_mcp
+            // branch closes the same bypass.
+            if mcp_success {
+                let expected_kind = workflow.as_ref().and_then(workflow_contract_project_kind);
+                let registry_for_validators = ToolRegistry::with_builtins(&self.working_dir);
+                let report = crate::workspace_contract::run_project_root_validators(
+                    &registry_for_validators,
+                    &self.working_dir,
+                    expected_kind,
+                )
+                .await;
+                if let Some(reason) = report.first_failure_reason() {
+                    mcp_success = false;
+                    mcp_output_override = Some(format!(
+                        "Status: FAILED\nremote_agent_mcp: project-scope validator rejected child artifact: {reason}"
+                    ));
+                }
+            }
+
+            // Workflow contract families always gate outputs through the
+            // workspace contract. The dispatch response is advisory; the
+            // final delivery path remains owned by the runtime.
+            //
+            // Runs LAST so the validator blocks above have already written
+            // the session + project ledgers; `inspect_workspace_contract_at_root`
+            // (inside `resolve_contract_terminal_files`) reads those ledgers
+            // to decide `ready`. Skipped on validator failure — empty
+            // `files_to_send` is correct for a failed result.
+            let mut files_to_send = response.files_to_send.clone();
+            if mcp_success {
+                if let Some(workflow_meta) = workflow.as_ref() {
+                    if workflow_uses_contract_terminal_delivery(workflow_meta) {
+                        match resolve_contract_terminal_files(
+                            self.working_dir.as_path(),
+                            Some(workflow_meta),
+                        ) {
+                            Ok(Some(contract_files)) => files_to_send = contract_files,
+                            Ok(None) => {}
+                            Err(error) => {
+                                return Ok(ToolResult {
+                                    output: format!("Status: FAILED\n{error}"),
+                                    success: false,
+                                    ..Default::default()
+                                });
+                            }
                         }
                     }
                 }
@@ -2293,6 +2345,36 @@ impl Tool for SpawnTool {
                             }
                         }
                     }
+
+                    // octos #997 (round-2 fix): in addition to the session-scope
+                    // validator run above, ALSO run each project-scope policy
+                    // at its OWN project root. The session run writes its
+                    // outcome to `<session>/.octos/validator_outcomes.jsonl`,
+                    // but `inspect_workspace_contract` reads from
+                    // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`
+                    // — so without this run a real valid deck whose project
+                    // policy declares a hard-required validator (octos #997:
+                    // `slides.mofa_slides.pptx_magic_bytes`) would surface as
+                    // `ready = false`. Scope the iteration to the workflow's
+                    // expected kind when available so a slides spawn does not
+                    // run the sites validator chain.
+                    if success {
+                        let expected_kind =
+                            workflow.as_ref().and_then(workflow_contract_project_kind);
+                        let report = crate::workspace_contract::run_project_root_validators(
+                            child_tools_handle.as_ref(),
+                            &self.working_dir,
+                            expected_kind,
+                        )
+                        .await;
+                        if let Some(reason) = report.first_failure_reason() {
+                            success = false;
+                            output = format!(
+                                "Subagent failed: project-scope validator rejected child artifact: {reason}"
+                            );
+                        }
+                    }
+
                     Ok(ToolResult {
                         output,
                         success,
@@ -2630,6 +2712,36 @@ impl Tool for SpawnTool {
                         }
                     }
                 }
+
+                // octos #997 (round-2 fix): also run each project-scope
+                // policy AT its OWN project root. The session-scope run above
+                // writes to `<session>/.octos/validator_outcomes.jsonl`, but
+                // `inspect_workspace_contract` reads from
+                // `<session>/<kind>/<slug>/.octos/validator_outcomes.jsonl`.
+                // Without this run a real valid deck whose project policy
+                // declares a hard-required validator (octos #997:
+                // `slides.mofa_slides.pptx_magic_bytes`) would surface as
+                // `ready = false` because the persisted outcome is missing
+                // from the path `inspect_workspace_contract` reads.
+                if contract_failure.is_none()
+                    && matches!(&result, Ok(task_result) if task_result.success)
+                {
+                    let expected_kind = workflow_metadata
+                        .as_ref()
+                        .and_then(workflow_contract_project_kind);
+                    let report = crate::workspace_contract::run_project_root_validators(
+                        child_tools_handle.as_ref(),
+                        &working_dir,
+                        expected_kind,
+                    )
+                    .await;
+                    if let Some(reason) = report.first_failure_reason() {
+                        contract_failure = Some(format!(
+                            "project-scope validator rejected child artifact: {reason}"
+                        ));
+                    }
+                }
+
                 if contract_failure.is_none() {
                     contract_failure = match &result {
                         Ok(task_result) if task_result.success => {
@@ -3222,7 +3334,16 @@ mod tests {
         std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
         std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        // octos #997 (round-2): real PPTX magic bytes ONLY. The spawn loop
+        // itself runs the slides-kind project-scope validator at the project
+        // root after `run_task` succeeds — that production wiring writes the
+        // Pass row into `slides/demo/.octos/validator_outcomes.jsonl`, which
+        // the contract-gated terminal delivery step then reads. Pre-round-2
+        // this fixture manually seeded the Pass via `ledger.append(...)`,
+        // masking the gap codex flagged. No manual seeding here.
+        let mut pptx = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx.extend_from_slice(b"final");
+        std::fs::write(repo_root.join("output/deck.pptx"), pptx).unwrap();
         std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
 
         let supervisor = Arc::new(TaskSupervisor::new());
@@ -3816,10 +3937,37 @@ PY
         std::fs::write(repo_root.join("script.js"), "// slides").unwrap();
         std::fs::write(repo_root.join("memory.md"), "# memory").unwrap();
         std::fs::write(repo_root.join("changelog.md"), "# changelog").unwrap();
-        std::fs::write(repo_root.join("output/deck.pptx"), "final").unwrap();
+        // octos #997: real PPTX magic bytes so the slides-kind project-scope
+        // `MagicBytes` validator does not block delivery on a fake-bytes deck.
+        let mut pptx_final = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_final.extend_from_slice(b"final");
+        std::fs::write(repo_root.join("output/deck.pptx"), pptx_final).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(repo_root.join("output/deck-draft.pptx"), "draft").unwrap();
+        let mut pptx_draft = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_draft.extend_from_slice(b"draft");
+        std::fs::write(repo_root.join("output/deck-draft.pptx"), pptx_draft).unwrap();
         std::fs::write(repo_root.join("output/slide-01.png"), "png").unwrap();
+        // octos #997 (round-2): exercise the production project-root
+        // validator helper so `inspect_workspace_contract_at_root` sees a
+        // real `Pass` row in the project ledger. Pre-round-2 this fixture
+        // manually `ledger.append(...)`ed a Pass — codex flagged that as
+        // masking the gap (the validator was declared but never RUN at the
+        // project root in production).
+        {
+            let registry = std::sync::Arc::new(crate::ToolRegistry::new());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime for fixture validator run");
+            runtime.block_on(async {
+                let _ = crate::workspace_contract::run_project_root_validators(
+                    &registry,
+                    temp.path(),
+                    Some(crate::WorkspaceProjectKind::Slides),
+                )
+                .await;
+            });
+        }
 
         let workflow = WorkflowMetadata {
             workflow_kind: "slides".to_string(),

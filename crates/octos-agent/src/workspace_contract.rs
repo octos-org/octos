@@ -12,7 +12,9 @@ use crate::tools::ToolRegistry;
 use crate::validators::{
     ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner, ValidatorStatus,
 };
-use crate::workspace_git::open_workspace_validator_ledger;
+use crate::workspace_git::{
+    WorkspaceProjectKind, list_workspace_repos, open_workspace_validator_ledger,
+};
 use crate::workspace_policy::{
     Validator, ValidatorPhaseKind, WorkspacePolicy, WorkspacePolicyKind, WorkspaceSpawnTaskPolicy,
     read_workspace_policy,
@@ -635,6 +637,126 @@ pub async fn run_declared_validators_with_output(
         return Err(format!("required validator failure: {joined}"));
     }
     Ok(outcomes)
+}
+
+/// octos #997 (round-2 fix): aggregated result for project-root validator runs.
+///
+/// `run_project_root_validators` iterates every policy-managed
+/// slides/sites project beneath the session's `working_dir` and runs each
+/// project's declared completion-phase validators AT THE PROJECT ROOT —
+/// so the resulting ledger writes land at
+/// `<working_dir>/<kind>/<slug>/.octos/validator_outcomes.jsonl`, which is
+/// the exact path `inspect_workspace_contract` reads.
+#[derive(Debug, Default, Clone)]
+pub struct ProjectRootValidatorReport {
+    /// Number of project roots beneath `working_dir` that had at least one
+    /// declared validator and ran the validator chain (Pass or Fail).
+    pub projects_run: usize,
+    /// `(repo_label, reason)` for any project whose declared validator chain
+    /// failed at its OWN project root. Callers should treat the first entry as
+    /// the load-bearing failure reason that demotes the spawn contract.
+    pub failures: Vec<(String, String)>,
+}
+
+impl ProjectRootValidatorReport {
+    pub fn is_empty(&self) -> bool {
+        self.projects_run == 0
+    }
+
+    pub fn first_failure_reason(&self) -> Option<String> {
+        self.failures
+            .first()
+            .map(|(repo_label, reason)| format!("{repo_label}: {reason}"))
+    }
+}
+
+/// octos #997 (round-2 fix): run each managed project's declared
+/// completion-phase validators AT THE PROJECT ROOT.
+///
+/// The session-scope spawn-task contract calls
+/// [`run_declared_validators`] with the SESSION root as `workspace_root`,
+/// which is correct for session-scope policies (the validator ledger lives
+/// under `<session>/.octos/validator_outcomes.jsonl`). But the
+/// project-scope contract gate — `inspect_workspace_contract` —
+/// reads `<session>/slides/<slug>/.octos/validator_outcomes.jsonl`. If
+/// nobody writes to that path, a real valid deck whose declared validator
+/// is hard-required (octos #997: `slides.mofa_slides.pptx_magic_bytes`)
+/// shows `ready = false` because the persisted outcome is missing — even
+/// though the artifact is genuinely on disk.
+///
+/// This helper closes the gap: for each slides/sites project beneath
+/// `working_dir`, read the project's own `WorkspacePolicy` and invoke
+/// [`run_declared_validators`] with that project root as `workspace_root`.
+/// The resulting outcomes naturally land in the project ledger that
+/// `inspect_workspace_contract` reads.
+///
+/// Returns a [`ProjectRootValidatorReport`] aggregating the per-project
+/// outcomes. Callers that want to short-circuit the spawn contract on a
+/// project-root validator failure should consult
+/// [`ProjectRootValidatorReport::first_failure_reason`].
+pub async fn run_project_root_validators(
+    tools: &ToolRegistry,
+    working_dir: &Path,
+    expected_kind: Option<WorkspaceProjectKind>,
+) -> ProjectRootValidatorReport {
+    let mut report = ProjectRootValidatorReport::default();
+    let repos = match list_workspace_repos(working_dir) {
+        Ok(repos) => repos,
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                error = %error,
+                "project-root validator: failed to list workspace repos"
+            );
+            return report;
+        }
+    };
+
+    for repo in repos {
+        if let Some(kind) = expected_kind {
+            if repo.kind != kind {
+                continue;
+            }
+        }
+        let project_root = repo.root.clone();
+        let repo_label = format!("{}/{}", repo.kind.directory_name(), repo.slug);
+
+        let policy = match read_workspace_policy(&project_root) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    project_root = %project_root.display(),
+                    error = %error,
+                    "project-root validator: failed to read project policy"
+                );
+                continue;
+            }
+        };
+
+        if policy.validation.validators.is_empty() {
+            continue;
+        }
+
+        report.projects_run = report.projects_run.saturating_add(1);
+        match run_declared_validators(
+            tools,
+            &project_root,
+            &policy.validation.validators,
+            &repo_label,
+            ValidatorPhase::Completion,
+            None,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(reason) => {
+                report.failures.push((repo_label, reason));
+            }
+        }
+    }
+
+    report
 }
 
 fn build_validator_runner(tools: &ToolRegistry, workspace_root: &Path) -> ValidatorRunner {

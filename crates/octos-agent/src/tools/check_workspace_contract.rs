@@ -125,8 +125,37 @@ impl Tool for CheckWorkspaceContractTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolRegistry;
     use crate::workspace_git::WorkspaceProjectKind;
     use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+    use std::sync::Arc;
+
+    /// Minimal PPTX magic-bytes prefix: ZIP local-file-header signature.
+    /// Required so `MagicByteKind::Pptx` (wired into the slides-kind policy
+    /// by octos #997) accepts the placeholder deck.
+    const PPTX_MAGIC_BYTES: &[u8] = &[
+        0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// octos #997 (round-2 fix): exercise the PRODUCTION code path that
+    /// writes the slides-kind PPTX `MagicBytes` validator outcome to the
+    /// project-root ledger. Previously these fixtures manually seeded the
+    /// ledger via `ledger.append(...)`, which masked the gap codex flagged:
+    /// pre-round-2 the validator was DECLARED at the project scope but
+    /// never RUN at the project root. Calling
+    /// `run_project_root_validators` mirrors the spawn completion path so a
+    /// regression in either the wiring or the validator itself surfaces
+    /// here.
+    async fn run_slides_project_root_validators(workspace_root: &std::path::Path) {
+        let registry = Arc::new(ToolRegistry::new());
+        let _ = crate::workspace_contract::run_project_root_validators(
+            &registry,
+            workspace_root,
+            Some(WorkspaceProjectKind::Slides),
+        )
+        .await;
+    }
 
     fn write_file(path: impl AsRef<std::path::Path>, contents: &str) {
         let path = path.as_ref();
@@ -134,6 +163,14 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, contents).unwrap();
+    }
+
+    fn write_pptx_bytes(path: impl AsRef<std::path::Path>) {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, PPTX_MAGIC_BYTES).unwrap();
     }
 
     #[tokio::test]
@@ -149,8 +186,13 @@ mod tests {
         write_file(repo_root.join("script.js"), "// slides");
         write_file(repo_root.join("memory.md"), "# memory");
         write_file(repo_root.join("changelog.md"), "# changelog");
-        write_file(repo_root.join("output/deck.pptx"), "deck");
+        // octos #997 (round-2): write a real PPTX, then exercise the
+        // production project-root validator path. The helper writes a Pass
+        // outcome to `slides/demo/.octos/validator_outcomes.jsonl` —
+        // the exact path `inspect_workspace_contract` reads.
+        write_pptx_bytes(repo_root.join("output/deck.pptx"));
         write_file(repo_root.join("output/imgs/slide-01.png"), "png");
+        run_slides_project_root_validators(tmp.path()).await;
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool
@@ -182,8 +224,14 @@ mod tests {
             write_file(root.join("memory.md"), "# memory");
             write_file(root.join("changelog.md"), "# changelog");
         }
-        write_file(ready_root.join("output/deck.pptx"), "deck");
+        // octos #997 (round-2): only the "ready" workspace gets the PPTX
+        // magic bytes — the production project-root validator run writes a
+        // Pass for it but a Fail for "broken" (no PPTX → MagicBytes can't
+        // find the artifact). Calling the helper here matches the path the
+        // spawn loop exercises in production.
+        write_pptx_bytes(ready_root.join("output/deck.pptx"));
         write_file(ready_root.join("output/imgs/slide-01.png"), "png");
+        run_slides_project_root_validators(tmp.path()).await;
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool

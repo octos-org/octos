@@ -679,7 +679,33 @@ impl WorkspacePolicy {
                         "file_exists:output/deck.pptx".into(),
                         "file_exists:output/**/slide-*.png".into(),
                     ],
-                    validators: Vec::new(),
+                    // octos #997: gate the slides project on the PPTX magic-bytes
+                    // signature so an HTML "success" deck (the mofa_slides
+                    // failure mode where the skill writes an error page in
+                    // place of the .pptx) trips the project-scope contract.
+                    //
+                    // The bare `MagicBytes` validator lives in `for_session()`
+                    // as `mofa_slides_contract` (workspace_policy.rs:863-874),
+                    // but the session-scope spawn_tasks table is not consulted
+                    // by `inspect_workspace_contract` — which only reads
+                    // `validation.validators` against the slides-kind policy.
+                    // Mirror the spawn-task contract here so the
+                    // project-scope gate actually exercises the check. See
+                    // option (a) of the issue write-up; the deeper fix
+                    // (option (b): teach `inspect_workspace_contract` to read
+                    // `spawn_tasks` too) is the right architectural cleanup
+                    // and is tracked as a follow-up.
+                    validators: vec![Validator {
+                        id: "slides.mofa_slides.pptx_magic_bytes".into(),
+                        required: true,
+                        soft_fail: false,
+                        timeout_ms: None,
+                        phase: ValidatorPhaseKind::Completion,
+                        spec: ValidatorSpec::MagicBytes {
+                            glob: "**/*.pptx".into(),
+                            format: MagicByteKind::Pptx,
+                        },
+                    }],
                 },
                 artifacts: WorkspaceArtifactsPolicy {
                     entries: BTreeMap::from([

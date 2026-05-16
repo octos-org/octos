@@ -31,7 +31,7 @@ impl WorkspaceProjectKind {
         }
     }
 
-    fn directory_name(self) -> &'static str {
+    pub(crate) fn directory_name(self) -> &'static str {
         match self {
             Self::Slides => "slides",
             Self::Sites => "sites",
@@ -993,7 +993,42 @@ fn is_git_index_lock_error(output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolRegistry;
     use crate::workspace_policy::{WorkspacePolicy, write_workspace_policy};
+    use std::sync::Arc;
+
+    /// Minimal PPTX magic-bytes prefix: ZIP local-file-header signature
+    /// (`PK\x03\x04`) used by `MagicByteKind::Pptx`. Plus padding so a
+    /// downstream `file_size_min` check sees a reasonable file size.
+    const PPTX_MAGIC_BYTES: &[u8] = &[
+        0x50, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// octos #997 (round-2 fix): exercise the PRODUCTION code path that
+    /// writes the slides-kind PPTX `MagicBytes` validator outcome to the
+    /// project-root ledger. Pre-round-2 the inspect-contract tests manually
+    /// seeded a `Pass` row via `ledger.append(...)` — but codex pointed out
+    /// that masked the gap (the validator was declared but never RUN at the
+    /// project root in production). Calling `run_project_root_validators`
+    /// mirrors the spawn completion path so a regression in either the
+    /// wiring or the validator itself surfaces here. Sync wrapper so the
+    /// existing `#[test]` callers don't have to switch to `#[tokio::test]`.
+    fn run_slides_project_root_validators_sync(workspace_root: &Path) {
+        let registry = Arc::new(ToolRegistry::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime for fixture validator run");
+        runtime.block_on(async {
+            let _ = crate::workspace_contract::run_project_root_validators(
+                &registry,
+                workspace_root,
+                Some(WorkspaceProjectKind::Slides),
+            )
+            .await;
+        });
+    }
 
     #[test]
     fn detects_slides_repo_from_changed_path() {
@@ -1158,13 +1193,21 @@ mod tests {
         std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
-        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), PPTX_MAGIC_BYTES).unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
 
         let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
         policy.validation.on_turn_end = vec!["file_exists:$deck".into()];
         policy.validation.on_completion = vec!["file_exists:$previews".into()];
         write_workspace_policy(&slides_root, &policy).unwrap();
+        // octos #997 (round-2): run the production project-root validator
+        // before committing so the resulting Pass row in
+        // `.octos/validator_outcomes.jsonl` is part of the committed state.
+        // Pre-round-2 this test seeded a fake `Pass` directly via
+        // `ledger.append(...)`, masking the gap that codex flagged: the
+        // validator was declared at the project policy but never RUN at the
+        // project root in production. Now we exercise the real helper.
+        run_slides_project_root_validators_sync(temp.path());
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
@@ -1234,13 +1277,22 @@ mod tests {
         std::fs::write(slides_root.join("script.js"), "module.exports = [];\n").unwrap();
         std::fs::write(slides_root.join("memory.md"), "# memory\n").unwrap();
         std::fs::write(slides_root.join("changelog.md"), "# changelog\n").unwrap();
-        std::fs::write(slides_root.join("output/deck.pptx"), b"PK").unwrap();
+        std::fs::write(slides_root.join("output/deck.pptx"), PPTX_MAGIC_BYTES).unwrap();
         std::fs::write(slides_root.join("output/imgs/slide-01.png"), b"png").unwrap();
         write_workspace_policy(
             &slides_root,
             &WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides),
         )
         .unwrap();
+        // octos #997 (round-2): run the production project-root validator
+        // BEFORE the initial commit so the ledger entry is part of the
+        // committed state and `status.dirty` remains false. Pre-round-2 this
+        // test manually seeded a `Pass` row via `ledger.append(...)`, which
+        // masked the gap codex flagged: the validator was declared at the
+        // project policy but never RUN at the project root in production.
+        // The helper writes a real `Pass` to the same ledger path the real
+        // harness writes after `run_task` succeeds.
+        run_slides_project_root_validators_sync(temp.path());
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
@@ -1302,6 +1354,10 @@ mod tests {
         policy.artifacts.entries.clear();
         policy.validation.on_turn_end = vec!["file_count_eq:output/*.png:2".into()];
         policy.validation.on_completion = vec!["any_exists:output/*.png|output/*.pdf".into()];
+        // This test exercises PNG file-count semantics, not the slides-kind
+        // PPTX MagicBytes validator (octos #997). Clear the validator list so
+        // the gate does not require a PPTX fixture that isn't relevant here.
+        policy.validation.validators = Vec::new();
         write_workspace_policy(&slides_root, &policy).unwrap();
         initialize_and_commit(
             &slides_root,
