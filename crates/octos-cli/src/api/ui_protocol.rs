@@ -73,6 +73,7 @@ use super::ui_protocol_progress::{
 use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
 use super::ui_protocol_task_output;
+use super::ws_slash;
 
 const FRAME_TOO_LARGE: i64 = -32005;
 const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
@@ -8671,7 +8672,7 @@ async fn run_standalone_turn(
     let active_profile_id = session_id
         .profile_id()
         .map(ToOwned::to_owned)
-        .or(routed_profile_id);
+        .or_else(|| routed_profile_id.clone());
     let Some(profile_runtime) =
         resolve_session_profile_runtime(&state, active_profile_id.as_deref())
     else {
@@ -8785,6 +8786,69 @@ async fn run_standalone_turn(
         session_id.clone(),
         adaptive_router_ref.clone(),
     );
+
+    // Issue #1013: intercept slash commands BEFORE the LLM round-trip,
+    // mirroring the gateway path (`session_actor.rs::try_handle_command` /
+    // `gateway_dispatcher.rs::try_dispatch_session_command`). When the
+    // chat transport migrated to UI Protocol v1 over WebSocket (PR #66),
+    // this interception was lost — every `/clear`, `/new slides …`,
+    // `/queue`, `/adaptive`, etc. reached the LLM and produced a
+    // conversational reply. The shared `try_dispatch_slash_command`
+    // helper runs the same scaffold / clear / etc. side effects and
+    // returns the synthesized assistant text; the WS turn path persists
+    // the user prompt + assistant reply against the session ledger and
+    // emits `turn/completed`. Non-slash messages return `None` here and
+    // fall through to the normal LLM construction below.
+    let slash_ctx = ws_slash::SlashCommandContext {
+        sessions: sessions.clone(),
+        session_id: session_id.clone(),
+        data_dir: session_runtime.profile.data_dir.clone(),
+        // The active profile id can come from `session_id.profile_id()`
+        // when the SPA encodes it via `SessionKey::with_profile`, or
+        // from the WS handshake's routed profile id (Host-header
+        // matched). Falls back to `MAIN_PROFILE_ID` inside the helper
+        // when both are absent — matching gateway_dispatcher.rs:188.
+        profile_id: session_id
+            .profile_id()
+            .map(ToOwned::to_owned)
+            .or_else(|| routed_profile_id.clone()),
+        // Codex round-2: use the session_runtime's resolved workspace_root
+        // so scaffolds land where the tools are pointed, not the default
+        // `data_dir/users/<base>/workspace`. Critical for WS sessions
+        // opened with a custom cwd / workspace hint.
+        workspace_root: Some(session_runtime.workspace_root.clone()),
+    };
+    if let Some(reply) = ws_slash::try_dispatch_slash_command(&prompt, &slash_ctx).await {
+        // Persist the user prompt + synthesized assistant reply against
+        // the session ledger so they survive replay/reconnect. The
+        // installed `MessageCommitObserver` auto-emits
+        // `message/persisted` notifications for both rows. Drop the
+        // failover forwarder before emitting the terminal — it has
+        // nothing more to forward after this point.
+        let user_turn_id = turn_id.0.to_string();
+        let user_message = pre_stamp_turn_thread_id(Message::user(prompt.clone()), &user_turn_id);
+        let assistant_message = pre_stamp_turn_thread_id(Message::assistant(reply), &user_turn_id);
+        {
+            let mut mgr = sessions.lock().await;
+            let _ = mgr.add_message_with_seq(&session_id, user_message).await;
+            let _ = mgr
+                .add_message_with_seq(&session_id, assistant_message)
+                .await;
+        }
+        stop_failover_forwarder(failover_forwarder).await;
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Completed,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            None,
+        )
+        .await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
 
     let history: Vec<Message> = {
         let mut sessions = sessions.lock().await;
