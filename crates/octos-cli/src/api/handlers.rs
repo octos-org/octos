@@ -3287,25 +3287,56 @@ pub async fn sign_preview(
             tracing::error!(error = %err, "sign_preview: getrandom failed");
             (StatusCode::SERVICE_UNAVAILABLE, "token mint failed").into_response()
         }
+        // #1009: every 429 carries a `Retry-After: 60` header. 60 s is
+        // the SPA's re-sign cadence (TTL - 60 s = 9 min - 60 s tail
+        // window) so a well-behaved client will naturally re-attempt
+        // around that boundary, but slow clients also get an explicit
+        // hint per RFC 9110. The hint covers all three rate-limit
+        // variants (#1007 per-identity, GAP 8 per-bearer, #1008
+        // global-with-no-evictable) so the SPA can render a uniform
+        // backoff toast without branching on the error string.
         Err(IssueError::PerBearerLimitReached) => {
             tracing::warn!("sign_preview: per-bearer cap reached (codex GAP 8 backpressure)");
-            (
-                StatusCode::TOO_MANY_REQUESTS,
+            preview_rate_limit_response(
                 "too many outstanding preview tokens for this session — wait for expiry or close some iframes",
             )
-                .into_response()
+        }
+        Err(IssueError::PerIdentityLimitReached) => {
+            tracing::warn!(
+                "sign_preview: per-identity cap reached (#1007 cross-bearer backpressure)"
+            );
+            preview_rate_limit_response(
+                "too many outstanding preview tokens for this account — wait for expiry or close some iframes",
+            )
         }
         Err(IssueError::GlobalLimitReached) => {
             tracing::error!(
                 "sign_preview: GLOBAL preview-token cap reached — possible DoS or runaway client"
             );
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                "preview-token cache is full; daemon is rate-limiting",
-            )
-                .into_response()
+            preview_rate_limit_response("preview-token cache is full; daemon is rate-limiting")
         }
     }
+}
+
+/// Build the HTTP 429 response for a preview-token rate-limit refusal.
+///
+/// #1009 follow-up: every preview-token 429 must include a
+/// `Retry-After: 60` header so SPAs and clients have a uniform backoff
+/// hint regardless of which cap (per-bearer / per-identity / global)
+/// tripped. 60 s is chosen to match the SPA's existing re-sign cadence
+/// (TTL - 60 s) — a polite client should naturally re-issue near the
+/// same boundary, and an aggressive client gets a hard backoff hint.
+///
+/// We hand-build the response (rather than the
+/// `(StatusCode, &'static str).into_response()` shortcut used
+/// elsewhere) so we can attach the header before returning.
+fn preview_rate_limit_response(body: &'static str) -> Response {
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("60"),
+    );
+    resp
 }
 
 /// `GET /api/preview-signed/{token}/{*path}` — serve a previewed asset

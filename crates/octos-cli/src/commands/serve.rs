@@ -562,6 +562,19 @@ impl ServeCommand {
         .await
         .wrap_err("failed to build swarm state")?;
 
+        // Issue #1001 follow-up: in-memory signed-preview token cache.
+        // Issue #1009: construct the cache first so we can spawn the
+        // background sweeper and own the resulting handle inside
+        // `AppState` — when the last `Arc<AppState>` is dropped the
+        // wrapper aborts the task instead of leaking it (the previous
+        // local-binding pattern relied on `process::exit(0)` and would
+        // strand the sweeper on any error-path drop).
+        let preview_tokens = Arc::new(crate::api::PreviewTokens::new());
+        let preview_sweeper = crate::api::PreviewSweeperHandle::spawn(
+            preview_tokens.clone(),
+            crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
+        );
+
         let state = Arc::new(AppState {
             profiles: profile_runtimes,
             session_cache,
@@ -640,19 +653,14 @@ impl ServeCommand {
             // `/api/preview/...` route now requires. Daemon restart
             // invalidates every grant (see
             // `crate::api::preview_tokens` for the design rationale).
-            preview_tokens: Arc::new(crate::api::PreviewTokens::new()),
+            preview_tokens,
+            // Issue #1009: owning sweeper handle. `Drop` aborts the
+            // tokio task when the last `Arc<AppState>` is released,
+            // replacing the previous `_preview_sweeper` local that
+            // leaked the task on any non-`process::exit(0)` shutdown
+            // path.
+            preview_sweeper: Some(preview_sweeper),
         });
-
-        // Codex NEEDS-FOLLOWUP 6: spawn the background sweeper for the
-        // signed-preview token cache. Without it, an idle daemon (no
-        // sign/serve traffic) accumulates expired entries indefinitely
-        // because the lazy sweep only fires on `issue`/`consume`. The
-        // JoinHandle is dropped intentionally — the task runs for the
-        // lifetime of the process and exits on shutdown.
-        let _preview_sweeper = crate::api::PreviewTokens::spawn_background_sweeper(
-            state.preview_tokens.clone(),
-            crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
-        );
 
         if self.stdio {
             crate::api::ui_protocol::stdio_connection(state).await?;

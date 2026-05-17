@@ -57,25 +57,41 @@
 //! is cheap (one POST + a HashMap insert) and the SPA already has the
 //! bearer, so a persistent cache earns nothing.
 //!
-//! Rate limiting & DoS hardening (codex GAP 8)
-//! -------------------------------------------
+//! Rate limiting & DoS hardening (codex GAP 8 + #1007 / #1008)
+//! -----------------------------------------------------------
 //! Without a cap, an authenticated client could mint unbounded tokens
 //! (each ~200 bytes, held 10 minutes by default) and OOM the daemon.
-//! Two layers of bounds:
+//! Three layers of bounds:
 //!   1. Per-`issuer_bearer`: at most [`PreviewTokens::MAX_PER_BEARER`]
-//!      (64) concurrent grants. At ~200 bytes each that's ~12 KB per
-//!      user — generous for a SPA that mints one preview per site
-//!      iframe, restrictive for an attacker. Mints over the cap return
-//!      `IssueError::PerBearerLimitReached` which the handler maps to
-//!      HTTP 429.
-//!   2. Global: at most [`PreviewTokens::MAX_TOTAL`] (10 000) entries
-//!      across all bearers. With ~200 bytes each that caps the whole
-//!      map at ~2 MB. Bounds the worst case where a large number of
-//!      tenants each sit at the per-bearer cap simultaneously. Mints
-//!      over the global cap also return 429.
+//!      (32) concurrent grants. Bounds how much one logged-in session
+//!      can mint before it has to wait for previews to expire.
+//!   2. Per-IDENTITY (#1007): at most
+//!      [`PreviewTokens::MAX_PER_IDENTITY`] (64) concurrent grants
+//!      across EVERY live bearer that resolves to the same identity
+//!      (user id or `admin`). Closes the bypass where logging out and
+//!      logging back in would reset the per-bearer counter — without
+//!      this cap, an attacker who can rotate sessions could mint
+//!      `MAX_PER_BEARER × N_rotations` tokens with no upper bound. The
+//!      identity is read from `Grant.identity_snapshot`. Mints over
+//!      the cap return `IssueError::PerIdentityLimitReached`.
+//!   3. Global: at most [`PreviewTokens::MAX_TOTAL`] (10 000) entries
+//!      across all identities. With ~200 bytes each that caps the
+//!      whole map at ~2 MB. Bounds the worst case where a many-tenant
+//!      fleet each sits at the per-identity cap simultaneously.
 //!
-//! Both checks happen AFTER the lazy `sweep_expired` so a long-idle
-//! bearer doesn't get stuck against its old quota.
+//! #1008 / #1012 change: when the global cap is full the issue path
+//! **does not** evict live grants. The original #1008 patch tried to
+//! evict the earliest-expiring entry, but after the inline
+//! `sweep_expired` already drops every expired token the
+//! "earliest-expiring" candidate is the closest live grant — evicting
+//! it pulls an active iframe out from under a legitimate user before
+//! its advertised `expires_at`. The corrected contract (#1012) is:
+//! sweep first, then if the map is still at the ceiling return
+//! [`IssueError::GlobalLimitReached`] so the caller gets a 429 +
+//! `Retry-After` instead of breaking somebody else's preview.
+//!
+//! All three checks happen AFTER the lazy `sweep_expired` so a
+//! long-idle identity doesn't get stuck against its old quota.
 //!
 //! Background sweep (codex NEEDS-FOLLOWUP 6)
 //! -----------------------------------------
@@ -119,10 +135,24 @@ pub enum IssueError {
     /// unavailable (very rare). Handler maps to HTTP 503.
     Random(std::io::Error),
     /// The requesting bearer is at [`PreviewTokens::MAX_PER_BEARER`]
-    /// concurrent grants. Handler maps to HTTP 429.
+    /// concurrent grants. Handler maps to HTTP 429 + `Retry-After`.
     PerBearerLimitReached,
-    /// The cache as a whole is at [`PreviewTokens::MAX_TOTAL`]. Handler
-    /// maps to HTTP 429.
+    /// The requesting identity (#1007) — user id or admin — is at
+    /// [`PreviewTokens::MAX_PER_IDENTITY`] concurrent grants across
+    /// every live bearer it owns. Closes the session-rotation bypass:
+    /// logging out and back in produces a fresh bearer but the same
+    /// identity, so the cap is enforced against the stable identity
+    /// snapshot stored on each grant. Handler maps to HTTP 429 +
+    /// `Retry-After`.
+    PerIdentityLimitReached,
+    /// The cache as a whole is at [`PreviewTokens::MAX_TOTAL`] after
+    /// the inline expiry sweep ran (#1012). The issue path explicitly
+    /// does NOT evict live grants here — doing so would break a
+    /// legitimate user's active preview iframe before its advertised
+    /// `expires_at`. Handler maps to HTTP 429 + `Retry-After`. Distinct
+    /// from the per-bearer / per-identity variants so logs can
+    /// distinguish "this user is over quota" from "the daemon is at
+    /// its hard global ceiling".
     GlobalLimitReached,
 }
 
@@ -132,6 +162,9 @@ impl std::fmt::Display for IssueError {
             IssueError::Random(err) => write!(f, "getrandom failed: {err}"),
             IssueError::PerBearerLimitReached => {
                 write!(f, "per-bearer preview-token cap reached")
+            }
+            IssueError::PerIdentityLimitReached => {
+                write!(f, "per-identity preview-token cap reached")
             }
             IssueError::GlobalLimitReached => {
                 write!(f, "global preview-token cap reached")
@@ -225,16 +258,32 @@ impl Default for PreviewTokens {
 
 impl PreviewTokens {
     /// Maximum concurrent grants per `issuer_bearer`. At ~200 bytes per
-    /// entry that's ~12 KB of cache per user — comfortably above the
-    /// SPA's normal envelope (one mint per visible iframe) and well
-    /// below the threshold where a hostile client could starve the
-    /// daemon. Codex GAP 8 fix.
-    pub const MAX_PER_BEARER: usize = 64;
+    /// entry that's ~6.4 KB of cache per active session. Lower than
+    /// [`Self::MAX_PER_IDENTITY`] on purpose: it bounds how much a
+    /// single session can mint before the user has to wait, and the
+    /// per-identity cap (issue #1007) bounds the total across every
+    /// rotated session.
+    pub const MAX_PER_BEARER: usize = 32;
 
-    /// Global cap on the whole cache, summed across every bearer.
+    /// Maximum concurrent grants per identity (user id, or `admin`)
+    /// summed across every live bearer that resolves to that identity.
+    /// Closes the session-rotation bypass in #1007: logging out and
+    /// back in produces a fresh bearer, so a per-bearer-only cap would
+    /// let one user mint `MAX_PER_BEARER × N_rotations` tokens. The
+    /// per-identity cap is enforced against the
+    /// [`AuthIdentity`] snapshot recorded at issue time.
+    pub const MAX_PER_IDENTITY: usize = 64;
+
+    /// Global cap on the whole cache, summed across every identity.
     /// Bounds the worst case where a many-tenant fleet has many users
-    /// each sitting at their per-bearer cap. ~200 bytes × 10 000 =
-    /// ~2 MB — fits comfortably in the daemon's resident set.
+    /// each sitting at their per-identity cap. ~200 bytes × 10 000 =
+    /// ~2 MB — fits comfortably in the daemon's resident set. #1012:
+    /// when the cap is hit `issue` runs the inline expiry sweep and,
+    /// if the map is STILL at the cap, refuses with
+    /// [`IssueError::GlobalLimitReached`]. The earlier #1008 attempt at
+    /// "evict the earliest-expiring entry" was withdrawn because the
+    /// candidate after the sweep is always a LIVE grant — evicting it
+    /// breaks a real user's iframe before its `expires_at`.
     pub const MAX_TOTAL: usize = 10_000;
 
     /// Build a token cache with the default 10-minute TTL.
@@ -264,13 +313,24 @@ impl PreviewTokens {
     /// back is not allowed — if `getrandom` errors we return the
     /// error to the caller, who maps it to 503.
     ///
-    /// Rate limiting (codex GAP 8): after the lazy sweep we count
-    /// entries owned by `issuer_bearer` and refuse if it would exceed
-    /// [`Self::MAX_PER_BEARER`]. We also refuse if the global map
-    /// would exceed [`Self::MAX_TOTAL`]. Both refusals return
-    /// `IssueError::*LimitReached`, which the handler maps to HTTP 429
-    /// — explicitly distinct from the 503 we return for OS-level
-    /// randomness failures so the SPA can backoff vs surface an error.
+    /// Rate limiting (codex GAP 8 + #1007 + #1012):
+    ///   1. Lazy sweep clears expired entries so a long-idle bearer
+    ///      doesn't get stuck against its old quota.
+    ///   2. Count live grants for THIS bearer; refuse with
+    ///      `PerBearerLimitReached` if at [`Self::MAX_PER_BEARER`].
+    ///   3. Count live grants for THIS identity (across all live
+    ///      bearers — #1007 closes session-rotation bypass); refuse
+    ///      with `PerIdentityLimitReached` if at
+    ///      [`Self::MAX_PER_IDENTITY`].
+    ///   4. If the map is STILL at [`Self::MAX_TOTAL`] after the sweep,
+    ///      refuse with `GlobalLimitReached` (#1012). The earlier #1008
+    ///      patch evicted the earliest-expiring entry here, but since
+    ///      the inline sweep already drops expired tokens the candidate
+    ///      after the sweep is always a LIVE grant — evicting it pulls
+    ///      an active iframe out from under a legitimate user before
+    ///      its advertised `expires_at`. Returning 429 instead lets the
+    ///      losing client back off via `Retry-After` without disrupting
+    ///      anyone else's active preview.
     pub async fn issue(
         &self,
         issuer_bearer: String,
@@ -302,23 +362,54 @@ impl PreviewTokens {
         let mut map = self.entries.write().await;
         // Piggyback expiry sweep on issue — keeps the map bounded
         // without forcing the caller to wait for the background
-        // sweeper. Sweep first, THEN count, so a bearer whose old
-        // tokens just expired isn't artificially capped against
-        // stale entries.
+        // sweeper. Sweep first, THEN count, so a bearer/identity
+        // whose old tokens just expired isn't artificially capped
+        // against stale entries.
         sweep_expired(&mut map);
 
-        // Rate limit: count this bearer's live grants. We must read
-        // `grant.issuer_bearer` (not `&issuer_bearer` directly) to
-        // avoid moving `issuer_bearer` before constructing the grant
-        // — but we already built `grant` above, so use a captured
-        // borrow from the field.
-        let owner = &grant.issuer_bearer;
-        let per_bearer = map.values().filter(|g| g.issuer_bearer == *owner).count();
+        // Rate limit (per-bearer). Read `grant.issuer_bearer` rather
+        // than the consumed `issuer_bearer` argument since `grant`
+        // owns it now.
+        let owner_bearer = &grant.issuer_bearer;
+        let per_bearer = map
+            .values()
+            .filter(|g| g.issuer_bearer == *owner_bearer)
+            .count();
         if per_bearer >= Self::MAX_PER_BEARER {
             return Err(IssueError::PerBearerLimitReached);
         }
+
+        // Rate limit (per-identity — #1007). Count live grants whose
+        // `identity_snapshot` matches this issue's identity. Stable
+        // across session rotation: logging out clears the bearer but
+        // not the identity, so the cap is enforced even when the
+        // attacker controls bearer rotation.
+        let owner_identity = identity_key(&grant.identity_snapshot);
+        let per_identity = map
+            .values()
+            .filter(|g| identity_key(&g.identity_snapshot) == owner_identity)
+            .count();
+        if per_identity >= Self::MAX_PER_IDENTITY {
+            return Err(IssueError::PerIdentityLimitReached);
+        }
+
+        // Global cap (#1012, supersedes #1008). The inline
+        // `sweep_expired` above already dropped every expired token.
+        // If the map is still at `MAX_TOTAL`, every remaining entry is
+        // a LIVE grant — evicting any of them would break a legitimate
+        // user's active iframe before its `expires_at`, which is
+        // exactly the regression #1008 introduced. Belt-and-suspenders:
+        // run one more sweep to cover the race where the background
+        // sweeper is mid-tick and an entry expired between the sweep
+        // above and now (rare but cheap to handle). After that, the
+        // contract is simply "if still full, return 429" — the losing
+        // caller can back off via the `Retry-After: 60` header without
+        // disrupting anybody else's preview.
         if map.len() >= Self::MAX_TOTAL {
-            return Err(IssueError::GlobalLimitReached);
+            sweep_expired(&mut map);
+            if map.len() >= Self::MAX_TOTAL {
+                return Err(IssueError::GlobalLimitReached);
+            }
         }
 
         map.insert(token.clone(), grant);
@@ -388,11 +479,10 @@ impl PreviewTokens {
     /// Without this, expired grants only get cleaned up on
     /// `issue`/`consume` traffic — an idle daemon can accumulate
     /// expired entries indefinitely. The spawned task runs forever,
-    /// sweeping at `interval` cadence; the returned `JoinHandle` is
-    /// kept by the serve binary so the task lives as long as the
-    /// process. There is no graceful shutdown signal: the sweeper is
-    /// cheap (one write-lock sweep) and the process exit drops
-    /// everything anyway.
+    /// sweeping at `interval` cadence; the returned [`JoinHandle`]
+    /// should be kept by the serve binary so the task lives as long
+    /// as the process. Callers that want the task to be aborted on
+    /// drop should wrap it in [`PreviewSweeperHandle`] (issue #1009).
     ///
     /// Tests pass a short interval (e.g. 20 ms) to exercise the
     /// contract; production passes
@@ -413,12 +503,128 @@ impl PreviewTokens {
     }
 }
 
+/// Owning wrapper around the background sweeper's [`JoinHandle`] that
+/// aborts the task when the handle is dropped (issue #1009).
+///
+/// Before #1009 the serve binary stored the handle in a `let
+/// _preview_sweeper = ...` local and relied on `process::exit(0)` to
+/// terminate the runtime — so a panicking caller, an `Err(_)`-bailing
+/// startup path, or any code path that drops `AppState` without going
+/// through `exit` would leak the sweeper task. Threading the handle
+/// through `AppState` (or any `Arc<...>` that lives as long as the
+/// daemon) plus this `Drop` impl makes the lifetime symmetric: the
+/// sweeper exits exactly when the cache that owns it goes away.
+///
+/// The wrapper is also `Clone`-free on purpose — there should be at
+/// most one owner of the abort signal at any time. Tests that need to
+/// reach the inner handle can call [`Self::into_inner`] before drop.
+pub struct PreviewSweeperHandle {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PreviewSweeperHandle {
+    /// Wrap a `JoinHandle` so it is aborted on drop.
+    pub fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Spawn the sweeper and return a self-aborting wrapper. Equivalent
+    /// to `PreviewSweeperHandle::new(PreviewTokens::spawn_background_sweeper(...))`
+    /// but reads more clearly at the call site.
+    pub fn spawn(cache: Arc<PreviewTokens>, interval: Duration) -> Self {
+        Self::new(PreviewTokens::spawn_background_sweeper(cache, interval))
+    }
+
+    /// Take ownership of the inner `JoinHandle`, disarming the abort.
+    /// Useful in tests that want to `await` the sweeper directly.
+    pub fn into_inner(mut self) -> Option<JoinHandle<()>> {
+        self.handle.take()
+    }
+
+    /// Abort the sweeper task immediately without waiting for drop.
+    /// Idempotent — subsequent calls are no-ops.
+    pub fn abort(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for PreviewSweeperHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Drop every entry whose `expires_at` is in the past. Called inline
 /// from `issue` and `consume`, which both already hold the write
 /// lock. Not called from `len` because that would defeat the test.
 fn sweep_expired(map: &mut HashMap<String, Grant>) {
     let now = Instant::now();
     map.retain(|_, grant| grant.expires_at > now);
+}
+
+/// Stable string key for an [`AuthIdentity`]. Used by the per-identity
+/// rate-limit counter (#1007) to count live grants across rotated
+/// bearers. `Admin` is collapsed to a single key — there's one admin
+/// surface, so admin previews share a quota.
+///
+/// We use a `"u:"` / `"a:"` prefix so two unrelated stores (e.g. a
+/// future API token store with arbitrary IDs) cannot collide with
+/// `Admin` even if they minted an id of `"admin"`.
+fn identity_key(identity: &AuthIdentity) -> String {
+    match identity {
+        AuthIdentity::Admin => "a:admin".to_string(),
+        AuthIdentity::User { id, .. } => format!("u:{id}"),
+    }
+}
+
+impl PreviewTokens {
+    /// Test-only: pad the cache with `count` synthetic grants whose
+    /// expiry runs from `base_ttl + 0s` upward in 1-second increments,
+    /// so the *first* injected entry is the earliest-expiring.
+    ///
+    /// Exposed `pub` (gated to `#[doc(hidden)]`) so integration tests
+    /// in `tests/preview_signed.rs` can prove the #1008 eviction path
+    /// end-to-end without minting `MAX_TOTAL` via the HTTP surface.
+    /// Each filler uses a unique synthetic bearer + identity so the
+    /// per-bearer/per-identity caps cannot trigger while padding —
+    /// only the global cap is exercised.
+    ///
+    /// Returns the token strings in injection order; the caller can
+    /// assert `tokens[0]` (the earliest-expiring) is the one evicted.
+    #[doc(hidden)]
+    pub async fn test_fill_with_synthetic_grants(
+        &self,
+        count: usize,
+        base_ttl: Duration,
+    ) -> Vec<String> {
+        let mut map = self.entries.write().await;
+        let base = Instant::now() + base_ttl;
+        let mut tokens = Vec::with_capacity(count);
+        for i in 0..count {
+            let token = format!("filltoken-{i:06}");
+            let identity = AuthIdentity::User {
+                id: format!("filler-{i}"),
+                role: crate::user_store::UserRole::User,
+            };
+            let grant = Grant {
+                issuer_bearer: format!("BEARER-FILL-{i}"),
+                identity_snapshot: identity,
+                profile_id: "synthetic".into(),
+                session_id: "synthetic".into(),
+                site_slug: "synthetic".into(),
+                expires_at: base + Duration::from_secs(i as u64),
+            };
+            map.insert(token.clone(), grant);
+            tokens.push(token);
+        }
+        tokens
+    }
 }
 
 /// `Arc<PreviewTokens>` is the shape stored in `AppState`. Aliased
@@ -510,7 +716,8 @@ mod tests {
     async fn token_uniqueness_across_issues() {
         let cache = PreviewTokens::with_ttl(Duration::from_secs(60));
         let mut seen = std::collections::HashSet::new();
-        // `MAX_PER_BEARER` is 64 — the loop walks right up to the cap
+        // Walk right up to `MAX_PER_BEARER` (currently 32 after the
+        // #1007 split between per-bearer and per-identity quotas)
         // without crossing it. The next iteration would refuse with
         // `PerBearerLimitReached`; that's exercised in
         // `per_bearer_cap_returns_rate_limited` below.
@@ -680,6 +887,273 @@ mod tests {
             cache.len().await,
             0,
             "background sweeper must have evicted the expired token"
+        );
+    }
+
+    /// #1009: `PreviewSweeperHandle` aborts its task on drop. Without
+    /// the wrapper, the previous `let _ = spawn(...)` pattern stranded
+    /// the tokio task on any non-`process::exit` shutdown because
+    /// dropping a `JoinHandle` does not abort. We assert the wrapper
+    /// actually fires `abort()` by holding a `JoinHandle` clone via
+    /// `abort_handle()`, dropping the wrapper, then verifying the task
+    /// is reported aborted.
+    #[tokio::test]
+    async fn preview_sweeper_handle_aborts_task_on_drop() {
+        // Long interval so the sweeper would otherwise stay alive
+        // indefinitely — only `Drop`-driven `abort()` can end it.
+        let cache = Arc::new(PreviewTokens::with_ttl(Duration::from_secs(60)));
+        let sweeper = PreviewSweeperHandle::spawn(cache, Duration::from_secs(60));
+        // Grab a non-owning probe BEFORE dropping the wrapper.
+        let probe = sweeper
+            .handle
+            .as_ref()
+            .expect("wrapper holds a handle")
+            .abort_handle();
+        assert!(!probe.is_finished(), "task should be running before drop");
+
+        drop(sweeper);
+
+        // `Drop` calls `abort()`. Yield a few times so the runtime can
+        // mark the task as finished.
+        for _ in 0..10 {
+            if probe.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            probe.is_finished(),
+            "PreviewSweeperHandle::drop must abort the spawned task"
+        );
+    }
+
+    /// #1007: per-identity cap. Bearer rotation must not reset the
+    /// quota. Mint 32 grants on bearer1 (= per-bearer cap), rotate to
+    /// bearer2 for the same identity, mint another 32 → total 64 = the
+    /// per-identity cap. A 65th mint MUST refuse with
+    /// `PerIdentityLimitReached`, proving the cap is keyed off the
+    /// identity snapshot, not the bearer string.
+    #[tokio::test]
+    async fn per_identity_cap_survives_bearer_rotation() {
+        let cache = PreviewTokens::with_ttl(Duration::from_secs(60));
+
+        // Bearer 1: fill up to the per-bearer cap (32).
+        for _ in 0..PreviewTokens::MAX_PER_BEARER {
+            cache
+                .issue(
+                    "BEARER-1".into(),
+                    make_identity(),
+                    "tenant-a".into(),
+                    "session-1".into(),
+                    "site-a".into(),
+                )
+                .await
+                .expect("under-cap issue on bearer 1 must succeed");
+        }
+        assert_eq!(
+            cache.len().await,
+            PreviewTokens::MAX_PER_BEARER,
+            "bearer 1 should occupy exactly MAX_PER_BEARER slots"
+        );
+
+        // Rotate to bearer 2 (same identity). Fill remaining identity
+        // quota: MAX_PER_IDENTITY - MAX_PER_BEARER = 64 - 32 = 32.
+        let remaining = PreviewTokens::MAX_PER_IDENTITY - PreviewTokens::MAX_PER_BEARER;
+        for _ in 0..remaining {
+            cache
+                .issue(
+                    "BEARER-2".into(),
+                    make_identity(),
+                    "tenant-a".into(),
+                    "session-1".into(),
+                    "site-a".into(),
+                )
+                .await
+                .expect("under-identity-cap issue on bearer 2 must succeed");
+        }
+        assert_eq!(
+            cache.len().await,
+            PreviewTokens::MAX_PER_IDENTITY,
+            "identity should now sit at MAX_PER_IDENTITY across the two bearers"
+        );
+
+        // Next mint on a THIRD bearer — bearer 3 has 0 prior grants
+        // so the per-bearer cap is irrelevant; identity is at the
+        // per-identity cap so the per-identity branch MUST fire. (If
+        // we tested via bearer 2 instead, the per-bearer cap would
+        // fire first — that's a useful sanity check but doesn't
+        // exercise the #1007 fix path.)
+        let err = cache
+            .issue(
+                "BEARER-3".into(),
+                make_identity(),
+                "tenant-a".into(),
+                "session-1".into(),
+                "site-a".into(),
+            )
+            .await
+            .expect_err("over-identity-cap mint must fail");
+        assert!(
+            matches!(err, IssueError::PerIdentityLimitReached),
+            "expected PerIdentityLimitReached, got: {err:?}"
+        );
+    }
+
+    /// #1012 (supersedes #1008): when the global cap is full and every
+    /// entry is LIVE, the next `issue` MUST refuse with
+    /// [`IssueError::GlobalLimitReached`] rather than evicting somebody
+    /// else's grant. The earlier #1008 patch evicted the
+    /// earliest-expiring entry, but since the inline `sweep_expired`
+    /// has already dropped expired tokens the candidate is always a
+    /// live grant — evicting it breaks a real user's active iframe
+    /// before its advertised `expires_at`. The corrected contract is
+    /// "sweep first; if still full, return 429".
+    #[tokio::test]
+    async fn global_cap_full_with_only_live_entries_refuses_issue() {
+        let cache = PreviewTokens::with_ttl(Duration::from_secs(600));
+        let base = Instant::now();
+
+        // Insert MAX_TOTAL live entries with unique bearer + identity
+        // each, so neither the per-bearer nor per-identity cap fires
+        // when we later call `issue`. The global cap is the only path
+        // that can refuse.
+        {
+            let mut map = cache.entries.write().await;
+            for i in 0..PreviewTokens::MAX_TOTAL {
+                let bearer = format!("BEARER-FILL-{i}");
+                let identity = AuthIdentity::User {
+                    id: format!("filler-{i}"),
+                    role: UserRole::User,
+                };
+                let token = format!("filltoken-{i:05}");
+                // Spread expiries so a buggy "evict earliest"
+                // implementation would have an obvious target — and we
+                // can assert that target is still present after the
+                // refusal.
+                let expires_at = base + Duration::from_secs(600 + i as u64);
+                map.insert(
+                    token,
+                    Grant {
+                        issuer_bearer: bearer,
+                        identity_snapshot: identity,
+                        profile_id: "tenant-a".into(),
+                        session_id: "session-1".into(),
+                        site_slug: "site-a".into(),
+                        expires_at,
+                    },
+                );
+            }
+        }
+
+        // Sanity: cache is at the cap and the earliest entry is live.
+        assert_eq!(
+            cache.len().await,
+            PreviewTokens::MAX_TOTAL,
+            "fixture must fill the cache exactly"
+        );
+        let oldest = "filltoken-00000".to_string();
+        assert!(
+            cache.entries.read().await.contains_key(&oldest),
+            "earliest-expiring entry must be present before issue"
+        );
+
+        // Mint a new token from a NEW identity. The global cap is full
+        // and every entry is live — must refuse with
+        // `GlobalLimitReached`, NOT evict somebody else's preview.
+        let new_identity = AuthIdentity::User {
+            id: "tenant-new".into(),
+            role: UserRole::User,
+        };
+        let err = cache
+            .issue(
+                "BEARER-NEW".into(),
+                new_identity,
+                "tenant-new".into(),
+                "session-1".into(),
+                "site-a".into(),
+            )
+            .await
+            .expect_err("issue MUST refuse when every entry is a live grant (#1012)");
+        assert!(
+            matches!(err, IssueError::GlobalLimitReached),
+            "expected GlobalLimitReached, got: {err:?}"
+        );
+
+        // Map size unchanged; earliest filler still present — the
+        // refusal must not collateral-damage a live user's grant.
+        let map = cache.entries.read().await;
+        assert_eq!(
+            map.len(),
+            PreviewTokens::MAX_TOTAL,
+            "cap must hold after refusal (no eviction)"
+        );
+        assert!(
+            map.contains_key(&oldest),
+            "earliest-expiring LIVE grant must remain after global-cap refusal; \
+             missing = the #1008 over-eager eviction bug we're fixing in #1012"
+        );
+    }
+
+    /// #1012 belt-and-suspenders: if some entries are expired when the
+    /// map is at `MAX_TOTAL`, the inline sweep inside `issue` drops
+    /// them and the issue succeeds. This proves the refusal path only
+    /// fires when EVERY entry is still live — expired tokens never
+    /// collateral-damage a fresh request.
+    #[tokio::test]
+    async fn global_cap_full_but_with_expired_entries_still_serves() {
+        let cache = PreviewTokens::with_ttl(Duration::from_secs(600));
+        let now = Instant::now();
+
+        // Fill the map to MAX_TOTAL; mark entry 0 as already expired
+        // (1 ns in the past). The rest are live with staggered TTLs.
+        {
+            let mut map = cache.entries.write().await;
+            for i in 0..PreviewTokens::MAX_TOTAL {
+                let expires_at = if i == 0 {
+                    now - Duration::from_nanos(1)
+                } else {
+                    now + Duration::from_secs(600 + i as u64)
+                };
+                map.insert(
+                    format!("filltoken-{i:05}"),
+                    Grant {
+                        issuer_bearer: format!("BEARER-FILL-{i}"),
+                        identity_snapshot: AuthIdentity::User {
+                            id: format!("filler-{i}"),
+                            role: UserRole::User,
+                        },
+                        profile_id: "tenant-a".into(),
+                        session_id: "session-1".into(),
+                        site_slug: "site-a".into(),
+                        expires_at,
+                    },
+                );
+            }
+        }
+        assert_eq!(cache.len().await, PreviewTokens::MAX_TOTAL);
+
+        let new_identity = AuthIdentity::User {
+            id: "tenant-new".into(),
+            role: UserRole::User,
+        };
+        cache
+            .issue(
+                "BEARER-NEW".into(),
+                new_identity,
+                "tenant-new".into(),
+                "session-1".into(),
+                "site-a".into(),
+            )
+            .await
+            .expect("expired entries must be swept so a real issue succeeds");
+
+        // Map still at cap (sweep dropped 1, insert added 1) and the
+        // expired entry is gone.
+        let map = cache.entries.read().await;
+        assert_eq!(map.len(), PreviewTokens::MAX_TOTAL);
+        assert!(
+            !map.contains_key("filltoken-00000"),
+            "expired entry must have been swept"
         );
     }
 }
