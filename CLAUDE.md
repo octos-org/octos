@@ -13,11 +13,15 @@ cargo clippy --workspace         # Lint
 cargo fmt --all                  # Format
 cargo fmt --all -- --check       # Check formatting
 cargo install --path crates/octos-cli \
-    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+    --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
                                           # Install CLI locally with the
                                           # canonical feature default
                                           # (matches scripts/milestone-ci.sh).
                                           # `api` is required for `octos serve`.
+                                          # `audio_mp3` is required for the
+                                          # `podcast_generate` workspace
+                                          # contract to validate mp3 output
+                                          # (see #1025).
 ```
 
 ## Architecture
