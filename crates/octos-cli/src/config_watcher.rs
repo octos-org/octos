@@ -87,16 +87,62 @@ impl ConfigWatcher {
     }
 
     /// Parse config from the first non-empty buffer.
-    /// Tries `Config` format first, then `UserProfile` format (for --profile mode).
+    ///
+    /// Sniffs the JSON shape first so a `UserProfile` is parsed as such
+    /// instead of silently coercing to a default-everything `Config`. Without
+    /// this discrimination, `Config` (which has `#[serde(default)]` on every
+    /// field) succeeds first and returns an all-defaults blob — masking
+    /// every non-Config field including the new `config.plugins` block.
+    /// That regression would skip the policy-change restart for profile
+    /// files (codex review round-8 P2).
+    ///
+    /// Section B (codex review round-7 P2): apply the same
+    /// `OCTOS_PLUGINS_REQUIRE_SIGNED` env-merge that `Config::from_file`
+    /// does so the diff doesn't see spurious "plugins changed from true
+    /// to false" transitions on a hot edit. Without this, a gateway
+    /// spawned with the env-forced policy would emit a bogus restart on
+    /// every unrelated edit.
     fn parse_first(buffers: &[(PathBuf, Vec<u8>)]) -> Option<Config> {
         let (path, bytes) = buffers.first()?;
-        // Try Config format first
-        if let Ok(c) = serde_json::from_slice::<Config>(bytes) {
+        // Discrimination: a UserProfile JSON has top-level "id" + "config"
+        // keys; a top-level Config does not. Try UserProfile first when the
+        // shape matches so the watcher actually sees the profile's nested
+        // `config.plugins` block rather than silently falling back to a
+        // default-everything Config from the all-`serde(default)` shape.
+        let looks_like_profile = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .is_some_and(|map| map.contains_key("id") && map.contains_key("config"));
+        if looks_like_profile {
+            match serde_json::from_slice::<UserProfile>(bytes) {
+                Ok(profile) => {
+                    let mut c = crate::profiles::config_from_profile(&profile, None, None);
+                    crate::config::merge_env_plugin_policy_pub(&mut c);
+                    return Some(c);
+                }
+                Err(e) => {
+                    warn!(
+                        "config reload: profile-shaped JSON failed to parse for {}: {e}",
+                        path.display()
+                    );
+                    // fall through to Config attempt
+                }
+            }
+        }
+        // Try Config format
+        if let Ok(mut c) = serde_json::from_slice::<Config>(bytes) {
+            crate::config::merge_env_plugin_policy_pub(&mut c);
             return Some(c);
         }
-        // Try UserProfile format (for --profile mode)
+        // Last-chance: try UserProfile even on non-profile-shaped JSON to
+        // preserve legacy behavior if a profile lacks the discriminator
+        // keys for some reason.
         match serde_json::from_slice::<UserProfile>(bytes) {
-            Ok(profile) => Some(crate::profiles::config_from_profile(&profile, None, None)),
+            Ok(profile) => {
+                let mut c = crate::profiles::config_from_profile(&profile, None, None);
+                crate::config::merge_env_plugin_policy_pub(&mut c);
+                Some(c)
+            }
             Err(e) => {
                 warn!("config reload failed for {}: {e}", path.display());
                 None
@@ -128,6 +174,13 @@ impl ConfigWatcher {
         }
         if old.hooks != new.hooks {
             restart_fields.push("hooks".into());
+        }
+        // Section B (codex review round-6 P2): plugin loader policy
+        // (`plugins.require_signed`) is consumed only during plugin
+        // load. A toggle in a running gateway must trigger a restart
+        // so the stale registry is flushed and the new gate applies.
+        if old.plugins != new.plugins {
+            restart_fields.push("plugins".into());
         }
 
         // Queue mode change requires restart (affects message processing loop)

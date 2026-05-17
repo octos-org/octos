@@ -113,6 +113,7 @@ fn base_config(
         working_dir,
         provider_policy: None,
         plugin_dirs: vec![],
+        plugin_require_signed: false,
         status_bridge: None,
         shutdown: Arc::new(AtomicBool::new(false)),
         max_parallel_workers: 1,

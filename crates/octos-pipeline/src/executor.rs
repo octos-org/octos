@@ -314,6 +314,10 @@ pub struct ExecutorConfig {
     pub working_dir: PathBuf,
     pub provider_policy: Option<octos_agent::ToolPolicy>,
     pub plugin_dirs: Vec<PathBuf>,
+    /// Section B (codex review P1.1): pipeline-level strict-signing policy.
+    /// When `true`, the per-node `CodergenHandler` rejects unsigned plugins
+    /// at cache build time. Defaults to `false` (legacy permissive path).
+    pub plugin_require_signed: bool,
     /// Optional status bridge for live progress updates to messaging channels.
     pub status_bridge: Option<PipelineStatusBridge>,
     /// Shared shutdown signal — set to true to cancel all pipeline workers.
@@ -1380,6 +1384,7 @@ impl PipelineExecutor {
         )
         .with_provider_policy(self.config.provider_policy.clone())
         .with_plugin_dirs(self.config.plugin_dirs.clone())
+        .with_plugin_require_signed(self.config.plugin_require_signed)
         // M8 parity (W1.A1): propagate the host context so per-node
         // Agents inherit the parent session's FileStateCache /
         // SubAgentOutputRouter / AgentSummaryGenerator. Empty context
@@ -2900,6 +2905,7 @@ mod tests {
             working_dir: PathBuf::from("/tmp"),
             provider_policy: None,
             plugin_dirs: vec![],
+            plugin_require_signed: false,
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,
@@ -3045,6 +3051,7 @@ mod tests {
             working_dir: PathBuf::from("/tmp"),
             provider_policy: None,
             plugin_dirs: vec![],
+            plugin_require_signed: false,
             status_bridge: None,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_parallel_workers: 8,

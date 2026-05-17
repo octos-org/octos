@@ -342,8 +342,32 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        // Step 1: derive the per-profile Config.
-        let config = config_from_profile(profile, None, None);
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None).await
+    }
+
+    /// Section B (codex review round-3): bootstrap a profile runtime while
+    /// honouring the host-level `plugins.require_signed` policy. When the
+    /// caller (e.g. `octos serve`) has the top-level [`Config`] in scope,
+    /// it passes the host plugin policy here so the per-profile plugin
+    /// load enforces strict signing even when the profile JSON doesn't
+    /// repeat the setting. Profile-level `plugins.require_signed` is OR'd
+    /// with the host setting — neither side can silently relax the other.
+    pub async fn bootstrap_with_host_plugins(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        host_plugins: Option<&crate::config::PluginsConfig>,
+    ) -> Result<Arc<Self>> {
+        // Step 1: derive the per-profile Config. Apply the host plugin
+        // policy on top of the profile-derived one before any downstream
+        // step inspects `config.plugins.require_signed`.
+        let mut config = config_from_profile(profile, None, None);
+        if let Some(host) = host_plugins {
+            if host.require_signed {
+                config.plugins.require_signed = true;
+            }
+        }
 
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
@@ -1409,6 +1433,64 @@ mod tests {
             rt.plugin_dirs.contains(&global_plugins),
             "plugin_dirs should include `<octos_home>/plugins`; got: {:?}",
             rt.plugin_dirs
+        );
+    }
+
+    /// Section B (codex review round-3): the host's `plugins.require_signed`
+    /// policy must reach the per-profile bootstrap so an unsigned skill
+    /// installed under `<data_dir>/skills/` is rejected even when the
+    /// profile JSON omits the flag. We plant an unsigned skill and assert
+    /// it does NOT load when `bootstrap_with_host_plugins` is invoked
+    /// with `host_plugins.require_signed = true`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_runtime_bootstrap_honours_host_require_signed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _key = ScopedEnvKey::set("OCTOS_HOST_SIGN_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let octos_home = tmp.path().join("octos-home");
+        let data_dir = octos_home.join("profiles").join("sigtest").join("data");
+        let skills_dir = data_dir.join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Plant an unsigned per-profile skill — manifest omits sha256.
+        let plugin_dir = skills_dir.join("unsigned-skill");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "name": "unsigned-skill",
+                "version": "1.0",
+                "tools": [{"name": "ut", "description": "d"}]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("unsigned-skill");
+        std::fs::write(&exec_path, b"#!/bin/sh\necho unsigned").unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile = fixture_profile("sigtest", "OCTOS_HOST_SIGN_KEY");
+        let host_plugins = crate::config::PluginsConfig {
+            require_signed: true,
+        };
+
+        let rt = ProfileRuntime::bootstrap_with_host_plugins(
+            &profile,
+            &data_dir,
+            Some(&octos_home),
+            BootstrapRole::Serve,
+            Some(&host_plugins),
+        )
+        .await
+        .expect("bootstrap should succeed (the rejection only suppresses the plugin)");
+
+        let specs = rt.tool_specs.specs();
+        let registered: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !registered.iter().any(|n| n == &"ut"),
+            "unsigned skill tool `ut` must NOT load when host strict policy is on; \
+             registered: {registered:?}"
         );
     }
 
