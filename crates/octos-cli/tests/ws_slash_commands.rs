@@ -60,6 +60,7 @@ async fn setup_ctx() -> (SlashCommandContext, TempDir, SessionKey) {
         sessions: sessions.clone(),
         session_id: session_key.clone(),
         data_dir: tmp.path().to_path_buf(),
+        workspace_root: None,
         profile_id: None,
     };
     (ctx, tmp, session_key)
@@ -218,4 +219,108 @@ async fn should_intercept_session_actor_style_commands_on_ws() {
             "{cmd} must be intercepted on WS path so it doesn't reach the LLM"
         );
     }
+}
+
+// ── Scenario 6 — `/new sites <preset>` plural form (round-2 fixup #1015) ──
+
+/// Round-2 codex review: `/new sites <preset>` (plural) MUST hit the
+/// site scaffold branch, not the generic "Switched to session: …"
+/// fallback. The SPA-facing call (`sites-chat.tsx`) and the gateway
+/// path use the singular `site` form, but power-users / parallel
+/// frontends mirror the slides path (`/new slides …` plural) and type
+/// `/new sites astro` by analogy. Pre-fix the plural form fell into
+/// the generic `_ => format!("Switched to session: {name_arg}")` arm
+/// and never scaffolded.
+///
+/// We cannot actually scaffold in unit tests — the site bootstrap
+/// requires a `mofa-site` skill dir under `data_dir`, which the
+/// fixture tempdir does not provide. The distinguishing observable
+/// for "the right branch was taken" is therefore the failure message
+/// shape: when the scaffold can't complete it surfaces "Site scaffold
+/// failed" (with the underlying error). The generic fallback would
+/// instead say "Switched to session: sites astro" — completely
+/// different wording.
+#[tokio::test]
+async fn should_scaffold_site_when_new_sites_preset_command_arrives_on_ws() {
+    let (ctx, _tmp, _session_key) = setup_ctx().await;
+
+    let reply = try_dispatch_slash_command("/new sites astro", &ctx).await;
+    let reply = reply.expect("/new sites astro must be intercepted on WS path");
+
+    // The reply must indicate the SITE scaffold branch ran. Either it
+    // succeeded (some test environments may have a mofa-site skill
+    // resolvable) or it failed with the scaffold-specific error
+    // wording. It MUST NOT be the generic switch-session reply.
+    let succeeded = reply.contains("Site project") && reply.contains("created");
+    let failed_at_scaffold =
+        reply.contains("Site scaffold failed") || reply.contains("site project");
+    assert!(
+        succeeded || failed_at_scaffold,
+        "/new sites <preset> must take the site-scaffold branch, got: {reply}"
+    );
+    assert!(
+        !reply.starts_with("Switched to session: sites"),
+        "/new sites <preset> must NOT fall into the generic switch-session arm, got: {reply}"
+    );
+}
+
+// ── Scenario 7 — session workspace_root override (round-2 fixup #1015) ──
+
+/// Round-2 codex review: the slash helper must scaffold under the
+/// session's actual `workspace_root` — NOT the conventional
+/// `<data_dir>/users/<encoded>/workspace` reconstruction. When a
+/// session is bootstrapped with a `workspace_hint` (the coding-agent
+/// flow), `session_runtime.workspace_root` points at the hinted path
+/// and ALL tools operate there. If the slash helper reconstructs a
+/// different path it can scaffold OUTSIDE the active tool sandbox.
+///
+/// The fix threads `workspace_root` through `SlashCommandContext` so
+/// the helper uses the same root the tools use.
+#[tokio::test]
+async fn should_use_session_workspace_root_when_override_present() {
+    let tmp = TempDir::new().unwrap();
+    let custom_workspace = tmp.path().join("custom-coding-root");
+    std::fs::create_dir_all(&custom_workspace).unwrap();
+
+    let session_key = SessionKey::new("api", "coding-test");
+    let sessions = Arc::new(Mutex::new(
+        octos_bus::SessionManager::open(tmp.path()).unwrap(),
+    ));
+    let ctx = SlashCommandContext {
+        sessions: sessions.clone(),
+        session_id: session_key.clone(),
+        data_dir: tmp.path().to_path_buf(),
+        workspace_root: Some(custom_workspace.clone()),
+        profile_id: None,
+    };
+
+    let reply = try_dispatch_slash_command("/new slides hint-deck", &ctx).await;
+    let reply = reply.expect("/new slides hint-deck must be intercepted");
+    assert!(reply.contains("hint-deck"));
+
+    // The scaffold must land under the CUSTOM workspace, NOT the
+    // conventional users/<encoded>/workspace reconstruction.
+    let scaffolded = custom_workspace.join("slides").join("hint-deck");
+    assert!(
+        scaffolded.is_dir(),
+        "slides scaffold must land in the session workspace_root override, got missing {}",
+        scaffolded.display()
+    );
+    assert!(scaffolded.join("script.js").is_file());
+
+    // Negative: the conventional fallback path must NOT exist.
+    let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+    let conventional = tmp
+        .path()
+        .join("users")
+        .join(&encoded_base)
+        .join("workspace")
+        .join("slides")
+        .join("hint-deck");
+    assert!(
+        !conventional.exists(),
+        "scaffold leaked into the data_dir conventional path {} — \
+         workspace_root override was ignored",
+        conventional.display()
+    );
 }

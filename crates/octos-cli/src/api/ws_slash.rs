@@ -72,14 +72,29 @@ pub struct SlashCommandContext {
     pub sessions: Arc<Mutex<SessionManager>>,
     /// The originating session for this turn. Both `/clear` (which
     /// targets the per-session ledger) and `/new slides|site` (which
-    /// scaffolds under `<data_dir>/users/<encoded_base>/workspace/`)
-    /// derive their on-disk paths from this key.
+    /// scaffolds under `<workspace_root>/`) derive their on-disk paths
+    /// from this key.
     pub session_id: SessionKey,
     /// Profile data dir — the WS turn path threads this from
-    /// `SessionRuntime.profile.data_dir`. Used as the `users/<base>/…`
-    /// root for scaffolding and as the `data_dir` parameter passed
-    /// into [`crate::project_templates::scaffold_site_project`].
+    /// `SessionRuntime.profile.data_dir`. Used as the `data_dir`
+    /// parameter passed into
+    /// [`crate::project_templates::scaffold_site_project`] (skill-dir
+    /// lookup) and into [`crate::project_templates::try_activate_*_template`]
+    /// (session prompt write).
     pub data_dir: PathBuf,
+    /// Active session workspace root — the WS turn path threads this
+    /// from `SessionRuntime.workspace_root`. This is the SAME directory
+    /// the per-session tool registry is bound to; scaffolding under any
+    /// other root would write files OUTSIDE the active sandbox.
+    ///
+    /// `None` falls back to the conventional
+    /// `<data_dir>/users/<encoded_base>/workspace/` layout
+    /// (`session_actor.rs::default_workspace_root`) for callers that
+    /// never opened a session with a workspace hint. Issue #1015
+    /// round-2 fixup: pre-fix the helper always reconstructed the
+    /// conventional path, which silently bypassed `workspace_hint`
+    /// overrides used by the coding-agent UI.
+    pub workspace_root: Option<PathBuf>,
     /// Optional profile id for the site scaffold. The gateway path
     /// derives this from `GatewayDispatcher.dispatch_profile_id`; on
     /// the WS path we plumb the same value from
@@ -177,12 +192,16 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
         return format!("Invalid session name: {reason}");
     }
 
-    let encoded_base = octos_bus::session::encode_path_component(ctx.session_id.base_key());
-    let workspace_root = ctx
-        .data_dir
-        .join("users")
-        .join(encoded_base)
-        .join("workspace");
+    // Round-2 fixup (#1015 codex review BLOCKING 2): use the active
+    // session's `workspace_root` when threaded through. This is the
+    // SAME directory the per-session tool registry is bound to — using
+    // anything else (e.g. a reconstructed `data_dir/users/<base>/workspace`
+    // when the caller actually opened the session with a workspace
+    // hint) would scaffold OUTSIDE the active tool sandbox.
+    let workspace_root: PathBuf = ctx
+        .workspace_root
+        .clone()
+        .unwrap_or_else(|| default_workspace_root_for(&ctx.data_dir, &ctx.session_id));
     if let Err(error) = std::fs::create_dir_all(&workspace_root) {
         tracing::warn!(
             session = %ctx.session_id.0,
@@ -192,10 +211,31 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
         );
     }
 
-    if name_arg == "slides" || name_arg.starts_with("slides ") {
-        match crate::project_templates::try_activate_slides_template(&ctx.data_dir, name_arg) {
+    // Round-2 fixup (#1015 codex review BLOCKING 1): normalize the
+    // plural `sites` alias to the canonical singular `site` form
+    // before downstream parsing. The SPA's sites-chat.tsx canonically
+    // emits `/new site <preset>` (singular) matching the gateway
+    // path, but the slides equivalent is plural (`/new slides …`) and
+    // power users / parallel frontends typing `/new sites astro` by
+    // analogy would otherwise fall into the generic switch arm and
+    // never trigger the scaffold. Aliasing here lets one branch
+    // handle both forms — the downstream
+    // [`crate::project_templates::site_preset_from_topic`] parser only
+    // recognises the singular form, so we hand it the normalized
+    // string.
+    let normalized_topic = if name_arg == "sites" {
+        std::borrow::Cow::Borrowed("site")
+    } else if let Some(rest) = name_arg.strip_prefix("sites ") {
+        std::borrow::Cow::Owned(format!("site {rest}"))
+    } else {
+        std::borrow::Cow::Borrowed(name_arg)
+    };
+    let topic: &str = normalized_topic.as_ref();
+
+    if topic == "slides" || topic.starts_with("slides ") {
+        match crate::project_templates::try_activate_slides_template(&ctx.data_dir, topic) {
             Some(template_reply) => {
-                let project_name = name_arg.strip_prefix("slides").unwrap_or("").trim();
+                let project_name = topic.strip_prefix("slides").unwrap_or("").trim();
                 let project_name = if project_name.is_empty() {
                     "untitled"
                 } else {
@@ -208,7 +248,7 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
                     Ok(_) => template_reply,
                     Err(error) => {
                         tracing::warn!(
-                            topic = name_arg,
+                            topic = topic,
                             error = %error,
                             "ws slash: slides scaffold failed"
                         );
@@ -218,8 +258,8 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
             }
             None => format!("Switched to session: {name_arg}"),
         }
-    } else if name_arg == "site" || name_arg.starts_with("site ") {
-        let _ = crate::project_templates::try_activate_site_template(&ctx.data_dir, name_arg);
+    } else if topic == "site" || topic.starts_with("site ") {
+        let _ = crate::project_templates::try_activate_site_template(&ctx.data_dir, topic);
         let profile_id = ctx
             .profile_id
             .clone()
@@ -228,22 +268,34 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
             &workspace_root,
             &profile_id,
             ctx.session_id.chat_id(),
-            name_arg,
+            topic,
             &ctx.data_dir,
         ) {
             Ok(metadata) => crate::project_templates::site_creation_reply(&metadata),
             Err(error) => {
                 tracing::warn!(
-                    topic = name_arg,
+                    topic = topic,
                     error = %error,
                     "ws slash: site scaffold failed"
                 );
-                format!("Switched to session: {name_arg}\n\nSite scaffold failed: {error}")
+                format!("Site scaffold failed: {error}")
             }
         }
     } else {
         format!("Switched to session: {name_arg}")
     }
+}
+
+/// Default workspace root layout when the caller did not thread a
+/// session workspace_root through `SlashCommandContext`. Mirrors
+/// `runtime::session::resolve_workspace_root`'s fallback so the slash
+/// helper and the per-session tool registry agree on the same root.
+fn default_workspace_root_for(data_dir: &std::path::Path, session_id: &SessionKey) -> PathBuf {
+    let encoded_base = octos_bus::session::encode_path_component(session_id.base_key());
+    data_dir
+        .join("users")
+        .join(encoded_base)
+        .join("workspace")
 }
 
 /// Unknown-command help text. Matches the wording in
@@ -277,6 +329,7 @@ mod tests {
             sessions,
             session_id: session_key.clone(),
             data_dir: tmp.path().to_path_buf(),
+            workspace_root: None,
             profile_id: None,
         };
         (ctx, tmp, session_key)

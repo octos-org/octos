@@ -8812,6 +8812,11 @@ async fn run_standalone_turn(
             .profile_id()
             .map(ToOwned::to_owned)
             .or_else(|| routed_profile_id.clone()),
+        // Codex round-2: use the session_runtime's resolved workspace_root
+        // so scaffolds land where the tools are pointed, not the default
+        // `data_dir/users/<base>/workspace`. Critical for WS sessions
+        // opened with a custom cwd / workspace hint.
+        workspace_root: Some(session_runtime.workspace_root.clone()),
     };
     if let Some(reply) = ws_slash::try_dispatch_slash_command(&prompt, &slash_ctx).await {
         // Persist the user prompt + synthesized assistant reply against
