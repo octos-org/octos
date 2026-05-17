@@ -78,8 +78,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             .allow_origin(tower_http::cors::AllowOrigin::predicate(
                 move |origin, _| {
                     let o = origin.to_str().unwrap_or("");
-                    // Allow listed origins + any plain-HTTP origin for local/tunnel access
-                    allowed.iter().any(|s| s == o) || o.starts_with("http://")
+                    allowed.iter().any(|s| s == o)
                 },
             ))
             .allow_methods(tower_http::cors::Any)
