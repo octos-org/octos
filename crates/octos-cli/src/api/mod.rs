@@ -40,8 +40,8 @@ pub mod webhook_proxy;
 pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
 pub use preview_tokens::{
-    DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewTokens,
-    SharedPreviewTokens, SignedPreviewResponse,
+    DEFAULT_PREVIEW_SWEEP_INTERVAL, IssueError as PreviewTokenIssueError, PreviewSweeperHandle,
+    PreviewTokens, SharedPreviewTokens, SignedPreviewResponse,
 };
 pub use router::{DEFAULT_BASE_DOMAIN, build_router, cors_allowlist_for_base_domain};
 
@@ -288,6 +288,14 @@ pub struct AppState {
     /// invalidates every outstanding grant. See
     /// [`crate::api::preview_tokens`] for full design rationale.
     pub preview_tokens: SharedPreviewTokens,
+    /// Owning handle to the background sweeper task spawned for
+    /// `preview_tokens` (issue #1009). Storing it here ties the
+    /// task's lifetime to `AppState`: when the last `Arc<AppState>` is
+    /// dropped (clean shutdown OR any abnormal exit path), the inner
+    /// `PreviewSweeperHandle::drop` aborts the task instead of leaking
+    /// it. `None` in tests and code paths that don't spawn the
+    /// sweeper.
+    pub preview_sweeper: Option<PreviewSweeperHandle>,
 }
 
 impl AppState {
@@ -345,6 +353,10 @@ impl AppState {
             task_query_store: None,
             appui_default_session_cwd: None,
             preview_tokens: Arc::new(PreviewTokens::new()),
+            // Tests don't spawn the sweeper. Tests that exercise the
+            // sweeper either drive `sweep_expired_all` directly or
+            // build their own `PreviewSweeperHandle::spawn(...)`.
+            preview_sweeper: None,
         }
     }
 }

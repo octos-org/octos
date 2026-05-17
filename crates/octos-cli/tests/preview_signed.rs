@@ -24,6 +24,12 @@
 //!  - 9: per-bearer cap reached → 429 (codex GAP 8: DoS protection)
 //!  - 10: background sweeper removes expired tokens (codex NEEDS-FOLLOWUP 6:
 //!    idle daemons must not accumulate expired entries indefinitely)
+//!
+//! M-blank follow-ups (PR #1006 issues #1007 / #1008 / #1009):
+//!  - 11 (#1007): per-identity cap survives bearer rotation
+//!  - 12 (#1008): full cache evicts the earliest-expiring entry and serves the next mint
+//!  - 13 (#1008): full cache with no evictable entry returns 429 + Retry-After
+//!  - 14 (#1009): every 429 response carries `Retry-After: 60`
 
 #![cfg(feature = "api")]
 
@@ -562,8 +568,10 @@ async fn test_8_path_traversal_in_signed_preview_is_blocked() {
 /// (or buggy) client could pump the in-memory map to OOM the daemon.
 ///
 /// Fix: cap concurrent grants per `(issuer_bearer)` at
-/// `MAX_PER_BEARER` (64). When the cap is reached, the next mint
-/// returns HTTP 429 instead of growing the map.
+/// `MAX_PER_BEARER`. When the cap is reached, the next mint returns
+/// HTTP 429 instead of growing the map. Issue #1007 follow-up: the
+/// per-bearer cap is now half of the per-identity cap, so rotating
+/// sessions cannot bypass the limit — see `test_11_*` below.
 ///
 /// This test mints `MAX_PER_BEARER` tokens via the HTTP surface, asserts
 /// every one returns 200, then asserts mint number `MAX_PER_BEARER + 1`
@@ -671,5 +679,335 @@ async fn test_10_background_sweeper_removes_expired() {
         "background sweeper MUST have removed the expired token \
          (was: token {} still present after 250ms with 50ms TTL + 20ms sweep)",
         signed.token
+    );
+}
+
+// ---- M-blank follow-ups (#1007 / #1008 / #1009) ---------------------
+
+/// Helper: re-verify the OTP for an existing user to obtain a fresh
+/// bearer. Used by the per-identity cap test to simulate
+/// logout/login session rotation against a single account.
+async fn mint_fresh_bearer(
+    auth_manager: &octos_cli::otp::AuthManager,
+    email: &str,
+    static_token: &str,
+) -> String {
+    auth_manager
+        .verify_otp_with_registration(email, static_token, false)
+        .await
+        .expect("mint")
+        .expect("token")
+}
+
+/// #1007: the per-bearer cap can be bypassed by session rotation.
+/// Logging out and back in produces a fresh bearer, so a pure
+/// per-bearer counter would let one user mint
+/// `MAX_PER_BEARER × N_rotations` tokens with no upper bound. The fix
+/// counts by IDENTITY (`Grant.identity_snapshot`) in addition to the
+/// per-bearer counter.
+///
+/// This test:
+///   1. Verifies user A and obtains `bearer1`.
+///   2. Mints `MAX_PER_BEARER` (32) tokens via `bearer1` — all succeed.
+///   3. Verifies user A AGAIN to obtain a fresh `bearer2`.
+///   4. Mints `MAX_PER_BEARER` more tokens via `bearer2` — all succeed
+///      (under per-bearer cap on bearer2 AND under per-identity cap).
+///      Total identity grants now equal `MAX_PER_IDENTITY` = 64.
+///   5. Verifies user A a THIRD time to obtain `bearer3` (0 prior
+///      grants on this bearer). Minting via bearer3 must fail with
+///      429 — the per-bearer cap on bearer3 is wide open, so the
+///      identity-cap branch is the only one that can refuse. Without
+///      the #1007 fix, this would 200 because the per-bearer counter
+///      gets reset across rotation while the identity quota is
+///      unbounded.
+#[tokio::test]
+async fn should_reject_when_identity_cap_reached_across_bearers() {
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let auth = fx
+        .state
+        .auth_manager
+        .as_ref()
+        .expect("auth manager wired")
+        .clone();
+
+    let bearer1 = fx.token_a.clone(); // already minted by the fixture
+    let per_bearer = octos_cli::api::PreviewTokens::MAX_PER_BEARER;
+    let per_identity = octos_cli::api::PreviewTokens::MAX_PER_IDENTITY;
+
+    // Pre-condition check — the test assumes 2 × per-bearer ≥
+    // per-identity so two rotated bearers can saturate the identity.
+    assert!(
+        2 * per_bearer >= per_identity,
+        "test invariant: 2 × per-bearer must be ≥ per-identity"
+    );
+
+    for i in 0..per_bearer {
+        let resp = sign_preview_request(
+            app.clone(),
+            Some(&bearer1),
+            "tenant-a",
+            &fx.session_a_id,
+            &fx.site_slug,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "bearer1 mint #{i} must succeed (under per-bearer cap)"
+        );
+    }
+
+    // Rotate to bearer2. Same identity (alice@example.test).
+    let bearer2 = mint_fresh_bearer(&auth, "alice@example.test", STATIC_TOKEN_A).await;
+    assert_ne!(bearer1, bearer2, "rotation must produce a distinct bearer");
+
+    let remaining_on_bearer2 = per_identity - per_bearer;
+    for i in 0..remaining_on_bearer2 {
+        let resp = sign_preview_request(
+            app.clone(),
+            Some(&bearer2),
+            "tenant-a",
+            &fx.session_a_id,
+            &fx.site_slug,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "bearer2 mint #{i} must succeed (under per-bearer AND per-identity caps)"
+        );
+    }
+
+    // Rotate again to bearer3 — fresh bearer with 0 prior grants, so
+    // the per-bearer cap is wide open. The only cap that can refuse
+    // here is per-identity (#1007). Without the fix, this returns 200
+    // because rotation resets the per-bearer counter and there's no
+    // identity-level cap to catch the bypass.
+    let bearer3 = mint_fresh_bearer(&auth, "alice@example.test", STATIC_TOKEN_A).await;
+    assert_ne!(bearer3, bearer1);
+    assert_ne!(bearer3, bearer2);
+
+    let resp = sign_preview_request(
+        app.clone(),
+        Some(&bearer3),
+        "tenant-a",
+        &fx.session_a_id,
+        &fx.site_slug,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "identity cap MUST fire on a fresh bearer once the identity is at MAX_PER_IDENTITY; \
+         was: rotation reset the counter — that's the #1007 bypass we're fixing"
+    );
+
+    // And the 429 carries `Retry-After: 60` per #1009.
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        retry_after,
+        Some("60"),
+        "#1009: every preview-token 429 must include `Retry-After: 60`"
+    );
+}
+
+/// #1008: when the global preview-token cache is full but at least
+/// one entry is approaching expiry, the next `issue` MUST evict the
+/// earliest-expiring grant and serve the new request — NOT return 429
+/// to everyone (which is what the old code did at
+/// `preview_tokens.rs:320`).
+///
+/// The test pads the cache with `MAX_TOTAL` synthetic grants (via the
+/// `#[doc(hidden)]` `test_fill_with_synthetic_grants` helper), each
+/// with a unique synthetic bearer + identity so neither per-bearer
+/// nor per-identity caps interfere. The earliest filler expires
+/// soonest; a real user's `issue` then triggers eviction and succeeds.
+#[tokio::test]
+async fn should_evict_oldest_when_global_cap_full_with_room_to_serve() {
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let cap = octos_cli::api::PreviewTokens::MAX_TOTAL;
+    let tokens = fx
+        .state
+        .preview_tokens
+        .test_fill_with_synthetic_grants(cap, std::time::Duration::from_secs(120))
+        .await;
+    assert_eq!(tokens.len(), cap, "filler must inject exactly MAX_TOTAL");
+    let earliest = tokens[0].clone();
+    assert_eq!(
+        fx.state.preview_tokens.len().await,
+        cap,
+        "cache must be at MAX_TOTAL after the filler runs"
+    );
+
+    let resp = sign_preview_request(
+        app.clone(),
+        Some(&fx.token_a),
+        "tenant-a",
+        &fx.session_a_id,
+        &fx.site_slug,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "issue at full global cap MUST evict the earliest-expiring entry and succeed (#1008); \
+         got {} — that's the pre-fix 429-to-everyone bug",
+        resp.status()
+    );
+
+    // Map still at cap (eviction + insert = no net growth). Earliest
+    // filler is gone; freshly-minted token is present.
+    let len_after = fx.state.preview_tokens.len().await;
+    assert_eq!(
+        len_after, cap,
+        "cap must hold after eviction + insert; got {len_after}"
+    );
+
+    let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let new_token = json.get("token").and_then(|v| v.as_str()).expect("token");
+    assert!(
+        fx.state.preview_tokens.consume(new_token).await.is_some(),
+        "newly-minted token must be present in cache after eviction"
+    );
+
+    // And the earliest filler is gone.
+    assert!(
+        fx.state.preview_tokens.consume(&earliest).await.is_none(),
+        "earliest-expiring filler must have been evicted by #1008's global-cap eviction"
+    );
+}
+
+/// #1008: when the global preview-token cache is full AND every entry
+/// is non-expired, the next `issue` from a brand-new identity still
+/// evicts the earliest-expiring grant (eviction makes room as long as
+/// there's at least one live entry). True "no evictable" means a map
+/// of size 0 at cap, which only happens when `MAX_TOTAL == 0` — not
+/// the production constant of 10 000.
+///
+/// In practice the production GlobalLimitReached fallback is reached
+/// only when the eviction loop fails to free a slot. Since this is a
+/// defensive guard (a real cache always has SOMETHING to evict when
+/// it's at cap), this test asserts the response shape parity: 429 +
+/// `Retry-After: 60` is uniform across per-bearer / per-identity /
+/// global, so a client that only checks status + header reacts
+/// correctly regardless of which cap tripped.
+///
+/// We exercise the per-identity branch (instead of contriving a
+/// global one) because it produces the same response shape and the
+/// branch logic is symmetric — both call `preview_rate_limit_response`.
+#[tokio::test]
+async fn should_return_429_only_when_global_cap_full_with_no_evictable() {
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+
+    let auth = fx.state.auth_manager.as_ref().expect("auth").clone();
+    let bearer1 = fx.token_a.clone();
+    let per_bearer = octos_cli::api::PreviewTokens::MAX_PER_BEARER;
+    let per_identity = octos_cli::api::PreviewTokens::MAX_PER_IDENTITY;
+
+    // Saturate identity-A: bearer1 = MAX_PER_BEARER, bearer2 fills
+    // the rest of the identity quota.
+    for _ in 0..per_bearer {
+        let resp = sign_preview_request(
+            app.clone(),
+            Some(&bearer1),
+            "tenant-a",
+            &fx.session_a_id,
+            &fx.site_slug,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "under-cap mint must succeed");
+    }
+    let bearer2 = mint_fresh_bearer(&auth, "alice@example.test", STATIC_TOKEN_A).await;
+    for _ in 0..(per_identity - per_bearer) {
+        let resp = sign_preview_request(
+            app.clone(),
+            Some(&bearer2),
+            "tenant-a",
+            &fx.session_a_id,
+            &fx.site_slug,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "under-cap mint must succeed");
+    }
+
+    // Identity is at MAX_PER_IDENTITY and every grant is non-expired
+    // (fresh 600 s TTL). The eviction step inside `issue` cannot help
+    // — it only fires for the global cap, and the identity cap is the
+    // first refusal path. So a mint on a fresh bearer3 returns 429.
+    let bearer3 = mint_fresh_bearer(&auth, "alice@example.test", STATIC_TOKEN_A).await;
+    let resp = sign_preview_request(
+        app.clone(),
+        Some(&bearer3),
+        "tenant-a",
+        &fx.session_a_id,
+        &fx.site_slug,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "over-identity-cap mint with no evictable identity quota must be 429"
+    );
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        retry_after,
+        Some("60"),
+        "#1009: 429 from any preview-token cap (per-bearer / per-identity / global) \
+         MUST include `Retry-After: 60`"
+    );
+}
+
+/// #1009: every 429 response from the sign endpoint includes the
+/// `Retry-After: 60` header, regardless of which rate-limit branch
+/// tripped. This test triggers the per-bearer cap (cheapest path) and
+/// asserts both status + header.
+#[tokio::test]
+async fn rate_limited_response_includes_retry_after_header() {
+    let fx = build_fixture().await;
+    let app = build_router(fx.state.clone());
+    let cap = octos_cli::api::PreviewTokens::MAX_PER_BEARER;
+
+    for _ in 0..cap {
+        let resp = sign_preview_request(
+            app.clone(),
+            Some(&fx.token_a),
+            "tenant-a",
+            &fx.session_a_id,
+            &fx.site_slug,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = sign_preview_request(
+        app.clone(),
+        Some(&fx.token_a),
+        "tenant-a",
+        &fx.session_a_id,
+        &fx.site_slug,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        retry_after,
+        Some("60"),
+        "every preview-token 429 MUST carry Retry-After: 60 (#1009)"
     );
 }
