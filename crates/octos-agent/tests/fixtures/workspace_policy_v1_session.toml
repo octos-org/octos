@@ -34,8 +34,8 @@ on_verify = [
 ]
 on_failure = ["notify_user:Podcast generation failed"]
 on_completion = [
-    { kind = "magic_bytes", glob = "skill-output/mofa-podcast/*.mp3", format = "mp3" },
-    { kind = "audio_non_silent", glob = "skill-output/mofa-podcast/*.mp3", min_ratio = 0.3 },
+    { kind = "magic_bytes", glob = "skill-output/mofa-podcast/**/*.mp3", format = "mp3" },
+    { kind = "audio_non_silent", glob = "skill-output/mofa-podcast/**/*.mp3", min_ratio = 0.3 },
 ]
 
 [spawn_tasks.fm_voice_save]

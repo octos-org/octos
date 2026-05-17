@@ -826,11 +826,11 @@ impl WorkspacePolicy {
             // close the gap for both validators in one shot.
             on_completion: vec![
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                    glob: "skill-output/mofa-podcast/*.mp3".into(),
+                    glob: "skill-output/mofa-podcast/**/*.mp3".into(),
                     format: MagicByteKind::Mp3,
                 }),
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
-                    glob: "skill-output/mofa-podcast/*.mp3".into(),
+                    glob: "skill-output/mofa-podcast/**/*.mp3".into(),
                     min_ratio: default_non_silent_ratio(),
                 }),
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
@@ -855,7 +855,7 @@ impl WorkspacePolicy {
             on_failure: vec!["notify_user:Voice synthesis failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(
                 ValidatorSpec::AudioNonSilent {
-                    glob: "skill-output/voice/*.{mp3,wav}".into(),
+                    glob: "skill-output/voice/**/*.{mp3,wav}".into(),
                     min_ratio: default_non_silent_ratio(),
                 },
             )],
