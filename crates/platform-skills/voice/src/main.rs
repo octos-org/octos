@@ -30,7 +30,18 @@ struct SynthesizeInput {
     output_path: Option<String>,
     #[serde(default)]
     language: Option<String>,
-    #[serde(default)]
+    /// LLMs (especially deepseek-chat) naturally call this with `voice`
+    /// as the parameter name — it matches user phrasing like
+    /// "用 vivian 的声音说…" and the `fm_tts` tool's `voice` field.
+    /// Without the alias the call silently drops the LLM's `voice`
+    /// argument and `speaker` defaults to `vivian`, silently
+    /// substituting any non-preset voice (e.g. `yangmi`) without error.
+    /// Observed live on mini1 2026-05-10: users repeatedly asked for
+    /// `yangmi`, got `vivian` back with no warning. The Qwen3-TTS
+    /// rejection path (which emits the "use fm_tts" hint) only fires
+    /// when the non-preset name actually reaches ominix-api, which the
+    /// silent default prevented.
+    #[serde(default, alias = "voice")]
     speaker: Option<String>,
     /// Style/emotion prompt (e.g. "用兴奋激动的语气说话，充满热情和活力")
     #[serde(default)]
