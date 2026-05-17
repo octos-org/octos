@@ -25,11 +25,13 @@
 //!  - 10: background sweeper removes expired tokens (codex NEEDS-FOLLOWUP 6:
 //!    idle daemons must not accumulate expired entries indefinitely)
 //!
-//! M-blank follow-ups (PR #1006 issues #1007 / #1008 / #1009):
+//! M-blank follow-ups (PR #1006 issues #1007 / #1008 / #1009 / #1012):
 //!  - 11 (#1007): per-identity cap survives bearer rotation
-//!  - 12 (#1008): full cache evicts the earliest-expiring entry and serves the next mint
-//!  - 13 (#1008): full cache with no evictable entry returns 429 + Retry-After
-//!  - 14 (#1009): every 429 response carries `Retry-After: 60`
+//!  - 12 (#1012, supersedes #1008): full cache of LIVE grants returns
+//!    429 + Retry-After — the issue path does NOT evict a live grant
+//!    (which the #1008 patch tried to do and inadvertently broke
+//!    legitimate users' active previews)
+//!  - 13 (#1009): every 429 response carries `Retry-After: 60`
 
 #![cfg(feature = "api")]
 
@@ -816,19 +818,30 @@ async fn should_reject_when_identity_cap_reached_across_bearers() {
     );
 }
 
-/// #1008: when the global preview-token cache is full but at least
-/// one entry is approaching expiry, the next `issue` MUST evict the
-/// earliest-expiring grant and serve the new request — NOT return 429
-/// to everyone (which is what the old code did at
-/// `preview_tokens.rs:320`).
+/// #1012 (supersedes #1008): when the global preview-token cache is
+/// full of LIVE grants, the next `issue` from a real user MUST refuse
+/// with 429 + `Retry-After: 60` rather than evict one of the live
+/// grants. The earlier #1008 patch evicted the earliest-expiring entry
+/// at this point, but since the inline `sweep_expired` has already
+/// dropped expired tokens the eviction candidate is always a LIVE
+/// grant — pulling it out from under whoever owns it breaks their
+/// active iframe before its advertised `expires_at`.
 ///
-/// The test pads the cache with `MAX_TOTAL` synthetic grants (via the
-/// `#[doc(hidden)]` `test_fill_with_synthetic_grants` helper), each
-/// with a unique synthetic bearer + identity so neither per-bearer
-/// nor per-identity caps interfere. The earliest filler expires
-/// soonest; a real user's `issue` then triggers eviction and succeeds.
+/// The test pads the cache to exactly `MAX_TOTAL` using the
+/// `#[doc(hidden)]` `test_fill_with_synthetic_grants` helper. Each
+/// filler uses a unique synthetic bearer + identity so neither the
+/// per-bearer nor per-identity cap can fire when the real user's
+/// `issue` runs — the only refusal path that can trip is the global
+/// cap. `base_ttl = 120s` keeps every filler well inside its TTL, so
+/// after the inline sweep the map is still full.
+///
+/// Asserts:
+///   - The real user's POST returns 429 with `Retry-After: 60`.
+///   - The map stays exactly at `MAX_TOTAL` (no insert happened).
+///   - The earliest-expiring filler is STILL present afterwards (the
+///     fix's whole point: no live grants were collateral-damaged).
 #[tokio::test]
-async fn should_evict_oldest_when_global_cap_full_with_room_to_serve() {
+async fn should_return_429_when_global_cap_full_with_only_live_grants() {
     let fx = build_fixture().await;
     let app = build_router(fx.state.clone());
 
@@ -846,6 +859,10 @@ async fn should_evict_oldest_when_global_cap_full_with_room_to_serve() {
         "cache must be at MAX_TOTAL after the filler runs"
     );
 
+    // A real user — fresh bearer, fresh identity (different from every
+    // synthetic filler identity) — tries to mint. Per-bearer and
+    // per-identity counters are 0, so the only refusal path that can
+    // fire is the global cap.
     let resp = sign_preview_request(
         app.clone(),
         Some(&fx.token_a),
@@ -856,108 +873,10 @@ async fn should_evict_oldest_when_global_cap_full_with_room_to_serve() {
     .await;
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "issue at full global cap MUST evict the earliest-expiring entry and succeed (#1008); \
-         got {} — that's the pre-fix 429-to-everyone bug",
-        resp.status()
-    );
-
-    // Map still at cap (eviction + insert = no net growth). Earliest
-    // filler is gone; freshly-minted token is present.
-    let len_after = fx.state.preview_tokens.len().await;
-    assert_eq!(
-        len_after, cap,
-        "cap must hold after eviction + insert; got {len_after}"
-    );
-
-    let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
-        .await
-        .unwrap();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    let new_token = json.get("token").and_then(|v| v.as_str()).expect("token");
-    assert!(
-        fx.state.preview_tokens.consume(new_token).await.is_some(),
-        "newly-minted token must be present in cache after eviction"
-    );
-
-    // And the earliest filler is gone.
-    assert!(
-        fx.state.preview_tokens.consume(&earliest).await.is_none(),
-        "earliest-expiring filler must have been evicted by #1008's global-cap eviction"
-    );
-}
-
-/// #1008: when the global preview-token cache is full AND every entry
-/// is non-expired, the next `issue` from a brand-new identity still
-/// evicts the earliest-expiring grant (eviction makes room as long as
-/// there's at least one live entry). True "no evictable" means a map
-/// of size 0 at cap, which only happens when `MAX_TOTAL == 0` — not
-/// the production constant of 10 000.
-///
-/// In practice the production GlobalLimitReached fallback is reached
-/// only when the eviction loop fails to free a slot. Since this is a
-/// defensive guard (a real cache always has SOMETHING to evict when
-/// it's at cap), this test asserts the response shape parity: 429 +
-/// `Retry-After: 60` is uniform across per-bearer / per-identity /
-/// global, so a client that only checks status + header reacts
-/// correctly regardless of which cap tripped.
-///
-/// We exercise the per-identity branch (instead of contriving a
-/// global one) because it produces the same response shape and the
-/// branch logic is symmetric — both call `preview_rate_limit_response`.
-#[tokio::test]
-async fn should_return_429_only_when_global_cap_full_with_no_evictable() {
-    let fx = build_fixture().await;
-    let app = build_router(fx.state.clone());
-
-    let auth = fx.state.auth_manager.as_ref().expect("auth").clone();
-    let bearer1 = fx.token_a.clone();
-    let per_bearer = octos_cli::api::PreviewTokens::MAX_PER_BEARER;
-    let per_identity = octos_cli::api::PreviewTokens::MAX_PER_IDENTITY;
-
-    // Saturate identity-A: bearer1 = MAX_PER_BEARER, bearer2 fills
-    // the rest of the identity quota.
-    for _ in 0..per_bearer {
-        let resp = sign_preview_request(
-            app.clone(),
-            Some(&bearer1),
-            "tenant-a",
-            &fx.session_a_id,
-            &fx.site_slug,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK, "under-cap mint must succeed");
-    }
-    let bearer2 = mint_fresh_bearer(&auth, "alice@example.test", STATIC_TOKEN_A).await;
-    for _ in 0..(per_identity - per_bearer) {
-        let resp = sign_preview_request(
-            app.clone(),
-            Some(&bearer2),
-            "tenant-a",
-            &fx.session_a_id,
-            &fx.site_slug,
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK, "under-cap mint must succeed");
-    }
-
-    // Identity is at MAX_PER_IDENTITY and every grant is non-expired
-    // (fresh 600 s TTL). The eviction step inside `issue` cannot help
-    // — it only fires for the global cap, and the identity cap is the
-    // first refusal path. So a mint on a fresh bearer3 returns 429.
-    let bearer3 = mint_fresh_bearer(&auth, "alice@example.test", STATIC_TOKEN_A).await;
-    let resp = sign_preview_request(
-        app.clone(),
-        Some(&bearer3),
-        "tenant-a",
-        &fx.session_a_id,
-        &fx.site_slug,
-    )
-    .await;
-    assert_eq!(
-        resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
-        "over-identity-cap mint with no evictable identity quota must be 429"
+        "issue at full global cap with only live grants MUST refuse — the #1012 contract; \
+         got {} — that means we regressed to the #1008 evict-a-live-grant bug",
+        resp.status()
     );
     let retry_after = resp
         .headers()
@@ -968,6 +887,20 @@ async fn should_return_429_only_when_global_cap_full_with_no_evictable() {
         Some("60"),
         "#1009: 429 from any preview-token cap (per-bearer / per-identity / global) \
          MUST include `Retry-After: 60`"
+    );
+
+    // The refusal must not collateral-damage anybody else's preview:
+    // map size unchanged, and the earliest-expiring filler (which
+    // #1008 used to evict) is still present.
+    let len_after = fx.state.preview_tokens.len().await;
+    assert_eq!(
+        len_after, cap,
+        "cap must hold and NO live grant was evicted; got {len_after}"
+    );
+    assert!(
+        fx.state.preview_tokens.consume(&earliest).await.is_some(),
+        "earliest-expiring LIVE grant must remain after global-cap refusal; \
+         missing = the #1008 over-eager-eviction bug we're fixing in #1012"
     );
 }
 

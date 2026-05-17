@@ -79,12 +79,16 @@
 //!      whole map at ~2 MB. Bounds the worst case where a many-tenant
 //!      fleet each sits at the per-identity cap simultaneously.
 //!
-//! #1008 change: when the global cap is full the issue path now tries
-//! to evict the earliest-expiring grant before refusing. The cap is
-//! still a hard ceiling on map size, but the failure mode is "rotate
-//! the oldest grant out" rather than "return 429 to everyone". 429 is
-//! only returned when EVERY live entry is at full TTL with no headroom
-//! to evict — see `IssueError::GlobalLimitReached`.
+//! #1008 / #1012 change: when the global cap is full the issue path
+//! **does not** evict live grants. The original #1008 patch tried to
+//! evict the earliest-expiring entry, but after the inline
+//! `sweep_expired` already drops every expired token the
+//! "earliest-expiring" candidate is the closest live grant — evicting
+//! it pulls an active iframe out from under a legitimate user before
+//! its advertised `expires_at`. The corrected contract (#1012) is:
+//! sweep first, then if the map is still at the ceiling return
+//! [`IssueError::GlobalLimitReached`] so the caller gets a 429 +
+//! `Retry-After` instead of breaking somebody else's preview.
 //!
 //! All three checks happen AFTER the lazy `sweep_expired` so a
 //! long-idle identity doesn't get stuck against its old quota.
@@ -141,12 +145,14 @@ pub enum IssueError {
     /// snapshot stored on each grant. Handler maps to HTTP 429 +
     /// `Retry-After`.
     PerIdentityLimitReached,
-    /// The cache as a whole is at [`PreviewTokens::MAX_TOTAL`] and the
-    /// earliest-expiring entry cannot be safely evicted (every entry
-    /// is at full TTL — see #1008). Handler maps to HTTP 429 +
-    /// `Retry-After`. Distinct from the per-bearer / per-identity
-    /// variants so logs can distinguish "this user is over quota"
-    /// from "the daemon is at its hard global ceiling".
+    /// The cache as a whole is at [`PreviewTokens::MAX_TOTAL`] after
+    /// the inline expiry sweep ran (#1012). The issue path explicitly
+    /// does NOT evict live grants here — doing so would break a
+    /// legitimate user's active preview iframe before its advertised
+    /// `expires_at`. Handler maps to HTTP 429 + `Retry-After`. Distinct
+    /// from the per-bearer / per-identity variants so logs can
+    /// distinguish "this user is over quota" from "the daemon is at
+    /// its hard global ceiling".
     GlobalLimitReached,
 }
 
@@ -271,10 +277,13 @@ impl PreviewTokens {
     /// Global cap on the whole cache, summed across every identity.
     /// Bounds the worst case where a many-tenant fleet has many users
     /// each sitting at their per-identity cap. ~200 bytes × 10 000 =
-    /// ~2 MB — fits comfortably in the daemon's resident set. #1008:
-    /// when the cap is hit, `issue` first tries to evict the
-    /// earliest-expiring entry; only when every entry is at full TTL
-    /// does the call refuse with [`IssueError::GlobalLimitReached`].
+    /// ~2 MB — fits comfortably in the daemon's resident set. #1012:
+    /// when the cap is hit `issue` runs the inline expiry sweep and,
+    /// if the map is STILL at the cap, refuses with
+    /// [`IssueError::GlobalLimitReached`]. The earlier #1008 attempt at
+    /// "evict the earliest-expiring entry" was withdrawn because the
+    /// candidate after the sweep is always a LIVE grant — evicting it
+    /// breaks a real user's iframe before its `expires_at`.
     pub const MAX_TOTAL: usize = 10_000;
 
     /// Build a token cache with the default 10-minute TTL.
@@ -304,7 +313,7 @@ impl PreviewTokens {
     /// back is not allowed — if `getrandom` errors we return the
     /// error to the caller, who maps it to 503.
     ///
-    /// Rate limiting (codex GAP 8 + #1007 + #1008):
+    /// Rate limiting (codex GAP 8 + #1007 + #1012):
     ///   1. Lazy sweep clears expired entries so a long-idle bearer
     ///      doesn't get stuck against its old quota.
     ///   2. Count live grants for THIS bearer; refuse with
@@ -313,10 +322,15 @@ impl PreviewTokens {
     ///      bearers — #1007 closes session-rotation bypass); refuse
     ///      with `PerIdentityLimitReached` if at
     ///      [`Self::MAX_PER_IDENTITY`].
-    ///   4. If the map is at [`Self::MAX_TOTAL`], try to evict the
-    ///      earliest-expiring entry (#1008). Only return
-    ///      `GlobalLimitReached` when no evictable entry exists
-    ///      (i.e. the eviction would still leave the map full).
+    ///   4. If the map is STILL at [`Self::MAX_TOTAL`] after the sweep,
+    ///      refuse with `GlobalLimitReached` (#1012). The earlier #1008
+    ///      patch evicted the earliest-expiring entry here, but since
+    ///      the inline sweep already drops expired tokens the candidate
+    ///      after the sweep is always a LIVE grant — evicting it pulls
+    ///      an active iframe out from under a legitimate user before
+    ///      its advertised `expires_at`. Returning 429 instead lets the
+    ///      losing client back off via `Retry-After` without disrupting
+    ///      anyone else's active preview.
     pub async fn issue(
         &self,
         issuer_bearer: String,
@@ -379,27 +393,20 @@ impl PreviewTokens {
             return Err(IssueError::PerIdentityLimitReached);
         }
 
-        // Global cap (#1008). If we're at the ceiling, try to evict
-        // the earliest-expiring entry. The sweep above already cleared
-        // already-expired entries, so the candidate here is "the live
-        // grant closest to expiry" — evicting it frees a slot for a
-        // fresh full-TTL grant. Only return `GlobalLimitReached` when
-        // there is literally no live entry to evict (cap is exactly 0
-        // — defensive; in practice MAX_TOTAL ≥ 1).
+        // Global cap (#1012, supersedes #1008). The inline
+        // `sweep_expired` above already dropped every expired token.
+        // If the map is still at `MAX_TOTAL`, every remaining entry is
+        // a LIVE grant — evicting any of them would break a legitimate
+        // user's active iframe before its `expires_at`, which is
+        // exactly the regression #1008 introduced. Belt-and-suspenders:
+        // run one more sweep to cover the race where the background
+        // sweeper is mid-tick and an entry expired between the sweep
+        // above and now (rare but cheap to handle). After that, the
+        // contract is simply "if still full, return 429" — the losing
+        // caller can back off via the `Retry-After: 60` header without
+        // disrupting anybody else's preview.
         if map.len() >= Self::MAX_TOTAL {
-            let oldest_token = map
-                .iter()
-                .min_by_key(|(_, g)| g.expires_at)
-                .map(|(token, _)| token.clone());
-            match oldest_token {
-                Some(token) => {
-                    map.remove(&token);
-                }
-                None => return Err(IssueError::GlobalLimitReached),
-            }
-            // After eviction we MUST have room; if not (MAX_TOTAL == 0
-            // or some other pathological case) refuse rather than
-            // exceed the cap.
+            sweep_expired(&mut map);
             if map.len() >= Self::MAX_TOTAL {
                 return Err(IssueError::GlobalLimitReached);
             }
@@ -992,34 +999,37 @@ mod tests {
         );
     }
 
-    /// #1008: when the global cap is full, the next issue MUST evict
-    /// the earliest-expiring grant rather than refuse all callers.
-    /// `MAX_TOTAL` is a `const` (10 000), so this unit test injects
-    /// `MAX_TOTAL` fake grants directly into the map (using the
-    /// private field — same module) and asserts the next public
-    /// `issue` succeeds AND the entry with the earliest `expires_at`
-    /// is gone afterwards. The full integration coverage lives in
-    /// `tests/preview_signed.rs`.
+    /// #1012 (supersedes #1008): when the global cap is full and every
+    /// entry is LIVE, the next `issue` MUST refuse with
+    /// [`IssueError::GlobalLimitReached`] rather than evicting somebody
+    /// else's grant. The earlier #1008 patch evicted the
+    /// earliest-expiring entry, but since the inline `sweep_expired`
+    /// has already dropped expired tokens the candidate is always a
+    /// live grant — evicting it breaks a real user's active iframe
+    /// before its advertised `expires_at`. The corrected contract is
+    /// "sweep first; if still full, return 429".
     #[tokio::test]
-    async fn global_cap_evicts_earliest_expiring_on_issue() {
+    async fn global_cap_full_with_only_live_entries_refuses_issue() {
         let cache = PreviewTokens::with_ttl(Duration::from_secs(600));
         let base = Instant::now();
 
-        // Insert MAX_TOTAL entries; the oldest has the earliest
-        // expiry so we can assert it's the one evicted.
+        // Insert MAX_TOTAL live entries with unique bearer + identity
+        // each, so neither the per-bearer nor per-identity cap fires
+        // when we later call `issue`. The global cap is the only path
+        // that can refuse.
         {
             let mut map = cache.entries.write().await;
             for i in 0..PreviewTokens::MAX_TOTAL {
-                // Use a unique bearer + identity per entry so neither
-                // the per-bearer nor per-identity cap fires when we
-                // later call `issue` — eviction must be driven solely
-                // by the global cap.
                 let bearer = format!("BEARER-FILL-{i}");
                 let identity = AuthIdentity::User {
                     id: format!("filler-{i}"),
                     role: UserRole::User,
                 };
                 let token = format!("filltoken-{i:05}");
+                // Spread expiries so a buggy "evict earliest"
+                // implementation would have an obvious target — and we
+                // can assert that target is still present after the
+                // refusal.
                 let expires_at = base + Duration::from_secs(600 + i as u64);
                 map.insert(
                     token,
@@ -1035,28 +1045,26 @@ mod tests {
             }
         }
 
-        // Sanity: cache is at the cap.
+        // Sanity: cache is at the cap and the earliest entry is live.
         assert_eq!(
             cache.len().await,
             PreviewTokens::MAX_TOTAL,
             "fixture must fill the cache exactly"
         );
-
-        // Track the earliest-expiring filler token: with the loop
-        // above it has index 0.
         let oldest = "filltoken-00000".to_string();
         assert!(
             cache.entries.read().await.contains_key(&oldest),
             "earliest-expiring entry must be present before issue"
         );
 
-        // Now mint a new token from a NEW identity. The global cap is
-        // full → must trigger eviction → must succeed.
+        // Mint a new token from a NEW identity. The global cap is full
+        // and every entry is live — must refuse with
+        // `GlobalLimitReached`, NOT evict somebody else's preview.
         let new_identity = AuthIdentity::User {
             id: "tenant-new".into(),
             role: UserRole::User,
         };
-        let resp = cache
+        let err = cache
             .issue(
                 "BEARER-NEW".into(),
                 new_identity,
@@ -1065,24 +1073,87 @@ mod tests {
                 "site-a".into(),
             )
             .await
-            .expect("issue must succeed via global-cap eviction (#1008)");
+            .expect_err("issue MUST refuse when every entry is a live grant (#1012)");
+        assert!(
+            matches!(err, IssueError::GlobalLimitReached),
+            "expected GlobalLimitReached, got: {err:?}"
+        );
 
-        // The new entry is in; the earliest-expiring filler is out;
-        // map size unchanged (cap respected).
+        // Map size unchanged; earliest filler still present — the
+        // refusal must not collateral-damage a live user's grant.
         let map = cache.entries.read().await;
         assert_eq!(
             map.len(),
             PreviewTokens::MAX_TOTAL,
-            "cap must hold after eviction + insert"
+            "cap must hold after refusal (no eviction)"
         );
         assert!(
-            map.contains_key(&resp.token),
-            "freshly-issued grant must be present"
+            map.contains_key(&oldest),
+            "earliest-expiring LIVE grant must remain after global-cap refusal; \
+             missing = the #1008 over-eager eviction bug we're fixing in #1012"
         );
+    }
+
+    /// #1012 belt-and-suspenders: if some entries are expired when the
+    /// map is at `MAX_TOTAL`, the inline sweep inside `issue` drops
+    /// them and the issue succeeds. This proves the refusal path only
+    /// fires when EVERY entry is still live — expired tokens never
+    /// collateral-damage a fresh request.
+    #[tokio::test]
+    async fn global_cap_full_but_with_expired_entries_still_serves() {
+        let cache = PreviewTokens::with_ttl(Duration::from_secs(600));
+        let now = Instant::now();
+
+        // Fill the map to MAX_TOTAL; mark entry 0 as already expired
+        // (1 ns in the past). The rest are live with staggered TTLs.
+        {
+            let mut map = cache.entries.write().await;
+            for i in 0..PreviewTokens::MAX_TOTAL {
+                let expires_at = if i == 0 {
+                    now - Duration::from_nanos(1)
+                } else {
+                    now + Duration::from_secs(600 + i as u64)
+                };
+                map.insert(
+                    format!("filltoken-{i:05}"),
+                    Grant {
+                        issuer_bearer: format!("BEARER-FILL-{i}"),
+                        identity_snapshot: AuthIdentity::User {
+                            id: format!("filler-{i}"),
+                            role: UserRole::User,
+                        },
+                        profile_id: "tenant-a".into(),
+                        session_id: "session-1".into(),
+                        site_slug: "site-a".into(),
+                        expires_at,
+                    },
+                );
+            }
+        }
+        assert_eq!(cache.len().await, PreviewTokens::MAX_TOTAL);
+
+        let new_identity = AuthIdentity::User {
+            id: "tenant-new".into(),
+            role: UserRole::User,
+        };
+        cache
+            .issue(
+                "BEARER-NEW".into(),
+                new_identity,
+                "tenant-new".into(),
+                "session-1".into(),
+                "site-a".into(),
+            )
+            .await
+            .expect("expired entries must be swept so a real issue succeeds");
+
+        // Map still at cap (sweep dropped 1, insert added 1) and the
+        // expired entry is gone.
+        let map = cache.entries.read().await;
+        assert_eq!(map.len(), PreviewTokens::MAX_TOTAL);
         assert!(
-            !map.contains_key(&oldest),
-            "global-cap eviction must drop the earliest-expiring grant; \
-             still present = the bypass-by-rate-limit-everyone path from #1008"
+            !map.contains_key("filltoken-00000"),
+            "expired entry must have been swept"
         );
     }
 }
