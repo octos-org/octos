@@ -1235,7 +1235,7 @@ case "$TRIPLE" in
         err "macOS x86_64 does not have pre-built binaries yet."
         hint "Build from source with the canonical feature set:"
         hint "  cargo install --path crates/octos-cli \\"
-        hint "      --features \"api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot\""
+        hint "      --features \"api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3\""
         hint "(matches scripts/milestone-ci.sh; \`api\` is required for \`octos serve\`.)"
         ;;
 esac
