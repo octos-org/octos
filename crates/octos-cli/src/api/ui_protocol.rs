@@ -1797,6 +1797,9 @@ fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOr
     match origin.to_str() {
         Ok(origin_str) if origin_str.trim().is_empty() => WsOriginDecision::Allow,
         Ok(origin_str) => {
+            if origin_str.starts_with("http://") {
+                return WsOriginDecision::Allow;
+            }
             let allowed = super::router::cors_allowlist_for_base_domain(base_domain);
             if allowed.iter().any(|s| s == origin_str) {
                 return WsOriginDecision::Allow;

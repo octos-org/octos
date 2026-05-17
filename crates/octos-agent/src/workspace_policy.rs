@@ -767,6 +767,9 @@ impl WorkspacePolicy {
         // recursive `**/*.pptx` glob already used by the MagicBytes(Pptx)
         // validator on `on_completion`.
         artifacts.insert("slides_pptx".into(), "**/*.pptx".into());
+        artifacts.insert("card_png".into(), "**/*.png".into());
+        artifacts.insert("comic_png".into(), "**/*.png".into());
+        artifacts.insert("infographic_png".into(), "**/*.png".into());
 
         let tts_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
@@ -930,7 +933,7 @@ impl WorkspacePolicy {
         // The contract uses a recursive PNG glob so any layout under that
         // directory is covered without hard-coding a single output path.
         let mofa_cards_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("card_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
@@ -952,7 +955,7 @@ impl WorkspacePolicy {
         // FileExists does the per-task path check; MagicBytes does the
         // bytes-are-actually-a-PNG check.
         let mofa_comic_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("comic_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
@@ -971,7 +974,7 @@ impl WorkspacePolicy {
         };
 
         let mofa_infographic_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("infographic_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
