@@ -36,6 +36,7 @@ mod ui_protocol_scope;
 mod ui_protocol_task_output;
 pub mod user_admin;
 pub mod webhook_proxy;
+pub mod ws_slash;
 
 pub use events::EventBroadcaster;
 pub use metrics::init_metrics;
