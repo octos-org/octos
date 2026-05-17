@@ -24,6 +24,12 @@ pub struct RunPipelineTool {
     working_dir: PathBuf,
     provider_policy: Option<ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
+    /// Section B (codex review P1.1): pipeline-level strict-signing
+    /// policy. Defaults to `false` (legacy permissive path). When the
+    /// host has opted into `plugins.require_signed`, this is set via
+    /// [`Self::with_plugin_require_signed`] so per-node plugin loads
+    /// enforce the same gate.
+    plugin_require_signed: bool,
     discovery: PipelineDiscovery,
     /// Per-message status bridge (set via `set_status_bridge` before each call).
     status_bridge: std::sync::Mutex<Option<PipelineStatusBridge>>,
@@ -52,6 +58,7 @@ impl RunPipelineTool {
             working_dir,
             provider_policy: None,
             plugin_dirs: Vec::new(),
+            plugin_require_signed: false,
             discovery,
             status_bridge: std::sync::Mutex::new(None),
             cost_accountant: None,
@@ -144,6 +151,14 @@ impl RunPipelineTool {
 
     pub fn with_plugin_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.plugin_dirs = dirs;
+        self
+    }
+
+    /// Section B (codex review P1.1): opt into strict signature
+    /// enforcement for pipeline-spawned plugin loads. Inherited from
+    /// `plugins.require_signed` on the host config.
+    pub fn with_plugin_require_signed(mut self, require_signed: bool) -> Self {
+        self.plugin_require_signed = require_signed;
         self
     }
 
@@ -369,6 +384,7 @@ impl Tool for RunPipelineTool {
             working_dir: self.working_dir.clone(),
             provider_policy: self.provider_policy.clone(),
             plugin_dirs: self.plugin_dirs.clone(),
+            plugin_require_signed: self.plugin_require_signed,
             status_bridge,
             shutdown: shutdown.clone(),
             max_parallel_workers: 8,

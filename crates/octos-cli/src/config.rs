@@ -213,6 +213,17 @@ pub struct Config {
 /// introduced. Set `require_signed = true` to enforce strict signature
 /// verification — plugins without `manifest.sha256` will be rejected at
 /// load time and re-hash gates apply on every invocation.
+///
+/// # Bundled / first-party skills caveat
+///
+/// First-party skills shipped under `crates/app-skills/*/manifest.json` and
+/// `crates/platform-skills/*/manifest.json` currently do NOT declare
+/// `sha256`. Enabling `require_signed = true` on a clean install will
+/// therefore drop those tools (deep-search, weather, send-email, voice,
+/// etc.) until the manifests are populated with the binaries' digests as
+/// part of the release process. Production deployments that depend on
+/// first-party skills should defer enabling this flag until the bundled
+/// manifests ship `sha256`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PluginsConfig {
@@ -221,6 +232,9 @@ pub struct PluginsConfig {
     /// before every invocation (pre-spawn re-hash closes the load→exec
     /// TOCTOU window). When `false` (default), unsigned plugins still load
     /// with a warning to preserve backward compatibility.
+    ///
+    /// See the [`PluginsConfig`] struct docs for a note on bundled
+    /// first-party skills that ship without `sha256` today.
     #[serde(default)]
     pub require_signed: bool,
 }
@@ -789,6 +803,27 @@ impl Config {
     }
 }
 
+/// Section B (codex review round-5 P1.2): OR-merge
+/// `OCTOS_PLUGINS_REQUIRE_SIGNED` (set by `ProcessManager` when the parent
+/// serve enabled strict signing) onto the loaded Config. Spawned gateway
+/// processes pick up the policy via env, even when the profile JSON they
+/// load omits the new `plugins` block.
+pub(crate) fn merge_env_plugin_policy_pub(config: &mut Config) {
+    merge_env_plugin_policy(config)
+}
+
+fn merge_env_plugin_policy(config: &mut Config) {
+    if let Ok(v) = std::env::var("OCTOS_PLUGINS_REQUIRE_SIGNED") {
+        let on = matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+        if on {
+            config.plugins.require_signed = true;
+        }
+    }
+}
+
 /// One-shot warning when `~/.octos/skills` still exists on disk after we
 /// stopped scanning it. Emitted at most once per process so operators see
 /// a single migration hint rather than spamming every profile bootstrap.
@@ -1010,9 +1045,13 @@ impl Config {
             }
         }
 
-        // No config found, use defaults
+        // No config found, use defaults. Even on the no-file path, honour
+        // `OCTOS_PLUGINS_REQUIRE_SIGNED` so spawned gateways without a
+        // config.json still inherit the host's strict-signing policy.
         tracing::info!("no config.json found, using defaults");
-        Ok((Self::default(), None))
+        let mut config = Self::default();
+        merge_env_plugin_policy(&mut config);
+        Ok((config, None))
     }
 
     /// Load config from a specific file.
@@ -1031,6 +1070,14 @@ impl Config {
 
         // Expand environment variables in config values
         config.expand_env_vars();
+
+        // Section B (codex review round-5 P1.2): the host's
+        // `plugins.require_signed` policy must reach spawned gateway
+        // processes too. `ProcessManager` sets `OCTOS_PLUGINS_REQUIRE_SIGNED=1`
+        // when the parent serve was launched with strict signing; we
+        // OR-merge that into every Config so a profile JSON that omits
+        // the new block still inherits the strict policy.
+        merge_env_plugin_policy(&mut config);
 
         // Log if migration changed something (don't silently rewrite user's config)
         if migrated {

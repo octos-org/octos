@@ -66,14 +66,31 @@ impl CachedPluginRegistration {
 /// throw-away registry. Errors are downgraded to a warn (matching the
 /// legacy pipeline behaviour) and an empty registration is cached so
 /// the warning fires at most once per handler lifetime.
-fn build_cached_plugin_registration(plugin_dirs: &[PathBuf]) -> CachedPluginRegistration {
+fn build_cached_plugin_registration(
+    plugin_dirs: &[PathBuf],
+    require_signed: bool,
+) -> CachedPluginRegistration {
     if plugin_dirs.is_empty() {
         return CachedPluginRegistration::default();
     }
 
     let started = std::time::Instant::now();
     let mut staging = ToolRegistry::new();
-    let load_result = octos_agent::PluginLoader::load_into(&mut staging, plugin_dirs, &[]);
+    // Section B (codex review P1.1): honour the pipeline's
+    // strict-signing policy. Default is `false` (legacy permissive
+    // path) but operators who opt into `plugins.require_signed` on
+    // their host config expect the pipeline cache to enforce the
+    // same gate.
+    let load_result = octos_agent::PluginLoader::load_into_with_options(
+        &mut staging,
+        plugin_dirs,
+        &[],
+        octos_agent::PluginLoadOptions {
+            work_dir: None,
+            synthesis_config: None,
+            require_signed,
+        },
+    );
     let elapsed = started.elapsed();
 
     let load_result = match load_result {
@@ -252,6 +269,13 @@ pub struct CodergenHandler {
     provider_router: Option<Arc<ProviderRouter>>,
     provider_policy: Option<octos_agent::ToolPolicy>,
     plugin_dirs: Vec<PathBuf>,
+    /// Section B (codex review P1.1): pipeline-level strict-signing
+    /// policy. Defaults to `false` (legacy permissive path). When the
+    /// host has opted into `plugins.require_signed`, the
+    /// `CodergenHandler` builder threads it through via
+    /// [`Self::with_plugin_require_signed`] so the plugin-load cache
+    /// enforces the same gate.
+    plugin_require_signed: bool,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Declared compaction policy to propagate onto child Agents
     /// (coding-blue FA-7). `None` = legacy path, no compaction runner
@@ -293,6 +317,7 @@ impl CodergenHandler {
             provider_router: None,
             provider_policy: None,
             plugin_dirs: Vec::new(),
+            plugin_require_signed: false,
             shutdown,
             compaction_policy: None,
             compaction_workspace: None,
@@ -300,6 +325,18 @@ impl CodergenHandler {
             host_context: crate::host_context::PipelineHostContext::default(),
             plugin_cache: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Section B (codex review P1.1): opt into strict signature
+    /// enforcement for the pipeline's plugin-load cache. Set this
+    /// when the host config carries `plugins.require_signed = true`.
+    pub fn with_plugin_require_signed(mut self, require_signed: bool) -> Self {
+        self.plugin_require_signed = require_signed;
+        // Mirror `with_plugin_dirs`: a policy change must invalidate the
+        // cache so a builder reordering doesn't surface a stale permissive
+        // registration.
+        self.plugin_cache = Arc::new(OnceLock::new());
+        self
     }
 
     /// M8 parity (W1.A1): attach the parent session's
@@ -411,7 +448,12 @@ impl CodergenHandler {
     /// load and an `Arc::clone`.
     fn cached_plugin_registration(&self) -> Arc<CachedPluginRegistration> {
         self.plugin_cache
-            .get_or_init(|| Arc::new(build_cached_plugin_registration(&self.plugin_dirs)))
+            .get_or_init(|| {
+                Arc::new(build_cached_plugin_registration(
+                    &self.plugin_dirs,
+                    self.plugin_require_signed,
+                ))
+            })
             .clone()
     }
 

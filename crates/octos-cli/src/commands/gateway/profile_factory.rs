@@ -506,6 +506,11 @@ pub(super) struct ProfileActorFactoryBuilder {
     /// M8 fix-first item 8 (gap 2): shared SubAgentOutputRouter cloned
     /// into every ActorFactory built by this builder.
     pub(super) subagent_output_router: Arc<octos_agent::SubAgentOutputRouter>,
+    /// Section B (codex review round-4): host-level plugin policy, OR'd
+    /// with the profile's own `plugins.require_signed` so a host config
+    /// can mandate strict signing even when individual profile JSONs omit
+    /// the flag. Mirrors `ProfileRuntime::bootstrap_with_host_plugins`.
+    pub(super) host_plugins: crate::config::PluginsConfig,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -516,7 +521,15 @@ impl ProfileActorFactoryBuilder {
             .ok_or_else(|| eyre::eyre!("target profile '{profile_id}' not found"))?;
         let effective_profile =
             crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
-        let profile_config = crate::profiles::config_from_profile(&effective_profile, None, None);
+        let mut profile_config =
+            crate::profiles::config_from_profile(&effective_profile, None, None);
+        // Section B (codex review round-4): OR-merge the host's
+        // `plugins.require_signed` onto the profile-derived flag so a
+        // child profile that omits the new `plugins` block still honours
+        // the host-level strict-signing policy.
+        if self.host_plugins.require_signed {
+            profile_config.plugins.require_signed = true;
+        }
         let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
@@ -794,6 +807,7 @@ impl ProfileActorFactoryBuilder {
                 plugin_dirs: Vec<PathBuf>,
                 router: Option<Arc<ProviderRouter>>,
                 octos_home: PathBuf,
+                plugin_require_signed: bool,
             }
 
             impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
@@ -806,6 +820,7 @@ impl ProfileActorFactoryBuilder {
                     )
                     .with_provider_policy(self.policy.clone())
                     .with_plugin_dirs(self.plugin_dirs.clone())
+                    .with_plugin_require_signed(self.plugin_require_signed)
                     .with_octos_home(self.octos_home.clone());
                     if let Some(ref router) = self.router {
                         pt = pt.with_provider_router(router.clone());
@@ -822,6 +837,9 @@ impl ProfileActorFactoryBuilder {
                 plugin_dirs: plugin_dirs.clone(),
                 router: provider_router.clone(),
                 octos_home: self.project_dir.clone(),
+                // Section B (codex review follow-up): propagate the
+                // profile's strict-signing policy.
+                plugin_require_signed: profile_config.plugins.require_signed,
             })
                 as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
 
@@ -886,6 +904,10 @@ impl ProfileActorFactoryBuilder {
             memory_store: Some(self.memory_store.clone()),
             plugin_dirs: actor_plugin_dirs,
             plugin_extra_env: actor_plugin_env,
+            // Section B (codex review P1.1): propagate the profile's
+            // strict-signing policy to SpawnTool subagents so unsigned
+            // plugins are also rejected under spawn.
+            plugin_require_signed: profile_config.plugins.require_signed,
             llm_strong,
             task_query_store: self.task_query_store.clone(),
             subagent_output_router: self.subagent_output_router.clone(),

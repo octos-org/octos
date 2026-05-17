@@ -272,6 +272,7 @@ mod tests {
             plugin_prompt_fragments: vec![],
             no_retry: false,
             sandbox_config: octos_agent::SandboxConfig::default(),
+            host_plugins: Default::default(),
         };
 
         let factory = builder.build("botfather--researcher").await.unwrap();

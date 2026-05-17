@@ -166,7 +166,7 @@ impl GatewayRuntime {
             cmd.profile.as_deref().map(|p| p.display().to_string())
         );
         let mut admin_mode = false;
-        let config = if let Some(ref profile_path) = cmd.profile {
+        let mut config = if let Some(ref profile_path) = cmd.profile {
             // Load config from profile JSON (single source of truth)
             let content = std::fs::read_to_string(profile_path)
                 .wrap_err_with(|| format!("failed to read profile: {}", profile_path.display()))?;
@@ -216,6 +216,12 @@ impl GatewayRuntime {
         } else {
             Config::load(&cwd, &data_dir)?
         };
+        // Section B (codex review round-5 P1.2): the `--profile` path
+        // bypasses `Config::from_file`, so call the same env-var OR-merge
+        // helper here. A host-level `plugins.require_signed = true`
+        // propagates to spawned gateways via
+        // `OCTOS_PLUGINS_REQUIRE_SIGNED=1` (set by `ProcessManager`).
+        crate::config::merge_env_plugin_policy_pub(&mut config);
 
         // Track whether any CLI override (`--model`, `--provider`,
         // `--base-url`) was supplied; `ProfileRuntime::bootstrap` is
@@ -289,11 +295,26 @@ impl GatewayRuntime {
         let profile_runtime: Option<Arc<ProfileRuntime>> = if let Some(profile) =
             resolved_profile.as_ref().filter(|_| !cli_llm_override)
         {
-            match ProfileRuntime::bootstrap(
+            // Section B (codex review round-3 + round-5 P1.2): thread the
+            // host's `plugins.require_signed` into the per-profile
+            // bootstrap so strict signing applies even when the profile
+            // JSON omits the flag.
+            //
+            // In the `--profile` managed path `config` is derived from the
+            // profile JSON, so `config.plugins.require_signed` mirrors
+            // whatever the profile declared. The host-level policy
+            // reaches this branch via `OCTOS_PLUGINS_REQUIRE_SIGNED`
+            // (set by `ProcessManager` in `octos serve`), which
+            // `Config::from_file` already OR-merges onto `config.plugins`
+            // for the `--config` path. We forward `config.plugins` here
+            // and `bootstrap_with_host_plugins` then OR-merges it onto
+            // the profile-derived config, closing the loop.
+            match ProfileRuntime::bootstrap_with_host_plugins(
                 profile,
                 &data_dir,
                 Some(&effective_octos_home),
                 crate::runtime::BootstrapRole::Gateway,
+                Some(&config.plugins),
             )
             .await
             {
@@ -902,6 +923,10 @@ impl GatewayRuntime {
                 let plugins_c = plugin_dirs_for_spawn.clone();
                 let router_c = provider_router.clone();
                 let octos_home_c = cmd.octos_home.clone();
+                // Section B (codex review follow-up): capture the host's
+                // strict-signing flag so per-session `RunPipelineTool`
+                // instances honour the same `plugins.require_signed` gate.
+                let plugin_require_signed_c = config.plugins.require_signed;
 
                 struct DefaultPipelineToolFactory {
                     llm: Arc<dyn LlmProvider>,
@@ -912,6 +937,7 @@ impl GatewayRuntime {
                     plugin_dirs: Vec<PathBuf>,
                     router: Option<Arc<ProviderRouter>>,
                     octos_home: Option<PathBuf>,
+                    plugin_require_signed: bool,
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
@@ -923,7 +949,8 @@ impl GatewayRuntime {
                             self.data_dir.clone(),
                         )
                         .with_provider_policy(self.policy.clone())
-                        .with_plugin_dirs(self.plugin_dirs.clone());
+                        .with_plugin_dirs(self.plugin_dirs.clone())
+                        .with_plugin_require_signed(self.plugin_require_signed);
                         if let Some(ref router) = self.router {
                             pt = pt.with_provider_router(router.clone());
                         }
@@ -943,6 +970,7 @@ impl GatewayRuntime {
                     plugin_dirs: plugins_c,
                     router: router_c,
                     octos_home: octos_home_c,
+                    plugin_require_signed: plugin_require_signed_c,
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }
@@ -1175,6 +1203,10 @@ impl GatewayRuntime {
             memory_store: Some(memory_store.clone()),
             plugin_dirs: plugin_dirs_for_spawn.clone(),
             plugin_extra_env: plugin_env.clone(),
+            // Section B (codex review P1.1): propagate the host
+            // strict-signing policy so SpawnTool subagents enforce the
+            // same gate.
+            plugin_require_signed: config.plugins.require_signed,
             llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
                 .unwrap_or_else(|_| llm_for_compaction.clone()),
             task_query_store: task_query_store.clone(),
@@ -1211,6 +1243,10 @@ impl GatewayRuntime {
                     sandbox_config: sandbox_config.clone(),
                     task_query_store: task_query_store.clone(),
                     subagent_output_router: subagent_output_router.clone(),
+                    // Section B (codex review round-4): clone the host's
+                    // plugin policy so child profiles inherit the
+                    // strict-signing gate even when their JSON omits it.
+                    host_plugins: config.plugins.clone(),
                 });
 
         // Start config watcher for hot-reload
