@@ -11,7 +11,7 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
-  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard -p skill-evolve"
 
 jobs:
@@ -294,7 +294,7 @@ jobs:
           shared-key: matrix-feature
 
       - name: Check octos-cli with matrix feature
-        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,slack,whatsapp,feishu,email,matrix
+        run: cargo check -p octos-cli --no-default-features --features api,telegram,discord,slack,whatsapp,feishu,email,matrix,audio_mp3
 
   check-arm:
     if: github.event_name != 'pull_request'
