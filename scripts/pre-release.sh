@@ -99,7 +99,7 @@ section "Build"
 if [ "$SKIP_BUILD" = true ]; then
     skip "release build (--skip-build)"
 else
-    BUILD_FLAGS="--features telegram,whatsapp,feishu,twilio,api"
+    BUILD_FLAGS="--features telegram,whatsapp,feishu,twilio,api,audio_mp3"
     echo "  Building octos-cli ($PROFILE) with $BUILD_FLAGS"
 
     if [ "$PROFILE" = "release" ]; then

@@ -160,7 +160,7 @@ if [ "$SKIP_BUILD" = false ]; then
     echo ""
     echo "==> Step 2: Building octos (release, all features)..."
     (cd "$REPO_ROOT" && cargo build --release -p octos-cli \
-        --features "api,telegram,whatsapp,feishu,twilio,wecom" 2>&1 | tail -3)
+        --features "api,telegram,whatsapp,feishu,twilio,wecom,audio_mp3" 2>&1 | tail -3)
 
     # Also build app-skills
     (cd "$REPO_ROOT" && cargo build --release \

@@ -47,7 +47,7 @@ RUN mkdir -p crates/octos-core/src && echo "" > crates/octos-core/src/lib.rs && 
 
 RUN cargo build --release --bin octos \
       -p octos-cli \
-      --features api,telegram,discord,slack,whatsapp,feishu,email \
+      --features api,telegram,discord,slack,whatsapp,feishu,email,audio_mp3 \
       2>/dev/null || true
 
 # Copy full source and build
@@ -55,7 +55,7 @@ COPY . .
 RUN find crates -name '*.rs' -exec touch {} + && \
     cargo build --release --bin octos \
       -p octos-cli \
-      --features api,telegram,discord,slack,whatsapp,feishu,email,matrix
+      --features api,telegram,discord,slack,whatsapp,feishu,email,matrix,audio_mp3
 
 # ============================================================
 # Stage 2: Minimal runtime image

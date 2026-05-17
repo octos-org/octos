@@ -50,7 +50,7 @@ jobs:
         run: cargo release ${{ inputs.bump }} --execute --no-confirm
 
       - name: Build octos CLI
-        run: cargo build --release -p octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
+        run: cargo build --release -p octos-cli --features "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
 
       - name: Build app-skill binaries
         run: cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard
