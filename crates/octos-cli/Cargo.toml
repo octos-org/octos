@@ -39,6 +39,14 @@ sha2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 getrandom = "0.2"
 constant_time_eq = "0.3"
+# Issue #1010 — `extract_token` must percent-decode the `token=` query
+# param so a token containing `!`, `+`, `/`, `=`, `:` matches the value
+# stored on `AppState.auth_token` / the OTP session store. The
+# `Authorization: Bearer …` header path takes the bytes literally —
+# HTTP headers are NOT percent-encoded — so the WS path uses RFC 3986
+# percent-decode-only semantics (leaves `+` literal) to stay consistent
+# with REST.
+percent-encoding = "2"
 open = { workspace = true }
 zip = { workspace = true }
 quick-xml = { workspace = true }
