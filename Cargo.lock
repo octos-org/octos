@@ -3795,6 +3795,7 @@ dependencies = [
  "octos-pipeline",
  "octos-swarm",
  "open",
+ "percent-encoding",
  "quick-xml",
  "rand 0.8.5",
  "regex",

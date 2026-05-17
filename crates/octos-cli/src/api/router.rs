@@ -820,6 +820,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Extract bearer token from request headers or query params.
+///
+/// Header path: `Authorization: Bearer <token>` — taken byte-for-byte
+/// (HTTP header values are NOT percent-encoded).
+///
+/// Query path: `?token=<value>` or `?_token=<value>` — used by SSE,
+/// `EventSource`, `<img src>`, and WebSocket clients that cannot set
+/// custom headers. Per [issue #1010](https://github.com/octos-org/octos/issues/1010),
+/// the raw query value is **percent-decoded** before comparison. The
+/// raw URI fragment may contain `%21` for `!`, `%2B` for `+`, `%2F`
+/// for `/`, etc. — without decoding, a token like
+/// `Octos-E2E-Strong-Token-2026-XYZ-123!` arrives as
+/// `…123%21`, never matches the stored token, and the auth middleware
+/// silently 401s the upgrade while REST callers (header path) work.
+///
+/// Decode semantics are RFC 3986 percent-decode-only — `+` stays
+/// literal `+`, only `%XX` triples are decoded — so the two auth paths
+/// accept the same token format. `application/x-www-form-urlencoded`
+/// (`+` → space) would break tokens containing `+`.
 fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
     // Try Authorization header first
     let header_token = req
@@ -844,7 +862,14 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
     if !header_token.is_empty() {
         header_token.to_string()
     } else {
-        query_token.to_string()
+        // RFC 3986 percent-decode (NOT form-decode — `+` stays literal).
+        // `decode_utf8_lossy` substitutes U+FFFD for invalid UTF-8
+        // sequences, which keeps the function infallible; downstream
+        // constant-time comparison against stored ASCII tokens still
+        // fails on garbage input.
+        percent_encoding::percent_decode_str(query_token)
+            .decode_utf8_lossy()
+            .into_owned()
     }
 }
 
@@ -1137,6 +1162,60 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "");
+    }
+
+    /// Issue [#1010](https://github.com/octos-org/octos/issues/1010):
+    /// browsers and curl percent-encode special characters in query
+    /// string values. The raw query string contains `%21` for `!`, so
+    /// the extractor must percent-decode the value before handing it to
+    /// `resolve_identity` — otherwise the comparison never matches the
+    /// stored token and WS auth silently 401s while REST (which carries
+    /// the token in the `Authorization` header) works.
+    #[test]
+    fn extract_token_query_param_is_percent_decoded_exclamation() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=test-token-%21")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "test-token-!");
+    }
+
+    /// Percent-decode-only semantics (RFC 3986), not `application/x-www-form-urlencoded`:
+    /// `+` stays literal `+` (matching the `Authorization: Bearer …`
+    /// header path, which never form-decodes), and `%2B` decodes to `+`.
+    #[test]
+    fn extract_token_query_param_keeps_plus_literal_and_decodes_pct2b() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=test+token%2Bfoo")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "test+token+foo");
+    }
+
+    /// Regression: tokens without any percent-encodable characters
+    /// continue to round-trip unchanged. Guards against an over-eager
+    /// decoder that mangles plain ASCII alphanumerics.
+    #[test]
+    fn extract_token_query_param_alphanumeric_unchanged() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=simpleToken123")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "simpleToken123");
+    }
+
+    /// A few extra characters that show up in real-world admin tokens
+    /// (`/`, `=`, `:`) and the percent-encoded equivalents should
+    /// round-trip cleanly. We pick the percent-encoded forms because
+    /// raw `:`/`/`/`=` in a query value are technically legal per RFC
+    /// 3986 but browsers/curl often encode them anyway.
+    #[test]
+    fn extract_token_query_param_decodes_common_special_chars() {
+        let req = Request::builder()
+            .uri("/api/ui-protocol/ws?token=A%2FB%3DC%3AD")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_token(&req), "A/B=C:D");
     }
 
     #[tokio::test]
