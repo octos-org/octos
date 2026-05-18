@@ -4438,9 +4438,8 @@ mod tests {
     // but was dropped after codex review caught that the voice plugin's
     // `succeed()` path emits only `{output, success}` (no `files_to_send`)
     // and its success text `"Generated audio: <path>"` is not one of the
-    // prefixes `PluginTool::detect_output_file` recognises. The validator
-    // would see an empty list and fail. See follow-up issue tracking the
-    // plugin emission fix.
+    // prefixes `PluginTool::detect_output_file` recognises. The marker
+    // was fixed in PR #1039 and the voice_synthesize sweep follows below.
 
     /// `mofa_slides` MagicBytes(Pptx) must run against the plugin's reported
     /// PPTX path verbatim, including outputs at arbitrary depth where the
@@ -4495,6 +4494,128 @@ mod tests {
             outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
             "mofa_slides contract must satisfy via spawn_only_files even when an \
              unrelated stale PPTX exists in the workspace; outcomes = {outcomes:?}",
+        );
+    }
+
+    // --- octos #1038: voice_synthesize sweep ------------------------------
+    //
+    // Mirror the octos #1036 mofa_slides happy-path test for the voice
+    // contract that PR #1037's revert (772783e7) left on the glob path.
+    // Failure mode being closed: a recursive
+    // `skill-output/voice/**/*.{mp3,wav}` glob would match unrelated
+    // stale audio from earlier runs in the same session workspace, the
+    // same fragility we already closed for `podcast_generate` (#1034)
+    // and `mofa_slides` (#1036). Predecessor PR #1039 fixed the voice
+    // plugin's success-line marker so `files_to_send` is now populated
+    // and the sweep is finally safe.
+
+    /// `voice_synthesize` AudioNonSilent must run against the plugin's
+    /// reported audio path verbatim. The reported file lives OUTSIDE
+    /// the legacy `skill-output/voice/**/*.{mp3,wav}` glob root, so a
+    /// validator that fell back to the glob would never see it — the
+    /// test would only pass via the spawn_only_files code path.
+    /// (The failure-mode counterpart below plants a non-silent file
+    /// INSIDE the legacy glob root to prove the validator does not
+    /// consult that path at all.)
+    #[tokio::test]
+    async fn voice_synthesize_uses_spawn_only_files_with_audio_outside_legacy_glob_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // Real, non-silent output the plugin would report via the
+        // `Generated: <path>` marker that PR #1039 introduced. The
+        // plugin writes to whatever path the LLM gave it, which is
+        // often OUTSIDE the legacy `skill-output/voice/` root — e.g.
+        // a project-scoped subdirectory or a tempdir-style path. This
+        // test pins down that the validator picks up the reported file
+        // regardless of where it lives in the workspace.
+        let project_dir = dir.path().join("projects/demo/audio");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fresh = project_dir.join("synthesized_1779067937.wav");
+        write_sine_wav(&fresh, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
+        let contract = session_policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract must be registered");
+        let validators: Vec<Validator> = contract
+            .on_completion
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
+                    entry.clone(),
+                    "voice_synthesize",
+                    i,
+                )
+            })
+            .collect();
+
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "voice_synthesize".into(),
+        )
+        .with_spawn_only_files(vec![fresh]);
+        let outcomes = runner.run_all(&invocation, &validators).await;
+        assert!(
+            outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
+            "voice_synthesize contract must satisfy via spawn_only_files for a file \
+             outside the legacy `skill-output/voice/**/*` glob root (a glob fallback \
+             would never have matched this path); outcomes = {outcomes:?}",
+        );
+    }
+
+    /// Belt-and-suspenders: when the plugin reports ONLY a silent .wav
+    /// (the failure mode the contract exists to catch), the validator
+    /// must surface a Fail outcome even when an unrelated non-silent
+    /// .wav lives in the workspace. The legacy glob would have matched
+    /// the unrelated file and silently satisfied the contract.
+    #[tokio::test]
+    async fn voice_synthesize_spawn_only_files_fails_when_reported_audio_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let voice_dir = dir.path().join("skill-output/voice");
+        std::fs::create_dir_all(&voice_dir).unwrap();
+        // The plugin reported a silent file — this is the failure case.
+        let silent = voice_dir.join("synthesized_1779067937.wav");
+        write_silent_wav(&silent, 800);
+        // A NON-silent file from an earlier run; if the validator ever
+        // fell back to the glob it would pick this up and pass, masking
+        // the failure. The spawn_only_files path must ignore it.
+        let unrelated = voice_dir.join("aaa-fresh.wav");
+        write_sine_wav(&unrelated, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
+        let contract = session_policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract must be registered");
+        let validators: Vec<Validator> = contract
+            .on_completion
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
+                    entry.clone(),
+                    "voice_synthesize",
+                    i,
+                )
+            })
+            .collect();
+
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "voice_synthesize".into(),
+        )
+        .with_spawn_only_files(vec![silent]);
+        let outcomes = runner.run_all(&invocation, &validators).await;
+        assert!(
+            outcomes.iter().any(|o| o.status == ValidatorStatus::Fail),
+            "voice_synthesize contract must FAIL on a silent reported file even when \
+             an unrelated non-silent file exists in the workspace (proves the validator \
+             does not fall back to the glob path); outcomes = {outcomes:?}",
         );
     }
 }

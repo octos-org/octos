@@ -62,13 +62,6 @@ on_failure = ["notify_user:Voice registration failed"]
 # session workspace. The `extension = "pptx"` filter narrows the list to
 # slide decks if the skill surfaces auxiliary preview files via
 # `files_to_send`.
-#
-# `voice_synthesize` was originally part of this sweep but was reverted
-# after codex review caught that the voice plugin's `succeed()` path
-# emits only `{output, success}` (no `files_to_send`) and its success
-# text `"Generated audio: <path>"` is not one of the prefixes
-# `PluginTool::detect_output_file` recognises. A follow-up issue tracks
-# the plugin emission fix.
 [spawn_tasks.mofa_slides]
 on_completion = [
     { kind = "magic_bytes", source = "spawn_only_files", extension = "pptx", format = "pptx" },
@@ -113,6 +106,24 @@ on_completion = [
     { kind = "magic_bytes", source = "spawn_only_files", extension = "png", format = "png" },
 ]
 on_failure = ["notify_user:Frame extraction failed"]
+
+# octos #1038 (follow-up to #1037): voice_synthesize now opts into the
+# `spawn_only_files` source so the audio-non-silent check inspects the
+# exact audio path the plugin reported via `files_to_send`. The previous
+# `skill-output/voice/**/*.{mp3,wav}` glob could match a stale file from
+# an earlier run in the same session workspace and falsely satisfy the
+# contract for a freshly-failed call. PR #1037 originally swept this
+# contract but the voice half was reverted (772783e7) until the plugin
+# learned to emit a marker `PluginTool::detect_output_file` recognises —
+# fixed in PR #1039. No `extension` filter: the voice plugin always
+# emits exactly one audio path per call (.mp3 when ffmpeg is available,
+# otherwise .wav fallback from the macOS Say path), and the validator
+# decodes either format.
+[spawn_tasks.voice_synthesize]
+on_completion = [
+    { kind = "audio_non_silent", source = "spawn_only_files", min_ratio = 0.3 },
+]
+on_failure = ["notify_user:Voice synthesis failed"]
 
 # Wave-3a: HttpProbeUntil + Sha256Match + soft_fail are operator-visible
 # TOML shapes; this fixture also acts as a syntax demo for operators.
