@@ -1458,6 +1458,30 @@ mod tests {
              (alias not normalized?), got: {}",
             msg.content
         );
+
+        // Codex round-2: lock down the order-of-operations bug. The
+        // active topic AND session prompt must both land on the
+        // normalized `site astro`, not the plural `sites astro` — if
+        // normalization happens AFTER switch_to/touch_user_session
+        // (round-1 mistake), the active topic stays "sites astro" and
+        // the gateway runtime's prompt lookup (keyed by active topic)
+        // misses entirely while the scaffolded prompt sits under "site
+        // astro".
+        let active = disp
+            .active_sessions
+            .read()
+            .await
+            .get_active_topic(session_key.base_key())
+            .to_string();
+        assert_eq!(
+            active, "site astro",
+            "active topic must be normalized form, got `{active}` — \
+             did normalization run after switch_to?"
+        );
+        assert!(
+            crate::project_templates::read_session_prompt(tmp.path(), "site astro").is_some(),
+            "session prompt must be looked up by the normalized topic"
+        );
     }
 
     /// Bare `/new sites` (no preset) — alias still normalizes to `site`,
@@ -1487,6 +1511,16 @@ mod tests {
             "bare /new sites must NOT fall into the generic switch-session arm, got: {}",
             msg.content
         );
+
+        // Active topic must be the normalized "site" form (see
+        // round-2 codex review on the with-preset case).
+        let active = disp
+            .active_sessions
+            .read()
+            .await
+            .get_active_topic(session_key.base_key())
+            .to_string();
+        assert_eq!(active, "site", "active topic must be normalized to bare `site`");
     }
 
     #[tokio::test]
