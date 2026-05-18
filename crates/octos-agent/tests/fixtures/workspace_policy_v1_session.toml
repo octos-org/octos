@@ -17,6 +17,11 @@ ignore = ["tmp/**", ".DS_Store"]
 [artifacts]
 primary_audio = "*.mp3"
 podcast_audio = "**/podcast_full_*.*"
+# octos #1040: the image-producing mofa contracts (comic, infographic,
+# frame) need a named artifact source so `bind_explicit_files_to_artifacts`
+# can bind the plugin-reported PNG into `ActionContext`. The glob mirrors
+# the `**/*.png` pattern the MagicBytes(Png) validator uses in glob mode.
+image_png = "**/*.png"
 
 [spawn_tasks.fm_tts]
 artifact = "primary_audio"
@@ -69,6 +74,45 @@ on_completion = [
     { kind = "magic_bytes", source = "spawn_only_files", extension = "pptx", format = "pptx" },
 ]
 on_failure = ["notify_user:Slide generation failed"]
+
+# octos #1040 (follow-up to #1035 / #1037): mofa_comic, mofa_infographic,
+# and mofa_frame all carry the same MagicBytes(Png) shape on the
+# `spawn_only_files` source. The plugin envelopes (or auto-detection via
+# `args.out` in `plugins/tool.rs::detect_output_file`) populate
+# `files_to_send` directly so the validator inspects the exact PNG the
+# skill wrote instead of any `**/*.png` match in the workspace. The
+# `extension = "png"` filter narrows the list when the skill surfaces
+# auxiliary files (intermediate panel PNGs, layout previews) via
+# `files_to_send`.
+#
+# `mofa_cards` is intentionally NOT in this sweep — the plugin does not
+# yet emit `files_to_send` (its required arg is `card_dir`, not `out`,
+# and the success text `"Generated N card(s) in <dir>"` does not match
+# the `Generated:` / `Generated PPTX:` markers that
+# `detect_output_file` auto-detects). A follow-up issue tracks the
+# plugin emission fix.
+[spawn_tasks.mofa_comic]
+artifact = "image_png"
+on_completion = [
+    { kind = "file_exists", path = "${args.out}", min_bytes = 1024 },
+    { kind = "magic_bytes", source = "spawn_only_files", extension = "png", format = "png" },
+]
+on_failure = ["notify_user:Comic generation failed"]
+
+[spawn_tasks.mofa_infographic]
+artifact = "image_png"
+on_completion = [
+    { kind = "file_exists", path = "${args.out}", min_bytes = 1024 },
+    { kind = "magic_bytes", source = "spawn_only_files", extension = "png", format = "png" },
+]
+on_failure = ["notify_user:Infographic generation failed"]
+
+[spawn_tasks.mofa_frame]
+artifact = "image_png"
+on_completion = [
+    { kind = "magic_bytes", source = "spawn_only_files", extension = "png", format = "png" },
+]
+on_failure = ["notify_user:Frame extraction failed"]
 
 # Wave-3a: HttpProbeUntil + Sha256Match + soft_fail are operator-visible
 # TOML shapes; this fixture also acts as a syntax demo for operators.

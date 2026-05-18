@@ -141,6 +141,34 @@ fn should_load_workspace_policy_v1_session_fixture() {
         saw_audio,
         "podcast fixture must declare AudioNonSilent(spawn_only_files)"
     );
+
+    // octos #1040 (follow-up to #1035 / #1037): mofa_comic, mofa_infographic,
+    // and mofa_frame all carry MagicBytes(Png) on the `spawn_only_files`
+    // source with the `extension = "png"` filter. The fixture is the
+    // durable promise of that shape; the round-trip pins both the new ABI
+    // field defaults AND the per-contract opt-in.
+    for tool in ["mofa_comic", "mofa_infographic", "mofa_frame"] {
+        let entry = policy
+            .spawn_tasks
+            .get(tool)
+            .unwrap_or_else(|| panic!("v1 fixture must declare {tool} spawn task"));
+        let saw = entry.on_completion.iter().any(|spec| {
+            matches!(
+                spec,
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    extension,
+                    ..
+                }) if extension.as_deref() == Some("png")
+            )
+        });
+        assert!(
+            saw,
+            "{tool} fixture must declare MagicBytes(png, spawn_only_files, extension=png); \
+             got {:?}",
+            entry.on_completion,
+        );
+    }
 }
 
 #[test]
