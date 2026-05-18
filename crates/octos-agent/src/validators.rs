@@ -4510,32 +4510,27 @@ mod tests {
     // and the sweep is finally safe.
 
     /// `voice_synthesize` AudioNonSilent must run against the plugin's
-    /// reported audio path verbatim. The legacy
-    /// `skill-output/voice/**/*.{mp3,wav}` glob would have matched a
-    /// stale silent .wav from an earlier run alongside the freshly-
-    /// emitted .mp3, so this test pins down that the validator inspects
-    /// only the file `files_to_send` reports.
+    /// reported audio path verbatim. The reported file lives OUTSIDE
+    /// the legacy `skill-output/voice/**/*.{mp3,wav}` glob root, so a
+    /// validator that fell back to the glob would never see it — the
+    /// test would only pass via the spawn_only_files code path.
+    /// (The failure-mode counterpart below plants a non-silent file
+    /// INSIDE the legacy glob root to prove the validator does not
+    /// consult that path at all.)
     #[tokio::test]
-    async fn voice_synthesize_uses_spawn_only_files_with_stale_silent_audio_present() {
+    async fn voice_synthesize_uses_spawn_only_files_with_audio_outside_legacy_glob_root() {
         let dir = tempfile::tempdir().unwrap();
         // Real, non-silent output the plugin would report via the
-        // `Generated: <path>` marker that PR #1039 introduced.
-        let voice_dir = dir.path().join("skill-output/voice");
-        std::fs::create_dir_all(&voice_dir).unwrap();
-        let fresh = voice_dir.join("synthesized_1779067937.wav");
+        // `Generated: <path>` marker that PR #1039 introduced. The
+        // plugin writes to whatever path the LLM gave it, which is
+        // often OUTSIDE the legacy `skill-output/voice/` root — e.g.
+        // a project-scoped subdirectory or a tempdir-style path. This
+        // test pins down that the validator picks up the reported file
+        // regardless of where it lives in the workspace.
+        let project_dir = dir.path().join("projects/demo/audio");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let fresh = project_dir.join("synthesized_1779067937.wav");
         write_sine_wav(&fresh, 800);
-        // Stale silent audio from a prior run. If the validator ever
-        // fell back to the glob path it would decode this alongside the
-        // fresh file, but a single non-silent match is enough for
-        // AudioNonSilent to pass — so this stale file isn't on its own a
-        // counter-example. Instead include a stale .wav that is ALSO
-        // non-silent: the glob path would still pass, but the
-        // spawn_only_files path must not consult the workspace at all.
-        // We anchor the assertion to the validator outcome plus the
-        // session-policy test above (`session_policy_voice_synthesize_*`)
-        // which pins the source enum directly.
-        let stale = voice_dir.join("aaa-stale.wav");
-        write_silent_wav(&stale, 800);
 
         let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
         let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
@@ -4565,8 +4560,9 @@ mod tests {
         let outcomes = runner.run_all(&invocation, &validators).await;
         assert!(
             outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
-            "voice_synthesize contract must satisfy via spawn_only_files even when \
-             stale audio exists in the workspace; outcomes = {outcomes:?}",
+            "voice_synthesize contract must satisfy via spawn_only_files for a file \
+             outside the legacy `skill-output/voice/**/*` glob root (a glob fallback \
+             would never have matched this path); outcomes = {outcomes:?}",
         );
     }
 
