@@ -22,6 +22,8 @@ pub mod discord_channel;
 pub mod email_channel;
 #[cfg(feature = "feishu")]
 pub mod feishu_channel;
+#[cfg(feature = "line")]
+pub mod line_channel;
 #[cfg(feature = "matrix")]
 pub mod matrix_channel;
 #[cfg(feature = "qq-bot")]
@@ -70,6 +72,8 @@ pub use discord_channel::DiscordChannel;
 pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
+#[cfg(feature = "line")]
+pub use line_channel::LineChannel;
 #[cfg(feature = "matrix")]
 pub use matrix_channel::{
     BotEntry, BotManager, BotRouter, BotVisibility, MatrixChannel, MatrixEventId, MatrixRoomId,
