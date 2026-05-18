@@ -6,26 +6,24 @@
 pkgs.testers.nixosTest {
   name = "octos-nixos-test";
 
-  nodes.machine =
-    { pkgs, ... }:
-    {
-      imports = [ octosModule ];
-      programs.octos = {
+  nodes.machine = {
+    imports = [ octosModule ];
+    programs.octos = {
+      enable = true;
+      # enableExtraPackages = true;  # Skipped to avoid resource bloat (chromium/ffmpeg/libreoffice/etc.) in VM test
+      enableAppSkills = true;
+      channels = [
+        "telegram"
+        "discord"
+      ];
+      service = {
         enable = true;
-        # enableExtraPackages = true;  # Skipped to avoid resource bloat (chromium/ffmpeg/libreoffice/etc.) in VM test
-        enableAppSkills = true;
-        channels = [
-          "telegram"
-          "discord"
-        ];
-        service = {
-          enable = true;
-          port = 50080;
-          dataDir = "/var/lib/octos-test";
-          authToken = "test-token";
-        };
+        port = 50080;
+        dataDir = "/var/lib/octos-test";
+        authToken = "test-token";
       };
     };
+  };
 
   testScript = ''
     machine.wait_for_unit("octos-serve.service")
