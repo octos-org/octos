@@ -946,6 +946,32 @@ impl WorkspacePolicy {
 
         // Voice synthesis (LLM-driven TTS): assert the decoded audio is not
         // silent. Catches the "render produced empty audio" failure path.
+        //
+        // octos #1038 (follow-up to #1037): consume the plugin's
+        // `files_to_send` envelope so the AudioNonSilent check runs against
+        // the exact audio path the skill reported, not whatever happens to
+        // match a recursive `skill-output/voice/**/*.{mp3,wav}` glob. The
+        // voice skill writes to `skill-output/voice/<timestamp>.{wav,mp3}`,
+        // so a recursive glob could match a stale file from an earlier run
+        // in the same session workspace and falsely satisfy the contract
+        // for a freshly-failed call — the same structural fragility we
+        // already closed for `podcast_generate` (#1034) and `mofa_slides`
+        // (#1036).
+        //
+        // `extension = None` — the voice plugin emits a single audio path
+        // per call (`try_convert_to_mp3` deletes the .wav when ffmpeg
+        // succeeds, so the .mp3 and .wav cannot co-exist by construction).
+        // We need to accept either extension since the macOS Say fallback
+        // path also routes through `try_convert_to_mp3` and ffmpeg may not
+        // be installed, in which case `final_path` stays a .wav.
+        //
+        // PR #1037 originally swept this contract alongside `mofa_slides`
+        // but the voice half was reverted at 772783e7 — the plugin
+        // emitted a `Generated audio: <path>` success line that
+        // `PluginTool::detect_output_file` did not recognise. PR #1039
+        // (this PR's predecessor on the stack) fixed the plugin to emit
+        // `Generated: <path>` on its own line, so the detector now
+        // populates `files_to_send` and this flip is finally safe.
         let voice_synthesize_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
             artifacts: Vec::new(),
@@ -958,9 +984,9 @@ impl WorkspacePolicy {
             on_failure: vec!["notify_user:Voice synthesis failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(
                 ValidatorSpec::AudioNonSilent {
-                    glob: "skill-output/voice/**/*.{mp3,wav}".into(),
+                    glob: String::new(),
                     min_ratio: default_non_silent_ratio(),
-                    source: ValidatorFileSource::Glob,
+                    source: ValidatorFileSource::SpawnOnlyFiles,
                     extension: None,
                 },
             )],
@@ -2218,7 +2244,10 @@ ignore = []
     /// `succeed()` path emits only `{output, success}` (no
     /// `files_to_send`) and the success text `"Generated audio: <path>"`
     /// is not one of the prefixes `PluginTool::detect_output_file`
-    /// recognises. See follow-up issue tracking the plugin emission fix.
+    /// recognises. The voice marker was fixed in PR #1039, and the
+    /// voice_synthesize half is re-pinned by
+    /// `session_policy_voice_synthesize_consumes_spawn_only_files_for_octos_1038`
+    /// below.
     #[test]
     fn session_policy_mofa_slides_consumes_spawn_only_files_for_octos_1036() {
         let policy = WorkspacePolicy::for_session();
@@ -2260,6 +2289,66 @@ ignore = []
         assert!(
             saw_magic,
             "mofa_slides contract must declare MagicBytes(Pptx)"
+        );
+    }
+
+    /// octos #1038 (follow-up to #1037 / PR #1039): `voice_synthesize` must
+    /// consume the plugin's `files_to_send` envelope rather than the
+    /// hardcoded `skill-output/voice/**/*.{mp3,wav}` glob. The recursive
+    /// glob silently matched stale audio from earlier runs in the same
+    /// session workspace, the same structural fragility we already fixed
+    /// for `podcast_generate` (#1034) and `mofa_slides` (#1036).
+    ///
+    /// PR #1037 originally swept this contract but the voice half was
+    /// reverted at 772783e7 because the plugin's `succeed()` path
+    /// emitted `Generated audio: <path>` — a prefix
+    /// `PluginTool::detect_output_file` did not recognise — so
+    /// `files_to_send` stayed empty. PR #1039 fixed the plugin to emit
+    /// `Generated: <path>` on its own line, unblocking this re-sweep.
+    ///
+    /// `extension = None`: the voice plugin emits exactly one audio path
+    /// per call (`try_convert_to_mp3` deletes the .wav on success), and
+    /// we accept either .mp3 or .wav since the macOS Say fallback may
+    /// keep the .wav when ffmpeg is unavailable. The validator decodes
+    /// both formats natively (WAV) or via the `audio_mp3` feature.
+    #[test]
+    fn session_policy_voice_synthesize_consumes_spawn_only_files_for_octos_1038() {
+        let policy = WorkspacePolicy::for_session();
+        let voice = policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract");
+
+        let mut saw_audio = false;
+        for entry in &voice.on_completion {
+            if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                source,
+                extension,
+                glob,
+                ..
+            }) = entry
+            {
+                assert_eq!(
+                    *source,
+                    ValidatorFileSource::SpawnOnlyFiles,
+                    "voice_synthesize AudioNonSilent must opt into spawn_only_files (octos #1038)"
+                );
+                assert!(
+                    extension.is_none(),
+                    "voice_synthesize must accept both .mp3 and .wav — \
+                     the macOS Say fallback may emit either; got extension = {extension:?}"
+                );
+                assert!(
+                    !glob.contains("skill-output/voice"),
+                    "voice_synthesize must NOT pin a `skill-output/voice/**/*` glob — \
+                     the spawn_only_files source consumes the reported path directly; got: {glob}"
+                );
+                saw_audio = true;
+            }
+        }
+        assert!(
+            saw_audio,
+            "voice_synthesize contract must declare AudioNonSilent"
         );
     }
 
