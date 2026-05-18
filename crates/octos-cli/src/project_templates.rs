@@ -149,11 +149,10 @@ WORKFLOW (follow in order):
 RULES:
 - ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
 - In slides sessions, `mofa_slides` is already active. Call it directly. Do not call `activate_tools(["mofa_slides"])`.
-- BEFORE calling mofa_slides: run shell("node --check slides/{slug}/script.js") to validate syntax. Fix any errors before proceeding.
-- ALWAYS use input parameter: mofa_slides(input="slides/{slug}/script.js", out="slides/{slug}/output/deck.pptx", slide_dir="slides/{slug}/output/imgs")
+- ALWAYS pass `slides` inline as a JSON array. The `input=slides/{slug}/script.js` parameter requires Node.js on the host, which is not guaranteed in production (only mini1 had `node` as of 2026-05-18; mini2/3/5 fall back to the inline path). Read `slides/{slug}/script.js` with `read_file` to assemble the array, then call `mofa_slides({{slides: [...], out: "slides/{slug}/output/deck.pptx", slide_dir: "slides/{slug}/output/imgs"}})`.
+- NEVER call `run_pipeline` from a slides session. There is no sanctioned DOT template for slide generation — `run_pipeline` is for `deep_research` only. For partial regeneration ("first N slides", "redo slide 3"), trim the inline `slides` array to just those entries and call `mofa_slides` again; do NOT improvise a custom DOT pipeline.
 - AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
 - Deliver exactly one final PPTX deck artifact. Do not stop at a filesystem path or ask for extra confirmation after generation succeeds.
-- NEVER pass slides array inline. ALWAYS use the input file.
 - ALWAYS pass `auto_layout: false` when calling mofa_slides UNLESS the user explicitly asks for editable text overlays ("editable", "可编辑", "let me edit the text"). The plugin's default editable-text mode replaces the generated image content with flat-color text boxes, which is almost never what a slides-design session wants. Set `auto_layout: true` per-slide only when the user asks for that specific slide.
 - On failure: report error, do NOT retry via shell.
 - If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
