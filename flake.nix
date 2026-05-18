@@ -7,6 +7,10 @@
       url = "https://flakehub.com/f/nix-darwin/nix-darwin/*";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -28,6 +32,10 @@
           }
         );
 
+      treefmtEval = forEachSupportedSystem (
+        { pkgs, ... }: inputs.treefmt-nix.lib.evalModule pkgs ./nix/treefmt.nix
+      );
+
       mkModuleWithPackages =
         modulePath:
         { pkgs, lib, ... }:
@@ -44,10 +52,10 @@
         };
     in
     {
+      formatter = forEachSupportedSystem ({ system, ... }: treefmtEval.${system}.config.build.wrapper);
+
       nixosModules.default = mkModuleWithPackages ./nix/modules/nixos.nix;
       darwinModules.default = mkModuleWithPackages ./nix/modules/darwin.nix;
-
-      formatter = forEachSupportedSystem ({ pkgs, ... }: pkgs.nixfmt-tree);
 
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
@@ -75,14 +83,16 @@
       checks = forEachSupportedSystem (
         { pkgs, ... }:
         {
-          # 1. Darwin Module Evaluation (Cross-platform)
+          formatting = treefmtEval.${pkgs.system}.config.build.check self;
+
+          # Darwin Module Evaluation (Cross-platform)
           darwin-module = pkgs.callPackage ./nix/tests/darwin.nix {
             inherit (inputs) nix-darwin;
             octosModule = self.darwinModules.default;
           };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          # 4. NixOS VM Test (Linux only, full E2E)
+          # NixOS VM Test (Linux only, full E2E)
           nixos-module-vm = pkgs.callPackage ./nix/tests/nixos.nix {
             octosModule = self.nixosModules.default;
           };
