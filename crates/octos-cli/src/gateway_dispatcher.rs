@@ -134,6 +134,29 @@ impl GatewayDispatcher {
                 ))
                 .await;
         } else {
+            // Issue #1016: normalize the plural `sites` alias to the canonical
+            // singular `site` form BEFORE touching session state. The WS path
+            // (`ws_slash::handle_new`) does the same — power users and parallel
+            // frontends typing `/new sites astro` by analogy with `/new slides
+            // …` (which IS plural) would otherwise fall through to the generic
+            // switch-session arm and never trigger the site scaffold. Aliasing
+            // here lets one branch handle both forms.
+            //
+            // Codex round-1 fixup: normalize BEFORE `switch_to` /
+            // `touch_user_session` / `try_activate_*_template`. Otherwise the
+            // active gateway topic + session file land on `sites astro` while
+            // the scaffolded prompt + workspace land on `site astro`, and the
+            // gateway runtime's prompt lookup (keyed by active topic) misses
+            // entirely.
+            let normalized_name: std::borrow::Cow<'_, str> = if name == "sites" {
+                std::borrow::Cow::Borrowed("site")
+            } else if let Some(rest) = name.strip_prefix("sites ") {
+                std::borrow::Cow::Owned(format!("site {rest}"))
+            } else {
+                std::borrow::Cow::Borrowed(name)
+            };
+            let name: &str = normalized_name.as_ref();
+
             self.active_sessions
                 .write()
                 .await
@@ -145,22 +168,6 @@ impl GatewayDispatcher {
                 .lock()
                 .await
                 .touch_user_session(base_key_str, name);
-
-            // Issue #1016: normalize the plural `sites` alias to the canonical
-            // singular `site` form before the template-dispatch branches below.
-            // The WS path (`ws_slash::handle_new`) does the same — power users
-            // and parallel frontends typing `/new sites astro` by analogy with
-            // `/new slides …` (which IS plural) would otherwise fall through
-            // to the generic switch-session arm and never trigger the
-            // site scaffold. Aliasing here lets one branch handle both forms.
-            let normalized_name: std::borrow::Cow<'_, str> = if name == "sites" {
-                std::borrow::Cow::Borrowed("site")
-            } else if let Some(rest) = name.strip_prefix("sites ") {
-                std::borrow::Cow::Owned(format!("site {rest}"))
-            } else {
-                std::borrow::Cow::Borrowed(name)
-            };
-            let name: &str = normalized_name.as_ref();
 
             // Check for project templates (e.g. "/new slides <project>")
             let reply = if name == "slides" || name.starts_with("slides ") {
@@ -1434,9 +1441,12 @@ mod tests {
 
         // The site-scaffold branch ran (either succeeded, or failed with
         // the site-scaffold-specific error shape) — NOT the generic
-        // switch-session fallback for the plural form.
+        // switch-session fallback for the plural form. Success path
+        // starts with "Site project ... created" (capital S — see
+        // `site_creation_reply`); failure path contains "Site scaffold
+        // failed".
         let took_site_branch = msg.content.contains("Site scaffold failed")
-            || msg.content.contains("site project");
+            || msg.content.contains("Site project");
         assert!(
             took_site_branch,
             "/new sites <preset> must take the site-scaffold branch, got: {}",
