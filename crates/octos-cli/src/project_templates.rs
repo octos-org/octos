@@ -154,6 +154,7 @@ RULES:
 - AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
 - Deliver exactly one final PPTX deck artifact. Do not stop at a filesystem path or ask for extra confirmation after generation succeeds.
 - NEVER pass slides array inline. ALWAYS use the input file.
+- ALWAYS pass `auto_layout: false` when calling mofa_slides UNLESS the user explicitly asks for editable text overlays ("editable", "可编辑", "let me edit the text"). The plugin's default editable-text mode replaces the generated image content with flat-color text boxes, which is almost never what a slides-design session wants. Set `auto_layout: true` per-slide only when the user asks for that specific slide.
 - On failure: report error, do NOT retry via shell.
 - If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
 - Read slides/{slug}/memory.md before each response for context.
@@ -1163,6 +1164,21 @@ mod tests {
         assert!(reply.unwrap().contains("untitled"));
         // Scaffolding happens in session_actor, not here
         assert!(!tmp.path().join("slides/untitled/script.js").is_file());
+    }
+
+    #[test]
+    fn slides_prompt_directs_llm_to_disable_auto_layout_by_default() {
+        // mofa-slides leaves `auto_layout` with no `default` declared in its
+        // manifest schema; the plugin's silent fallback is "editable text
+        // mode" which replaces generated image content with flat-color text
+        // boxes. The slides-design workflow almost never wants that — make
+        // the system prompt direct the LLM to pass `auto_layout: false`
+        // unless the user explicitly opts in.
+        let prompt = slides_system_prompt("Deck");
+        assert!(
+            prompt.contains("auto_layout: false"),
+            "slides prompt must instruct the LLM to pass auto_layout: false"
+        );
     }
 
     #[test]
