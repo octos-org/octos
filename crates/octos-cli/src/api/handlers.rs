@@ -1660,7 +1660,7 @@ fn api_session_workspace_dirs(
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let profile_id = infer_profile_id_from_data_dir(data_dir);
-    let mut dirs = Vec::with_capacity(3);
+    let mut dirs = Vec::with_capacity(4);
     let mut seen = HashSet::new();
 
     for key in [
@@ -1673,6 +1673,20 @@ fn api_session_workspace_dirs(
         if seen.insert(path.clone()) {
             dirs.push(path);
         }
+    }
+
+    // SPA-created sessions (slides-/web-/site- session_ids) write their
+    // workspace under the BARE session_id, without the `<channel>:` prefix
+    // that gets percent-encoded by `encode_path_component`. The three
+    // channel-prefixed encodings above don't match those on-disk paths,
+    // so the listing endpoint returned an empty set and the SlidesChat
+    // scaffold-wait loop timed out with "slides scaffold did not appear"
+    // (live mini3 regression 2026-05-18 for session
+    // `slides-1779125959003-ugtbaa`, even though the scaffold itself
+    // succeeded server-side and the 3 expected files were on disk).
+    let bare_path = data_dir.join("users").join(session_id).join("workspace");
+    if seen.insert(bare_path.clone()) {
+        dirs.push(bare_path);
     }
 
     dirs
@@ -3598,7 +3612,7 @@ mod tests {
         let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
         let dirs = api_session_workspace_dirs(base, "slides-123");
 
-        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs.len(), 4);
         assert_eq!(
             dirs[0],
             base.join("users")
@@ -3616,6 +3630,15 @@ mod tests {
             base.join("users")
                 .join("api%3Aslides-123")
                 .join("workspace")
+        );
+        // SPA-created slides/web sessions live under the BARE session_id
+        // on disk — the listing endpoint must look there too. Without
+        // this fourth candidate, slides-scaffold-wait times out with
+        // "slides scaffold did not appear" even when the deck dir +
+        // scaffold files all exist (mini3 regression 2026-05-18).
+        assert_eq!(
+            dirs[3],
+            base.join("users").join("slides-123").join("workspace")
         );
     }
 
