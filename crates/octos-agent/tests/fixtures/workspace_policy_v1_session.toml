@@ -51,6 +51,25 @@ on_completion = [
 ]
 on_failure = ["notify_user:Voice registration failed"]
 
+# octos #1036 (follow-up to #1034): mofa_slides now opts into the
+# `spawn_only_files` source so the magic-bytes check inspects the exact
+# PPTX path the plugin reported instead of any `**/*.pptx` match in the
+# session workspace. The `extension = "pptx"` filter narrows the list to
+# slide decks if the skill surfaces auxiliary preview files via
+# `files_to_send`.
+#
+# `voice_synthesize` was originally part of this sweep but was reverted
+# after codex review caught that the voice plugin's `succeed()` path
+# emits only `{output, success}` (no `files_to_send`) and its success
+# text `"Generated audio: <path>"` is not one of the prefixes
+# `PluginTool::detect_output_file` recognises. A follow-up issue tracks
+# the plugin emission fix.
+[spawn_tasks.mofa_slides]
+on_completion = [
+    { kind = "magic_bytes", source = "spawn_only_files", extension = "pptx", format = "pptx" },
+]
+on_failure = ["notify_user:Slide generation failed"]
+
 # Wave-3a: HttpProbeUntil + Sha256Match + soft_fail are operator-visible
 # TOML shapes; this fixture also acts as a syntax demo for operators.
 

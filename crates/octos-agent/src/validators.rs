@@ -4426,4 +4426,75 @@ mod tests {
             outcomes[0].reason
         );
     }
+
+    // --- octos #1036: mofa_slides sweep -----------------------------------
+    //
+    // Mirror the octos #1034 podcast happy-path test for the mofa_slides
+    // contract that PR #1035 left on the glob path. Failure mode being
+    // closed: a recursive `**/*.pptx` glob would match unrelated stale
+    // decks from earlier runs in the same session workspace.
+    //
+    // The `voice_synthesize` contract was originally part of this sweep
+    // but was dropped after codex review caught that the voice plugin's
+    // `succeed()` path emits only `{output, success}` (no `files_to_send`)
+    // and its success text `"Generated audio: <path>"` is not one of the
+    // prefixes `PluginTool::detect_output_file` recognises. The validator
+    // would see an empty list and fail. See follow-up issue tracking the
+    // plugin emission fix.
+
+    /// `mofa_slides` MagicBytes(Pptx) must run against the plugin's reported
+    /// PPTX path verbatim, including outputs at arbitrary depth where the
+    /// session workspace may contain unrelated PPTXs from earlier runs.
+    #[tokio::test]
+    async fn mofa_slides_uses_spawn_only_files_at_arbitrary_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        // Deeply-nested project-style path (`<project>/output/deck.pptx`).
+        // Lay down a SECOND stale PPTX elsewhere in the workspace — the
+        // legacy `**/*.pptx` glob would match either, but the
+        // spawn_only_files path must inspect only the reported file.
+        let project_out = dir.path().join("slides/demo/output");
+        std::fs::create_dir_all(&project_out).unwrap();
+        let pptx_path = project_out.join("deck.pptx");
+        let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
+        pptx_bytes.extend(std::iter::repeat_n(0u8, 256));
+        std::fs::write(&pptx_path, &pptx_bytes).unwrap();
+        // Stale, structurally-broken PPTX from a prior run. If the
+        // validator ever fell back to the glob path it would pick this
+        // up first (alphabetical glob order under `**`) and fail —
+        // satisfying the test only via the spawn_only_files path.
+        let stale = dir.path().join("aaa-stale.pptx");
+        std::fs::write(&stale, b"<!DOCTYPE html>\n<html>old error</html>\n").unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
+        let contract = session_policy
+            .spawn_tasks
+            .get("mofa_slides")
+            .expect("mofa_slides contract must be registered");
+        let validators: Vec<Validator> = contract
+            .on_completion
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
+                    entry.clone(),
+                    "mofa_slides",
+                    i,
+                )
+            })
+            .collect();
+
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "mofa_slides".into(),
+        )
+        .with_spawn_only_files(vec![pptx_path]);
+        let outcomes = runner.run_all(&invocation, &validators).await;
+        assert!(
+            outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
+            "mofa_slides contract must satisfy via spawn_only_files even when an \
+             unrelated stale PPTX exists in the workspace; outcomes = {outcomes:?}",
+        );
+    }
 }
