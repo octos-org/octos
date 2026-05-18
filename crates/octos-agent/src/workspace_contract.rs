@@ -1399,6 +1399,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mofa_frame_contract_rejects_stale_png_without_files_to_send_octos_1040() {
+        // octos #1040: `mofa_frame` flips to MagicBytes(SpawnOnlyFiles)
+        // preemptively (the manifest is not `spawn_only: true` today —
+        // contract is dormant — but the script at
+        // `mofa-skills/mofa-frame/main` already emits `files_to_send`).
+        // This test is a cleaner cross-check than the `mofa_comic` stale
+        // case because the `mofa_frame` contract has NO FileExists
+        // validator: the SpawnOnlyFiles source is the only gate, so a
+        // regression to the workspace glob would silently pass on any
+        // stale PNG in the workspace.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        // Stale-but-valid PNG that an `**/*.png` glob would have matched.
+        let stale = temp.path().join("aaa-stale.png");
+        let mut padded = PNG_1X1.to_vec();
+        padded.extend(std::iter::repeat_n(0u8, 2048));
+        std::fs::write(&stale, &padded).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_frame",
+            "tool-call-frame-stale",
+            // Plugin reported nothing (the dormant-contract simulation).
+            &[],
+            UNIX_EPOCH,
+            None,
+            // mofa_frame's required args are `video_path` and `timestamp`;
+            // `out_path` is optional. Pass none so the dormant-contract
+            // mode is what we exercise.
+            Some(&json!({})),
+        )
+        .await;
+
+        // Either artifact-resolution catches it ("could not find
+        // artifact 'image_png'") because nothing in the workspace
+        // matches the artifact glob with the task-started-at filter
+        // applied, OR the SpawnOnlyFiles validator surfaces the
+        // empty-list failure. Both are valid because we want
+        // "stale PNG does NOT silently pass" — the assertion below
+        // just requires a Failed outcome with notify_user.
+        match result {
+            SpawnTaskContractResult::Failed { notify_user, .. } => {
+                assert_eq!(notify_user.as_deref(), Some("Frame extraction failed"));
+            }
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                panic!(
+                    "mofa_frame contract MUST NOT silently pass on a stale workspace PNG; \
+                     got Satisfied with files {output_files:?}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn mofa_comic_contract_fails_when_args_out_file_is_missing() {
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
