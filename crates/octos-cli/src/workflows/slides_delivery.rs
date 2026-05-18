@@ -13,7 +13,8 @@ use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,
 };
 use octos_agent::workspace_policy::{
-    MagicByteKind, Validator, ValidatorPhaseKind, ValidatorSpec, WorkspacePolicyWorkspace,
+    MagicByteKind, Validator, ValidatorFileSource, ValidatorPhaseKind, ValidatorSpec,
+    WorkspacePolicyWorkspace,
 };
 use octos_agent::{
     ValidationPolicy, WorkspaceArtifactsPolicy, WorkspacePolicy, WorkspacePolicyKind,
@@ -103,6 +104,8 @@ pub fn workspace_policy() -> WorkspacePolicy {
                 spec: ValidatorSpec::MagicBytes {
                     glob: "**/*.pptx".into(),
                     format: MagicByteKind::Pptx,
+                    source: ValidatorFileSource::Glob,
+                    extension: None,
                 },
             }],
         },

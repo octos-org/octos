@@ -33,9 +33,16 @@ on_verify = [
     "file_size_min:$artifact:4096",
 ]
 on_failure = ["notify_user:Podcast generation failed"]
+# octos #1034: opt the magic-bytes + audio-non-silent validators into the
+# `spawn_only_files` source so the validator consumes the authoritative path
+# list the plugin reports via its JSON stdout envelope. Avoids the
+# topic-suffixed output directory race (`mofa-podcast-zhuyu/`, etc.) that
+# made the legacy hardcoded glob `skill-output/mofa-podcast/**/*.mp3`
+# unreliable. The `extension` filter narrows the list to mp3 outputs so
+# adjacent intermediate WAVs in `files_to_send` are ignored.
 on_completion = [
-    { kind = "magic_bytes", glob = "skill-output/mofa-podcast/**/*.mp3", format = "mp3" },
-    { kind = "audio_non_silent", glob = "skill-output/mofa-podcast/**/*.mp3", min_ratio = 0.3 },
+    { kind = "magic_bytes", source = "spawn_only_files", extension = "mp3", format = "mp3" },
+    { kind = "audio_non_silent", source = "spawn_only_files", extension = "mp3", min_ratio = 0.3 },
 ]
 
 [spawn_tasks.fm_voice_save]

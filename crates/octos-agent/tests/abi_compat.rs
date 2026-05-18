@@ -71,6 +71,10 @@ fn should_load_workspace_policy_v1_slides_fixture() {
 
 #[test]
 fn should_load_workspace_policy_v1_session_fixture() {
+    use octos_agent::workspace_policy::{
+        SpawnTaskValidatorSpec, ValidatorFileSource, ValidatorSpec,
+    };
+
     let temp = tempfile::tempdir().unwrap();
     copy_fixture_into_workspace("workspace_policy_v1_session.toml", temp.path());
 
@@ -93,6 +97,49 @@ fn should_load_workspace_policy_v1_session_fixture() {
             .iter()
             .any(|line| line == "file_size_min:$artifact:1024"),
         "expected fm_tts verify action for artifact size",
+    );
+
+    // octos #1034: the podcast_generate contract opts into the
+    // `spawn_only_files` source via the new ABI fields. The fixture is the
+    // durable promise of that shape — parsing it must populate `source =
+    // SpawnOnlyFiles` and `extension = Some("mp3")` on both the MagicBytes
+    // and AudioNonSilent validators so an older operator policy that
+    // committed the prior glob form will surface a clear deserialization
+    // error rather than silently fall back to the glob path.
+    let podcast = policy
+        .spawn_tasks
+        .get("podcast_generate")
+        .expect("podcast_generate spawn task contract");
+    let mut saw_magic = false;
+    let mut saw_audio = false;
+    for entry in &podcast.on_completion {
+        match entry {
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                source, extension, ..
+            }) => {
+                assert_eq!(*source, ValidatorFileSource::SpawnOnlyFiles);
+                assert_eq!(extension.as_deref(), Some("mp3"));
+                saw_magic = true;
+            }
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                source,
+                extension,
+                ..
+            }) => {
+                assert_eq!(*source, ValidatorFileSource::SpawnOnlyFiles);
+                assert_eq!(extension.as_deref(), Some("mp3"));
+                saw_audio = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_magic,
+        "podcast fixture must declare MagicBytes(spawn_only_files)"
+    );
+    assert!(
+        saw_audio,
+        "podcast fixture must declare AudioNonSilent(spawn_only_files)"
     );
 }
 
