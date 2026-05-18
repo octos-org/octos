@@ -862,6 +862,20 @@ pub enum ChannelCredentials {
         #[serde(default = "default_wechat_base_url")]
         base_url: String,
     },
+    Line {
+        #[serde(default = "default_line_secret_env")]
+        channel_secret_env: String,
+        #[serde(default = "default_line_token_env")]
+        channel_access_token_env: String,
+        #[serde(default)]
+        allowed_senders: String,
+        #[serde(default)]
+        webhook_port: Option<u16>,
+        #[serde(default)]
+        require_mention: bool,
+        #[serde(default)]
+        bot_user_id: String,
+    },
 }
 
 fn default_telegram_env() -> String {
@@ -929,6 +943,12 @@ fn default_wechat_token_env() -> String {
 }
 fn default_wechat_base_url() -> String {
     "https://ilinkai.weixin.qq.com".into()
+}
+fn default_line_secret_env() -> String {
+    "LINE_CHANNEL_SECRET".into()
+}
+fn default_line_token_env() -> String {
+    "LINE_CHANNEL_ACCESS_TOKEN".into()
 }
 
 /// Gateway-specific settings.
@@ -1393,8 +1413,11 @@ pub(crate) fn config_from_profile(
                     entry["settings"]["bridge_url"] = serde_json::json!(url);
                 }
             }
-            // Override Feishu webhook_port if auto-assigned
-            if let ChannelCredentials::Feishu { .. } = ch {
+            // Override webhook_port if auto-assigned (Feishu webhook / LINE)
+            if matches!(
+                ch,
+                ChannelCredentials::Feishu { .. } | ChannelCredentials::Line { .. }
+            ) {
                 if let Some(port) = feishu_port_override {
                     entry["settings"]["webhook_port"] = serde_json::json!(port);
                 }
@@ -1674,6 +1697,36 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
                 "base_url": base_url,
             }
         }),
+        ChannelCredentials::Line {
+            channel_secret_env,
+            channel_access_token_env,
+            allowed_senders,
+            webhook_port,
+            require_mention,
+            bot_user_id,
+        } => {
+            let senders: Vec<&str> = allowed_senders
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut settings = serde_json::json!({
+                "channel_secret_env": channel_secret_env,
+                "channel_access_token_env": channel_access_token_env,
+                "require_mention": require_mention,
+            });
+            if let Some(port) = webhook_port {
+                settings["webhook_port"] = serde_json::json!(port);
+            }
+            if !bot_user_id.is_empty() {
+                settings["bot_user_id"] = serde_json::json!(bot_user_id);
+            }
+            serde_json::json!({
+                "type": "line",
+                "allowed_senders": senders,
+                "settings": settings,
+            })
+        }
     }
 }
 
@@ -1772,6 +1825,31 @@ pub fn feishu_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
         }
     }
     None
+}
+
+/// Check if a profile has a LINE channel and return its webhook port configuration.
+///
+/// Returns:
+/// - `Some(Some(port))` — LINE channel exists with explicit webhook port
+/// - `Some(None)` — LINE channel exists but needs an auto-assigned port
+/// - `None` — no LINE channel
+pub fn line_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
+    for ch in &profile.config.channels {
+        if let ChannelCredentials::Line { webhook_port, .. } = ch {
+            return Some(*webhook_port);
+        }
+    }
+    None
+}
+
+/// Webhook port needed by any profile channel that listens for HTTP webhooks.
+pub fn profile_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
+    match (feishu_webhook_port(profile), line_webhook_port(profile)) {
+        (Some(f), Some(l)) => Some(f.or(l)),
+        (Some(f), None) => Some(f),
+        (None, Some(l)) => Some(l),
+        (None, None) => None,
+    }
 }
 
 /// Get the API channel port from a profile, if one is configured.

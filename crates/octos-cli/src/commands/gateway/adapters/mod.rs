@@ -22,6 +22,8 @@ mod discord;
 mod email;
 #[cfg(feature = "feishu")]
 mod feishu;
+#[cfg(feature = "line")]
+mod line;
 #[cfg(feature = "matrix")]
 mod matrix;
 #[cfg(feature = "qq-bot")]
@@ -53,6 +55,7 @@ mod whatsapp;
     feature = "twilio",
     feature = "wecom",
     feature = "wecom-bot",
+    feature = "line",
     feature = "matrix",
     feature = "qq-bot",
     feature = "wechat"
@@ -137,6 +140,8 @@ pub fn register_all(
             )?,
             #[cfg(feature = "wecom-bot")]
             "wecom-bot" => wecom_bot::register(channel_mgr, entry, ctx.shutdown)?,
+            #[cfg(feature = "line")]
+            "line" => line::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "matrix")]
             "matrix" => matrix::register(
                 channel_mgr,

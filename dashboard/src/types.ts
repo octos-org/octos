@@ -16,7 +16,9 @@ export interface GatewaySettings {
 
 export interface ChannelCredentials {
   type: string
-  [key: string]: string | number
+  allowed_senders?: string
+  bot_user_id?: string
+  [key: string]: string | number | boolean | undefined
 }
 
 export interface FallbackModel {
@@ -187,9 +189,9 @@ export interface BulkActionResponse {
   count: number
 }
 
-export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'feishu' | 'email'
+export type ChannelType = 'telegram' | 'discord' | 'slack' | 'whatsapp' | 'feishu' | 'line' | 'email'
 
-export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'email']
+export const CHANNEL_TYPES: ChannelType[] = ['telegram', 'discord', 'slack', 'whatsapp', 'feishu', 'line', 'email']
 
 export const CHANNEL_COLORS: Record<ChannelType, string> = {
   telegram: 'bg-blue-500',
@@ -197,6 +199,7 @@ export const CHANNEL_COLORS: Record<ChannelType, string> = {
   slack: 'bg-purple-500',
   whatsapp: 'bg-green-500',
   feishu: 'bg-cyan-500',
+  line: 'bg-green-600',
   email: 'bg-orange-500',
 }
 
@@ -206,6 +209,7 @@ export const CHANNEL_LABELS: Record<ChannelType, string> = {
   slack: 'SL',
   whatsapp: 'WA',
   feishu: 'FS',
+  line: 'LN',
   email: 'EM',
 }
 
