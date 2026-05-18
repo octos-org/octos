@@ -1227,6 +1227,10 @@ mod tests {
     async fn mofa_slides_contract_satisfies_when_pptx_is_present() {
         // P1-4: the default session policy for `mofa_slides` should
         // verify a PPTX with a valid ZIP signature is present.
+        //
+        // octos #1036: the contract now consumes the plugin's
+        // `files_to_send` directly (the spawn_only_files source). Mirror
+        // the live call path by passing the reported PPTX in the slice.
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
         let pptx = temp.path().join("output/deck.pptx");
@@ -1241,7 +1245,7 @@ mod tests {
             &ToolRegistry::with_builtins(temp.path()),
             "mofa_slides",
             "tool-call-slides",
-            &[],
+            &[pptx.clone()],
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "output/deck.pptx"})),
@@ -1258,6 +1262,11 @@ mod tests {
     async fn mofa_slides_contract_fails_when_artifact_is_html_error_page() {
         // Catches the silent-failure path: tool wrote an HTML error page
         // in place of the PPTX. MagicBytes (Pptx) rejects it.
+        //
+        // octos #1036: the contract now consumes the plugin's
+        // `files_to_send` directly. Pass the HTML-shaped "PPTX" via the
+        // file list so the magic-bytes check inspects the exact path
+        // the skill reported.
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
         let pptx = temp.path().join("output/deck.pptx");
@@ -1268,7 +1277,7 @@ mod tests {
             &ToolRegistry::with_builtins(temp.path()),
             "mofa_slides",
             "tool-call-slides-fail",
-            &[],
+            &[pptx.clone()],
             UNIX_EPOCH,
             None,
             Some(&json!({"out": "output/deck.pptx"})),

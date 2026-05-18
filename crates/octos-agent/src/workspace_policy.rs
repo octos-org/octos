@@ -939,6 +939,17 @@ impl WorkspacePolicy {
 
         // Voice synthesis (LLM-driven TTS): assert the decoded audio is not
         // silent. Catches the "render produced empty audio" failure path.
+        //
+        // octos #1036 (follow-up to #1034 / PR #1035): consume the plugin's
+        // `files_to_send` list directly rather than globbing the workspace.
+        // The legacy glob `skill-output/voice/**/*.{mp3,wav}` was anchored at
+        // a directory the plugin does not actually guarantee — the voice
+        // skill writes to `$OCTOS_WORK_DIR/<filename>.{wav,mp3}` (see
+        // `crates/platform-skills/voice/src/main.rs:558-660`), and any
+        // operator-customised work dir or future per-voice subdirectory
+        // (`skill-output/voice-yangmi/...`) would silently slip past the
+        // validator. `extension = None` keeps both the initial `.wav` and
+        // the converted `.mp3` in scope since the plugin may report either.
         let voice_synthesize_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
             artifacts: Vec::new(),
@@ -951,9 +962,9 @@ impl WorkspacePolicy {
             on_failure: vec!["notify_user:Voice synthesis failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(
                 ValidatorSpec::AudioNonSilent {
-                    glob: "skill-output/voice/**/*.{mp3,wav}".into(),
+                    glob: String::new(),
                     min_ratio: default_non_silent_ratio(),
-                    source: ValidatorFileSource::Glob,
+                    source: ValidatorFileSource::SpawnOnlyFiles,
                     extension: None,
                 },
             )],
@@ -1011,6 +1022,20 @@ impl WorkspacePolicy {
         // (`**/*.pptx`) is the same recursive pattern the on-completion
         // MagicBytes validator uses, so the two checks see a consistent
         // set of paths.
+        //
+        // octos #1036 (follow-up to #1034 / PR #1035): consume the plugin's
+        // `files_to_send` envelope so the MagicBytes check runs against the
+        // exact PPTX path the skill reported, not whatever happens to match
+        // a recursive `**/*.pptx` glob. Two failure modes the prior glob
+        // could mask:
+        //   1. A stale `.pptx` from an earlier run in the same session
+        //      workspace passing the contract for a freshly-failed call.
+        //   2. The plugin writing the deck to a non-default subdirectory
+        //      that an operator-customised workspace policy would otherwise
+        //      need to anticipate in its glob.
+        // The `extension = "pptx"` filter narrows the file list to slide
+        // decks if the skill also surfaces auxiliary files (preview PNGs,
+        // etc.) via `files_to_send`.
         let mofa_slides_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("slides_pptx".into()),
             artifacts: Vec::new(),
@@ -1019,10 +1044,10 @@ impl WorkspacePolicy {
             on_deliver: vec![],
             on_failure: vec!["notify_user:Slide generation failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                glob: "**/*.pptx".into(),
+                glob: String::new(),
                 format: MagicByteKind::Pptx,
-                source: ValidatorFileSource::Glob,
-                extension: None,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("pptx".into()),
             })],
         };
 
@@ -2163,6 +2188,101 @@ ignore = []
                 ..
             })
         )));
+    }
+
+    /// octos #1036 (follow-up to #1034 / PR #1035): both `voice_synthesize`
+    /// and `mofa_slides` must consume the plugin's `files_to_send` envelope
+    /// rather than a hardcoded glob. The legacy globs
+    /// (`skill-output/voice/**/*.{mp3,wav}` and `**/*.pptx`) silently
+    /// missed files whenever the plugin wrote to a directory the policy
+    /// didn't anticipate, the same structural fragility we already fixed
+    /// for `podcast_generate`.
+    #[test]
+    fn session_policy_voice_synthesize_consumes_spawn_only_files_for_octos_1036() {
+        let policy = WorkspacePolicy::for_session();
+        let voice = policy
+            .spawn_tasks
+            .get("voice_synthesize")
+            .expect("voice_synthesize contract");
+
+        let mut saw_audio = false;
+        for entry in &voice.on_completion {
+            if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                source,
+                extension,
+                glob,
+                ..
+            }) = entry
+            {
+                assert_eq!(
+                    *source,
+                    ValidatorFileSource::SpawnOnlyFiles,
+                    "voice_synthesize AudioNonSilent must opt into spawn_only_files (octos #1036)"
+                );
+                // The voice plugin emits both WAV and MP3 variants — both must
+                // satisfy the non-silent check, so the extension filter is
+                // intentionally unset.
+                assert!(
+                    extension.is_none(),
+                    "voice_synthesize AudioNonSilent must accept both wav and mp3 \
+                     outputs (extension must remain unset); got: {extension:?}"
+                );
+                assert!(
+                    !glob.contains("skill-output/voice/"),
+                    "voice_synthesize must NOT pin the legacy `skill-output/voice/**` \
+                     glob — that anchor is the bug we are sweeping away; got: {glob}"
+                );
+                saw_audio = true;
+            }
+        }
+        assert!(
+            saw_audio,
+            "voice_synthesize contract must declare AudioNonSilent"
+        );
+    }
+
+    #[test]
+    fn session_policy_mofa_slides_consumes_spawn_only_files_for_octos_1036() {
+        let policy = WorkspacePolicy::for_session();
+        let slides = policy
+            .spawn_tasks
+            .get("mofa_slides")
+            .expect("mofa_slides contract");
+
+        let mut saw_magic = false;
+        for entry in &slides.on_completion {
+            if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                source,
+                extension,
+                format,
+                glob,
+                ..
+            }) = entry
+            {
+                assert_eq!(*format, MagicByteKind::Pptx);
+                assert_eq!(
+                    *source,
+                    ValidatorFileSource::SpawnOnlyFiles,
+                    "mofa_slides MagicBytes must opt into spawn_only_files (octos #1036)"
+                );
+                assert_eq!(
+                    extension.as_deref(),
+                    Some("pptx"),
+                    "mofa_slides MagicBytes must filter to pptx outputs so auxiliary \
+                     files in files_to_send don't trip the check"
+                );
+                assert!(
+                    !glob.contains("**/*.pptx"),
+                    "mofa_slides must NOT pin a `**/*.pptx` glob — the spawn_only_files \
+                     source consumes the reported path directly; got: {glob}"
+                );
+                saw_magic = true;
+            }
+        }
+        assert!(
+            saw_magic,
+            "mofa_slides contract must declare MagicBytes(Pptx)"
+        );
     }
 
     #[test]

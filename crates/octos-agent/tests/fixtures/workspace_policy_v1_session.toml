@@ -51,6 +51,31 @@ on_completion = [
 ]
 on_failure = ["notify_user:Voice registration failed"]
 
+# octos #1036 (follow-up to #1034): voice_synthesize + mofa_slides now also
+# opt into the `spawn_only_files` source so the validator consumes the
+# plugin's reported file list rather than globbing the workspace. The
+# voice contract leaves `extension` unset because the plugin emits both
+# `.wav` (initial PCM render) and `.mp3` (post-convert) variants and both
+# must satisfy the non-silent-audio check; the slides contract pins
+# `extension = "pptx"` so auxiliary preview files emitted alongside the
+# deck don't trip the magic-bytes check.
+[spawn_tasks.voice_synthesize]
+artifact = "primary_audio"
+on_verify = [
+    "file_exists:$artifact",
+    "file_size_min:$artifact:1024",
+]
+on_failure = ["notify_user:Voice synthesis failed"]
+on_completion = [
+    { kind = "audio_non_silent", source = "spawn_only_files", min_ratio = 0.3 },
+]
+
+[spawn_tasks.mofa_slides]
+on_completion = [
+    { kind = "magic_bytes", source = "spawn_only_files", extension = "pptx", format = "pptx" },
+]
+on_failure = ["notify_user:Slide generation failed"]
+
 # Wave-3a: HttpProbeUntil + Sha256Match + soft_fail are operator-visible
 # TOML shapes; this fixture also acts as a syntax demo for operators.
 
