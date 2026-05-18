@@ -134,6 +134,29 @@ impl GatewayDispatcher {
                 ))
                 .await;
         } else {
+            // Issue #1016: normalize the plural `sites` alias to the canonical
+            // singular `site` form BEFORE touching session state. The WS path
+            // (`ws_slash::handle_new`) does the same — power users and parallel
+            // frontends typing `/new sites astro` by analogy with `/new slides
+            // …` (which IS plural) would otherwise fall through to the generic
+            // switch-session arm and never trigger the site scaffold. Aliasing
+            // here lets one branch handle both forms.
+            //
+            // Codex round-1 fixup: normalize BEFORE `switch_to` /
+            // `touch_user_session` / `try_activate_*_template`. Otherwise the
+            // active gateway topic + session file land on `sites astro` while
+            // the scaffolded prompt + workspace land on `site astro`, and the
+            // gateway runtime's prompt lookup (keyed by active topic) misses
+            // entirely.
+            let normalized_name: std::borrow::Cow<'_, str> = if name == "sites" {
+                std::borrow::Cow::Borrowed("site")
+            } else if let Some(rest) = name.strip_prefix("sites ") {
+                std::borrow::Cow::Owned(format!("site {rest}"))
+            } else {
+                std::borrow::Cow::Borrowed(name)
+            };
+            let name: &str = normalized_name.as_ref();
+
             self.active_sessions
                 .write()
                 .await
@@ -1382,6 +1405,122 @@ mod tests {
         let msg = rx.try_recv().unwrap();
         assert!(msg.content.contains("untitled"));
         assert!(workspace_root.join("slides/untitled/script.js").is_file());
+    }
+
+    // ── /new sites tests (issue #1016 — plural alias parity with ws_slash) ──
+
+    /// `/new sites <preset>` (plural) on the gateway path MUST hit the
+    /// site-scaffold branch, not the generic switch-session arm. PR #1015
+    /// added the same normalization to the WS path; #1016 mirrors it here so
+    /// Telegram/Discord/CLI users who type the plural form by analogy with
+    /// `/new slides …` get scaffolded too.
+    ///
+    /// Without `mofa-site` skill registered in `data_dir`, the scaffold
+    /// itself fails — but the failure surfaces the SITE-scaffold-failed
+    /// shape, not the generic `Switched to session: sites astro` fallback.
+    /// That distinguishing signal is what we assert.
+    #[tokio::test]
+    async fn should_scaffold_site_when_new_sites_preset_command_arrives() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command(
+                "/new sites astro",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+
+        // The site-scaffold branch ran (either succeeded, or failed with
+        // the site-scaffold-specific error shape) — NOT the generic
+        // switch-session fallback for the plural form. Success path
+        // starts with "Site project ... created" (capital S — see
+        // `site_creation_reply`); failure path contains "Site scaffold
+        // failed".
+        let took_site_branch = msg.content.contains("Site scaffold failed")
+            || msg.content.contains("Site project");
+        assert!(
+            took_site_branch,
+            "/new sites <preset> must take the site-scaffold branch, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.starts_with("Switched to session: sites"),
+            "/new sites <preset> must NOT fall into the generic switch-session arm \
+             (alias not normalized?), got: {}",
+            msg.content
+        );
+
+        // Codex round-2: lock down the order-of-operations bug. The
+        // active topic AND session prompt must both land on the
+        // normalized `site astro`, not the plural `sites astro` — if
+        // normalization happens AFTER switch_to/touch_user_session
+        // (round-1 mistake), the active topic stays "sites astro" and
+        // the gateway runtime's prompt lookup (keyed by active topic)
+        // misses entirely while the scaffolded prompt sits under "site
+        // astro".
+        let active = disp
+            .active_sessions
+            .read()
+            .await
+            .get_active_topic(session_key.base_key())
+            .to_string();
+        assert_eq!(
+            active, "site astro",
+            "active topic must be normalized form, got `{active}` — \
+             did normalization run after switch_to?"
+        );
+        assert!(
+            crate::project_templates::read_session_prompt(tmp.path(), "site astro").is_some(),
+            "session prompt must be looked up by the normalized topic"
+        );
+    }
+
+    /// Bare `/new sites` (no preset) — alias still normalizes to `site`,
+    /// hits the site-scaffold branch with empty preset. Same observable
+    /// shape as the cased-form: site-branch error, not generic switch.
+    #[tokio::test]
+    async fn should_normalize_bare_new_sites_to_site_branch() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command(
+                "/new sites",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert!(
+            !msg.content.starts_with("Switched to session: sites"),
+            "bare /new sites must NOT fall into the generic switch-session arm, got: {}",
+            msg.content
+        );
+
+        // Active topic must be the normalized "site" form (see
+        // round-2 codex review on the with-preset case).
+        let active = disp
+            .active_sessions
+            .read()
+            .await
+            .get_active_topic(session_key.base_key())
+            .to_string();
+        assert_eq!(active, "site", "active topic must be normalized to bare `site`");
     }
 
     #[tokio::test]
