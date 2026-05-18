@@ -522,6 +522,11 @@ impl Swarm {
             ),
             input_args: None,
             tool_output: None,
+            // Swarm subtask invocations run AFTER their per-subtask
+            // workspace contract; the dispatcher has no spawn_only file
+            // list of its own to forward. Subtask-level validators that
+            // need a file source should stay on the glob path.
+            spawn_only_files: Vec::new(),
         };
 
         let outcomes = validator.runner.run_all(&invocation, &scoped).await;

@@ -531,6 +531,7 @@ async fn run_completion_validators(
         repo_label: format!("mcp-serve/{contract}"),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = run_workspace_validators(
         &runner,
