@@ -224,7 +224,7 @@ impl ProcessManager {
         };
 
         // Auto-assign Feishu webhook port if needed
-        let feishu_port = match crate::profiles::feishu_webhook_port(profile) {
+        let feishu_port = match crate::profiles::profile_webhook_port(profile) {
             Some(Some(port)) => Some(port),
             Some(None) => Some(self.allocate_webhook_port(&procs)),
             None => None,
