@@ -4427,66 +4427,20 @@ mod tests {
         );
     }
 
-    // --- octos #1036: voice_synthesize + mofa_slides sweep ----------------
+    // --- octos #1036: mofa_slides sweep -----------------------------------
     //
-    // Mirror the octos #1034 podcast happy-path test for the two contracts
-    // that PR #1035 left on the glob path. The failure modes the sweep is
-    // closing:
-    //   - voice_synthesize: plugin writes to a work dir that does not
-    //     match `skill-output/voice/**/*.{mp3,wav}` (e.g. operator-set
-    //     OCTOS_WORK_DIR or a future per-voice subdirectory).
-    //   - mofa_slides: a recursive `**/*.pptx` glob would match unrelated
-    //     stale decks from earlier runs in the same session workspace.
-
-    /// `voice_synthesize` AudioNonSilent must run against the plugin's
-    /// reported file regardless of which subdirectory the WAV/MP3 landed
-    /// in, including a per-voice topic-suffixed path that the legacy glob
-    /// `skill-output/voice/**/*.{mp3,wav}` would not reach.
-    #[tokio::test]
-    async fn voice_synthesize_uses_spawn_only_files_at_non_default_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        // A per-voice directory the legacy glob (`skill-output/voice/**`)
-        // would NOT match — proves the validator consumes the reported
-        // path directly.
-        let voice_dir = dir.path().join("skill-output/voice-yangmi");
-        std::fs::create_dir_all(&voice_dir).unwrap();
-        let wav_path = voice_dir.join("yangmi.wav");
-        write_sine_wav(&wav_path, 800);
-
-        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
-        // Lift the contract verbatim from `for_session()` so we exercise
-        // the production shape end-to-end.
-        let session_policy = crate::workspace_policy::WorkspacePolicy::for_session();
-        let contract = session_policy
-            .spawn_tasks
-            .get("voice_synthesize")
-            .expect("voice_synthesize contract must be registered");
-        let validators: Vec<Validator> = contract
-            .on_completion
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                crate::workspace_policy::SpawnTaskValidatorSpec::into_validator(
-                    entry.clone(),
-                    "voice_synthesize",
-                    i,
-                )
-            })
-            .collect();
-
-        let invocation = ValidatorInvocation::new(
-            ValidatorPhase::Completion,
-            dir.path().to_path_buf(),
-            "voice_synthesize".into(),
-        )
-        .with_spawn_only_files(vec![wav_path]);
-        let outcomes = runner.run_all(&invocation, &validators).await;
-        assert!(
-            outcomes.iter().all(|o| o.status == ValidatorStatus::Pass),
-            "voice_synthesize contract must satisfy via spawn_only_files at a \
-             non-default directory; outcomes = {outcomes:?}",
-        );
-    }
+    // Mirror the octos #1034 podcast happy-path test for the mofa_slides
+    // contract that PR #1035 left on the glob path. Failure mode being
+    // closed: a recursive `**/*.pptx` glob would match unrelated stale
+    // decks from earlier runs in the same session workspace.
+    //
+    // The `voice_synthesize` contract was originally part of this sweep
+    // but was dropped after codex review caught that the voice plugin's
+    // `succeed()` path emits only `{output, success}` (no `files_to_send`)
+    // and its success text `"Generated audio: <path>"` is not one of the
+    // prefixes `PluginTool::detect_output_file` recognises. The validator
+    // would see an empty list and fail. See follow-up issue tracking the
+    // plugin emission fix.
 
     /// `mofa_slides` MagicBytes(Pptx) must run against the plugin's reported
     /// PPTX path verbatim, including outputs at arbitrary depth where the

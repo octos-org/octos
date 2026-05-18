@@ -939,17 +939,6 @@ impl WorkspacePolicy {
 
         // Voice synthesis (LLM-driven TTS): assert the decoded audio is not
         // silent. Catches the "render produced empty audio" failure path.
-        //
-        // octos #1036 (follow-up to #1034 / PR #1035): consume the plugin's
-        // `files_to_send` list directly rather than globbing the workspace.
-        // The legacy glob `skill-output/voice/**/*.{mp3,wav}` was anchored at
-        // a directory the plugin does not actually guarantee — the voice
-        // skill writes to `$OCTOS_WORK_DIR/<filename>.{wav,mp3}` (see
-        // `crates/platform-skills/voice/src/main.rs:558-660`), and any
-        // operator-customised work dir or future per-voice subdirectory
-        // (`skill-output/voice-yangmi/...`) would silently slip past the
-        // validator. `extension = None` keeps both the initial `.wav` and
-        // the converted `.mp3` in scope since the plugin may report either.
         let voice_synthesize_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
             artifacts: Vec::new(),
@@ -962,9 +951,9 @@ impl WorkspacePolicy {
             on_failure: vec!["notify_user:Voice synthesis failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(
                 ValidatorSpec::AudioNonSilent {
-                    glob: String::new(),
+                    glob: "skill-output/voice/**/*.{mp3,wav}".into(),
                     min_ratio: default_non_silent_ratio(),
-                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    source: ValidatorFileSource::Glob,
                     extension: None,
                 },
             )],
@@ -2190,57 +2179,18 @@ ignore = []
         )));
     }
 
-    /// octos #1036 (follow-up to #1034 / PR #1035): both `voice_synthesize`
-    /// and `mofa_slides` must consume the plugin's `files_to_send` envelope
-    /// rather than a hardcoded glob. The legacy globs
-    /// (`skill-output/voice/**/*.{mp3,wav}` and `**/*.pptx`) silently
-    /// missed files whenever the plugin wrote to a directory the policy
-    /// didn't anticipate, the same structural fragility we already fixed
-    /// for `podcast_generate`.
-    #[test]
-    fn session_policy_voice_synthesize_consumes_spawn_only_files_for_octos_1036() {
-        let policy = WorkspacePolicy::for_session();
-        let voice = policy
-            .spawn_tasks
-            .get("voice_synthesize")
-            .expect("voice_synthesize contract");
-
-        let mut saw_audio = false;
-        for entry in &voice.on_completion {
-            if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
-                source,
-                extension,
-                glob,
-                ..
-            }) = entry
-            {
-                assert_eq!(
-                    *source,
-                    ValidatorFileSource::SpawnOnlyFiles,
-                    "voice_synthesize AudioNonSilent must opt into spawn_only_files (octos #1036)"
-                );
-                // The voice plugin emits both WAV and MP3 variants — both must
-                // satisfy the non-silent check, so the extension filter is
-                // intentionally unset.
-                assert!(
-                    extension.is_none(),
-                    "voice_synthesize AudioNonSilent must accept both wav and mp3 \
-                     outputs (extension must remain unset); got: {extension:?}"
-                );
-                assert!(
-                    !glob.contains("skill-output/voice/"),
-                    "voice_synthesize must NOT pin the legacy `skill-output/voice/**` \
-                     glob — that anchor is the bug we are sweeping away; got: {glob}"
-                );
-                saw_audio = true;
-            }
-        }
-        assert!(
-            saw_audio,
-            "voice_synthesize contract must declare AudioNonSilent"
-        );
-    }
-
+    /// octos #1036 (follow-up to #1034 / PR #1035): `mofa_slides` must
+    /// consume the plugin's `files_to_send` envelope rather than a
+    /// hardcoded glob. The legacy `**/*.pptx` glob silently matched stale
+    /// PPTXs from earlier runs in the same session workspace, the same
+    /// structural fragility we already fixed for `podcast_generate`.
+    ///
+    /// `voice_synthesize` was originally part of this sweep but was
+    /// dropped after codex review caught that the voice plugin's
+    /// `succeed()` path emits only `{output, success}` (no
+    /// `files_to_send`) and the success text `"Generated audio: <path>"`
+    /// is not one of the prefixes `PluginTool::detect_output_file`
+    /// recognises. See follow-up issue tracking the plugin emission fix.
     #[test]
     fn session_policy_mofa_slides_consumes_spawn_only_files_for_octos_1036() {
         let policy = WorkspacePolicy::for_session();

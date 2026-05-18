@@ -51,25 +51,19 @@ on_completion = [
 ]
 on_failure = ["notify_user:Voice registration failed"]
 
-# octos #1036 (follow-up to #1034): voice_synthesize + mofa_slides now also
-# opt into the `spawn_only_files` source so the validator consumes the
-# plugin's reported file list rather than globbing the workspace. The
-# voice contract leaves `extension` unset because the plugin emits both
-# `.wav` (initial PCM render) and `.mp3` (post-convert) variants and both
-# must satisfy the non-silent-audio check; the slides contract pins
-# `extension = "pptx"` so auxiliary preview files emitted alongside the
-# deck don't trip the magic-bytes check.
-[spawn_tasks.voice_synthesize]
-artifact = "primary_audio"
-on_verify = [
-    "file_exists:$artifact",
-    "file_size_min:$artifact:1024",
-]
-on_failure = ["notify_user:Voice synthesis failed"]
-on_completion = [
-    { kind = "audio_non_silent", source = "spawn_only_files", min_ratio = 0.3 },
-]
-
+# octos #1036 (follow-up to #1034): mofa_slides now opts into the
+# `spawn_only_files` source so the magic-bytes check inspects the exact
+# PPTX path the plugin reported instead of any `**/*.pptx` match in the
+# session workspace. The `extension = "pptx"` filter narrows the list to
+# slide decks if the skill surfaces auxiliary preview files via
+# `files_to_send`.
+#
+# `voice_synthesize` was originally part of this sweep but was reverted
+# after codex review caught that the voice plugin's `succeed()` path
+# emits only `{output, success}` (no `files_to_send`) and its success
+# text `"Generated audio: <path>"` is not one of the prefixes
+# `PluginTool::detect_output_file` recognises. A follow-up issue tracks
+# the plugin emission fix.
 [spawn_tasks.mofa_slides]
 on_completion = [
     { kind = "magic_bytes", source = "spawn_only_files", extension = "pptx", format = "pptx" },
