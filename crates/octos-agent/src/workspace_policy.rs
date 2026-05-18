@@ -1011,6 +1011,20 @@ impl WorkspacePolicy {
         // (`**/*.pptx`) is the same recursive pattern the on-completion
         // MagicBytes validator uses, so the two checks see a consistent
         // set of paths.
+        //
+        // octos #1036 (follow-up to #1034 / PR #1035): consume the plugin's
+        // `files_to_send` envelope so the MagicBytes check runs against the
+        // exact PPTX path the skill reported, not whatever happens to match
+        // a recursive `**/*.pptx` glob. Two failure modes the prior glob
+        // could mask:
+        //   1. A stale `.pptx` from an earlier run in the same session
+        //      workspace passing the contract for a freshly-failed call.
+        //   2. The plugin writing the deck to a non-default subdirectory
+        //      that an operator-customised workspace policy would otherwise
+        //      need to anticipate in its glob.
+        // The `extension = "pptx"` filter narrows the file list to slide
+        // decks if the skill also surfaces auxiliary files (preview PNGs,
+        // etc.) via `files_to_send`.
         let mofa_slides_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("slides_pptx".into()),
             artifacts: Vec::new(),
@@ -1019,10 +1033,10 @@ impl WorkspacePolicy {
             on_deliver: vec![],
             on_failure: vec!["notify_user:Slide generation failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                glob: "**/*.pptx".into(),
+                glob: String::new(),
                 format: MagicByteKind::Pptx,
-                source: ValidatorFileSource::Glob,
-                extension: None,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("pptx".into()),
             })],
         };
 
@@ -2163,6 +2177,62 @@ ignore = []
                 ..
             })
         )));
+    }
+
+    /// octos #1036 (follow-up to #1034 / PR #1035): `mofa_slides` must
+    /// consume the plugin's `files_to_send` envelope rather than a
+    /// hardcoded glob. The legacy `**/*.pptx` glob silently matched stale
+    /// PPTXs from earlier runs in the same session workspace, the same
+    /// structural fragility we already fixed for `podcast_generate`.
+    ///
+    /// `voice_synthesize` was originally part of this sweep but was
+    /// dropped after codex review caught that the voice plugin's
+    /// `succeed()` path emits only `{output, success}` (no
+    /// `files_to_send`) and the success text `"Generated audio: <path>"`
+    /// is not one of the prefixes `PluginTool::detect_output_file`
+    /// recognises. See follow-up issue tracking the plugin emission fix.
+    #[test]
+    fn session_policy_mofa_slides_consumes_spawn_only_files_for_octos_1036() {
+        let policy = WorkspacePolicy::for_session();
+        let slides = policy
+            .spawn_tasks
+            .get("mofa_slides")
+            .expect("mofa_slides contract");
+
+        let mut saw_magic = false;
+        for entry in &slides.on_completion {
+            if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                source,
+                extension,
+                format,
+                glob,
+                ..
+            }) = entry
+            {
+                assert_eq!(*format, MagicByteKind::Pptx);
+                assert_eq!(
+                    *source,
+                    ValidatorFileSource::SpawnOnlyFiles,
+                    "mofa_slides MagicBytes must opt into spawn_only_files (octos #1036)"
+                );
+                assert_eq!(
+                    extension.as_deref(),
+                    Some("pptx"),
+                    "mofa_slides MagicBytes must filter to pptx outputs so auxiliary \
+                     files in files_to_send don't trip the check"
+                );
+                assert!(
+                    !glob.contains("**/*.pptx"),
+                    "mofa_slides must NOT pin a `**/*.pptx` glob — the spawn_only_files \
+                     source consumes the reported path directly; got: {glob}"
+                );
+                saw_magic = true;
+            }
+        }
+        assert!(
+            saw_magic,
+            "mofa_slides contract must declare MagicBytes(Pptx)"
+        );
     }
 
     #[test]
