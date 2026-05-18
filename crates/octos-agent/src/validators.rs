@@ -35,7 +35,9 @@ use tracing::{debug, warn};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::tools::{ToolRegistry, ToolResult};
-use crate::workspace_policy::{MagicByteKind, Validator, ValidatorPhaseKind, ValidatorSpec};
+use crate::workspace_policy::{
+    MagicByteKind, Validator, ValidatorFileSource, ValidatorPhaseKind, ValidatorSpec,
+};
 
 /// Current schema version for [`ValidatorOutcome`] persistence.
 pub const VALIDATOR_RESULT_SCHEMA_VERSION: u32 = 1;
@@ -172,6 +174,18 @@ pub struct ValidatorInvocation {
     /// envelope. Used by `${output.<key>}` interpolation; absent when the
     /// tool emitted no named outputs (most legacy plugins).
     pub tool_output: Option<serde_json::Value>,
+    /// Optional `files_to_send` list from the originating spawn_only tool's
+    /// stdout envelope (the plugin protocol's authoritative list of files
+    /// the skill just produced). Consumed by file-list-driven validators
+    /// (`MagicBytes`, `AudioNonSilent`, `PerFileNonSilent`) when their spec
+    /// declares `source = "spawn_only_files"` — see issue octos #1034.
+    ///
+    /// Absent (defaulted to an empty `Vec`) for non-spawn contexts and for
+    /// spawn_only tools that emit no files. Validators that consult this
+    /// list and find it empty surface a `Fail` outcome so misconfigured
+    /// policies (e.g. opting into `spawn_only_files` from a turn-end
+    /// validator that has no plugin output) are caught early.
+    pub spawn_only_files: Vec<PathBuf>,
 }
 
 impl ValidatorInvocation {
@@ -184,6 +198,7 @@ impl ValidatorInvocation {
             repo_label,
             input_args: None,
             tool_output: None,
+            spawn_only_files: Vec::new(),
         }
     }
 
@@ -198,6 +213,14 @@ impl ValidatorInvocation {
     /// `${output.<key>}` template interpolation by domain validators.
     pub fn with_tool_output(mut self, output: serde_json::Value) -> Self {
         self.tool_output = Some(output);
+        self
+    }
+
+    /// Attach the plugin-reported `files_to_send` list so file-list-driven
+    /// validators with `source = "spawn_only_files"` (issue octos #1034)
+    /// can consume the authoritative path set the spawn_only tool emitted.
+    pub fn with_spawn_only_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.spawn_only_files = files;
         self
     }
 }
@@ -519,25 +542,53 @@ impl ValidatorRunner {
                     )
                     .await
                 }
-                ValidatorSpec::AudioNonSilent { glob, min_ratio } => self.run_audio_non_silent(
-                    invocation, validator, glob, *min_ratio, started_at, started,
+                ValidatorSpec::AudioNonSilent {
+                    glob,
+                    min_ratio,
+                    source,
+                    extension,
+                } => self.run_audio_non_silent(
+                    invocation,
+                    validator,
+                    glob,
+                    *min_ratio,
+                    *source,
+                    extension.as_deref(),
+                    started_at,
+                    started,
                 ),
                 ValidatorSpec::PerFileNonSilent {
                     glob,
                     min_ratio,
                     require_at_least,
+                    source,
+                    extension,
                 } => self.run_per_file_non_silent(
                     invocation,
                     validator,
                     glob,
                     *min_ratio,
                     *require_at_least,
+                    *source,
+                    extension.as_deref(),
                     started_at,
                     started,
                 ),
-                ValidatorSpec::MagicBytes { glob, format } => {
-                    self.run_magic_bytes(invocation, validator, glob, *format, started_at, started)
-                }
+                ValidatorSpec::MagicBytes {
+                    glob,
+                    format,
+                    source,
+                    extension,
+                } => self.run_magic_bytes(
+                    invocation,
+                    validator,
+                    glob,
+                    *format,
+                    *source,
+                    extension.as_deref(),
+                    started_at,
+                    started,
+                ),
                 ValidatorSpec::HttpProbeUntil {
                     url_template,
                     expected_status,
@@ -1093,46 +1144,36 @@ impl ValidatorRunner {
     }
 
     /// Run an AudioNonSilent validator.
+    #[allow(clippy::too_many_arguments)]
     fn run_audio_non_silent(
         &self,
         invocation: &ValidatorInvocation,
         validator: &Validator,
         pattern: &str,
         min_ratio: f32,
+        source: ValidatorFileSource,
+        extension: Option<&str>,
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        // Interpolate `${args.X}` / `${output.X}` so policies can scope the
-        // glob to a per-invocation output dir (e.g.
-        // `${output.audio_dir}/**/*.wav`). A missing key is a hard error.
-        let resolved_pattern = match interpolate_template(
+        // Resolve the candidate file list. For `source = "glob"` (legacy
+        // default) the validator interpolates the glob and matches it
+        // against the workspace root. For `source = "spawn_only_files"`
+        // (issue octos #1034) the validator consumes the plugin-reported
+        // `files_to_send` list verbatim, optionally narrowed by extension —
+        // see [`resolve_validator_files`] for the shared resolution rules.
+        let (matches, pattern_for_diagnostics) = match resolve_validator_files(
+            invocation,
             pattern,
-            invocation.input_args.as_ref(),
-            invocation.tool_output.as_ref(),
+            source,
+            extension,
+            FileResolutionMode::TemplateBoth,
+            "audio_non_silent",
         ) {
-            Ok(value) => value,
-            Err(reason) => {
-                return self.make_outcome(
-                    invocation,
-                    validator,
-                    ValidatorStatus::Error,
-                    reason,
-                    started_at,
-                    started,
-                );
-            }
-        };
-        let matches = match glob_files(&invocation.workspace_root, &resolved_pattern) {
-            Ok(matches) => matches,
-            Err(reason) => {
-                return self.make_outcome(
-                    invocation,
-                    validator,
-                    ValidatorStatus::Error,
-                    reason,
-                    started_at,
-                    started,
-                );
+            Ok(resolution) => resolution,
+            Err(FileResolutionError { status, reason }) => {
+                return self
+                    .make_outcome(invocation, validator, status, reason, started_at, started);
             }
         };
         if matches.is_empty() {
@@ -1140,7 +1181,7 @@ impl ValidatorRunner {
                 invocation,
                 validator,
                 ValidatorStatus::Fail,
-                format!("audio_non_silent: no files matched '{resolved_pattern}'"),
+                format!("audio_non_silent: no files matched '{pattern_for_diagnostics}'"),
                 started_at,
                 started,
             );
@@ -1200,38 +1241,30 @@ impl ValidatorRunner {
         pattern: &str,
         min_ratio: f32,
         require_at_least: usize,
+        source: ValidatorFileSource,
+        extension: Option<&str>,
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        // Interpolate `${args.X}` ONLY (rejects path-traversal segments and
-        // absolute-path arg values). `${output.X}` is intentionally not
-        // supported here — callers wanting tool-output-driven globs should
-        // use the whole-file `AudioNonSilent` variant.
-        let resolved_pattern = match interpolate_args_path(pattern, invocation.input_args.as_ref())
-        {
-            Ok(value) => value,
-            Err(reason) => {
-                return self.make_outcome(
-                    invocation,
-                    validator,
-                    ValidatorStatus::Error,
-                    reason,
-                    started_at,
-                    started,
-                );
-            }
-        };
-        let matches = match glob_files(&invocation.workspace_root, &resolved_pattern) {
-            Ok(matches) => matches,
-            Err(reason) => {
-                return self.make_outcome(
-                    invocation,
-                    validator,
-                    ValidatorStatus::Error,
-                    reason,
-                    started_at,
-                    started,
-                );
+        // Resolve the candidate file list. Glob mode interpolates `${args.X}`
+        // ONLY (rejects path-traversal segments and absolute-path arg
+        // values). `${output.X}` is intentionally not supported in glob mode
+        // here — callers wanting tool-output-driven globs should use the
+        // whole-file `AudioNonSilent` variant. `spawn_only_files` mode
+        // (octos #1034) bypasses interpolation entirely and consumes the
+        // plugin-reported file list verbatim.
+        let (matches, _resolved_pattern) = match resolve_validator_files(
+            invocation,
+            pattern,
+            source,
+            extension,
+            FileResolutionMode::TemplateArgsOnly,
+            "per_file_non_silent",
+        ) {
+            Ok(resolution) => resolution,
+            Err(FileResolutionError { status, reason }) => {
+                return self
+                    .make_outcome(invocation, validator, status, reason, started_at, started);
             }
         };
 
@@ -1300,45 +1333,35 @@ impl ValidatorRunner {
     }
 
     /// Run a MagicBytes validator.
+    #[allow(clippy::too_many_arguments)]
     fn run_magic_bytes(
         &self,
         invocation: &ValidatorInvocation,
         validator: &Validator,
         pattern: &str,
         kind: MagicByteKind,
+        source: ValidatorFileSource,
+        extension: Option<&str>,
         started_at: DateTime<Utc>,
         started: Instant,
     ) -> ValidatorOutcome {
-        // Interpolate `${args.X}` / `${output.X}` so policies can pin the
-        // glob to a tool-emitted output path. Missing key → Error outcome.
-        let resolved_pattern = match interpolate_template(
+        // Resolve the candidate file list. Glob mode interpolates
+        // `${args.X}` / `${output.X}` so policies can pin the glob to a
+        // tool-emitted output path. `spawn_only_files` mode (octos #1034)
+        // bypasses interpolation and consumes the plugin-reported file list
+        // verbatim.
+        let (matches, pattern_for_diagnostics) = match resolve_validator_files(
+            invocation,
             pattern,
-            invocation.input_args.as_ref(),
-            invocation.tool_output.as_ref(),
+            source,
+            extension,
+            FileResolutionMode::TemplateBoth,
+            "magic_bytes",
         ) {
-            Ok(value) => value,
-            Err(reason) => {
-                return self.make_outcome(
-                    invocation,
-                    validator,
-                    ValidatorStatus::Error,
-                    reason,
-                    started_at,
-                    started,
-                );
-            }
-        };
-        let matches = match glob_files(&invocation.workspace_root, &resolved_pattern) {
-            Ok(matches) => matches,
-            Err(reason) => {
-                return self.make_outcome(
-                    invocation,
-                    validator,
-                    ValidatorStatus::Error,
-                    reason,
-                    started_at,
-                    started,
-                );
+            Ok(resolution) => resolution,
+            Err(FileResolutionError { status, reason }) => {
+                return self
+                    .make_outcome(invocation, validator, status, reason, started_at, started);
             }
         };
         if matches.is_empty() {
@@ -1346,7 +1369,7 @@ impl ValidatorRunner {
                 invocation,
                 validator,
                 ValidatorStatus::Fail,
-                format!("magic_bytes: no files matched '{resolved_pattern}'"),
+                format!("magic_bytes: no files matched '{pattern_for_diagnostics}'"),
                 started_at,
                 started,
             );
@@ -2007,6 +2030,128 @@ async fn fetch_ominix_voices(url: &str, timeout_ms: u64) -> Result<Vec<String>, 
     Ok(names)
 }
 
+/// Template-interpolation flavour used by [`resolve_validator_files`].
+///
+/// Mirrors the per-variant interpolation rules already in place before octos
+/// #1034: `MagicBytes` / `AudioNonSilent` substitute both `${args.X}` and
+/// `${output.X}`, while `PerFileNonSilent` substitutes `${args.X}` only via
+/// the path-traversal-safe [`interpolate_args_path`] helper.
+#[derive(Clone, Copy, Debug)]
+enum FileResolutionMode {
+    /// Interpolate both `${args.X}` and `${output.X}`. Used by `MagicBytes`
+    /// and `AudioNonSilent`.
+    TemplateBoth,
+    /// Interpolate `${args.X}` only via [`interpolate_args_path`]. Used by
+    /// `PerFileNonSilent`.
+    TemplateArgsOnly,
+}
+
+/// Error returned by [`resolve_validator_files`] when the file list cannot be
+/// produced (interpolation failure, invalid glob, etc.). The caller surfaces
+/// `status` + `reason` directly through `make_outcome`.
+#[derive(Clone, Debug)]
+struct FileResolutionError {
+    status: ValidatorStatus,
+    reason: String,
+}
+
+/// Resolve the candidate file list for a file-list-driven validator
+/// (`MagicBytes`, `AudioNonSilent`, `PerFileNonSilent`).
+///
+/// * `ValidatorFileSource::Glob` (legacy default) — interpolates the
+///   `pattern` per `mode` and matches the resolved glob against
+///   `invocation.workspace_root` via [`glob_files`]. Returns the matched
+///   path list and the resolved pattern (for diagnostics).
+/// * `ValidatorFileSource::SpawnOnlyFiles` (octos #1034) — bypasses the glob
+///   entirely and consumes `invocation.spawn_only_files` verbatim. If
+///   `extension` is set, only files whose extension matches (case-
+///   insensitive, no leading dot) are returned. The diagnostic pattern is
+///   synthesized from the optional extension filter so failure messages
+///   remain interpretable. Files that do NOT exist on disk are filtered out
+///   so the contract treats a stale `files_to_send` entry the same way the
+///   glob path treats a missing match.
+fn resolve_validator_files(
+    invocation: &ValidatorInvocation,
+    pattern: &str,
+    source: ValidatorFileSource,
+    extension: Option<&str>,
+    mode: FileResolutionMode,
+    validator_kind: &str,
+) -> Result<(Vec<PathBuf>, String), FileResolutionError> {
+    match source {
+        ValidatorFileSource::Glob => {
+            let resolved_pattern = match mode {
+                FileResolutionMode::TemplateBoth => interpolate_template(
+                    pattern,
+                    invocation.input_args.as_ref(),
+                    invocation.tool_output.as_ref(),
+                ),
+                FileResolutionMode::TemplateArgsOnly => {
+                    interpolate_args_path(pattern, invocation.input_args.as_ref())
+                }
+            }
+            .map_err(|reason| FileResolutionError {
+                status: ValidatorStatus::Error,
+                reason,
+            })?;
+            let matches =
+                glob_files(&invocation.workspace_root, &resolved_pattern).map_err(|reason| {
+                    FileResolutionError {
+                        status: ValidatorStatus::Error,
+                        reason,
+                    }
+                })?;
+            Ok((matches, resolved_pattern))
+        }
+        ValidatorFileSource::SpawnOnlyFiles => {
+            let normalized_ext = extension.map(normalize_extension_suffix);
+            let mut matches = Vec::new();
+            for path in &invocation.spawn_only_files {
+                if let Some(ref required) = normalized_ext {
+                    let actual = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if &actual != required {
+                        continue;
+                    }
+                }
+                if path.is_file() {
+                    matches.push(path.clone());
+                }
+            }
+            let diagnostic_pattern = match normalized_ext.as_deref() {
+                Some(ext) => format!("spawn_only_files (extension={ext})"),
+                None => "spawn_only_files".to_string(),
+            };
+            // Surface a helpful Error outcome if a misconfigured policy
+            // opts into `spawn_only_files` but the validator runs in a
+            // context without any plugin-reported files (e.g. a turn-end
+            // pass). The caller turns the empty list into a domain-specific
+            // Fail message; this branch fires ONLY when the policy itself
+            // is asking for a list the invocation cannot produce.
+            if invocation.spawn_only_files.is_empty() {
+                return Err(FileResolutionError {
+                    status: ValidatorStatus::Fail,
+                    reason: format!(
+                        "{validator_kind}: source = \"spawn_only_files\" requested but the spawn_only \
+                         tool emitted no files_to_send"
+                    ),
+                });
+            }
+            Ok((matches, diagnostic_pattern))
+        }
+    }
+}
+
+/// Normalize an extension filter (`"mp3"`, `".MP3"`, `"Mp3"`) to a lowercase
+/// no-leading-dot form so [`resolve_validator_files`] can compare against
+/// `PathBuf::extension()` output uniformly.
+fn normalize_extension_suffix(ext: &str) -> String {
+    ext.trim_start_matches('.').to_ascii_lowercase()
+}
+
 /// Resolve a glob pattern against `workspace_root` and return matching files
 /// (skipping directories).
 fn glob_files(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>, String> {
@@ -2426,7 +2571,9 @@ mod tests {
         assert_eq!(
             validator_kind_label(&ValidatorSpec::AudioNonSilent {
                 glob: "*.wav".into(),
-                min_ratio: 0.3
+                min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             }),
             "audio_non_silent"
         );
@@ -2435,6 +2582,8 @@ mod tests {
                 glob: "**/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             }),
             "per_file_non_silent"
         );
@@ -2442,6 +2591,8 @@ mod tests {
             validator_kind_label(&ValidatorSpec::MagicBytes {
                 glob: "*.mp3".into(),
                 format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             }),
             "magic_bytes"
         );
@@ -2775,6 +2926,8 @@ mod tests {
             ValidatorSpec::AudioNonSilent {
                 glob: "*.wav".into(),
                 min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -2799,6 +2952,8 @@ mod tests {
             ValidatorSpec::AudioNonSilent {
                 glob: "*.wav".into(),
                 min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -2820,6 +2975,8 @@ mod tests {
             ValidatorSpec::MagicBytes {
                 glob: "*.mp3".into(),
                 format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -2839,6 +2996,8 @@ mod tests {
             ValidatorSpec::MagicBytes {
                 glob: "*.mp3".into(),
                 format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -3470,6 +3629,8 @@ mod tests {
             ValidatorSpec::MagicBytes {
                 glob: "${output.dir}/*.png".into(),
                 format: crate::workspace_policy::MagicByteKind::Png,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let invocation = ValidatorInvocation::new(
@@ -3495,6 +3656,8 @@ mod tests {
             ValidatorSpec::AudioNonSilent {
                 glob: "${output.audio_dir}/*.wav".into(),
                 min_ratio: 0.3,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let invocation = ValidatorInvocation::new(
@@ -3841,6 +4004,8 @@ mod tests {
                 glob: "**/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -3874,6 +4039,8 @@ mod tests {
                 glob: "**/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -3911,6 +4078,8 @@ mod tests {
                 glob: "**/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -3941,6 +4110,8 @@ mod tests {
                 glob: "**/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 0,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -3966,6 +4137,8 @@ mod tests {
                 glob: "${args.episode_dir}/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let invocation = dummy_invocation(dir.path().to_path_buf())
@@ -3987,6 +4160,8 @@ mod tests {
                 glob: "${args.episode_dir}/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let invocation = dummy_invocation(dir.path().to_path_buf())
@@ -4026,6 +4201,8 @@ mod tests {
                 glob: "**/segments/seg_*.wav".into(),
                 min_ratio: 0.3,
                 require_at_least: 1,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             },
         );
         let outcomes = runner
@@ -4035,6 +4212,217 @@ mod tests {
         assert!(
             outcomes[0].reason.contains("1 match"),
             "glob must match exactly 1 dialogue segment, not the 4 files on disk: {}",
+            outcomes[0].reason
+        );
+    }
+
+    // --- octos #1034: source = "spawn_only_files" --------------------------
+    //
+    // The validator family below covers the file-list-driven source that
+    // replaces the legacy glob when a contract opts in via
+    // `source = "spawn_only_files"`. The plugin protocol's `files_to_send`
+    // (already captured by `enforce_spawn_task_contract` and threaded into
+    // `ValidatorInvocation::spawn_only_files`) is the authoritative path
+    // set the skill produced — globbing the workspace can no longer race
+    // the topic-suffixed output directory naming.
+
+    /// MagicBytes + AudioNonSilent must accept a `files_to_send` list and
+    /// run their checks against each file directly, bypassing the glob.
+    /// This is the canonical happy-path for the octos #1034 refactor.
+    #[tokio::test]
+    async fn magic_bytes_uses_spawn_only_files_when_source_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        // Topic-suffixed directory — the exact failure mode from the
+        // mini5 trace (chat topic 《逐玉》 → `mofa-podcast-zhuyu/`). A glob
+        // anchored at `skill-output/mofa-podcast/` would never reach this.
+        let podcast_dir = dir.path().join("skill-output/mofa-podcast-zhuyu");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        let mp3_path = podcast_dir.join("podcast_full_1779067937.mp3");
+        let mut bytes = b"ID3".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 128));
+        std::fs::write(&mp3_path, &bytes).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_spawn_only",
+            ValidatorSpec::MagicBytes {
+                // Glob is intentionally something that would NOT match
+                // anything on disk — proving the validator does not fall
+                // back to the glob path.
+                glob: String::new(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("mp3".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![mp3_path]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    #[tokio::test]
+    async fn audio_non_silent_uses_spawn_only_files_when_source_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let podcast_dir = dir.path().join("skill-output/mofa-podcast-zhuyu");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        // WAV here so the audio decoder path runs without the optional
+        // `audio_mp3` feature gate.
+        let wav_path = podcast_dir.join("podcast_full_1779067937.wav");
+        write_sine_wav(&wav_path, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "audio_non_silent_spawn_only",
+            ValidatorSpec::AudioNonSilent {
+                glob: String::new(),
+                min_ratio: 0.3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("wav".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![wav_path]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// PerFileNonSilent also accepts the file list verbatim (for callers
+    /// whose intermediate artifacts ARE in `files_to_send`).
+    #[tokio::test]
+    async fn per_file_non_silent_uses_spawn_only_files_when_source_opted_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let podcast_dir = dir.path().join("skill-output/mofa-podcast-zhuyu/segments");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        let a = podcast_dir.join("seg_000.wav");
+        let b = podcast_dir.join("seg_001.wav");
+        write_sine_wav(&a, 800);
+        write_sine_wav(&b, 800);
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "per_file_spawn_only",
+            ValidatorSpec::PerFileNonSilent {
+                glob: String::new(),
+                min_ratio: 0.3,
+                require_at_least: 2,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("wav".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![a, b]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// The extension filter must distinguish files by suffix so a contract
+    /// can pin "the mp3" without false-matching adjacent WAV intermediates
+    /// that may also live in `files_to_send`.
+    #[tokio::test]
+    async fn spawn_only_files_extension_filter_distinguishes_mp3_from_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let topic_dir = dir.path().join("skill-output/mofa-podcast-zhuyu");
+        std::fs::create_dir_all(&topic_dir).unwrap();
+        // Two files emitted by the plugin: an MP3 (the real deliverable)
+        // and a WAV intermediate the plugin also chose to expose.
+        let mp3 = topic_dir.join("podcast_full.mp3");
+        let mut bytes = b"ID3".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 128));
+        std::fs::write(&mp3, &bytes).unwrap();
+        let wav = topic_dir.join("podcast_full.wav");
+        // Write a NON-mp3 byte pattern (RIFF/WAVE-shaped) so the magic
+        // check on the wav file would fail if it leaked through the
+        // filter — proving the extension filter actually gates the input.
+        std::fs::write(&wav, b"RIFF\0\0\0\0WAVE").unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_mp3_only",
+            ValidatorSpec::MagicBytes {
+                glob: String::new(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("mp3".into()),
+            },
+        );
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        // Both files are reported by the plugin — the filter selects the mp3.
+        .with_spawn_only_files(vec![mp3, wav]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// Regression guard: existing contracts that did NOT opt in keep the
+    /// glob path verbatim. The `spawn_only_files` invocation attached to
+    /// the call must not be consulted when `source = "glob"` (the default).
+    #[tokio::test]
+    async fn glob_source_still_used_when_not_opted_in_even_with_files_to_send_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_path = dir.path().join("a.png");
+        std::fs::write(&real_path, PNG_1X1).unwrap();
+
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_legacy_glob",
+            ValidatorSpec::MagicBytes {
+                glob: "*.png".into(),
+                format: crate::workspace_policy::MagicByteKind::Png,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        );
+        // Attach a `files_to_send` list pointing at a DIFFERENT path that
+        // does not exist on disk. The validator must ignore the list and
+        // still satisfy via the glob match.
+        let invocation = ValidatorInvocation::new(
+            ValidatorPhase::Completion,
+            dir.path().to_path_buf(),
+            "test".into(),
+        )
+        .with_spawn_only_files(vec![dir.path().join("nonexistent.png")]);
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Pass, "{outcomes:?}");
+    }
+
+    /// A contract that opts into `spawn_only_files` from a context where
+    /// the spawn_only tool emitted no files must Fail (not Pass via empty
+    /// match) so a misconfigured policy surfaces early.
+    #[tokio::test]
+    async fn spawn_only_files_source_fails_when_files_to_send_list_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ValidatorRunner::new(Arc::new(ToolRegistry::new()), dir.path().to_path_buf());
+        let validator = validator_with_spec(
+            "magic_bytes_no_files",
+            ValidatorSpec::MagicBytes {
+                glob: String::new(),
+                format: crate::workspace_policy::MagicByteKind::Mp3,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("mp3".into()),
+            },
+        );
+        let invocation = dummy_invocation(dir.path().to_path_buf());
+        let outcomes = runner.run_all(&invocation, &[validator]).await;
+        assert_eq!(outcomes[0].status, ValidatorStatus::Fail, "{outcomes:?}");
+        assert!(
+            outcomes[0].reason.contains("spawn_only_files"),
+            "reason should surface the source: {}",
             outcomes[0].reason
         );
     }

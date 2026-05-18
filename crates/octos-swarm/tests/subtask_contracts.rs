@@ -107,6 +107,7 @@ fn aggregate_validator(
         repo_label: "swarm-subtask-test".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     AggregateValidator {
         runner,

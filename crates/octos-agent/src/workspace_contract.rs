@@ -206,6 +206,11 @@ pub async fn enforce_spawn_task_contract_with_args_and_output(
         ValidatorPhase::Completion,
         input_args.cloned(),
         tool_named_outputs.cloned(),
+        // octos #1034: forward the plugin's `files_to_send` so the
+        // file-list-driven validators (`MagicBytes`, `AudioNonSilent`,
+        // `PerFileNonSilent`) declaring `source = "spawn_only_files"`
+        // can consume the authoritative path set the skill emitted.
+        Some(files_to_send.to_vec()),
     )
     .await
     {
@@ -563,6 +568,7 @@ pub async fn run_declared_validators(
         phase,
         input_args,
         None,
+        None,
     )
     .await
 }
@@ -572,6 +578,14 @@ pub async fn run_declared_validators(
 /// domain validators can resolve `${output.<key>}` references against
 /// tool-emitted values (e.g. `mofa_publish` emitting `deploy_url` for the
 /// HttpProbe to call).
+///
+/// `spawn_only_files` is the plugin-reported `files_to_send` list from the
+/// originating spawn_only tool. Consumed by file-list-driven validators
+/// (`MagicBytes`, `AudioNonSilent`, `PerFileNonSilent`) when their spec
+/// declares `source = "spawn_only_files"` (octos #1034). Pass `None` for
+/// callers that have no plugin output to forward (turn-end validators,
+/// non-spawn contexts).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_declared_validators_with_output(
     tools: &ToolRegistry,
     workspace_root: &Path,
@@ -580,6 +594,7 @@ pub async fn run_declared_validators_with_output(
     phase: ValidatorPhase,
     input_args: Option<serde_json::Value>,
     tool_output: Option<serde_json::Value>,
+    spawn_only_files: Option<Vec<PathBuf>>,
 ) -> Result<Vec<ValidatorOutcome>, String> {
     if validators.is_empty() {
         return Ok(Vec::new());
@@ -621,6 +636,7 @@ pub async fn run_declared_validators_with_output(
         repo_label: repo_label_hint.to_string(),
         input_args,
         tool_output,
+        spawn_only_files: spawn_only_files.unwrap_or_default(),
     };
 
     let outcomes = runner.run_all(&invocation, &scoped).await;
@@ -1947,12 +1963,27 @@ mod tests {
         for entry in task.on_completion.iter_mut() {
             if let SpawnTaskValidatorSpec::Bare(spec) = entry {
                 match spec {
-                    ValidatorSpec::AudioNonSilent { glob, .. } => {
+                    ValidatorSpec::AudioNonSilent { glob, source, .. } => {
                         *glob = "skill-output/mofa-podcast/*.wav".into();
+                        // Switch the helper to glob mode so this contract
+                        // test still drives the validator off a filesystem
+                        // scan even when the production policy uses
+                        // `spawn_only_files` (octos #1034).
+                        *source = crate::workspace_policy::ValidatorFileSource::Glob;
                     }
-                    ValidatorSpec::MagicBytes { glob, format } => {
+                    ValidatorSpec::MagicBytes {
+                        glob,
+                        format,
+                        source,
+                        ..
+                    } => {
                         *glob = "skill-output/mofa-podcast/*.wav".into();
                         *format = MagicByteKind::Wav;
+                        // Switch the helper to glob mode so this contract
+                        // test still drives the validator off a filesystem
+                        // scan even when the production policy uses
+                        // `spawn_only_files` (octos #1034).
+                        *source = crate::workspace_policy::ValidatorFileSource::Glob;
                     }
                     _ => {}
                 }

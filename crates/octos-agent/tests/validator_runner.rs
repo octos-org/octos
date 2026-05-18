@@ -143,6 +143,7 @@ async fn should_block_ready_when_required_command_validator_fails() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -179,6 +180,7 @@ async fn should_warn_but_not_block_when_optional_validator_fails() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -212,6 +214,7 @@ async fn should_record_duration_and_evidence_path_for_command_validator() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -252,6 +255,7 @@ async fn should_expose_stderr_in_outcome_for_operator_visibility() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -302,6 +306,7 @@ async fn should_kill_child_process_on_validator_timeout() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
 
     let before = std::time::Instant::now();
@@ -353,6 +358,7 @@ async fn should_pass_file_exists_validator_when_file_meets_size_floor() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -377,6 +383,7 @@ async fn should_fail_file_exists_validator_when_size_under_floor() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -396,6 +403,7 @@ async fn should_pass_tool_call_validator_when_tool_succeeds() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -414,6 +422,7 @@ async fn should_fail_tool_call_validator_when_tool_reports_unsuccessful() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
@@ -442,6 +451,7 @@ async fn should_persist_outcomes_and_replay_them_byte_for_byte() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let original = runner.run_all(&invocation, &validators).await;
     assert_eq!(original.len(), 2);
@@ -496,6 +506,7 @@ async fn should_strip_blocked_env_vars_from_command_validator_child() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     // Invoke via a helper that pre-seeds LD_PRELOAD on the spawned command.
     runner
@@ -758,6 +769,7 @@ async fn should_block_command_validator_with_dangerous_pattern() {
         repo_label: "slides/demo".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let outcomes = runner.run_all(&invocation, &validators).await;
 
