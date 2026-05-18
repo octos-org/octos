@@ -246,6 +246,44 @@ fn is_default_phase(phase: &ValidatorPhaseKind) -> bool {
     *phase == ValidatorPhaseKind::default()
 }
 
+/// Where a file-list-driven validator (`MagicBytes`, `AudioNonSilent`,
+/// `PerFileNonSilent`) sources its candidate file paths.
+///
+/// Defaults to [`ValidatorFileSource::Glob`] so existing TOML contracts keep
+/// their historic behaviour: the validator resolves the `glob` field against
+/// the workspace root. Opting into [`ValidatorFileSource::SpawnOnlyFiles`]
+/// tells the validator to use the originating spawn_only tool's
+/// `files_to_send` list verbatim (the plugin protocol's authoritative list
+/// of files the skill just produced), optionally filtered by an extension
+/// suffix.
+///
+/// Issue octos #1034: the topic-suffixed plugin output paths
+/// (e.g. `mofa-podcast-zhuyu/`) break globbing because the per-topic
+/// directory name is unpredictable. `files_to_send` carries the exact path
+/// the plugin wrote and is the canonical source of truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidatorFileSource {
+    /// Resolve files by glob (the legacy behaviour). The validator's `glob`
+    /// field is matched against the workspace root.
+    #[default]
+    Glob,
+    /// Use the originating spawn_only tool's `files_to_send` list, optionally
+    /// filtered by a file extension supplied alongside (e.g. `extension =
+    /// "mp3"`). The `glob` field is IGNORED in this mode. When the file list
+    /// is empty (non-spawn-only contexts) the validator surfaces a `Fail`
+    /// outcome so misconfigured policies are caught early.
+    SpawnOnlyFiles,
+}
+
+impl ValidatorFileSource {
+    /// Predicate used by `skip_serializing_if` so a default value does not
+    /// pollute TOML output for contracts that did not opt in.
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Glob)
+    }
+}
+
 /// Lifecycle phase a validator runs in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -308,10 +346,22 @@ pub enum ValidatorSpec {
     /// Assert that at least one file matching `glob` has decoded audio with
     /// `non_silent_samples / total_samples >= min_ratio`. WAV is supported
     /// natively. MP3 support requires the `audio_mp3` feature flag.
+    ///
+    /// When `source = "spawn_only_files"` (octos #1034) the validator skips
+    /// the glob entirely and consumes the originating spawn_only tool's
+    /// `files_to_send` list, optionally narrowed by `extension`
+    /// (e.g. `extension = "mp3"`). This is the canonical mode for plugins
+    /// that write to topic-suffixed output directories whose names a glob
+    /// cannot predict.
     AudioNonSilent {
+        #[serde(default)]
         glob: String,
         #[serde(default = "default_non_silent_ratio")]
         min_ratio: f32,
+        #[serde(default, skip_serializing_if = "ValidatorFileSource::is_default")]
+        source: ValidatorFileSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<String>,
     },
     /// Assert that EVERY file matching `glob` independently meets
     /// `non_silent_samples / total_samples >= min_ratio`, and that at least
@@ -342,11 +392,21 @@ pub enum ValidatorSpec {
     ///   still pass when no files matched (consistent with optional
     ///   intermediate artifacts that may not exist in every run).
     PerFileNonSilent {
+        #[serde(default)]
         glob: String,
         #[serde(default = "default_non_silent_ratio")]
         min_ratio: f32,
         #[serde(default)]
         require_at_least: usize,
+        /// Where to source the candidate file list. See [`ValidatorFileSource`]
+        /// for the opt-in `spawn_only_files` mode (octos #1034) that bypasses
+        /// the glob and consumes the plugin's `files_to_send` list verbatim.
+        #[serde(default, skip_serializing_if = "ValidatorFileSource::is_default")]
+        source: ValidatorFileSource,
+        /// Optional extension filter applied to the file list when
+        /// `source = "spawn_only_files"`. Ignored when `source = "glob"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<String>,
     },
     /// Assert each file matching `glob` has the magic-byte prefix for the
     /// declared `format`. Catches "tool wrote 0 bytes" or "tool wrote an
@@ -354,7 +414,19 @@ pub enum ValidatorSpec {
     ///
     /// The format field is named `format` rather than `kind` to avoid
     /// colliding with serde's `kind` discriminator tag.
-    MagicBytes { glob: String, format: MagicByteKind },
+    ///
+    /// When `source = "spawn_only_files"` (octos #1034) the validator skips
+    /// the glob entirely and consumes the originating spawn_only tool's
+    /// `files_to_send` list, optionally narrowed by `extension`.
+    MagicBytes {
+        #[serde(default)]
+        glob: String,
+        format: MagicByteKind,
+        #[serde(default, skip_serializing_if = "ValidatorFileSource::is_default")]
+        source: ValidatorFileSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<String>,
+    },
     /// Polling HTTP probe — repeatedly GET a templated URL (with
     /// `${args.<key>}` interpolation against the spawn task's input args)
     /// until the expected status code (+ optional body substring) is
@@ -704,6 +776,8 @@ impl WorkspacePolicy {
                         spec: ValidatorSpec::MagicBytes {
                             glob: "**/*.pptx".into(),
                             format: MagicByteKind::Pptx,
+                            source: ValidatorFileSource::Glob,
+                            extension: None,
                         },
                     }],
                 },
@@ -805,8 +879,28 @@ impl WorkspacePolicy {
             //      Result-aware `SegmentDirCleanup` RAII guard introduced
             //      in mofa-skills #59).
             //
-            // The per-file glob `**/segments/seg_*.wav` deliberately
-            // EXCLUDES `pause_after_*.wav`, `pause_line_*.wav`, and
+            // octos #1034: switched (1) and (2) to consume the plugin's
+            // `files_to_send` list (the canonical authoritative path set
+            // emitted by the JSON envelope on stdout). The prior hardcoded
+            // glob `skill-output/mofa-podcast/**/*.mp3` could not match
+            // topic-suffixed output directories (e.g. `mofa-podcast-zhuyu/`
+            // for the chat topic 《逐玉》), and PR #1014's `*→**` widening
+            // did not cure the prefix mismatch. `files_to_send` carries
+            // the exact path the plugin wrote, so the validator no longer
+            // races the plugin's directory-naming logic.
+            //
+            // (3) still consumes a glob because the intermediate segment
+            // WAVs are scratch files the plugin does NOT report in
+            // `files_to_send` — they are preserved on disk so the
+            // PerFileNonSilent gate can inspect them, but the protocol's
+            // file list only carries the final deliverable MP3. The glob
+            // has been broadened to `**/segments/seg_*.wav` (no longer
+            // anchored at `skill-output/mofa-podcast/`) so it tracks the
+            // topic-suffixed output directory without re-needing a glob
+            // fix for every new directory name.
+            //
+            // The per-file glob deliberately EXCLUDES
+            // `pause_after_*.wav`, `pause_line_*.wav`, and
             // `bgm_placeholder_line_*.wav` — those filenames are emitted
             // by mofa-podcast as intentionally-silent inter-segment pauses
             // and would never pass a non-silent ratio check.
@@ -814,29 +908,31 @@ impl WorkspacePolicy {
             // Stale-segment concern: this glob does NOT apply the
             // `task_started_at` look-back filter that `resolve_artifacts`
             // uses (the validator runner doesn't see that timestamp).
-            // Same caveat applies to the pre-existing whole-file
-            // `AudioNonSilent` above (`skill-output/mofa-podcast/*.mp3`),
-            // so this is a shared harness invariant rather than a
-            // regression. In practice mofa-skills #59 clears
-            // `<output_dir>/segments/` at the start of every invocation
-            // (`generate_podcast::seg_dir` cleanup), so stale segments
-            // only matter for unusual concurrent-run workflows. A future
-            // follow-up can plumb `task_started_at` into the validator
-            // runner to filter per-file matches by mtime, which would
-            // close the gap for both validators in one shot.
+            // In practice mofa-skills #59 clears `<output_dir>/segments/`
+            // at the start of every invocation (`generate_podcast::seg_dir`
+            // cleanup), so stale segments only matter for unusual
+            // concurrent-run workflows. A future follow-up can plumb
+            // `task_started_at` into the validator runner to filter
+            // per-file matches by mtime, which would close the gap.
             on_completion: vec![
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                    glob: "skill-output/mofa-podcast/**/*.mp3".into(),
+                    glob: String::new(),
                     format: MagicByteKind::Mp3,
+                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    extension: Some("mp3".into()),
                 }),
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
-                    glob: "skill-output/mofa-podcast/**/*.mp3".into(),
+                    glob: String::new(),
                     min_ratio: default_non_silent_ratio(),
+                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    extension: Some("mp3".into()),
                 }),
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
-                    glob: "skill-output/mofa-podcast/**/segments/seg_*.wav".into(),
+                    glob: "**/segments/seg_*.wav".into(),
                     min_ratio: default_non_silent_ratio(),
                     require_at_least: 1,
+                    source: ValidatorFileSource::Glob,
+                    extension: None,
                 }),
             ],
         };
@@ -857,6 +953,8 @@ impl WorkspacePolicy {
                 ValidatorSpec::AudioNonSilent {
                     glob: "skill-output/voice/**/*.{mp3,wav}".into(),
                     min_ratio: default_non_silent_ratio(),
+                    source: ValidatorFileSource::Glob,
+                    extension: None,
                 },
             )],
         };
@@ -923,6 +1021,8 @@ impl WorkspacePolicy {
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                 glob: "**/*.pptx".into(),
                 format: MagicByteKind::Pptx,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             })],
         };
 
@@ -939,6 +1039,8 @@ impl WorkspacePolicy {
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                 glob: "**/*.png".into(),
                 format: MagicByteKind::Png,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             })],
         };
 
@@ -966,6 +1068,8 @@ impl WorkspacePolicy {
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                     glob: "**/*.png".into(),
                     format: MagicByteKind::Png,
+                    source: ValidatorFileSource::Glob,
+                    extension: None,
                 }),
             ],
         };
@@ -985,6 +1089,8 @@ impl WorkspacePolicy {
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                     glob: "**/*.png".into(),
                     format: MagicByteKind::Png,
+                    source: ValidatorFileSource::Glob,
+                    extension: None,
                 }),
             ],
         };
@@ -1005,6 +1111,8 @@ impl WorkspacePolicy {
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                 glob: "**/*.png".into(),
                 format: MagicByteKind::Png,
+                source: ValidatorFileSource::Glob,
+                extension: None,
             })],
         };
 
@@ -1853,6 +1961,91 @@ ignore = []
         assert!(!MagicByteKind::Pptx.matches(b"<!DOCTYPE html>"));
     }
 
+    /// octos #1034: the podcast contract's MagicBytes + AudioNonSilent
+    /// validators must be declared with `source = SpawnOnlyFiles` so the
+    /// plugin's reported `files_to_send` list drives the check rather than
+    /// a hardcoded glob that misses topic-suffixed output directories
+    /// (e.g. `mofa-podcast-zhuyu/` for the chat topic 《逐玉》). The
+    /// PerFileNonSilent validator stays on the glob path because the
+    /// intermediate segment WAVs are scratch files not exposed by the
+    /// plugin protocol's `files_to_send` envelope.
+    #[test]
+    fn session_policy_podcast_validators_consume_spawn_only_files_for_octos_1034() {
+        let policy = WorkspacePolicy::for_session();
+        let podcast = policy
+            .spawn_tasks
+            .get("podcast_generate")
+            .expect("podcast contract");
+
+        let mut saw_magic = false;
+        let mut saw_audio = false;
+        let mut saw_per_file = false;
+        for entry in &podcast.on_completion {
+            match entry {
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    source,
+                    extension,
+                    ..
+                }) => {
+                    assert_eq!(
+                        *source,
+                        ValidatorFileSource::SpawnOnlyFiles,
+                        "podcast MagicBytes must opt into spawn_only_files (octos #1034)"
+                    );
+                    assert_eq!(
+                        extension.as_deref(),
+                        Some("mp3"),
+                        "podcast MagicBytes must filter to mp3 outputs"
+                    );
+                    saw_magic = true;
+                }
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                    source,
+                    extension,
+                    ..
+                }) => {
+                    assert_eq!(
+                        *source,
+                        ValidatorFileSource::SpawnOnlyFiles,
+                        "podcast AudioNonSilent must opt into spawn_only_files (octos #1034)"
+                    );
+                    assert_eq!(
+                        extension.as_deref(),
+                        Some("mp3"),
+                        "podcast AudioNonSilent must filter to mp3 outputs"
+                    );
+                    saw_audio = true;
+                }
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
+                    source,
+                    glob,
+                    ..
+                }) => {
+                    assert_eq!(
+                        *source,
+                        ValidatorFileSource::Glob,
+                        "podcast PerFileNonSilent must stay on the glob path because \
+                         intermediate segment WAVs are not in the plugin's files_to_send"
+                    );
+                    assert!(
+                        !glob.starts_with("skill-output/mofa-podcast/"),
+                        "PerFileNonSilent glob must NOT anchor at the legacy \
+                         `skill-output/mofa-podcast/` prefix — topic-suffixed \
+                         directories like `mofa-podcast-zhuyu/` would never match: {glob}"
+                    );
+                    saw_per_file = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_magic, "podcast contract must declare MagicBytes");
+        assert!(saw_audio, "podcast contract must declare AudioNonSilent");
+        assert!(
+            saw_per_file,
+            "podcast contract must declare PerFileNonSilent"
+        );
+    }
+
     #[test]
     fn session_policy_declares_new_domain_validators_for_silent_failure_paths() {
         let policy = WorkspacePolicy::for_session();
@@ -1886,6 +2079,7 @@ ignore = []
                     glob,
                     min_ratio,
                     require_at_least,
+                    ..
                 }) => Some((glob.clone(), *min_ratio, *require_at_least)),
                 _ => None,
             })
@@ -2205,6 +2399,7 @@ ignore = []
                 ref glob,
                 min_ratio,
                 require_at_least,
+                ..
             } => {
                 assert_eq!(glob, "**/segments/seg_*.wav");
                 assert!((min_ratio - 0.3).abs() < f32::EPSILON);
@@ -2235,6 +2430,7 @@ ignore = []
                 ref glob,
                 min_ratio,
                 require_at_least,
+                ..
             } => {
                 assert_eq!(glob, "**/segments/seg_*.wav");
                 assert!(

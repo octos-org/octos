@@ -453,6 +453,7 @@ async fn should_aggregate_validator_over_combined_output() {
         repo_label: "swarm-test".into(),
         input_args: None,
         tool_output: None,
+        spawn_only_files: Vec::new(),
     };
     let validator = Validator {
         id: "aggregate_exists".into(),
