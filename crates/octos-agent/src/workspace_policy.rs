@@ -841,6 +841,13 @@ impl WorkspacePolicy {
         // recursive `**/*.pptx` glob already used by the MagicBytes(Pptx)
         // validator on `on_completion`.
         artifacts.insert("slides_pptx".into(), "**/*.pptx".into());
+        // octos #1040 (follow-up to #1035 / #1037): `mofa_comic`,
+        // `mofa_infographic`, and `mofa_frame` all emit a single PNG via
+        // `files_to_send`. The `image_png` artifact gives those contracts
+        // a target name so `bind_explicit_files_to_artifacts` can bind the
+        // reported PNG path into `ActionContext` without erroring on "no
+        // artifact source" the same way `slides_pptx` does for slides.
+        artifacts.insert("image_png".into(), "**/*.png".into());
 
         let tts_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
@@ -1061,14 +1068,28 @@ impl WorkspacePolicy {
         // mofa_comic and mofa_infographic each take a required `out` arg
         // pointing at a single PNG file. The contract asserts BOTH that
         // the file landed at the declared path (FileExists with
-        // `${args.out}`, FileExists already supports template
-        // interpolation) AND that there is at least one valid PNG header
-        // present in the workspace (MagicBytes against the recursive
-        // `**/*.png` glob — MagicBytes does not template its glob today).
-        // FileExists does the per-task path check; MagicBytes does the
-        // bytes-are-actually-a-PNG check.
+        // `${args.out}`, which already supports template interpolation)
+        // AND that the file at the plugin-reported path carries a valid
+        // PNG header (MagicBytes against the `spawn_only_files` source —
+        // octos #1040, follow-up to #1035 / #1037).
+        //
+        // `detect_output_file` in `plugins/tool.rs:556-577` populates
+        // `files_to_send` from the `args.out` argument when the plugin's
+        // success envelope omits it. mofa-cli's `plugin_comic` /
+        // `plugin_infographic` emit `"Generated comic: <path>"` /
+        // `"Generated infographic: <path>"` (no `Generated:` marker),
+        // but the `args.out` branch fires first so the validator always
+        // sees the exact PNG path the skill wrote. The `extension =
+        // "png"` filter narrows the list if a future revision of the
+        // plugin starts surfacing auxiliary files (intermediate panel
+        // PNGs in `work_dir`, layout previews, etc.) via
+        // `files_to_send`.
+        //
+        // FileExists still does the per-task path check (mismatches
+        // between `args.out` and what the plugin actually wrote);
+        // MagicBytes still does the bytes-are-actually-a-PNG check.
         let mofa_comic_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("image_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
@@ -1080,16 +1101,16 @@ impl WorkspacePolicy {
                     min_bytes: Some(1024),
                 }),
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                    glob: "**/*.png".into(),
+                    glob: String::new(),
                     format: MagicByteKind::Png,
-                    source: ValidatorFileSource::Glob,
-                    extension: None,
+                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    extension: Some("png".into()),
                 }),
             ],
         };
 
         let mofa_infographic_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("image_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
@@ -1101,10 +1122,10 @@ impl WorkspacePolicy {
                     min_bytes: Some(1024),
                 }),
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                    glob: "**/*.png".into(),
+                    glob: String::new(),
                     format: MagicByteKind::Png,
-                    source: ValidatorFileSource::Glob,
-                    extension: None,
+                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    extension: Some("png".into()),
                 }),
             ],
         };
@@ -1115,18 +1136,25 @@ impl WorkspacePolicy {
         // should be wired even if the gate is not yet fired. Recording
         // the entry here lets the next spawn_only flip pick up the
         // contract automatically.
+        //
+        // octos #1040: preemptively use the `spawn_only_files` source so
+        // the contract is on the right shape the moment the manifest
+        // flips. The mofa-frame plugin script
+        // (`mofa-skills/mofa-frame/main`) already emits `files_to_send`
+        // in its JSON envelope (the final `jq` call surfaces the
+        // generated PNG path), so no plugin work is needed.
         let mofa_frame_contract = WorkspaceSpawnTaskPolicy {
-            artifact: None,
+            artifact: Some("image_png".into()),
             artifacts: Vec::new(),
             on_verify: Vec::new(),
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:Frame extraction failed".into()],
             on_completion: vec![SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
-                glob: "**/*.png".into(),
+                glob: String::new(),
                 format: MagicByteKind::Png,
-                source: ValidatorFileSource::Glob,
-                extension: None,
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension: Some("png".into()),
             })],
         };
 
@@ -2323,6 +2351,110 @@ ignore = []
                 .cloned(),
             Some("notify_user:Publish probe failed".to_string()),
             "on_failure should surface a notify_user hint",
+        );
+    }
+
+    #[test]
+    fn session_policy_mofa_comic_infographic_frame_consume_spawn_only_files_for_octos_1040() {
+        // octos #1040 (follow-up to #1035 / #1037): the MagicBytes
+        // validator on each of mofa_comic, mofa_infographic, and
+        // mofa_frame must opt into `spawn_only_files` so the validator
+        // consumes the plugin-reported `files_to_send` path directly
+        // instead of any `**/*.png` match in the session workspace
+        // (which could pass on a stale PNG from an earlier turn). The
+        // `extension = "png"` filter narrows the file list if the
+        // skill surfaces auxiliary files (intermediate panel PNGs,
+        // layout previews, etc.) via `files_to_send`.
+        //
+        // `mofa_cards` is intentionally NOT in this sweep — the plugin
+        // does not yet emit `files_to_send` (it returns `card_dir` not
+        // `out`, and its success text `"Generated N card(s) in <dir>"`
+        // does not match the `Generated:` / `Generated PPTX:` markers
+        // that `PluginTool::detect_output_file` auto-detects). Tracked
+        // by a separate plugin-fix issue.
+        let policy = WorkspacePolicy::for_session();
+        for tool in ["mofa_comic", "mofa_infographic", "mofa_frame"] {
+            let entry = policy
+                .spawn_tasks
+                .get(tool)
+                .unwrap_or_else(|| panic!("policy missing spawn task for {tool}"));
+
+            let mut saw_magic = false;
+            for spec in &entry.on_completion {
+                if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                    source,
+                    extension,
+                    format,
+                    glob,
+                    ..
+                }) = spec
+                {
+                    assert_eq!(*format, MagicByteKind::Png);
+                    assert_eq!(
+                        *source,
+                        ValidatorFileSource::SpawnOnlyFiles,
+                        "{tool} MagicBytes must opt into spawn_only_files (octos #1040)"
+                    );
+                    assert_eq!(
+                        extension.as_deref(),
+                        Some("png"),
+                        "{tool} MagicBytes must filter to png outputs so auxiliary files \
+                         in files_to_send don't trip the check"
+                    );
+                    assert!(
+                        !glob.contains("**/*.png"),
+                        "{tool} must NOT pin a `**/*.png` glob — the spawn_only_files source \
+                         consumes the reported path directly; got: {glob}"
+                    );
+                    saw_magic = true;
+                }
+            }
+            assert!(saw_magic, "{tool} contract must declare MagicBytes(Png)");
+        }
+    }
+
+    #[test]
+    fn session_policy_mofa_cards_keeps_glob_until_plugin_emits_files_to_send_octos_1041() {
+        // octos #1041 (audit #1040 follow-up): `mofa_cards` cannot yet
+        // sweep to `spawn_only_files` because the plugin does not emit
+        // `files_to_send` and `PluginTool::detect_output_file` does not
+        // auto-populate it (no `out` arg, success text uses an
+        // unrecognised `Generated N card(s) in <dir>` prefix).
+        //
+        // This test pins the current behaviour so a future contributor
+        // doesn't sweep `mofa_cards` without first fixing the plugin
+        // emission — that would regress to the empty-files-to-send
+        // failure mode that #1037 caught for `voice_synthesize` and
+        // tracked as #1038.
+        let policy = WorkspacePolicy::for_session();
+        let cards = policy
+            .spawn_tasks
+            .get("mofa_cards")
+            .expect("policy must declare mofa_cards spawn task");
+
+        let magic = cards.on_completion.iter().find_map(|spec| match spec {
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
+                source,
+                extension,
+                format,
+                glob,
+                ..
+            }) => Some((*format, *source, extension.clone(), glob.clone())),
+            _ => None,
+        });
+
+        let (format, source, _extension, glob) = magic.expect(
+            "mofa_cards contract must declare MagicBytes(Png) — see workspace_policy.rs:1043",
+        );
+        assert_eq!(format, MagicByteKind::Png);
+        assert_eq!(
+            source,
+            ValidatorFileSource::Glob,
+            "mofa_cards must keep `Glob` until octos #1041 lands the plugin-emission fix"
+        );
+        assert!(
+            glob.contains("**/*.png"),
+            "mofa_cards Glob source must keep the recursive PNG pattern; got: {glob}"
         );
     }
 
