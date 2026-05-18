@@ -2,9 +2,11 @@
 // bootstrap admin token with a persistent hashed record.
 //
 // UX moved from "generate a 32-char random secret + email-receipt" to
-// "operator types their own password (>= 8 chars)". The auto-generate /
+// "operator types their own password (exactly 8 chars)". The auto-generate /
 // copy / email-receipt ceremony is gone — operators chose their secret, so
-// they don't need help remembering it.
+// they don't need help remembering it. The "exactly 8" constraint (rather
+// than "8 or more") makes the requirement legible in the help text without
+// nudging operators toward unbounded length they're unlikely to remember.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
@@ -61,7 +63,7 @@ describe('SetupRotateToken', () => {
     expect(screen.queryByRole('button', { name: /^copy$/i })).not.toBeInTheDocument()
   })
 
-  it('keeps the submit button disabled until the operator types >= 8 characters', async () => {
+  it('keeps the submit button disabled until the operator types exactly 8 characters', async () => {
     const user = userEvent.setup()
     renderPage()
     const submit = screen.getByRole('button', { name: /submit/i })
@@ -71,11 +73,19 @@ describe('SetupRotateToken', () => {
     await user.type(input, '1234567') // 7 chars: still too short
     expect(submit).toBeDisabled()
     expect(
-      screen.getByText(/token must be at least 8 characters/i),
+      screen.getByText(/token must be exactly 8 characters/i),
     ).toBeInTheDocument()
 
     await user.type(input, '8') // total = 8 chars
     expect(submit).toBeEnabled()
+
+    // Typing a 9th character must disable submit again — the constraint is
+    // exact, not a lower bound.
+    await user.type(input, '9')
+    expect(submit).toBeDisabled()
+    expect(
+      screen.getByText(/token must be exactly 8 characters/i),
+    ).toBeInTheDocument()
   })
 
   it('toggles between password and text input when the show/hide button is clicked', async () => {
