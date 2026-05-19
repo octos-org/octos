@@ -92,21 +92,18 @@ fn should_not_fire_grace_call_without_productive_history() {
 
 #[test]
 fn should_require_fresh_productive_history_between_grace_calls() {
-    // A second budget-exhaustion after Grace was fired must escalate unless a
-    // fresh productive tool call is recorded. This prevents loops that
-    // merely accumulate productive calls before budget from chaining
-    // grace calls indefinitely.
+    // A second budget-exhaustion after Grace was fired must escalate even
+    // when fresh productive tool calls are recorded. The grace call is a
+    // single global escape hatch per retry state, not a renewable allowance.
     let mut state = LoopRetryState::new();
     state.record_productive_tool_call();
     state.record_productive_tool_call();
     assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Grace);
-    // Without recording more productive calls, the second exhaustion
-    // escalates even though the loop once was productive.
     assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Escalate);
 
     state.record_productive_tool_call();
-    assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Grace);
-    assert_eq!(state.grace_calls_fired, 2);
+    assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Escalate);
+    assert_eq!(state.grace_calls_fired, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

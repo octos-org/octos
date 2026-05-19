@@ -32,7 +32,7 @@ use eyre::Result;
 use metrics::counter;
 use octos_agent::harness_events::{HarnessEvent, HarnessSwarmDispatchEvent};
 use octos_agent::tools::mcp_agent::{
-    DispatchOutcome, DispatchRequest, McpAgentBackend, record_dispatch,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, McpAgentBackend, record_dispatch,
 };
 use octos_agent::validators::{
     ValidatorInvocation, ValidatorOutcome, ValidatorPhase, ValidatorRunner,
@@ -199,6 +199,14 @@ impl Swarm {
         persistence_dir: impl Into<PathBuf>,
     ) -> SwarmBuilder {
         SwarmBuilder::new(backend, persistence_dir.into())
+    }
+
+    /// Return the configured MCP backend.
+    ///
+    /// AppUI-owned product workflows use this to launch supervised MCP
+    /// specialists without exposing a generic UI-side scheduler.
+    pub fn backend(&self) -> Arc<dyn McpAgentBackend> {
+        self.backend.clone()
     }
 
     /// Dispatch a batch of contracts against the configured backend.
@@ -834,11 +842,15 @@ async fn dispatch_once(
     contract: &ContractSpec,
     prior_attempts: u32,
 ) -> SubtaskOutcome {
-    let request = DispatchRequest {
-        tool_name: contract.tool_name.clone(),
-        task: contract.task.clone(),
-    };
-    let response = backend.dispatch(request).await;
+    let context_contract =
+        DispatchContextContract::external_unmanaged("swarm_mcp_backend_context_payload_not_wired")
+            .with_child_session_key(Some(contract.contract_id.clone()));
+    let request = DispatchRequest::new(contract.tool_name.clone(), contract.task.clone())
+        .with_context_contract(context_contract.clone());
+    let response = backend
+        .dispatch(request)
+        .await
+        .with_context_contract(Some(context_contract));
     record_dispatch(backend.backend_label(), response.outcome);
 
     let status = SubtaskStatus::from_dispatch(response.outcome);

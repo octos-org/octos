@@ -83,6 +83,9 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
+    use crate::prompt_context::{
+        PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
+    };
     use crate::tools::ToolRegistry;
 
     struct SmallWindowProvider {
@@ -110,6 +113,22 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct NoopPromptContextManager;
+
+    impl PromptContextManager for NoopPromptContextManager {
+        fn prepare_prompt(
+            &self,
+            _request: PromptContextRequest,
+            messages: &mut Vec<Message>,
+        ) -> std::result::Result<PromptContextReport, String> {
+            Ok(PromptContextReport {
+                messages_before: messages.len(),
+                messages_after: messages.len(),
+                ..PromptContextReport::default()
+            })
         }
     }
 
@@ -256,6 +275,35 @@ mod tests {
                 || turn
                     .repair_reasons()
                     .contains(&LoopRepairReason::OldToolResultsTruncated)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_managed_agent_skips_legacy_context_trimming() {
+        let (_dir, agent) = setup_agent(120).await;
+        let agent = agent.with_prompt_context_manager(Arc::new(NoopPromptContextManager));
+        let mut turn = LoopTurnState::new(Instant::now());
+        let mut messages = vec![sys("prompt")];
+        for index in 0..12 {
+            messages.push(user(&format!("old filler {index} {}", "x".repeat(80))));
+            messages.push(assistant(&format!("old reply {index} {}", "y".repeat(80))));
+        }
+        messages.push(user("current question"));
+        let original_len = messages.len();
+
+        prepare_conversation_messages(&agent, &mut messages, &mut turn);
+        agent.prepare_prompt_with_context_manager(&mut messages, PromptContextPhase::TurnStart, 1);
+
+        assert_eq!(
+            messages.len(),
+            original_len,
+            "ContextManager-owned sessions must not run the legacy extractive trim before the context bridge"
+        );
+        assert!(
+            !turn
+                .repair_reasons()
+                .contains(&LoopRepairReason::ContextTrimmed),
+            "legacy ContextTrimmed repair should stay absent when ContextManager owns prompt compaction"
         );
     }
 

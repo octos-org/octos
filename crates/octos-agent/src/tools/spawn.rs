@@ -15,12 +15,13 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::mcp_agent::{
-    DispatchRequest, DispatchResponse, McpAgentBackendConfig, SharedBackend,
-    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    DispatchContextContract, DispatchRequest, DispatchResponse, McpAgentBackendConfig,
+    SharedBackend, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
 };
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
+use crate::prompt_context::PromptContextManager;
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::TaskSupervisor;
@@ -36,6 +37,20 @@ use crate::{Agent, AgentConfig, HookContext, HookExecutor, HookPayload, HookResu
 /// [`SpawnTool::with_mcp_agent_backend`] for runtimes that expose a
 /// different entry point.
 pub const DEFAULT_MCP_AGENT_TOOL_NAME: &str = "run_task";
+
+/// Metadata passed to the parent runtime when a spawned child needs its own
+/// caller-owned prompt context manager.
+#[derive(Clone, Debug)]
+pub struct ChildPromptContextRequest {
+    pub parent_session_key: Option<String>,
+    pub child_session_key: Option<String>,
+    pub task_id: Option<String>,
+    pub worker_id: String,
+    pub task_label: String,
+}
+
+pub type ChildPromptContextManagerFactory =
+    Arc<dyn Fn(ChildPromptContextRequest) -> Option<Arc<dyn PromptContextManager>> + Send + Sync>;
 
 /// Guard C (issue #607): maximum nesting depth for `spawn`-within-`spawn`
 /// invocations before [`SpawnTool::execute_with_context`] refuses further
@@ -456,6 +471,11 @@ pub struct SpawnTool {
     /// so the child can spawn periodic-summary watchers under the same
     /// LLM/budget contract.
     parent_subagent_summary_generator: Option<Arc<AgentSummaryGenerator>>,
+    /// Caller-owned context-manager factory for child agents. AppUI/session
+    /// runtimes use this to fork the parent context ledger before a subagent
+    /// starts, so child prompts are compacted and normalized by the same
+    /// durable context path as top-level turns.
+    child_prompt_context_manager_factory: Option<ChildPromptContextManagerFactory>,
 }
 
 impl SpawnTool {
@@ -493,6 +513,7 @@ impl SpawnTool {
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
+            child_prompt_context_manager_factory: None,
         }
     }
 
@@ -533,6 +554,7 @@ impl SpawnTool {
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
+            child_prompt_context_manager_factory: None,
         }
     }
 
@@ -692,6 +714,15 @@ impl SpawnTool {
         self
     }
 
+    /// Attach a runtime-owned context manager factory for spawned children.
+    pub fn with_child_prompt_context_manager_factory(
+        mut self,
+        factory: ChildPromptContextManagerFactory,
+    ) -> Self {
+        self.child_prompt_context_manager_factory = Some(factory);
+        self
+    }
+
     /// M8 Runtime Parity W2.B1 introspection helper — used by tests
     /// and the parity audit harness to assert that a SpawnTool was
     /// fully wired with parent caches.
@@ -730,7 +761,13 @@ impl SpawnTool {
             .clone()
             .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
 
-        let request = DispatchRequest { tool_name, task };
+        let request = DispatchRequest::new(tool_name, task).with_context_contract(
+            DispatchContextContract::external_unmanaged(
+                "direct_mcp_dispatch_has_no_octos_context_manager_payload",
+            )
+            .with_parent_session_key(Some(session_id.to_string()))
+            .with_child_session_key(Some(task_id.to_string())),
+        );
         let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
         let payload = build_dispatch_event_payload(
             session_id,
@@ -1930,10 +1967,14 @@ impl Tool for SpawnTool {
             };
 
             let (response, event) = {
-                let request = DispatchRequest {
-                    tool_name,
-                    task: dispatch_payload,
-                };
+                let request = DispatchRequest::new(tool_name, dispatch_payload)
+                    .with_context_contract(
+                        DispatchContextContract::external_unmanaged(
+                            "mcp_agent_backend_does_not_consume_octos_prompt_context_manager",
+                        )
+                        .with_parent_session_key(self.session_key.clone())
+                        .with_child_session_key(Some(task_id_for_event.clone())),
+                    );
                 let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
                 let payload = build_dispatch_event_payload(
                     session_key_for_event.clone(),
@@ -2267,6 +2308,17 @@ impl Tool for SpawnTool {
             if let Some(ref config) = self.worker_config {
                 worker = worker.with_config(config.clone());
             }
+            if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
+                if let Some(manager) = factory(ChildPromptContextRequest {
+                    parent_session_key: self.session_key.clone(),
+                    child_session_key: None,
+                    task_id: None,
+                    worker_id: worker.id.to_string(),
+                    task_label: label.clone(),
+                }) {
+                    worker = worker.with_prompt_context_manager(manager);
+                }
+            }
 
             // M8 Runtime Parity W2.B1: inherit parent caches so the child
             // observes the same file_state_cache + subagent_output_router
@@ -2490,6 +2542,8 @@ impl Tool for SpawnTool {
             let parent_file_state_cache = self.parent_file_state_cache.clone();
             let parent_subagent_output_router = self.parent_subagent_output_router.clone();
             let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
+            let child_prompt_context_manager_factory =
+                self.child_prompt_context_manager_factory.clone();
             // Guard C (issue #607): snapshot the caller's spawn depth so
             // the detached child Agent dispatched below sees
             // `parent_depth + 1` and the [`MAX_SPAWN_DEPTH`] gate fires
@@ -2652,6 +2706,17 @@ impl Tool for SpawnTool {
                     profile_id: ctx.profile_id.clone(),
                 }) {
                     worker = worker.with_hook_context(ctx);
+                }
+                if let Some(factory) = child_prompt_context_manager_factory.as_ref() {
+                    if let Some(manager) = factory(ChildPromptContextRequest {
+                        parent_session_key: parent_session_key.clone(),
+                        child_session_key: tracked_child_session_key.clone(),
+                        task_id: tracked_task_id.clone(),
+                        worker_id: wid.to_string(),
+                        task_label: task_label.clone(),
+                    }) {
+                        worker = worker.with_prompt_context_manager(manager);
+                    }
                 }
 
                 // Review A F-004: propagate the parent's declarative
@@ -3291,6 +3356,7 @@ mod tests {
             parent_file_state_cache: None,
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
+            child_prompt_context_manager_factory: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);

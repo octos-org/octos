@@ -292,10 +292,7 @@ async fn handle_new(ctx: &SlashCommandContext, name_arg: &str) -> String {
 /// helper and the per-session tool registry agree on the same root.
 fn default_workspace_root_for(data_dir: &std::path::Path, session_id: &SessionKey) -> PathBuf {
     let encoded_base = octos_bus::session::encode_path_component(session_id.base_key());
-    data_dir
-        .join("users")
-        .join(encoded_base)
-        .join("workspace")
+    data_dir.join("users").join(encoded_base).join("workspace")
 }
 
 /// Unknown-command help text. Matches the wording in
