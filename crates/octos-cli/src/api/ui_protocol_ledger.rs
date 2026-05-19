@@ -2183,6 +2183,7 @@ mod tests {
                 seq: 0,
             },
             persisted_at: Utc::now(),
+            content: None,
         })
     }
 

@@ -2604,6 +2604,20 @@ pub struct MessagePersistedEvent {
     /// running older protocol versions see the same wire shape they used to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
+    /// Optional text content of the persisted row.
+    ///
+    /// Pre-fix this field was omitted from the wire: `message/persisted`
+    /// carried only metadata alongside `media`, and the SPA hardcoded
+    /// `content: ""` when rebuilding the message. That dropped the
+    /// assistant's caption or summary text whenever a row carried BOTH
+    /// text and a file (e.g. `send_file` with a caption, mofa_slides
+    /// delivery with a summary). Carrying the content here when non-empty
+    /// lets clients render the bubble with text + file together.
+    ///
+    /// Wire compatibility: serialized as omitted when empty, so legacy
+    /// clients that don't read the field continue to behave as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 // ----- M10 Phase 1 `turn/spawn_complete` -----
@@ -2627,11 +2641,13 @@ pub struct MessagePersistedEvent {
 ///   anchor; the splice-merge logic in legacy clients was the bug surface
 ///   the new envelope replaces).
 ///
-/// Unlike `message/persisted` (which is metadata-only and works alongside
-/// streaming `message/delta` deltas to reconstruct content), this event
-/// carries the full `content` and `media` for the late completion in one
-/// frame — by design, the client never needs to splice-merge or wait for
-/// further deltas. `media` mirrors the convention in `MessagePersistedEvent`.
+/// Unlike `message/persisted` (which carries optional `content` alongside
+/// streamed `message/delta` deltas — see [`MessagePersistedEvent::content`]
+/// — and is primarily a durable commit confirmation), this event carries
+/// the full `content` and `media` for the late completion in one frame as
+/// a REQUIRED field — by design, the client never needs to splice-merge or
+/// wait for further deltas. `media` mirrors the convention in
+/// `MessagePersistedEvent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnSpawnCompleteEvent {
     pub session_id: SessionKey,
@@ -2667,8 +2683,8 @@ pub struct TurnSpawnCompleteEvent {
     pub cursor: UiCursor,
     pub persisted_at: DateTime<Utc>,
     /// REQUIRED. The full assistant text for the completion bubble. Unlike
-    /// [`MessagePersistedEvent`] (where `content` lives only in the
-    /// session ledger), this event carries the text inline so the client
+    /// [`MessagePersistedEvent::content`] (optional and omitted when
+    /// empty), this event ALWAYS carries the text inline so the client
     /// can render the new bubble atomically without a follow-up fetch.
     pub content: String,
     /// File attachments for this completion (e.g. `_report.md`,
@@ -7802,11 +7818,29 @@ mod tests {
             },
             persisted_at: sample_persisted_at(),
             media: vec!["report.md".into()],
+            content: Some("Here is the report.".into()),
         };
         let value = serde_json::to_value(&event).expect("serialize");
         assert_eq!(value.get("source"), Some(&json!("assistant")));
+        assert_eq!(value.get("content"), Some(&json!("Here is the report.")));
         let parsed: MessagePersistedEvent = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed, event);
+
+        // content=None must be omitted from the wire (legacy compat
+        // for clients that don't read the field).
+        let event_no_content = MessagePersistedEvent {
+            content: None,
+            ..event.clone()
+        };
+        let value_no_content = serde_json::to_value(&event_no_content).expect("serialize");
+        assert_eq!(
+            value_no_content.get("content"),
+            None,
+            "content=None must be omitted from the wire"
+        );
+        let parsed_no_content: MessagePersistedEvent =
+            serde_json::from_value(value_no_content).expect("deserialize none");
+        assert_eq!(parsed_no_content, event_no_content);
 
         // All five source variants round-trip.
         for source in [
@@ -7831,6 +7865,7 @@ mod tests {
                 },
                 persisted_at: sample_persisted_at(),
                 media: vec![],
+                content: None,
             };
             let v = serde_json::to_value(&e).expect("serialize source");
             let p: MessagePersistedEvent = serde_json::from_value(v).expect("deserialize source");
