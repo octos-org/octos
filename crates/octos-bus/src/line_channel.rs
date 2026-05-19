@@ -15,9 +15,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::{
-    Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post,
-};
+use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use eyre::{Result, WrapErr};
@@ -64,7 +62,11 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 }
 
 /// Map a UTF-16 code-unit range (LINE mention indices) to byte offsets in `text`.
-fn utf16_range_to_byte_range(text: &str, utf16_start: usize, utf16_len: usize) -> Option<(usize, usize)> {
+fn utf16_range_to_byte_range(
+    text: &str,
+    utf16_start: usize,
+    utf16_len: usize,
+) -> Option<(usize, usize)> {
     let mut utf16_pos = 0usize;
     let mut byte_start = None;
     for (byte_idx, ch) in text.char_indices() {
@@ -148,12 +150,7 @@ impl LineChannel {
         if !self.require_mention {
             return Ok(());
         }
-        if self
-            .bot_user_id
-            .lock()
-            .expect("bot_user_id lock")
-            .is_some()
-        {
+        if self.bot_user_id.lock().expect("bot_user_id lock").is_some() {
             return Ok(());
         }
         let id = self.fetch_bot_user_id().await?;
@@ -179,10 +176,7 @@ impl LineChannel {
     }
 
     fn bot_user_id(&self) -> Option<String> {
-        self.bot_user_id
-            .lock()
-            .expect("bot_user_id lock")
-            .clone()
+        self.bot_user_id.lock().expect("bot_user_id lock").clone()
     }
 
     fn is_group_source(source_type: &str) -> bool {
@@ -357,15 +351,11 @@ impl LineChannel {
         let msg_type = message.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         if Self::is_group_source(source_type) && self.require_mention {
-            let text_preview = message
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let text_preview = message.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if !self.should_respond_in_group(source_type, text_preview, message) {
                 debug!(
                     source_type,
-                    msg_type,
-                    "LINE: ignored group message (mention gating)"
+                    msg_type, "LINE: ignored group message (mention gating)"
                 );
                 return None;
             }
@@ -376,34 +366,25 @@ impl LineChannel {
 
         match msg_type {
             "text" => {
-                let text = message
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let text = message.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 content = if Self::is_group_source(source_type) {
                     self.strip_bot_mentions(text, message)
                 } else {
                     text.to_string()
                 };
             }
-            "image" => {
-                match self.download_line_content(message_id, ".jpg").await {
-                    Ok(path) => media.push(path.display().to_string()),
-                    Err(e) => warn!("failed to download LINE image: {e}"),
-                }
-            }
-            "audio" => {
-                match self.download_line_content(message_id, ".m4a").await {
-                    Ok(path) => media.push(path.display().to_string()),
-                    Err(e) => warn!("failed to download LINE audio: {e}"),
-                }
-            }
-            "video" => {
-                match self.download_line_content(message_id, ".mp4").await {
-                    Ok(path) => media.push(path.display().to_string()),
-                    Err(e) => warn!("failed to download LINE video: {e}"),
-                }
-            }
+            "image" => match self.download_line_content(message_id, ".jpg").await {
+                Ok(path) => media.push(path.display().to_string()),
+                Err(e) => warn!("failed to download LINE image: {e}"),
+            },
+            "audio" => match self.download_line_content(message_id, ".m4a").await {
+                Ok(path) => media.push(path.display().to_string()),
+                Err(e) => warn!("failed to download LINE audio: {e}"),
+            },
+            "video" => match self.download_line_content(message_id, ".mp4").await {
+                Ok(path) => media.push(path.display().to_string()),
+                Err(e) => warn!("failed to download LINE video: {e}"),
+            },
             "file" => {
                 let file_name = message
                     .get("fileName")
@@ -446,7 +427,10 @@ impl LineChannel {
         }
 
         if content.is_empty() && media.is_empty() {
-            debug!(message_id, msg_type, "LINE: empty content and media, skipping");
+            debug!(
+                message_id,
+                msg_type, "LINE: empty content and media, skipping"
+            );
             return None;
         }
 

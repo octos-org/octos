@@ -310,7 +310,8 @@ impl AuthManager {
     /// Live-update the `allow_self_registration` flag (admin save path).
     /// Takes effect immediately; no `octos serve` restart required.
     pub fn set_allow_self_registration(&self, value: bool) {
-        self.allow_self_registration_flag.store(value, Ordering::Relaxed);
+        self.allow_self_registration_flag
+            .store(value, Ordering::Relaxed);
     }
 
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.

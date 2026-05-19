@@ -463,10 +463,7 @@ pub async fn post_smtp(
         // written when the caller explicitly supplied a value, so legacy
         // callers that omit the field keep the existing setting.
         if let Some(allow) = body.allow_self_registration {
-            auth_obj.insert(
-                "allow_self_registration".into(),
-                serde_json::json!(allow),
-            );
+            auth_obj.insert("allow_self_registration".into(), serde_json::json!(allow));
         }
         Ok(())
     })
