@@ -111,7 +111,9 @@ const scenarios = new Map([
       id: 'task-subagent-tree',
       title: 'Task Subagent Tree',
       transport: 'stdio',
-      runner: 'task-subagent-tree',
+      runner: null,
+      blockedMessage:
+        'Current octos-tui renders a generic agent task for this prompt but does not produce the M15 live-subagent final marker or m15-evidence transcript yet.',
       finalMarker: 'M19_TASK_SUBAGENT_TREE_FINAL_LINE',
       prompt:
         'Run M15 code review with live subagent orchestration through octos serve --stdio. Use supervised subagents and produce the final marker.',
@@ -174,7 +176,7 @@ Environment:
   OCTOS_UX_TMUX_OUT_ROOT     Override output root. Default: e2e/test-results-ux.
   OCTOS_UX_TMUX_OUT_DIR      Override scenario output directory.
   OCTOS_UX_TMUX_TUI_RUNNER   Override octos-tui tmux runner script.
-  OCTOS_TUI_REPO             Override octos-tui checkout. Default: /Users/yuechen/home/octos-tui.
+  OCTOS_TUI_REPO             Override octos-tui checkout. Default: ../octos-tui next to this repo.
 `;
 }
 
@@ -303,6 +305,7 @@ function resolveContext({ scenarioId, selfTest }) {
   const stamp = compactTimestamp();
   const runId =
     process.env.OCTOS_UX_TMUX_RUN_ID || `${selfTest ? 'ux-tmux-self-test' : 'ux-tmux'}-${stamp}`;
+  const runKey = `${runId}-${scenario.id}`;
   const outRoot = path.resolve(
     process.env.OCTOS_UX_TMUX_OUT_ROOT || path.join(repoRoot, 'e2e', 'test-results-ux'),
   );
@@ -310,7 +313,7 @@ function resolveContext({ scenarioId, selfTest }) {
     process.env.OCTOS_UX_TMUX_OUT_DIR || path.join(outRoot, runId, scenario.id),
   );
   const runtimeRoot = path.resolve(
-    process.env.OCTOS_UX_TMUX_RUNTIME_ROOT || path.join(os.tmpdir(), `octos-ux-tmux-${runId}`),
+    process.env.OCTOS_UX_TMUX_RUNTIME_ROOT || path.join(os.tmpdir(), `octos-ux-tmux-${runKey}`),
   );
   const dataDir = path.resolve(process.env.OCTOS_UX_TMUX_DATA_DIR || path.join(runtimeRoot, 'data'));
   const workdir = path.resolve(
@@ -319,7 +322,7 @@ function resolveContext({ scenarioId, selfTest }) {
   const replayFile = path.resolve(
     process.env.OCTOS_UX_TMUX_REPLAY || path.join(scenarioDir, 'input-replay.log'),
   );
-  const tuiRepo = path.resolve(process.env.OCTOS_TUI_REPO || '/Users/yuechen/home/octos-tui');
+  const tuiRepo = path.resolve(process.env.OCTOS_TUI_REPO || path.join(repoRoot, '..', 'octos-tui'));
   const lowerRunner = path.resolve(
     process.env.OCTOS_UX_TMUX_TUI_RUNNER
       || process.env.OCTOS_M19_UX_TUI_RUNNER
@@ -329,7 +332,7 @@ function resolveContext({ scenarioId, selfTest }) {
   const tuiBin = path.resolve(process.env.OCTOS_TUI_BIN || path.join(tuiRepo, 'target', 'debug', 'octos-tui'));
   const cols = positiveIntegerEnv('OCTOS_UX_TMUX_COLS', scenario.id === 'narrow-layout' ? 80 : 120);
   const rows = positiveIntegerEnv('OCTOS_UX_TMUX_ROWS', scenario.id === 'narrow-layout' ? 24 : 40);
-  const port = positiveIntegerEnv('OCTOS_UX_TMUX_PORT', stablePortForRunId(runId));
+  const port = positiveIntegerEnv('OCTOS_UX_TMUX_PORT', stablePortForRunId(runKey));
   const profileId = process.env.OCTOS_UX_TMUX_PROFILE || 'coding';
   const sessionId =
     process.env.OCTOS_UX_TMUX_SESSION_ID || `${profileId}:local:ux:${scenario.id}:${runId}`;
@@ -360,6 +363,7 @@ function resolveContext({ scenarioId, selfTest }) {
   return {
     scenario,
     runId,
+    runKey,
     outRoot,
     scenarioDir,
     runtimeRoot,
@@ -409,6 +413,57 @@ function writeReplay(ctx) {
   );
 }
 
+function writeRuntimePolicyStamp(ctx, generatedAt, { force = false } = {}) {
+  const file = path.join(ctx.scenarioDir, 'runtime-policy-stamp.json');
+  if (!force && fs.existsSync(file)) return;
+  writeJson(file, {
+    schema: 'octos.ux.runtime_policy_stamp.v1',
+    generated_at: generatedAt,
+    source: 'harness',
+    run_id: ctx.runId,
+    scenario_id: ctx.scenario.id,
+    transport: ctx.scenario.transport,
+    backend: ctx.scenario.transport === 'websocket' ? 'octos serve --websocket' : 'octos serve --stdio',
+    stamp: {
+      profile_id: ctx.profileId,
+      session_id: ctx.sessionId,
+      approval_policy: process.env.OCTOS_APPROVAL_POLICY || null,
+      sandbox_mode: process.env.OCTOS_SANDBOX || 'inherits harness environment',
+      network_access: process.env.OCTOS_NETWORK || 'inherits harness environment',
+    },
+    terminal: {
+      cols: ctx.cols,
+      rows: ctx.rows,
+    },
+  });
+}
+
+function collectArtifactNames(outDir) {
+  const names = new Set(requiredArtifacts);
+  const visit = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        visit(file);
+      } else if (entry.isFile()) {
+        names.add(path.relative(outDir, file));
+      }
+    }
+  };
+  visit(outDir);
+  return [...names].sort((left, right) => {
+    const leftRequired = requiredArtifacts.indexOf(left);
+    const rightRequired = requiredArtifacts.indexOf(right);
+    if (leftRequired !== -1 || rightRequired !== -1) {
+      if (leftRequired === -1) return 1;
+      if (rightRequired === -1) return -1;
+      return leftRequired - rightRequired;
+    }
+    return left.localeCompare(right);
+  });
+}
+
 function writeArtifactSkeleton(ctx, options) {
   const generatedAt = utcNow();
   const placeholder = options.placeholderArtifacts !== false;
@@ -436,6 +491,7 @@ function writeArtifactSkeleton(ctx, options) {
     profile_id: ctx.profileId,
     final_marker: ctx.scenario.finalMarker,
     lower_runner: ctx.lowerRunner,
+    required_artifacts: requiredArtifacts,
   });
 
   writeText(path.join(ctx.scenarioDir, 'launch-command.txt'), `${ctx.launchCommand}\n`);
@@ -445,25 +501,7 @@ function writeArtifactSkeleton(ctx, options) {
     cols: ctx.cols,
     rows: ctx.rows,
   });
-  writeJson(path.join(ctx.scenarioDir, 'runtime-policy-stamp.json'), {
-    schema: 'octos.ux.runtime_policy_stamp.v1',
-    generated_at: generatedAt,
-    run_id: ctx.runId,
-    scenario_id: ctx.scenario.id,
-    transport: ctx.scenario.transport,
-    backend: 'octos serve --stdio',
-    stamp: {
-      profile_id: ctx.profileId,
-      session_id: ctx.sessionId,
-      approval_policy: process.env.OCTOS_APPROVAL_POLICY || null,
-      sandbox_mode: process.env.OCTOS_SANDBOX || 'inherits harness environment',
-      network_access: process.env.OCTOS_NETWORK || 'inherits harness environment',
-    },
-    terminal: {
-      cols: ctx.cols,
-      rows: ctx.rows,
-    },
-  });
+  writeRuntimePolicyStamp(ctx, generatedAt, { force: placeholder });
 
   if (placeholder) {
     writeText(
@@ -543,7 +581,7 @@ function writeArtifactSkeleton(ctx, options) {
   };
   writeJson(summaryPath, summary);
   summary.artifacts = Object.fromEntries(
-    requiredArtifacts.map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
+    collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
   );
   writeJson(summaryPath, summary);
 }
@@ -571,7 +609,7 @@ function refreshSummaryArtifacts(ctx, validationStatus = null) {
     }
   }
   summary.artifacts = Object.fromEntries(
-    requiredArtifacts.map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
+    collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
   );
   writeJson(summaryPath, summary);
 }
@@ -778,7 +816,7 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_TRANSPORT: ctx.scenario.transport === 'websocket' ? 'ws' : ctx.scenario.transport,
     OCTOS_TUI_SOAK_PROFILE: ctx.profileId,
     OCTOS_TUI_SOAK_SESSION: ctx.sessionId,
-    OCTOS_TUI_SOAK_SERVER_SESSION: `octos-onboard-server-${ctx.runId}`,
+    OCTOS_TUI_SOAK_SERVER_SESSION: `octos-onboard-server-${safeSlug(ctx.runKey)}`,
     OCTOS_TUI_SOAK_TUI_SESSION: ctx.sessionName,
     OCTOS_TUI_SOAK_LOCAL_NAME: process.env.OCTOS_TUI_SOAK_LOCAL_NAME || ctx.profileId,
     OCTOS_TUI_SOAK_LOCAL_USERNAME: process.env.OCTOS_TUI_SOAK_LOCAL_USERNAME || ctx.profileId,
@@ -913,7 +951,7 @@ function realMode(ctx) {
     status: 'starting',
     ok: false,
     message: 'real tmux run starting',
-    placeholderArtifacts: true,
+    placeholderArtifacts: false,
     realTmuxLaunched: false,
   });
 

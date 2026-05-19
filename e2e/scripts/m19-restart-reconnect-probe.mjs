@@ -14,7 +14,14 @@ const authToken = process.env.OCTOS_M19_RESTART_AUTH_TOKEN;
 const profileId = process.env.OCTOS_M19_RESTART_PROFILE_ID || 'coding';
 const sessionId = process.env.OCTOS_M19_RESTART_SESSION_ID;
 const workspace = process.env.OCTOS_M19_RESTART_WORKSPACE || process.cwd();
-const timeoutMs = Number(process.env.OCTOS_M19_RESTART_TIMEOUT_MS || 15_000);
+function positiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+const timeoutMs = positiveIntegerEnv('OCTOS_M19_RESTART_TIMEOUT_MS', 15_000);
 const appuiTranscript = path.join(artifactDir, 'appui-transcript.jsonl');
 const websocketTranscript = path.join(artifactDir, 'websocket-transcript.jsonl');
 const snapshotPath = path.join(

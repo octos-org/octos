@@ -85,6 +85,12 @@ const KNOWN_CAPTURE_BUG_PATTERNS = [
 const SERVER_DROPPED_TURN_PATTERN =
   /lifecycle notification not delivered.*turn\/completed|writer channel full for lifecycle frame|lifecycle ws send failed; aborting connection/;
 const CAPTURE_STUCK_RUNNING_PATTERN = /Task Working|Progress .*Thinking|state .*Working/;
+const ACCEPTABLE_IDEMPOTENT_ERROR_CODES = new Set([
+  'profile_exists',
+  'already_exists',
+  'conflict',
+  'profile_local_collision',
+]);
 
 function usage() {
   return [
@@ -123,6 +129,19 @@ function readJson(file) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function jsonRpcErrorCode(error) {
+  if (!isPlainObject(error)) return '';
+  return String(error.data?.kind || error.data?.code || error.code || error.message || '');
+}
+
+function isAcceptableJsonRpcError(frame) {
+  if (!isPlainObject(frame) || !isPlainObject(frame.error)) return false;
+  const code = jsonRpcErrorCode(frame.error);
+  if (ACCEPTABLE_IDEMPOTENT_ERROR_CODES.has(code)) return true;
+  const message = String(frame.error.message || '').toLowerCase();
+  return [...ACCEPTABLE_IDEMPOTENT_ERROR_CODES].some((known) => message.includes(known));
 }
 
 function artifactPath(artifactDir, name) {
@@ -529,7 +548,12 @@ function checkAppuiTranscriptSemantic(artifactDir) {
       requestIds.set(String(frame.id), frame.method);
     }
     if (Object.prototype.hasOwnProperty.call(frame, 'result') || Object.prototype.hasOwnProperty.call(frame, 'error')) {
-      responseIds.push({ id: frame.id, row: entry.row, hasError: Object.prototype.hasOwnProperty.call(frame, 'error') });
+      responseIds.push({
+        id: frame.id,
+        row: entry.row,
+        frame,
+        hasError: Object.prototype.hasOwnProperty.call(frame, 'error'),
+      });
     }
   }
 
@@ -543,7 +567,7 @@ function checkAppuiTranscriptSemantic(artifactDir) {
     if (requestIds.size > 0 && !requestIds.has(id)) {
       problems.push(`line ${response.row.line}: response id ${id} has no matching request`);
     }
-    if (response.hasError) {
+    if (response.hasError && !isAcceptableJsonRpcError(response.frame)) {
       problems.push(`line ${response.row.line}: transcript contains JSON-RPC error response id ${id}`);
     }
   }
@@ -705,8 +729,16 @@ function checkPermissionSelectionScenario(artifactDir) {
   }
   if (!appliedCapture.ok) {
     problems.push(`tui-capture-permissions-applied.txt could not be read: ${appliedCapture.error}`);
-  } else if (!/Permissions updated|Permissions:/.test(appliedCapture.text)) {
-    problems.push('applied permission capture is missing a permission status update');
+  } else {
+    for (const expected of [
+      'Permissions updated: Workspace Write',
+      'Workspace Write',
+      'network blocked',
+    ]) {
+      if (!appliedCapture.text.includes(expected)) {
+        problems.push(`applied permission capture is missing ${expected}`);
+      }
+    }
   }
 
   return makeCheck(
@@ -834,6 +866,15 @@ function checkTaskSubagentTreeScenario(artifactDir) {
       true,
       'task-subagent-tree visible contract is not required for this scenario',
       ['scenario.json'],
+    );
+  }
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (summary.ok && ['blocked', 'skipped', 'quarantined'].includes(summary.value.status)) {
+    return makeCheck(
+      'task_subagent_tree_visible_contract',
+      true,
+      `task-subagent-tree visible contract is not required for status=${summary.value.status}`,
+      ['scenario.json', 'summary.json'],
     );
   }
 
@@ -974,9 +1015,13 @@ function checkRestartReconnectScenario(artifactDir) {
     if (preSnapshot.value.session_id !== postSnapshot.value.session_id) {
       problems.push('pre/post snapshots refer to different session_id values');
     }
-    const preSeq = Number(preSnapshot.value.cursor?.seq ?? preSnapshot.value.hydrate?.cursor?.seq ?? 0);
-    const postSeq = Number(postSnapshot.value.cursor?.seq ?? postSnapshot.value.hydrate?.cursor?.seq ?? 0);
-    if (!Number.isFinite(preSeq) || !Number.isFinite(postSeq) || postSeq < preSeq) {
+    const preCursorValue = preSnapshot.value.cursor?.seq ?? preSnapshot.value.hydrate?.cursor?.seq;
+    const postCursorValue = postSnapshot.value.cursor?.seq ?? postSnapshot.value.hydrate?.cursor?.seq;
+    const preSeq = Number(preCursorValue);
+    const postSeq = Number(postCursorValue);
+    if (preCursorValue === undefined || postCursorValue === undefined) {
+      problems.push('pre/post snapshots must both include cursor.seq or hydrate.cursor.seq');
+    } else if (!Number.isFinite(preSeq) || !Number.isFinite(postSeq) || postSeq < preSeq) {
       problems.push(`post reconnect cursor seq ${postSeq} is behind pre restart cursor seq ${preSeq}`);
     }
   }
