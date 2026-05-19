@@ -136,13 +136,13 @@ fn build_state_with_users(
     // Use a static token so we don't need an SMTP send round-trip to
     // mint a session.
     let auth_config = octos_cli::otp::DashboardAuthConfig {
-        smtp: octos_cli::otp::SmtpConfig {
+        smtp: Some(octos_cli::otp::SmtpConfig {
             host: "unused".into(),
             port: 587,
             username: "unused@example.com".into(),
             password_env: "UNUSED_PASSWORD".into(),
             from_address: "unused@example.com".into(),
-        },
+        }),
         session_expiry_hours: 24,
         allow_self_registration: false,
         static_tokens: vec!["e2e-static-bypass".into()],
