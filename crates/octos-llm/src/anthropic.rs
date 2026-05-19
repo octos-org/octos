@@ -306,14 +306,19 @@ struct AnthropicImageSource {
 }
 
 fn build_anthropic_content(msg: &Message) -> AnthropicContent {
-    // Mirror openai.rs: only inline vision content on USER messages.
-    // Assistant/Tool media is prior-turn tool output (e.g.
-    // send_file(skill-output/slides/<slug>/output/slide-NN.png)) and
-    // should never be re-fed as image input on subsequent turns.
+    // Mirror openai.rs:
+    //   - Assistant/Tool media: never inline as image content (prior
+    //     turn's tool output, e.g. send_file(slide.png)).
+    //   - Paths under `skill-output/`: never inline regardless of role,
+    //     since the SPA can surface generated artifacts into the user
+    //     composer's attachment field (live mini3 dspfac reproducer).
     let images: Vec<_> = if msg.role != MessageRole::User {
         vec![]
     } else {
-        msg.media.iter().filter(|p| vision::is_image(p)).collect()
+        msg.media
+            .iter()
+            .filter(|p| vision::is_image(p) && !vision::is_tool_output_path(p))
+            .collect()
     };
 
     if images.is_empty() {

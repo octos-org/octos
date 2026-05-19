@@ -37,6 +37,28 @@ pub fn is_image(path: &str) -> bool {
         || lower.ends_with(".webp")
 }
 
+/// Check if a path points to a tool-generated artifact under the
+/// workspace `skill-output/` convention. Tool outputs are never valid
+/// LLM vision inputs — re-feeding them produces large redundant
+/// `image_url` content blocks on every subsequent turn and breaks
+/// providers that reject vision payloads (e.g. kimi-k2.5).
+///
+/// Live reproducer on mini3 dspfac session
+/// `slides-1779130130502-th18yr`: the slides editor surfaced a
+/// generated slide PNG into the chat composer's attachment field,
+/// so the path arrived as `Message.media` on a User-role message.
+/// A role-only check could not catch that — but the path itself is
+/// always recognizable as plugin output.
+///
+/// Match is intentionally substring-based so it catches both
+/// workspace-relative paths (`skill-output/slides/...`) and the
+/// absolute paths the file-server emits
+/// (`/Users/cloud/.octos/profiles/dspfac/data/workspaces/slides-…/skill-output/...`).
+pub fn is_tool_output_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized.contains("/skill-output/") || normalized.starts_with("skill-output/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
