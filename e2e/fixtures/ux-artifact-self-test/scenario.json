@@ -7,6 +7,9 @@
   "required_artifacts": [
     "scenario.json",
     "summary.json",
+    "launch-command.txt",
+    "terminal-size.json",
+    "input-replay.log",
     "appui-transcript.jsonl",
     "server.log",
     "tui-capture.txt",

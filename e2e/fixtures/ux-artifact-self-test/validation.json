@@ -9,6 +9,9 @@
       "evidence": [
         "scenario.json",
         "summary.json",
+        "launch-command.txt",
+        "terminal-size.json",
+        "input-replay.log",
         "appui-transcript.jsonl",
         "server.log",
         "tui-capture.txt",
@@ -25,12 +28,47 @@
       ]
     },
     {
+      "id": "real_tmux_evidence",
+      "status": "passed",
+      "detail": "real tmux evidence is not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json"
+      ]
+    },
+    {
+      "id": "appui_transcript_semantic",
+      "status": "passed",
+      "detail": "semantic transcript checks are not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json",
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
       "id": "rendered_screen_no_known_bug_patterns",
       "status": "passed",
       "detail": "tui-capture.txt and server.log do not match known tmux UX bug patterns",
       "evidence": [
         "tui-capture.txt",
         "server.log"
+      ]
+    },
+    {
+      "id": "screen_geometry_consistent",
+      "status": "passed",
+      "detail": "screen geometry checks are not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json",
+        "terminal-size.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "permission_selection_visible_contract",
+      "status": "passed",
+      "detail": "permission-selection visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
       ]
     },
     {

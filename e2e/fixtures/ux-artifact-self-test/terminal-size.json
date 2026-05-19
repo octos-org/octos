@@ -1,0 +1,5 @@
+{
+  "schema": "octos.ux.terminal_size.v1",
+  "cols": 120,
+  "rows": 40
+}
