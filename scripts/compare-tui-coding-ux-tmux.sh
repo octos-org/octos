@@ -481,9 +481,14 @@ tui_capture_has_ready_state() {
 }
 
 tui_capture_has_active_state() {
+  # Match the visible "active" footer / status vocabulary the current TUI
+  # emits. Includes the legacy `running|blocked` words as well as the new
+  # `Working|Progress|Streaming` footer states (#854 — deepseek-v4-pro
+  # live soak transcripts showed `state ◒ Working (...)` which the
+  # legacy regex missed and caused inline-diff detection to stall).
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
+    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
 }
 
 tui_capture_has_blocking_approval() {
@@ -646,6 +651,34 @@ wait_for_regex_soft() {
     capture="$(printf '%s\n' "$capture" | strip_prompt_echoes)"
     if printf '%s\n' "$capture" | grep -E -q -- "$regex"; then
       return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# Soft wait that also exits early if the TUI returns to a ready/idle
+# state while the requested regex remains absent. #854 — without the
+# fast-exit branch, soak runs spend the full MAX_WAIT_TURN budget when
+# the model lands back at Done/Idle without producing the expected
+# soft signal, slowing CI and masking detector drift as timeouts.
+wait_for_tui_regex_or_idle() {
+  local session="$1"
+  local regex="$2"
+  local timeout="$3"
+  local deadline=$((SECONDS + timeout))
+  local capture
+
+  while [ "$SECONDS" -le "$deadline" ]; do
+    capture="$(capture_visible_clean "$session" || true)"
+    capture="$(printf '%s\n' "$capture" | strip_prompt_echoes)"
+    if printf '%s\n' "$capture" | grep -E -q -- "$regex"; then
+      return 0
+    fi
+    if tui_capture_has_ready_state "$capture" \
+      && ! tui_capture_has_active_state "$capture" \
+      && ! tui_capture_has_blocking_approval "$capture"; then
+      return 1
     fi
     sleep 0.5
   done
@@ -1124,7 +1157,7 @@ EOF
   if ! send_tui_prompt "$tui_session" "$PROMPT_QUESTION" "question turn"; then
     append_capture_clean_to_file "$tui_session" "$transcript" "octos-tui question submit failure"
   fi
-  if wait_for_regex_soft "$tui_session" "$QUESTION_REGEX" "$MAX_WAIT_TURN"; then
+  if wait_for_tui_regex_or_idle "$tui_session" "$QUESTION_REGEX" "$MAX_WAIT_TURN"; then
     question_seen=1
   fi
   wait_for_tui_turn_cycle "$tui_session" 240 || wait_for_tui_first_turn_complete "$tui_session" 60 || true
@@ -1842,4 +1875,9 @@ main() {
   fi
 }
 
-main "$@"
+# Only run the soak when this script is invoked directly. Sourcing
+# (e.g. from scripts/tests/test-compare-tui-coding-ux-detectors.sh) is
+# expected to load helpers without running the long-running flow.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
