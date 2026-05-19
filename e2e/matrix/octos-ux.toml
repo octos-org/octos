@@ -200,11 +200,15 @@ expected_artifacts = [
   "runtime-policy-stamp.json",
   "validation.json",
   "approval-events.jsonl",
+  "tui-capture-approval-request.txt",
+  "tui-capture-approval-denied.txt",
 ]
 acceptance = [
   "appui.approval_denied_event_present",
   "appui.no_tool_call_after_denial",
+  "approval_denial_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner with OCTOS_M9_PROTOCOL_FIXTURES=1 to trigger a real AppUI approval request and drive denial through the TUI."
 
 [[scenario]]
 id = "task-subagent-tree"

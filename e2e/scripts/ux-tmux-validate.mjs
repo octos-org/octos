@@ -760,6 +760,53 @@ function checkProviderMissingScenario(artifactDir) {
   );
 }
 
+function checkApprovalDenialScenario(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'approval_denial_visible_contract',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (scenario.value.id !== 'approval-denial' && scenario.value.scenario_id !== 'approval-denial') {
+    return makeCheck(
+      'approval_denial_visible_contract',
+      true,
+      'approval-denial visible contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const requestCapture = readText(artifactPath(artifactDir, 'tui-capture-approval-request.txt'));
+  const deniedCapture = readText(artifactPath(artifactDir, 'tui-capture-approval-denied.txt'));
+  const problems = [];
+  if (!requestCapture.ok) {
+    problems.push(`tui-capture-approval-request.txt could not be read: ${requestCapture.error}`);
+  } else {
+    for (const expected of ['Approval Requested', 'n = deny it']) {
+      if (!requestCapture.text.includes(expected)) {
+        problems.push(`approval request capture is missing ${expected}`);
+      }
+    }
+  }
+  if (!deniedCapture.ok) {
+    problems.push(`tui-capture-approval-denied.txt could not be read: ${deniedCapture.error}`);
+  } else if (!/Approval denied|denied by client|without sudo|continuing without sudo/i.test(deniedCapture.text)) {
+    problems.push('approval denied capture is missing a denial acknowledgement');
+  }
+
+  return makeCheck(
+    'approval_denial_visible_contract',
+    problems.length === 0,
+    problems.length === 0
+      ? 'approval request surfaced in the TUI and denial acknowledgement was rendered after pressing n'
+      : `approval denial visible contract problems: ${problems.join('; ')}`,
+    ['tui-capture-approval-request.txt', 'tui-capture-approval-denied.txt'],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -808,6 +855,7 @@ function buildValidation(artifactDir) {
     checkScreenGeometryConsistent(artifactDir),
     checkPermissionSelectionScenario(artifactDir),
     checkProviderMissingScenario(artifactDir),
+    checkApprovalDenialScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks

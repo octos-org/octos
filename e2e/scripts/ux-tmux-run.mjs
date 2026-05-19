@@ -99,11 +99,10 @@ const scenarios = new Map([
       id: 'approval-denial',
       title: 'Approval Denial',
       transport: 'stdio',
-      runner: null,
-      blockedMessage:
-        'Approval denial needs a migrated AppUI UX fixture or replay before it can launch in real tmux mode.',
+      runner: 'approval-denial',
       finalMarker: 'M19_APPROVAL_DENIAL_FINAL_LINE',
-      prompt: 'Show the approval denial path.',
+      prompt:
+        'M9 approval fixture: request approval for printf m19-approval-denial and deny it in the TUI.',
     },
   ],
   [
@@ -652,6 +651,9 @@ function runnerSteps(ctx) {
   if (ctx.scenario.runner === 'permission-selection') {
     return ['start', 'drive-permissions', 'drive-solo'];
   }
+  if (ctx.scenario.runner === 'approval-denial') {
+    return ['start', 'drive-approval-denial', 'drive-solo'];
+  }
   return ['start', 'drive-solo'];
 }
 
@@ -687,6 +689,7 @@ function runLowerRunner(ctx) {
       || (ctx.scenario.transport === 'websocket' ? '4' : '1'),
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
+    OCTOS_M9_PROTOCOL_FIXTURES: '1',
   };
 
   const action = (name, inherit = true, envOverrides = {}) => spawnSync(ctx.lowerRunner, [name], {
