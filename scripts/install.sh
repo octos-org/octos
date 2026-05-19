@@ -293,6 +293,24 @@ pkg_hint() {
 # Install a package using the command from pkg_hint.
 # Usage: install_pkg <package>
 # Returns 0 on success, 1 on failure.
+#
+# Pre-2026-05-18: this helper silenced stderr (`eval "$cmd" >/dev/null 2>&1`)
+# and printed only "<pkg> install failed" on a non-zero exit. That hid the
+# most common real-world failure on a fresh macOS host — `brew install`
+# returns "command not found: brew" because Homebrew itself isn't installed
+# — and let operators believe their fleet was correctly bootstrapped while
+# silently shipping without Node.js / ffmpeg / chromium. Live mini2/3/5
+# regression 2026-05-18 (mofa-slides `input=script.js` codepath broken on
+# three hosts; not noticed for weeks).
+#
+# Now:
+#   * On macOS, if the install command starts with `brew` and `brew` is
+#     not in PATH, refuse early with the canonical Homebrew bootstrap
+#     hint instead of running an `eval "brew …"` that's guaranteed to
+#     fail.
+#   * Capture the eval's stderr to a tempfile and surface the LAST few
+#     lines on failure, so the operator sees the actual reason rather
+#     than just "<pkg> install failed".
 install_pkg() {
     local pkg="$1"
     local cmd
@@ -301,12 +319,34 @@ install_pkg() {
         warn "don't know how to install $pkg on this system"
         return 1
     fi
+    # macOS gate: if the install plan calls `brew` and brew is missing,
+    # do not even try — the eval would emit "command not found: brew"
+    # to stderr, which the legacy code silenced. Tell the operator
+    # exactly what to run first.
+    if [ "$OS" = "Darwin" ] && [[ "$cmd" == brew* ]] && ! command -v brew >/dev/null 2>&1; then
+        warn "$pkg install failed: Homebrew is not installed on this host"
+        hint "Install Homebrew first, then re-run this script:"
+        hint '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+        hint "then: $cmd"
+        return 1
+    fi
     echo "    Installing $pkg..."
-    if eval "$cmd" >/dev/null 2>&1; then
+    local stderr_log
+    stderr_log=$(mktemp -t octos-install-pkg-stderr.XXXXXX)
+    if eval "$cmd" >/dev/null 2>"$stderr_log"; then
+        rm -f "$stderr_log"
         return 0
     else
         warn "$pkg install failed"
         hint "$cmd"
+        if [ -s "$stderr_log" ]; then
+            # Surface the LAST 5 lines of stderr so the operator can see
+            # the proximate cause without scrolling through a brew/apt
+            # download log.
+            hint "Captured error output (last 5 lines):"
+            tail -5 "$stderr_log" 2>/dev/null | sed 's/^/    /' >&2 || true
+        fi
+        rm -f "$stderr_log"
         return 1
     fi
 }

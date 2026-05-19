@@ -590,7 +590,44 @@ pub async fn session_messages(
         return response;
     }
 
-    // Try standalone store first in local mode.
+    // M11-F per-profile SessionManager lookup. The WS turn handler
+    // (`run_standalone_turn`) writes session history through
+    // `SessionRuntime.sessions` which opens against the profile's own
+    // `data_dir` (`<profile>/data/sessions/...`). The process-wide
+    // `state.sessions` below opens against the top-level home and
+    // never sees profile-scoped JSONLs — so for an authenticated
+    // tenant request (e.g. dspfac asking for its own slides session),
+    // the legacy `state.sessions` walk returns 0 messages and the
+    // left chat panel renders empty after a hard refresh. Live mini3
+    // regression 2026-05-18 for session
+    // `slides-1779130130502-th18yr#slides untitled-deck-th18yr`
+    // (38 lines on disk under `profiles/dspfac/data/sessions/`,
+    // 0 candidates matched at the process-wide layer).
+    //
+    // Open a transient `SessionManager` against the resolved profile's
+    // data_dir and walk the bare-key candidates the SPA actually uses
+    // (`<session_id>` and `<session_id>#<topic>`). The candidate
+    // helper's admin/main gate is irrelevant here because the disk
+    // scope IS the tenant boundary (the request's profile_data_dir
+    // resolves only sessions belonging to that profile).
+    if !use_full {
+        if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await
+        {
+            if let Some(history) = read_profile_session_messages(
+                &profile_data_dir,
+                &id,
+                params.topic.as_deref(),
+                limit,
+                offset,
+            )
+            .await
+            {
+                return Json(history).into_response();
+            }
+        }
+    }
+
+    // Try the process-wide standalone store next (legacy + admin fallback).
     if !use_full {
         if let Some(sessions) = &state.sessions {
             let fetch_count = match offset.checked_add(limit) {
@@ -1655,12 +1692,66 @@ async fn serve_file_impl(data_dir: &std::path::Path, filename: &str) -> Response
     (StatusCode::OK, headers, data).into_response()
 }
 
+/// Open a fresh `SessionManager` against the resolved profile's data dir
+/// and try the SPA-bare key candidates the WS turn handler actually
+/// writes under. Returns the requested message page if a candidate has
+/// non-empty history; `None` otherwise (caller falls back to the
+/// process-wide `state.sessions` block).
+///
+/// The bare-key candidate (`<id>` and `<id>#<topic>`) is tried
+/// unconditionally inside the per-profile scope because the on-disk
+/// scope IS the tenant boundary — `profile_data_dir/sessions/` only
+/// contains that profile's JSONLs. The admin / main-profile gating in
+/// [`standalone_api_session_key_candidates_with_topic`] is for the
+/// process-wide `state.sessions`, where bare keys could theoretically
+/// match a JSONL written by a different tenant.
+async fn read_profile_session_messages(
+    profile_data_dir: &std::path::Path,
+    session_id: &str,
+    topic: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Option<Vec<MessageInfo>> {
+    let fetch_count = offset.checked_add(limit)?;
+    let topic = topic.unwrap_or_default();
+    let mut mgr = octos_bus::SessionManager::open(profile_data_dir).ok()?;
+    let mut candidates: Vec<SessionKey> = Vec::with_capacity(2);
+    if is_safe_bare_session_id(session_id) {
+        if topic.is_empty() {
+            candidates.push(SessionKey(session_id.to_string()));
+        } else {
+            candidates.push(SessionKey(format!("{session_id}#{topic}")));
+            candidates.push(SessionKey(session_id.to_string()));
+        }
+    }
+    for key in &candidates {
+        let session = mgr.get_or_create(key).await;
+        if session.get_history(1).is_empty() {
+            continue;
+        }
+        let messages: Vec<MessageInfo> = session
+            .get_history(fetch_count)
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|m| MessageInfo {
+                role: m.role.to_string(),
+                content: m.content.clone(),
+                timestamp: m.timestamp.to_rfc3339(),
+                thread_id: m.thread_id.clone(),
+            })
+            .collect();
+        return Some(messages);
+    }
+    None
+}
+
 fn api_session_workspace_dirs(
     data_dir: &std::path::Path,
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let profile_id = infer_profile_id_from_data_dir(data_dir);
-    let mut dirs = Vec::with_capacity(3);
+    let mut dirs = Vec::with_capacity(4);
     let mut seen = HashSet::new();
 
     for key in [
@@ -1673,6 +1764,20 @@ fn api_session_workspace_dirs(
         if seen.insert(path.clone()) {
             dirs.push(path);
         }
+    }
+
+    // SPA-created sessions (slides-/web-/site- session_ids) write their
+    // workspace under the BARE session_id, without the `<channel>:` prefix
+    // that gets percent-encoded by `encode_path_component`. The three
+    // channel-prefixed encodings above don't match those on-disk paths,
+    // so the listing endpoint returned an empty set and the SlidesChat
+    // scaffold-wait loop timed out with "slides scaffold did not appear"
+    // (live mini3 regression 2026-05-18 for session
+    // `slides-1779125959003-ugtbaa`, even though the scaffold itself
+    // succeeded server-side and the 3 expected files were on disk).
+    let bare_path = data_dir.join("users").join(session_id).join("workspace");
+    if seen.insert(bare_path.clone()) {
+        dirs.push(bare_path);
     }
 
     dirs
@@ -3598,7 +3703,7 @@ mod tests {
         let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
         let dirs = api_session_workspace_dirs(base, "slides-123");
 
-        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs.len(), 4);
         assert_eq!(
             dirs[0],
             base.join("users")
@@ -3617,6 +3722,63 @@ mod tests {
                 .join("api%3Aslides-123")
                 .join("workspace")
         );
+        // SPA-created slides/web sessions live under the BARE session_id
+        // on disk — the listing endpoint must look there too. Without
+        // this fourth candidate, slides-scaffold-wait times out with
+        // "slides scaffold did not appear" even when the deck dir +
+        // scaffold files all exist (mini3 regression 2026-05-18).
+        assert_eq!(
+            dirs[3],
+            base.join("users").join("slides-123").join("workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_profile_session_messages_returns_bare_key_history() {
+        // Reproduces the mini3 slides regression 2026-05-18: the WS
+        // turn handler persists slides history under the SPA-bare key
+        // `slides-<id>#<topic>` in `profile_data_dir/sessions/`, but
+        // the legacy process-wide store walk at `state.sessions`
+        // never sees it because it opens against a different
+        // `data_dir`. The per-profile helper must find the JSONL by
+        // walking the bare candidate directly.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+        let sessions_dir = profile_data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Persist a session under the bare-form key the SPA actually
+        // uses for slides. Round-trip through `SessionManager` so the
+        // file layout matches production exactly.
+        let bare_key =
+            SessionKey("slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string());
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            mgr.add_message(&bare_key, octos_core::Message::user("hello"))
+                .await
+                .unwrap();
+            // PR F (M8.10 thread-binding): assistant persists require a
+            // caller-supplied thread_id.
+            let mut assistant = octos_core::Message::assistant("hi back");
+            assistant.thread_id = Some("turn-1".to_string());
+            mgr.add_message(&bare_key, assistant).await.unwrap();
+        }
+
+        let messages = read_profile_session_messages(
+            profile_data_dir,
+            "slides-1779130130502-th18yr",
+            Some("slides untitled-deck-th18yr"),
+            10,
+            0,
+        )
+        .await
+        .expect("should find bare-key history under profile_data_dir");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "hi back");
     }
 
     #[test]
