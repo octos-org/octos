@@ -6374,9 +6374,6 @@ impl SessionActor {
                     }
                 }
 
-                // Auto-deliver report files produced by the agent (e.g. from run_pipeline).
-                // This ensures the file reaches the user's channel (Telegram, web, etc.)
-                // without relying on the LLM to call send_file within its token budget.
                 if conv_response.files_modified.is_empty() {
                     tracing::debug!(session = %self.session_key, "no files_modified in conv_response");
                 } else {
@@ -6385,58 +6382,6 @@ impl SessionActor {
                         files = ?conv_response.files_modified.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
                         "conv_response has files_modified"
                     );
-                }
-                for file in &conv_response.files_modified {
-                    if file.extension().and_then(|e| e.to_str()) == Some("md") {
-                        // Resolve relative paths to absolute so the file URL works
-                        let abs_file = if file.is_relative() {
-                            std::fs::canonicalize(file)
-                                .or_else(|_| std::fs::canonicalize(self.data_dir.join(file)))
-                                .unwrap_or_else(|_| file.clone())
-                        } else {
-                            file.clone()
-                        };
-                        info!(
-                            session = %self.session_key,
-                            file = %abs_file.display(),
-                            channel = %self.channel,
-                            chat_id = %self.chat_id,
-                            "auto-delivering report file"
-                        );
-                        // Codex pre-merge review of #748 P1: media metadata
-                        // must carry `thread_id` so `ApiChannel::send` does
-                        // NOT fall back to sticky-map lookup. Without this,
-                        // an A/B race where B's request seeds sticky after
-                        // A's user row but before A's report delivery causes
-                        // A's file row to land under B's bubble (same leak
-                        // class the rest of PR F closes elsewhere).
-                        let mut file_metadata = serde_json::json!({
-                            "topic": self.session_key.topic(),
-                        });
-                        let report_thread_id = client_message_id
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string);
-                        if let Some(tid) = report_thread_id.as_deref() {
-                            if let serde_json::Value::Object(ref mut m) = file_metadata {
-                                m.insert(
-                                    "thread_id".to_string(),
-                                    serde_json::Value::String(tid.to_string()),
-                                );
-                            }
-                        }
-                        let file_msg = OutboundMessage {
-                            channel: self.channel.clone(),
-                            chat_id: self.chat_id.clone(),
-                            content: String::new(),
-                            reply_to: None,
-                            media: vec![abs_file.to_string_lossy().into_owned()],
-                            metadata: file_metadata,
-                        };
-                        if let Err(e) = self.out_tx.send(file_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to auto-deliver report file");
-                        }
-                    }
                 }
 
                 // Send reply
