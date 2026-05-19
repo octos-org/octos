@@ -642,10 +642,17 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            let already_leads = matches!(messages.first(), Some(m) if m.role == MessageRole::System);
-            if !already_leads {
-                messages.insert(0, system);
-            }
+            // Always re-insert. The frame may legitimately start with a
+            // compaction-summary System emitted by `for_prompt`; the
+            // runtime System (agent persona + workflow guidance) is a
+            // separate concern. `normalize_system_messages` merges
+            // consecutive Systems into a single `messages[0]` before
+            // the provider call, so both contributions reach the LLM.
+            // Safe to insert unconditionally because
+            // `context_manager::record_message_with_source_ref` early-
+            // returns for System role, so the frame cannot contain the
+            // runtime System itself.
+            messages.insert(0, system);
         }
         scratch.observed_messages = messages.len();
         {
@@ -2723,6 +2730,39 @@ impl ActorFactory {
             let pipeline_factory = pipeline_factory.clone();
             spawn_tool =
                 spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+        }
+        // Child SendFileTool factory (gateway parity with AppUI). Every
+        // spawned subagent's registry gets a fresh `SendFileTool` wired
+        // to the SAME `proxy_tx` channel as the parent, so spawn_only
+        // `files_to_send` deliveries land via the canonical session
+        // persist path. Pre-fix the gateway child registry was missing
+        // `send_file` (only `with_builtins + plugins + pipeline_factory`),
+        // and any workspace-contract subagent declaring `send_file` in
+        // `allowed_tools` (slides post-completion delivery, etc.) hit
+        // spawn preflight "required tool(s) not available on this host:
+        // send_file" at `spawn.rs:1344` — same regression as on the
+        // AppUI path, surfaced by codex review of PR #1079.
+        {
+            // `channel` / `chat_id` are `&'a str` from `SpawnParams`;
+            // the child factory closure outlives this stack frame, so
+            // own them as `String` before capture.
+            let factory_proxy_tx = proxy_tx.clone();
+            let factory_channel: String = channel.to_string();
+            let factory_chat_id: String = chat_id.to_string();
+            let factory_topic = session_key.topic().map(str::to_string);
+            let factory_base = user_workspace.clone();
+            let factory_extra = self.data_dir.clone();
+            spawn_tool = spawn_tool.with_child_tool_factory(Arc::new(move || {
+                let tool = SendFileTool::with_context(
+                    factory_proxy_tx.clone(),
+                    factory_channel.clone(),
+                    factory_chat_id.clone(),
+                )
+                .with_topic(factory_topic.clone())
+                .with_base_dir(factory_base.clone())
+                .with_extra_allowed_dir(factory_extra.clone());
+                Arc::new(tool) as Arc<dyn octos_agent::tools::Tool>
+            }));
         }
 
         // Wire direct background result injection (bypasses InboundMessage relay)

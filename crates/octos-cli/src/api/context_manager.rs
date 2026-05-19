@@ -770,6 +770,24 @@ impl ContextManager {
         message: &Message,
         source_ref: Option<TranscriptSourceRef>,
     ) -> Vec<TranscriptItemId> {
+        // The agent's runtime System prompt is composed per turn via
+        // `compose_system_prompt()` and placed at `messages[0]` by the
+        // agent loop; it is NOT a piece of session state the
+        // ContextManager should own. Recording it here makes every
+        // entry point (bridge per-turn recording, persisted-message
+        // merge, boot replay via from_session_history, fork) stack a
+        // `SystemInstruction` item across turns / restarts. `for_prompt`
+        // then re-emits them all and `normalize_system_messages`
+        // concatenates them into a 4×-bloated `messages[0]`.
+        //
+        // The legitimate use of SystemInstruction items (compaction
+        // summaries) flows through `compact_context`, not through this
+        // recording API. Skipping System here is therefore safe across
+        // all callers: bridge recording, persisted-message merging,
+        // boot replay, and snapshot reconstruction.
+        if message.role == MessageRole::System {
+            return Vec::new();
+        }
         let mut ids = Vec::new();
         match message.role {
             MessageRole::System => ids.push(self.record_item_with_source_ref(

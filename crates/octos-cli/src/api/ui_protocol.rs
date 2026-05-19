@@ -1956,10 +1956,24 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            let already_leads = matches!(messages.first(), Some(m) if m.role == MessageRole::System);
-            if !already_leads {
-                messages.insert(0, system);
-            }
+            // Always re-insert the runtime System at index 0, even if
+            // the frame already leads with a System (which would be a
+            // compaction-summary System emitted by `for_prompt`'s
+            // compaction path — see `context_manager.rs:1159`). The
+            // runtime System (agent persona + slides workflow
+            // guidance, etc.) and the compaction summary serve
+            // different purposes and must both reach the LLM.
+            // `normalize_system_messages` (`message_repair.rs:92`)
+            // merges consecutive Systems into a single `messages[0]`
+            // before the provider call, so the LLM still sees one
+            // System message; this preserves both contributions.
+            //
+            // Safe to insert unconditionally because
+            // `record_message_with_source_ref` early-returns for
+            // System (see `context_manager.rs:752`), so the frame
+            // cannot contain the runtime System itself — only a
+            // compaction summary or nothing.
+            messages.insert(0, system);
         }
         scratch.observed_messages = messages.len();
         {
@@ -14322,25 +14336,31 @@ async fn run_standalone_turn(
     let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
     let agent_config = session_runtime.agent.agent_config();
-    // Per-session system prompt override. Gateway path already reads
+    // Per-session system prompt override. Gateway path reads
     // `data_dir/session_prompts/<topic>.md` for structured-template
-    // sessions (`/new slides X`, `/new site X`) via
-    // `gateway_runtime::compose_session_prompt`, but the AppUI/WS turn
-    // path never had the equivalent wiring — so slides/site sessions on
-    // the web UI fell back to the generic agent prompt and lost their
-    // workflow guidance. `read_session_prompt` is the canonical reader
-    // in `project_templates.rs`; fall back to the agent's snapshot when
-    // the session has no topic prompt on disk (every non-template
-    // session).
-    let system_prompt_base = session_id
-        .topic()
-        .and_then(|topic| {
-            crate::project_templates::read_session_prompt(
-                &session_runtime.profile.data_dir,
-                topic,
-            )
-        })
-        .unwrap_or_else(|| session_runtime.agent.system_prompt_snapshot());
+    // sessions (`/new slides X`, `/new site X`) and CONCATENATES the
+    // session prompt onto its base prompt (see
+    // `gateway_runtime.rs:1864-1878` — `format!("{base}\n\n{session_prompt}")`).
+    // The AppUI/WS turn path never had any wiring for the session
+    // prompt, so slides/site sessions on the web UI fell back to the
+    // generic agent prompt and lost their workflow guidance.
+    //
+    // Mirror the gateway pattern: append the session prompt onto the
+    // profile snapshot rather than replacing it. The snapshot carries
+    // the profile's memory bank, skills index, persona, and other
+    // dynamic context — none of which the session prompt should
+    // supplant. The session prompt is workflow-specific guidance that
+    // augments rather than replaces.
+    let agent_snapshot = session_runtime.agent.system_prompt_snapshot();
+    let system_prompt_base = match session_id.topic().and_then(|topic| {
+        crate::project_templates::read_session_prompt(
+            &session_runtime.profile.data_dir,
+            topic,
+        )
+    }) {
+        Some(session_prompt) => format!("{agent_snapshot}\n\n{session_prompt}"),
+        None => agent_snapshot,
+    };
 
     // Wave4-A: emit an initial `router/status` snapshot adjacent to
     // `turn/started` so clients can render the routing pill before the
