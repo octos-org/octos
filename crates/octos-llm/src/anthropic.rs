@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
-use octos_core::Message;
+use octos_core::{Message, MessageRole};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -306,7 +306,15 @@ struct AnthropicImageSource {
 }
 
 fn build_anthropic_content(msg: &Message) -> AnthropicContent {
-    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
+    // Mirror openai.rs: only inline vision content on USER messages.
+    // Assistant/Tool media is prior-turn tool output (e.g.
+    // send_file(skill-output/slides/<slug>/output/slide-NN.png)) and
+    // should never be re-fed as image input on subsequent turns.
+    let images: Vec<_> = if msg.role != MessageRole::User {
+        vec![]
+    } else {
+        msg.media.iter().filter(|p| vision::is_image(p)).collect()
+    };
 
     if images.is_empty() {
         // Include non-image file paths so the agent can use read_file
