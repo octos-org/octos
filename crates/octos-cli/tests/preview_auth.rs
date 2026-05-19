@@ -20,9 +20,11 @@
 
 #![cfg(feature = "api")]
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use octos_cli::api::{AppState, build_router};
@@ -40,6 +42,15 @@ const STATIC_TOKEN_B: &str = "STATIC-TEST-TOKEN-FOR-USER-B";
 /// codex-follow-up tests 9-11 below to pin the admin cross-tenant
 /// design contract (see test comments for the design intent).
 const ADMIN_BEARER_TOKEN: &str = "STATIC-TEST-TOKEN-FOR-ADMIN";
+
+fn loopback_socket_addr() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 65432)
+}
+
+fn with_connect_info(mut req: Request<Body>, addr: SocketAddr) -> Request<Body> {
+    req.extensions_mut().insert(ConnectInfo(addr));
+    req
+}
 
 struct Fixture {
     _tempdir: TempDir,
@@ -154,13 +165,13 @@ async fn build_fixture() -> Fixture {
     //    token and looks up the user by email — no allow_registration
     //    needed since both users already exist.
     let auth_cfg = DashboardAuthConfig {
-        smtp: SmtpConfig {
+        smtp: Some(SmtpConfig {
             host: "smtp.invalid".into(),
             port: 465,
             username: "no-reply@invalid".into(),
             password_env: "OCTOS_TEST_NO_SMTP".into(),
             from_address: "no-reply@invalid".into(),
-        },
+        }),
         session_expiry_hours: 1,
         allow_self_registration: false,
         static_tokens: vec![STATIC_TOKEN_A.into(), STATIC_TOKEN_B.into()],
@@ -526,7 +537,7 @@ async fn test_6_reject_site_preview_with_forged_x_profile_id() {
     );
     let resp = app
         .clone()
-        .oneshot(
+        .oneshot(with_connect_info(
             Request::builder()
                 .method("GET")
                 .uri(&uri)
@@ -534,7 +545,8 @@ async fn test_6_reject_site_preview_with_forged_x_profile_id() {
                 .header("x-profile-id", "tenant-b")
                 .body(Body::empty())
                 .unwrap(),
-        )
+            loopback_socket_addr(),
+        ))
         .await
         .unwrap();
 
@@ -715,7 +727,7 @@ async fn test_9_admin_with_forged_x_profile_id_does_not_cross_tenant_via_header(
     );
     let resp = app
         .clone()
-        .oneshot(
+        .oneshot(with_connect_info(
             Request::builder()
                 .method("GET")
                 .uri(&uri)
@@ -723,7 +735,8 @@ async fn test_9_admin_with_forged_x_profile_id_does_not_cross_tenant_via_header(
                 .header("x-profile-id", "tenant-b")
                 .body(Body::empty())
                 .unwrap(),
-        )
+            loopback_socket_addr(),
+        ))
         .await
         .unwrap();
 
@@ -826,7 +839,7 @@ async fn test_11_admin_with_host_and_matching_x_profile_id() {
     );
     let resp = app
         .clone()
-        .oneshot(
+        .oneshot(with_connect_info(
             Request::builder()
                 .method("GET")
                 .uri(&uri)
@@ -835,7 +848,8 @@ async fn test_11_admin_with_host_and_matching_x_profile_id() {
                 .header("x-profile-id", "tenant-b")
                 .body(Body::empty())
                 .unwrap(),
-        )
+            loopback_socket_addr(),
+        ))
         .await
         .unwrap();
 
