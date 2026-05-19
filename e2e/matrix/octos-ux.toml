@@ -109,12 +109,16 @@ expected_artifacts = [
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
+  "tui-capture-permissions-open.txt",
+  "tui-capture-permissions-applied.txt",
 ]
 acceptance = [
   "runtime.policy_stamp_present",
   "runtime.policy_stamp_matches_selection",
   "appui.no_otp_calls",
+  "permission_selection_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner to open /permissions, apply a workspace-write never-ask policy, and preserve permission captures."
 
 [[scenario]]
 id = "stdio-happy-path"

@@ -90,9 +90,7 @@ const scenarios = new Map([
       id: 'permission-selection',
       title: 'Permission Selection',
       transport: 'stdio',
-      runner: null,
-      blockedMessage:
-        'Permission selection needs a current-main TUI replay and policy-stamp validator before it can launch in real tmux mode.',
+      runner: 'permission-selection',
       finalMarker: 'M19_PERMISSION_SELECTION_FINAL_LINE',
       prompt: 'Show the permission selection path.',
     },
@@ -649,6 +647,13 @@ function launchWebsocketTuiFallback(ctx, env) {
   return result.status || 0;
 }
 
+function runnerSteps(ctx) {
+  if (ctx.scenario.runner === 'permission-selection') {
+    return ['start', 'drive-permissions', 'drive-solo'];
+  }
+  return ['start', 'drive-solo'];
+}
+
 function runLowerRunner(ctx) {
   const env = {
     ...process.env,
@@ -688,7 +693,7 @@ function runLowerRunner(ctx) {
   });
 
   let status = 0;
-  for (const step of ['start', 'drive-solo']) {
+  for (const step of runnerSteps(ctx)) {
     if (status !== 0) break;
     const result = action(step);
     if (result.error) throw result.error;

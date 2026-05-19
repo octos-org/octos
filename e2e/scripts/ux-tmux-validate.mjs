@@ -661,6 +661,53 @@ function checkScreenGeometryConsistent(artifactDir) {
   );
 }
 
+function checkPermissionSelectionScenario(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'permission_selection_visible_contract',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (scenario.value.id !== 'permission-selection' && scenario.value.scenario_id !== 'permission-selection') {
+    return makeCheck(
+      'permission_selection_visible_contract',
+      true,
+      'permission-selection visible contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const openCapture = readText(artifactPath(artifactDir, 'tui-capture-permissions-open.txt'));
+  const appliedCapture = readText(artifactPath(artifactDir, 'tui-capture-permissions-applied.txt'));
+  const problems = [];
+  if (!openCapture.ok) {
+    problems.push(`tui-capture-permissions-open.txt could not be read: ${openCapture.error}`);
+  } else {
+    for (const expected of ['Update Model Permissions', 'Workspace Write, Never Ask', 'Full Access']) {
+      if (!openCapture.text.includes(expected)) {
+        problems.push(`open permission capture is missing ${expected}`);
+      }
+    }
+  }
+  if (!appliedCapture.ok) {
+    problems.push(`tui-capture-permissions-applied.txt could not be read: ${appliedCapture.error}`);
+  } else if (!/Permissions updated|Permissions:/.test(appliedCapture.text)) {
+    problems.push('applied permission capture is missing a permission status update');
+  }
+
+  return makeCheck(
+    'permission_selection_visible_contract',
+    problems.length === 0,
+    problems.length === 0
+      ? 'permission menu opened and applied-state capture shows server-confirmed permission state'
+      : `permission selection visible contract problems: ${problems.join('; ')}`,
+    ['tui-capture-permissions-open.txt', 'tui-capture-permissions-applied.txt'],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -707,6 +754,7 @@ function buildValidation(artifactDir) {
     checkAppuiTranscriptSemantic(artifactDir),
     checkRenderedScreenNoKnownBugPatterns(artifactDir),
     checkScreenGeometryConsistent(artifactDir),
+    checkPermissionSelectionScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks
