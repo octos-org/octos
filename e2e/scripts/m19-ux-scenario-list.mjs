@@ -2,8 +2,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = path.resolve(import.meta.dirname, '..', '..');
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(scriptDir, '..', '..');
 const defaultManifestPath = path.join(repoRoot, 'e2e', 'matrix', 'octos-ux.toml');
 const siblingOctosTuiRepo = path.resolve(repoRoot, '..', 'octos-tui');
 const statusClasses = ['runnable', 'skipped', 'blocked', 'quarantined'];
