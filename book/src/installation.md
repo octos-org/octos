@@ -81,6 +81,10 @@ For cloud signup and managed tenant installs, the node name becomes both the ten
 
 ## Platform-Specific Instructions
 
+### NixOS
+
+If you use Nix, Octos provides a flake with packages, a development shell, and NixOS / nix-darwin modules. See the [Nix](nix.md) page for details.
+
 ### macOS
 
 ```bash
