@@ -257,13 +257,23 @@ fi
 echo "==> Setting up Caddy for ${TUNNEL_DOMAIN}"
 echo "    Mode: $([ "$ENABLE_HTTPS" = true ] && echo "HTTPS (DNS: ${DNS_PROVIDER})" || echo "HTTP only")"
 
-# ── Detect architecture ──────────────────────────────────────────────
+# ── Detect OS + architecture for Caddy download API ──────────────────
+# Caddy's download API uses Go's GOOS/GOARCH naming, which differs from
+# `uname -s` / `uname -m`. Normalize once so both the prebuilt-with-plugin
+# and standard download paths share the same values.
+CADDY_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "$CADDY_OS" in
+    darwin|linux) ;;
+    *) echo "ERROR: Caddy install path supports darwin and linux, not $CADDY_OS"; exit 1 ;;
+esac
+
 ARCH=$(uname -m)
 case "$ARCH" in
-    x86_64)  CADDY_ARCH="amd64" ;;
-    aarch64) CADDY_ARCH="arm64" ;;
-    arm64)   CADDY_ARCH="arm64" ;;
-    *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+    x86_64|amd64)        CADDY_ARCH="amd64" ;;
+    aarch64|arm64)       CADDY_ARCH="arm64" ;;
+    armv7l|armv6l|arm)   CADDY_ARCH="arm" ;;
+    i686|i386)           CADDY_ARCH="386" ;;
+    *)                   echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
 # ── Map DNS provider to Caddy plugin ─────────────────────────────────
@@ -353,30 +363,78 @@ EOF
 LAUNCHD_ENV_DICT="$(launchd_env_dict)"
 
 # ── Install Caddy ────────────────────────────────────────────────────
+
+# Try Caddy's official download API for a prebuilt binary that already
+# bundles the requested DNS plugin. Returns 0 on success, non-zero on any
+# failure (network, plugin not in the build farm, downloaded binary
+# doesn't actually have the plugin loaded).
+#
+# Used as the primary path for HTTPS+DNS installs because it avoids the
+# Go toolchain dependency entirely on every supported OS — the same
+# endpoint serves linux/darwin/windows binaries with plugins compiled in
+# by Caddy's build server.
+download_caddy_prebuilt() {
+    local plugin="$1"
+    local expected_module="$2"
+    local tmp
+    tmp=$(mktemp /tmp/caddy.XXXXXX)
+
+    if ! curl -fsSL --max-time 90 \
+        "https://caddyserver.com/api/download?os=${CADDY_OS}&arch=${CADDY_ARCH}&p=${plugin}" \
+        -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod +x "$tmp"
+    # Verify the plugin actually loaded — the API may return a stock
+    # binary if the plugin name was rejected, in which case we want to
+    # fall back to the source build instead of installing something that
+    # can't solve the DNS challenge.
+    if ! "$tmp" list-modules 2>/dev/null | grep -qF "$expected_module"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    sudo install -m 0755 "$tmp" /usr/local/bin/caddy
+    rm -f "$tmp"
+    return 0
+}
+
+# Build Caddy from source via xcaddy. Requires Go; prompts to install if
+# missing. Used as the fallback when the Caddy API doesn't have a
+# prebuilt for the requested plugin.
+build_caddy_with_xcaddy() {
+    local plugin="$1"
+    if ! XCADDY="$(find_xcaddy)"; then
+        if ! command -v go >/dev/null 2>&1; then
+            prompt_install_pkg go || exit 1
+        fi
+        go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+        XCADDY="$(find_xcaddy)" || {
+            echo "ERROR: installed xcaddy but could not find it."
+            echo "       Re-run after adding \$(go env GOPATH)/bin to PATH, or invoke:"
+            echo "       $(go env GOPATH)/bin/xcaddy"
+            exit 1
+        }
+    fi
+    "$XCADDY" build --with "$plugin" --output /tmp/caddy
+    sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
+    rm -f /tmp/caddy
+}
+
 install_caddy() {
     sudo mkdir -p /usr/local/bin
     if [ "$ENABLE_HTTPS" = true ]; then
-        # Build custom Caddy with DNS plugin using xcaddy
-        echo "    Building Caddy with ${DNS_PROVIDER} DNS plugin..."
-        if ! XCADDY="$(find_xcaddy)"; then
-            if ! command -v go >/dev/null 2>&1; then
-                prompt_install_pkg go || exit 1
-            fi
-            go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-            XCADDY="$(find_xcaddy)" || {
-                echo "ERROR: installed xcaddy but could not find it."
-                echo "       Re-run after adding \$(go env GOPATH)/bin to PATH, or invoke:"
-                echo "       $(go env GOPATH)/bin/xcaddy"
-                exit 1
-            }
+        local expected_module="dns.providers.${DNS_PROVIDER}"
+        echo "    Installing Caddy with ${DNS_PROVIDER} DNS plugin..."
+        if download_caddy_prebuilt "$DNS_PLUGIN" "$expected_module"; then
+            echo "    Installed prebuilt Caddy with ${DNS_PROVIDER} DNS plugin (no Go required)."
+            return
         fi
-        "$XCADDY" build --with "$DNS_PLUGIN" --output /tmp/caddy
-        sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
-        rm -f /tmp/caddy
+        echo "    Prebuilt with-plugin download unavailable; falling back to xcaddy build (requires Go)..."
+        build_caddy_with_xcaddy "$DNS_PLUGIN"
     else
-        # Standard Caddy binary (no plugins needed)
+        # Standard Caddy binary (no plugins needed).
         echo "    Downloading standard Caddy..."
-        CADDY_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
         curl -fsSL "https://caddyserver.com/api/download?os=${CADDY_OS}&arch=${CADDY_ARCH}" -o /tmp/caddy
         sudo install -m 0755 /tmp/caddy /usr/local/bin/caddy
         rm -f /tmp/caddy

@@ -83,13 +83,13 @@ fn derive_dashboard_auth_from_profile(
 
     Some((
         crate::otp::DashboardAuthConfig {
-            smtp: crate::otp::SmtpConfig {
+            smtp: Some(crate::otp::SmtpConfig {
                 host: host.to_string(),
                 port: email.smtp_port.unwrap_or(465),
                 username: username.to_string(),
                 password_env,
                 from_address: from_address.to_string(),
-            },
+            }),
             session_expiry_hours: 24,
             allow_self_registration: false,
             static_tokens: Vec::new(),
@@ -158,13 +158,15 @@ fn resolve_dashboard_auth_smtp_password(
     profile_store: &crate::profiles::ProfileStore,
     auth_config: &crate::otp::DashboardAuthConfig,
 ) -> Option<String> {
-    if std::env::var(&auth_config.smtp.password_env).is_ok() {
+    // No SMTP block on disk → nothing to resolve.
+    let smtp = auth_config.smtp.as_ref()?;
+    if std::env::var(&smtp.password_env).is_ok() {
         return None;
     }
 
     for profile in preferred_dashboard_auth_profiles(profile_store) {
         if let Some(email) = profile.config.email.as_ref() {
-            if profile_email_matches_dashboard_smtp(email, &auth_config.smtp) {
+            if profile_email_matches_dashboard_smtp(email, smtp) {
                 if let Some(secret) = resolve_profile_email_secret(email, &profile.config.env_vars)
                 {
                     tracing::info!(
@@ -179,20 +181,20 @@ fn resolve_dashboard_auth_smtp_password(
 
     let profiles_for_smtp = profile_store.list().unwrap_or_default();
     for profile in &profiles_for_smtp {
-        if let Some(password) = profile.config.env_vars.get(&auth_config.smtp.password_env) {
+        if let Some(password) = profile.config.env_vars.get(&smtp.password_env) {
             if password == crate::auth::keychain::KEYCHAIN_MARKER {
                 if let Ok(Some(secret)) =
-                    crate::auth::keychain::get_secret(&auth_config.smtp.password_env)
+                    crate::auth::keychain::get_secret(&smtp.password_env)
                 {
                     tracing::info!(
-                        var = %auth_config.smtp.password_env,
+                        var = %smtp.password_env,
                         "SMTP password resolved from keychain"
                     );
                     return Some(secret);
                 }
             } else if !password.is_empty() {
                 tracing::info!(
-                    var = %auth_config.smtp.password_env,
+                    var = %smtp.password_env,
                     profile = %profile.id,
                     "SMTP password resolved from profile env_vars"
                 );
@@ -1156,11 +1158,11 @@ mod tests {
 
         let (auth, password) = derive_dashboard_auth_from_profiles(&store)
             .expect("dashboard auth should derive from admin profile");
-        assert_eq!(auth.smtp.host, "smtp.example.com");
-        assert_eq!(auth.smtp.port, 587);
-        assert_eq!(auth.smtp.username, "admin@example.com");
-        assert_eq!(auth.smtp.password_env, "SMTP_PASSWORD");
-        assert_eq!(auth.smtp.from_address, "admin@example.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().host, "smtp.example.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().port, 587);
+        assert_eq!(auth.smtp.as_ref().unwrap().username, "admin@example.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().password_env, "SMTP_PASSWORD");
+        assert_eq!(auth.smtp.as_ref().unwrap().from_address, "admin@example.com");
         assert_eq!(password.as_deref(), Some("secret"));
     }
 
@@ -1199,13 +1201,13 @@ mod tests {
             .unwrap();
 
         let auth = crate::otp::DashboardAuthConfig {
-            smtp: crate::otp::SmtpConfig {
+            smtp: Some(crate::otp::SmtpConfig {
                 host: "smtp.example.com".into(),
                 port: 465,
                 username: "admin@example.com".into(),
                 password_env: "SMTP_PASSWORD".into(),
                 from_address: "admin@example.com".into(),
-            },
+            }),
             session_expiry_hours: 24,
             allow_self_registration: false,
             static_tokens: Vec::new(),
@@ -1280,9 +1282,9 @@ mod tests {
 
         let (auth, password) = derive_dashboard_auth_from_profiles(&store)
             .expect("dashboard auth should derive from usable profile");
-        assert_eq!(auth.smtp.host, "smtp.gmail.com");
-        assert_eq!(auth.smtp.username, "dspfac@gmail.com");
-        assert_eq!(auth.smtp.from_address, "dspfac@gmail.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().host, "smtp.gmail.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().username, "dspfac@gmail.com");
+        assert_eq!(auth.smtp.as_ref().unwrap().from_address, "dspfac@gmail.com");
         assert_eq!(password.as_deref(), Some("app-password"));
     }
 
@@ -1325,13 +1327,13 @@ mod tests {
             .unwrap();
 
         let auth = crate::otp::DashboardAuthConfig {
-            smtp: crate::otp::SmtpConfig {
+            smtp: Some(crate::otp::SmtpConfig {
                 host: "smtp.gmail.com".into(),
                 port: 465,
                 username: "dspfac@gmail.com".into(),
                 password_env: "SMTP_PASSWORD".into(),
                 from_address: "dspfac@gmail.com".into(),
-            },
+            }),
             session_expiry_hours: 24,
             allow_self_registration: false,
             static_tokens: Vec::new(),
