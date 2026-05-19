@@ -3110,7 +3110,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!resp.0.ok, "send_code must surface failure when SMTP is unconfigured (was masked by anti-enumeration always-success)");
+        assert!(
+            !resp.0.ok,
+            "send_code must surface failure when SMTP is unconfigured (was masked by anti-enumeration always-success)"
+        );
         let msg = resp.0.message.expect("message should be set");
         assert!(
             msg.contains("SMTP is not configured"),
@@ -3147,8 +3150,9 @@ mod tests {
             .unwrap();
 
         // First: SMTP configured (the temp_app_state default) → enabled.
-        let Json(status_with_smtp) =
-            auth_status(State(Arc::new(state)), HeaderMap::new()).await.unwrap();
+        let Json(status_with_smtp) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
         assert!(
             status_with_smtp.email_login_enabled,
             "with SMTP configured + a login-ready user, email login should be enabled"
@@ -3175,8 +3179,9 @@ mod tests {
         profile_store2
             .save(&make_user_profile("alice", "Alice"))
             .unwrap();
-        let Json(status_without_smtp) =
-            auth_status(State(Arc::new(state2)), HeaderMap::new()).await.unwrap();
+        let Json(status_without_smtp) = auth_status(State(Arc::new(state2)), HeaderMap::new())
+            .await
+            .unwrap();
         assert!(
             !status_without_smtp.email_login_enabled,
             "without SMTP, email login must be disabled regardless of user state"

@@ -14,11 +14,7 @@ pub fn register(
     shutdown: &Arc<AtomicBool>,
     media_dir: &Path,
 ) -> eyre::Result<()> {
-    let secret_env = settings_str(
-        &entry.settings,
-        "channel_secret_env",
-        "LINE_CHANNEL_SECRET",
-    );
+    let secret_env = settings_str(&entry.settings, "channel_secret_env", "LINE_CHANNEL_SECRET");
     let token_env = settings_str(
         &entry.settings,
         "channel_access_token_env",
