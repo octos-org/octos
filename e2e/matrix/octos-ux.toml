@@ -279,6 +279,7 @@ expected_artifacts = [
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
+  "terminal-size.json",
   "runtime-policy-stamp.json",
   "validation.json",
 ]
