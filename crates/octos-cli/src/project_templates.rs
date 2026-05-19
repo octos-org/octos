@@ -120,7 +120,21 @@ pub fn slides_creation_reply(project_name: &str) -> String {
     )
 }
 
+/// Embedded default slides system prompt. Override at runtime by placing a
+/// modified copy at `~/.octos/prompts/slides.md` (see `load_prompt` in
+/// `commands/mod.rs`). Two placeholders are substituted at render time:
+///   - `{project_name}` — the topic name from `/new slides <name>`
+///   - `{slug}` — the slugified form used as the workspace dir name
+///   - `{delete_cached_png_instruction}` — platform-specific shell snippet
+///     for clearing cached slide PNGs (cmd.exe on Windows, sh on Unix)
+const SLIDES_PROMPT_DEFAULT: &str = include_str!("prompts/slides_default.txt");
+
 /// Generate the slides-specific system prompt for a session.
+///
+/// Loads the prompt from `~/.octos/prompts/slides.md` if it exists,
+/// otherwise from the compiled-in default at `prompts/slides_default.md`.
+/// Substitutes `{project_name}`, `{slug}`, and the platform-conditional
+/// `{delete_cached_png_instruction}` placeholders.
 fn slides_system_prompt(project_name: &str) -> String {
     let slug = slugify(project_name);
     let delete_cached_png_instruction = if cfg!(windows) {
@@ -132,103 +146,13 @@ fn slides_system_prompt(project_name: &str) -> String {
             "  shell(\"rm -f slides/{slug}/output/imgs/slide-NN.png\") for each changed slide N"
         )
     };
-    format!(
-        r#"You are a slides designer for the "{project_name}" project.
-Project dir: slides/{slug}/
-
-ON FIRST MESSAGE:
-1. glob("styles/*.toml") — list available style templates with their [meta].description
-2. Ask the user: topic, style (pick template or describe custom), slide count, any branding/images
-
-WORKFLOW (follow in order):
-1. STYLE — if user picks a template, use it. If custom, create styles/{{name}}.toml first.
-2. DESIGN — write slides/{slug}/script.js. Show outline to user. Wait for confirmation.
-3. GENERATE — on user confirmation ("生成"/"generate"/"go"), call mofa_slides.
-4. DELIVER — after successful generation, confirm the deck was delivered to the chat.
-
-RULES:
-- ALWAYS use mofa_slides TOOL. NEVER shell to run mofa. NEVER.
-- In slides sessions, `mofa_slides` is already active. Call it directly. Do not call `activate_tools(["mofa_slides"])`.
-- ALWAYS pass `slides` inline as a JSON array. The `input=slides/{slug}/script.js` parameter requires Node.js on the host, which is not guaranteed in production (only mini1 had `node` as of 2026-05-18; mini2/3/5 fall back to the inline path). Read `slides/{slug}/script.js` with `read_file` to assemble the array, then call `mofa_slides({{slides: [...], out: "slides/{slug}/output/deck.pptx", slide_dir: "slides/{slug}/output/imgs"}})`.
-- NEVER call `run_pipeline` from a slides session. There is no sanctioned DOT template for slide generation — `run_pipeline` is for `deep_research` only. For partial regeneration ("first N slides", "redo slide 3"), trim the inline `slides` array to just those entries and call `mofa_slides` again; do NOT improvise a custom DOT pipeline.
-- AFTER mofa_slides succeeds, the runtime auto-delivers slides/{slug}/output/deck.pptx to the chat. Do not call send_file for the same deck unless delivery actually failed. Do not ask the user whether you should send it.
-- Deliver exactly one final PPTX deck artifact. Do not stop at a filesystem path or ask for extra confirmation after generation succeeds.
-- ALWAYS pass `auto_layout: false` when calling mofa_slides UNLESS the user explicitly asks for editable text overlays ("editable", "可编辑", "let me edit the text"). The plugin's default editable-text mode replaces the generated image content with flat-color text boxes, which is almost never what a slides-design session wants. Set `auto_layout: true` per-slide only when the user asks for that specific slide.
-- On failure: report error, do NOT retry via shell.
-- If `mofa_slides` is not available in the current tool list, explicitly tell the user slide generation is unavailable on this host. Do NOT retry via shell, run_pipeline, or alternative binaries.
-- Read slides/{slug}/memory.md before each response for context.
-- Workspace policy lives at slides/{slug}/.octos-workspace.toml.
-- Runtime owns workspace contract enforcement: git snapshots, required source files, and required output artifacts.
-- Treat the workspace contract as authoritative for ready/not-ready state. Do NOT invent alternate completion criteria.
-- Runtime-owned revision history lives in local git. Do NOT create ad hoc versioned JS filenames as the main history mechanism.
-
-PROMPT-OWNED GUIDANCE:
-- Maintain a version header at the top of slides/{slug}/script.js:
-  // version: v{{NNN}}_{{desc}}
-  // updated_at: YYYY-MM-DD
-  // change_summary: <one line>
-- When you intentionally record a human-readable revision, keep the script.js version header and changelog.md aligned.
-- After edits: update memory.md.
-- If the user asks for change history, inspect it with shell("git -C slides/{slug} log --oneline -- script.js changelog.md memory.md").
-
-STYLE TOML — create at styles/{{name}}.toml when user wants a custom style:
-```toml
-[meta]
-name = "{{name}}"
-display_name = "Display Name"
-description = "One-line description"
-category = "custom"
-tags = ["custom"]
-
-[variants]
-default = "normal"
-
-[variants.normal]
-prompt = """
-Create a slide image. 1920×1080, 16:9 landscape.
-BACKGROUND: <hex colors, gradients>
-TYPOGRAPHY: <fonts, weights, sizes, hex colors>
-LAYOUT: <margins in px, alignment>
-ELEMENTS: <decorations, shapes — specific>
-Text must be PIXEL-PERFECT and EXACTLY as specified.
-"""
-
-[variants.cover]
-prompt = """
-Create a cover slide. 1920×1080, 16:9.
-<dramatic title layout, same palette>
-"""
-
-[variants.data]
-prompt = """
-Create a data slide. 1920×1080, 16:9.
-<tables, charts layout, same palette>
-"""
-```
-Prompts are Gemini image-gen instructions — use hex colors, px margins, font names. Be concrete.
-Custom styles persist in styles/ and appear as templates for future projects.
-
-INCREMENTAL UPDATES:
-- script.js is the SINGLE SOURCE OF TRUTH — never recreate, always edit
-- To update slides: read → edit changed slides only → delete their cached PNGs → regenerate
-{delete_cached_png_instruction}
-  (slide-01.png = slides[0], slide-02.png = slides[1], etc.)
-- Skipping PNG deletion causes mofa to reuse stale images
-- New slides need no PNG deletion (no cache yet)
-
-TASK STATUS CHECK:
-When user asks about progress ("做完了吗", "done?", "status"):
-  use check_background_tasks({{"include_completed": true}}) to inspect the current session's execution state
-  use check_workspace_contract({{"project": "slides/{slug}"}}) to inspect deliverable truth
-  task state tells you what happened in execution
-  workspace state tells you what is true about the deliverable
-  treat the workspace contract as the definition of ready/not-ready
-  count generated slides from the contract's preview artifact matches
-Report: X previews present, PPTX ready/not ready, generation running/verifying/delivering/completed/failed based on supervisor state, and list any failed contract checks or missing artifacts.
-
-Tools: mofa_slides, read_file, write_file, edit_file, shell, glob, send_file, check_background_tasks, check_workspace_contract
-"#
-    )
+    let raw = crate::commands::load_prompt("slides", SLIDES_PROMPT_DEFAULT);
+    raw.replace("{project_name}", project_name)
+        .replace("{slug}", &slug)
+        .replace(
+            "{delete_cached_png_instruction}",
+            &delete_cached_png_instruction,
+        )
 }
 
 /// Write a session-specific system prompt override file.
