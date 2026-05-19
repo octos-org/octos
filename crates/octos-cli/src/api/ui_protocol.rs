@@ -1819,6 +1819,12 @@ fn tool_call_slices_match(
 struct AppUiLoopPromptScratch {
     manager: ContextManager,
     observed_messages: usize,
+    /// Cached runtime System captured at TurnStart. Reused on every
+    /// `Iteration` phase within the same turn so the merge logic does
+    /// not re-capture an already-merged `messages[0]` (which would
+    /// duplicate the compaction summary content on each iteration).
+    /// Cleared/replaced when a new TurnStart phase fires.
+    runtime_system: Option<Message>,
 }
 
 struct AppUiPromptContextBridge {
@@ -1892,6 +1898,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             *scratch_guard = Some(AppUiLoopPromptScratch {
                 manager,
                 observed_messages: messages.len(),
+                runtime_system: None,
             });
         }
         let scratch = scratch_guard
@@ -1936,18 +1943,21 @@ impl PromptContextManager for AppUiPromptContextBridge {
             publish_appui_context_status(&self.session_id, &scratch.manager);
         }
 
-        // Capture the caller's runtime System prompt (composed by
-        // `compose_system_prompt()` and placed at `messages[0]` by the
-        // agent loop) BEFORE we overwrite `messages` with the manager's
-        // frame. After replacement we re-insert it at index 0 if the
-        // frame did not already lead with a System message — the
-        // manager intentionally does not own the per-turn runtime
-        // System (see `record_prompt_messages_not_covered_by_context`),
-        // and the LLM call requires the runtime System to be present.
-        let runtime_system = messages
-            .first()
-            .filter(|m| m.role == MessageRole::System)
-            .cloned();
+        // Capture the caller's runtime System ONCE per turn at
+        // TurnStart, then reuse across iterations. Pre-fix the bridge
+        // re-captured `messages[0]` on every iteration, but after the
+        // first in-place merge `messages[0]` already contained
+        // `runtime + compaction_summary`. Re-capturing that on the
+        // next iteration and merging again with a fresh frame summary
+        // duplicated the summary. The TurnStart cache holds the
+        // original, untainted runtime System for the rest of the turn.
+        if request.phase == PromptContextPhase::TurnStart {
+            scratch.runtime_system = messages
+                .first()
+                .filter(|m| m.role == MessageRole::System)
+                .cloned();
+        }
+        let runtime_system = scratch.runtime_system.clone();
         let frame = scratch.manager.for_prompt(&policy);
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages

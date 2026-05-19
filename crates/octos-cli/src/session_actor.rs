@@ -508,6 +508,10 @@ fn tool_call_slices_match(
 struct LoopPromptContextScratch {
     manager: ContextManager,
     observed_messages: usize,
+    /// Cached runtime System captured at TurnStart, reused across
+    /// iterations to avoid re-capturing an already-merged `messages[0]`
+    /// (see analogue in `AppUiLoopPromptScratch`).
+    runtime_system: Option<Message>,
 }
 
 struct SessionActorPromptContextBridge {
@@ -581,6 +585,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             *scratch_guard = Some(LoopPromptContextScratch {
                 manager,
                 observed_messages: messages.len(),
+                runtime_system: None,
             });
         }
         let scratch = scratch_guard
@@ -625,15 +630,17 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             publish_context_manager_status(&self.session_key, &scratch.manager);
         }
 
-        // Capture the caller's runtime System prompt before frame
-        // replacement; re-insert it at index 0 if the frame did not
-        // already lead with one. See the AppUI bridge analogue in
+        // Capture runtime System once per turn at TurnStart, reuse on
+        // every Iteration. See the AppUI analogue in
         // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
-        // for the same fix and the rationale.
-        let runtime_system = messages
-            .first()
-            .filter(|m| m.role == MessageRole::System)
-            .cloned();
+        // for the duplication concern that motivates the cache.
+        if request.phase == PromptContextPhase::TurnStart {
+            scratch.runtime_system = messages
+                .first()
+                .filter(|m| m.role == MessageRole::System)
+                .cloned();
+        }
+        let runtime_system = scratch.runtime_system.clone();
         let frame = scratch.manager.for_prompt(&policy);
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
