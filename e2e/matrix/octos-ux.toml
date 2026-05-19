@@ -254,7 +254,7 @@ terminal = "100x30"
 tui_binary = "octos-tui"
 tmux_command = "ux-tui-restart-reconnect"
 required_tools = ["tmux", "octos", "octos-tui"]
-required_capabilities = ["session/resume", "transport/reconnect"]
+required_capabilities = ["session/resume", "session/snapshot", "session/hydrate", "protocol/replay_lossy", "transport/reconnect"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
@@ -264,11 +264,20 @@ expected_artifacts = [
   "runtime-policy-stamp.json",
   "validation.json",
   "reconnect-events.jsonl",
+  "tui-capture-pre-restart.txt",
+  "tui-capture-post-reconnect.txt",
+  "pre-restart-snapshot.json",
+  "post-reconnect-snapshot.json",
+  "websocket-transcript.jsonl",
+  "server-before-restart.log",
+  "server-pane-after-restart.txt",
 ]
 acceptance = [
   "appui.no_duplicate_prompt_after_reconnect",
   "appui.session_state_preserved",
+  "restart_reconnect_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner over WebSocket, restarts the real backend tmux server under the live TUI, then captures TUI reconnect state plus session/hydrate pre/post snapshots."
 
 [[scenario]]
 id = "narrow-layout"

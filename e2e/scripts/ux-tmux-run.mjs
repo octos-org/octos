@@ -123,9 +123,7 @@ const scenarios = new Map([
       id: 'restart-reconnect',
       title: 'Restart And Reconnect',
       transport: 'websocket',
-      runner: null,
-      blockedMessage:
-        'Restart/reconnect depends on replacing the removed M15 runner in the M16 restart fixture.',
+      runner: 'restart-reconnect',
       finalMarker: 'M19_RESTART_RECONNECT_FINAL_LINE',
       prompt: 'Show the restart and reconnect path.',
     },
@@ -643,7 +641,113 @@ function launchWebsocketTuiFallback(ctx, env) {
   return result.status || 0;
 }
 
+function resizeTmuxWindow(ctx) {
+  const resize = spawnSync('tmux', [
+    'resize-window',
+    '-t',
+    ctx.sessionName,
+    '-x',
+    String(ctx.cols),
+    '-y',
+    String(ctx.rows),
+  ], { stdio: 'ignore' });
+  if (resize.error) throw resize.error;
+  if (resize.status !== 0) {
+    console.error(`tmux resize-window failed for ${ctx.sessionName}; capture validation will report if the TUI pane exited`);
+  }
+}
+
+function captureTmuxPane(sessionName, outputFile) {
+  const result = spawnSync('tmux', [
+    'capture-pane',
+    '-t',
+    sessionName,
+    '-p',
+    '-J',
+    '-S',
+    '-300',
+  ], { encoding: 'utf8' });
+  if (result.error) throw result.error;
+  writeText(
+    outputFile,
+    result.status === 0
+      ? result.stdout
+      : `tmux capture-pane failed for ${sessionName}: ${result.stderr || `status ${result.status}`}\n`,
+  );
+  return result.status === 0 ? 0 : (result.status || 1);
+}
+
+function runRestartReconnectProbe(ctx, phase, env) {
+  const result = spawnSync(process.execPath, [
+    path.join(scriptDir, 'm19-restart-reconnect-probe.mjs'),
+  ], {
+    cwd: repoRoot,
+    env: {
+      ...env,
+      OCTOS_M19_RESTART_PHASE: phase,
+      OCTOS_M19_RESTART_ARTIFACT_DIR: ctx.scenarioDir,
+      OCTOS_M19_RESTART_WS_ENDPOINT: ctx.websocketEndpoint,
+      OCTOS_M19_RESTART_AUTH_TOKEN: ctx.authToken,
+      OCTOS_M19_RESTART_PROFILE_ID: ctx.profileId,
+      OCTOS_M19_RESTART_SESSION_ID: ctx.sessionId,
+      OCTOS_M19_RESTART_WORKSPACE: ctx.workdir,
+    },
+    stdio: 'inherit',
+  });
+  if (result.error) throw result.error;
+  return result.status || 0;
+}
+
+function runRestartReconnectScenario(ctx, action, env) {
+  let status = 0;
+  const start = action('start');
+  if (start.error) throw start.error;
+  if (start.status !== 0) return start.status || 1;
+  if (!tmuxHasSession(ctx.sessionName)) {
+    console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
+    status = launchWebsocketTuiFallback(ctx, env);
+    if (status !== 0) return status;
+  }
+  resizeTmuxWindow(ctx);
+
+  const preTurn = action('send-turn', true, {
+    OCTOS_TUI_SOAK_PROMPT:
+      'Before backend restart, answer briefly so the reconnect fixture has visible session state.',
+    OCTOS_TUI_SOAK_TURN_WAIT_SECS: process.env.OCTOS_TUI_SOAK_RESTART_PRE_TURN_WAIT_SECS || '10',
+  });
+  if (preTurn.error) throw preTurn.error;
+  if (preTurn.status !== 0) status = preTurn.status || 1;
+  captureTmuxPane(ctx.sessionName, path.join(ctx.scenarioDir, 'tui-capture-pre-restart.txt'));
+  if (status === 0) status = runRestartReconnectProbe(ctx, 'pre', env);
+
+  if (status === 0) {
+    const restart = action('restart-server', true, {
+      OCTOS_TUI_SOAK_SERVER_WAIT_SECS:
+        process.env.OCTOS_TUI_SOAK_RESTART_SERVER_WAIT_SECS || '20',
+    });
+    if (restart.error) throw restart.error;
+    if (restart.status !== 0) status = restart.status || 1;
+  }
+
+  if (status === 0) {
+    const postTurn = action('send-turn', true, {
+      OCTOS_TUI_SOAK_PROMPT:
+        `After backend restart, confirm the TUI reconnected and finish with ${ctx.scenario.finalMarker}.`,
+      OCTOS_TUI_SOAK_TURN_WAIT_SECS:
+        process.env.OCTOS_TUI_SOAK_RESTART_POST_TURN_WAIT_SECS || '20',
+    });
+    if (postTurn.error) throw postTurn.error;
+    if (postTurn.status !== 0) status = postTurn.status || 1;
+  }
+  captureTmuxPane(ctx.sessionName, path.join(ctx.scenarioDir, 'tui-capture-post-reconnect.txt'));
+  if (status === 0) status = runRestartReconnectProbe(ctx, 'post', env);
+  return status;
+}
+
 function runnerSteps(ctx) {
+  if (ctx.scenario.runner === 'restart-reconnect') {
+    return [];
+  }
   if (ctx.scenario.runner === 'provider-missing') {
     return ['start', 'drive-provider-missing', 'drive-solo'];
   }
@@ -674,6 +778,7 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_TRANSPORT: ctx.scenario.transport === 'websocket' ? 'ws' : ctx.scenario.transport,
     OCTOS_TUI_SOAK_PROFILE: ctx.profileId,
     OCTOS_TUI_SOAK_SESSION: ctx.sessionId,
+    OCTOS_TUI_SOAK_SERVER_SESSION: `octos-onboard-server-${ctx.runId}`,
     OCTOS_TUI_SOAK_TUI_SESSION: ctx.sessionName,
     OCTOS_TUI_SOAK_LOCAL_NAME: process.env.OCTOS_TUI_SOAK_LOCAL_NAME || ctx.profileId,
     OCTOS_TUI_SOAK_LOCAL_USERNAME: process.env.OCTOS_TUI_SOAK_LOCAL_USERNAME || ctx.profileId,
@@ -710,32 +815,24 @@ function runLowerRunner(ctx) {
   });
 
   let status = 0;
-  for (const step of runnerSteps(ctx)) {
-    if (status !== 0) break;
-    const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
-      ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
-      : {};
-    const result = action(step, true, stepEnv);
-    if (result.error) throw result.error;
-    if (result.status !== 0) status = result.status || 1;
-    if (step === 'start' && status === 0) {
-      if (ctx.scenario.transport === 'websocket' && !tmuxHasSession(ctx.sessionName)) {
-        console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
-        const fallbackStatus = launchWebsocketTuiFallback(ctx, env);
-        if (fallbackStatus !== 0) status = fallbackStatus;
-      }
-      const resize = spawnSync('tmux', [
-        'resize-window',
-        '-t',
-        ctx.sessionName,
-        '-x',
-        String(ctx.cols),
-        '-y',
-        String(ctx.rows),
-      ], { stdio: 'ignore' });
-      if (resize.error) throw resize.error;
-      if (resize.status !== 0) {
-        console.error(`tmux resize-window failed for ${ctx.sessionName}; capture validation will report if the TUI pane exited`);
+  if (ctx.scenario.runner === 'restart-reconnect') {
+    status = runRestartReconnectScenario(ctx, action, env);
+  } else {
+    for (const step of runnerSteps(ctx)) {
+      if (status !== 0) break;
+      const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
+        ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
+        : {};
+      const result = action(step, true, stepEnv);
+      if (result.error) throw result.error;
+      if (result.status !== 0) status = result.status || 1;
+      if (step === 'start' && status === 0) {
+        if (ctx.scenario.transport === 'websocket' && !tmuxHasSession(ctx.sessionName)) {
+          console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
+          const fallbackStatus = launchWebsocketTuiFallback(ctx, env);
+          if (fallbackStatus !== 0) status = fallbackStatus;
+        }
+        resizeTmuxWindow(ctx);
       }
     }
   }

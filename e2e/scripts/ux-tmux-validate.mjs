@@ -562,6 +562,10 @@ function checkAppuiTranscriptSemantic(artifactDir) {
 }
 
 function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  const scenarioId = scenario.ok
+    ? (scenario.value.id || scenario.value.scenario_id || '')
+    : '';
   const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
   const serverLog = readText(artifactPath(artifactDir, 'server.log'));
   const problems = [];
@@ -571,6 +575,13 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     problems.push('tui-capture.txt is empty after stripping ANSI escapes');
   } else {
     for (const pattern of KNOWN_CAPTURE_BUG_PATTERNS) {
+      if (
+        scenarioId === 'restart-reconnect'
+        && pattern.id === 'appui_error_text_visible'
+        && /UI protocol disconnected[\s\S]*UI protocol reconnected/.test(capture.text)
+      ) {
+        continue;
+      }
       const match = lineMatches(capture.text, pattern.regex);
       if (match) {
         problems.push(`${pattern.id} at line ${match.line}: ${pattern.detail}`);
@@ -889,6 +900,111 @@ function checkTaskSubagentTreeScenario(artifactDir) {
   );
 }
 
+function checkRestartReconnectScenario(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'restart_reconnect_visible_contract',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (scenario.value.id !== 'restart-reconnect' && scenario.value.scenario_id !== 'restart-reconnect') {
+    return makeCheck(
+      'restart_reconnect_visible_contract',
+      true,
+      'restart-reconnect visible contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const preCapture = readText(artifactPath(artifactDir, 'tui-capture-pre-restart.txt'));
+  const postCapture = readText(artifactPath(artifactDir, 'tui-capture-post-reconnect.txt'));
+  const preSnapshot = readJson(artifactPath(artifactDir, 'pre-restart-snapshot.json'));
+  const postSnapshot = readJson(artifactPath(artifactDir, 'post-reconnect-snapshot.json'));
+  const parsed = parseJsonl(artifactPath(artifactDir, 'websocket-transcript.jsonl'));
+  const frameRows = parsed.rows
+    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
+    .filter((entry) => isPlainObject(entry.frame));
+  const methodNames = new Set(
+    frameRows
+      .map((entry) => entry.frame.method)
+      .filter((method) => typeof method === 'string' && method.length > 0),
+  );
+  const requiredMethods = [
+    'client_hello',
+    'config/capabilities/list',
+    'profile/local/create',
+    'permission/profile/list',
+    'permission/profile/set',
+    'session/open',
+    'session/status/read',
+    'tool/status/list',
+    'session/snapshot',
+    'session/hydrate',
+  ];
+  const problems = [];
+  if (!preCapture.ok) {
+    problems.push(`tui-capture-pre-restart.txt could not be read: ${preCapture.error}`);
+  } else if (!/Before backend restart|Done|Protocol backend connected|Ask Octos to change code/.test(preCapture.text)) {
+    problems.push('pre-restart TUI capture is missing visible active-session state');
+  }
+  if (!postCapture.ok) {
+    problems.push(`tui-capture-post-reconnect.txt could not be read: ${postCapture.error}`);
+  } else {
+    const normalizedPostCapture = postCapture.text.replaceAll('_', '');
+    if (!/Backend connection reconnected|UI protocol reconnected|M19_RESTART_RECONNECT_FINAL_LINE|M19RESTARTRECONNECTFINALLINE|reconnected/i.test(postCapture.text)) {
+      problems.push('post-reconnect TUI capture is missing reconnect or final-marker evidence');
+    }
+    if (
+      !postCapture.text.includes('M19_RESTART_RECONNECT_FINAL_LINE')
+      && !normalizedPostCapture.includes('M19RESTARTRECONNECTFINALLINE')
+    ) {
+      problems.push('post-reconnect TUI capture is missing the restart reconnect final marker');
+    }
+  }
+  if (!preSnapshot.ok) {
+    problems.push(`pre-restart-snapshot.json is not parseable JSON: ${preSnapshot.error}`);
+  }
+  if (!postSnapshot.ok) {
+    problems.push(`post-reconnect-snapshot.json is not parseable JSON: ${postSnapshot.error}`);
+  }
+  if (preSnapshot.ok && postSnapshot.ok) {
+    if (preSnapshot.value.session_id !== postSnapshot.value.session_id) {
+      problems.push('pre/post snapshots refer to different session_id values');
+    }
+    const preSeq = Number(preSnapshot.value.cursor?.seq ?? preSnapshot.value.hydrate?.cursor?.seq ?? 0);
+    const postSeq = Number(postSnapshot.value.cursor?.seq ?? postSnapshot.value.hydrate?.cursor?.seq ?? 0);
+    if (!Number.isFinite(preSeq) || !Number.isFinite(postSeq) || postSeq < preSeq) {
+      problems.push(`post reconnect cursor seq ${postSeq} is behind pre restart cursor seq ${preSeq}`);
+    }
+  }
+  for (const error of parsed.errors) {
+    problems.push(`websocket transcript line ${error.line}: ${error.error}`);
+  }
+  for (const method of requiredMethods) {
+    if (!methodNames.has(method)) {
+      problems.push(`websocket transcript missing ${method}`);
+    }
+  }
+
+  return makeCheck(
+    'restart_reconnect_visible_contract',
+    problems.length === 0,
+    problems.length === 0
+      ? 'backend restart, TUI reconnect, and session hydrate snapshots are visible and cursor-consistent'
+      : `restart/reconnect visible contract problems: ${problems.join('; ')}`,
+    [
+      'tui-capture-pre-restart.txt',
+      'tui-capture-post-reconnect.txt',
+      'pre-restart-snapshot.json',
+      'post-reconnect-snapshot.json',
+      'websocket-transcript.jsonl',
+    ],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -939,6 +1055,7 @@ function buildValidation(artifactDir) {
     checkProviderMissingScenario(artifactDir),
     checkApprovalDenialScenario(artifactDir),
     checkTaskSubagentTreeScenario(artifactDir),
+    checkRestartReconnectScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks

@@ -96,6 +96,14 @@
       ]
     },
     {
+      "id": "restart_reconnect_visible_contract",
+      "status": "passed",
+      "detail": "restart-reconnect visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
       "id": "lower_soak_summary_semantic",
       "status": "passed",
       "detail": "no lower soak summary artifact is present for this scenario",
