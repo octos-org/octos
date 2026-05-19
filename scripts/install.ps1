@@ -1356,6 +1356,11 @@ if ($Domain -and (Test-Command "caddy")) {
     respond /check 200
 }
 
+http:// {
+    @octos host $Domain *.$Domain
+    redir @octos https://{host}{uri} 308
+}
+
 $Domain {
     handle /api/* {
         reverse_proxy $caddyUpstream
@@ -1374,32 +1379,30 @@ $Domain {
     }
 }
 
-*.$Domain {
+https:// {
     tls {
         on_demand
     }
 
-    @api path /api/*
-    @admin path /admin*
-    @auth path /auth/*
+    @sub host *.$Domain
 
-    handle @api {
-        reverse_proxy $caddyUpstream {
-            header_up X-Profile-Id {labels.2}
+    handle @sub {
+        @api path /api/*
+        @admin path /admin*
+        @auth path /auth/*
+
+        handle @api {
+            reverse_proxy $caddyUpstream
         }
-    }
-    handle @admin {
-        reverse_proxy $caddyUpstream {
-            header_up X-Profile-Id {labels.2}
+        handle @admin {
+            reverse_proxy $caddyUpstream
         }
-    }
-    handle @auth {
-        reverse_proxy $caddyUpstream {
-            header_up X-Profile-Id {labels.2}
+        handle @auth {
+            reverse_proxy $caddyUpstream
         }
-    }
-    handle {
-        reverse_proxy $caddyUpstream
+        handle {
+            reverse_proxy $caddyUpstream
+        }
     }
 }
 "@ | Set-Content -Path $caddyfile -Encoding UTF8
