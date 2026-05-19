@@ -849,6 +849,10 @@ impl WorkspacePolicy {
         // artifact source" the same way `slides_pptx` does for slides.
         artifacts.insert("image_png".into(), "**/*.png".into());
 
+        // fm_tts emits a single MP3 deliverable via the plugin protocol's
+        // files_to_send list. Validate that exact reported file instead of a
+        // broad workspace glob, which can match stale audio from an earlier
+        // call in the same session workspace.
         let tts_contract = WorkspaceSpawnTaskPolicy {
             artifact: Some("primary_audio".into()),
             artifacts: Vec::new(),
@@ -859,7 +863,14 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:TTS generation failed".into()],
-            on_completion: Vec::new(),
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(
+                ValidatorSpec::AudioNonSilent {
+                    glob: String::new(),
+                    min_ratio: default_non_silent_ratio(),
+                    source: ValidatorFileSource::SpawnOnlyFiles,
+                    extension: Some("mp3".into()),
+                },
+            )],
         };
 
         let podcast_contract = WorkspaceSpawnTaskPolicy {
@@ -1717,6 +1728,33 @@ mod tests {
         assert!(task.artifacts.is_empty());
         assert!(task.on_complete.is_empty());
         assert!(task.on_deliver.is_empty());
+        let mut saw_tts_audio = false;
+        for entry in &task.on_completion {
+            if let SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                source,
+                extension,
+                glob,
+                ..
+            }) = entry
+            {
+                assert_eq!(
+                    *source,
+                    ValidatorFileSource::SpawnOnlyFiles,
+                    "fm_tts AudioNonSilent must consume plugin-reported files_to_send"
+                );
+                assert_eq!(
+                    extension.as_deref(),
+                    Some("mp3"),
+                    "fm_tts AudioNonSilent must validate the delivered MP3 artifact"
+                );
+                assert!(
+                    glob.is_empty(),
+                    "fm_tts must not use a workspace glob that can match stale audio: {glob}"
+                );
+                saw_tts_audio = true;
+            }
+        }
+        assert!(saw_tts_audio, "fm_tts contract must declare AudioNonSilent");
         assert_eq!(
             policy
                 .artifacts
