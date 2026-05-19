@@ -395,22 +395,33 @@ dashboard_auth = data.get("dashboard_auth")
 if enable_smtp:
     if not isinstance(dashboard_auth, dict):
         dashboard_auth = {}
-    dashboard_auth["smtp"] = {
-        "host": smtp_host,
-        "port": smtp_port,
-        "username": smtp_username,
-        "password_env": "SMTP_PASSWORD",
-        "from_address": smtp_from,
-    }
+    # Per-field merge so any keys the dashboard wizard may have set
+    # (e.g. a non-default password_env, or fields the script doesn't
+    # know about yet) survive the rewrite. Only the four fields the
+    # operator just supplied are replaced; password_env is set as a
+    # default if absent so lettre has something to fall back on.
+    existing_smtp = dashboard_auth.get("smtp")
+    if not isinstance(existing_smtp, dict):
+        existing_smtp = {}
+    existing_smtp["host"] = smtp_host
+    existing_smtp["port"] = smtp_port
+    existing_smtp["username"] = smtp_username
+    existing_smtp["from_address"] = smtp_from
+    existing_smtp.setdefault("password_env", "SMTP_PASSWORD")
+    dashboard_auth["smtp"] = existing_smtp
     dashboard_auth["session_expiry_hours"] = dashboard_auth.get("session_expiry_hours", 24)
     dashboard_auth["allow_self_registration"] = allow_self_registration
     data["dashboard_auth"] = dashboard_auth
-elif isinstance(dashboard_auth, dict) and "smtp" in dashboard_auth:
-    dashboard_auth.pop("smtp", None)
-    if dashboard_auth:
-        data["dashboard_auth"] = dashboard_auth
-    else:
-        data.pop("dashboard_auth", None)
+elif isinstance(dashboard_auth, dict):
+    # SMTP is disabled. Drop the entire dashboard_auth block — the
+    # remaining fields (allow_self_registration, session_expiry_hours)
+    # are functionally meaningless without SMTP, and leaving a
+    # dashboard_auth block without a `smtp` field used to crash
+    # `octos serve` on startup (DashboardAuthConfig.smtp is now
+    # Option<SmtpConfig> upstream of this fix, so the config parses,
+    # but a partial block with allow_self_registration=true is still
+    # misleading — registration via OTP can't actually succeed).
+    data.pop("dashboard_auth", None)
 
 config_path.write_text(json.dumps(data, indent=2) + "\n")
 PYEOF
@@ -764,6 +775,28 @@ if [ "$ENABLE_SMTP" = true ]; then
     prompt_value SMTP_FROM "SMTP from address" "$SMTP_USERNAME"
     prompt_yes_no ALLOW_SELF_REGISTRATION "Allow self-registration via email OTP" false
     [ -n "${SMTP_PASSWORD:-}" ] || err "SMTP_PASSWORD is required for SMTP. Export it and re-run."
+else
+    # Self-registration sends an OTP via email, so it is meaningless without
+    # SMTP. Default to false so the downstream validator accepts the value
+    # and the dashboard_auth block (which is omitted when SMTP is off) does
+    # not need this field at all.
+    ALLOW_SELF_REGISTRATION=false
+fi
+# Preserve auth_token from existing config.json on re-runs so live dashboard
+# sessions don't get silently invalidated when the operator re-runs the
+# deploy (e.g. to update HTTPS settings) without explicitly passing
+# --auth-token. Only generates a fresh token on truly first-time installs.
+# Resolution order (highest precedence first):
+#   1. --auth-token CLI flag (set above at line 99)
+#   2. AUTH_TOKEN restored from cloud-bootstrap.env state file (line 174)
+#   3. existing config.json's auth_token field (added here)
+#   4. fresh-generated random hex
+if [ -z "$AUTH_TOKEN" ] && [ -f "$DATA_DIR/config.json" ] && command -v python3 >/dev/null 2>&1; then
+    AUTH_TOKEN=$(python3 -c 'import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("auth_token", ""))
+except Exception:
+    pass' "$DATA_DIR/config.json" 2>/dev/null || true)
 fi
 if [ -z "$AUTH_TOKEN" ]; then
     AUTH_TOKEN="$(openssl rand -hex 32)"
