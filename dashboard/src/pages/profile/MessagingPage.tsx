@@ -9,12 +9,14 @@ import FeishuTab from '../../components/tabs/FeishuTab'
 import WeComBotTab from '../../components/tabs/WeComBotTab'
 import QQBotTab from '../../components/tabs/QQBotTab'
 import WeChatTab from "../../components/tabs/WeChatTab"
+import LineTab from '../../components/tabs/LineTab'
 
 const TABS = [
   { key: 'telegram', label: 'Telegram' },
   { key: 'discord', label: 'Discord' },
   { key: 'whatsapp', label: 'WhatsApp' },
   { key: 'feishu', label: 'Feishu' },
+  { key: 'line', label: 'LINE' },
   { key: 'wecom-bot', label: 'WeCom' },
   { key: "qq-bot", label: "QQ Bot" },
   { key: "wechat", label: "WeChat" },
@@ -46,6 +48,7 @@ export default function MessagingPage() {
           {activeTab === 'discord' && <DiscordTab config={config} onChange={setConfig} />}
           {activeTab === 'whatsapp' && <WhatsAppTab config={config} onChange={setConfig} isRunning={isRunning} />}
           {activeTab === 'feishu' && <FeishuTab config={config} onChange={setConfig} profileId={profileId} />}
+          {activeTab === 'line' && <LineTab config={config} onChange={setConfig} profileId={profileId} />}
           {activeTab === 'wecom-bot' && <WeComBotTab config={config} onChange={setConfig} />}
           {activeTab === 'qq-bot' && <QQBotTab config={config} onChange={setConfig} />}
           {activeTab === "wechat" && <WeChatTab config={config} onChange={setConfig} />}

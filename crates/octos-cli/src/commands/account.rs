@@ -498,5 +498,6 @@ fn channel_type(ch: &ChannelCredentials) -> &'static str {
         ChannelCredentials::Matrix { .. } => "matrix",
         ChannelCredentials::QQBot { .. } => "qq-bot",
         ChannelCredentials::WeChat { .. } => "wechat",
+        ChannelCredentials::Line { .. } => "line",
     }
 }
