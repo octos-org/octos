@@ -8,6 +8,7 @@
 
 pub mod abort;
 pub mod app_ui;
+pub mod app_ui_codec;
 mod error;
 pub mod gateway;
 mod message;

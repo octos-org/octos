@@ -20,6 +20,8 @@
     "test:live:capabilities": "npx playwright test tests/refactor-capabilities.spec.ts",
     "test:live:recovery": "npx playwright test tests/session-recovery.spec.ts",
     "test:live:acceptance": "npx playwright test --workers=1 tests/live-browser.spec.ts tests/refactor-capabilities.spec.ts tests/session-recovery.spec.ts",
-    "test:live:coding": "npx playwright test tests/coding-hardcases.spec.ts"
+    "test:live:coding": "npx playwright test tests/coding-hardcases.spec.ts",
+    "soak:m14:codex-tool-parity": "node scripts/m14-codex-tool-parity-soak.mjs",
+    "soak:m18:appui-transport-parity": "node scripts/m18-appui-transport-parity-soak.mjs"
   }
 }

@@ -65,6 +65,7 @@ fn ready_response(text: &str) -> DispatchResponse {
         output: text.into(),
         files_to_send: Vec::new(),
         error: None,
+        context_contract: None,
     }
 }
 

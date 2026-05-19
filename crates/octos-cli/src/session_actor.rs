@@ -22,8 +22,9 @@ use octos_agent::tools::{
 };
 use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, HookContext, HookExecutor, HookPayload,
-    HookResult, LoopRetryState, TaskSupervisor, TokenTracker, TurnAttachmentContext,
-    WorkspacePolicy, read_workspace_policy, workspace_policy_path, write_workspace_policy,
+    HookResult, LoopRetryState, PromptContextManager, PromptContextPhase, PromptContextReport,
+    PromptContextRequest, TaskSupervisor, TokenTracker, TurnAttachmentContext, WorkspacePolicy,
+    read_workspace_policy, workspace_policy_path, write_workspace_policy,
 };
 use octos_bus::{
     ActiveSessionStore, SessionHandle, SessionManager,
@@ -46,7 +47,17 @@ use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "api")]
+use crate::api::agent_orchestrator::{default_agent_orchestrator, upsert_background_task_agent};
+#[cfg(feature = "api")]
+use crate::api::master_continuation_scheduler::{
+    MasterContinuationReason, MasterContinuationRuntimeState, QueuedMasterContinuation,
+};
 use crate::config::QueueMode;
+use crate::context_manager::{
+    CompactContextPolicy, ContextManager, PromptBuildPolicy, load_or_rebuild_context_manager,
+    persist_context_manager_snapshot,
+};
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
 use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
@@ -113,6 +124,10 @@ const BACKGROUND_RESULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// recovery-to-primary inside an incident still surface within a few
 /// seconds; long enough to absorb back-to-back retries on the same lane.
 const FAILOVER_PUSH_DEBOUNCE: Duration = Duration::from_secs(5);
+
+const DEFAULT_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
+const DEFAULT_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
+const DEFAULT_CONTEXT_COMPACT_KEEP_ITEMS: usize = 16;
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PersistedSessionMessage {
@@ -212,6 +227,338 @@ fn save_retry_state(path: &std::path::Path, state: &LoopRetryState) {
     }
 }
 
+fn context_manager_from_history(session_key: &SessionKey, messages: &[Message]) -> ContextManager {
+    ContextManager::from_session_history(session_key.to_string(), None, messages)
+}
+
+#[cfg(feature = "api")]
+fn context_manager_status_value(manager: &ContextManager) -> serde_json::Value {
+    let state = manager.state();
+    let last_compaction = manager.compactions().last().map(|record| {
+        serde_json::json!({
+            "compaction_id": record.compaction_id.as_str(),
+            "checkpoint_id": record.checkpoint_id.as_str(),
+            "status": record.status,
+            "policy_id": record.policy_id,
+            "trigger": record.trigger,
+            "input_generation": record.input_generation,
+            "output_generation": record.output_generation,
+            "input_transcript_hash": record.input_transcript_hash,
+            "replacement_transcript_hash": record.replacement_transcript_hash,
+            "installed_transcript_hash": record.installed_transcript_hash,
+            "input_item_count": record.input_item_count,
+            "retained_count": record.retained_item_ids.len(),
+            "dropped_count": record.dropped_item_ids.len(),
+            "summary_item_id": record.summary_item_id.as_ref().map(|id| id.as_str()),
+            "token_estimate_before": record.token_estimate_before,
+            "token_estimate_after": record.token_estimate_after,
+            "error": record.error,
+        })
+    });
+    serde_json::json!({
+        "schema": "octos.context.lifecycle.v1",
+        "state": state,
+        "compaction": {
+            "count": manager.compactions().len(),
+            "last": last_compaction,
+        }
+    })
+}
+
+fn publish_context_manager_status(session_key: &SessionKey, manager: &ContextManager) {
+    #[cfg(feature = "api")]
+    crate::api::ui_protocol::update_session_context_status(
+        session_key,
+        context_manager_status_value(manager),
+    );
+    #[cfg(not(feature = "api"))]
+    let _ = (session_key, manager);
+}
+
+fn persist_context_manager_snapshot_for_session(
+    data_dir: &Path,
+    session_key: &SessionKey,
+    manager: &ContextManager,
+) {
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_key.to_string(), manager)
+    {
+        warn!(
+            session = %session_key,
+            error = %error,
+            "failed to persist context manager snapshot"
+        );
+    }
+}
+
+fn record_context_manager_message(
+    context_manager: &Arc<StdMutex<ContextManager>>,
+    session_key: &SessionKey,
+    data_dir: &Path,
+    message: &Message,
+    seq: usize,
+) {
+    let mut manager = context_manager.lock().unwrap_or_else(|e| e.into_inner());
+    let ids = manager.record_persisted_message_merging_prompt_equivalent(message, seq);
+    let state = manager.state();
+    debug!(
+        session = %session_key,
+        seq,
+        role = message.role.as_str(),
+        generated_items = ids.len(),
+        generation = state.generation,
+        transcript_hash = %state.transcript_hash,
+        "context manager shadow transcript recorded persisted session message"
+    );
+    publish_context_manager_status(session_key, &manager);
+    persist_context_manager_snapshot_for_session(data_dir, session_key, &manager);
+}
+
+fn committed_message_or_fallback(
+    handle: &SessionHandle,
+    seq: usize,
+    fallback: &Message,
+) -> Message {
+    handle
+        .session()
+        .messages
+        .get(seq)
+        .cloned()
+        .unwrap_or_else(|| fallback.clone())
+}
+
+fn reset_context_manager_from_history(
+    context_manager: &Arc<StdMutex<ContextManager>>,
+    session_key: &SessionKey,
+    data_dir: &Path,
+    messages: &[Message],
+) {
+    let rebuilt = context_manager_from_history(session_key, messages);
+    let state = rebuilt.state();
+    let mut manager = context_manager.lock().unwrap_or_else(|e| e.into_inner());
+    *manager = rebuilt;
+    publish_context_manager_status(session_key, &manager);
+    persist_context_manager_snapshot_for_session(data_dir, session_key, &manager);
+    info!(
+        session = %session_key,
+        generation = state.generation,
+        transcript_hash = %state.transcript_hash,
+        item_count = state.item_count,
+        "context manager shadow transcript rebuilt from session history"
+    );
+}
+
+fn prompt_message_matches(left: &Message, right: &Message) -> bool {
+    left.role == right.role
+        && left.content == right.content
+        && left.tool_call_id == right.tool_call_id
+        && tool_call_slices_match(left.tool_calls.as_deref(), right.tool_calls.as_deref())
+}
+
+fn record_prompt_messages_not_covered_by_context(
+    manager: &mut ContextManager,
+    policy: &PromptBuildPolicy,
+    messages: &[Message],
+) {
+    let known_messages = manager.for_prompt(policy).messages;
+    let covered = covered_prompt_message_indices(messages, &known_messages);
+    for (index, message) in messages.iter().enumerate() {
+        if !covered[index] {
+            manager.record_message(message);
+        }
+    }
+}
+
+fn covered_prompt_message_indices(messages: &[Message], known_messages: &[Message]) -> Vec<bool> {
+    let mut covered = vec![false; messages.len()];
+    if known_messages.is_empty() || known_messages.len() > messages.len() {
+        return covered;
+    }
+    let Some(start) = messages.windows(known_messages.len()).position(|window| {
+        window
+            .iter()
+            .zip(known_messages.iter())
+            .all(|(left, right)| prompt_message_matches(left, right))
+    }) else {
+        return covered;
+    };
+    for slot in covered.iter_mut().skip(start).take(known_messages.len()) {
+        *slot = true;
+    }
+    covered
+}
+
+fn tool_call_slices_match(
+    left: Option<&[octos_core::ToolCall]>,
+    right: Option<&[octos_core::ToolCall]>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.len() == right.len() => {
+            left.iter().zip(right.iter()).all(|(left, right)| {
+                left.id == right.id
+                    && left.name == right.name
+                    && left.arguments == right.arguments
+                    && left.metadata == right.metadata
+            })
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+struct LoopPromptContextScratch {
+    manager: ContextManager,
+    observed_messages: usize,
+}
+
+struct SessionActorPromptContextBridge {
+    session_key: SessionKey,
+    data_dir: PathBuf,
+    context_manager: Arc<StdMutex<ContextManager>>,
+    scratch: StdMutex<Option<LoopPromptContextScratch>>,
+}
+
+impl SessionActorPromptContextBridge {
+    fn new(
+        session_key: SessionKey,
+        data_dir: PathBuf,
+        context_manager: Arc<StdMutex<ContextManager>>,
+    ) -> Self {
+        Self {
+            session_key,
+            data_dir,
+            context_manager,
+            scratch: StdMutex::new(None),
+        }
+    }
+
+    fn threshold_tokens(request: &PromptContextRequest) -> usize {
+        std::env::var("OCTOS_CONTEXT_COMPACT_THRESHOLD_TOKENS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                (request.context_window as usize * DEFAULT_CONTEXT_COMPACT_RATIO_NUMERATOR
+                    / DEFAULT_CONTEXT_COMPACT_RATIO_DENOMINATOR)
+                    .max(1)
+            })
+    }
+
+    fn keep_items() -> usize {
+        std::env::var("OCTOS_CONTEXT_COMPACT_KEEP_ITEMS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CONTEXT_COMPACT_KEEP_ITEMS)
+    }
+
+    fn prompt_policy(request: &PromptContextRequest) -> PromptBuildPolicy {
+        PromptBuildPolicy {
+            include_reasoning: false,
+            supports_media: true,
+            max_prompt_token_estimate: None,
+            model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
+        }
+    }
+}
+
+impl PromptContextManager for SessionActorPromptContextBridge {
+    fn prepare_prompt(
+        &self,
+        request: PromptContextRequest,
+        messages: &mut Vec<Message>,
+    ) -> Result<PromptContextReport, String> {
+        let messages_before = messages.len();
+        let policy = Self::prompt_policy(&request);
+        let mut scratch_guard = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if request.phase == PromptContextPhase::TurnStart || scratch_guard.is_none() {
+            let mut manager = self
+                .context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            record_prompt_messages_not_covered_by_context(&mut manager, &policy, messages);
+            *scratch_guard = Some(LoopPromptContextScratch {
+                manager,
+                observed_messages: messages.len(),
+            });
+        }
+        let scratch = scratch_guard
+            .as_mut()
+            .ok_or_else(|| "prompt context scratch was not initialized".to_string())?;
+        if request.phase != PromptContextPhase::TurnStart
+            && scratch.observed_messages < messages.len()
+        {
+            for message in messages.iter().skip(scratch.observed_messages) {
+                scratch.manager.record_message(message);
+            }
+        } else if scratch.observed_messages > messages.len() {
+            scratch.observed_messages = messages.len();
+        }
+
+        let threshold = Self::threshold_tokens(&request);
+        let mut compaction_performed = false;
+        if scratch.manager.state().token_estimate > threshold {
+            let before = scratch.manager.for_prompt(&policy);
+            let summary_budget = threshold.clamp(256, 4096) as u32;
+            let summary =
+                octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+            let record = scratch.manager.compact_context(
+                summary,
+                CompactContextPolicy {
+                    trigger: format!("agent_loop:{}", request.phase.as_str()),
+                    keep_recent_items: Self::keep_items(),
+                    ..CompactContextPolicy::default()
+                },
+            );
+            compaction_performed = true;
+            info!(
+                session = %self.session_key,
+                phase = request.phase.as_str(),
+                iteration = request.iteration,
+                compaction_id = %record.compaction_id.as_str(),
+                checkpoint_id = %record.checkpoint_id.as_str(),
+                token_estimate_before = record.token_estimate_before,
+                token_estimate_after = ?record.token_estimate_after,
+                "context manager compact_context installed for in-loop model prompt"
+            );
+            publish_context_manager_status(&self.session_key, &scratch.manager);
+        }
+
+        let frame = scratch.manager.for_prompt(&policy);
+        let prompt_replaced = messages.len() != frame.messages.len()
+            || messages
+                .iter()
+                .zip(frame.messages.iter())
+                .any(|(left, right)| !prompt_message_matches(left, right));
+        *messages = frame.messages;
+        scratch.observed_messages = messages.len();
+        {
+            let mut canonical = self
+                .context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *canonical = scratch.manager.clone();
+            publish_context_manager_status(&self.session_key, &canonical);
+            persist_context_manager_snapshot_for_session(
+                &self.data_dir,
+                &self.session_key,
+                &canonical,
+            );
+        }
+        Ok(PromptContextReport {
+            prompt_replaced,
+            compaction_performed,
+            messages_before,
+            messages_after: messages.len(),
+            token_estimate: Some(frame.report.token_estimate),
+            generation: Some(frame.context_state.generation),
+        })
+    }
+}
+
 /// PR F (M8.10): pick a `thread_id` for an Assistant row when the caller
 /// didn't supply one and we want to honor the new-write fail-closed split.
 /// Walks `history` backwards for the most-recent User; falls back to a
@@ -237,6 +584,7 @@ fn fallback_thread_id_for_assistant(history: &[Message]) -> String {
 
 async fn persist_assistant_message(
     session_handle: &Arc<Mutex<SessionHandle>>,
+    context_manager: Option<&Arc<StdMutex<ContextManager>>>,
     session_key: &SessionKey,
     data_dir: &Path,
     content: String,
@@ -326,7 +674,17 @@ async fn persist_assistant_message(
     .await
     {
         Ok(seq) => {
-            handle.push_message_in_memory(assistant_msg);
+            handle.push_message_in_memory(assistant_msg.clone());
+            drop(handle);
+            if let Some(context_manager) = context_manager {
+                record_context_manager_message(
+                    context_manager,
+                    session_key,
+                    data_dir,
+                    &assistant_msg,
+                    seq,
+                );
+            }
             Some(PersistedSessionMessage { seq, timestamp })
         }
         Err(error) => {
@@ -387,6 +745,14 @@ fn inbound_client_message_id(inbound: &InboundMessage) -> Option<String> {
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn inbound_is_master_continuation(inbound: &InboundMessage) -> bool {
+    inbound
+        .metadata
+        .get("_master_continuation")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
@@ -466,6 +832,7 @@ async fn send_outbound_with_timeout(
 #[allow(clippy::too_many_arguments)]
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
+    context_manager: Option<&Arc<StdMutex<ContextManager>>>,
     session_key: &SessionKey,
     data_dir: &Path,
     out_tx: &mpsc::Sender<OutboundMessage>,
@@ -478,6 +845,7 @@ async fn persist_terminal_reply_and_fanout(
 ) -> bool {
     let Some(_persisted) = persist_assistant_message(
         session_handle,
+        context_manager,
         session_key,
         data_dir,
         content.clone(),
@@ -945,6 +1313,9 @@ fn forward_task_status_to_actor_inbox(
     data_dir: &Path,
     task: &octos_agent::BackgroundTask,
 ) {
+    #[cfg(feature = "api")]
+    let _ = upsert_background_task_agent(task);
+
     let task_json = sanitize_task_for_response(data_dir, task);
     let Ok(json) = serde_json::to_string(&task_json) else {
         return;
@@ -2035,6 +2406,28 @@ impl ActorFactory {
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
+        let (initial_context_manager, context_ledger_status) = load_or_rebuild_context_manager(
+            &self.data_dir,
+            session_key.to_string(),
+            None,
+            &session_handle.session().messages,
+        );
+        let context_manager = Arc::new(StdMutex::new(initial_context_manager));
+        {
+            let guard = context_manager.lock().unwrap_or_else(|e| e.into_inner());
+            let state = guard.state();
+            publish_context_manager_status(&session_key, &guard);
+            persist_context_manager_snapshot_for_session(&self.data_dir, &session_key, &guard);
+            info!(
+                session = %session_key,
+                generation = state.generation,
+                transcript_hash = %state.transcript_hash,
+                item_count = state.item_count,
+                recovery_state = ?state.recovery_state,
+                ledger_status = ?context_ledger_status,
+                "context manager shadow transcript initialized"
+            );
+        }
         let task_state_path = session_handle.task_state_path();
         let session_handle = Arc::new(Mutex::new(session_handle));
         let session_policy_path = workspace_policy_path(&user_workspace);
@@ -2453,10 +2846,17 @@ impl ActorFactory {
         // Per-session cancellation flag: shared with the agent so that
         // interrupt mode can stop a running agent loop mid-iteration.
         let cancelled = Arc::new(AtomicBool::new(false));
+        let prompt_context_bridge: Arc<dyn PromptContextManager> =
+            Arc::new(SessionActorPromptContextBridge::new(
+                session_key.clone(),
+                self.data_dir.clone(),
+                context_manager.clone(),
+            ));
         let mut agent = Agent::new(agent_id, session_llm, tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
             .with_shutdown(cancelled.clone())
+            .with_prompt_context_manager(prompt_context_bridge)
             .with_system_prompt(system_prompt)
             // M8 fix-first item 8 (gap 1): wire the seeded per-actor
             // FileStateCache so file tools see resumed-state claims.
@@ -2523,7 +2923,6 @@ impl ActorFactory {
             hooks: self.hooks.clone(),
             hook_context: session_hook_context,
             session_handle,
-            llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
             status_indicator,
             sender_user_id: sender_user_id.clone(),
@@ -2545,6 +2944,7 @@ impl ActorFactory {
             user_workspace: user_workspace.clone(),
             cron_tool: cron_tool_ref,
             persistent_retry_state,
+            context_manager,
             retry_state_path: Some(retry_state_path),
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -2871,6 +3271,67 @@ pub(crate) fn format_failover_push(event: &FailoverEvent) -> String {
     )
 }
 
+#[cfg(feature = "api")]
+fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
+    match reason {
+        MasterContinuationReason::ChildCompleted => "child_completed",
+        MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete",
+        MasterContinuationReason::LoopFire => "loop_fire",
+        MasterContinuationReason::GoalContinue => "goal_continue",
+        MasterContinuationReason::External(_) => "external",
+    }
+}
+
+#[cfg(feature = "api")]
+fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
+    let metadata = continuation
+        .metadata
+        .iter()
+        .map(|(key, value)| format!("- {key}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let metadata = if metadata.is_empty() {
+        "- none".to_owned()
+    } else {
+        metadata
+    };
+    match &continuation.reason {
+        MasterContinuationReason::ChildCompleted => format!(
+            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\nGive the user a concise progress update. Mention what this child completed, whether follow-up work remains, and reference artifacts only when metadata or visible task state provides them.",
+            child = continuation
+                .child_agent_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown"),
+            group = continuation.group_id.as_str(),
+        ),
+        MasterContinuationReason::ScatterJoinComplete => format!(
+            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nProduce the joined answer for the user. Summarize each child result, call out unresolved failures or missing artifacts, and state the next concrete action if one is required.",
+            group = continuation.group_id.as_str(),
+        ),
+        MasterContinuationReason::LoopFire => format!(
+            "[system-internal]\nA scheduled /loop continuation fired.\n\nLoop: {loop_id}\nMetadata:\n{metadata}\n\nExecute the loop prompt now. Keep the answer brief unless the loop prompt requires a full report.",
+            loop_id = continuation
+                .loop_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown"),
+        ),
+        MasterContinuationReason::GoalContinue => format!(
+            "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
+            goal_id = continuation
+                .goal_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown"),
+        ),
+        MasterContinuationReason::External(kind) => format!(
+            "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
+            group = continuation.group_id.as_str(),
+        ),
+    }
+}
+
 // ── SessionActor ────────────────────────────────────────────────────────────
 
 /// Long-lived task that processes all messages for one session.
@@ -2887,7 +3348,6 @@ struct SessionActor {
 
     /// Per-actor session handle — owns this session's data, no shared mutex.
     session_handle: Arc<Mutex<SessionHandle>>,
-    llm_for_compaction: Arc<dyn LlmProvider>,
 
     out_tx: mpsc::Sender<OutboundMessage>,
 
@@ -2934,6 +3394,11 @@ struct SessionActor {
     /// start and writes back on drop. We hold a clone of the same `Arc` so
     /// we can flush the state to a JSON sidecar after every turn.
     persistent_retry_state: Arc<StdMutex<LoopRetryState>>,
+    /// M16 shadow ContextManager: rebuilt from the durable session history at
+    /// actor startup and updated after this actor persists session messages.
+    /// It is not yet the production prompt source; it gives SessionActor a
+    /// canonical model-visible transcript boundary to compare against.
+    context_manager: Arc<StdMutex<ContextManager>>,
     /// Path of the retry-state JSON sidecar on disk. `None` when the path
     /// could not be resolved (e.g. unusual test data dirs); in that case
     /// the in-memory state still accumulates within this actor's lifetime
@@ -3053,6 +3518,93 @@ impl SessionActor {
         guard.insert(task_id.to_string())
     }
 
+    fn context_compact_threshold_tokens(&self) -> usize {
+        if let Ok(raw) = std::env::var("OCTOS_CONTEXT_COMPACT_THRESHOLD_TOKENS") {
+            if let Ok(value) = raw.parse::<usize>() {
+                return value;
+            }
+        }
+        let window = self.agent.llm_provider().context_window() as usize;
+        (window * DEFAULT_CONTEXT_COMPACT_RATIO_NUMERATOR
+            / DEFAULT_CONTEXT_COMPACT_RATIO_DENOMINATOR)
+            .max(1)
+    }
+
+    fn context_compact_keep_items(&self) -> usize {
+        std::env::var("OCTOS_CONTEXT_COMPACT_KEEP_ITEMS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CONTEXT_COMPACT_KEEP_ITEMS)
+    }
+
+    fn context_prompt_policy(&self) -> PromptBuildPolicy {
+        PromptBuildPolicy {
+            include_reasoning: false,
+            supports_media: true,
+            max_prompt_token_estimate: None,
+            model_capability_id: format!(
+                "{}/{}",
+                self.agent.provider_name(),
+                self.agent.model_id()
+            ),
+        }
+    }
+
+    fn context_history_for_agent(&self, trigger: &str) -> Vec<Message> {
+        let threshold = self.context_compact_threshold_tokens();
+        let keep_recent_items = self.context_compact_keep_items();
+        let policy = self.context_prompt_policy();
+        let mut manager = self
+            .context_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = manager.state();
+        if state.token_estimate > threshold {
+            let before = manager.for_prompt(&policy);
+            let summary_budget = threshold.clamp(256, 4096) as u32;
+            let summary =
+                octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+            let record = manager.compact_context(
+                summary,
+                CompactContextPolicy {
+                    trigger: trigger.to_owned(),
+                    keep_recent_items,
+                    ..CompactContextPolicy::default()
+                },
+            );
+            info!(
+                session = %self.session_key,
+                compaction_id = %record.compaction_id.as_str(),
+                checkpoint_id = %record.checkpoint_id.as_str(),
+                input_generation = record.input_generation,
+                output_generation = ?record.output_generation,
+                input_items = record.input_item_count,
+                retained = record.retained_item_ids.len(),
+                dropped = record.dropped_item_ids.len(),
+                token_estimate_before = record.token_estimate_before,
+                token_estimate_after = ?record.token_estimate_after,
+                trigger,
+                "context manager compact_context installed before model prompt"
+            );
+            publish_context_manager_status(&self.session_key, &manager);
+            persist_context_manager_snapshot_for_session(
+                &self.data_dir,
+                &self.session_key,
+                &manager,
+            );
+        }
+        let frame = manager.for_prompt(&policy);
+        debug!(
+            session = %self.session_key,
+            generation = frame.context_state.generation,
+            transcript_hash = %frame.context_state.transcript_hash,
+            prompt_hash = %frame.report.output_prompt_hash,
+            prompt_messages = frame.messages.len(),
+            "context manager prompt frame selected for agent history"
+        );
+        frame.messages
+    }
+
     /// Build a synthetic `InboundMessage` carrying the recovery prompt so
     /// the existing inbound pipeline (history persistence, agent loop)
     /// runs unchanged.
@@ -3091,6 +3643,78 @@ impl SessionActor {
         }
     }
 
+    #[cfg(feature = "api")]
+    fn synthetic_master_continuation_inbound(
+        &self,
+        continuation: &QueuedMasterContinuation,
+    ) -> InboundMessage {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("_master_continuation".to_string(), serde_json::json!(true));
+        metadata.insert(
+            "continuation_id".to_string(),
+            serde_json::json!(continuation.id.as_u64()),
+        );
+        metadata.insert(
+            "continuation_reason".to_string(),
+            serde_json::json!(master_continuation_reason_name(&continuation.reason)),
+        );
+
+        InboundMessage {
+            channel: self.channel.clone(),
+            sender_id: "octos-runtime".to_string(),
+            chat_id: self.chat_id.clone(),
+            content: master_continuation_prompt(continuation),
+            timestamp: chrono::Utc::now(),
+            media: vec![],
+            metadata: serde_json::Value::Object(metadata),
+            message_id: None,
+        }
+    }
+
+    #[cfg(feature = "api")]
+    async fn drain_master_continuations(&mut self) -> bool {
+        let runtime_state = if self.active_overflow_tasks.load(Ordering::Acquire) > 0 {
+            MasterContinuationRuntimeState::busy()
+        } else {
+            MasterContinuationRuntimeState::idle()
+        }
+        .with_user_input_pending(!self.inbox.is_empty());
+        let profile_id = self
+            .session_key
+            .profile_id()
+            .unwrap_or(MAIN_PROFILE_ID)
+            .to_owned();
+        let continuations = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &self.session_key,
+            &profile_id,
+            runtime_state,
+            1,
+        );
+        let drained = !continuations.is_empty();
+        for continuation in continuations {
+            info!(
+                session = %self.session_key,
+                continuation_id = continuation.id.as_u64(),
+                reason = master_continuation_reason_name(&continuation.reason),
+                "draining queued master continuation into session actor"
+            );
+            default_agent_orchestrator().mark_continuation_started(&continuation);
+            let synthetic = self.synthetic_master_continuation_inbound(&continuation);
+            self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
+                .await;
+            default_agent_orchestrator().mark_continuation_completed(
+                &continuation,
+                Some("processed_by_session_actor".to_owned()),
+            );
+        }
+        drained
+    }
+
+    #[cfg(not(feature = "api"))]
+    async fn drain_master_continuations(&mut self) -> bool {
+        false
+    }
+
     async fn run(mut self) {
         self.emit_resume_hook().await;
         // Wave-4 B3.4 — surface adaptive-router failovers on the bus so
@@ -3120,6 +3744,10 @@ impl SessionActor {
                 chat_id,
             }))
         });
+        let idle_sleep = tokio::time::sleep(self.idle_timeout);
+        tokio::pin!(idle_sleep);
+        let mut continuation_tick = tokio::time::interval(Duration::from_secs(2));
+        continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 msg = self.inbox.recv() => {
@@ -3130,6 +3758,7 @@ impl SessionActor {
                             attachment_media,
                             attachment_prompt,
                         }) => {
+                            idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
                             if let Some(ref cron) = self.cron_tool {
@@ -3219,6 +3848,7 @@ impl SessionActor {
                                 )
                                 .await;
                             }
+                            let _ = self.drain_master_continuations().await;
                         }
                         Some(ActorMessage::BackgroundResult {
                             task_label,
@@ -3228,6 +3858,9 @@ impl SessionActor {
                             originating_thread_id,
                             ack,
                         }) => {
+                            idle_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + self.idle_timeout);
                             let persisted = self
                                 .handle_background_result(
                                     &task_label,
@@ -3240,8 +3873,10 @@ impl SessionActor {
                             if let Some(ack) = ack {
                                 let _ = ack.send(persisted);
                             }
+                            let _ = self.drain_master_continuations().await;
                         }
                         Some(ActorMessage::TaskStatusChanged { task_json }) => {
+                            idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
                             // Push task status change to the web client via SSE
                             let _ = self.out_tx.send(octos_core::OutboundMessage {
                                 channel: self.channel.clone(),
@@ -3261,6 +3896,7 @@ impl SessionActor {
                             prompt,
                             originating_client_message_id,
                         }) => {
+                            idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
                             // Cap recovery at one attempt per task to avoid
                             // runaway loops if the recovery turn itself
                             // fails. Subsequent failures from the same task
@@ -3295,8 +3931,10 @@ impl SessionActor {
                                 None,
                             )
                             .await;
+                            let _ = self.drain_master_continuations().await;
                         }
                         Some(ActorMessage::Cancel) => {
+                            idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
                             debug!(session = %self.session_key, "cancel requested");
                             self.cancelled.store(true, Ordering::Release);
                         }
@@ -3306,7 +3944,12 @@ impl SessionActor {
                         }
                     }
                 }
-                _ = tokio::time::sleep(self.idle_timeout) => {
+                _ = continuation_tick.tick() => {
+                    if self.drain_master_continuations().await {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
+                    }
+                }
+                _ = &mut idle_sleep => {
                     record_timeout("idle_actor");
                     debug!(session = %self.session_key, "idle timeout, shutting down actor");
                     break;
@@ -4150,6 +4793,7 @@ impl SessionActor {
         let content = finalize_assistant_content(&self.session_key, &self.user_workspace, &content);
         let persisted = persist_assistant_message(
             &self.session_handle,
+            Some(&self.context_manager),
             &self.session_key,
             &self.data_dir,
             content.clone(),
@@ -4459,8 +5103,18 @@ impl SessionActor {
             if session.summary.is_none() && !persisted_user_content.trim().is_empty() {
                 session.summary = Some(persisted_user_content.chars().take(100).collect());
             }
-            match handle.add_message_with_seq(user_msg).await {
-                Ok(seq) => Some(seq),
+            match handle.add_message_with_seq(user_msg.clone()).await {
+                Ok(seq) => {
+                    let committed = committed_message_or_fallback(&handle, seq, &user_msg);
+                    record_context_manager_message(
+                        &self.context_manager,
+                        &self.session_key,
+                        &self.data_dir,
+                        &committed,
+                        seq,
+                    );
+                    Some(seq)
+                }
                 Err(error) => {
                     warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
                     None
@@ -4527,6 +5181,7 @@ impl SessionActor {
         let ack_content = workflow_ack;
         let persisted = persist_assistant_message(
             &self.session_handle,
+            Some(&self.context_manager),
             &self.session_key,
             &self.data_dir,
             ack_content.clone(),
@@ -4636,6 +5291,12 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+        let is_master_continuation = inbound_is_master_continuation(&inbound);
+        let status_prompt = if is_master_continuation {
+            "supervised agent continuation"
+        } else {
+            inbound.content.as_str()
+        };
 
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
@@ -4659,7 +5320,11 @@ impl SessionActor {
             return;
         }
 
-        let max_history = self.max_history.load(Ordering::Acquire);
+        // M16-D2: capture ContextManager-derived prompt history before
+        // persisting this turn's user message, because the agent appends the
+        // current user message internally.
+        let history_for_agent: Vec<Message> =
+            self.context_history_for_agent("pre_turn_speculative");
 
         // Save the primary user message to session history BEFORE spawning
         // so overflow reads see it in context (chronological ordering).
@@ -4669,23 +5334,30 @@ impl SessionActor {
         let client_message_id = inbound_client_message_id(&inbound);
         let persisted_user_content_for_event = persisted_user_content.clone();
         let user_media_for_event = image_media.clone();
-        // PR A: typed constructor for the cmid-bearing path; legacy
-        // `Message::user` for the rare cmid-less path. See sibling site
-        // around line 3961 for the rationale.
-        let mut user_msg = match client_message_id.as_deref() {
-            Some(cmid) if !cmid.is_empty() => Message::user_with_cmid(
-                persisted_user_content,
-                octos_core::ClientMessageId::new(cmid),
-            ),
-            _ => Message::user(persisted_user_content),
-        };
-        user_msg.media = image_media
-            .iter()
-            .chain(attachment_media.iter())
-            .cloned()
-            .collect();
-        let user_msg_timestamp = user_msg.timestamp;
-        let user_seq = {
+        let mut user_msg_timestamp = None;
+        let user_seq = if is_master_continuation {
+            debug!(
+                session = %self.session_key,
+                "skipping durable user-row persist for internal master continuation"
+            );
+            None
+        } else {
+            // PR A: typed constructor for the cmid-bearing path; legacy
+            // `Message::user` for the rare cmid-less path. See sibling site
+            // around line 3961 for the rationale.
+            let mut user_msg = match client_message_id.as_deref() {
+                Some(cmid) if !cmid.is_empty() => Message::user_with_cmid(
+                    persisted_user_content,
+                    octos_core::ClientMessageId::new(cmid),
+                ),
+                _ => Message::user(persisted_user_content),
+            };
+            user_msg.media = image_media
+                .iter()
+                .chain(attachment_media.iter())
+                .cloned()
+                .collect();
+            user_msg_timestamp = Some(user_msg.timestamp);
             let mut handle = self.session_handle.lock().await;
             // Auto-generate summary from first user message
             {
@@ -4695,7 +5367,23 @@ impl SessionActor {
                     session.summary = Some(summary);
                 }
             }
-            handle.add_message_with_seq(user_msg).await.ok()
+            match handle.add_message_with_seq(user_msg.clone()).await {
+                Ok(seq) => {
+                    let committed = committed_message_or_fallback(&handle, seq, &user_msg);
+                    record_context_manager_message(
+                        &self.context_manager,
+                        &self.session_key,
+                        &self.data_dir,
+                        &committed,
+                        seq,
+                    );
+                    Some(seq)
+                }
+                Err(error) => {
+                    warn!(session = %self.session_key, error = %error, "failed to persist speculative user message");
+                    None
+                }
+            }
         };
 
         // The web client sorts by Message.timestamp (timestamp-primary
@@ -4706,12 +5394,6 @@ impl SessionActor {
         let _ = user_msg_timestamp;
         let _ = persisted_user_content_for_event;
         let _ = user_media_for_event;
-
-        // Get conversation history (now includes the user message we just saved)
-        let history: Vec<Message> = {
-            let handle = self.session_handle.lock().await;
-            handle.get_history(max_history).to_vec()
-        };
 
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
@@ -4730,7 +5412,7 @@ impl SessionActor {
             // has rotated under rapid-fire concurrent writes.
             si.start_with_thread(
                 self.chat_id.clone(),
-                &inbound.content,
+                status_prompt,
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
@@ -4823,20 +5505,6 @@ impl SessionActor {
         // this stamp the gateway's failover surfacing would never fire.
         let router_session_id = self.session_key.to_string();
         let router_turn_id = client_message_id.clone();
-
-        // The agent receives the history snapshot (which includes the user
-        // message we saved above). The agent will prepend its own system
-        // prompt and user message internally — we'll deduplicate on save.
-        // Note: we pass the history WITHOUT the user message we just saved,
-        // because process_message_tracked adds a user message itself.
-        // The pre-saved user message ensures overflow calls see it in history.
-        let history_for_agent: Vec<Message> = if !history.is_empty() {
-            // Strip the last message (the user msg we just saved) since the
-            // agent's process_message_inner will re-add it.
-            history[..history.len() - 1].to_vec()
-        } else {
-            vec![]
-        };
 
         // Snapshot for overflow tasks: conversation context BEFORE the
         // primary task, EXCLUDING the primary user message.  Overflow needs
@@ -5272,8 +5940,21 @@ impl SessionActor {
                                 to_save.thread_id = Some(tid.clone());
                             }
                         }
-                        if let Err(e) = handle.add_message(to_save).await {
-                            warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                        match handle.add_message_with_seq(to_save.clone()).await {
+                            Ok(seq) => {
+                                let committed =
+                                    committed_message_or_fallback(&handle, seq, &to_save);
+                                record_context_manager_message(
+                                    &self.context_manager,
+                                    &self.session_key,
+                                    &self.data_dir,
+                                    &committed,
+                                    seq,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                            }
                         }
                     }
 
@@ -5326,8 +6007,17 @@ impl SessionActor {
                         // assistant timestamp is `Utc::now()` (newer than any
                         // tool message) so the post-sort position matches the
                         // append index returned here.
-                        match handle.add_message_with_seq(assistant_msg).await {
+                        match handle.add_message_with_seq(assistant_msg.clone()).await {
                             Ok(seq) => {
+                                let committed =
+                                    committed_message_or_fallback(&handle, seq, &assistant_msg);
+                                record_context_manager_message(
+                                    &self.context_manager,
+                                    &self.session_key,
+                                    &self.data_dir,
+                                    &committed,
+                                    seq,
+                                );
                                 assistant_committed_seq = u64::try_from(seq).ok();
                             }
                             Err(e) => {
@@ -5344,15 +6034,11 @@ impl SessionActor {
                         warn!(session = %self.session_key, error = %e, "failed to rewrite session after sort");
                     }
 
-                    // Compact if needed
-                    if let Err(e) = crate::compaction::maybe_compact_handle(
-                        &mut handle,
-                        &*self.llm_for_compaction,
-                    )
-                    .await
-                    {
-                        warn!("session compaction failed: {e}");
-                    }
+                    // M16-D2: ContextManager owns production prompt
+                    // compaction. Keep the user-facing session history raw
+                    // here; rewriting it through the legacy in-memory
+                    // compactor would create a second model-context truth and
+                    // force a stale rebuild over the compacted context ledger.
                 }
 
                 // M8.10-A: thread the committed assistant seq into the
@@ -5550,6 +6236,7 @@ impl SessionActor {
                 let content = format!("Error: {e}");
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
+                    Some(&self.context_manager),
                     &self.session_key,
                     &self.data_dir,
                     &self.out_tx,
@@ -5568,6 +6255,7 @@ impl SessionActor {
                 let content = "Processing timed out. Please try again.".to_string();
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
+                    Some(&self.context_manager),
                     &self.session_key,
                     &self.data_dir,
                     &self.out_tx,
@@ -5582,9 +6270,9 @@ impl SessionActor {
             }
         }
 
-        self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
+        self.snapshot_workspace_turn_if_needed(status_prompt, inbound_message_id.clone())
             .await;
-        self.emit_turn_end_hook(&inbound.content).await;
+        self.emit_turn_end_hook(status_prompt).await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         // This must happen AFTER the agent finishes, so it has had a chance to
@@ -5665,6 +6353,7 @@ impl SessionActor {
         // Clone everything needed for the spawned task
         let agent = Arc::clone(&self.agent);
         let session_handle = Arc::clone(&self.session_handle);
+        let context_manager = Arc::clone(&self.context_manager);
         let overflow_counter = Arc::clone(&self.active_overflow_tasks);
         let out_tx = self.out_tx.clone();
         let channel = self.channel.clone();
@@ -5706,7 +6395,27 @@ impl SessionActor {
             user_msg.timestamp = user_msg_timestamp;
             let user_seq_for_overflow = {
                 let mut handle = session_handle.lock().await;
-                handle.add_message_with_seq(user_msg).await.ok()
+                match handle.add_message_with_seq(user_msg.clone()).await {
+                    Ok(seq) => {
+                        let committed = committed_message_or_fallback(&handle, seq, &user_msg);
+                        record_context_manager_message(
+                            &context_manager,
+                            &session_key,
+                            &data_dir,
+                            &committed,
+                            seq,
+                        );
+                        Some(seq)
+                    }
+                    Err(error) => {
+                        warn!(
+                            session = %session_key,
+                            error = %error,
+                            "failed to persist overflow user message"
+                        );
+                        None
+                    }
+                }
             };
 
             // Restore the overflow user-message session_result emission that
@@ -5996,9 +6705,10 @@ impl SessionActor {
                     };
                     final_reply.reasoning_content = conv_response.reasoning_content.clone();
                     final_reply.timestamp = final_reply_timestamp;
+                    let final_reply_for_context = final_reply.clone();
                     let committed_seq = {
                         let mut handle = session_handle.lock().await;
-                        handle
+                        match handle
                             .add_message_with_seq(final_reply)
                             .await
                             .map_err(|error| {
@@ -6008,8 +6718,24 @@ impl SessionActor {
                                     "failed to persist overflow assistant message"
                                 );
                                 error
-                            })
-                            .ok()
+                            }) {
+                            Ok(seq) => {
+                                let committed = committed_message_or_fallback(
+                                    &handle,
+                                    seq,
+                                    &final_reply_for_context,
+                                );
+                                record_context_manager_message(
+                                    &context_manager,
+                                    &session_key,
+                                    &data_dir,
+                                    &committed,
+                                    seq,
+                                );
+                                Some(seq)
+                            }
+                            Err(_) => None,
+                        }
                     };
 
                     let reply = strip_think_tags(&final_content);
@@ -6114,6 +6840,7 @@ impl SessionActor {
                     let content = format!("Error: {e}");
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
+                        Some(&context_manager),
                         &session_key,
                         &data_dir,
                         &out_tx,
@@ -6131,6 +6858,7 @@ impl SessionActor {
                     let content = "Processing timed out.".to_string();
                     let _ = persist_terminal_reply_and_fanout(
                         &session_handle,
+                        Some(&context_manager),
                         &session_key,
                         &data_dir,
                         &out_tx,
@@ -6177,6 +6905,12 @@ impl SessionActor {
         // carries `thread_id` metadata. The API channel reads it back to
         // tag SSE payloads with the right per-cmid thread.
         let client_message_id = inbound_client_message_id(&inbound);
+        let is_master_continuation = inbound_is_master_continuation(&inbound);
+        let status_prompt = if is_master_continuation {
+            "supervised agent continuation"
+        } else {
+            inbound.content.as_str()
+        };
 
         // Acquire concurrency permit
         let _permit = match self.semaphore.acquire().await {
@@ -6201,6 +6935,14 @@ impl SessionActor {
             {
                 let mut handle = self.session_handle.lock().await;
                 handle.clear_messages_for_unsafe_resume();
+                let messages = handle.session().messages.clone();
+                drop(handle);
+                reset_context_manager_from_history(
+                    &self.context_manager,
+                    &self.session_key,
+                    &self.data_dir,
+                    &messages,
+                );
             }
             if let Err(e) = std::fs::create_dir_all(&self.user_workspace) {
                 warn!(
@@ -6213,14 +6955,6 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
-
-        // Get conversation history
-        let max_history = self.max_history.load(Ordering::Acquire);
-        let history: Vec<Message> = {
-            let mut handle = self.session_handle.lock().await;
-            let session = handle.get_or_create();
-            session.get_history(max_history).to_vec()
-        };
 
         if self
             .maybe_start_forced_background_workflow(
@@ -6236,6 +6970,12 @@ impl SessionActor {
             self.cancelled.store(false, Ordering::Release);
             return;
         }
+
+        // M16-D2: the production pre-turn prompt history comes from the
+        // ContextManager. If the active context is over threshold this installs
+        // a compacted generation before the model call; raw session history
+        // remains durable and unchanged.
+        let history: Vec<Message> = self.context_history_for_agent("pre_turn");
 
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
@@ -6254,7 +6994,7 @@ impl SessionActor {
 
             si.start_with_thread(
                 self.chat_id.clone(),
-                &inbound.content,
+                status_prompt,
                 Arc::clone(&token_tracker),
                 voice_transcript,
                 &self.user_status_config,
@@ -6456,7 +7196,10 @@ impl SessionActor {
                     // Auto-generate summary from first user message
                     {
                         let session = handle.get_or_create();
-                        if session.summary.is_none() && !inbound.content.trim().is_empty() {
+                        if !is_master_continuation
+                            && session.summary.is_none()
+                            && !inbound.content.trim().is_empty()
+                        {
                             let summary: String = inbound.content.chars().take(100).collect();
                             session.summary = Some(summary);
                         }
@@ -6477,6 +7220,17 @@ impl SessionActor {
                     };
                     let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
+                        if is_master_continuation
+                            && !persisted_user_message
+                            && msg.role == MessageRole::User
+                        {
+                            persisted_user_message = true;
+                            debug!(
+                                session = %self.session_key,
+                                "skipping durable user-row persist for internal master continuation"
+                            );
+                            continue;
+                        }
                         let message_to_save =
                             if !persisted_user_message && msg.role == MessageRole::User {
                                 persisted_user_message = true;
@@ -6528,8 +7282,21 @@ impl SessionActor {
                                 }
                                 to_save
                             };
-                        if let Err(e) = handle.add_message(message_to_save).await {
-                            warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                        match handle.add_message_with_seq(message_to_save.clone()).await {
+                            Ok(seq) => {
+                                let committed =
+                                    committed_message_or_fallback(&handle, seq, &message_to_save);
+                                record_context_manager_message(
+                                    &self.context_manager,
+                                    &self.session_key,
+                                    &self.data_dir,
+                                    &committed,
+                                    seq,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
+                            }
                         }
                     }
 
@@ -6564,20 +7331,29 @@ impl SessionActor {
                             }
                         };
                         assistant_msg.reasoning_content = conv_response.reasoning_content.clone();
-                        if let Err(e) = handle.add_message(assistant_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                        match handle.add_message_with_seq(assistant_msg.clone()).await {
+                            Ok(seq) => {
+                                let committed =
+                                    committed_message_or_fallback(&handle, seq, &assistant_msg);
+                                record_context_manager_message(
+                                    &self.context_manager,
+                                    &self.session_key,
+                                    &self.data_dir,
+                                    &committed,
+                                    seq,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                            }
                         }
                     }
 
-                    // Compact if needed
-                    if let Err(e) = crate::compaction::maybe_compact_handle(
-                        &mut handle,
-                        &*self.llm_for_compaction,
-                    )
-                    .await
-                    {
-                        warn!("session compaction failed: {e}");
-                    }
+                    // M16-D2: ContextManager owns production prompt
+                    // compaction. Keep the user-facing session history raw
+                    // here; rewriting it through the legacy in-memory
+                    // compactor would create a second model-context truth and
+                    // force a stale rebuild over the compacted context ledger.
                 }
 
                 // Send reply — always goes to this actor's chat (no race!)
@@ -6680,6 +7456,7 @@ impl SessionActor {
                 let content = format!("Error: {e}");
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
+                    Some(&self.context_manager),
                     &self.session_key,
                     &self.data_dir,
                     &self.out_tx,
@@ -6698,6 +7475,7 @@ impl SessionActor {
                 let content = "Processing timed out. Please try again.".to_string();
                 let _ = persist_terminal_reply_and_fanout(
                     &self.session_handle,
+                    Some(&self.context_manager),
                     &self.session_key,
                     &self.data_dir,
                     &self.out_tx,
@@ -6712,9 +7490,9 @@ impl SessionActor {
             }
         }
 
-        self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
+        self.snapshot_workspace_turn_if_needed(status_prompt, inbound_message_id.clone())
             .await;
-        self.emit_turn_end_hook(&inbound.content).await;
+        self.emit_turn_end_hook(status_prompt).await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         self.cancelled.store(false, Ordering::Release);
@@ -6848,6 +7626,144 @@ mod tests {
     use octos_agent::{HookConfig, HookEvent};
     use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
     use std::sync::atomic::AtomicUsize;
+
+    fn test_context_manager(key: &SessionKey) -> Arc<StdMutex<ContextManager>> {
+        Arc::new(StdMutex::new(context_manager_from_history(key, &[])))
+    }
+
+    fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
+        Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn session_actor_prompt_context_bridge_compacts_next_model_prompt() {
+        let session_key = SessionKey::new("cli", "context-bridge-test");
+        let mut history = vec![test_message(MessageRole::System, "system prompt")];
+        for index in 0..24 {
+            history.push(test_message(
+                MessageRole::User,
+                format!("user turn {index} {}", "context ".repeat(120)),
+            ));
+            history.push(test_message(
+                MessageRole::Assistant,
+                format!("assistant turn {index} {}", "answer ".repeat(120)),
+            ));
+        }
+        let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+            session_key.to_string(),
+            None,
+            &history,
+        )));
+        let dir = tempfile::TempDir::new().unwrap();
+        let bridge = SessionActorPromptContextBridge::new(
+            session_key.clone(),
+            dir.path().to_path_buf(),
+            manager,
+        );
+        let mut prompt = history.clone();
+
+        let report = bridge
+            .prepare_prompt(
+                PromptContextRequest {
+                    phase: PromptContextPhase::TurnStart,
+                    iteration: 1,
+                    provider_name: "test".to_string(),
+                    model_id: "tiny-context".to_string(),
+                    context_window: 128,
+                },
+                &mut prompt,
+            )
+            .expect("context manager bridge should prepare prompt");
+
+        assert!(report.prompt_replaced);
+        assert!(report.compaction_performed);
+        assert!(
+            prompt
+                .iter()
+                .any(|message| message.content.contains("[Conversation summary]")),
+            "compacted prompt should include the ContextManager summary frame"
+        );
+        assert!(
+            crate::context_manager::context_ledger_path(dir.path(), &session_key.to_string())
+                .exists(),
+            "prompt-context compaction should be durable even before a later message write"
+        );
+    }
+
+    #[test]
+    fn session_actor_prompt_context_bridge_preserves_current_user_turn() {
+        let session_key = SessionKey::new("cli", "context-current-user");
+        let history = vec![
+            test_message(MessageRole::User, "old request"),
+            test_message(MessageRole::Assistant, "old answer"),
+        ];
+        let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+            session_key.to_string(),
+            None,
+            &history,
+        )));
+        let dir = tempfile::TempDir::new().unwrap();
+        let bridge = SessionActorPromptContextBridge::new(
+            session_key.clone(),
+            dir.path().to_path_buf(),
+            manager,
+        );
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(history);
+        prompt.push(test_message(MessageRole::User, "current request"));
+
+        let report = bridge
+            .prepare_prompt(
+                PromptContextRequest {
+                    phase: PromptContextPhase::TurnStart,
+                    iteration: 1,
+                    provider_name: "test".to_string(),
+                    model_id: "large-context".to_string(),
+                    context_window: 16_000,
+                },
+                &mut prompt,
+            )
+            .expect("context manager bridge should prepare prompt");
+
+        assert!(report.prompt_replaced);
+        assert!(
+            prompt.iter().any(|message| {
+                message.role == MessageRole::System && message.content == "runtime system"
+            }),
+            "managed prompt should keep the runtime system instruction"
+        );
+        assert!(
+            prompt.iter().any(|message| {
+                message.role == MessageRole::User && message.content == "current request"
+            }),
+            "managed prompt must keep the current user turn"
+        );
+        assert_eq!(
+            prompt
+                .iter()
+                .filter(|message| {
+                    message.role == MessageRole::User && message.content == "old request"
+                })
+                .count(),
+            1,
+            "known history should not be duplicated while adding the current turn"
+        );
+        assert!(
+            crate::context_manager::context_ledger_path(dir.path(), &session_key.to_string())
+                .exists(),
+            "prompt-context preparation should persist the canonical context ledger"
+        );
+    }
 
     #[cfg(unix)]
     fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
@@ -7905,10 +8821,6 @@ mod tests {
                 dir.path(),
                 &SessionKey::new("cli", "test"),
             ))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: None,
             sender_user_id: None,
@@ -7930,6 +8842,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -7977,10 +8890,6 @@ mod tests {
                 dir.path(),
                 &SessionKey::new("cli", "test"),
             ))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: None,
             sender_user_id: None,
@@ -8002,6 +8911,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -8009,6 +8919,81 @@ mod tests {
 
         let handle = tokio::spawn(actor.run());
         (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    #[cfg(feature = "api")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn master_continuation_tick_reenters_actor_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = Arc::new(DelayedMockProvider::new(
+            "continuation-test",
+            vec![(Duration::ZERO, make_response("child progress summary"))],
+        ));
+        let (tx, _out_rx, handle, _session_mgr) =
+            setup_actor_with_mode(provider.clone(), QueueMode::Followup, None, false, &dir).await;
+        let session_id = SessionKey::new("cli", "test");
+
+        crate::api::agent_orchestrator::default_agent_orchestrator().upsert_agent(
+            crate::api::agent_orchestrator::AgentUpsert {
+                agent_id: "child-a".into(),
+                parent_agent_id: Some("master".into()),
+                session_id: session_id.clone(),
+                task_id: None,
+                path: "master/child-a".into(),
+                role: "worker".into(),
+                nickname: "Ada".into(),
+                backend_kind: "native".into(),
+                status: "completed".into(),
+                last_task: Some("review finished".into()),
+                cwd: None,
+                profile_id: MAIN_PROFILE_ID.into(),
+            },
+        );
+
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            if provider.call_count.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+
+        assert!(
+            provider.call_count.load(Ordering::Relaxed) > 0,
+            "periodic actor tick must drain queued child completion into process_inbound"
+        );
+
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            tokio::task::yield_now().await;
+            let session_handle = SessionHandle::open(dir.path(), &session_id);
+            if session_handle.session().messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message.content.contains("child progress summary")
+            }) {
+                break;
+            }
+        }
+        let session_handle = SessionHandle::open(dir.path(), &session_id);
+        let session = session_handle.session();
+        assert!(
+            session.messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message.content.contains("child progress summary")
+            }),
+            "master continuation should persist the model-generated progress summary: {:?}",
+            session.messages
+        );
+        assert!(
+            !session.messages.iter().any(|message| {
+                message.role == MessageRole::User
+                    && message.content.contains("[system-internal]")
+                    && message.content.contains("supervised child agent")
+            }),
+            "internal master-continuation prompt must not leak into chat history: {:?}",
+            session.messages
+        );
+        drop(tx);
+        handle.abort();
     }
 
     #[tokio::test]
@@ -8055,10 +9040,6 @@ mod tests {
                 dir.path(),
                 &SessionKey::new("cli", "test"),
             ))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: None,
             sender_user_id: None,
@@ -8080,6 +9061,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -8180,10 +9162,6 @@ mod tests {
                 dir.path(),
                 &SessionKey::new("cli", "test"),
             ))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: None,
             sender_user_id: None,
@@ -8205,6 +9183,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -8301,10 +9280,6 @@ mod tests {
                 dir.path(),
                 &SessionKey::new("cli", "test"),
             ))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: None,
             sender_user_id: None,
@@ -8326,6 +9301,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: Some(cron_tool),
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -8394,10 +9370,6 @@ mod tests {
                 dir.path(),
                 &SessionKey::new("cli", "test"),
             ))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: None,
             sender_user_id: None,
@@ -8419,6 +9391,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&SessionKey::new("cli", "test")),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -8486,10 +9459,6 @@ mod tests {
             hooks: None,
             hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(dir.path(), &session_key))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
             out_tx,
             status_indicator: Some(status_indicator),
             sender_user_id: None,
@@ -8511,6 +9480,7 @@ mod tests {
             user_workspace: dir.path().join("workspace"),
             cron_tool: None,
             persistent_retry_state: Arc::new(StdMutex::new(LoopRetryState::default())),
+            context_manager: test_context_manager(&session_key),
             retry_state_path: None,
             recovered_tasks: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             current_command_cmid: None,
@@ -10865,8 +11835,8 @@ mod tests {
                 ..Default::default()
             },
             llm: provider.clone(),
-            llm_strong: provider.clone(),
             llm_for_compaction: provider.clone(),
+            llm_strong: provider.clone(),
             memory,
             system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),
             hooks: None,
@@ -11991,6 +12961,7 @@ mod tests {
                     // so its seq is disk-canonical.
                     let res = persist_assistant_message(
                         &actor_handle,
+                        None,
                         &key,
                         &data_dir,
                         format!("actor-{i}"),

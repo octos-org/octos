@@ -196,6 +196,10 @@ pub struct DispatchResponse {
     pub files_to_send: Vec<PathBuf>,
     /// Optional error message. Populated for every non-`Success` outcome.
     pub error: Option<String>,
+    /// Context contract evidence attached by the parent dispatcher. External
+    /// child agents either receive this as part of their arguments or the
+    /// dispatch event records why the context is explicitly unmanaged.
+    pub context_contract: Option<DispatchContextContract>,
 }
 
 impl DispatchResponse {
@@ -205,6 +209,7 @@ impl DispatchResponse {
             output,
             files_to_send,
             error: None,
+            context_contract: None,
         }
     }
 
@@ -215,7 +220,13 @@ impl DispatchResponse {
             output: message.clone(),
             files_to_send: Vec::new(),
             error: Some(message),
+            context_contract: None,
         }
+    }
+
+    pub fn with_context_contract(mut self, contract: Option<DispatchContextContract>) -> Self {
+        self.context_contract = contract;
+        self
     }
 }
 
@@ -230,6 +241,94 @@ pub struct DispatchRequest {
     /// Task prompt or structured instruction payload the remote agent
     /// consumes. Opaque to this module.
     pub task: serde_json::Value,
+    /// Context contract visible to external agents and evidence ledgers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_contract: Option<DispatchContextContract>,
+}
+
+impl DispatchRequest {
+    pub fn new(tool_name: impl Into<String>, task: serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            task,
+            context_contract: None,
+        }
+    }
+
+    pub fn with_context_contract(mut self, contract: DispatchContextContract) -> Self {
+        self.context_contract = Some(contract);
+        self
+    }
+
+    fn arguments_payload(&self) -> serde_json::Value {
+        let Some(contract) = &self.context_contract else {
+            return self.task.clone();
+        };
+        let contract_value = serde_json::to_value(contract).unwrap_or_else(|_| {
+            serde_json::json!({
+                "mode": "external_context_unmanaged",
+                "reason": "context_contract_serialization_failed"
+            })
+        });
+        match self.task.clone() {
+            serde_json::Value::Object(mut obj) => {
+                obj.insert("context_contract".to_string(), contract_value);
+                serde_json::Value::Object(obj)
+            }
+            other => serde_json::json!({
+                "task": other,
+                "context_contract": contract_value,
+            }),
+        }
+    }
+}
+
+/// Context evidence attached to external child-agent dispatches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispatchContextContract {
+    /// Stable mode label, for example `managed_payload` or
+    /// `external_context_unmanaged`.
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_session_key: Option<String>,
+}
+
+impl DispatchContextContract {
+    pub fn external_unmanaged(reason: impl Into<String>) -> Self {
+        Self {
+            mode: "external_context_unmanaged".to_string(),
+            reason: Some(reason.into()),
+            context_ref: None,
+            parent_session_key: None,
+            child_session_key: None,
+        }
+    }
+
+    pub fn managed_payload(context_ref: impl Into<String>) -> Self {
+        Self {
+            mode: "managed_payload".to_string(),
+            reason: None,
+            context_ref: Some(context_ref.into()),
+            parent_session_key: None,
+            child_session_key: None,
+        }
+    }
+
+    pub fn with_parent_session_key(mut self, value: Option<String>) -> Self {
+        self.parent_session_key = value;
+        self
+    }
+
+    pub fn with_child_session_key(mut self, value: Option<String>) -> Self {
+        self.child_session_key = value;
+        self
+    }
 }
 
 /// Trait implemented by each transport backend. Implementations MUST be
@@ -485,7 +584,7 @@ async fn perform_stdio_handshake_and_call(
         "tools/call",
         serde_json::json!({
             "name": request.tool_name,
-            "arguments": request.task,
+            "arguments": request.arguments_payload(),
         }),
     )
     .await
@@ -599,6 +698,7 @@ fn parse_tools_call_response(result: serde_json::Value) -> DispatchResponse {
             output: output.clone(),
             files_to_send: Vec::new(),
             error: Some(output),
+            context_contract: None,
         };
     }
 
@@ -758,7 +858,7 @@ impl HttpMcpAgent {
             "method": "tools/call",
             "params": {
                 "name": request.tool_name,
-                "arguments": request.task,
+                "arguments": request.arguments_payload(),
             },
         });
 
@@ -898,7 +998,28 @@ pub fn build_dispatch_event_payload(
             endpoint: backend.endpoint_label(),
             outcome: response.outcome.as_str().to_string(),
             message: response.error.clone(),
-            extra: HashMap::new(),
+            extra: {
+                let mut extra = HashMap::new();
+                if let Some(contract) = response.context_contract.as_ref() {
+                    extra.insert(
+                        "context_mode".to_string(),
+                        serde_json::Value::String(contract.mode.clone()),
+                    );
+                    if let Some(reason) = contract.reason.as_ref() {
+                        extra.insert(
+                            "context_reason".to_string(),
+                            serde_json::Value::String(reason.clone()),
+                        );
+                    }
+                    if let Some(context_ref) = contract.context_ref.as_ref() {
+                        extra.insert(
+                            "context_ref".to_string(),
+                            serde_json::Value::String(context_ref.clone()),
+                        );
+                    }
+                }
+                extra
+            },
         },
     }
 }
@@ -934,7 +1055,11 @@ pub async fn dispatch_with_metrics(
     backend: &dyn McpAgentBackend,
     request: DispatchRequest,
 ) -> (DispatchResponse, DispatchEventSummary) {
-    let response = backend.dispatch(request).await;
+    let context_contract = request.context_contract.clone();
+    let response = backend
+        .dispatch(request)
+        .await
+        .with_context_contract(context_contract);
     record_dispatch(backend.backend_label(), response.outcome);
     let summary = DispatchEventSummary {
         backend: backend.backend_label().to_string(),
@@ -954,6 +1079,67 @@ pub type BackendMutex = Mutex<Arc<dyn McpAgentBackend>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_request_injects_context_contract_into_arguments() {
+        let request = DispatchRequest::new("run_task", serde_json::json!({"task": "review"}))
+            .with_context_contract(
+                DispatchContextContract::external_unmanaged("fixture")
+                    .with_parent_session_key(Some("parent".to_string()))
+                    .with_child_session_key(Some("child".to_string())),
+            );
+
+        let args = request.arguments_payload();
+        assert_eq!(args["task"], "review");
+        assert_eq!(
+            args["context_contract"]["mode"],
+            "external_context_unmanaged"
+        );
+        assert_eq!(args["context_contract"]["reason"], "fixture");
+        assert_eq!(args["context_contract"]["parent_session_key"], "parent");
+        assert_eq!(args["context_contract"]["child_session_key"], "child");
+    }
+
+    #[test]
+    fn sub_agent_dispatch_event_exposes_context_contract() {
+        let response = DispatchResponse::success("done".to_string(), Vec::new())
+            .with_context_contract(Some(DispatchContextContract::external_unmanaged(
+                "mcp unmanaged",
+            )));
+        let backend = StdioMcpAgent {
+            cmd: "claude".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            dispatch_timeout: Duration::from_secs(1),
+        };
+
+        let payload = build_dispatch_event_payload(
+            "session",
+            "task",
+            Some("coding"),
+            Some("review"),
+            &backend,
+            &response,
+        );
+        match payload {
+            HarnessEventPayload::SubAgentDispatch { data } => {
+                assert_eq!(
+                    data.extra
+                        .get("context_mode")
+                        .and_then(|value| value.as_str()),
+                    Some("external_context_unmanaged")
+                );
+                assert_eq!(
+                    data.extra
+                        .get("context_reason")
+                        .and_then(|value| value.as_str()),
+                    Some("mcp unmanaged")
+                );
+            }
+            other => panic!("wrong payload: {other:?}"),
+        }
+    }
 
     #[test]
     fn backend_label_round_trips() {

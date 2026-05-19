@@ -26,6 +26,7 @@ use octos_memory::EpisodeStore;
 use crate::file_state_cache::FileStateCache;
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
+use crate::prompt_context::PromptContextManager;
 use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 
@@ -255,6 +256,12 @@ pub struct Agent {
     /// `None` keeps legacy behaviour — callers that don't track the sandbox
     /// config (chat, gateway, tests) get the previous default.
     pub(super) sandbox_config: Option<crate::sandbox::SandboxConfig>,
+    /// Optional caller-owned prompt context manager. When present, the agent
+    /// loop asks it to prepare the final model-visible prompt before each LLM
+    /// call. This lets AppUI/session runtimes route mid-turn prompt compaction
+    /// through their durable context ledger without making `octos-agent`
+    /// depend on the CLI crate.
+    pub(super) prompt_context_manager: Option<Arc<dyn PromptContextManager>>,
 }
 
 impl Agent {
@@ -297,6 +304,7 @@ impl Agent {
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
+            prompt_context_manager: None,
         }
     }
 
@@ -340,6 +348,7 @@ impl Agent {
             parent_session_key: None,
             spawn_depth: 0,
             sandbox_config: None,
+            prompt_context_manager: None,
         }
     }
 
@@ -404,6 +413,18 @@ impl Agent {
         }
         self.config = config;
         self
+    }
+
+    /// Attach a caller-owned prompt context manager. Optional; absent keeps
+    /// the legacy agent-local compaction path.
+    pub fn with_prompt_context_manager(mut self, manager: Arc<dyn PromptContextManager>) -> Self {
+        self.prompt_context_manager = Some(manager);
+        self
+    }
+
+    /// Access the attached prompt context manager, if any.
+    pub fn prompt_context_manager(&self) -> Option<Arc<dyn PromptContextManager>> {
+        self.prompt_context_manager.clone()
     }
 
     /// Set the progress reporter.

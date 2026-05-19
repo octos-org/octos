@@ -9,12 +9,15 @@ pub mod admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
 pub mod auth;
+pub mod cli_agent_adapter;
 pub mod commands;
 pub mod compaction;
 pub mod config;
 pub mod config_watcher;
 #[cfg(feature = "api")]
 pub mod content_catalog;
+#[path = "api/context_manager.rs"]
+pub(crate) mod context_manager;
 pub mod cron_tool;
 pub mod gateway_dispatcher;
 #[cfg(feature = "api")]

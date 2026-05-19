@@ -94,6 +94,25 @@ pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1: &str = "projection.envelop
 /// once `octos-web` has migrated (tracked separately).
 pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to_ws.v1";
 
+/// Required feature flag for UPCR-2026-021 M15 autonomy inspection/control.
+pub const UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
+
+/// Optional M15 feature flag for backend-owned agent lifecycle controls.
+pub const UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1: &str = "coding.agent_control.v1";
+
+/// Optional M15 feature flag for persisted goal runtime controls.
+pub const UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1: &str = "coding.goal_runtime.v1";
+
+/// Optional M15 feature flag for recurring loop runtime controls.
+pub const UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1: &str = "coding.loop_runtime.v1";
+
+/// Optional M15 feature flag for backend-owned product review workflows.
+pub const UI_PROTOCOL_FEATURE_REVIEW_START_V1: &str = "review.start.v1";
+
+/// Feature flag for backend-owned context generation, checkpoint, and
+/// compaction lifecycle inspection.
+pub const UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -111,6 +130,12 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -144,6 +169,23 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::CONTENT_LIST
         | methods::CONTENT_DELETE
         | methods::CONTENT_BULK_DELETE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+        methods::AGENT_LIST
+        | methods::AGENT_STATUS_READ
+        | methods::AGENT_OUTPUT_READ
+        | methods::AGENT_ARTIFACT_LIST
+        | methods::AGENT_ARTIFACT_READ
+        | methods::AGENT_INTERRUPT
+        | methods::AGENT_CLOSE => Some(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
+        methods::SESSION_GOAL_GET | methods::SESSION_GOAL_SET | methods::SESSION_GOAL_CLEAR => {
+            Some(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1)
+        }
+        methods::LOOP_CREATE
+        | methods::LOOP_LIST
+        | methods::LOOP_DELETE
+        | methods::LOOP_PAUSE
+        | methods::LOOP_RESUME
+        | methods::LOOP_FIRE_NOW => Some(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
+        methods::REVIEW_START => Some(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
         _ => None,
     }
 }
@@ -295,6 +337,26 @@ pub mod rpc_error_codes {
     /// REST 404 was force-mapped to `UNKNOWN_SESSION` regardless of
     /// resource kind.
     pub const RESOURCE_NOT_FOUND: i64 = -32170;
+}
+
+/// UPCR-2026-021 autonomy runtime error kind registry.
+pub mod autonomy_error_kinds {
+    pub const AGENT_NOT_FOUND: &str = "agent_not_found";
+    pub const AGENT_CONTROL_FORBIDDEN: &str = "agent_control_forbidden";
+    pub const AGENT_CONTROL_UNAVAILABLE: &str = "agent_control_unavailable";
+    pub const AGENT_ARTIFACT_DENIED: &str = "agent_artifact_denied";
+    pub const GOAL_RUNTIME_UNAVAILABLE: &str = "goal_runtime_unavailable";
+    pub const GOAL_UNAVAILABLE: &str = "goal_unavailable";
+    pub const GOAL_INVALID_STATE: &str = "goal_invalid_state";
+    pub const GOAL_RATE_LIMITED: &str = "goal_rate_limited";
+    pub const LOOP_RUNTIME_UNAVAILABLE: &str = "loop_runtime_unavailable";
+    pub const LOOP_NOT_FOUND: &str = "loop_not_found";
+    pub const LOOP_INVALID_INTERVAL: &str = "loop_invalid_interval";
+    pub const LOOP_PROMPT_EMPTY: &str = "loop_prompt_empty";
+    pub const LOOP_BUSY: &str = "loop_busy";
+    pub const LOOP_SLASH_DENIED: &str = "loop_slash_denied";
+    pub const LOOP_POLICY_DENIED: &str = "loop_policy_denied";
+    pub const AUTONOMY_QUOTA_EXCEEDED: &str = "autonomy_quota_exceeded";
 }
 
 /// Logical event-ledger cursor used for resumable UI notification consumption.
@@ -725,6 +787,34 @@ pub mod methods {
     /// UPCR-2026-011 `turn/state/get` — turn lifecycle introspection.
     pub const TURN_STATE_GET: &str = "turn/state/get";
 
+    /// UPCR-2026-021 M15 agent inspection/control surface.
+    pub const AGENT_LIST: &str = "agent/list";
+    pub const AGENT_STATUS_READ: &str = "agent/status/read";
+    pub const AGENT_OUTPUT_READ: &str = "agent/output/read";
+    pub const AGENT_ARTIFACT_LIST: &str = "agent/artifact/list";
+    pub const AGENT_ARTIFACT_READ: &str = "agent/artifact/read";
+    pub const AGENT_INTERRUPT: &str = "agent/interrupt";
+    pub const AGENT_CLOSE: &str = "agent/close";
+
+    /// UPCR-2026-021 M15 persisted goal runtime surface.
+    pub const SESSION_GOAL_GET: &str = "session/goal/get";
+    pub const SESSION_GOAL_SET: &str = "session/goal/set";
+    pub const SESSION_GOAL_CLEAR: &str = "session/goal/clear";
+
+    /// UPCR-2026-021 M15 recurring loop runtime surface.
+    pub const LOOP_CREATE: &str = "loop/create";
+    pub const LOOP_LIST: &str = "loop/list";
+    pub const LOOP_DELETE: &str = "loop/delete";
+    pub const LOOP_PAUSE: &str = "loop/pause";
+    pub const LOOP_RESUME: &str = "loop/resume";
+    pub const LOOP_FIRE_NOW: &str = "loop/fire_now";
+
+    /// Product-level automated code review workflow.
+    ///
+    /// This is not a generic child-agent control API. The backend owns the
+    /// review template and decides which specialist agents to launch.
+    pub const REVIEW_START: &str = "review/start";
+
     pub const TURN_STARTED: &str = "turn/started";
     pub const TURN_COMPLETED: &str = "turn/completed";
     pub const TURN_ERROR: &str = "turn/error";
@@ -823,6 +913,22 @@ pub mod methods {
     /// today; the constant is defined so type-checked code paths across
     /// the workspace can reference one source of truth.
     pub const QUEUE_STATE: &str = "queue/state";
+
+    /// UPCR-2026-021 M15 agent lifecycle/output notifications.
+    pub const AGENT_UPDATED: &str = "agent/updated";
+    pub const AGENT_OUTPUT_DELTA: &str = "agent/output/delta";
+    pub const AGENT_ARTIFACT_UPDATED: &str = "agent/artifact/updated";
+    /// UPCR-2026-021 M15 goal runtime notifications.
+    pub const SESSION_GOAL_UPDATED: &str = "session/goal/updated";
+    pub const SESSION_GOAL_CLEARED: &str = "session/goal/cleared";
+    /// UPCR-2026-021 M15 loop runtime notifications.
+    pub const LOOP_UPDATED: &str = "loop/updated";
+    pub const LOOP_FIRED: &str = "loop/fired";
+    pub const LOOP_COMPLETED: &str = "loop/completed";
+    /// M16 `context.lifecycle.v1`: compact-context lifecycle notification.
+    pub const CONTEXT_COMPACTION_COMPLETED: &str = "context/compaction_completed";
+    /// M16 `context.lifecycle.v1`: prompt normalization report notification.
+    pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
 }
 
 /// Reason codes for `approval/cancelled` notifications. The registry is
@@ -850,6 +956,23 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_HYDRATE,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
+    methods::AGENT_LIST,
+    methods::AGENT_STATUS_READ,
+    methods::AGENT_OUTPUT_READ,
+    methods::AGENT_ARTIFACT_LIST,
+    methods::AGENT_ARTIFACT_READ,
+    methods::AGENT_INTERRUPT,
+    methods::AGENT_CLOSE,
+    methods::SESSION_GOAL_GET,
+    methods::SESSION_GOAL_SET,
+    methods::SESSION_GOAL_CLEAR,
+    methods::LOOP_CREATE,
+    methods::LOOP_LIST,
+    methods::LOOP_DELETE,
+    methods::LOOP_PAUSE,
+    methods::LOOP_RESUME,
+    methods::LOOP_FIRE_NOW,
+    methods::REVIEW_START,
     methods::SESSION_LIST,
     methods::SESSION_SNAPSHOT,
     methods::SESSION_MESSAGES_PAGE,
@@ -893,6 +1016,16 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::ROUTER_STATUS,
     methods::ROUTER_FAILOVER,
     methods::QUEUE_STATE,
+    methods::AGENT_UPDATED,
+    methods::AGENT_OUTPUT_DELTA,
+    methods::AGENT_ARTIFACT_UPDATED,
+    methods::SESSION_GOAL_UPDATED,
+    methods::SESSION_GOAL_CLEARED,
+    methods::LOOP_UPDATED,
+    methods::LOOP_FIRED,
+    methods::LOOP_COMPLETED,
+    methods::CONTEXT_COMPACTION_COMPLETED,
+    methods::CONTEXT_NORMALIZATION_REPORTED,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -912,6 +1045,23 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::SESSION_HYDRATE,
     methods::THREAD_GRAPH_GET,
     methods::TURN_STATE_GET,
+    methods::AGENT_LIST,
+    methods::AGENT_STATUS_READ,
+    methods::AGENT_OUTPUT_READ,
+    methods::AGENT_ARTIFACT_LIST,
+    methods::AGENT_ARTIFACT_READ,
+    methods::AGENT_INTERRUPT,
+    methods::AGENT_CLOSE,
+    methods::SESSION_GOAL_GET,
+    methods::SESSION_GOAL_SET,
+    methods::SESSION_GOAL_CLEAR,
+    methods::LOOP_CREATE,
+    methods::LOOP_LIST,
+    methods::LOOP_DELETE,
+    methods::LOOP_PAUSE,
+    methods::LOOP_RESUME,
+    methods::LOOP_FIRE_NOW,
+    methods::REVIEW_START,
     methods::SESSION_LIST,
     methods::SESSION_SNAPSHOT,
     methods::SESSION_MESSAGES_PAGE,
@@ -997,6 +1147,12 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+            UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+            UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
         ])
     }
 
@@ -1044,9 +1200,15 @@ impl UiProtocolCapabilities {
             .into_iter()
             .map(|feature| feature.as_ref().to_owned())
             .collect();
+        let autonomy_base_requested = requested
+            .iter()
+            .any(|feature| feature == UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1);
         let supported_features: Vec<String> = UI_PROTOCOL_KNOWN_FEATURES
             .iter()
-            .filter(|feature| requested.iter().any(|requested| requested == **feature))
+            .filter(|feature| {
+                requested.iter().any(|requested| requested == **feature)
+                    && (autonomy_base_requested || !is_autonomy_optional_feature(feature))
+            })
             .map(|feature| (*feature).to_owned())
             .collect();
         let supported_methods: Vec<String> = UI_PROTOCOL_FIRST_SERVER_METHODS
@@ -1109,6 +1271,15 @@ impl UiProtocolCapabilities {
             .iter()
             .find(|report| report.method == method)
     }
+}
+
+fn is_autonomy_optional_feature(feature: &str) -> bool {
+    matches!(
+        feature,
+        UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1
+            | UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1
+            | UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1
+    )
 }
 
 fn string_list(values: &[&str]) -> Vec<String> {
@@ -1936,6 +2107,10 @@ pub struct SessionHydrateResult {
     pub session_id: SessionKey,
     pub cursor: UiCursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<HydratedMessage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<Vec<ThreadGraphEntry>>,
@@ -2045,6 +2220,10 @@ pub struct TurnStateGetResult {
     pub turn_id: TurnId,
     pub state: TurnLifecycleState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
@@ -2144,6 +2323,8 @@ pub struct SessionStatusGetParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStatusGetResult {
     pub status: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
 }
 
 /// Params for `session/files.list`.
@@ -3031,6 +3212,10 @@ pub struct SessionOpened {
     pub active_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_state: Option<UiContextState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<UiCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3962,6 +4147,300 @@ pub struct TaskOutputDeltaEvent {
     pub text: String,
 }
 
+/// Runtime policy details attached to M15 agent records. The policy stamp is
+/// backend-owned and intentionally open so future autonomy policy fields round
+/// trip without forcing clients back to raw JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAutonomyRuntimePolicyStamp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy_id: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Artifact metadata shared by `agent/artifact/list`,
+/// `agent/artifact/updated`, and the nested artifact list on agent snapshots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAgentArtifact {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// M15 agent lifecycle snapshot. This mirrors the existing raw fixture and
+/// orchestrator payload while keeping optional display aliases (`title`,
+/// `summary`, `output_tail`) compatible with the production AppUI projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiAgentRecord {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<String>,
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub path: String,
+    pub role: String,
+    pub nickname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub backend_kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<UiAutonomyRuntimePolicyStamp>,
+    #[serde(default)]
+    pub artifact_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<UiAgentArtifact>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentUpdatedEvent {
+    pub session_id: SessionKey,
+    pub agent: UiAgentRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentOutputDeltaEvent {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    pub cursor: OutputCursor,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentArtifactUpdatedEvent {
+    pub session_id: SessionKey,
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<UiAgentArtifact>,
+}
+
+/// M15 persisted goal snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiGoalRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub goal_id: String,
+    pub objective: String,
+    pub status: String,
+    pub token_budget: u64,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub goal: UiGoalRecord,
+    pub transition_actor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionGoalClearedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub cleared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<UiGoalRecord>,
+    pub transition_actor: String,
+}
+
+/// M15 recurring loop snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiLoopRecord {
+    pub loop_id: String,
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub prompt: String,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at_ms: Option<i64>,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopUpdatedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_id: Option<String>,
+    #[serde(rename = "loop")]
+    pub loop_state: UiLoopRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiLoopFire {
+    #[serde(default)]
+    pub queued: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopFiredEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub loop_id: String,
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_state: Option<UiLoopRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire: Option<UiLoopFire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoopCompletedEvent {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub loop_id: String,
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_state: Option<UiLoopRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// M16 active model-visible context state exposed through AppUI lifecycle
+/// notifications. This intentionally carries hashes and counts, not raw
+/// transcript content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextState {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub generation: u64,
+    pub transcript_hash: String,
+    pub item_count: usize,
+    pub token_estimate: usize,
+    pub recovery_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_compaction_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextCompactionRecord {
+    pub compaction_id: String,
+    pub checkpoint_id: String,
+    pub status: String,
+    pub policy_id: String,
+    pub trigger: String,
+    pub input_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_generation: Option<u64>,
+    pub input_transcript_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_transcript_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_transcript_hash: Option<String>,
+    pub input_item_count: usize,
+    pub retained_count: usize,
+    pub dropped_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_item_id: Option<String>,
+    pub token_estimate_before: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_estimate_after: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionCompletedEvent {
+    pub session_id: SessionKey,
+    pub context_state: UiContextState,
+    pub compaction: UiContextCompactionRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextNormalizationReport {
+    pub generation: u64,
+    pub input_transcript_hash: String,
+    pub output_prompt_hash: String,
+    pub model_capability_id: String,
+    pub prompt_message_count: usize,
+    pub token_estimate: usize,
+    pub repaired_count: usize,
+    pub dropped_count: usize,
+    pub synthetic_count: usize,
+    pub truncated_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextNormalizationReportedEvent {
+    pub session_id: SessionKey,
+    pub context_state: UiContextState,
+    pub normalization: UiContextNormalizationReport,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WarningEvent {
     pub session_id: SessionKey,
@@ -4164,6 +4643,26 @@ pub enum UiNotification {
     /// Wave4-A: queue-state snapshot. Client-manufactured today — server
     /// never emits this. See [`QueueStateEvent`] docs.
     QueueState(QueueStateEvent),
+    /// UPCR-2026-021 M15: backend-owned agent lifecycle snapshot.
+    AgentUpdated(AgentUpdatedEvent),
+    /// UPCR-2026-021 M15: best-effort agent output tail delta.
+    AgentOutputDelta(AgentOutputDeltaEvent),
+    /// UPCR-2026-021 M15: agent artifact metadata changed.
+    AgentArtifactUpdated(AgentArtifactUpdatedEvent),
+    /// UPCR-2026-021 M15: persisted session goal changed.
+    SessionGoalUpdated(SessionGoalUpdatedEvent),
+    /// UPCR-2026-021 M15: persisted session goal cleared.
+    SessionGoalCleared(SessionGoalClearedEvent),
+    /// UPCR-2026-021 M15: recurring loop metadata changed.
+    LoopUpdated(LoopUpdatedEvent),
+    /// UPCR-2026-021 M15: loop fired and queued/attempted a continuation.
+    LoopFired(LoopFiredEvent),
+    /// UPCR-2026-021 M15: loop iteration reached a terminal result.
+    LoopCompleted(LoopCompletedEvent),
+    /// M16: compact-context lifecycle event.
+    ContextCompactionCompleted(ContextCompactionCompletedEvent),
+    /// M16: prompt normalization lifecycle event.
+    ContextNormalizationReported(ContextNormalizationReportedEvent),
 }
 
 impl UiNotification {
@@ -4193,6 +4692,16 @@ impl UiNotification {
             Self::RouterStatus(_) => methods::ROUTER_STATUS,
             Self::RouterFailover(_) => methods::ROUTER_FAILOVER,
             Self::QueueState(_) => methods::QUEUE_STATE,
+            Self::AgentUpdated(_) => methods::AGENT_UPDATED,
+            Self::AgentOutputDelta(_) => methods::AGENT_OUTPUT_DELTA,
+            Self::AgentArtifactUpdated(_) => methods::AGENT_ARTIFACT_UPDATED,
+            Self::SessionGoalUpdated(_) => methods::SESSION_GOAL_UPDATED,
+            Self::SessionGoalCleared(_) => methods::SESSION_GOAL_CLEARED,
+            Self::LoopUpdated(_) => methods::LOOP_UPDATED,
+            Self::LoopFired(_) => methods::LOOP_FIRED,
+            Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
+            Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
+            Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
         }
     }
 
@@ -4223,6 +4732,16 @@ impl UiNotification {
             Self::RouterStatus(params) => serde_json::to_value(params),
             Self::RouterFailover(params) => serde_json::to_value(params),
             Self::QueueState(params) => serde_json::to_value(params),
+            Self::AgentUpdated(params) => serde_json::to_value(params),
+            Self::AgentOutputDelta(params) => serde_json::to_value(params),
+            Self::AgentArtifactUpdated(params) => serde_json::to_value(params),
+            Self::SessionGoalUpdated(params) => serde_json::to_value(params),
+            Self::SessionGoalCleared(params) => serde_json::to_value(params),
+            Self::LoopUpdated(params) => serde_json::to_value(params),
+            Self::LoopFired(params) => serde_json::to_value(params),
+            Self::LoopCompleted(params) => serde_json::to_value(params),
+            Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
+            Self::ContextNormalizationReported(params) => serde_json::to_value(params),
         }?;
 
         Ok(RpcNotification::new(method, params))
@@ -4275,6 +4794,28 @@ impl UiNotification {
             methods::ROUTER_STATUS => Ok(Self::RouterStatus(decode_params(method, params)?)),
             methods::ROUTER_FAILOVER => Ok(Self::RouterFailover(decode_params(method, params)?)),
             methods::QUEUE_STATE => Ok(Self::QueueState(decode_params(method, params)?)),
+            methods::AGENT_UPDATED => Ok(Self::AgentUpdated(decode_params(method, params)?)),
+            methods::AGENT_OUTPUT_DELTA => {
+                Ok(Self::AgentOutputDelta(decode_params(method, params)?))
+            }
+            methods::AGENT_ARTIFACT_UPDATED => {
+                Ok(Self::AgentArtifactUpdated(decode_params(method, params)?))
+            }
+            methods::SESSION_GOAL_UPDATED => {
+                Ok(Self::SessionGoalUpdated(decode_params(method, params)?))
+            }
+            methods::SESSION_GOAL_CLEARED => {
+                Ok(Self::SessionGoalCleared(decode_params(method, params)?))
+            }
+            methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
+            methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
+            methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
+            methods::CONTEXT_COMPACTION_COMPLETED => Ok(Self::ContextCompactionCompleted(
+                decode_params(method, params)?,
+            )),
+            methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
+                decode_params(method, params)?,
+            )),
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -4394,6 +4935,8 @@ mod tests {
             session_id: session_id.clone(),
             active_profile_id: Some("coding".into()),
             workspace_root: Some("/repo".into()),
+            context: None,
+            context_state: None,
             cursor: None,
             panes: Some(UiPaneSnapshot {
                 session_id: session_id.clone(),
@@ -4474,6 +5017,8 @@ mod tests {
             session_id: SessionKey("local:demo".into()),
             active_profile_id: None,
             workspace_root: None,
+            context: None,
+            context_state: None,
             cursor: None,
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
@@ -4622,6 +5167,24 @@ mod tests {
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
             "auxiliary.rest_to_ws.v1"
         );
+        assert_eq!(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, "coding.autonomy.v1");
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+            "coding.agent_control.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+            "coding.goal_runtime.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+            "coding.loop_runtime.v1"
+        );
+        assert_eq!(UI_PROTOCOL_FEATURE_REVIEW_START_V1, "review.start.v1");
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            "context.lifecycle.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -4642,6 +5205,23 @@ mod tests {
                 "session/hydrate",
                 "thread/graph/get",
                 "turn/state/get",
+                "agent/list",
+                "agent/status/read",
+                "agent/output/read",
+                "agent/artifact/list",
+                "agent/artifact/read",
+                "agent/interrupt",
+                "agent/close",
+                "session/goal/get",
+                "session/goal/set",
+                "session/goal/clear",
+                "loop/create",
+                "loop/list",
+                "loop/delete",
+                "loop/pause",
+                "loop/resume",
+                "loop/fire_now",
+                "review/start",
                 "session/list",
                 "session/snapshot",
                 "session/messages_page",
@@ -4686,6 +5266,16 @@ mod tests {
                 "router/status",
                 "router/failover",
                 "queue/state",
+                "agent/updated",
+                "agent/output/delta",
+                "agent/artifact/updated",
+                "session/goal/updated",
+                "session/goal/cleared",
+                "loop/updated",
+                "loop/fired",
+                "loop/completed",
+                "context/compaction_completed",
+                "context/normalization_reported",
             ]
         );
         assert_eq!(
@@ -4706,6 +5296,23 @@ mod tests {
                 "session/hydrate",
                 "thread/graph/get",
                 "turn/state/get",
+                "agent/list",
+                "agent/status/read",
+                "agent/output/read",
+                "agent/artifact/list",
+                "agent/artifact/read",
+                "agent/interrupt",
+                "agent/close",
+                "session/goal/get",
+                "session/goal/set",
+                "session/goal/clear",
+                "loop/create",
+                "loop/list",
+                "loop/delete",
+                "loop/pause",
+                "loop/resume",
+                "loop/fire_now",
+                "review/start",
                 "session/list",
                 "session/snapshot",
                 "session/messages_page",
@@ -4759,6 +5366,23 @@ mod tests {
                     "session/hydrate",
                     "thread/graph/get",
                     "turn/state/get",
+                    "agent/list",
+                    "agent/status/read",
+                    "agent/output/read",
+                    "agent/artifact/list",
+                    "agent/artifact/read",
+                    "agent/interrupt",
+                    "agent/close",
+                    "session/goal/get",
+                    "session/goal/set",
+                    "session/goal/clear",
+                    "loop/create",
+                    "loop/list",
+                    "loop/delete",
+                    "loop/pause",
+                    "loop/resume",
+                    "loop/fire_now",
+                    "review/start",
                     "session/list",
                     "session/snapshot",
                     "session/messages_page",
@@ -4799,7 +5423,17 @@ mod tests {
                     "session/event",
                     "router/status",
                     "router/failover",
-                    "queue/state"
+                    "queue/state",
+                    "agent/updated",
+                    "agent/output/delta",
+                    "agent/artifact/updated",
+                    "session/goal/updated",
+                    "session/goal/cleared",
+                    "loop/updated",
+                    "loop/fired",
+                    "loop/completed",
+                    "context/compaction_completed",
+                    "context/normalization_reported"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
@@ -4812,7 +5446,13 @@ mod tests {
                     "event.message_persisted.v1",
                     "event.spawn_complete.v1",
                     "projection.envelope.v1",
-                    "auxiliary.rest_to_ws.v1"
+                    "auxiliary.rest_to_ws.v1",
+                    "coding.autonomy.v1",
+                    "coding.agent_control.v1",
+                    "coding.goal_runtime.v1",
+                    "coding.loop_runtime.v1",
+                    "review.start.v1",
+                    "context.lifecycle.v1"
                 ]
             })
         );
@@ -5565,6 +6205,8 @@ mod tests {
             session_id: SessionKey("local:demo".into()),
             active_profile_id: Some("coding".into()),
             workspace_root: None,
+            context: None,
+            context_state: None,
             cursor: Some(UiCursor {
                 stream: "events".into(),
                 seq: 42,
@@ -6088,6 +6730,237 @@ mod tests {
         assert_eq!(decoded, event);
     }
 
+    fn m15_agent_record(session_id: SessionKey) -> UiAgentRecord {
+        UiAgentRecord {
+            agent_id: "reviewer-api".into(),
+            parent_agent_id: Some("master".into()),
+            session_id,
+            task_id: Some("task_01".into()),
+            path: "master/reviewer-api".into(),
+            role: "reviewer".into(),
+            nickname: "Ada Lovelace".into(),
+            title: Some("Ada Lovelace".into()),
+            backend_kind: "cli_process".into(),
+            status: "running".into(),
+            last_task: Some("Running live code review check".into()),
+            summary: Some("Running live code review check".into()),
+            output_tail: Some("reviewer-api: checking API surface\n".into()),
+            cwd: Some("/repo".into()),
+            profile_id: "coding".into(),
+            runtime_policy_stamp: Some(UiAutonomyRuntimePolicyStamp {
+                profile_id: Some("coding".into()),
+                sandbox: Some("workspace-write".into()),
+                approval_policy: Some("on-request".into()),
+                tool_policy_id: Some("coding-v1".into()),
+                extra: BTreeMap::new(),
+            }),
+            artifact_count: 1,
+            artifacts: vec![m15_agent_artifact()],
+            created_at_ms: 1_778_870_000_000,
+            updated_at_ms: 1_778_870_030_000,
+        }
+    }
+
+    fn m15_agent_artifact() -> UiAgentArtifact {
+        UiAgentArtifact {
+            id: "api-report".into(),
+            title: "API report".into(),
+            kind: "markdown".into(),
+            status: "ready".into(),
+            path: None,
+            content: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn m15_goal_record() -> UiGoalRecord {
+        UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: "finish the review and tests".into(),
+            status: "active".into(),
+            token_budget: 50_000,
+            tokens_used: 3_200,
+            time_used_seconds: 180,
+            created_at_ms: 1_778_870_000_000,
+            updated_at_ms: 1_778_870_030_000,
+        }
+    }
+
+    fn m15_loop_record(session_id: SessionKey) -> UiLoopRecord {
+        UiLoopRecord {
+            loop_id: "loop_01".into(),
+            session_id,
+            profile_id: Some("coding".into()),
+            prompt: "check deploy".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: Some(1_778_870_600_000),
+            last_run_at_ms: Some(1_778_870_000_000),
+            expires_at_ms: 1_779_474_800_000,
+            created_at_ms: 1_778_870_000_000,
+            updated_at_ms: 1_778_870_030_000,
+        }
+    }
+
+    #[test]
+    fn m15_autonomy_notifications_register_methods_and_round_trip() {
+        let session_id = SessionKey("coding:local:tui#coding".into());
+        let loop_state = m15_loop_record(session_id.clone());
+        let cases = vec![
+            (
+                UiNotification::AgentUpdated(AgentUpdatedEvent {
+                    session_id: session_id.clone(),
+                    agent: m15_agent_record(session_id.clone()),
+                }),
+                methods::AGENT_UPDATED,
+            ),
+            (
+                UiNotification::AgentOutputDelta(AgentOutputDeltaEvent {
+                    session_id: session_id.clone(),
+                    agent_id: "reviewer-api".into(),
+                    cursor: OutputCursor { offset: 42 },
+                    text: "partial output\n".into(),
+                }),
+                methods::AGENT_OUTPUT_DELTA,
+            ),
+            (
+                UiNotification::AgentArtifactUpdated(AgentArtifactUpdatedEvent {
+                    session_id: session_id.clone(),
+                    agent_id: "reviewer-api".into(),
+                    artifacts: vec![m15_agent_artifact()],
+                }),
+                methods::AGENT_ARTIFACT_UPDATED,
+            ),
+            (
+                UiNotification::SessionGoalUpdated(SessionGoalUpdatedEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    goal: m15_goal_record(),
+                    transition_actor: "user".into(),
+                }),
+                methods::SESSION_GOAL_UPDATED,
+            ),
+            (
+                UiNotification::SessionGoalCleared(SessionGoalClearedEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    cleared: true,
+                    goal: None,
+                    transition_actor: "user".into(),
+                }),
+                methods::SESSION_GOAL_CLEARED,
+            ),
+            (
+                UiNotification::LoopUpdated(LoopUpdatedEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    loop_id: Some("loop_01".into()),
+                    loop_state: loop_state.clone(),
+                    ok: Some(true),
+                    status: Some("active".into()),
+                    deleted: None,
+                }),
+                methods::LOOP_UPDATED,
+            ),
+            (
+                UiNotification::LoopFired(LoopFiredEvent {
+                    session_id: session_id.clone(),
+                    profile_id: Some("coding".into()),
+                    loop_id: "loop_01".into(),
+                    loop_state: Some(loop_state.clone()),
+                    fire: Some(UiLoopFire {
+                        queued: true,
+                        duplicate: Some(false),
+                        continuation_id: Some(7),
+                        dedupe_key: Some("loop:loop_01".into()),
+                        reason: Some("LoopFire".into()),
+                        priority: Some(20),
+                        message: None,
+                        extra: BTreeMap::new(),
+                    }),
+                    ok: Some(true),
+                    status: Some("queued".into()),
+                }),
+                methods::LOOP_FIRED,
+            ),
+            (
+                UiNotification::LoopCompleted(LoopCompletedEvent {
+                    session_id,
+                    profile_id: Some("coding".into()),
+                    loop_id: "loop_01".into(),
+                    loop_state: Some(loop_state),
+                    status: Some("completed".into()),
+                    completed_at_ms: Some(1_778_870_090_000),
+                    result: Some(json!({ "message": "iteration completed" })),
+                    error: None,
+                }),
+                methods::LOOP_COMPLETED,
+            ),
+        ];
+
+        for (event, method) in cases {
+            assert_eq!(event.method(), method);
+            assert!(UI_PROTOCOL_NOTIFICATION_METHODS.contains(&method));
+
+            let rpc = event
+                .clone()
+                .into_rpc_notification()
+                .expect("serialize M15 notification");
+            assert_eq!(rpc.method, method);
+            let decoded =
+                UiNotification::from_rpc_notification(rpc).expect("decode M15 notification");
+            assert_eq!(decoded, event);
+        }
+    }
+
+    #[test]
+    fn m15_agent_fixture_notifications_decode_to_typed_variants() {
+        let session_id = SessionKey("coding:local:tui#coding".into());
+        let agent = m15_agent_record(session_id.clone());
+        let agent_wire = RpcNotification::new(
+            methods::AGENT_UPDATED,
+            json!({
+                "session_id": session_id,
+                "agent": agent,
+            }),
+        );
+        let decoded =
+            UiNotification::from_rpc_notification(agent_wire).expect("decode agent/updated");
+        assert!(matches!(decoded, UiNotification::AgentUpdated(_)));
+
+        let output_wire = RpcNotification::new(
+            methods::AGENT_OUTPUT_DELTA,
+            json!({
+                "session_id": session_id,
+                "agent_id": "reviewer-api",
+                "cursor": { "offset": 23 },
+                "text": "reviewer-api: finding\n"
+            }),
+        );
+        let decoded =
+            UiNotification::from_rpc_notification(output_wire).expect("decode agent/output/delta");
+        assert!(matches!(decoded, UiNotification::AgentOutputDelta(_)));
+
+        let artifact_wire = RpcNotification::new(
+            methods::AGENT_ARTIFACT_UPDATED,
+            json!({
+                "session_id": session_id,
+                "agent_id": "reviewer-api",
+                "artifacts": [{
+                    "id": "api-report",
+                    "title": "API report",
+                    "kind": "markdown",
+                    "status": "ready"
+                }]
+            }),
+        );
+        let decoded = UiNotification::from_rpc_notification(artifact_wire)
+            .expect("decode agent/artifact/updated");
+        assert!(matches!(decoded, UiNotification::AgentArtifactUpdated(_)));
+    }
+
     #[test]
     fn resumable_notifications_carry_event_ledger_cursors() {
         let session_id = SessionKey("local:demo".into());
@@ -6099,6 +6972,8 @@ mod tests {
             session_id: session_id.clone(),
             active_profile_id: None,
             workspace_root: None,
+            context: None,
+            context_state: None,
             cursor: Some(opened_cursor.clone()),
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
@@ -6757,6 +7632,8 @@ mod tests {
         let result = SessionHydrateResult {
             session_id: sample_session_id(),
             cursor: sample_cursor(),
+            context: None,
+            context_state: None,
             messages: Some(vec![HydratedMessage {
                 seq: 17,
                 role: "user".into(),
@@ -6796,6 +7673,8 @@ mod tests {
         let messages_only = SessionHydrateResult {
             session_id: sample_session_id(),
             cursor: sample_cursor(),
+            context: None,
+            context_state: None,
             messages: Some(vec![]),
             threads: None,
             turns: None,
@@ -6867,6 +7746,8 @@ mod tests {
             session_id: sample_session_id(),
             turn_id: sample_turn_id(),
             state: TurnLifecycleState::Active,
+            context: None,
+            context_state: None,
             started_at: Some(sample_persisted_at()),
             completed_at: None,
             thread_id: Some("thread-1".into()),
@@ -6891,6 +7772,8 @@ mod tests {
                 session_id: sample_session_id(),
                 turn_id: sample_turn_id(),
                 state,
+                context: None,
+                context_state: None,
                 started_at: None,
                 completed_at: None,
                 thread_id: None,
@@ -7526,6 +8409,27 @@ mod tests {
         assert!(with_feature.supports_feature(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1));
     }
 
+    #[test]
+    fn autonomy_methods_require_base_and_group_features() {
+        let without_base = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+        ]);
+        assert!(!without_base.supports_feature(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1));
+        assert!(!without_base.supports_method(methods::SESSION_GOAL_SET));
+
+        let base_only = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+        ]);
+        assert!(base_only.supports_feature(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
+        assert!(!base_only.supports_method(methods::SESSION_GOAL_SET));
+
+        let with_group = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+        ]);
+        assert!(with_group.supports_method(methods::SESSION_GOAL_SET));
+    }
+
     /// Codex review 2026-05-12 (MEDIUM 2): every M12 Phase D-1
     /// request/result DTO must be pinned to a JSON-shape golden, not
     /// just to a serde round-trip. A round-trip catches "can encode
@@ -7726,6 +8630,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(SessionStatusGetResult {
                 status: serde_json::json!({ "active": false }),
+                context_state: None,
             })
             .expect("serialize"),
             serde_json::json!({ "status": { "active": false } }),

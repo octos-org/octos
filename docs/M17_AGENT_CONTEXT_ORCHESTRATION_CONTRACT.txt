@@ -1,0 +1,150 @@
+# M17 Agent Context Orchestration Contract
+
+Date: 2026-05-17
+Milestone: M17 Agent Context Orchestration Hardening
+
+## Objective
+
+Close the remaining production gaps for multi-agent orchestration and context
+management after M15/M16. A completed M17 must prove that every production
+child-agent path either uses a managed ContextManager fork or emits an explicit
+unmanaged context marker with evidence, and that parent turns receive bounded
+result capsules instead of raw child transcripts.
+
+## Current Status
+
+- Existing open issues #976 through #992 cover the broad M15/M16 autonomy,
+  orchestration, goal/loop, durable supervisor, and ContextManager work.
+- Those issues are now assigned to the M17 milestone.
+- New M17 issues #1019 through #1024 track the remaining closure gaps found by
+  code review and live soak evidence.
+
+## Workstreams
+
+### M17-A: Gateway And Session Actor Context Parity
+
+Issue: #1019
+
+Wire gateway/session_actor spawned children to ContextManager forks.
+
+Acceptance:
+
+- Every gateway/session_actor child spawn has child context ledger evidence.
+- Logs include child context generation/checkpoint ids before model calls.
+- Parent context receives a bounded child capsule, not raw child transcript or
+  tool chatter.
+- Regression tests cover session_actor/gateway spawn parity with AppUI spawn.
+
+### M17-B: Delegate And Pipeline Worker Context Propagation
+
+Issue: #1020
+
+Propagate ContextManager through delegate_task and run_pipeline workers.
+
+Acceptance:
+
+- delegate_task workers have child context ledger evidence.
+- run_pipeline workers have child context ledger evidence or
+  external_context_unmanaged with a reason.
+- Parent prompt history contains only bounded worker capsules.
+- Live deep-review/code-review soak proves no raw worker transcript flooding.
+
+### M17-C: Native, CLI, And MCP Specialist Context Contract
+
+Issue: #1021
+
+Define the specialist child-context contract for native, CLI, and MCP agents.
+
+Acceptance:
+
+- Native specialists run with managed child context.
+- CLI and MCP specialists receive compacted payload/artifact refs or emit
+  external_context_unmanaged.
+- AppUI agent/updated exposes child context mode and context refs.
+- Tests cover native, CLI, and MCP context modes.
+
+### M17-D: Parent-Child Join Summary Discipline
+
+Issue: #1022
+
+Enforce parent-child join summaries without context pollution.
+
+Acceptance:
+
+- Parent prompt generation includes bounded result capsules only.
+- Raw child transcript is durable and retrievable out of band by explicit handle.
+- One-child-finished summaries are generated from capsules and artifact refs.
+- Final joined answers run after all child terminal states and cite capsule or
+  artifact refs.
+
+### M17-E: Final Live Orchestration Soaks
+
+Issue: #1023
+
+Re-run budget, spawn, and DeepSeek live code-review swarm soaks.
+
+Acceptance:
+
+- Live stdio tmux soak passes with the real Octos backend, not a fixture backend.
+- At least three child specialists spawn and complete.
+- Child context ledgers exist for every managed child.
+- Final joined answer is visible in the TUI capture.
+- Budget stop/grace behavior is visible and bounded in logs.
+
+### M17-F: Soak Fixture Secret Hygiene
+
+Issue: #1024
+
+Harden tmux soak fixture cleanup and evidence scanning.
+
+Acceptance:
+
+- Cleanup trap is registered before any provider config or API key is written.
+- Full evidence/runtime tree secret scan is required for pass.
+- Validator reports scanned paths and redaction counts without printing secrets.
+- Regression test simulates startup failure after provider config write and
+  verifies cleanup/scan behavior.
+
+## Existing Carryover Issues In Milestone
+
+- #976: MasterContinuationScheduler and model-generated scatter-join summaries.
+- #977: Production LoopRuntime scheduler and execution policy.
+- #978: Durable supervisor runtime for supervised agents and continuations.
+- #979: Production GoalRuntime scheduler and execution policy.
+- #980: Backend ContextManager shadow transcript primitive.
+- #981: Prompt normalization invariant engine for ContextManager.
+- #982: Canonical tool-output envelopes and truncation evidence.
+- #983: Durable context ledger, checkpoints, and compaction lifecycle.
+- #984: Sanitized supervised subagent fork histories.
+- #985: AppUI context lifecycle protocol and replay state.
+- #986: ContextManager integration with DB/session history.
+- #987: Subagent context capsules and out-of-band artifact retrieval.
+- #988: Compact-context lifecycle through AppUI.
+- #989: Production prompt compaction through ContextManager.
+- #990: AppUI autonomy protocol typed notifications and capability gates.
+- #991: Production AgentOrchestrator runtime for native, CLI, and MCP agents.
+- #992: Production multi-agent orchestration wiring tracker.
+
+## Required Evidence
+
+- appui-transcript.jsonl
+- server.log
+- runtime-policy-stamp.json
+- agent-orchestrator-ledger.jsonl
+- context-ledger.jsonl
+- child-context-ledger.jsonl
+- agent-ledger.jsonl
+- task-ledger.jsonl
+- artifact-index.json
+- native-agent-transcript.jsonl
+- cli-agent-transcript.jsonl or external_context_unmanaged evidence
+- mcp-agent-transcript.jsonl or external_context_unmanaged evidence
+- tui-capture.txt
+- secret-scan-report.json
+- ux-validation.json
+
+## Definition Of Done
+
+M17 is complete only when the milestone issues are closed with passing unit,
+integration, and live tmux/stdio evidence. Fixture-only evidence is not enough
+for production orchestration closure.

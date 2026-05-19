@@ -6,11 +6,16 @@ use tracing::{info, warn};
 use super::Agent;
 use crate::compaction::CompactionPhase;
 use crate::compaction_tiered::Tier1Report;
+use crate::prompt_context::{PromptContextPhase, PromptContextRequest};
 
 impl Agent {
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
         use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
         use octos_llm::context::{estimate_message_tokens, estimate_tokens};
+
+        if self.prompt_context_manager.is_some() {
+            return false;
+        }
 
         if messages.len() <= 1 + MIN_RECENT_MESSAGES {
             return false;
@@ -83,9 +88,15 @@ impl Agent {
     /// Run preflight compaction before the first LLM call if the wired
     /// policy declares a threshold and the conversation already exceeds it.
     ///
-    /// No-op when no [`crate::compaction::CompactionRunner`] is attached,
-    /// which preserves legacy extractive behaviour for every existing caller.
+    /// No-op when a caller-owned prompt context manager is attached. In that
+    /// mode ContextManager owns the production prompt compaction path and the
+    /// legacy declarative runner must not mutate the same prompt vector first.
+    /// Also no-op when no [`crate::compaction::CompactionRunner`] is attached,
+    /// preserving legacy extractive behaviour for every existing caller.
     pub(super) fn maybe_run_preflight_compaction(&self, messages: &mut Vec<Message>) {
+        if self.prompt_context_manager.is_some() {
+            return;
+        }
         let Some(runner) = self.compaction_runner.as_ref() else {
             return;
         };
@@ -120,6 +131,9 @@ impl Agent {
         messages: &mut [Message],
         protected_tool_call_ids: &[String],
     ) -> Tier1Report {
+        if self.prompt_context_manager.is_some() {
+            return Tier1Report::default();
+        }
         let Some(runner) = self.tiered_compaction.as_ref() else {
             return Tier1Report::default();
         };
@@ -147,6 +161,9 @@ impl Agent {
     /// `ChatConfig.context_management`; returning `None` means the request
     /// should be sent untouched.
     pub(super) fn build_tier2_context_management(&self) -> Option<serde_json::Value> {
+        if self.prompt_context_manager.is_some() {
+            return None;
+        }
         let runner = self.tiered_compaction.as_ref()?;
         runner.build_tier2_payload_for(self.llm.provider_name())
     }
@@ -156,6 +173,9 @@ impl Agent {
     /// no-op otherwise so every caller that does not wire the contract keeps
     /// the existing behaviour byte-for-byte.
     pub(super) fn maybe_run_turn_compaction(&self, messages: &mut Vec<Message>, iteration: u32) {
+        if self.prompt_context_manager.is_some() {
+            return;
+        }
         let Some(runner) = self.compaction_runner.as_ref() else {
             return;
         };
@@ -177,6 +197,55 @@ impl Agent {
                 "harness M6.3 compaction per-turn pass"
             );
             self.enforce_preservation(messages, CompactionPhase::TurnEnd);
+        }
+    }
+
+    /// Ask the caller-owned context bridge to prepare the final model prompt.
+    ///
+    /// AppUI/session runtimes that own a durable context ledger replace the
+    /// prompt with their canonical `ContextManager::for_prompt` generation.
+    /// When this bridge is present, the legacy/tiered compaction paths above
+    /// are disabled so only one component owns prompt compaction.
+    pub(super) fn prepare_prompt_with_context_manager(
+        &self,
+        messages: &mut Vec<Message>,
+        phase: PromptContextPhase,
+        iteration: u32,
+    ) {
+        let Some(manager) = self.prompt_context_manager.as_ref() else {
+            return;
+        };
+        let request = PromptContextRequest {
+            phase,
+            iteration,
+            provider_name: self.llm.provider_name().to_owned(),
+            model_id: self.llm.model_id().to_owned(),
+            context_window: self.llm.context_window(),
+        };
+        match manager.prepare_prompt(request, messages) {
+            Ok(report) => {
+                if report.prompt_replaced || report.compaction_performed {
+                    info!(
+                        phase = phase.as_str(),
+                        iteration,
+                        prompt_replaced = report.prompt_replaced,
+                        compaction_performed = report.compaction_performed,
+                        messages_before = report.messages_before,
+                        messages_after = report.messages_after,
+                        token_estimate = ?report.token_estimate,
+                        generation = ?report.generation,
+                        "caller-owned prompt context manager prepared model prompt"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    phase = phase.as_str(),
+                    iteration,
+                    error = %error,
+                    "caller-owned prompt context manager failed; using existing prompt vector"
+                );
+            }
         }
     }
 

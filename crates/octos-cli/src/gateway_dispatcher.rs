@@ -1445,8 +1445,8 @@ mod tests {
         // starts with "Site project ... created" (capital S — see
         // `site_creation_reply`); failure path contains "Site scaffold
         // failed".
-        let took_site_branch = msg.content.contains("Site scaffold failed")
-            || msg.content.contains("Site project");
+        let took_site_branch =
+            msg.content.contains("Site scaffold failed") || msg.content.contains("Site project");
         assert!(
             took_site_branch,
             "/new sites <preset> must take the site-scaffold branch, got: {}",
@@ -1520,7 +1520,10 @@ mod tests {
             .await
             .get_active_topic(session_key.base_key())
             .to_string();
-        assert_eq!(active, "site", "active topic must be normalized to bare `site`");
+        assert_eq!(
+            active, "site",
+            "active topic must be normalized to bare `site`"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "issue": "octos#1030",
+  "last_reviewed": "2026-05-18",
+  "entries": [
+    {
+      "id": "m18-runtime-policy-stamp-path-redaction",
+      "status": "open",
+      "applies_to": {
+        "fields": [
+          "runtime_policy_stamp.workspace_root",
+          "workspace_root"
+        ]
+      },
+      "reason": "Same-scenario runs use different per-transport data and process roots. The normalized diff redacts absolute paths and compares semantic policy fields. Runtime method/result/error differences are intentionally not allowlisted.",
+      "expected_resolution": "Keep path redaction unless the runner switches to a shared canonical test root for both transports."
+    }
+  ]
+}

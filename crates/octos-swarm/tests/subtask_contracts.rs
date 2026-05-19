@@ -59,6 +59,7 @@ impl McpAgentBackend for OkBackend {
             output: format!("ok:{contract_id}"),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }

@@ -180,6 +180,34 @@ The focused fixture test is:
 npm --prefix e2e run test -- --workers=1 tests/m12-solo-soak-artifacts.spec.ts
 ```
 
+### M22 TUI Solo Onboarding Gate
+
+Use this gate for first-run TUI onboarding product-surface evidence. The full
+contract, issue roster, test matrix, and required artifacts live in
+`docs/M22_TUI_SOLO_ONBOARDING_CONTRACT_2026-05-18.md`.
+
+Required backend checks:
+
+```bash
+./scripts/m12-solo-appui-soak.sh self-test
+OCTOS_M12_SOAK_TRANSPORT=both OCTOS_M12_SOAK_STRICT=1 \
+  ./scripts/m12-solo-appui-soak.sh run
+```
+
+Required TUI checks in `../octos-tui`:
+
+```bash
+cargo test --all --workspace onboarding
+cargo test --all --workspace permissions
+scripts/run-onboarding-tmux-soak.sh solo-self-test
+OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh drive-solo
+OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh verify-solo
+```
+
+The M22 release gate must fail on OTP calls in local solo onboarding, secret
+leaks, missing runtime policy stamps, unsupported AppUI calls that should have
+been capability-gated, invalid workspace bypass, or blank/stuck tmux captures.
+
 ---
 
 ## CI Pipeline

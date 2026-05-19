@@ -105,6 +105,7 @@ impl McpAgentBackend for FakeBackend {
             output: format!("default:{contract_id}"),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }
@@ -145,6 +146,7 @@ fn success(text: &str) -> DispatchResponse {
         output: text.to_string(),
         files_to_send: Vec::new(),
         error: None,
+        context_contract: None,
     }
 }
 
@@ -154,6 +156,7 @@ fn success_with_files(text: &str, files: Vec<PathBuf>) -> DispatchResponse {
         output: text.to_string(),
         files_to_send: files,
         error: None,
+        context_contract: None,
     }
 }
 
@@ -163,6 +166,7 @@ fn timeout_failure(msg: &str) -> DispatchResponse {
         output: msg.to_string(),
         files_to_send: Vec::new(),
         error: Some(msg.to_string()),
+        context_contract: None,
     }
 }
 
@@ -172,6 +176,7 @@ fn transport_failure(msg: &str) -> DispatchResponse {
         output: msg.to_string(),
         files_to_send: Vec::new(),
         error: Some(msg.to_string()),
+        context_contract: None,
     }
 }
 

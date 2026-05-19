@@ -1,0 +1,102 @@
+M16 UX Tmux Soak Fixture
+
+Status: passing live soak
+Date: 2026-05-16
+
+Purpose
+
+e2e/scripts/m16-live-tui-tmux-soak.sh is the M16 visual soak for
+multi-agent orchestration through the real AppUI stdio path.
+
+It launches:
+
+- octos serve --stdio from this repo.
+- octos-tui --mode protocol --stdio-command ... through the octos-tui tmux
+  harness.
+- A typed AppUI review/start request that asks for supervised specialist
+  agents. Native specialists are resolved from
+  OCTOS_REVIEW_NATIVE_SPECIALISTS_JSON, then profile
+  review.native_specialists, then the built-in default template. Optional
+  reviewer-cli and reviewer-mcp specialists are added when their backends are
+  configured.
+
+The backend uses the production review/start path inside octos serve --stdio.
+Native model-backed specialists, a CLI-process specialist, and an MCP stdio
+specialist are normalized into the same AppUI agent lifecycle. The Python
+AppUI fixture backend is not used.
+
+Command
+
+From the octos repo:
+
+  bash e2e/scripts/m16-live-tui-tmux-soak.sh run
+
+Useful overrides:
+
+  OCTOS_TUI_REPO=/Users/yuechen/home/octos-tui \
+  OCTOS_M16_UX_RUN_ID=m16-local \
+  bash e2e/scripts/m16-live-tui-tmux-soak.sh run
+
+Set OCTOS_M16_BUILD=0 to skip building octos with the api feature.
+Set OCTOS_M16_BUILD_TUI=1 to force rebuilding octos-tui; by default the script
+uses an existing octos-tui binary and only builds it when missing.
+Set OCTOS_M16_UX_KEEP_SESSION=1 to leave tmux open after the run.
+
+Evidence
+
+The default output root is:
+
+  e2e/test-results-m16-tmux-ux/<run-id>/
+
+Required evidence includes:
+
+- launch-command.txt: proves octos-tui launched with octos serve --stdio.
+- input-replay.log: records the exact terminal replay and prompt.
+- tui-capture-child-start.txt
+- tui-capture-child-progress.txt
+- tui-capture-one-child-finished.txt
+- tui-capture-code-review-summary.txt
+- tui-capture-live-final.txt
+- appui-transcript.jsonl
+- server.log
+- runtime-policy-stamp.json
+- agent-ledger.jsonl
+- task-ledger.jsonl
+- artifact-index.json
+- m16-ux-soak-validation.json
+
+The M16 validator asserts:
+
+- The TUI used a real octos serve --stdio backend, not the Python fixture
+  backend.
+- The replay submitted a real review/start request and names the configured
+  specialist agents.
+- AppUI transcript and ledgers show child start, child progress, output,
+  artifacts, and completion.
+- AppUI transcript and ledgers show both native `review/start` specialists and
+  ordinary mirrored `TaskSupervisor` work on the unified `agent/updated`
+  surface.
+- Terminal captures show child start/progress and the final joined
+  scatter-join answer.
+- The one-child-finished summaries are present in the AppUI message stream.
+- The final joined answer includes the requested final marker.
+- The evidence and runtime directories do not leak provider API keys.
+
+Latest passing evidence
+
+  /Users/yuechen/home/octos/e2e/test-results-m16-tmux-ux/m16-context-promote-20260516T203002Z
+
+Validator status:
+
+  passed
+
+Passed checks:
+
+- required_artifacts
+- real_octos_serve_stdio_backend
+- explicit_code_review_prompt
+- appui_orchestration_events
+- visible_child_start
+- visible_one_child_finished_summary
+- visible_final_joined_answer
+- review_artifacts_collected

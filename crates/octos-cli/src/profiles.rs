@@ -54,6 +54,12 @@ pub struct ProfileConfig {
     /// First-class structured LLM selection contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmProfileConfig>,
+    /// Coding review specialist template. When omitted, `/review`
+    /// uses the server's built-in default specialists. Operators may
+    /// configure this per profile to change the native reviewer fanout
+    /// without changing code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewConfig>,
     /// Search provider contract for product-level search behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchConfig>,
@@ -123,6 +129,30 @@ pub struct ProfileConfig {
     /// unsigned plugins still load with a warning.
     #[serde(default)]
     pub plugins: crate::config::PluginsConfig,
+}
+
+/// Profile-owned review workflow configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Native model-backed specialists to launch for AppUI `review/start`.
+    ///
+    /// Empty means "use the built-in default template".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_specialists: Vec<ReviewSpecialistConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSpecialistConfig {
+    /// Stable suffix used to build the child agent id.
+    pub agent_key: String,
+    /// Human-facing agent name rendered in AppUI traces.
+    pub nickname: String,
+    /// Machine-readable review role.
+    pub role: String,
+    /// Focus text injected into the specialist prompt.
+    pub focus: String,
 }
 
 /// Search configuration persisted in the profile contract.
@@ -384,6 +414,8 @@ pub struct ProfileConfigPatch {
     #[serde(default)]
     pub llm: PatchField<LlmProfileConfig>,
     #[serde(default)]
+    pub review: PatchField<ReviewConfig>,
+    #[serde(default)]
     pub search: PatchField<SearchConfig>,
     #[serde(default)]
     pub deep_crawl: PatchField<DeepCrawlConfig>,
@@ -593,6 +625,11 @@ impl ProfileConfig {
             PatchField::Absent => {}
             PatchField::Clear => self.llm = None,
             PatchField::Value(llm) => self.llm = Some(llm),
+        }
+        match patch.review {
+            PatchField::Absent => {}
+            PatchField::Clear => self.review = None,
+            PatchField::Value(review) => self.review = Some(review),
         }
         match patch.search {
             PatchField::Absent => {}
@@ -1281,6 +1318,9 @@ pub fn resolve_effective_profile(
 
     // Inherit the LLM contract from parent.
     ec.llm = pc.llm.clone();
+    if ec.review.is_none() {
+        ec.review = pc.review.clone();
+    }
     if ec.search.is_none() {
         ec.search = pc.search.clone();
     }
@@ -1690,8 +1730,8 @@ pub enum ProfileChange {
 
 /// Compare two profiles and classify the nature of changes.
 ///
-/// Restart-required: llm, search, deep_crawl, apps, channels, env_vars,
-///   email, hooks, credential_pool.
+/// Restart-required: llm, review, search, deep_crawl, apps, channels,
+///   env_vars, email, hooks, credential_pool.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -1706,6 +1746,9 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
 
     if oc.llm != nc.llm {
         restart_fields.push("llm".into());
+    }
+    if oc.review != nc.review {
+        restart_fields.push("review".into());
     }
     if oc.search != nc.search {
         restart_fields.push("search".into());
@@ -2204,6 +2247,27 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_config_patch_replaces_review_contract() {
+        let mut config = ProfileConfig::default();
+
+        config.apply_patch(ProfileConfigPatch {
+            review: PatchField::Value(ReviewConfig {
+                native_specialists: vec![ReviewSpecialistConfig {
+                    agent_key: "reviewer-ux".into(),
+                    nickname: "Noether".into(),
+                    role: "ux_review".into(),
+                    focus: "TUI UX and tmux evidence".into(),
+                }],
+            }),
+            ..Default::default()
+        });
+
+        let review = config.review.as_ref().expect("review config set");
+        assert_eq!(review.native_specialists.len(), 1);
+        assert_eq!(review.native_specialists[0].agent_key, "reviewer-ux");
+    }
+
+    #[test]
     fn test_profile_config_patch_clears_structured_llm_contract() {
         let mut config = ProfileConfig {
             llm: Some(llm_profile(
@@ -2521,6 +2585,14 @@ mod tests {
                         default_theme: Some("crew".into()),
                     }),
                 }),
+                review: Some(ReviewConfig {
+                    native_specialists: vec![ReviewSpecialistConfig {
+                        agent_key: "reviewer-api".into(),
+                        nickname: "Ada Lovelace".into(),
+                        role: "api_contract_review".into(),
+                        focus: "API".into(),
+                    }],
+                }),
                 ..Default::default()
             },
             created_at: Utc::now(),
@@ -2547,9 +2619,18 @@ mod tests {
                 default_theme: Some("ocean".into()),
             }),
         });
+        changed.config.review = Some(ReviewConfig {
+            native_specialists: vec![ReviewSpecialistConfig {
+                agent_key: "reviewer-ux".into(),
+                nickname: "Noether".into(),
+                role: "ux_review".into(),
+                focus: "TUI UX".into(),
+            }],
+        });
 
         match diff_profiles(&base, &changed) {
             ProfileChange::RestartRequired(fields) => {
+                assert!(fields.contains(&"review".into()));
                 assert!(fields.contains(&"search".into()));
                 assert!(fields.contains(&"deep_crawl".into()));
                 assert!(fields.contains(&"apps".into()));

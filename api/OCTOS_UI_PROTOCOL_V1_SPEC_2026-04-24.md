@@ -74,10 +74,24 @@ Stdio transport rules:
   WebSocket Origin checks, or bearer-token headers.
 - Stdio clients must send one complete UTF-8 JSON object per line. Servers and
   clients may reject frames larger than `MAX_TEXT_FRAME_BYTES` with
-  `frame_too_large`.
+  `frame_too_large`. Servers must enforce the bound while reading the line,
+  not after buffering an unbounded frame.
+- A failed stdout write or closed pipe terminates the stdio AppUI connection
+  and stops dispatching new requests for that connection.
+- Stdio does not define an application heartbeat. Pipe EOF on stdin and write
+  failure on stdout are the stdio liveness signals; after either signal the
+  server must clean up connection-owned live forwarders and active turns.
+- Stdio shares the WebSocket AppUI method surface. A method advertised in
+  `supported_methods` must route to the same server handler and return the
+  same result/error shape over both transports. Transport-only unsupported
+  errors are allowed only for methods omitted from `supported_methods` or
+  listed in the checked-in conformance allowlist.
+- Stdio clients may send `client_hello` as their first request to negotiate
+  the same feature-token set that WebSocket clients normally send through
+  `X-Octos-Ui-Features` or the `ui_feature` query parameter.
 - Because stdio has no `X-Profile-Id` header, profile-scoped methods resolve
   identity in this order: explicit `params.profile_id`, profile encoded in
-  `params.session_id`, profile bound by the first successful `session/open`,
+  `params.session_id`, profile bound by the most recent successful `session/open`,
   then the server default profile. Clients should pass `profile_id` explicitly
   before `session/open`.
 
@@ -252,6 +266,27 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-018](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_018_LOCAL_SOLO_ONBOARDING_AND_POLICY.md).
   They let local clients create a no-OTP solo owner profile and render the
   server's effective sandbox/approval/filesystem/network policy.
+- The additive backend-owned review workflow method (`review/start`) is
+  governed by
+  [UPCR-2026-019](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_019_AGENT_SUPERVISION.md),
+  gated behind `review.start.v1`. It starts a product-level review workflow
+  that the backend implements with native/CLI/MCP specialist agents. It is
+  not a generic UI-side subagent scheduler.
+- The additive coding tool contract inspection fields on `tool/status/list`
+  and `session/status/read` are governed by proposed
+  [UPCR-2026-020](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_020_CODEX_TOOL_PARITY.md).
+  They let clients verify that the backend exposes Codex-compatible
+  model-visible coding tools without letting clients invoke those tools
+  directly.
+- The additive backend context lifecycle surface (`context.lifecycle.v1`,
+  `context` and `context_state` on `session/open`, `session/hydrate`,
+  legacy REST-bridge `session/status.get`, AppUI `session/status/read`,
+  `turn/state/get`, and context lifecycle notifications) is governed by the
+  M16 context-manager workstream
+  [OCTOS_CONTEXT_MANAGER_GAP_CONTRACT](../docs/OCTOS_CONTEXT_MANAGER_GAP_CONTRACT.md).
+  It lets AppUI clients inspect the server-owned prompt context generation,
+  transcript hash, checkpoint, compaction, and recovery state without
+  reconstructing it from chat rows.
 
 ## 5. Identity Model
 
@@ -310,10 +345,12 @@ The logical command/event names are:
 Commands:
 
 - `config/capabilities/list` (accepted `UPCR-2026-017`)
+- `client_hello` (accepted `UPCR-2026-016`)
 - `profile/local/create` (accepted `UPCR-2026-018`)
 - `session/open`
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `turn/start`
+- `review/start` (capability-gated, accepted `UPCR-2026-019`)
 - `turn/interrupt`
 - `approval/respond`
 - `permission/profile/list`, `permission/profile/set`
@@ -402,6 +439,75 @@ Required result fields from accepted `UPCR-2026-007`:
   `supported_features`, so the advertised method set always agrees with the
   callable surface.
 
+Optional result fields from the M16 `context.lifecycle.v1` contract:
+
+- `context`
+  Server-owned lifecycle envelope for the opened session. Present when
+  `context.lifecycle.v1` is available for the connection. It contains
+  `schema = "octos.context.lifecycle.v1"`, the same `context_state` under
+  `state`, and compaction metadata including count and the latest compaction
+  record.
+- `context_state`
+  Server-owned model-visible context state for the opened session. Present
+  when `context.lifecycle.v1` is available for the connection. It uses the
+  `UiContextState` shape documented under `session/status/read` and is sourced
+  from the same canonical profile/session store used by `turn/start` and
+  `session/hydrate`.
+
+### `session/hydrate`
+
+Purpose:
+
+- return the authoritative chat-state projection for a session
+- hydrate messages, threads, turns, pending approvals, and replay envelopes
+  according to the request's `include` filter
+
+Gate:
+
+- `state.session_hydrate.v1`
+
+Minimum params:
+
+- `session_id`
+- optional `include`
+- optional `after`
+
+Optional result fields from the M16 `context.lifecycle.v1` contract:
+
+- `context`
+  Full lifecycle envelope for the hydrated session, using the same shape as
+  `session/open`.
+- `context_state`
+  Typed model-visible context state for the hydrated session. This state must
+  be read from the same canonical profile/session store used by `turn/start`,
+  not reconstructed by the client from hydrated chat rows.
+
+### `turn/state/get`
+
+Purpose:
+
+- return deterministic lifecycle state for one turn using the active-turn
+  registry plus the durable ledger projection
+- return `state = "unknown"` rather than an error for a missing turn
+
+Gate:
+
+- `state.turn_state_get.v1`
+
+Minimum params:
+
+- `session_id`
+- `turn_id`
+
+Optional result fields from the M16 `context.lifecycle.v1` contract:
+
+- `context`
+  Full lifecycle envelope for the requested session at the time of the state
+  read. During an active turn this must prefer any live prompt-time compacted
+  context generation over a rebuild from durable user-facing rows.
+- `context_state`
+  Typed model-visible context state corresponding to `context.state`.
+
 ### `turn/start`
 
 Purpose:
@@ -419,6 +525,68 @@ Behavior:
 - server emits `turn/started`
 - server may emit zero or more `message/delta`, `tool/*`, `task/updated`, `warning`
 - server finishes with `turn/completed` or `turn/error`
+
+### `review/start`
+
+Purpose:
+
+- start the server-owned product code-review workflow for a session
+- let the backend choose and supervise native/CLI/MCP specialist agents
+- expose progress through the existing `turn/*`, `task/*`, and `agent/*`
+  notification surfaces
+
+Gate:
+
+- `review.start.v1`
+
+Minimum params:
+
+- `session_id`
+- optional `turn_id`; if omitted, the server assigns one
+- optional `profile_id`, scoped by the same profile/session rules as
+  `turn/start`
+- optional `target`; accepted shapes include
+  `{ "type": "uncommitted_changes" }`, `{ "type": "base_branch",
+  "base_branch": "main" }`, `{ "type": "commit", "commit": "..." }`, and
+  `{ "type": "custom", "path": "..." }`
+- optional `prompt` or `instructions`
+- optional `delivery`; current implementation supports inline chat delivery
+
+Result:
+
+```json
+{
+  "accepted": true,
+  "session_id": "local:demo",
+  "turn_id": "019e...",
+  "workflow": "code_review",
+  "backend": "native",
+  "agent_count": 4
+}
+```
+
+Behavior:
+
+- server emits `turn/started`
+- server emits `task/updated` and `task/output/delta` for the review swarm
+- server resolves native specialists from server configuration, not from a
+  hard-coded AppUI client contract. Resolution order is:
+  `OCTOS_REVIEW_NATIVE_SPECIALISTS_JSON`, profile
+  `review.native_specialists`, built-in default template. Optional CLI/MCP
+  specialists are added when their backend configuration is available, so
+  `agent_count` is dynamic.
+- server emits `agent/updated`, `agent/output/delta`, and
+  `agent/artifact/updated` for specialist lifecycle, output, and artifacts
+- server mirrors supervised background tasks launched by the legacy
+  `TaskSupervisor` path, including `spawn_only`, `run_pipeline`, and child
+  session tasks, into the same `agent/updated` surface. Clients should treat
+  `agent/list`, `agent/status/read`, `agent/output/read`, and
+  `agent/artifact/*` as the unified supervision surface instead of special
+  casing review specialists.
+- server may emit intermediate `message/delta` when one specialist finishes
+- server emits a final joined assistant answer, then `turn/completed`
+- `turn/interrupt` against the returned `turn_id` cancels the workflow and
+  terminally reports `turn/error` with `code = "interrupted"`
 
 ### `turn/interrupt`
 
@@ -659,6 +827,52 @@ onboarding command surface below. These commands are additive and appear in
 `UiProtocolCapabilities.supported_methods` only when implemented by the server.
 Clients must use that method list to enable or disable slash commands.
 
+`client_hello`:
+
+- optional first request on any transport
+- required for stdio clients that need feature-token negotiation equivalent to
+  WebSocket `X-Octos-Ui-Features` / `ui_feature`
+- params:
+
+  ```json
+  {
+    "transport": "stdio",
+    "client": { "name": "octos-tui" },
+    "supported_features": [
+      "approval.typed.v1",
+      "session.workspace_cwd.v1",
+      "context.lifecycle.v1"
+    ]
+  }
+  ```
+
+- result:
+
+  ```json
+  {
+    "type": "server_hello",
+    "transport": "stdio",
+    "client_transport": "stdio",
+    "client": { "name": "octos-tui" },
+    "capabilities": {
+      "version": {
+        "protocol": "octos-ui/v1alpha1",
+        "schema_version": 1,
+        "jsonrpc": "2.0"
+      },
+      "capabilities_schema_version": 2,
+      "supported_features": ["approval.typed.v1"],
+      "supported_methods": ["session/open"],
+      "supported_notifications": ["turn/started"]
+    }
+  }
+  ```
+
+- if `supported_features` is omitted or empty, the server preserves the
+  connection's existing feature negotiation state
+- if `supported_features` is present, the server rebuilds negotiated
+  capabilities from those tokens and the current transport
+
 `config/capabilities/list`:
 
 - returns the same `UiProtocolCapabilities` schema advertised by
@@ -669,6 +883,10 @@ Clients must use that method list to enable or disable slash commands.
 - servers that support server-owned permission inspection advertise
   `permission.profile.v1`; servers that expose the extended runtime policy
   stamp advertise `runtime.policy_stamp.v1`
+- unauthenticated stdio servers must omit `auth/me`, `content/list`, and
+  `content/delete` from `supported_methods` and list them under
+  `unsupported` with a reason; direct calls to those methods still return the
+  typed `auth_unavailable` error with code `-32120`
 
 `profile/local/create`:
 
@@ -714,6 +932,32 @@ Clients must use that method list to enable or disable slash commands.
 
 - returns runtime status for the selected profile/session plus a runtime policy
   stamp containing provider/model/profile/tool/sandbox-visible state
+- when `context.lifecycle.v1` is advertised, also returns compact context
+  inspection fields:
+  - `context_state`: active model-visible context generation, transcript hash,
+    checkpoint/compaction IDs, token estimate, item count, and recovery state
+  - `context`: the compact lifecycle status envelope containing the active
+    `context_state` plus compaction count and the most recent compaction
+    record
+- `context.lifecycle.v1` is advertised by `config/capabilities/list` when the
+  backend can expose backend-owned context state for AppUI turns. Clients should
+  render this state from `session/status/read` and must not infer it from chat
+  rows or local transcript heuristics.
+- `session/open`, `session/hydrate`, legacy REST-bridge
+  `session/status.get`, and `turn/state/get` also include `context` and
+  `context_state` when `context.lifecycle.v1` is available.
+  `session/status.get` returns the same `context_state` both at top level and
+  under `status.context_state` so legacy status-object renderers can still read
+  the value from the status body. AppUI JSON-RPC clients should use
+  `session/status/read`; `session/status.get` is not an alias for that method.
+- A connection with no feature header follows the first-server-slice discovery
+  behavior from `UPCR-2026-007`: context snapshots and lifecycle notifications
+  are available. Once a client sends any feature header, `context.lifecycle.v1`
+  is opt-in and the server must not send context snapshots or lifecycle events
+  unless that feature was negotiated.
+- Context inspection must use the canonical profile/session store. A profiled
+  coding session must not read the top-level daemon session store if its
+  turns persist into a `ProfileRuntime` session manager.
 - `runtime_policy_stamp` contains the server-effective values:
 
   ```json
@@ -729,6 +973,47 @@ Clients must use that method list to enable or disable slash commands.
     "tool_policy_id": "profile",
     "mcp_servers": [],
     "memory_scope": "profile-session"
+  }
+  ```
+
+  Example `context` payload:
+
+  ```json
+  {
+    "schema": "octos.context.lifecycle.v1",
+    "state": {
+      "session_id": "ada:local:tui#coding",
+      "thread_id": null,
+      "generation": 8,
+      "transcript_hash": "sha256:...",
+      "last_checkpoint_id": "ctxchk_000008",
+      "last_compaction_id": "ctxcmp_000001",
+      "token_estimate": 4231,
+      "item_count": 17,
+      "recovery_state": "exact"
+    },
+    "compaction": {
+      "count": 1,
+      "last": {
+        "compaction_id": "ctxcmp_000001",
+        "checkpoint_id": "ctxchk_000008",
+        "status": "installed",
+        "policy_id": "compact-context-v1",
+        "trigger": "pre_turn",
+        "input_generation": 7,
+        "output_generation": 9,
+        "input_transcript_hash": "sha256:...",
+        "replacement_transcript_hash": "sha256:...",
+        "installed_transcript_hash": "sha256:...",
+        "input_item_count": 42,
+        "retained_count": 16,
+        "dropped_count": 26,
+        "summary_item_id": "ctxitem_000043",
+        "token_estimate_before": 8012,
+        "token_estimate_after": 4231,
+        "error": null
+      }
+    }
   }
   ```
 
@@ -757,6 +1042,9 @@ Clients must use that method list to enable or disable slash commands.
 
 - expose the email OTP login flow used by the dashboard
 - use structured errors for invalid OTP, expired OTP, and unauthenticated state
+- unauthenticated stdio does not advertise the auth-bound `auth/me` method;
+  callers that invoke it anyway receive `-32120` with
+  `data.kind = "auth_unavailable"`
 
 `profile/llm/catalog`:
 
@@ -795,6 +1083,86 @@ Clients must use that method list to enable or disable slash commands.
   config, provider config, MCP config, tool registry, memory, or sandbox state
   directly
 
+### Coding Tool Contract Inspection
+
+Proposed `UPCR-2026-020` extends the existing runtime inspection methods for
+Codex-compatible coding sessions. The tools described here are model-visible
+backend tools, not AppUI client commands. TUI and web clients render the
+contract and warnings; they do not invoke these tools directly.
+
+Capability feature:
+
+- `coding.tool_contract.v1`
+
+Optional capability feature flags:
+
+- `coding.patch_tool.v1`
+- `coding.exec_session.v1`
+- `coding.plan_tool.v1`
+- `coding.user_input_tool.v1`
+- `coding.subagent_aliases.v1`
+- `coding.image_view.v1`
+- `coding.dynamic_tool_search.v1`
+- `coding.image_generation.v1`
+
+`session/status/read`:
+
+- when `coding.tool_contract.v1` is negotiated,
+  `runtime_policy_stamp` includes the effective server-owned coding tool
+  contract fields:
+
+  ```json
+  {
+    "tool_contract_id": "codex-compatible-coding-v1",
+    "tool_contract_version": "1",
+    "model_toolset": "coding",
+    "dynamic_tool_discovery": "enabled"
+  }
+  ```
+
+`tool/status/list`:
+
+- when `coding.tool_contract.v1` is negotiated, the result includes
+  `coding_tool_contract`
+- `coding_tool_contract.required_tools[]` entries describe the effective
+  model-visible tool name, category, status, backend implementation or alias,
+  capability flag, and policy state
+- `coding_tool_contract.missing_required_tools[]` lists any required
+  Codex-parity tools that the backend cannot expose for the effective profile
+
+Initial Codex-parity tool names:
+
+- P0: `apply_patch`, `exec_command`, `write_stdin`, `update_plan`,
+  `request_user_input`, `spawn_agent`, `send_input`, `resume_agent`,
+  `wait_agent`, and `close_agent`
+- P1: `view_image`, `tool_search`, and `tool_suggest`
+- P2: generic `image_generation`
+
+Tool status values:
+
+- `available`
+- `aliased`
+- `disabled_by_policy`
+- `missing`
+- `unimplemented`
+
+Required security rules:
+
+- tool contract resolution happens only inside the server-owned session runtime
+  factory
+- aliases are policy-equivalent to their backend tools
+- disabled tools are not advertised to the model
+- client UIs must not infer coding tool availability from local files
+- WebSocket and stdio return the same tool contract payload
+
+Errors use the existing AppUI taxonomy with these structured `data.kind`
+values when applicable:
+
+- `tool_contract_unavailable`
+- `coding_tool_denied`
+- `coding_tool_missing`
+- `exec_session_unknown`
+
 ## 8. Event Semantics
 
 ### `turn/started`
@@ -807,6 +1175,10 @@ Carries the opened-session notification and optional cursor baseline. The
 notification payload shares the `SessionOpened` shape used by
 `SessionOpenResult.opened`, including the required `capabilities` field
 from accepted `UPCR-2026-007` (see § 7).
+
+When `context.lifecycle.v1` is available for the connection, the notification
+payload may also include `context` and `context_state` with the same semantics
+as the `session/open` result.
 
 Optional pane fields from accepted `UPCR-2026-002`:
 
@@ -995,6 +1367,7 @@ Minimum categories:
 - `unknown_preview`
 - `unknown_task`
 - `cursor_out_of_range`
+- `profile_unresolved`
 - `runtime_unavailable`
 - `permission_denied`
 - `internal_error`
@@ -1004,6 +1377,10 @@ Rules:
 - transport errors and runtime errors should not be conflated
 - errors should include machine-readable `code` and human-readable `message`
 - idempotent commands should say so explicitly in their success/error behavior
+- a request that names a profile which is not present in server profile storage
+  must fail with JSON-RPC `INVALID_PARAMS` and
+  `data.kind = "profile_unresolved"`; it must not fabricate a runtime policy
+  stamp for that profile or silently fall back to a default profile
 
 ## 11. Relationship to REST
 
@@ -1503,3 +1880,55 @@ tag when no router is attached).
   no `AdaptiveRouter` is built — `router/*` methods return
   `runtime_unavailable`. This was a config-correctness fix in Wave4-A
   (the previous behavior was silent default-ON).
+
+## 16. M15 Agent, Goal, And Loop Autonomy Notifications
+
+These notifications are capability-related to `coding.autonomy.v1` and
+the optional `coding.agent_control.v1`, `coding.goal_runtime.v1`, and
+`coding.loop_runtime.v1` groups. They are typed in
+`crates/octos-core/src/ui_protocol.rs` and preserve compatibility with
+the raw M15 AppUI fixture payloads.
+
+Agent notifications:
+
+- `agent/updated`: params are `{ "session_id": SessionKey, "agent": Agent }`.
+  The backend sends this for native review specialists, CLI/MCP specialists,
+  and mirrored `TaskSupervisor` background work. Mirrored task agents use a
+  stable `agent_id` derived from the child session when available and expose
+  `backend_kind` as either `spawn_child_session` or `task_supervisor:<tool>`.
+- `agent/output/delta`: params are `{ "session_id": SessionKey,
+  "agent_id": string, "cursor": { "offset": number }, "text": string }`.
+- `agent/artifact/updated`: params are `{ "session_id": SessionKey,
+  "agent_id": string, "artifacts": AgentArtifact[] }`.
+
+Whenever an `agent/updated` transition enters a terminal state
+(`completed`, `failed`, or `interrupted`), the backend queues a master
+continuation through the same scatter-join scheduler. Repeating the same
+terminal state must not queue duplicate continuations.
+
+Goal notifications:
+
+- `session/goal/updated`: params are `{ "session_id": SessionKey,
+  "profile_id"?: string, "goal": Goal, "transition_actor": string }`.
+- `session/goal/cleared`: params are `{ "session_id": SessionKey,
+  "profile_id"?: string, "cleared": boolean, "goal": null,
+  "transition_actor": string }`.
+
+Loop notifications:
+
+- `loop/updated`: params are `{ "session_id": SessionKey,
+  "profile_id"?: string, "loop_id"?: string, "loop": Loop,
+  "ok"?: boolean, "status"?: string, "deleted"?: boolean }`.
+- `loop/fired`: params are `{ "session_id": SessionKey,
+  "profile_id"?: string, "loop_id": string, "loop"?: Loop,
+  "fire"?: LoopFire, "ok"?: boolean, "status"?: string }`.
+- `loop/completed`: params are `{ "session_id": SessionKey,
+  "profile_id"?: string, "loop_id": string, "loop"?: Loop,
+  "status"?: string, "completed_at_ms"?: number, "result"?: object,
+  "error"?: string }`.
+
+`Agent`, `Goal`, and `Loop` shapes match UPCR-2026-021. String status
+fields are open registries; clients must preserve unknown values. The
+`LoopFire` object mirrors the `loop/fire_now` result object (`queued`,
+optional `duplicate`, `continuation_id`, `dedupe_key`, `reason`,
+`priority`, and `message`).

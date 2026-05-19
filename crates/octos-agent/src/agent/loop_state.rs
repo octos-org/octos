@@ -273,20 +273,22 @@ impl LoopRetryState {
     }
 
     /// Resolve the decision at hard-budget exhaustion. Returns
-    /// [`LoopDecision::Grace`] iff there has been at least one productive
-    /// tool call since the last grace call; otherwise returns
-    /// [`LoopDecision::Escalate`].
+    /// [`LoopDecision::Grace`] at most once for this retry state, and only
+    /// when there has been at least one productive tool call before the first
+    /// budget hit; otherwise returns [`LoopDecision::Escalate`].
     ///
-    /// A `Grace` decision *consumes* the productive history: subsequent
-    /// grace calls require fresh productive tool calls.
+    /// The single grace call is deliberately global to the loop, not one per
+    /// productive tool call. Otherwise an agent that keeps making productive
+    /// reads after `max_iterations` can run indefinitely.
     pub fn observe_budget_exhaustion(&mut self) -> LoopDecision {
-        let decision = if self.productive_tool_calls_since_last_grace >= 1 {
-            self.productive_tool_calls_since_last_grace = 0;
-            self.grace_calls_fired = self.grace_calls_fired.saturating_add(1);
-            LoopDecision::Grace
-        } else {
-            LoopDecision::Escalate
-        };
+        let decision =
+            if self.grace_calls_fired == 0 && self.productive_tool_calls_since_last_grace >= 1 {
+                self.productive_tool_calls_since_last_grace = 0;
+                self.grace_calls_fired = self.grace_calls_fired.saturating_add(1);
+                LoopDecision::Grace
+            } else {
+                LoopDecision::Escalate
+            };
         Self::record_metric("budget_exhaustion", decision);
         decision
     }
@@ -520,6 +522,16 @@ mod tests {
         // Productive history consumed; second call without fresh productive
         // tool calls must escalate.
         assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Escalate);
+    }
+
+    #[test]
+    fn grace_call_is_single_use_even_after_fresh_productive_tool_call() {
+        let mut state = LoopRetryState::new();
+        state.record_productive_tool_call();
+        assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Grace);
+        state.record_productive_tool_call();
+        assert_eq!(state.observe_budget_exhaustion(), LoopDecision::Escalate);
+        assert_eq!(state.grace_calls_fired, 1);
     }
 
     #[test]

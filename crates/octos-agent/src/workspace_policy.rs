@@ -1717,7 +1717,6 @@ mod tests {
         assert!(task.artifacts.is_empty());
         assert!(task.on_complete.is_empty());
         assert!(task.on_deliver.is_empty());
-
         assert_eq!(
             policy
                 .artifacts

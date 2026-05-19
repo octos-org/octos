@@ -31,6 +31,7 @@ pub mod plugins;
 pub mod policy;
 pub mod profile;
 pub mod progress;
+pub mod prompt_context;
 pub mod prompt_guard;
 pub mod prompt_layer;
 pub mod provider_tools;
@@ -112,6 +113,9 @@ pub use policy::{
     PermissionProfile, PermissionProfileError, RuntimeMode,
 };
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
+pub use prompt_context::{
+    PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
+};
 pub use prompt_layer::PromptLayerBuilder;
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
 pub use recorder::{BlackBoxRecorder, RecordEntry};
@@ -138,14 +142,14 @@ pub use tools::{
     CheckBackgroundTasksTool, CheckWorkspaceContractTool, ConcurrencyClass, ConfigureToolTool,
     DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
     DEFAULT_HTTP_READ_TIMEOUT_SECS, DELEGATED_DENY_GROUP, DELEGATION_METRIC, DeepSearchTool,
-    DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool, DispatchOutcome,
-    DispatchRequest, DispatchResponse, EditFileTool, GlobTool, GrepTool, HttpMcpAgent, ListDirTool,
-    MAX_DEPTH, ManageSkillsTool, McpAgentBackend, McpAgentBackendConfig, MessageTool,
-    PolicyDecision, ReadFileTool, ReadTaskOutputTool, RecallMemoryTool, RobotToolRegistry,
-    SaveMemoryTool, SendFileTool, SharedBackend, ShellTool, SpawnTool, StdioMcpAgent,
-    SynthesizeResearchTool, Tool, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester,
-    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, TurnAttachmentContext, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
+    GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, ManageSkillsTool, McpAgentBackend,
+    McpAgentBackendConfig, MessageTool, PolicyDecision, ReadFileTool, ReadTaskOutputTool,
+    RecallMemoryTool, RobotToolRegistry, SaveMemoryTool, SendFileTool, SharedBackend, ShellTool,
+    SpawnTool, StdioMcpAgent, SynthesizeResearchTool, Tool, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprovalRequester, ToolConfigStore, ToolPolicy, ToolRegistry,
+    ToolResult, TurnAttachmentContext, WebFetchTool, WebSearchTool, WriteFileTool,
     admin::{AdminApiContext, register_admin_api_tools},
     build_backend_from_config, build_delegated_child_policy, build_dispatch_event_payload,
     dispatch_with_metrics, install_robot_registry, record_dispatch,
