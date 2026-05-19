@@ -979,14 +979,6 @@ impl ContextManager {
         let mut repaired_item_ids = Vec::new();
         let mut synthetic_item_ids = Vec::new();
         let mut truncated_item_ids = Vec::new();
-        let tool_output_call_ids = self
-            .items
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TranscriptItemKind::ToolOutput { envelope } => Some(envelope.tool_call_id.as_str()),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
         let mut emitted_tool_calls = HashSet::new();
         let mut emitted_tool_outputs = HashSet::new();
         let mut index = 0;
@@ -1098,18 +1090,6 @@ impl ContextManager {
                             if envelope.truncation_reason.is_some() {
                                 truncated_item_ids.push(tool_item_id);
                             }
-                        } else if !tool_output_call_ids.contains(call_id.as_str()) {
-                            let synthetic_id =
-                                TranscriptItemId::new(format!("synthetic_tool_output_{call_id}"));
-                            synthetic_item_ids.push(synthetic_id.clone());
-                            let mut synthetic =
-                                message(MessageRole::Tool, SYNTHETIC_MISSING_TOOL_OUTPUT);
-                            synthetic.tool_call_id = Some(call_id.clone());
-                            entries.push(PromptMessageEntry::tool_output(
-                                synthetic,
-                                synthetic_id,
-                                call_id.clone(),
-                            ));
                         } else {
                             let synthetic_id =
                                 TranscriptItemId::new(format!("synthetic_tool_output_{call_id}"));

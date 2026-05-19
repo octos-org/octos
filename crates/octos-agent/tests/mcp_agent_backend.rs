@@ -170,7 +170,7 @@ async fn should_dispatch_to_stdio_mcp_agent_and_return_contract_artifact() {
     };
     let backend =
         build_backend_from_config(&config, Some(dir.path())).expect("build stdio backend");
-    let request = DispatchRequest::new("run_task".into(), serde_json::json!({"task": "hello"}));
+    let request = DispatchRequest::new("run_task", serde_json::json!({"task": "hello"}));
     let response = backend.dispatch(request).await;
 
     assert_eq!(response.outcome, DispatchOutcome::Success);
@@ -208,7 +208,7 @@ async fn should_dispatch_to_remote_mcp_agent_and_return_contract_artifact() {
     let backend = HttpMcpAgent::from_config(&config)
         .expect("build http backend")
         .with_loopback_allowed_for_tests();
-    let request = DispatchRequest::new("run_task".into(), serde_json::json!({"task": "hi"}));
+    let request = DispatchRequest::new("run_task", serde_json::json!({"task": "hi"}));
     let response = backend.dispatch(request).await;
     join.abort();
 
@@ -238,10 +238,7 @@ async fn should_kill_subprocess_on_timeout_and_reap_within_500ms() {
 
     let start = Instant::now();
     let response = backend
-        .dispatch(DispatchRequest::new(
-            "run_task".into(),
-            serde_json::json!({}),
-        ))
+        .dispatch(DispatchRequest::new("run_task", serde_json::json!({})))
         .await;
     let elapsed = start.elapsed();
 
@@ -311,10 +308,7 @@ async fn should_apply_blocked_env_vars_to_stdio_subprocess() {
         .with_cwd(dir.path().to_path_buf());
 
     let response = backend
-        .dispatch(DispatchRequest::new(
-            "run_task".into(),
-            serde_json::json!({}),
-        ))
+        .dispatch(DispatchRequest::new("run_task", serde_json::json!({})))
         .await;
     assert_eq!(response.outcome, DispatchOutcome::Success);
 
@@ -365,10 +359,7 @@ async fn should_enforce_http_timeout_on_remote_backend() {
 
     let start = Instant::now();
     let response = backend
-        .dispatch(DispatchRequest::new(
-            "run_task".into(),
-            serde_json::json!({}),
-        ))
+        .dispatch(DispatchRequest::new("run_task", serde_json::json!({})))
         .await;
     let elapsed = start.elapsed();
     join.abort();
@@ -394,7 +385,7 @@ async fn should_emit_sub_agent_dispatch_event_on_typed_payload() {
         build_backend_from_config(&config, Some(dir.path())).expect("build stdio backend");
 
     let (session_id, task_id) = unique_ids();
-    let request = DispatchRequest::new("run_task".into(), serde_json::json!({"task": "hi"}));
+    let request = DispatchRequest::new("run_task", serde_json::json!({"task": "hi"}));
     let (response, summary) = dispatch_with_metrics(backend.as_ref(), request).await;
 
     let payload = build_dispatch_event_payload(
@@ -473,7 +464,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text
 
     let response = backend
         .dispatch(DispatchRequest::new(
-            "run_task".into(),
+            "run_task",
             serde_json::json!({"task": "x"}),
         ))
         .await;
