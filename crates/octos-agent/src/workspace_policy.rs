@@ -889,13 +889,6 @@ impl WorkspacePolicy {
             //      audio (MagicBytes).
             //   2. tool generated a valid MP3 header but a silent decoded
             //      stream (AudioNonSilent — whole final mix).
-            //   3. one of the intermediate segment WAVs is silent but the
-            //      surrounding non-silent segments mask the gap in the
-            //      assembled MP3 (PerFileNonSilent on the preserved
-            //      `<output_dir>/segments/seg_*.wav` files — mofa-podcast
-            //      preserves segments after successful assembly via the
-            //      Result-aware `SegmentDirCleanup` RAII guard introduced
-            //      in mofa-skills #59).
             //
             // octos #1034: switched (1) and (2) to consume the plugin's
             // `files_to_send` list (the canonical authoritative path set
@@ -907,31 +900,17 @@ impl WorkspacePolicy {
             // the exact path the plugin wrote, so the validator no longer
             // races the plugin's directory-naming logic.
             //
-            // (3) still consumes a glob because the intermediate segment
-            // WAVs are scratch files the plugin does NOT report in
-            // `files_to_send` — they are preserved on disk so the
-            // PerFileNonSilent gate can inspect them, but the protocol's
-            // file list only carries the final deliverable MP3. The glob
-            // has been broadened to `**/segments/seg_*.wav` (no longer
-            // anchored at `skill-output/mofa-podcast/`) so it tracks the
-            // topic-suffixed output directory without re-needing a glob
-            // fix for every new directory name.
-            //
-            // The per-file glob deliberately EXCLUDES
-            // `pause_after_*.wav`, `pause_line_*.wav`, and
-            // `bgm_placeholder_line_*.wav` — those filenames are emitted
-            // by mofa-podcast as intentionally-silent inter-segment pauses
-            // and would never pass a non-silent ratio check.
-            //
-            // Stale-segment concern: this glob does NOT apply the
-            // `task_started_at` look-back filter that `resolve_artifacts`
-            // uses (the validator runner doesn't see that timestamp).
-            // In practice mofa-skills #59 clears `<output_dir>/segments/`
-            // at the start of every invocation (`generate_podcast::seg_dir`
-            // cleanup), so stale segments only matter for unusual
-            // concurrent-run workflows. A future follow-up can plumb
-            // `task_started_at` into the validator runner to filter
-            // per-file matches by mtime, which would close the gap.
+            // The historical (3) was a `PerFileNonSilent` gate over
+            // `**/segments/seg_*.wav` to catch the silent-segment dropout
+            // class that whole-file AudioNonSilent can mask. It was dropped
+            // here: the deployed `mofa-podcast` plugin does not preserve
+            // `seg_*.wav` segment files on disk after assembly, so the
+            // gate matched zero files and the `require_at_least:1` floor
+            // hard-failed every podcast call (regression observed live on
+            // mini3 2026-05-18: `per_file_non_silent: expected >=1 audio
+            // files, found 0`). The plugin's silent-segment failure mode
+            // can be re-armed in a future contract once the skill emits
+            // segment scratch files (or carries them in `files_to_send`).
             on_completion: vec![
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
                     glob: String::new(),
@@ -944,13 +923,6 @@ impl WorkspacePolicy {
                     min_ratio: default_non_silent_ratio(),
                     source: ValidatorFileSource::SpawnOnlyFiles,
                     extension: Some("mp3".into()),
-                }),
-                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
-                    glob: "**/segments/seg_*.wav".into(),
-                    min_ratio: default_non_silent_ratio(),
-                    require_at_least: 1,
-                    source: ValidatorFileSource::Glob,
-                    extension: None,
                 }),
             ],
         };
@@ -2071,9 +2043,10 @@ ignore = []
     /// plugin's reported `files_to_send` list drives the check rather than
     /// a hardcoded glob that misses topic-suffixed output directories
     /// (e.g. `mofa-podcast-zhuyu/` for the chat topic 《逐玉》). The
-    /// PerFileNonSilent validator stays on the glob path because the
-    /// intermediate segment WAVs are scratch files not exposed by the
-    /// plugin protocol's `files_to_send` envelope.
+    /// historical `PerFileNonSilent` per-segment gate was dropped — the
+    /// deployed mofa-podcast plugin does not preserve `seg_*.wav` segment
+    /// files after assembly, so the gate hard-failed every podcast call
+    /// (mini3 live regression 2026-05-18).
     #[test]
     fn session_policy_podcast_validators_consume_spawn_only_files_for_octos_1034() {
         let policy = WorkspacePolicy::for_session();
@@ -2084,7 +2057,6 @@ ignore = []
 
         let mut saw_magic = false;
         let mut saw_audio = false;
-        let mut saw_per_file = false;
         for entry in &podcast.on_completion {
             match entry {
                 SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes {
@@ -2121,34 +2093,20 @@ ignore = []
                     );
                     saw_audio = true;
                 }
-                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
-                    source,
-                    glob,
-                    ..
-                }) => {
-                    assert_eq!(
-                        *source,
-                        ValidatorFileSource::Glob,
-                        "podcast PerFileNonSilent must stay on the glob path because \
-                         intermediate segment WAVs are not in the plugin's files_to_send"
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent { .. }) => {
+                    panic!(
+                        "podcast contract must NOT declare PerFileNonSilent: the deployed \
+                         mofa-podcast plugin does not preserve `seg_*.wav` segment files, \
+                         so the validator hard-fails 100% of podcast calls (live mini3 \
+                         regression observed 2026-05-18). Re-arm only when the plugin \
+                         emits segment scratch files or carries them in files_to_send."
                     );
-                    assert!(
-                        !glob.starts_with("skill-output/mofa-podcast/"),
-                        "PerFileNonSilent glob must NOT anchor at the legacy \
-                         `skill-output/mofa-podcast/` prefix — topic-suffixed \
-                         directories like `mofa-podcast-zhuyu/` would never match: {glob}"
-                    );
-                    saw_per_file = true;
                 }
                 _ => {}
             }
         }
         assert!(saw_magic, "podcast contract must declare MagicBytes");
         assert!(saw_audio, "podcast contract must declare AudioNonSilent");
-        assert!(
-            saw_per_file,
-            "podcast contract must declare PerFileNonSilent"
-        );
     }
 
     #[test]
@@ -2169,40 +2127,19 @@ ignore = []
             entry,
             SpawnTaskValidatorSpec::Bare(ValidatorSpec::MagicBytes { .. })
         )));
-        // The per-segment gate (PerFileNonSilent) catches the silent-
-        // segment failure mode that the whole-file AudioNonSilent cannot
-        // detect: one bad seg_NNN_<voice>.wav whose silent gap gets
-        // averaged out by the surrounding speech in the assembled MP3.
-        // mofa-skills #59 preserves segments after successful assembly
-        // via the Result-aware `SegmentDirCleanup` RAII guard so this
-        // glob actually matches when the harness runs.
-        let per_file = podcast
-            .on_completion
-            .iter()
-            .find_map(|entry| match entry {
-                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent {
-                    glob,
-                    min_ratio,
-                    require_at_least,
-                    ..
-                }) => Some((glob.clone(), *min_ratio, *require_at_least)),
-                _ => None,
-            })
-            .expect("podcast_generate must declare PerFileNonSilent on segments");
+        // The per-segment gate (`PerFileNonSilent`) used to live here but
+        // was dropped: the deployed mofa-podcast plugin does not preserve
+        // `seg_*.wav` segments after assembly, so the `require_at_least:1`
+        // floor hard-failed every podcast call (mini3 live regression
+        // 2026-05-18). The whole-file `AudioNonSilent` above still gates
+        // against silent final mixes. Re-arm only when the plugin emits
+        // segment scratch files (or carries them in `files_to_send`).
         assert!(
-            per_file.0.contains("segments/seg_*.wav"),
-            "PerFileNonSilent glob must scope to segment WAVs to exclude pause/BGM placeholders: {}",
-            per_file.0
-        );
-        assert!(
-            per_file.1 >= 0.3,
-            "min_ratio should be at least the harness default (0.3): {}",
-            per_file.1
-        );
-        assert!(
-            per_file.2 >= 1,
-            "require_at_least must enforce a non-zero floor so an empty segments dir surfaces as a contract failure (got {})",
-            per_file.2,
+            !podcast.on_completion.iter().any(|entry| matches!(
+                entry,
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::PerFileNonSilent { .. })
+            )),
+            "podcast contract must NOT declare PerFileNonSilent (see comment above)"
         );
 
         let voice_save = policy
