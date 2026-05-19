@@ -1,0 +1,778 @@
+#!/usr/bin/env node
+
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(scriptDir, '..', '..');
+const defaultScenarioId = 'stdio-happy-path';
+const requiredArtifacts = [
+  'scenario.json',
+  'summary.json',
+  'validation.json',
+  'launch-command.txt',
+  'terminal-size.json',
+  'server.log',
+  'tui-capture.txt',
+  'runtime-policy-stamp.json',
+  'appui-transcript.jsonl',
+];
+
+const scenarios = new Map([
+  [
+    defaultScenarioId,
+    {
+      id: defaultScenarioId,
+      title: 'Stdio Happy Path',
+      transport: 'stdio',
+      runner: 'onboarding-solo',
+      finalMarker: 'M19_STDIO_HAPPY_PATH_FINAL_LINE',
+      prompt:
+        'Run the stdio happy path UX smoke. Open a session, send one short prompt, and finish with M19_STDIO_HAPPY_PATH_FINAL_LINE.',
+    },
+  ],
+  [
+    'websocket-happy-path',
+    {
+      id: 'websocket-happy-path',
+      title: 'WebSocket Happy Path',
+      transport: 'websocket',
+      runner: 'onboarding-solo',
+      finalMarker: 'M19_WEBSOCKET_HAPPY_PATH_FINAL_LINE',
+      prompt:
+        'Run the WebSocket happy path UX smoke. Open a session, send one short prompt, and finish with M19_WEBSOCKET_HAPPY_PATH_FINAL_LINE.',
+    },
+  ],
+  [
+    'tui-solo-onboarding',
+    {
+      id: 'tui-solo-onboarding',
+      title: 'TUI Solo Onboarding',
+      transport: 'stdio',
+      runner: 'onboarding-solo',
+      finalMarker: 'M19_TUI_SOLO_ONBOARDING_FINAL_LINE',
+      prompt:
+        'Run the solo onboarding UX smoke and finish with M19_TUI_SOLO_ONBOARDING_FINAL_LINE.',
+    },
+  ],
+  [
+    'narrow-layout',
+    {
+      id: 'narrow-layout',
+      title: 'Narrow Terminal Layout',
+      transport: 'stdio',
+      runner: 'onboarding-solo',
+      finalMarker: 'M19_NARROW_LAYOUT_FINAL_LINE',
+      prompt:
+        'Run the narrow-layout UX smoke and finish with M19_NARROW_LAYOUT_FINAL_LINE.',
+    },
+  ],
+  [
+    'provider-missing-recoverable',
+    {
+      id: 'provider-missing-recoverable',
+      title: 'Missing Provider Is Recoverable',
+      transport: 'stdio',
+      runner: null,
+      blockedMessage:
+        'Provider-missing recovery needs a current-main TUI replay before it can launch in real tmux mode.',
+      finalMarker: 'M19_PROVIDER_MISSING_FINAL_LINE',
+      prompt: 'Show the missing provider recovery path.',
+    },
+  ],
+  [
+    'permission-selection',
+    {
+      id: 'permission-selection',
+      title: 'Permission Selection',
+      transport: 'stdio',
+      runner: null,
+      blockedMessage:
+        'Permission selection needs a current-main TUI replay and policy-stamp validator before it can launch in real tmux mode.',
+      finalMarker: 'M19_PERMISSION_SELECTION_FINAL_LINE',
+      prompt: 'Show the permission selection path.',
+    },
+  ],
+  [
+    'approval-denial',
+    {
+      id: 'approval-denial',
+      title: 'Approval Denial',
+      transport: 'stdio',
+      runner: null,
+      blockedMessage:
+        'Approval denial needs a migrated AppUI UX fixture or replay before it can launch in real tmux mode.',
+      finalMarker: 'M19_APPROVAL_DENIAL_FINAL_LINE',
+      prompt: 'Show the approval denial path.',
+    },
+  ],
+  [
+    'task-subagent-tree',
+    {
+      id: 'task-subagent-tree',
+      title: 'Task Subagent Tree',
+      transport: 'websocket',
+      runner: null,
+      blockedMessage:
+        'Task/subagent tree depends on recreating the removed M15 live tmux runner under M19.',
+      finalMarker: 'M19_TASK_SUBAGENT_TREE_FINAL_LINE',
+      prompt: 'Show the task and subagent tree path.',
+    },
+  ],
+  [
+    'restart-reconnect',
+    {
+      id: 'restart-reconnect',
+      title: 'Restart And Reconnect',
+      transport: 'websocket',
+      runner: null,
+      blockedMessage:
+        'Restart/reconnect depends on replacing the removed M15 runner in the M16 restart fixture.',
+      finalMarker: 'M19_RESTART_RECONNECT_FINAL_LINE',
+      prompt: 'Show the restart and reconnect path.',
+    },
+  ],
+  [
+    'dropped-completion-backpressure',
+    {
+      id: 'dropped-completion-backpressure',
+      title: 'Dropped Completion Backpressure',
+      transport: 'websocket',
+      runner: null,
+      blockedMessage:
+        'Dropped-completion backpressure depends on recreating the removed M18 live runner under M19.',
+      finalMarker: 'M19_DROPPED_COMPLETION_FINAL_LINE',
+      prompt: 'Show the dropped completion recovery path.',
+    },
+  ],
+  [
+    'router-status-failover',
+    {
+      id: 'router-status-failover',
+      title: 'Router Status Failover',
+      transport: 'websocket',
+      runner: null,
+      blockedMessage:
+        'Router status failover requires a fresh current-main port of the router/queue TUI UX.',
+      finalMarker: 'M19_ROUTER_STATUS_FAILOVER_FINAL_LINE',
+      prompt: 'Show the router status failover path.',
+    },
+  ],
+]);
+
+function usage() {
+  return `Usage:
+  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run]
+  node e2e/scripts/ux-tmux-run.mjs --self-test [${defaultScenarioId}]
+
+Options:
+  --dry-run      Write the artifact skeleton without launching tmux.
+  --self-test    Write and validate the artifact skeleton without launching tmux.
+  --help         Show this help.
+
+Scenarios:
+  ${[...scenarios.keys()].join(', ')}
+
+Environment:
+  OCTOS_UX_TMUX_RUN_ID       Override run id.
+  OCTOS_UX_TMUX_OUT_ROOT     Override output root. Default: e2e/test-results-ux.
+  OCTOS_UX_TMUX_OUT_DIR      Override scenario output directory.
+  OCTOS_UX_TMUX_TUI_RUNNER   Override octos-tui tmux runner script.
+  OCTOS_TUI_REPO             Override octos-tui checkout. Default: /Users/yuechen/home/octos-tui.
+`;
+}
+
+function parseArgs(argv) {
+  let scenarioId = null;
+  let dryRun = false;
+  let selfTest = false;
+  let help = false;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg === '--self-test' || arg === 'self-test') {
+      selfTest = true;
+    } else if (arg === '--scenario') {
+      i += 1;
+      if (!argv[i]) throw new Error('--scenario requires a scenario id');
+      scenarioId = argv[i];
+    } else if (arg.startsWith('--scenario=')) {
+      scenarioId = arg.slice('--scenario='.length);
+    } else if (arg === 'run') {
+      // Accept an explicit command word for callers that model this as ux:tmux:run.
+    } else if (arg === '--help' || arg === '-h' || arg === 'help') {
+      help = true;
+    } else if (arg.startsWith('-')) {
+      throw new Error(`unknown option: ${arg}`);
+    } else if (!scenarioId) {
+      scenarioId = arg;
+    } else {
+      throw new Error(`unexpected argument: ${arg}`);
+    }
+  }
+
+  return {
+    scenarioId: scenarioId || defaultScenarioId,
+    dryRun,
+    selfTest,
+    help,
+  };
+}
+
+function compactTimestamp(date = new Date()) {
+  return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+}
+
+function utcNow() {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function safeSlug(value) {
+  return String(value).replace(/[^a-zA-Z0-9_.-]/g, '-');
+}
+
+function shellQuote(value) {
+  const text = String(value);
+  if (text.length === 0) return "''";
+  return `'${text.replaceAll("'", "'\\''")}'`;
+}
+
+function positiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer, got ${raw}`);
+  }
+  return value;
+}
+
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tmuxAvailable() {
+  const result = spawnSync('tmux', ['-V'], { stdio: 'ignore' });
+  return !result.error && result.status === 0;
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
+function writeText(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text, 'utf8');
+}
+
+function appendJsonl(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify(value)}\n`, 'utf8');
+}
+
+function artifactInfo(outDir, name) {
+  const file = path.join(outDir, name);
+  const exists = fs.existsSync(file);
+  return {
+    path: file,
+    exists,
+    bytes: exists ? fs.statSync(file).size : 0,
+  };
+}
+
+function resolveContext({ scenarioId, selfTest }) {
+  const scenario = scenarios.get(scenarioId);
+  if (!scenario) {
+    throw new Error(
+      `unsupported scenario: ${scenarioId}. Supported scenarios: ${[...scenarios.keys()].join(', ')}`,
+    );
+  }
+
+  const stamp = compactTimestamp();
+  const runId =
+    process.env.OCTOS_UX_TMUX_RUN_ID || `${selfTest ? 'ux-tmux-self-test' : 'ux-tmux'}-${stamp}`;
+  const outRoot = path.resolve(
+    process.env.OCTOS_UX_TMUX_OUT_ROOT || path.join(repoRoot, 'e2e', 'test-results-ux'),
+  );
+  const scenarioDir = path.resolve(
+    process.env.OCTOS_UX_TMUX_OUT_DIR || path.join(outRoot, runId, scenario.id),
+  );
+  const runtimeRoot = path.resolve(
+    process.env.OCTOS_UX_TMUX_RUNTIME_ROOT || path.join(os.tmpdir(), `octos-ux-tmux-${runId}`),
+  );
+  const dataDir = path.resolve(process.env.OCTOS_UX_TMUX_DATA_DIR || path.join(runtimeRoot, 'data'));
+  const workdir = path.resolve(
+    process.env.OCTOS_UX_TMUX_WORKDIR || path.join(runtimeRoot, 'workspace'),
+  );
+  const replayFile = path.resolve(
+    process.env.OCTOS_UX_TMUX_REPLAY || path.join(scenarioDir, 'input-replay.log'),
+  );
+  const tuiRepo = path.resolve(process.env.OCTOS_TUI_REPO || '/Users/yuechen/home/octos-tui');
+  const lowerRunner = path.resolve(
+    process.env.OCTOS_UX_TMUX_TUI_RUNNER
+      || process.env.OCTOS_M19_UX_TUI_RUNNER
+      || path.join(tuiRepo, 'scripts', 'run-onboarding-tmux-soak.sh'),
+  );
+  const octosBin = path.resolve(process.env.OCTOS_BIN || path.join(repoRoot, 'target', 'debug', 'octos'));
+  const tuiBin = path.resolve(process.env.OCTOS_TUI_BIN || path.join(tuiRepo, 'target', 'debug', 'octos-tui'));
+  const cols = positiveIntegerEnv('OCTOS_UX_TMUX_COLS', scenario.id === 'narrow-layout' ? 80 : 120);
+  const rows = positiveIntegerEnv('OCTOS_UX_TMUX_ROWS', scenario.id === 'narrow-layout' ? 24 : 40);
+  const profileId = process.env.OCTOS_UX_TMUX_PROFILE || 'coding';
+  const sessionId =
+    process.env.OCTOS_UX_TMUX_SESSION_ID || `${profileId}:local:ux:${scenario.id}:${runId}`;
+  const sessionName =
+    process.env.OCTOS_UX_TMUX_SESSION || `octos-ux-${safeSlug(runId)}-${safeSlug(scenario.id)}`;
+  const backendCommand =
+    process.env.OCTOS_UX_TMUX_BACKEND_COMMAND
+    || [
+      'env',
+      'OCTOS_M9_PROTOCOL_FIXTURES=1',
+      'DEEPSEEK_API_KEY=dummy-key-for-ux-tmux',
+      shellQuote(octosBin),
+      'serve',
+      '--stdio',
+      '--data-dir',
+      shellQuote(dataDir),
+      '--cwd',
+      shellQuote(workdir),
+    ].join(' ');
+  const launchCommand =
+    process.env.OCTOS_UX_TMUX_LAUNCH_COMMAND
+    || `${shellQuote(tuiBin)} --mode protocol --stdio-command ${shellQuote(backendCommand)}`;
+
+  return {
+    scenario,
+    runId,
+    outRoot,
+    scenarioDir,
+    runtimeRoot,
+    dataDir,
+    workdir,
+    replayFile,
+    tuiRepo,
+    lowerRunner,
+    octosBin,
+    tuiBin,
+    cols,
+    rows,
+    profileId,
+    sessionId,
+    sessionName,
+    backendCommand,
+    launchCommand,
+  };
+}
+
+function writeWorkspaceFixture(ctx) {
+  fs.mkdirSync(ctx.workdir, { recursive: true });
+  writeText(
+    path.join(ctx.workdir, 'README.md'),
+    `# ${ctx.scenario.title}\n\nMinimal workspace fixture for ${ctx.scenario.id}.\n`,
+  );
+}
+
+function writeReplay(ctx) {
+  writeText(
+    ctx.replayFile,
+    [
+      `# ${ctx.scenario.title} UX tmux replay.`,
+      'sleep 3',
+      'capture tui-capture-start.txt',
+      `line ${ctx.scenario.prompt}`,
+      'sleep 4',
+      'capture tui-capture.txt',
+      'exit',
+      'sleep 1',
+      'capture tui-exit-capture.txt',
+      '',
+    ].join('\n'),
+  );
+}
+
+function writeArtifactSkeleton(ctx, options) {
+  const generatedAt = utcNow();
+  const placeholder = options.placeholderArtifacts !== false;
+  fs.mkdirSync(ctx.scenarioDir, { recursive: true });
+  fs.mkdirSync(ctx.dataDir, { recursive: true });
+  fs.mkdirSync(ctx.runtimeRoot, { recursive: true });
+  writeWorkspaceFixture(ctx);
+  writeReplay(ctx);
+
+  writeJson(path.join(ctx.scenarioDir, 'scenario.json'), {
+    schema: 'octos.ux.scenario.v1',
+    artifact_abi: 'octos.ux.artifacts.v1',
+    generated_at: generatedAt,
+    id: ctx.scenario.id,
+    scenario_id: ctx.scenario.id,
+    title: ctx.scenario.title,
+    transport: ctx.scenario.transport,
+    run_id: ctx.runId,
+    output_dir: ctx.scenarioDir,
+    runtime_root: ctx.runtimeRoot,
+    data_dir: ctx.dataDir,
+    workspace: ctx.workdir,
+    replay_file: ctx.replayFile,
+    session_id: ctx.sessionId,
+    profile_id: ctx.profileId,
+    final_marker: ctx.scenario.finalMarker,
+    lower_runner: ctx.lowerRunner,
+  });
+
+  writeText(path.join(ctx.scenarioDir, 'launch-command.txt'), `${ctx.launchCommand}\n`);
+  writeJson(path.join(ctx.scenarioDir, 'terminal-size.json'), {
+    schema: 'octos.ux.terminal_size.v1',
+    generated_at: generatedAt,
+    cols: ctx.cols,
+    rows: ctx.rows,
+  });
+  writeJson(path.join(ctx.scenarioDir, 'runtime-policy-stamp.json'), {
+    schema: 'octos.ux.runtime_policy_stamp.v1',
+    generated_at: generatedAt,
+    run_id: ctx.runId,
+    scenario_id: ctx.scenario.id,
+    transport: ctx.scenario.transport,
+    backend: 'octos serve --stdio',
+    stamp: {
+      profile_id: ctx.profileId,
+      session_id: ctx.sessionId,
+      approval_policy: process.env.OCTOS_APPROVAL_POLICY || null,
+      sandbox_mode: process.env.OCTOS_SANDBOX || 'inherits harness environment',
+      network_access: process.env.OCTOS_NETWORK || 'inherits harness environment',
+    },
+    terminal: {
+      cols: ctx.cols,
+      rows: ctx.rows,
+    },
+  });
+
+  if (placeholder) {
+    writeText(
+      path.join(ctx.scenarioDir, 'server.log'),
+      [
+        `[${generatedAt}] placeholder server log`,
+        `status=${options.status}`,
+        `message=${options.message}`,
+        `backend_command=${ctx.backendCommand}`,
+        '',
+      ].join('\n'),
+    );
+    writeText(
+      path.join(ctx.scenarioDir, 'tui-capture.txt'),
+      [
+        `[${ctx.scenario.title}] placeholder TUI capture`,
+        `status: ${options.status}`,
+        `message: ${options.message}`,
+        `tmux launched: ${options.realTmuxLaunched ? 'yes' : 'no'}`,
+        '',
+      ].join('\n'),
+    );
+    writeText(path.join(ctx.scenarioDir, 'appui-transcript.jsonl'), '');
+    appendJsonl(path.join(ctx.scenarioDir, 'appui-transcript.jsonl'), {
+      direction: 'client_to_server',
+      frame: {
+        jsonrpc: '2.0',
+        id: 'placeholder-1',
+        method: 'harness/placeholder',
+        params: {
+          generated_at: generatedAt,
+          scenario_id: ctx.scenario.id,
+          status: options.status,
+          message: options.message,
+          real_tmux_launched: Boolean(options.realTmuxLaunched),
+        },
+      },
+    });
+    appendJsonl(path.join(ctx.scenarioDir, 'appui-transcript.jsonl'), {
+      direction: 'server_to_client',
+      frame: {
+        jsonrpc: '2.0',
+        id: 'placeholder-1',
+        result: {
+          status: options.status,
+          message: options.message,
+        },
+      },
+    });
+  } else {
+    for (const name of ['server.log', 'tui-capture.txt', 'appui-transcript.jsonl']) {
+      const file = path.join(ctx.scenarioDir, name);
+      if (!fs.existsSync(file)) writeText(file, '');
+    }
+  }
+
+  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
+  const summary = {
+    schema: 'octos.ux.summary.v1',
+    generated_at: generatedAt,
+    ok: Boolean(options.ok),
+    status: options.status,
+    mode: options.mode,
+    message: options.message,
+    blockers: options.blockers || [],
+    scenario_id: ctx.scenario.id,
+    run_id: ctx.runId,
+    output_dir: ctx.scenarioDir,
+    placeholder_artifacts: placeholder,
+    real_tmux_launched: Boolean(options.realTmuxLaunched),
+    lower_runner: {
+      path: ctx.lowerRunner,
+      exists: fs.existsSync(ctx.lowerRunner),
+      executable: isExecutable(ctx.lowerRunner),
+    },
+    artifacts: {},
+  };
+  writeJson(summaryPath, summary);
+  summary.artifacts = Object.fromEntries(
+    requiredArtifacts.map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
+  );
+  writeJson(summaryPath, summary);
+}
+
+function validateArtifactSkeleton(ctx) {
+  const missing = requiredArtifacts.filter((name) => {
+    const file = path.join(ctx.scenarioDir, name);
+    return !fs.existsSync(file) || fs.statSync(file).size === 0;
+  });
+  if (missing.length > 0) {
+    throw new Error(`self-test missing or empty artifacts: ${missing.join(', ')}`);
+  }
+}
+
+function refreshSummaryArtifacts(ctx, validationStatus = null) {
+  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
+  if (!fs.existsSync(summaryPath)) return;
+  const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+  if (validationStatus !== null) {
+    summary.validation_status = validationStatus === 0 ? 'passed' : 'failed';
+    if (validationStatus !== 0) {
+      summary.ok = false;
+      summary.status = 'failed';
+      summary.message = `${summary.message}; validation failed; see validation.json`;
+    }
+  }
+  summary.artifacts = Object.fromEntries(
+    requiredArtifacts.map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
+  );
+  writeJson(summaryPath, summary);
+}
+
+function missingRunnerBlocker(ctx) {
+  if (!fs.existsSync(ctx.lowerRunner)) {
+    return `octos-tui tmux runner is missing: ${ctx.lowerRunner}`;
+  }
+  if (!isExecutable(ctx.lowerRunner)) {
+    return `octos-tui tmux runner is not executable: ${ctx.lowerRunner}`;
+  }
+  return null;
+}
+
+function runLowerRunner(ctx) {
+  const env = {
+    ...process.env,
+    OCTOS_REPO: repoRoot,
+    OCTOS_BIN: ctx.octosBin,
+    OCTOS_TUI_BIN: ctx.tuiBin,
+    OCTOS_TUI_SOAK_RUN_ID: ctx.runId,
+    OCTOS_TUI_SOAK_ARTIFACT_DIR: ctx.scenarioDir,
+    OCTOS_TUI_SOAK_RUNTIME_ROOT: ctx.runtimeRoot,
+    OCTOS_TUI_SOAK_WORKSPACE: ctx.workdir,
+    OCTOS_TUI_SOAK_DATA_DIR: ctx.dataDir,
+    OCTOS_TUI_SOAK_TRANSPORT: ctx.scenario.transport === 'websocket' ? 'ws' : ctx.scenario.transport,
+    OCTOS_TUI_SOAK_PROFILE: ctx.profileId,
+    OCTOS_TUI_SOAK_SESSION: ctx.sessionId,
+    OCTOS_TUI_SOAK_TUI_SESSION: ctx.sessionName,
+    OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
+    OCTOS_TUI_SOAK_REQUIRE_PROFILE: '0',
+    OCTOS_TUI_SOAK_SOLO_STRICT: process.env.OCTOS_TUI_SOAK_SOLO_STRICT || '0',
+    OCTOS_TUI_SOAK_SERVER_WAIT_SECS: process.env.OCTOS_TUI_SOAK_SERVER_WAIT_SECS || '1',
+    OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
+    OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '1',
+  };
+
+  const action = (name, inherit = true) => spawnSync(ctx.lowerRunner, [name], {
+    cwd: repoRoot,
+    env,
+    stdio: inherit ? 'inherit' : 'pipe',
+  });
+
+  let status = 0;
+  for (const step of ['start', 'drive-solo']) {
+    if (status !== 0) break;
+    const result = action(step);
+    if (result.error) throw result.error;
+    if (result.status !== 0) status = result.status || 1;
+    if (step === 'start' && status === 0) {
+      const resize = spawnSync('tmux', [
+        'resize-window',
+        '-t',
+        ctx.sessionName,
+        '-x',
+        String(ctx.cols),
+        '-y',
+        String(ctx.rows),
+      ], { stdio: 'ignore' });
+      if (resize.error) throw resize.error;
+      if (resize.status !== 0) status = resize.status || 1;
+    }
+  }
+
+  const capture = action('capture');
+  if (capture.error && status === 0) throw capture.error;
+  if (capture.status !== 0 && status === 0) status = capture.status || 1;
+
+  if (process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
+    action('stop', false);
+  }
+
+  return status;
+}
+
+function runValidation(ctx) {
+  const result = spawnSync(process.execPath, [path.join(scriptDir, 'ux-tmux-validate.mjs'), ctx.scenarioDir], {
+    cwd: repoRoot,
+    stdio: 'inherit',
+  });
+  if (result.error) throw result.error;
+  const status = result.status === 0 ? 0 : (result.status ?? 1);
+  refreshSummaryArtifacts(ctx, status);
+  return status;
+}
+
+function realMode(ctx) {
+  if (!ctx.scenario.runner) {
+    const blocker = ctx.scenario.blockedMessage || `scenario ${ctx.scenario.id} has no real tmux runner yet`;
+    writeArtifactSkeleton(ctx, {
+      mode: 'run',
+      status: 'blocked',
+      ok: false,
+      message: blocker,
+      blockers: [blocker],
+      placeholderArtifacts: true,
+      realTmuxLaunched: false,
+    });
+    const validationStatus = runValidation(ctx);
+    console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
+    return validationStatus === 0 ? 2 : validationStatus;
+  }
+
+  const runnerBlocker = missingRunnerBlocker(ctx);
+  if (runnerBlocker) {
+    writeArtifactSkeleton(ctx, {
+      mode: 'run',
+      status: 'blocked',
+      ok: false,
+      message: runnerBlocker,
+      blockers: [runnerBlocker],
+      placeholderArtifacts: true,
+      realTmuxLaunched: false,
+    });
+    const validationStatus = runValidation(ctx);
+    console.error(`${runnerBlocker}\nArtifacts: ${ctx.scenarioDir}`);
+    return validationStatus === 0 ? 2 : validationStatus;
+  }
+
+  if (!tmuxAvailable()) {
+    const blocker = 'tmux is required for real ux tmux mode';
+    writeArtifactSkeleton(ctx, {
+      mode: 'run',
+      status: 'blocked',
+      ok: false,
+      message: blocker,
+      blockers: [blocker],
+      placeholderArtifacts: true,
+      realTmuxLaunched: false,
+    });
+    const validationStatus = runValidation(ctx);
+    console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
+    return validationStatus === 0 ? 2 : validationStatus;
+  }
+
+  writeArtifactSkeleton(ctx, {
+    mode: 'run',
+    status: 'starting',
+    ok: false,
+    message: 'real tmux run starting',
+    placeholderArtifacts: true,
+    realTmuxLaunched: false,
+  });
+
+  let status = 1;
+  try {
+    status = runLowerRunner(ctx);
+  } finally {
+    writeArtifactSkeleton(ctx, {
+      mode: 'run',
+      status: status === 0 ? 'passed' : 'failed',
+      ok: status === 0,
+      message: status === 0 ? 'real tmux run completed' : `lower runner exited with status ${status}`,
+      placeholderArtifacts: false,
+      realTmuxLaunched: true,
+    });
+  }
+  const validationStatus = runValidation(ctx);
+  console.log(`UX tmux artifacts: ${ctx.scenarioDir}`);
+  return status === 0 ? validationStatus : status;
+}
+
+function dryRun(ctx) {
+  writeArtifactSkeleton(ctx, {
+    mode: 'dry-run',
+    status: 'blocked',
+    ok: true,
+    message: 'dry run wrote artifact skeleton; tmux was not launched',
+    placeholderArtifacts: true,
+    realTmuxLaunched: false,
+  });
+  const validationStatus = runValidation(ctx);
+  console.log(`Dry run wrote UX tmux artifact skeleton: ${ctx.scenarioDir}`);
+  return validationStatus;
+}
+
+function selfTest(ctx) {
+  writeArtifactSkeleton(ctx, {
+    mode: 'self-test',
+    status: 'passed',
+    ok: true,
+    message: 'self-test wrote and validated artifact skeleton; tmux was not launched',
+    placeholderArtifacts: true,
+    realTmuxLaunched: false,
+  });
+  const validationStatus = runValidation(ctx);
+  if (validationStatus !== 0) {
+    throw new Error(`self-test validator failed with status ${validationStatus}`);
+  }
+  validateArtifactSkeleton(ctx);
+  console.log(`Self-test passed: ${ctx.scenarioDir}`);
+  return 0;
+}
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    console.log(usage());
+    return 0;
+  }
+
+  const ctx = resolveContext(args);
+  if (args.selfTest) return selfTest(ctx);
+  if (args.dryRun) return dryRun(ctx);
+  return realMode(ctx);
+}
+
+try {
+  process.exitCode = main();
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}

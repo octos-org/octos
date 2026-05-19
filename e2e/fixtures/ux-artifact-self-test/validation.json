@@ -1,0 +1,46 @@
+{
+  "schema": "octos.ux.validation.v1",
+  "status": "passed",
+  "checks": [
+    {
+      "id": "artifact_abi",
+      "status": "passed",
+      "detail": "required octos.ux.artifacts.v1 artifacts are present and schema-shaped; validation.json uses octos.ux.validation.v1",
+      "evidence": [
+        "scenario.json",
+        "summary.json",
+        "appui-transcript.jsonl",
+        "server.log",
+        "tui-capture.txt",
+        "runtime-policy-stamp.json",
+        "validation.json"
+      ]
+    },
+    {
+      "id": "appui_transcript_parseable",
+      "status": "passed",
+      "detail": "parsed 5 JSONL entries; methods=client_hello, session/open, turn/completed; responses=2",
+      "evidence": [
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "rendered_screen_no_known_bug_patterns",
+      "status": "passed",
+      "detail": "tui-capture.txt and server.log do not match known tmux UX bug patterns",
+      "evidence": [
+        "tui-capture.txt",
+        "server.log"
+      ]
+    },
+    {
+      "id": "lower_soak_summary_semantic",
+      "status": "passed",
+      "detail": "no lower soak summary artifact is present for this scenario",
+      "evidence": [
+        "soak-summary.json"
+      ]
+    }
+  ],
+  "failures": []
+}

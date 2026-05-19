@@ -1,0 +1,15 @@
+{
+  "schema": "octos.ux.summary.v1",
+  "status": "passed",
+  "scenario_id": "ux-artifact-self-test",
+  "transport": "stdio",
+  "artifacts": {
+    "scenario": "scenario.json",
+    "summary": "summary.json",
+    "appui_transcript": "appui-transcript.jsonl",
+    "server_log": "server.log",
+    "tui_capture": "tui-capture.txt",
+    "runtime_policy_stamp": "runtime-policy-stamp.json",
+    "validation": "validation.json"
+  }
+}
