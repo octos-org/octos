@@ -252,6 +252,14 @@ function positiveIntegerEnv(name, fallback) {
   return value;
 }
 
+function stablePortForRunId(runId) {
+  let hash = 0;
+  for (const char of runId) {
+    hash = ((hash * 33) + char.charCodeAt(0)) >>> 0;
+  }
+  return 51000 + (hash % 10000);
+}
+
 function isExecutable(file) {
   try {
     fs.accessSync(file, fs.constants.X_OK);
@@ -328,6 +336,7 @@ function resolveContext({ scenarioId, selfTest }) {
   const tuiBin = path.resolve(process.env.OCTOS_TUI_BIN || path.join(tuiRepo, 'target', 'debug', 'octos-tui'));
   const cols = positiveIntegerEnv('OCTOS_UX_TMUX_COLS', scenario.id === 'narrow-layout' ? 80 : 120);
   const rows = positiveIntegerEnv('OCTOS_UX_TMUX_ROWS', scenario.id === 'narrow-layout' ? 24 : 40);
+  const port = positiveIntegerEnv('OCTOS_UX_TMUX_PORT', stablePortForRunId(runId));
   const profileId = process.env.OCTOS_UX_TMUX_PROFILE || 'coding';
   const sessionId =
     process.env.OCTOS_UX_TMUX_SESSION_ID || `${profileId}:local:ux:${scenario.id}:${runId}`;
@@ -347,9 +356,13 @@ function resolveContext({ scenarioId, selfTest }) {
       '--cwd',
       shellQuote(workdir),
     ].join(' ');
+  const websocketEndpoint = `ws://127.0.0.1:${port}/api/ui-protocol/ws`;
+  const authToken = process.env.OCTOS_UX_TMUX_AUTH_TOKEN || 'octos-tui-onboarding-soak-token';
   const launchCommand =
     process.env.OCTOS_UX_TMUX_LAUNCH_COMMAND
-    || `${shellQuote(tuiBin)} --mode protocol --stdio-command ${shellQuote(backendCommand)}`;
+    || (scenario.transport === 'websocket'
+      ? `${shellQuote(tuiBin)} --mode protocol --endpoint ${shellQuote(websocketEndpoint)} --auth-token ${shellQuote(authToken)}`
+      : `${shellQuote(tuiBin)} --mode protocol --stdio-command ${shellQuote(backendCommand)}`);
 
   return {
     scenario,
@@ -366,6 +379,9 @@ function resolveContext({ scenarioId, selfTest }) {
     tuiBin,
     cols,
     rows,
+    port,
+    websocketEndpoint,
+    authToken,
     profileId,
     sessionId,
     sessionName,
@@ -577,6 +593,59 @@ function missingRunnerBlocker(ctx) {
   return null;
 }
 
+function tmuxHasSession(sessionName) {
+  const result = spawnSync('tmux', ['has-session', '-t', sessionName], { stdio: 'ignore' });
+  return !result.error && result.status === 0;
+}
+
+function launchWebsocketTuiFallback(ctx, env) {
+  const outputLog = path.join(ctx.scenarioDir, 'tui-process.log');
+  const apiKeyEnv = process.env.OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV || 'AUTODL_API_KEY';
+  const apiKey = env.OCTOS_TUI_SOAK_API_KEY || 'octos-m19-placeholder-key';
+  const command = [
+    'cd',
+    shellQuote(ctx.workdir),
+    '&&',
+    'env',
+    shellQuote(`${apiKeyEnv}=${apiKey}`),
+    shellQuote(ctx.tuiBin),
+    '--mode',
+    'protocol',
+    '--endpoint',
+    shellQuote(ctx.websocketEndpoint),
+    '--auth-token',
+    shellQuote(ctx.authToken),
+    '--session',
+    shellQuote(ctx.sessionId),
+    '--profile-id',
+    shellQuote(ctx.profileId),
+    '--cwd',
+    shellQuote(ctx.workdir),
+    '--theme',
+    shellQuote(process.env.OCTOS_TUI_SOAK_THEME || 'codex'),
+    '>',
+    shellQuote(outputLog),
+    '2>&1;',
+    'status=$?;',
+    'echo',
+    shellQuote('octos-tui exited with status'),
+    '"$status"',
+    '>>',
+    shellQuote(outputLog),
+    ';',
+    'sleep',
+    shellQuote(process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30'),
+  ].join(' ');
+  writeText(path.join(ctx.scenarioDir, 'tui-fallback-command.txt'), `${command}\n`);
+  const result = spawnSync('tmux', ['new-session', '-d', '-s', ctx.sessionName, command], {
+    cwd: repoRoot,
+    env,
+    stdio: 'inherit',
+  });
+  if (result.error) throw result.error;
+  return result.status || 0;
+}
+
 function runLowerRunner(ctx) {
   const env = {
     ...process.env,
@@ -597,6 +666,8 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_LOCAL_EMAIL: process.env.OCTOS_TUI_SOAK_LOCAL_EMAIL || `${ctx.profileId}@example.invalid`,
     OCTOS_TUI_SOAK_API_KEY: process.env.OCTOS_TUI_SOAK_API_KEY || 'octos-m19-placeholder-key',
     OCTOS_TUI_SOAK_INIT_PROFILE_LLM: process.env.OCTOS_TUI_SOAK_INIT_PROFILE_LLM || '1',
+    OCTOS_TUI_SOAK_PORT: String(ctx.port),
+    OCTOS_TUI_SOAK_AUTH_TOKEN: ctx.authToken,
     OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
     OCTOS_TUI_SOAK_REQUIRE_PROFILE: '0',
     OCTOS_TUI_SOAK_SOLO_STRICT: process.env.OCTOS_TUI_SOAK_SOLO_STRICT || '0',
@@ -618,6 +689,11 @@ function runLowerRunner(ctx) {
     if (result.error) throw result.error;
     if (result.status !== 0) status = result.status || 1;
     if (step === 'start' && status === 0) {
+      if (ctx.scenario.transport === 'websocket' && !tmuxHasSession(ctx.sessionName)) {
+        console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
+        const fallbackStatus = launchWebsocketTuiFallback(ctx, env);
+        if (fallbackStatus !== 0) status = fallbackStatus;
+      }
       const resize = spawnSync('tmux', [
         'resize-window',
         '-t',
