@@ -77,9 +77,7 @@ const scenarios = new Map([
       id: 'provider-missing-recoverable',
       title: 'Missing Provider Is Recoverable',
       transport: 'stdio',
-      runner: null,
-      blockedMessage:
-        'Provider-missing recovery needs a current-main TUI replay before it can launch in real tmux mode.',
+      runner: 'provider-missing',
       finalMarker: 'M19_PROVIDER_MISSING_FINAL_LINE',
       prompt: 'Show the missing provider recovery path.',
     },
@@ -648,6 +646,9 @@ function launchWebsocketTuiFallback(ctx, env) {
 }
 
 function runnerSteps(ctx) {
+  if (ctx.scenario.runner === 'provider-missing') {
+    return ['start', 'drive-provider-missing', 'drive-solo'];
+  }
   if (ctx.scenario.runner === 'permission-selection') {
     return ['start', 'drive-permissions', 'drive-solo'];
   }
@@ -655,6 +656,7 @@ function runnerSteps(ctx) {
 }
 
 function runLowerRunner(ctx) {
+  const shouldInitProfileLlm = ctx.scenario.runner === 'provider-missing' ? '0' : '1';
   const env = {
     ...process.env,
     OCTOS_REPO: repoRoot,
@@ -673,7 +675,8 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_LOCAL_USERNAME: process.env.OCTOS_TUI_SOAK_LOCAL_USERNAME || ctx.profileId,
     OCTOS_TUI_SOAK_LOCAL_EMAIL: process.env.OCTOS_TUI_SOAK_LOCAL_EMAIL || `${ctx.profileId}@example.invalid`,
     OCTOS_TUI_SOAK_API_KEY: process.env.OCTOS_TUI_SOAK_API_KEY || 'octos-m19-placeholder-key',
-    OCTOS_TUI_SOAK_INIT_PROFILE_LLM: process.env.OCTOS_TUI_SOAK_INIT_PROFILE_LLM || '1',
+    OCTOS_TUI_SOAK_INIT_PROFILE_LLM:
+      process.env.OCTOS_TUI_SOAK_INIT_PROFILE_LLM || shouldInitProfileLlm,
     OCTOS_TUI_SOAK_PORT: String(ctx.port),
     OCTOS_TUI_SOAK_AUTH_TOKEN: ctx.authToken,
     OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
@@ -686,16 +689,19 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
   };
 
-  const action = (name, inherit = true) => spawnSync(ctx.lowerRunner, [name], {
+  const action = (name, inherit = true, envOverrides = {}) => spawnSync(ctx.lowerRunner, [name], {
     cwd: repoRoot,
-    env,
+    env: { ...env, ...envOverrides },
     stdio: inherit ? 'inherit' : 'pipe',
   });
 
   let status = 0;
   for (const step of runnerSteps(ctx)) {
     if (status !== 0) break;
-    const result = action(step);
+    const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
+      ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
+      : {};
+    const result = action(step, true, stepEnv);
     if (result.error) throw result.error;
     if (result.status !== 0) status = result.status || 1;
     if (step === 'start' && status === 0) {

@@ -708,6 +708,58 @@ function checkPermissionSelectionScenario(artifactDir) {
   );
 }
 
+function checkProviderMissingScenario(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'provider_missing_visible_contract',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (
+    scenario.value.id !== 'provider-missing-recoverable'
+    && scenario.value.scenario_id !== 'provider-missing-recoverable'
+  ) {
+    return makeCheck(
+      'provider_missing_visible_contract',
+      true,
+      'provider-missing visible contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const capture = readText(artifactPath(artifactDir, 'tui-capture-provider-missing.txt'));
+  const problems = [];
+  if (!capture.ok) {
+    problems.push(`tui-capture-provider-missing.txt could not be read: ${capture.error}`);
+  } else {
+    for (const expected of [
+      'Set Up LLM Provider',
+      'Load provider catalog',
+      'Selected provider: not selected',
+      'Saved provider: none',
+      'API key: not set',
+      'Open coding session',
+      'save provider first',
+    ]) {
+      if (!capture.text.includes(expected)) {
+        problems.push(`provider-missing capture is missing ${expected}`);
+      }
+    }
+  }
+
+  return makeCheck(
+    'provider_missing_visible_contract',
+    problems.length === 0,
+    problems.length === 0
+      ? 'provider setup surface shows recoverable missing-provider state and setup actions'
+      : `provider-missing visible contract problems: ${problems.join('; ')}`,
+    ['tui-capture-provider-missing.txt'],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -755,6 +807,7 @@ function buildValidation(artifactDir) {
     checkRenderedScreenNoKnownBugPatterns(artifactDir),
     checkScreenGeometryConsistent(artifactDir),
     checkPermissionSelectionScenario(artifactDir),
+    checkProviderMissingScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks

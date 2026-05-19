@@ -82,12 +82,15 @@ expected_artifacts = [
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
+  "tui-capture-provider-missing.txt",
 ]
 acceptance = [
   "appui.provider_missing_banner_present",
   "appui.no_panic",
   "tui.first_frame_not_blank",
+  "provider_missing_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner with no profile LLM to open /provider and preserve the recoverable provider setup capture."
 
 [[scenario]]
 id = "permission-selection"
