@@ -404,6 +404,25 @@ pub async fn send_code(
         .auth_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    // Server-state precheck: if SMTP isn't configured the OTP code path will
+    // silently log to the console (otp.rs::send_otp falls through to a debug
+    // log when smtp_config is None). Surface that to the caller as a clear,
+    // non-enumerating error — this branches on server state, not on whether
+    // any specific email is registered, so it can't be used for account
+    // enumeration. Operator fix is to configure SMTP via the wizard or
+    // directly via POST /api/admin/smtp.
+    if !auth_mgr.smtp_configured().await {
+        tracing::warn!(
+            email = %req.email,
+            "send_code rejected — dashboard_auth.smtp is not configured on this server",
+        );
+        return Ok(Json(SendCodeResponse {
+            ok: false,
+            message: Some(
+                "Email login is not available on this server because SMTP is not configured. Contact the administrator.".into(),
+            ),
+        }));
+    }
     let requested_email = req.email.trim().to_lowercase();
     let scoped_profile_id = trusted_auth_scope_profile_id(&state, &headers);
     let scoped_login_target = scoped_profile_id
@@ -412,7 +431,7 @@ pub async fn send_code(
     let root_login_target = if scoped_profile_id.is_none() {
         match resolve_root_login_target(&state, &requested_email) {
             Some(target) => Some(target),
-            None if auth_mgr.allow_self_registration => Some(RootLoginTarget::Allowlisted),
+            None if auth_mgr.allow_self_registration() => Some(RootLoginTarget::Allowlisted),
             None => None,
         }
     } else {
@@ -432,7 +451,7 @@ pub async fn send_code(
             }));
         }
     } else if root_login_target.is_none() {
-        if !auth_mgr.allow_self_registration {
+        if !auth_mgr.allow_self_registration() {
             tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
             return Ok(Json(SendCodeResponse {
                 ok: false,
@@ -529,10 +548,21 @@ pub async fn auth_status(
             })
         })
         .unwrap_or(false);
-    let email_login_enabled = scoped_profile
+    let user_based_enabled = scoped_profile
         .as_ref()
         .map(|profile| profile.email_login_enabled)
         .unwrap_or(global_email_login_enabled);
+    // Email login is only "enabled" if the server can actually deliver mail.
+    // Without SMTP, send_otp silently logs the code to the server console and
+    // returns success — leaving the dashboard happy to show the email form
+    // but the user never receiving anything. Surfacing the SMTP state here
+    // lets the dashboard hide the email form / display a clear notice.
+    // Server-state, not user-state, so no enumeration risk.
+    let smtp_ready = match state.auth_manager.as_ref() {
+        Some(mgr) => mgr.smtp_configured().await,
+        None => false,
+    };
+    let email_login_enabled = user_based_enabled && smtp_ready;
 
     Ok(Json(AuthStatusResponse {
         bootstrap_mode: is_bootstrap_mode(&state),
@@ -541,7 +571,7 @@ pub async fn auth_status(
         allow_self_registration: state
             .auth_manager
             .as_ref()
-            .map(|m| m.allow_self_registration)
+            .map(|m| m.allow_self_registration())
             .unwrap_or(false),
         scoped_profile,
     }))
@@ -577,7 +607,7 @@ pub async fn verify(
                 message: Some("Invalid or expired code".into()),
             }));
         }
-    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration {
+    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration() {
         return Ok(Json(VerifyResponse {
             ok: false,
             token: None,
@@ -602,7 +632,7 @@ pub async fn verify(
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await
             }
-            None if auth_mgr.allow_self_registration => {
+            None if auth_mgr.allow_self_registration() => {
                 auth_mgr
                     .verify_otp_with_registration(&requested_email, &req.code, true)
                     .await
@@ -2325,6 +2355,26 @@ mod tests {
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
         let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
         let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
+        // Tests that exercise per-email send_code/verify branches expect the
+        // SMTP precheck to pass; populate a synthetic config so the common
+        // fixture stays past the early "SMTP not configured" return. Tests
+        // that specifically check the no-SMTP behavior can clear this with
+        // set_smtp_config(None).
+        let auth_manager = Arc::new(AuthManager::new(
+            Some(crate::otp::DashboardAuthConfig {
+                smtp: Some(crate::otp::SmtpConfig {
+                    host: "smtp.test.invalid".into(),
+                    port: 465,
+                    username: "test@test.invalid".into(),
+                    password_env: "SMTP_PASSWORD".into(),
+                    from_address: "test@test.invalid".into(),
+                }),
+                session_expiry_hours: 24,
+                allow_self_registration: false,
+                static_tokens: Vec::new(),
+            }),
+            user_store.clone(),
+        ));
         let state = AppState {
             auth_token: Some("bootstrap-token".into()),
             admin_token_store: Arc::new(crate::admin_token_store::AdminTokenStore::new(dir.path())),
@@ -2333,7 +2383,7 @@ mod tests {
             profile_store: Some(profile_store.clone()),
             user_store: Some(user_store.clone()),
             allowlist_store: Some(allowlist_store),
-            auth_manager: Some(Arc::new(AuthManager::new(None, user_store.clone()))),
+            auth_manager: Some(auth_manager),
             ..AppState::empty_for_tests()
         };
         (dir, state, user_store, profile_store)
@@ -3030,6 +3080,107 @@ mod tests {
             .user
             .expect("verify should return the scoped user");
         assert_eq!(user.id, "tenant--assistant");
+    }
+
+    #[tokio::test]
+    async fn send_code_returns_clear_error_when_smtp_unconfigured() {
+        // Without SMTP, otp.rs::send_otp silently logs the OTP to the
+        // server console and returns Ok(true). The handler used to forward
+        // that as "Verification code sent to your email", leaving the user
+        // staring at an empty inbox with no error indication. The precheck
+        // now surfaces a clear server-state message — this is the
+        // regression test that locks it in.
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        // Clear the synthetic SMTP that temp_app_state installs so the
+        // precheck fires.
+        state
+            .auth_manager
+            .as_ref()
+            .unwrap()
+            .set_smtp_config(None)
+            .await;
+
+        let resp = send_code(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "anyone@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!resp.0.ok, "send_code must surface failure when SMTP is unconfigured (was masked by anti-enumeration always-success)");
+        let msg = resp.0.message.expect("message should be set");
+        assert!(
+            msg.contains("SMTP is not configured"),
+            "message should explain the server-state issue, not a per-email issue: {msg}"
+        );
+        assert!(
+            msg.contains("administrator"),
+            "message should direct the user to contact admin: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_status_email_login_disabled_when_smtp_unconfigured() {
+        // /api/auth/status drives the dashboard's login-form rendering.
+        // Reporting email_login_enabled=true while SMTP is missing leaves
+        // the dashboard happy to show the email form for a login attempt
+        // that can never succeed. With this change the flag honestly
+        // reflects whether mail can actually be delivered.
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        // Add a top-level user so the user-based half of the AND would
+        // otherwise be true.
+        user_store
+            .save(&User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: "Alice".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        profile_store
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+
+        // First: SMTP configured (the temp_app_state default) → enabled.
+        let Json(status_with_smtp) =
+            auth_status(State(Arc::new(state)), HeaderMap::new()).await.unwrap();
+        assert!(
+            status_with_smtp.email_login_enabled,
+            "with SMTP configured + a login-ready user, email login should be enabled"
+        );
+
+        // Second: clear SMTP → disabled even though the user still exists.
+        let (_dir2, state2, user_store2, profile_store2) = temp_app_state();
+        state2
+            .auth_manager
+            .as_ref()
+            .unwrap()
+            .set_smtp_config(None)
+            .await;
+        user_store2
+            .save(&User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: "Alice".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        profile_store2
+            .save(&make_user_profile("alice", "Alice"))
+            .unwrap();
+        let Json(status_without_smtp) =
+            auth_status(State(Arc::new(state2)), HeaderMap::new()).await.unwrap();
+        assert!(
+            !status_without_smtp.email_login_enabled,
+            "without SMTP, email login must be disabled regardless of user state"
+        );
     }
 
     #[test]

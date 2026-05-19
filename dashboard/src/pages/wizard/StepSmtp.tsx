@@ -27,6 +27,11 @@ export default function StepSmtp({ mode, onContinue }: Props) {
   const [fromAddress, setFromAddress] = useState('')
   const [password, setPassword] = useState('')
   const [passwordConfigured, setPasswordConfigured] = useState(false)
+  // Default-on so a fresh cloud-host install (or any fresh wizard pass)
+  // matches cloud-host-deploy.sh's interactive default. Unchecking this
+  // forces a deliberate operator decision rather than silently leaving
+  // tenants unable to register.
+  const [allowSelfRegistration, setAllowSelfRegistration] = useState(true)
   const [loaded, setLoaded] = useState(false)
 
   const [testTo, setTestTo] = useState('')
@@ -44,6 +49,16 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         setUsername(s.username)
         setFromAddress(s.from_address)
         setPasswordConfigured(s.password_configured)
+        // Always default the checkbox to on when the wizard opens. The
+        // install-time coercion (cloud-host-deploy.sh forcing
+        // ALLOW_SELF_REGISTRATION=false when SMTP is declined) leaves the
+        // saved value at false, but the wizard's intent is to surface this
+        // as the operator's first chance to flip it on. Reflecting saved
+        // state would defeat that. Operators who deliberately want
+        // allowlist-only login uncheck and save here — the next wizard
+        // visit will show on again, which is a small wart vs. the install-
+        // time-coercion silent-disable problem this is closing.
+        setAllowSelfRegistration(true)
         setLoaded(true)
       })
       .catch((e) => {
@@ -64,6 +79,10 @@ export default function StepSmtp({ mode, onContinue }: Props) {
     fromAddress.includes('@') &&
     (password.length > 0 || passwordConfigured)
   const canContinue = !isRequired || allFieldsFilled
+  // Server-side truth for "is SMTP usable right now". The host/from/etc. can
+  // be set without a stored password; without the password OTP delivery
+  // fails, so the warning is gated on both pieces being present.
+  const smtpConfigured = loaded && host.trim().length > 0 && passwordConfigured
 
   const handleSave = async () => {
     setSave({ kind: 'saving' })
@@ -74,6 +93,7 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         username: username.trim(),
         from_address: fromAddress.trim(),
         password: password.length > 0 ? password : undefined,
+        allow_self_registration: allowSelfRegistration,
       })
       setSave({ kind: 'saved' })
       if (password.length > 0) {
@@ -95,6 +115,7 @@ export default function StepSmtp({ mode, onContinue }: Props) {
         username: username.trim(),
         from_address: fromAddress.trim(),
         password: password.length > 0 ? password : undefined,
+        allow_self_registration: allowSelfRegistration,
       })
       if (password.length > 0) {
         setPassword('')
@@ -129,6 +150,33 @@ export default function StepSmtp({ mode, onContinue }: Props) {
               : 'Pick a deployment mode first to know whether this step is required.'}
         </p>
       </div>
+
+      {loaded && !smtpConfigured && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+          <div className="text-sm font-medium text-amber-300 mb-1">
+            SMTP is not configured
+          </div>
+          <div className="text-gray-300">
+            {isRequired
+              ? "Tenants log in via email OTP only — without working SMTP they cannot sign in, and registration/install emails issued by the portal won't be delivered. Strongly recommended to configure here before continuing."
+              : 'OTP login codes will be logged to the server console only. The dashboard will work via admin-token login, but email-based login will not deliver to mailboxes.'}
+          </div>
+          <div className="text-gray-400 mt-2">
+            You can skip this step ("Skip This Step" below) and revisit any time from the sidebar — but tenant onboarding and email login will not work until it's configured.
+          </div>
+        </div>
+      )}
+
+      {loaded && smtpConfigured && (
+        <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-3 text-xs">
+          <div className="text-sm font-medium text-emerald-300 mb-1">
+            SMTP is configured
+          </div>
+          <div className="text-gray-300">
+            A host and password are stored. You can adjust the fields below or run "Send Test" to verify delivery before continuing.
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <div className="col-span-2">
@@ -187,6 +235,21 @@ export default function StepSmtp({ mode, onContinue }: Props) {
           />
         </div>
       </div>
+
+      <label className="flex items-start gap-3 p-3 rounded-lg border border-gray-700/50 bg-background/60 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={allowSelfRegistration}
+          onChange={(e) => setAllowSelfRegistration(e.target.checked)}
+          className="mt-1"
+        />
+        <div className="flex-1 text-sm">
+          <div className="text-white font-medium">Allow self-registration via email OTP</div>
+          <div className="text-xs text-gray-400 mt-0.5">
+            New users can sign in with any email by completing the OTP flow — a profile is created on first verify. Leave on for a public cloud relay; turn off if only invited users (allowlist) should be able to log in. Mirrors <span className="font-mono text-gray-300">cloud-host-deploy.sh</span>'s self-registration prompt.
+          </div>
+        </div>
+      </label>
 
       <div className="border-t border-gray-700/50 pt-3 space-y-2">
         <label className="block text-xs font-medium text-gray-400">Send test email to</label>
