@@ -642,17 +642,25 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            // Always re-insert. The frame may legitimately start with a
-            // compaction-summary System emitted by `for_prompt`; the
-            // runtime System (agent persona + workflow guidance) is a
-            // separate concern. `normalize_system_messages` merges
-            // consecutive Systems into a single `messages[0]` before
-            // the provider call, so both contributions reach the LLM.
-            // Safe to insert unconditionally because
-            // `context_manager::record_message_with_source_ref` early-
-            // returns for System role, so the frame cannot contain the
-            // runtime System itself.
-            messages.insert(0, system);
+            // Merge in place when the frame leads with a System (e.g.
+            // compaction summary). `normalize_system_messages` runs
+            // BEFORE this bridge in the agent loop
+            // (`loop_compaction.rs:35`), so multi-System payloads
+            // produced here would reach the provider unmerged.
+            // Anthropic in particular rejects them outright. See the
+            // AppUI analogue in `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // for the rationale.
+            match messages.first_mut() {
+                Some(first) if first.role == MessageRole::System => {
+                    let existing = std::mem::take(&mut first.content);
+                    first.content = if existing.is_empty() {
+                        system.content
+                    } else {
+                        format!("{}\n\n{}", system.content, existing)
+                    };
+                }
+                _ => messages.insert(0, system),
+            }
         }
         scratch.observed_messages = messages.len();
         {

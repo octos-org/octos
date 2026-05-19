@@ -1956,24 +1956,40 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
         if let Some(system) = runtime_system {
-            // Always re-insert the runtime System at index 0, even if
-            // the frame already leads with a System (which would be a
-            // compaction-summary System emitted by `for_prompt`'s
-            // compaction path — see `context_manager.rs:1159`). The
-            // runtime System (agent persona + slides workflow
-            // guidance, etc.) and the compaction summary serve
-            // different purposes and must both reach the LLM.
-            // `normalize_system_messages` (`message_repair.rs:92`)
-            // merges consecutive Systems into a single `messages[0]`
-            // before the provider call, so the LLM still sees one
-            // System message; this preserves both contributions.
+            // Re-apply the agent's runtime System prompt. Two cases:
             //
-            // Safe to insert unconditionally because
+            //   a) `frame.messages` leads with a System message
+            //      (e.g. a `[Conversation summary]` emitted by
+            //      `for_prompt`'s compaction path —
+            //      `context_manager.rs:1159`). Concatenate the runtime
+            //      System CONTENT into that existing System rather
+            //      than inserting a second one. We do this in-place to
+            //      avoid producing two consecutive `System` messages
+            //      because `normalize_system_messages` runs BEFORE
+            //      this bridge (`loop_compaction.rs:35`) — anything we
+            //      emit here goes straight to the provider, and
+            //      multi-System payloads are rejected by Anthropic
+            //      (single `system` field) and other providers.
+            //
+            //   b) `frame.messages` does not lead with a System.
+            //      Insert the runtime System at index 0.
+            //
+            // Safe to merge unconditionally because
             // `record_message_with_source_ref` early-returns for
-            // System (see `context_manager.rs:752`), so the frame
-            // cannot contain the runtime System itself — only a
-            // compaction summary or nothing.
-            messages.insert(0, system);
+            // `System` role (`context_manager.rs:752`) so the frame
+            // can only contain compaction summaries or no System at
+            // all — never the runtime System itself.
+            match messages.first_mut() {
+                Some(first) if first.role == MessageRole::System => {
+                    let existing = std::mem::take(&mut first.content);
+                    first.content = if existing.is_empty() {
+                        system.content
+                    } else {
+                        format!("{}\n\n{}", system.content, existing)
+                    };
+                }
+                _ => messages.insert(0, system),
+            }
         }
         scratch.observed_messages = messages.len();
         {
