@@ -448,9 +448,22 @@ fn record_prompt_messages_not_covered_by_context(
     let known_messages = manager.for_prompt(policy).messages;
     let covered = covered_prompt_message_indices(messages, &known_messages);
     for (index, message) in messages.iter().enumerate() {
-        if !covered[index] {
-            manager.record_message(message);
+        if covered[index] {
+            continue;
         }
+        // Mirror of the same exemption in
+        // `api::ui_protocol::record_prompt_messages_not_covered_by_context`:
+        // skip System messages. The agent's runtime System prompt is
+        // re-composed on every turn and prepended fresh to
+        // `messages[0]`; recording it here makes the manager stack one
+        // `SystemInstruction` item per turn, which `for_prompt` then
+        // re-emits and `normalize_system_messages` concatenates into a
+        // multi-copy blob. The runtime System is re-applied at the end
+        // of `prepare_prompt`, so dropping it here does not lose it.
+        if message.role == MessageRole::System {
+            continue;
+        }
+        manager.record_message(message);
     }
 }
 
@@ -612,6 +625,15 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             publish_context_manager_status(&self.session_key, &scratch.manager);
         }
 
+        // Capture the caller's runtime System prompt before frame
+        // replacement; re-insert it at index 0 if the frame did not
+        // already lead with one. See the AppUI bridge analogue in
+        // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+        // for the same fix and the rationale.
+        let runtime_system = messages
+            .first()
+            .filter(|m| m.role == MessageRole::System)
+            .cloned();
         let frame = scratch.manager.for_prompt(&policy);
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
@@ -619,6 +641,12 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .zip(frame.messages.iter())
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
+        if let Some(system) = runtime_system {
+            let already_leads = matches!(messages.first(), Some(m) if m.role == MessageRole::System);
+            if !already_leads {
+                messages.insert(0, system);
+            }
+        }
         scratch.observed_messages = messages.len();
         {
             let mut canonical = self

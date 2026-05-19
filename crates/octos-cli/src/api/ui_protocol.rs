@@ -1757,9 +1757,24 @@ fn record_prompt_messages_not_covered_by_context(
     let known_messages = manager.for_prompt(policy).messages;
     let covered = covered_prompt_message_indices(messages, &known_messages);
     for (index, message) in messages.iter().enumerate() {
-        if !covered[index] {
-            manager.record_message(message);
+        if covered[index] {
+            continue;
         }
+        // Skip System messages: the agent freshly composes its runtime
+        // System prompt on every turn via `compose_system_prompt()` and
+        // prepends it to `messages[0]`. Recording that as a
+        // `SystemInstruction` item makes the manager accumulate one
+        // duplicate per turn — `for_prompt` then re-emits all of them
+        // into every LLM call, which `normalize_system_messages` later
+        // concatenates into a single 4×-bloated `messages[0]`. The
+        // runtime System is re-applied at the end of `prepare_prompt`,
+        // so dropping it here does not lose it. (Regression introduced
+        // by commit 28552bb9d which added the AppUI/gateway bridges
+        // without exempting the per-turn runtime System.)
+        if message.role == MessageRole::System {
+            continue;
+        }
+        manager.record_message(message);
     }
 }
 
@@ -1921,6 +1936,18 @@ impl PromptContextManager for AppUiPromptContextBridge {
             publish_appui_context_status(&self.session_id, &scratch.manager);
         }
 
+        // Capture the caller's runtime System prompt (composed by
+        // `compose_system_prompt()` and placed at `messages[0]` by the
+        // agent loop) BEFORE we overwrite `messages` with the manager's
+        // frame. After replacement we re-insert it at index 0 if the
+        // frame did not already lead with a System message — the
+        // manager intentionally does not own the per-turn runtime
+        // System (see `record_prompt_messages_not_covered_by_context`),
+        // and the LLM call requires the runtime System to be present.
+        let runtime_system = messages
+            .first()
+            .filter(|m| m.role == MessageRole::System)
+            .cloned();
         let frame = scratch.manager.for_prompt(&policy);
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
@@ -1928,6 +1955,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .zip(frame.messages.iter())
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
+        if let Some(system) = runtime_system {
+            let already_leads = matches!(messages.first(), Some(m) if m.role == MessageRole::System);
+            if !already_leads {
+                messages.insert(0, system);
+            }
+        }
         scratch.observed_messages = messages.len();
         {
             let mut canonical = self
