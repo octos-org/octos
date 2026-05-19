@@ -592,12 +592,17 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_PROFILE: ctx.profileId,
     OCTOS_TUI_SOAK_SESSION: ctx.sessionId,
     OCTOS_TUI_SOAK_TUI_SESSION: ctx.sessionName,
+    OCTOS_TUI_SOAK_LOCAL_NAME: process.env.OCTOS_TUI_SOAK_LOCAL_NAME || ctx.profileId,
+    OCTOS_TUI_SOAK_LOCAL_USERNAME: process.env.OCTOS_TUI_SOAK_LOCAL_USERNAME || ctx.profileId,
+    OCTOS_TUI_SOAK_LOCAL_EMAIL: process.env.OCTOS_TUI_SOAK_LOCAL_EMAIL || `${ctx.profileId}@example.invalid`,
+    OCTOS_TUI_SOAK_API_KEY: process.env.OCTOS_TUI_SOAK_API_KEY || 'octos-m19-placeholder-key',
+    OCTOS_TUI_SOAK_INIT_PROFILE_LLM: process.env.OCTOS_TUI_SOAK_INIT_PROFILE_LLM || '1',
     OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
     OCTOS_TUI_SOAK_REQUIRE_PROFILE: '0',
     OCTOS_TUI_SOAK_SOLO_STRICT: process.env.OCTOS_TUI_SOAK_SOLO_STRICT || '0',
     OCTOS_TUI_SOAK_SERVER_WAIT_SECS: process.env.OCTOS_TUI_SOAK_SERVER_WAIT_SECS || '1',
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
-    OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '1',
+    OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
   };
 
   const action = (name, inherit = true) => spawnSync(ctx.lowerRunner, [name], {
@@ -623,7 +628,9 @@ function runLowerRunner(ctx) {
         String(ctx.rows),
       ], { stdio: 'ignore' });
       if (resize.error) throw resize.error;
-      if (resize.status !== 0) status = resize.status || 1;
+      if (resize.status !== 0) {
+        console.error(`tmux resize-window failed for ${ctx.sessionName}; capture validation will report if the TUI pane exited`);
+      }
     }
   }
 

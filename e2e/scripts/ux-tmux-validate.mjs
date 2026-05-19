@@ -61,6 +61,11 @@ const KNOWN_CAPTURE_BUG_PATTERNS = [
     regex: /malformed_json|session\.workspace_cwd|requires protocol|provider is unavailable|Task Error|app-ui error|unavailable: AppUI capabilities/,
     detail: 'AppUI or onboarding error text is visible in the capture',
   },
+  {
+    id: 'tmux_session_missing',
+    regex: /tmux session not running:|octos-tui exited with status/,
+    detail: 'tmux capture shows the real TUI pane exited or was missing',
+  },
 ];
 
 const SERVER_DROPPED_TURN_PATTERN =
@@ -323,6 +328,13 @@ function normalizeTranscriptFrame(value) {
     };
   }
   if (value.direction === 'rx') {
+    if (value.notification === true && typeof value.method === 'string') {
+      return {
+        jsonrpc: value.jsonrpc ?? '2.0',
+        method: value.method,
+        params: value.params,
+      };
+    }
     if (isPlainObject(value.error)) {
       return {
         jsonrpc: '2.0',
