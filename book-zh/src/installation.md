@@ -71,6 +71,10 @@ octos --version
 
 ## 各平台安装指南
 
+### NixOS
+
+如果你使用 Nix，Octos 提供了包含软件包、开发环境以及 NixOS / nix-darwin 模块的 Flake。详见 [Nix](nix.md) 页面。
+
 ### macOS
 
 ```bash
