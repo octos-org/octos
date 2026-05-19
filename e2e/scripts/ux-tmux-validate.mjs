@@ -8,6 +8,9 @@ const ARTIFACT_ABI = 'octos.ux.artifacts.v1';
 const REQUIRED_ARTIFACTS = [
   'scenario.json',
   'summary.json',
+  'launch-command.txt',
+  'terminal-size.json',
+  'input-replay.log',
   'appui-transcript.jsonl',
   'server.log',
   'tui-capture.txt',
@@ -18,6 +21,7 @@ const INPUT_ARTIFACTS = REQUIRED_ARTIFACTS.filter((name) => name !== 'validation
 const JSON_ARTIFACTS = new Set([
   'scenario.json',
   'summary.json',
+  'terminal-size.json',
   'runtime-policy-stamp.json',
 ]);
 const VALID_SUMMARY_STATUSES = new Set(['passed', 'failed', 'blocked', 'skipped', 'quarantined']);
@@ -185,6 +189,11 @@ function validateSummaryJson(value) {
   }
   if (value.artifacts !== undefined && !isPlainObject(value.artifacts)) {
     problems.push('summary.json artifacts must be an object when present');
+  } else if (isPlainObject(value.artifacts)) {
+    const missing = REQUIRED_ARTIFACTS.filter((name) => !Object.prototype.hasOwnProperty.call(value.artifacts, name));
+    if (missing.length > 0) {
+      problems.push(`summary.json artifacts omits ${missing.join(', ')}`);
+    }
   }
   return problems;
 }
@@ -196,6 +205,20 @@ function validateRuntimePolicyStampJson(value) {
   }
   if (!isPlainObject(value.stamp) && !isPlainObject(value.runtime_policy_stamp)) {
     problems.push('runtime-policy-stamp.json must include stamp or runtime_policy_stamp object');
+  }
+  return problems;
+}
+
+function validateTerminalSizeJson(value) {
+  const problems = [];
+  if (value.schema !== 'octos.ux.terminal_size.v1') {
+    problems.push('terminal-size.json schema must be octos.ux.terminal_size.v1');
+  }
+  if (!Number.isInteger(value.cols) || value.cols <= 0) {
+    problems.push('terminal-size.json cols must be a positive integer');
+  }
+  if (!Number.isInteger(value.rows) || value.rows <= 0) {
+    problems.push('terminal-size.json rows must be a positive integer');
   }
   return problems;
 }
@@ -221,6 +244,7 @@ function validateExistingValidationJson(file) {
 function validateJsonArtifact(name, value) {
   if (name === 'scenario.json') return validateScenarioJson(value);
   if (name === 'summary.json') return validateSummaryJson(value);
+  if (name === 'terminal-size.json') return validateTerminalSizeJson(value);
   if (name === 'runtime-policy-stamp.json') return validateRuntimePolicyStampJson(value);
   return [];
 }
@@ -404,6 +428,127 @@ function checkAppuiTranscriptParseable(artifactDir) {
   );
 }
 
+function checkRealTmuxEvidence(artifactDir) {
+  const parsed = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (!parsed.ok) {
+    return makeCheck(
+      'real_tmux_evidence',
+      false,
+      `summary.json is not parseable JSON: ${parsed.error}`,
+      ['summary.json'],
+    );
+  }
+
+  const summary = parsed.value;
+  if (summary.mode !== 'run' || ['blocked', 'skipped', 'quarantined'].includes(summary.status)) {
+    return makeCheck(
+      'real_tmux_evidence',
+      true,
+      `real tmux evidence is not required for mode=${summary.mode ?? '<unset>'} status=${summary.status ?? '<unset>'}`,
+      ['summary.json'],
+    );
+  }
+
+  const problems = [];
+  if (summary.status !== 'passed') {
+    problems.push(`summary.status must be passed for a real UX gate, got ${summary.status ?? '<unset>'}`);
+  }
+  if (summary.placeholder_artifacts !== false) {
+    problems.push('summary.placeholder_artifacts must be false for a real UX gate');
+  }
+  if (summary.real_tmux_launched !== true) {
+    problems.push('summary.real_tmux_launched must be true for a real UX gate');
+  }
+
+  return makeCheck(
+    'real_tmux_evidence',
+    problems.length === 0,
+    problems.length === 0
+      ? 'summary confirms this artifact set came from a completed real tmux run'
+      : `real tmux evidence problems: ${problems.join('; ')}`,
+    ['summary.json'],
+  );
+}
+
+function checkAppuiTranscriptSemantic(artifactDir) {
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (!summary.ok) {
+    return makeCheck(
+      'appui_transcript_semantic',
+      false,
+      `summary.json is not parseable JSON: ${summary.error}`,
+      ['summary.json', 'appui-transcript.jsonl'],
+    );
+  }
+  if (summary.value.mode !== 'run' || ['blocked', 'skipped', 'quarantined'].includes(summary.value.status)) {
+    return makeCheck(
+      'appui_transcript_semantic',
+      true,
+      `semantic transcript checks are not required for mode=${summary.value.mode ?? '<unset>'} status=${summary.value.status ?? '<unset>'}`,
+      ['summary.json', 'appui-transcript.jsonl'],
+    );
+  }
+
+  const parsed = parseJsonl(artifactPath(artifactDir, 'appui-transcript.jsonl'));
+  const frameRows = parsed.rows
+    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
+    .filter((entry) => isPlainObject(entry.frame));
+  const methodNames = new Set(
+    frameRows
+      .map((entry) => entry.frame.method)
+      .filter((method) => typeof method === 'string' && method.length > 0),
+  );
+  const requiredMethods = [
+    'config/capabilities/list',
+    'profile/local/create',
+    'permission/profile/list',
+    'permission/profile/set',
+    'session/open',
+    'session/status/read',
+    'tool/status/list',
+  ];
+  const requestIds = new Map();
+  const responseIds = [];
+  const problems = [];
+
+  for (const entry of frameRows) {
+    const { frame } = entry;
+    if (typeof frame.method === 'string' && Object.prototype.hasOwnProperty.call(frame, 'id')) {
+      requestIds.set(String(frame.id), frame.method);
+    }
+    if (Object.prototype.hasOwnProperty.call(frame, 'result') || Object.prototype.hasOwnProperty.call(frame, 'error')) {
+      responseIds.push({ id: frame.id, row: entry.row, hasError: Object.prototype.hasOwnProperty.call(frame, 'error') });
+    }
+  }
+
+  for (const method of requiredMethods) {
+    if (!methodNames.has(method)) {
+      problems.push(`missing required AppUI method ${method}`);
+    }
+  }
+  for (const response of responseIds) {
+    const id = String(response.id);
+    if (requestIds.size > 0 && !requestIds.has(id)) {
+      problems.push(`line ${response.row.line}: response id ${id} has no matching request`);
+    }
+    if (response.hasError) {
+      problems.push(`line ${response.row.line}: transcript contains JSON-RPC error response id ${id}`);
+    }
+  }
+  if (responseIds.length === 0) {
+    problems.push('appui-transcript.jsonl has no JSON-RPC response frames');
+  }
+
+  return makeCheck(
+    'appui_transcript_semantic',
+    problems.length === 0,
+    problems.length === 0
+      ? `transcript includes required onboarding/session/permission methods and ${responseIds.length} correlated response(s)`
+      : `transcript semantic problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
 function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
   const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
   const serverLog = readText(artifactPath(artifactDir, 'server.log'));
@@ -483,6 +628,8 @@ function buildValidation(artifactDir) {
   const checks = [
     checkArtifactAbi(artifactDir),
     checkAppuiTranscriptParseable(artifactDir),
+    checkRealTmuxEvidence(artifactDir),
+    checkAppuiTranscriptSemantic(artifactDir),
     checkRenderedScreenNoKnownBugPatterns(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];

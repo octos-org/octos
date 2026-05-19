@@ -15,6 +15,7 @@ const requiredArtifacts = [
   'validation.json',
   'launch-command.txt',
   'terminal-size.json',
+  'input-replay.log',
   'server.log',
   'tui-capture.txt',
   'runtime-policy-stamp.json',
