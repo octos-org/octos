@@ -3008,6 +3008,7 @@ pub async fn config_check(
             crate::profiles::ChannelCredentials::Matrix { .. } => "matrix",
             crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
             crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
+            crate::profiles::ChannelCredentials::Line { .. } => "line",
         })
         .collect();
 
@@ -3183,6 +3184,14 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             }
             crate::profiles::ChannelCredentials::WeChat { token_env, .. } => {
                 insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Line {
+                channel_secret_env,
+                channel_access_token_env,
+                ..
+            } => {
+                insert_ref(channel_secret_env, "channels");
+                insert_ref(channel_access_token_env, "channels");
             }
             crate::profiles::ChannelCredentials::WhatsApp { .. }
             | crate::profiles::ChannelCredentials::Api { .. }
