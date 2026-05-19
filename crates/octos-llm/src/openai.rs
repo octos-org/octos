@@ -567,33 +567,23 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
 }
 
 fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
-    // Image inlining rules:
+    // Only inline images on USER messages. Tool outputs (Assistant/Tool
+    // role with `media`) are previous-turn artifacts the agent emitted —
+    // e.g. `send_file(skill-output/slides/<slug>/output/slide-NN.png)` —
+    // and feeding them back into the LLM as `image_url` content on every
+    // subsequent turn is both wasteful (~1 MB per slide per call) and
+    // wrong: the LLM never asked to see the rendered output, and some
+    // providers (kimi-k2.5, deepseek, minimax) reject `image_url` parts
+    // outright. Mini3 dspfac slides session 1779130130502-th18yr hit
+    // this when generated slide PNGs were re-encoded on every turn.
     //
-    // 1. `lacks_vision` providers (deepseek, minimax, kimi, etc.) get no
-    //    image_url parts under any circumstance.
-    // 2. Non-User roles never get inline images — assistant/tool media
-    //    fields carry prior-turn tool outputs (e.g.
-    //    `send_file(skill-output/slides/<slug>/output/slide-NN.png)`).
-    //    These should not be re-fed as vision input on subsequent turns.
-    // 3. Paths under `skill-output/` are tool-generated artifacts by
-    //    workspace convention. They are NEVER LLM inputs, regardless of
-    //    which role's media field they end up on. Reproduced live on
-    //    mini3 dspfac session slides-1779130130502-th18yr: the SPA's
-    //    slides editor surfaced a generated slide PNG into the user's
-    //    chat composer attachment field, so the path landed on a
-    //    User-role message and bypassed rule 2. kimi-k2.5 then 400'd
-    //    on every retry of that turn.
-    //
-    // The `read_file` text path still works: the model can read an
-    // image's bytes if it explicitly needs to inspect them, but the
-    // file is not pushed unsolicited into vision content.
+    // The `read_file` text path still works: the assistant can read the
+    // image's bytes if it really needs to inspect them, but the file is
+    // not pushed unsolicited into vision content.
     let images: Vec<_> = if hints.lacks_vision || msg.role != MessageRole::User {
         vec![]
     } else {
-        msg.media
-            .iter()
-            .filter(|p| vision::is_image(p) && !vision::is_tool_output_path(p))
-            .collect()
+        msg.media.iter().filter(|p| vision::is_image(p)).collect()
     };
 
     if images.is_empty() {
@@ -967,29 +957,6 @@ mod tests {
         assert!(p.hints.fixed_temperature);
         assert!(p.hints.lacks_vision);
         assert!(!p.hints.merge_system_messages);
-    }
-
-    #[test]
-    fn test_build_content_strips_tool_output_image_on_user_message() {
-        // Live mini3 reproducer: SPA slides editor surfaced a
-        // generated slide PNG into the chat composer attachment, so
-        // the workspace path `skill-output/slides/<slug>/output/...`
-        // arrived on a User-role message. Role check alone could not
-        // catch this — the path-based filter is the safety net.
-        let hints = ModelHints::default(); // lacks_vision: false
-        let mut user = msg("look at this slide");
-        user.media =
-            vec!["skill-output/slides/deck/output/slide-01.png".to_string()];
-        let content =
-            build_openai_content(&user, &hints).expect("user content should be built");
-        match content {
-            OpenAIContent::Text(text) => {
-                assert_eq!(text, "look at this slide");
-            }
-            OpenAIContent::Parts(_) => {
-                panic!("tool-output image must not be inlined even on User role");
-            }
-        }
     }
 
     #[test]
