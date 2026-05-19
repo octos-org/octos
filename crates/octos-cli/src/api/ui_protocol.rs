@@ -14322,7 +14322,25 @@ async fn run_standalone_turn(
     let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
     let agent_config = session_runtime.agent.agent_config();
-    let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
+    // Per-session system prompt override. Gateway path already reads
+    // `data_dir/session_prompts/<topic>.md` for structured-template
+    // sessions (`/new slides X`, `/new site X`) via
+    // `gateway_runtime::compose_session_prompt`, but the AppUI/WS turn
+    // path never had the equivalent wiring — so slides/site sessions on
+    // the web UI fell back to the generic agent prompt and lost their
+    // workflow guidance. `read_session_prompt` is the canonical reader
+    // in `project_templates.rs`; fall back to the agent's snapshot when
+    // the session has no topic prompt on disk (every non-template
+    // session).
+    let system_prompt_base = session_id
+        .topic()
+        .and_then(|topic| {
+            crate::project_templates::read_session_prompt(
+                &session_runtime.profile.data_dir,
+                topic,
+            )
+        })
+        .unwrap_or_else(|| session_runtime.agent.system_prompt_snapshot());
 
     // Wave4-A: emit an initial `router/status` snapshot adjacent to
     // `turn/started` so clients can render the routing pill before the
@@ -14708,6 +14726,31 @@ async fn run_standalone_turn(
             });
         tool_registry.set_background_result_sender(background_result_sender.clone());
 
+        // Build the SendFile channel + path config UP HERE (before
+        // SpawnTool construction) so we can hand the same `out_tx` and
+        // base-dir set to BOTH the parent SendFileTool registration
+        // AND the spawn-child SendFileTool factory. Pre-fix the child
+        // registry only inherited builtins + plugins + pipeline_factory
+        // — `send_file` was missing, and spawn preflight failed with
+        // "required tool(s) not available on this host: send_file"
+        // whenever a workspace-contract subagent declared `send_file`
+        // among allowed_tools (e.g. mofa_slides post-completion
+        // delivery). Live reproducer on mini3 dspfac session
+        // slides-1779207239761-u8pt1j.
+        let (out_tx, mut out_rx) =
+            mpsc::channel::<octos_core::OutboundMessage>(SEND_FILE_CHANNEL_CAPACITY);
+        let send_file_base = workspace_root
+            .clone()
+            .unwrap_or_else(|| bg_data_dir.clone());
+        let send_file_extras: Vec<PathBuf> = {
+            let mut v = vec![bg_data_dir.clone()];
+            if plugin_root_dir != bg_data_dir {
+                v.push(plugin_root_dir.clone());
+            }
+            v
+        };
+        let send_file_context_session = bg_session_id.0.clone();
+
         let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel::<InboundMessage>(32);
         let mut spawn_tool = octos_agent::SpawnTool::with_context(
             llm_provider.clone(),
@@ -14799,40 +14842,50 @@ async fn run_standalone_turn(
                 )))
             },
         ));
+        // Child SendFileTool factory: every spawned subagent's registry
+        // gets a fresh `SendFileTool` wired to the SAME `out_tx`
+        // channel as the parent, so spawn_only `files_to_send`
+        // deliveries land via the canonical AppUI persist loop below.
+        // Pre-fix (commit 28552bb9d added spawn on AppUI but no child
+        // factory) the child registry was missing `send_file`, breaking
+        // any subagent that the workspace contract auto-delivered via
+        // it.
+        {
+            let factory_out_tx = out_tx.clone();
+            let factory_base = send_file_base.clone();
+            let factory_extras = send_file_extras.clone();
+            let factory_session = send_file_context_session.clone();
+            spawn_tool = spawn_tool.with_child_tool_factory(Arc::new(move || {
+                let mut tool = octos_agent::SendFileTool::new(factory_out_tx.clone())
+                    .with_base_dir(factory_base.clone());
+                for extra in &factory_extras {
+                    tool = tool.with_extra_allowed_dir(extra.clone());
+                }
+                tool.set_context("api", &factory_session);
+                Arc::new(tool) as Arc<dyn octos_agent::tools::Tool>
+            }));
+        }
         tool_registry.register(spawn_tool);
         tool_registry.add_base_tools(["spawn", "check_background_tasks", "read_task_output"]);
 
-        // Wire `send_file` for the legacy non-contract `files_to_send` path
-        // and any explicit agent calls. The spawn_only auto-background
-        // branch falls back to `send_file` when the workspace contract is
-        // `NotConfigured` (`execution.rs:549`) — without this registration,
-        // tools like `deep_search` (no default api-mode workspace policy)
-        // emit `files_to_send` that have nowhere to land.
-        let (out_tx, mut out_rx) =
-            mpsc::channel::<octos_core::OutboundMessage>(SEND_FILE_CHANNEL_CAPACITY);
-        // Mirror gateway's session_actor.rs:2087 base/extra split: use the
-        // session workspace root as the base_dir (so a spawn_only tool
-        // returning `files_to_send: ["output/report.md"]` resolves under
-        // the user's workspace), and keep `data_dir` as an extra-allowed
-        // directory for pipeline-generated artefacts. Fall back to
-        // `data_dir` as base when the session has no workspace (rare —
-        // CLI clients without `session.workspace_cwd.v1` capability).
-        let send_file_base = workspace_root
-            .clone()
-            .unwrap_or_else(|| bg_data_dir.clone());
-        let mut send_file_tool = octos_agent::SendFileTool::new(out_tx)
-            .with_base_dir(send_file_base)
-            .with_extra_allowed_dir(bg_data_dir.clone());
-        // Profiles with a custom `data_dir` outside `bg_data_dir` host
-        // their plugin output under a path the default extras above would
-        // reject. Add `plugin_root_dir` (resolved per-profile via
-        // `routed_profile_id` or `session_id.profile_id()`) as an extra
-        // allowed dir so spawn_only `send_file` deliveries from those
-        // profiles still pass the path-scoping check.
-        if plugin_root_dir != bg_data_dir {
-            send_file_tool = send_file_tool.with_extra_allowed_dir(plugin_root_dir.clone());
+        // Wire the PARENT `send_file` for the legacy non-contract
+        // `files_to_send` path and any explicit agent calls. The
+        // spawn_only auto-background branch falls back to `send_file`
+        // when the workspace contract is `NotConfigured`
+        // (`execution.rs:549`) — without this registration, tools like
+        // `deep_search` (no default api-mode workspace policy) emit
+        // `files_to_send` that have nowhere to land.
+        //
+        // The `out_tx`/`send_file_base`/`send_file_extras`/`send_file_context_session`
+        // bindings were created above (before SpawnTool construction)
+        // so the SAME deps are used by both the parent tool and the
+        // child factory wired into `spawn_tool`.
+        let mut send_file_tool =
+            octos_agent::SendFileTool::new(out_tx).with_base_dir(send_file_base.clone());
+        for extra in &send_file_extras {
+            send_file_tool = send_file_tool.with_extra_allowed_dir(extra.clone());
         }
-        send_file_tool.set_context("api", &bg_session_id.0);
+        send_file_tool.set_context("api", &send_file_context_session);
         tool_registry.register(send_file_tool);
 
         // Drain `OutboundMessage`s emitted by `send_file` calls and persist
