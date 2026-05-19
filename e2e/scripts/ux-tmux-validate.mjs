@@ -142,6 +142,18 @@ function lineMatches(text, regex) {
   return null;
 }
 
+function captureLines(text) {
+  const lines = text.split('\n');
+  while (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  return lines;
+}
+
+function codepointLength(text) {
+  return [...text].length;
+}
+
 function sortedStrings(values) {
   return [...new Set(values)].sort();
 }
@@ -586,6 +598,69 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
   );
 }
 
+function checkScreenGeometryConsistent(artifactDir) {
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (!summary.ok) {
+    return makeCheck(
+      'screen_geometry_consistent',
+      false,
+      `summary.json is not parseable JSON: ${summary.error}`,
+      ['summary.json', 'terminal-size.json', 'tui-capture.txt'],
+    );
+  }
+  if (summary.value.mode !== 'run' || ['blocked', 'skipped', 'quarantined'].includes(summary.value.status)) {
+    return makeCheck(
+      'screen_geometry_consistent',
+      true,
+      `screen geometry checks are not required for mode=${summary.value.mode ?? '<unset>'} status=${summary.value.status ?? '<unset>'}`,
+      ['summary.json', 'terminal-size.json', 'tui-capture.txt'],
+    );
+  }
+
+  const terminal = readJson(artifactPath(artifactDir, 'terminal-size.json'));
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const problems = [];
+  if (!terminal.ok) {
+    problems.push(`terminal-size.json is not parseable JSON: ${terminal.error}`);
+  }
+  if (!capture.ok) {
+    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  }
+  if (problems.length > 0) {
+    return makeCheck(
+      'screen_geometry_consistent',
+      false,
+      `screen geometry problems: ${problems.join('; ')}`,
+      ['terminal-size.json', 'tui-capture.txt'],
+    );
+  }
+
+  const { cols, rows } = terminal.value;
+  const lines = captureLines(capture.text);
+  const maxWidth = lines.reduce((max, line) => Math.max(max, codepointLength(line)), 0);
+  if (lines.length > rows) {
+    problems.push(`capture has ${lines.length} rendered row(s), expected at most ${rows}`);
+  }
+  if (maxWidth > cols) {
+    problems.push(`capture has a ${maxWidth}-column line, expected at most ${cols}`);
+  }
+  if (!capture.text.includes('Composer')) {
+    problems.push('capture is missing the Composer control row');
+  }
+  if (!/(^|\n) state /.test(capture.text)) {
+    problems.push('capture is missing the bottom state row');
+  }
+
+  return makeCheck(
+    'screen_geometry_consistent',
+    problems.length === 0,
+    problems.length === 0
+      ? `capture fits declared terminal size ${cols}x${rows} with max width ${maxWidth} and ${lines.length} row(s)`
+      : `screen geometry problems: ${problems.join('; ')}`,
+    ['terminal-size.json', 'tui-capture.txt'],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -631,6 +706,7 @@ function buildValidation(artifactDir) {
     checkRealTmuxEvidence(artifactDir),
     checkAppuiTranscriptSemantic(artifactDir),
     checkRenderedScreenNoKnownBugPatterns(artifactDir),
+    checkScreenGeometryConsistent(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks
