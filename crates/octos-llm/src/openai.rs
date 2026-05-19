@@ -567,7 +567,20 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
 }
 
 fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
-    let images: Vec<_> = if hints.lacks_vision {
+    // Only inline images on USER messages. Tool outputs (Assistant/Tool
+    // role with `media`) are previous-turn artifacts the agent emitted —
+    // e.g. `send_file(skill-output/slides/<slug>/output/slide-NN.png)` —
+    // and feeding them back into the LLM as `image_url` content on every
+    // subsequent turn is both wasteful (~1 MB per slide per call) and
+    // wrong: the LLM never asked to see the rendered output, and some
+    // providers (kimi-k2.5, deepseek, minimax) reject `image_url` parts
+    // outright. Mini3 dspfac slides session 1779130130502-th18yr hit
+    // this when generated slide PNGs were re-encoded on every turn.
+    //
+    // The `read_file` text path still works: the assistant can read the
+    // image's bytes if it really needs to inspect them, but the file is
+    // not pushed unsolicited into vision content.
+    let images: Vec<_> = if hints.lacks_vision || msg.role != MessageRole::User {
         vec![]
     } else {
         msg.media.iter().filter(|p| vision::is_image(p)).collect()
@@ -944,6 +957,34 @@ mod tests {
         assert!(p.hints.fixed_temperature);
         assert!(p.hints.lacks_vision);
         assert!(!p.hints.merge_system_messages);
+    }
+
+    #[test]
+    fn test_build_content_strips_images_on_assistant_messages() {
+        // Regression for live mini3 dspfac slides session
+        // 1779130130502-th18yr: send_file(slide-NN.png) populated
+        // assistant_msg.media in session_actor.rs, and on every
+        // subsequent turn the openai provider re-encoded the same
+        // generated PNGs into image_url content. That broke kimi
+        // (400 InvalidParameter: "incorrect modal image") and wasted
+        // ~1 MB per slide per call on vision-capable models.
+        //
+        // Inlining vision content should only flow from user→model,
+        // never assistant→model on echo of its own tool outputs.
+        let hints = ModelHints::default(); // lacks_vision: false
+        let mut assistant = msg("I delivered the deck.");
+        assistant.role = MessageRole::Assistant;
+        assistant.media = vec!["skill-output/slides/deck/output/slide-01.png".to_string()];
+        let content = build_openai_content(&assistant, &hints)
+            .expect("assistant content should still be built");
+        match content {
+            OpenAIContent::Text(text) => {
+                assert_eq!(text, "I delivered the deck.");
+            }
+            OpenAIContent::Parts(_) => {
+                panic!("assistant message media must not produce image_url parts");
+            }
+        }
     }
 
     #[test]
