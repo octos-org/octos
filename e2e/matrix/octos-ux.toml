@@ -232,11 +232,16 @@ expected_artifacts = [
   "validation.json",
   "task-ledger.jsonl",
   "artifact-index.json",
+  "tui-capture-task-subagent-tree-running.txt",
+  "tui-capture-task-subagent-tree-final.txt",
+  "m15-evidence/appui-transcript.jsonl",
 ]
 acceptance = [
   "appui.child_parent_wiring_consistent",
   "tui.task_tree_rendered",
+  "task_subagent_tree_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner with OCTOS_M15_LIVE_SUBAGENT_FIXTURE=1 to trigger the real M15 live subagent fixture and preserve task/subagent captures."
 
 [[scenario]]
 id = "restart-reconnect"

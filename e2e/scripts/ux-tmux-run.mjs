@@ -110,12 +110,11 @@ const scenarios = new Map([
     {
       id: 'task-subagent-tree',
       title: 'Task Subagent Tree',
-      transport: 'websocket',
-      runner: null,
-      blockedMessage:
-        'Task/subagent tree depends on recreating the removed M15 live tmux runner under M19.',
+      transport: 'stdio',
+      runner: 'task-subagent-tree',
       finalMarker: 'M19_TASK_SUBAGENT_TREE_FINAL_LINE',
-      prompt: 'Show the task and subagent tree path.',
+      prompt:
+        'Run M15 code review with live subagent orchestration through octos serve --stdio. Use supervised subagents and produce the final marker.',
     },
   ],
   [
@@ -654,6 +653,9 @@ function runnerSteps(ctx) {
   if (ctx.scenario.runner === 'approval-denial') {
     return ['start', 'drive-approval-denial', 'drive-solo'];
   }
+  if (ctx.scenario.runner === 'task-subagent-tree') {
+    return ['start', 'drive-task-subagent-tree', 'drive-solo'];
+  }
   return ['start', 'drive-solo'];
 }
 
@@ -690,6 +692,15 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
+    ...(ctx.scenario.runner === 'task-subagent-tree'
+      ? {
+        OCTOS_M15_LIVE_SUBAGENT_FIXTURE: '1',
+        OCTOS_TUI_M15_UX_OUTPUT_DIR: path.join(ctx.workdir, '.octos-m15-evidence'),
+        OCTOS_TUI_M15_UX_WORKDIR: ctx.workdir,
+        OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE:
+          process.env.OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE || '0.25',
+      }
+      : {}),
   };
 
   const action = (name, inherit = true, envOverrides = {}) => spawnSync(ctx.lowerRunner, [name], {

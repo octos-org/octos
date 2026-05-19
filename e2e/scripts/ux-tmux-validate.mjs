@@ -807,6 +807,88 @@ function checkApprovalDenialScenario(artifactDir) {
   );
 }
 
+function checkTaskSubagentTreeScenario(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'task_subagent_tree_visible_contract',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (scenario.value.id !== 'task-subagent-tree' && scenario.value.scenario_id !== 'task-subagent-tree') {
+    return makeCheck(
+      'task_subagent_tree_visible_contract',
+      true,
+      'task-subagent-tree visible contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const runningCapture = readText(artifactPath(artifactDir, 'tui-capture-task-subagent-tree-running.txt'));
+  const finalCapture = readText(artifactPath(artifactDir, 'tui-capture-task-subagent-tree-final.txt'));
+  const transcriptPath = artifactPath(artifactDir, path.join('m15-evidence', 'appui-transcript.jsonl'));
+  const parsed = parseJsonl(transcriptPath);
+  const frameRows = parsed.rows
+    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
+    .filter((entry) => isPlainObject(entry.frame));
+  const methodNames = new Set(
+    frameRows
+      .map((entry) => entry.frame.method)
+      .filter((method) => typeof method === 'string' && method.length > 0),
+  );
+  const requiredMethods = [
+    'turn/start',
+    'turn/started',
+    'task/updated',
+    'task/output/delta',
+    'agent/updated',
+    'message/delta',
+    'turn/completed',
+  ];
+  const problems = [];
+  if (!runningCapture.ok) {
+    problems.push(`tui-capture-task-subagent-tree-running.txt could not be read: ${runningCapture.error}`);
+  } else if (!/Live code review subagent swarm|Agent task|fixture turn running/.test(runningCapture.text)) {
+    problems.push('running task/subagent capture is missing a visible task or fixture-running marker');
+  }
+  if (!finalCapture.ok) {
+    problems.push(`tui-capture-task-subagent-tree-final.txt could not be read: ${finalCapture.error}`);
+  } else {
+    if (!/Code Review Summary|Review Summary/.test(finalCapture.text)) {
+      problems.push('final task/subagent capture is missing review summary heading');
+    }
+    for (const expected of ['Scatter-join complete', 'M15CODEREVIEWFINALLINE']) {
+      if (!finalCapture.text.includes(expected)) problems.push(`final task/subagent capture is missing ${expected}`);
+    }
+  }
+  if (!fs.existsSync(transcriptPath)) {
+    problems.push('m15-evidence/appui-transcript.jsonl is missing');
+  }
+  for (const error of parsed.errors) {
+    problems.push(`m15 evidence transcript line ${error.line}: ${error.error}`);
+  }
+  for (const method of requiredMethods) {
+    if (!methodNames.has(method)) {
+      problems.push(`m15 evidence transcript missing ${method}`);
+    }
+  }
+
+  return makeCheck(
+    'task_subagent_tree_visible_contract',
+    problems.length === 0,
+    problems.length === 0
+      ? 'task/subagent fixture rendered running and final TUI states with M15 AppUI transcript evidence'
+      : `task/subagent tree visible contract problems: ${problems.join('; ')}`,
+    [
+      'tui-capture-task-subagent-tree-running.txt',
+      'tui-capture-task-subagent-tree-final.txt',
+      'm15-evidence/appui-transcript.jsonl',
+    ],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -856,6 +938,7 @@ function buildValidation(artifactDir) {
     checkPermissionSelectionScenario(artifactDir),
     checkProviderMissingScenario(artifactDir),
     checkApprovalDenialScenario(artifactDir),
+    checkTaskSubagentTreeScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks
