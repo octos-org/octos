@@ -29,6 +29,9 @@ on_verify = [
     "file_exists:$artifact",
     "file_size_min:$artifact:1024",
 ]
+on_completion = [
+    { kind = "audio_non_silent", source = "spawn_only_files", extension = "mp3", min_ratio = 0.3 },
+]
 on_failure = ["notify_user:TTS generation failed"]
 
 [spawn_tasks.podcast_generate]

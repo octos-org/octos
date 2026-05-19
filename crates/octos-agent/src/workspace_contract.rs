@@ -836,7 +836,15 @@ mod tests {
     #[tokio::test]
     async fn tts_contract_resolves_new_mp3_for_actor_delivery() {
         let temp = tempfile::tempdir().unwrap();
-        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        if let Some(task) = policy.spawn_tasks.get_mut("fm_tts") {
+            // This test exercises legacy artifact resolution for actor
+            // delivery. The default fm_tts validator now decodes the
+            // plugin-reported MP3 from files_to_send; validator behavior is
+            // covered separately and would reject these fake MP3 bytes.
+            task.on_completion.clear();
+        }
+        write_workspace_policy(temp.path(), &policy).unwrap();
         let output = temp.path().join("tts_result.mp3");
         std::fs::write(&output, vec![1u8; 2048]).unwrap();
 

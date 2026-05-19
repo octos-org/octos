@@ -98,6 +98,17 @@ fn should_load_workspace_policy_v1_session_fixture() {
             .any(|line| line == "file_size_min:$artifact:1024"),
         "expected fm_tts verify action for artifact size",
     );
+    assert!(
+        tts.on_completion.iter().any(|entry| matches!(
+            entry,
+            SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent {
+                source: ValidatorFileSource::SpawnOnlyFiles,
+                extension,
+                ..
+            }) if extension.as_deref() == Some("mp3")
+        )),
+        "expected fm_tts AudioNonSilent validator over spawn_only_files mp3",
+    );
 
     // octos #1034: the podcast_generate contract opts into the
     // `spawn_only_files` source via the new ABI fields. The fixture is the
