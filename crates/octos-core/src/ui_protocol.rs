@@ -5180,6 +5180,11 @@ mod tests {
             UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
             "coding.loop_runtime.v1"
         );
+        assert_eq!(UI_PROTOCOL_FEATURE_REVIEW_START_V1, "review.start.v1");
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            "context.lifecycle.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -5216,6 +5221,7 @@ mod tests {
                 "loop/pause",
                 "loop/resume",
                 "loop/fire_now",
+                "review/start",
                 "session/list",
                 "session/snapshot",
                 "session/messages_page",
@@ -5268,6 +5274,8 @@ mod tests {
                 "loop/updated",
                 "loop/fired",
                 "loop/completed",
+                "context/compaction_completed",
+                "context/normalization_reported",
             ]
         );
         assert_eq!(
@@ -5304,6 +5312,7 @@ mod tests {
                 "loop/pause",
                 "loop/resume",
                 "loop/fire_now",
+                "review/start",
                 "session/list",
                 "session/snapshot",
                 "session/messages_page",
@@ -5373,6 +5382,7 @@ mod tests {
                     "loop/pause",
                     "loop/resume",
                     "loop/fire_now",
+                    "review/start",
                     "session/list",
                     "session/snapshot",
                     "session/messages_page",
@@ -5421,7 +5431,9 @@ mod tests {
                     "session/goal/cleared",
                     "loop/updated",
                     "loop/fired",
-                    "loop/completed"
+                    "loop/completed",
+                    "context/compaction_completed",
+                    "context/normalization_reported"
                 ],
                 "supported_features": [
                     "approval.typed.v1",
@@ -5439,6 +5451,7 @@ mod tests {
                     "coding.agent_control.v1",
                     "coding.goal_runtime.v1",
                     "coding.loop_runtime.v1",
+                    "review.start.v1",
                     "context.lifecycle.v1"
                 ]
             })
