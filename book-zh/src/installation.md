@@ -33,9 +33,6 @@ cargo install --path crates/octos-cli
 # 启用消息渠道
 cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
 
-# 启用浏览器自动化（需要 Chrome/Chromium）
-cargo install --path crates/octos-cli --features browser
-
 # 启用 Web 界面和 REST API
 cargo install --path crates/octos-cli --features api
 
