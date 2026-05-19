@@ -4052,6 +4052,7 @@ impl SessionActor {
                      /status — show agent status\n\
                      /adaptive — view adaptive routing\n\
                      /router — inspect/switch adaptive router (status, set, metrics)\n\
+                     /queue — view or change queue mode\n\
                      /reset — reset session state\n\
                      /help — show this help",
                 )
@@ -13438,6 +13439,32 @@ mod tests {
         assert!(
             reply.content.contains("not enabled"),
             "expected not-enabled notice: {}",
+            reply.content
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_command_help_lists_queue_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::ZERO, make_response("noop"))],
+        ));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_inbound("/unknown")).await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("help reply must arrive")
+            .expect("channel must not close");
+        assert!(
+            reply.content.contains("/queue"),
+            "unknown-command help must list /queue: {}",
             reply.content
         );
 
