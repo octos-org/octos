@@ -120,21 +120,20 @@ pub fn slides_creation_reply(project_name: &str) -> String {
     )
 }
 
-/// Embedded default slides system prompt. Override at runtime by placing a
-/// modified copy at `~/.octos/prompts/slides.md` (see `load_prompt` in
-/// `commands/mod.rs`). Two placeholders are substituted at render time:
+/// Embedded slides system prompt. Compiled into the binary at build time —
+/// there is intentionally no runtime override path. The slides workflow is
+/// opinionated (mofa_slides + script.js + style toml convention) and should
+/// not drift per deployment; updates ship via the normal Rust build path so
+/// every host runs an identical contract.
+///
+/// Placeholders substituted at render time:
 ///   - `{project_name}` — the topic name from `/new slides <name>`
 ///   - `{slug}` — the slugified form used as the workspace dir name
 ///   - `{delete_cached_png_instruction}` — platform-specific shell snippet
 ///     for clearing cached slide PNGs (cmd.exe on Windows, sh on Unix)
-const SLIDES_PROMPT_DEFAULT: &str = include_str!("prompts/slides_default.txt");
+const SLIDES_PROMPT_TEMPLATE: &str = include_str!("prompts/slides_default.txt");
 
 /// Generate the slides-specific system prompt for a session.
-///
-/// Loads the prompt from `~/.octos/prompts/slides.md` if it exists,
-/// otherwise from the compiled-in default at `prompts/slides_default.md`.
-/// Substitutes `{project_name}`, `{slug}`, and the platform-conditional
-/// `{delete_cached_png_instruction}` placeholders.
 fn slides_system_prompt(project_name: &str) -> String {
     let slug = slugify(project_name);
     let delete_cached_png_instruction = if cfg!(windows) {
@@ -146,8 +145,8 @@ fn slides_system_prompt(project_name: &str) -> String {
             "  shell(\"rm -f slides/{slug}/output/imgs/slide-NN.png\") for each changed slide N"
         )
     };
-    let raw = crate::commands::load_prompt("slides", SLIDES_PROMPT_DEFAULT);
-    raw.replace("{project_name}", project_name)
+    SLIDES_PROMPT_TEMPLATE
+        .replace("{project_name}", project_name)
         .replace("{slug}", &slug)
         .replace(
             "{delete_cached_png_instruction}",
