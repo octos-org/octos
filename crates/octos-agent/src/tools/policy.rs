@@ -155,12 +155,18 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:fs",
         description: "File operations: read, write, edit, and diff-edit files",
-        tools: &["read_file", "write_file", "edit_file", "diff_edit"],
+        tools: &[
+            "read_file",
+            "write_file",
+            "apply_patch",
+            "edit_file",
+            "diff_edit",
+        ],
     },
     ToolGroupInfo {
         name: "group:runtime",
         description: "Shell command execution",
-        tools: &["shell"],
+        tools: &["shell", "exec_command", "write_stdin"],
     },
     ToolGroupInfo {
         name: "group:web",
@@ -175,7 +181,14 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     ToolGroupInfo {
         name: "group:sessions",
         description: "Spawn background subagents for parallel tasks",
-        tools: &["spawn"],
+        tools: &[
+            "spawn",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ],
     },
     ToolGroupInfo {
         name: "group:memory",

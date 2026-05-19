@@ -9,17 +9,23 @@
 
 pub mod admin;
 pub mod admin_setup;
+pub(crate) mod agent_orchestrator;
 pub mod auth_handlers;
+pub(crate) mod coding_tool_contract;
 mod events;
 mod events_harness;
 mod frps_plugin;
+pub(crate) mod goal_loop_runtime;
 mod handlers;
+pub(crate) mod master_continuation_scheduler;
 pub mod metrics;
 pub mod preview;
 pub mod preview_tokens;
 pub mod purge;
 mod router;
+pub(crate) mod specialist_runner;
 mod static_files;
+pub(crate) mod supervisor_store;
 pub mod swarm;
 pub(crate) mod ui_protocol;
 mod ui_protocol_alpha2_bridge;

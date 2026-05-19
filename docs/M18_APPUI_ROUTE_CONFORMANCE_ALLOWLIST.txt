@@ -1,0 +1,34 @@
+# M18 AppUI Route Conformance Allowlist
+
+Status: strict runtime gaps fail
+Date: 2026-05-18
+Issues: octos#1030, octos#1032
+
+The M18 same-scenario runner writes these artifacts for every run:
+
+- appui-ws-transcript.jsonl
+- appui-stdio-transcript.jsonl
+- normalized-diff.json
+- server.log
+- runtime-policy-stamp.json
+
+Checked-in conformance metadata lives under:
+
+- e2e/fixtures/appui-conformance/m18-route-inventory.json
+- e2e/fixtures/appui-conformance/m18-conformance-allowlist.json
+
+Current allowlist policy:
+
+- Runtime method/result/error mismatches are not allowlisted, except for the
+  explicit stdio auth context case below. If stdio advertises a method, the
+  same-scenario runner expects the same semantic result or the same typed error
+  class as WebSocket.
+- Auth-bound probes (`auth/me`, `content/list`, `content/delete`) may differ
+  only when stdio returns typed `auth_unavailable`; this proves the route does
+  not silently fall back to `_main` or fail with a transport close.
+- The only accepted normalization is environment-shaped data: per-run
+  timestamps, JSON-RPC ids, generated turn/task ids, and absolute filesystem
+  roots in runtime policy stamps and artifacts.
+- Router, profile, auth, and content probes are intentionally strict. Any
+  advertised-method failure outside a shared typed runtime-unavailable result
+  is reported as an unexpected difference.

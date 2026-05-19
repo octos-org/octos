@@ -26,7 +26,7 @@ use crate::commands::gateway::build_system_prompt;
 use crate::commands::gateway::profile_factory::{profile_plugin_env, profile_search_provider_keys};
 use crate::config::Config;
 use crate::cron_tool::CronTool;
-use crate::profiles::{UserProfile, config_from_profile};
+use crate::profiles::{ReviewConfig, UserProfile, config_from_profile};
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::skills_scope::{
     build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
@@ -223,6 +223,13 @@ pub struct ProfileRuntime {
     /// gateway can reuse the bootstrap's `PluginLoadResult` without
     /// re-running plugin discovery.
     pub plugin_hooks: Vec<octos_agent::HookConfig>,
+
+    /// Profile-owned coding review fanout template. `None` means the
+    /// AppUI `/review` path should use its built-in default
+    /// specialists. Keeping this on `ProfileRuntime` lets the review
+    /// workflow resolve specialists from the same profile runtime that
+    /// owns model, memory, sandbox, and tools.
+    pub review_config: Option<ReviewConfig>,
 
     /// Long-lived [`EpisodeStore`] for this profile (redb at
     /// `<data_dir>/episodes.redb`). Shared across all sessions of
@@ -851,6 +858,7 @@ impl ProfileRuntime {
             plugin_dirs,
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
+            review_config: profile.config.review.clone(),
             system_prompt,
             memory,
             memory_store,

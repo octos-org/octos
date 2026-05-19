@@ -616,6 +616,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
+pub mod codex_tools;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
@@ -655,6 +656,10 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
+pub use codex_tools::{
+    ApplyPatchTool, CloseAgentTool, ExecCommandTool, RequestUserInputTool, ResumeAgentTool,
+    SendInputTool, SpawnAgentTool, UpdatePlanTool, WaitAgentTool, WriteStdinTool,
+};
 pub use deep_search::DeepSearchTool;
 pub use delegate::{
     DELEGATED_DENY_GROUP, DELEGATION_METRIC, DelegateTool, DelegationEvent, DelegationOutcome,
@@ -668,9 +673,9 @@ pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
 pub use mcp_agent::{
     DEFAULT_DISPATCH_TIMEOUT_SECS, DEFAULT_HTTP_CONNECT_TIMEOUT_SECS,
-    DEFAULT_HTTP_READ_TIMEOUT_SECS, DispatchOutcome, DispatchRequest, DispatchResponse,
-    HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, SharedBackend, StdioMcpAgent,
-    build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    DEFAULT_HTTP_READ_TIMEOUT_SECS, DispatchContextContract, DispatchOutcome, DispatchRequest,
+    DispatchResponse, HttpMcpAgent, McpAgentBackend, McpAgentBackendConfig, SharedBackend,
+    StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
 pub use message::MessageTool;

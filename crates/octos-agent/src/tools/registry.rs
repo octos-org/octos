@@ -15,10 +15,12 @@ use crate::task_supervisor::TaskSupervisor;
 use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
-    BrowserTool, CheckWorkspaceContractTool, ConfigureToolTool, DiffEditTool, EditFileTool,
-    GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle,
-    ToolResult, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
-    WorkspaceShowTool, WriteFileTool,
+    ApplyPatchTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool, ConfigureToolTool,
+    DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool, ListDirTool, ReadFileTool,
+    RequestUserInputTool, ResumeAgentTool, SendInputTool, ShellTool, SpawnAgentTool, Tool,
+    ToolConfigStore, ToolLifecycle, ToolResult, UpdatePlanTool, WaitAgentTool, WebFetchTool,
+    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
+    WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -345,13 +347,28 @@ impl ToolRegistry {
 
     /// Register a tool.
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name().to_string(), Arc::new(tool));
+        let name = tool.name().to_string();
+        let tool: Arc<dyn Tool> = Arc::new(tool);
+        self.tools.insert(name.clone(), tool.clone());
+        if name == "spawn" {
+            self.tools.insert(
+                "spawn_agent".to_string(),
+                Arc::new(SpawnAgentTool::with_delegate(tool)),
+            );
+        }
         self.invalidate_cache();
     }
 
     /// Register a tool from an existing Arc (for keeping a separate reference).
     pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        self.tools.insert(name.clone(), tool.clone());
+        if name == "spawn" {
+            self.tools.insert(
+                "spawn_agent".to_string(),
+                Arc::new(SpawnAgentTool::with_delegate(tool)),
+            );
+        }
         self.invalidate_cache();
     }
 
@@ -1035,14 +1052,34 @@ impl ToolRegistry {
         let cwd = cwd.as_ref();
         let mut registry = Self::new();
         registry.workspace_root = Some(cwd.to_path_buf());
+        let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
         registry.register(
             ShellTool::new(cwd)
-                .with_sandbox(sandbox)
+                .with_shared_sandbox(sandbox.clone())
                 .with_policy(permissions.shell_command_policy())
                 .with_approval_policy(permissions.approval_policy),
         );
+        registry.register(
+            ExecCommandTool::new(cwd, sandbox)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry.register(WriteStdinTool);
+        registry.register(UpdatePlanTool);
+        registry.register(RequestUserInputTool);
+        registry.register(SpawnAgentTool::new());
+        registry.register(SendInputTool);
+        registry.register(ResumeAgentTool);
+        registry.register(WaitAgentTool);
+        registry.register(CloseAgentTool);
         registry
             .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
+        registry.register(
+            ApplyPatchTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
         registry.register(
             DiffEditTool::new(cwd)
                 .with_filesystem_scope(permissions.filesystem_scope)
@@ -1080,8 +1117,10 @@ impl ToolRegistry {
     /// Used by `rebind_cwd()` to re-register these tools with a new workspace path.
     pub const CWD_BOUND_TOOLS: &'static [&'static str] = &[
         "shell",
+        "exec_command",
         "read_file",
         "write_file",
+        "apply_patch",
         "edit_file",
         "diff_edit",
         "glob",
@@ -1115,15 +1154,27 @@ impl ToolRegistry {
         // Clone everything except cwd-bound tools
         let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
         registry.workspace_root = Some(cwd.to_path_buf());
+        let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
         // Re-register cwd-bound tools with the new workspace
         registry.register(
             ShellTool::new(cwd)
-                .with_sandbox(sandbox)
+                .with_shared_sandbox(sandbox.clone())
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        registry.register(
+            ExecCommandTool::new(cwd, sandbox)
+                .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
                 .with_approval_policy(permissions.approval_policy),
         );
         registry
             .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
+        registry.register(
+            ApplyPatchTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
         registry.register(
             DiffEditTool::new(cwd)
                 .with_filesystem_scope(permissions.filesystem_scope)

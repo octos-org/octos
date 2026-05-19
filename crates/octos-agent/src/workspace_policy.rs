@@ -859,7 +859,14 @@ impl WorkspacePolicy {
             on_complete: vec![],
             on_deliver: vec![],
             on_failure: vec!["notify_user:TTS generation failed".into()],
-            on_completion: Vec::new(),
+            on_completion: vec![SpawnTaskValidatorSpec::Bare(
+                ValidatorSpec::AudioNonSilent {
+                    glob: "skill-output/**/*.{wav,mp3}".into(),
+                    min_ratio: default_non_silent_ratio(),
+                    source: ValidatorFileSource::Glob,
+                    extension: None,
+                },
+            )],
         };
 
         let podcast_contract = WorkspaceSpawnTaskPolicy {
@@ -1717,6 +1724,24 @@ mod tests {
         assert!(task.artifacts.is_empty());
         assert!(task.on_complete.is_empty());
         assert!(task.on_deliver.is_empty());
+        // fm_tts must validate the audio is non-silent across both wav (default
+        // ominix-api PCM output) and mp3 (post-encode) extensions. Closes the
+        // gap where a tiny silent placeholder ≥1024 bytes would pass the size
+        // check at on_verify but never get its content inspected.
+        let audio_validator = task
+            .on_completion
+            .iter()
+            .find_map(|v| match v {
+                SpawnTaskValidatorSpec::Bare(ValidatorSpec::AudioNonSilent { glob, .. }) => {
+                    Some(glob.as_str())
+                }
+                _ => None,
+            })
+            .expect("fm_tts must declare an AudioNonSilent validator");
+        assert!(
+            audio_validator.contains("wav") && audio_validator.contains("mp3"),
+            "fm_tts AudioNonSilent glob must cover both wav and mp3: {audio_validator}"
+        );
 
         assert_eq!(
             policy

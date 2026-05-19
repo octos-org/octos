@@ -367,6 +367,7 @@ impl McpAgentBackend for AlwaysSuccessMcpBackend {
             output: "fake remote success".to_string(),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }
