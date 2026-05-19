@@ -183,9 +183,7 @@ fn resolve_dashboard_auth_smtp_password(
     for profile in &profiles_for_smtp {
         if let Some(password) = profile.config.env_vars.get(&smtp.password_env) {
             if password == crate::auth::keychain::KEYCHAIN_MARKER {
-                if let Ok(Some(secret)) =
-                    crate::auth::keychain::get_secret(&smtp.password_env)
-                {
+                if let Ok(Some(secret)) = crate::auth::keychain::get_secret(&smtp.password_env) {
                     tracing::info!(
                         var = %smtp.password_env,
                         "SMTP password resolved from keychain"
@@ -1162,7 +1160,10 @@ mod tests {
         assert_eq!(auth.smtp.as_ref().unwrap().port, 587);
         assert_eq!(auth.smtp.as_ref().unwrap().username, "admin@example.com");
         assert_eq!(auth.smtp.as_ref().unwrap().password_env, "SMTP_PASSWORD");
-        assert_eq!(auth.smtp.as_ref().unwrap().from_address, "admin@example.com");
+        assert_eq!(
+            auth.smtp.as_ref().unwrap().from_address,
+            "admin@example.com"
+        );
         assert_eq!(password.as_deref(), Some("secret"));
     }
 

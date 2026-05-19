@@ -78,7 +78,17 @@ impl ModelHints {
             || m.starts_with("minimax")
             || m.contains("codestral")
             || m.starts_with("mistral")
-            || m.starts_with("yi-");
+            || m.starts_with("yi-")
+            // 2026-05-18: kimi-k2.5 returns
+            //   `400 InvalidParameter: incorrect modal "image" was entered,
+            //    which may not be supported by the model`
+            // when image_url content parts are present. Production users on
+            // mini3 (dspfac profile) hit this when attaching slide PNGs as
+            // user-uploaded media. The text-only fallback (`[user-uploaded
+            // files: ...]`) lets kimi still process the turn and ask the
+            // agent to `read_file` the attachment if needed.
+            || m.contains("kimi")
+            || m.contains("moonshot");
 
         Self {
             uses_completion_tokens,
@@ -867,7 +877,12 @@ mod tests {
         let h = ModelHints::detect("kimi-k2.5");
         assert!(!h.uses_completion_tokens);
         assert!(h.fixed_temperature);
-        assert!(!h.lacks_vision);
+        // 2026-05-18: empirically kimi-k2.5 returns
+        //   `400 InvalidParameter: incorrect modal "image" was entered`
+        // when sent image_url content parts. Reproduced live on mini3
+        // (dspfac profile, session slides-1779130130502-th18yr) with
+        // a user-uploaded PNG. Treat kimi as text-only.
+        assert!(h.lacks_vision);
     }
 
     #[test]
