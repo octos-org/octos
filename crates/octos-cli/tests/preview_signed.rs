@@ -126,13 +126,13 @@ async fn build_fixture_with_ttl(ttl: std::time::Duration) -> Fixture {
     user_store.save(&user_b).expect("save user b");
 
     let auth_cfg = DashboardAuthConfig {
-        smtp: SmtpConfig {
+        smtp: Some(SmtpConfig {
             host: "smtp.invalid".into(),
             port: 465,
             username: "no-reply@invalid".into(),
             password_env: "OCTOS_TEST_NO_SMTP".into(),
             from_address: "no-reply@invalid".into(),
-        },
+        }),
         session_expiry_hours: 1,
         allow_self_registration: false,
         static_tokens: vec![STATIC_TOKEN_A.into(), STATIC_TOKEN_B.into()],

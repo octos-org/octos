@@ -3008,6 +3008,7 @@ pub async fn config_check(
             crate::profiles::ChannelCredentials::Matrix { .. } => "matrix",
             crate::profiles::ChannelCredentials::QQBot { .. } => "qq-bot",
             crate::profiles::ChannelCredentials::WeChat { .. } => "wechat",
+            crate::profiles::ChannelCredentials::Line { .. } => "line",
         })
         .collect();
 
@@ -3183,6 +3184,14 @@ fn collect_env_var_refs(config: &ProfileConfig) -> Vec<EnvVarReferenceStatus> {
             }
             crate::profiles::ChannelCredentials::WeChat { token_env, .. } => {
                 insert_ref(token_env, "channels");
+            }
+            crate::profiles::ChannelCredentials::Line {
+                channel_secret_env,
+                channel_access_token_env,
+                ..
+            } => {
+                insert_ref(channel_secret_env, "channels");
+                insert_ref(channel_access_token_env, "channels");
             }
             crate::profiles::ChannelCredentials::WhatsApp { .. }
             | crate::profiles::ChannelCredentials::Api { .. }
@@ -4094,13 +4103,13 @@ mod register_tenant_email_tests {
         let auth_manager = Arc::new(
             AuthManager::new(
                 Some(DashboardAuthConfig {
-                    smtp: SmtpConfig {
+                    smtp: Some(SmtpConfig {
                         host: "smtp.example.com".into(),
                         port: 465,
                         username: "octos".into(),
                         password_env: "SMTP_PASSWORD".into(),
                         from_address: "noreply@example.com".into(),
-                    },
+                    }),
                     session_expiry_hours: 24,
                     allow_self_registration: true,
                     static_tokens: Vec::new(),
