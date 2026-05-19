@@ -611,8 +611,7 @@ pub async fn session_messages(
     // scope IS the tenant boundary (the request's profile_data_dir
     // resolves only sessions belonging to that profile).
     if !use_full {
-        if let Ok(profile_data_dir) =
-            resolve_profile_data_dir(&state, &headers, identity_ref).await
+        if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await
         {
             if let Some(history) = read_profile_session_messages(
                 &profile_data_dir,
@@ -3751,9 +3750,8 @@ mod tests {
         // Persist a session under the bare-form key the SPA actually
         // uses for slides. Round-trip through `SessionManager` so the
         // file layout matches production exactly.
-        let bare_key = SessionKey(
-            "slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string(),
-        );
+        let bare_key =
+            SessionKey("slides-1779130130502-th18yr#slides untitled-deck-th18yr".to_string());
         {
             let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
             mgr.add_message(&bare_key, octos_core::Message::user("hello"))

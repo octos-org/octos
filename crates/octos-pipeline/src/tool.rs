@@ -267,8 +267,7 @@ impl Tool for RunPipelineTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        let pipeline_desc =
-            "Name of the sanctioned pipeline to run. The only currently \
+        let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
              sanctioned name is `deep_research`. Do NOT pass an inline \
              DOT graph here — inline DOT was the legacy free-form \
              contract; the executor still accepts it for operator \
@@ -278,7 +277,7 @@ impl Tool for RunPipelineTool {
              domain (`mofa_slides` for slides, `podcast_generate` for \
              podcasts, `voice_synthesize` for TTS, etc.), or tell the \
              user no such tool exists for their request."
-                .to_string();
+            .to_string();
 
         serde_json::json!({
             "type": "object",
