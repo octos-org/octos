@@ -2604,14 +2604,15 @@ pub struct MessagePersistedEvent {
     /// running older protocol versions see the same wire shape they used to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
-    /// Optional text content of the persisted row. Pre-fix this field was
-    /// omitted from the wire — `message/persisted` carried only metadata
-    /// + `media`, and the SPA hardcoded `content: ""` when rebuilding
-    /// the message. That dropped the assistant's caption / summary text
-    /// whenever a row carried BOTH text and a file (e.g.
-    /// `send_file` with a caption, mofa_slides delivery with a
-    /// summary). Carry the content here when non-empty so clients can
-    /// render the bubble with text + file together.
+    /// Optional text content of the persisted row.
+    ///
+    /// Pre-fix this field was omitted from the wire: `message/persisted`
+    /// carried only metadata alongside `media`, and the SPA hardcoded
+    /// `content: ""` when rebuilding the message. That dropped the
+    /// assistant's caption or summary text whenever a row carried BOTH
+    /// text and a file (e.g. `send_file` with a caption, mofa_slides
+    /// delivery with a summary). Carrying the content here when non-empty
+    /// lets clients render the bubble with text + file together.
     ///
     /// Wire compatibility: serialized as omitted when empty, so legacy
     /// clients that don't read the field continue to behave as before.
