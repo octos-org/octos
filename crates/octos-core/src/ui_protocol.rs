@@ -2640,11 +2640,13 @@ pub struct MessagePersistedEvent {
 ///   anchor; the splice-merge logic in legacy clients was the bug surface
 ///   the new envelope replaces).
 ///
-/// Unlike `message/persisted` (which is metadata-only and works alongside
-/// streaming `message/delta` deltas to reconstruct content), this event
-/// carries the full `content` and `media` for the late completion in one
-/// frame — by design, the client never needs to splice-merge or wait for
-/// further deltas. `media` mirrors the convention in `MessagePersistedEvent`.
+/// Unlike `message/persisted` (which carries optional `content` alongside
+/// streamed `message/delta` deltas — see [`MessagePersistedEvent::content`]
+/// — and is primarily a durable commit confirmation), this event carries
+/// the full `content` and `media` for the late completion in one frame as
+/// a REQUIRED field — by design, the client never needs to splice-merge or
+/// wait for further deltas. `media` mirrors the convention in
+/// `MessagePersistedEvent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnSpawnCompleteEvent {
     pub session_id: SessionKey,
@@ -2680,8 +2682,8 @@ pub struct TurnSpawnCompleteEvent {
     pub cursor: UiCursor,
     pub persisted_at: DateTime<Utc>,
     /// REQUIRED. The full assistant text for the completion bubble. Unlike
-    /// [`MessagePersistedEvent`] (where `content` lives only in the
-    /// session ledger), this event carries the text inline so the client
+    /// [`MessagePersistedEvent::content`] (optional and omitted when
+    /// empty), this event ALWAYS carries the text inline so the client
     /// can render the new bubble atomically without a follow-up fetch.
     pub content: String,
     /// File attachments for this completion (e.g. `_report.md`,
