@@ -343,7 +343,7 @@ terminal = "100x30"
 tui_binary = "octos-tui"
 tmux_command = "ux-tui-dropped-completion"
 required_tools = ["tmux", "octos", "octos-tui"]
-required_capabilities = ["chat/send_prompt", "chat/stream"]
+required_capabilities = ["chat/send_prompt", "chat/stream", "turn/completed", "protocol/replay_lossy", "session/snapshot"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
@@ -356,9 +356,16 @@ expected_artifacts = [
   "runtime-policy-stamp.json",
   "validation.json",
   "stream-events.jsonl",
+  "notification-log.jsonl",
+  "backpressure-report.json",
+  "websocket-transcript.jsonl",
+  "tui-capture-replay-lossy.txt",
+  "tui-capture-backpressure-final.txt",
 ]
 acceptance = [
   "appui.backpressure_warning_present",
   "appui.no_silent_token_drop",
   "appui.next_prompt_succeeds",
+  "dropped_completion_backpressure_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner plus a WebSocket sidecar probe to cover fixture-backed protocol/replay_lossy recovery. This does not yet force a true dropped turn/completed writer-channel failure."

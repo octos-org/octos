@@ -1050,6 +1050,122 @@ function checkRestartReconnectScenario(artifactDir) {
   );
 }
 
+function checkDroppedCompletionBackpressureScenario(artifactDir) {
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  if (!scenario.ok) {
+    return makeCheck(
+      'dropped_completion_backpressure_contract',
+      false,
+      `scenario.json is not parseable JSON: ${scenario.error}`,
+      ['scenario.json'],
+    );
+  }
+  if (
+    scenario.value.id !== 'dropped-completion-backpressure'
+    && scenario.value.scenario_id !== 'dropped-completion-backpressure'
+  ) {
+    return makeCheck(
+      'dropped_completion_backpressure_contract',
+      true,
+      'dropped-completion/backpressure contract is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (summary.ok && ['blocked', 'skipped', 'quarantined'].includes(summary.value.status)) {
+    return makeCheck(
+      'dropped_completion_backpressure_contract',
+      true,
+      `dropped-completion/backpressure contract is not required for status=${summary.value.status}`,
+      ['scenario.json', 'summary.json'],
+    );
+  }
+
+  const replayCapture = readText(artifactPath(artifactDir, 'tui-capture-replay-lossy.txt'));
+  const finalCapture = readText(artifactPath(artifactDir, 'tui-capture-backpressure-final.txt'));
+  const report = readJson(artifactPath(artifactDir, 'backpressure-report.json'));
+  const parsedNotifications = parseJsonl(artifactPath(artifactDir, 'notification-log.jsonl'));
+  const parsedWs = parseJsonl(artifactPath(artifactDir, 'websocket-transcript.jsonl'));
+  const notificationFrames = parsedNotifications.rows
+    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
+    .filter((entry) => isPlainObject(entry.frame));
+  const wsFrames = parsedWs.rows
+    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
+    .filter((entry) => isPlainObject(entry.frame));
+  const wsMethods = new Set(
+    wsFrames
+      .map((entry) => entry.frame.method)
+      .filter((method) => typeof method === 'string' && method.length > 0),
+  );
+  const problems = [];
+
+  if (!replayCapture.ok) {
+    problems.push(`tui-capture-replay-lossy.txt could not be read: ${replayCapture.error}`);
+  } else if (!replayCapture.text.includes('Replay lossy')) {
+    problems.push('replay-lossy TUI capture is missing Replay lossy status');
+  }
+  if (!finalCapture.ok) {
+    problems.push(`tui-capture-backpressure-final.txt could not be read: ${finalCapture.error}`);
+  } else if (CAPTURE_STUCK_RUNNING_PATTERN.test(finalCapture.text)) {
+    problems.push('final backpressure capture still shows a running task state');
+  }
+  if (!report.ok) {
+    problems.push(`backpressure-report.json is not parseable JSON: ${report.error}`);
+  } else {
+    const droppedCount = Number(report.value.replay_lossy?.dropped_count);
+    if (!Number.isFinite(droppedCount) || droppedCount <= 0) {
+      problems.push(`backpressure report replay_lossy.dropped_count must be > 0, got ${report.value.replay_lossy?.dropped_count ?? '<missing>'}`);
+    }
+    if (report.value.terminal?.method !== 'turn/completed') {
+      problems.push(`backpressure report terminal method must be turn/completed, got ${report.value.terminal?.method ?? '<missing>'}`);
+    }
+    if (report.value.session_id !== scenario.value.session_id) {
+      problems.push('backpressure report session_id does not match scenario session_id');
+    }
+    if (!isPlainObject(report.value.snapshot)) {
+      problems.push('backpressure report is missing session snapshot object');
+    }
+  }
+  for (const error of parsedNotifications.errors) {
+    problems.push(`notification log line ${error.line}: ${error.error}`);
+  }
+  for (const error of parsedWs.errors) {
+    problems.push(`websocket transcript line ${error.line}: ${error.error}`);
+  }
+  if (!notificationFrames.some((entry) => entry.frame.method === 'protocol/replay_lossy')) {
+    problems.push('notification-log.jsonl is missing protocol/replay_lossy');
+  }
+  for (const method of [
+    'client_hello',
+    'config/capabilities/list',
+    'profile/local/create',
+    'permission/profile/list',
+    'permission/profile/set',
+    'session/open',
+    'session/status/read',
+    'tool/status/list',
+    'turn/start',
+    'session/snapshot',
+  ]) {
+    if (!wsMethods.has(method)) problems.push(`websocket transcript missing ${method}`);
+  }
+
+  return makeCheck(
+    'dropped_completion_backpressure_contract',
+    problems.length === 0,
+    problems.length === 0
+      ? 'fixture-backed protocol/replay_lossy recovery is visible, terminal, and snapshot-backed'
+      : `dropped-completion/backpressure contract problems: ${problems.join('; ')}`,
+    [
+      'tui-capture-replay-lossy.txt',
+      'tui-capture-backpressure-final.txt',
+      'notification-log.jsonl',
+      'backpressure-report.json',
+      'websocket-transcript.jsonl',
+    ],
+  );
+}
+
 function checkLowerSoakSummary(artifactDir) {
   const file = artifactPath(artifactDir, 'soak-summary.json');
   if (!fs.existsSync(file)) {
@@ -1101,6 +1217,7 @@ function buildValidation(artifactDir) {
     checkApprovalDenialScenario(artifactDir),
     checkTaskSubagentTreeScenario(artifactDir),
     checkRestartReconnectScenario(artifactDir),
+    checkDroppedCompletionBackpressureScenario(artifactDir),
     checkLowerSoakSummary(artifactDir),
   ];
   const failures = checks

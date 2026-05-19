@@ -136,11 +136,10 @@ const scenarios = new Map([
       id: 'dropped-completion-backpressure',
       title: 'Dropped Completion Backpressure',
       transport: 'websocket',
-      runner: null,
-      blockedMessage:
-        'Dropped-completion backpressure depends on recreating the removed M18 live runner under M19.',
+      runner: 'dropped-completion-backpressure',
       finalMarker: 'M19_DROPPED_COMPLETION_FINAL_LINE',
-      prompt: 'Show the dropped completion recovery path.',
+      prompt:
+        'M9 replay-lossy fixture for M18 reconnect-style replay. This covers protocol/replay_lossy recovery, not a forced dropped turn/completed send failure.',
     },
   ],
   [
@@ -736,6 +735,27 @@ function runRestartReconnectProbe(ctx, phase, env) {
   return result.status || 0;
 }
 
+function runBackpressureReplayProbe(ctx, env) {
+  const result = spawnSync(process.execPath, [
+    path.join(scriptDir, 'm19-backpressure-replay-probe.mjs'),
+  ], {
+    cwd: repoRoot,
+    env: {
+      ...env,
+      OCTOS_M19_BACKPRESSURE_ARTIFACT_DIR: ctx.scenarioDir,
+      OCTOS_M19_BACKPRESSURE_WS_ENDPOINT: ctx.websocketEndpoint,
+      OCTOS_M19_BACKPRESSURE_AUTH_TOKEN: ctx.authToken,
+      OCTOS_M19_BACKPRESSURE_PROFILE_ID: ctx.profileId,
+      OCTOS_M19_BACKPRESSURE_SESSION_ID: ctx.sessionId,
+      OCTOS_M19_BACKPRESSURE_WORKSPACE: ctx.workdir,
+      OCTOS_M19_BACKPRESSURE_PROMPT: ctx.scenario.prompt,
+    },
+    stdio: 'inherit',
+  });
+  if (result.error) throw result.error;
+  return result.status || 0;
+}
+
 function runRestartReconnectScenario(ctx, action, env) {
   let status = 0;
   const start = action('start');
@@ -782,8 +802,30 @@ function runRestartReconnectScenario(ctx, action, env) {
   return status;
 }
 
+function runDroppedCompletionBackpressureScenario(ctx, action, env) {
+  let status = 0;
+  const start = action('start');
+  if (start.error) throw start.error;
+  if (start.status !== 0) return start.status || 1;
+  if (!tmuxHasSession(ctx.sessionName)) {
+    console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
+    status = launchWebsocketTuiFallback(ctx, env);
+    if (status !== 0) return status;
+  }
+  resizeTmuxWindow(ctx);
+
+  const drive = action('drive-dropped-completion-backpressure', true, {
+    OCTOS_TUI_SOAK_BACKPRESSURE_PROMPT: ctx.scenario.prompt,
+  });
+  if (drive.error) throw drive.error;
+  if (drive.status !== 0) status = drive.status || 1;
+  captureTmuxPane(ctx.sessionName, path.join(ctx.scenarioDir, 'tui-capture-backpressure-final.txt'));
+  if (status === 0) status = runBackpressureReplayProbe(ctx, env);
+  return status;
+}
+
 function runnerSteps(ctx) {
-  if (ctx.scenario.runner === 'restart-reconnect') {
+  if (ctx.scenario.runner === 'restart-reconnect' || ctx.scenario.runner === 'dropped-completion-backpressure') {
     return [];
   }
   if (ctx.scenario.runner === 'provider-missing') {
@@ -855,6 +897,8 @@ function runLowerRunner(ctx) {
   let status = 0;
   if (ctx.scenario.runner === 'restart-reconnect') {
     status = runRestartReconnectScenario(ctx, action, env);
+  } else if (ctx.scenario.runner === 'dropped-completion-backpressure') {
+    status = runDroppedCompletionBackpressureScenario(ctx, action, env);
   } else {
     for (const step of runnerSteps(ctx)) {
       if (status !== 0) break;
