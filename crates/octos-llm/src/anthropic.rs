@@ -571,6 +571,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_build_content_strips_skill_output_image() {
+        // Live mini3 reproducer: user-role message carrying a generated
+        // slide PNG path (skill-output/slides/<slug>/output/...) must
+        // not be inlined as image content. The text content should
+        // still flow through.
+        let mut m = msg(MessageRole::User, "look at this");
+        m.media = vec!["skill-output/slides/deck/output/slide-01.png".to_string()];
+        let content = build_anthropic_content(&m);
+        match content {
+            AnthropicContent::Text(t) => assert_eq!(t, "look at this"),
+            _ => panic!("tool-output image must not be inlined"),
+        }
+    }
+
+    #[test]
+    fn test_build_content_strips_image_on_assistant_role() {
+        // Assistant-role media is prior-turn tool output (e.g. a
+        // send_file path); even with a non-skill-output path the role
+        // check strips images.
+        let mut m = msg(MessageRole::Assistant, "delivered");
+        m.media = vec!["/tmp/some-image.png".to_string()];
+        let content = build_anthropic_content(&m);
+        match content {
+            AnthropicContent::Text(t) => assert_eq!(t, "delivered"),
+            _ => panic!("assistant-role image media must not be inlined"),
+        }
+    }
+
     // --- build_request tests ---
 
     #[test]

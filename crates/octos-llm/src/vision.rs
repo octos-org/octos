@@ -147,4 +147,40 @@ mod tests {
         let result = encode_image("/nonexistent/path/image.png");
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_is_tool_output_path_relative() {
+        assert!(is_tool_output_path("skill-output/slides/deck/output/slide-01.png"));
+        assert!(is_tool_output_path("skill-output/podcast/episode.mp3"));
+    }
+
+    #[test]
+    fn test_is_tool_output_path_absolute_file_server() {
+        // Live shape from `/api/files/list?dirs=...`: the server returns
+        // workspace-anchored absolute paths.
+        assert!(is_tool_output_path(
+            "/Users/cloud/.octos/profiles/dspfac/data/workspaces/slides-1779/skill-output/slides/deck/output/slide-01.png"
+        ));
+        assert!(is_tool_output_path(
+            "/var/folders/xx/T/octos-workspace/skill-output/fm_tts/voice.wav"
+        ));
+    }
+
+    #[test]
+    fn test_is_tool_output_path_windows_separators() {
+        // The file-server normalizes to forward slashes, but defense-in-depth.
+        assert!(is_tool_output_path(
+            "C:\\Users\\cloud\\.octos\\workspaces\\slides-X\\skill-output\\slides\\deck\\out.png"
+        ));
+        assert!(is_tool_output_path("skill-output\\slides\\X.png"));
+    }
+
+    #[test]
+    fn test_is_tool_output_path_negatives() {
+        // Regular user attachments must still flow through as images.
+        assert!(!is_tool_output_path("/tmp/upload.png"));
+        assert!(!is_tool_output_path("photo.jpg"));
+        assert!(!is_tool_output_path("/Users/me/Pictures/sunset.png"));
+        assert!(!is_tool_output_path("./relative/path/img.png"));
+    }
 }
