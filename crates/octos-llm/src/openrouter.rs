@@ -326,7 +326,18 @@ fn build_api_message<'a>(msg: &'a Message) -> ApiMessage<'a> {
 }
 
 fn build_api_content(msg: &Message) -> Option<ApiContent> {
-    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
+    // Two filters:
+    //   - non-User roles: never inline images (prior-turn tool outputs)
+    //   - skill-output/ paths: never inline (workspace-convention tool
+    //     output; see vision.rs::is_tool_output_path)
+    let images: Vec<_> = if msg.role != MessageRole::User {
+        vec![]
+    } else {
+        msg.media
+            .iter()
+            .filter(|p| vision::is_image(p) && !vision::is_tool_output_path(p))
+            .collect()
+    };
 
     if images.is_empty() {
         if msg.content.is_empty() {

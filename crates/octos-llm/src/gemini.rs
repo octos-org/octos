@@ -523,7 +523,13 @@ fn parts_compatible(existing: &[GeminiPart], new: &[GeminiPart]) -> bool {
 }
 
 fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
-    let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
+    // Workspace-output paths (skill-output/...) are tool-generated
+    // artifacts and never valid LLM vision inputs — see vision.rs.
+    let images: Vec<_> = msg
+        .media
+        .iter()
+        .filter(|p| vision::is_image(p) && !vision::is_tool_output_path(p))
+        .collect();
 
     if images.is_empty() {
         return vec![GeminiPart::Text {

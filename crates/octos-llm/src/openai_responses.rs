@@ -295,10 +295,12 @@ fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
 }
 
 fn build_user_content(msg: &Message) -> serde_json::Value {
+    // Workspace-output paths (skill-output/...) are tool-generated
+    // artifacts and never valid LLM vision inputs — see vision.rs.
     let images: Vec<_> = msg
         .media
         .iter()
-        .filter(|p| crate::vision::is_image(p))
+        .filter(|p| crate::vision::is_image(p) && !crate::vision::is_tool_output_path(p))
         .collect();
 
     if images.is_empty() {
