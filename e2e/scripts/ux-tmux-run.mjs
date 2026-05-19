@@ -626,10 +626,10 @@ function launchWebsocketTuiFallback(ctx, env) {
     '>',
     shellQuote(outputLog),
     '2>&1;',
-    'status=$?;',
+    'exit_code=$?;',
     'echo',
     shellQuote('octos-tui exited with status'),
-    '"$status"',
+    '"$exit_code"',
     '>>',
     shellQuote(outputLog),
     ';',
@@ -671,7 +671,9 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_OPEN_SESSION: 'auto',
     OCTOS_TUI_SOAK_REQUIRE_PROFILE: '0',
     OCTOS_TUI_SOAK_SOLO_STRICT: process.env.OCTOS_TUI_SOAK_SOLO_STRICT || '0',
-    OCTOS_TUI_SOAK_SERVER_WAIT_SECS: process.env.OCTOS_TUI_SOAK_SERVER_WAIT_SECS || '1',
+    OCTOS_TUI_SOAK_SERVER_WAIT_SECS:
+      process.env.OCTOS_TUI_SOAK_SERVER_WAIT_SECS
+      || (ctx.scenario.transport === 'websocket' ? '4' : '1'),
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
   };

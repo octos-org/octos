@@ -63,8 +63,18 @@ const KNOWN_CAPTURE_BUG_PATTERNS = [
   },
   {
     id: 'tmux_session_missing',
-    regex: /tmux session not running:|octos-tui exited with status/,
-    detail: 'tmux capture shows the real TUI pane exited or was missing',
+    regex: /tmux session not running:/,
+    detail: 'tmux capture shows the real TUI pane was missing',
+  },
+  {
+    id: 'octos_tui_exited',
+    regex: /octos-tui exited with status/,
+    detail: 'tmux capture shows the real octos-tui process exited before validation',
+  },
+  {
+    id: 'ui_protocol_connect_failed',
+    regex: /failed to connect UI protocol endpoint|Connection refused \(os error/,
+    detail: 'TUI failed to connect to the AppUI protocol endpoint',
   },
 ];
 
