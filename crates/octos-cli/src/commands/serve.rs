@@ -298,6 +298,14 @@ impl ServeCommand {
             Config::load_with_path(&cwd, &data_dir)?
         };
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
+        if let Err(error) = crate::api::agent_orchestrator::default_agent_orchestrator()
+            .configure_supervisor_store(data_dir.join("supervisor"))
+        {
+            tracing::warn!(
+                %error,
+                "failed to configure durable agent supervisor store; continuing with in-process supervision only"
+            );
+        }
 
         let broadcaster = Arc::new(EventBroadcaster::new(256));
 

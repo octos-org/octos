@@ -63,6 +63,7 @@ impl McpAgentBackend for CountingBackend {
             output: "ok".to_string(),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }
@@ -100,6 +101,7 @@ impl McpAgentBackend for HttpCountingBackend {
             output: "ok".to_string(),
             files_to_send: Vec::new(),
             error: None,
+            context_contract: None,
         }
     }
 }

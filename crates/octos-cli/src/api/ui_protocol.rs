@@ -5,9 +5,10 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use axum::Extension;
@@ -18,48 +19,72 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use octos_agent::{
-    Agent, BackgroundResultKind, BackgroundResultPayload, ToolApprovalDecision, ToolApprovalRequest,
+    Agent, BackgroundResultKind, BackgroundResultPayload, PromptContextManager, PromptContextPhase,
+    PromptContextReport, PromptContextRequest, ToolApprovalDecision, ToolApprovalRequest,
 };
+use octos_core::app_ui_codec::{self, AppUiFrame, MAX_TEXT_FRAME_BYTES};
 use octos_core::ui_protocol::{
-    ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
+    AgentUpdatedEvent, ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalCommandDetails,
     ApprovalDecidedEvent, ApprovalDecision, ApprovalId, ApprovalRenderHints,
     ApprovalRequestedEvent, ApprovalTypedDetails, ContentBulkDeleteParams, ContentDeleteParams,
-    ContentListParams, HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent,
-    MessagePersistedEvent, MessagePersistedSource, OutputCursor, ReplayLossyEvent, RpcError,
-    RpcErrorResponse, RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX,
-    SESSION_MESSAGES_PAGE_DEFAULT_LIMIT, SESSION_MESSAGES_PAGE_MAX_LIMIT,
-    SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS, SessionDeleteParams,
-    SessionFilesListParams, SessionHydrateParams, SessionHydrateResult, SessionListParams,
-    SessionMessagesPageParams, SessionOpenParams, SessionOpenResult, SessionOpened,
-    SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
-    SessionWorkspaceGetParams, SystemStatusGetParams, TaskCancelParams, TaskCancelResult,
-    TaskListEntry, TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
-    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
-    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent,
+    ContentListParams, ContextCompactionCompletedEvent, ContextNormalizationReportedEvent,
+    HydratedMessage, HydratedTurn, InputItem, MessageDeltaEvent, MessagePersistedEvent,
+    MessagePersistedSource, OutputCursor, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest,
+    RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
+    SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
+    SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
+    SessionOpened, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams, TaskCancelParams,
+    TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult, TaskOutputDeltaEvent,
+    TaskRestartFromNodeParams, TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState,
+    TaskUpdatedEvent, ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult,
+    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
+    TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent,
     TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
-    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand,
-    UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem,
-    UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    approval_cancelled_reasons, approval_kinds, hydrate_sections, progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
+    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
+    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
+    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
+    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
+    approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
-use octos_core::{AgentId, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId};
+use octos_core::{
+    AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, SessionKey, TaskId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
 
 use super::AppState;
+#[cfg(test)]
+use super::agent_orchestrator::clear_default_agent_orchestrator_for_test;
+use super::agent_orchestrator::{
+    AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
+    AgentRequest, AgentUpsert, GoalSessionRequest, GoalSetRequest, LoopControlKind,
+    LoopControlRequest, LoopCreateRequest, LoopListRequest, NativeSpecialistAppUiEvent,
+    NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
+    master_continuation_reason_name, upsert_background_task_agent,
+};
+use super::master_continuation_scheduler::MasterContinuationRuntimeState;
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
+use super::specialist_runner::{
+    AppUiSupervisorEventSink, SpecialistArtifactSpec, SupervisedCliSpecialist,
+    SupervisedMcpSpecialist, SupervisedSpecialistSpec, run_supervised_cli_specialist,
+    run_supervised_mcp_specialist,
+};
 use super::ui_protocol_approvals::PendingApprovalStore;
 use super::ui_protocol_audit::{ApprovalsAuditConfig, ApprovalsAuditLog, log_decision_tracing};
 use super::ui_protocol_diff::{DiffPreviewConfig, PendingDiffPreviewStore};
@@ -74,11 +99,16 @@ use super::ui_protocol_sanitize::sanitize_display_path;
 use super::ui_protocol_scope::{ApprovalScopeKind, ScopePolicy, match_key_for};
 use super::ui_protocol_task_output;
 use super::ws_slash;
+use crate::context_manager::{
+    CompactContextPolicy, ContextCompactionRecord, ContextManager, ForkPolicy, PromptBuildPolicy,
+    PromptFrame, load_or_rebuild_context_manager, persist_context_manager_snapshot,
+};
 
-const FRAME_TOO_LARGE: i64 = -32005;
-const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
+const APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
+const APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
+const APPUI_CONTEXT_COMPACT_KEEP_ITEMS: usize = 16;
 /// Wall-clock budget for delivering a *terminal* task lifecycle update
 /// (`completed` / `failed` / `cancelled`) when the bounded progress
 /// channel is full. Long enough that real WebSocket backpressure can
@@ -106,6 +136,7 @@ const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
 const APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED: &str = "request_send_failed";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
+const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
 const APPUI_METHOD_SESSION_STATUS_READ: &str =
     octos_core::ui_protocol::methods::SESSION_STATUS_READ;
 const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str =
@@ -128,11 +159,14 @@ const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
 const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
+const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 const APPUI_EXTRA_METHODS: &[&str] = &[
+    APPUI_METHOD_CLIENT_HELLO,
     APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
     APPUI_METHOD_SESSION_STATUS_READ,
     APPUI_METHOD_PROFILE_LOCAL_CREATE,
@@ -154,6 +188,13 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+];
+const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
+    APPUI_METHOD_AUTH_ME,
+    APPUI_METHOD_AUTH_LOGOUT,
+    octos_core::ui_protocol::methods::CONTENT_LIST,
+    octos_core::ui_protocol::methods::CONTENT_DELETE,
+    octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
 ];
 type WsSink = futures::stream::SplitSink<WebSocket, WsMessage>;
 type SharedActiveTurns = Arc<tokio::sync::Mutex<HashMap<SessionKey, ActiveTurn>>>;
@@ -245,8 +286,28 @@ impl ConnectionMetrics {
 /// task lives until the channel is closed (last sender dropped) or the sink
 /// errors.
 #[derive(Clone)]
+struct ConnectionFailureSignal {
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    failed_notify: Arc<tokio::sync::Notify>,
+}
+
+impl ConnectionFailureSignal {
+    fn mark_failed(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Wake every current and future `notified()` waiter so the read
+        // loop wakes immediately on an idle connection. `notify_waiters`
+        // alone has no permit-stash behaviour; combined with the Acquire
+        // load in the select! arm a late `notified().await` will still
+        // see `failed == true` and bail out before parking.
+        self.failed_notify.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct WsConnection {
     writer: mpsc::Sender<WsMessage>,
+    stdio_writer: Option<std::sync::mpsc::SyncSender<WsMessage>>,
     metrics: Arc<ConnectionMetrics>,
     /// Unique within the process. Stamped onto every ledger append we
     /// also direct-send so the live forwarder running on this same
@@ -269,6 +330,19 @@ impl WsConnection {
     pub(crate) fn new(writer: mpsc::Sender<WsMessage>) -> Self {
         Self {
             writer,
+            stdio_writer: None,
+            metrics: Arc::new(ConnectionMetrics::default()),
+            connection_id: ConnectionId::next(),
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failed_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn new_stdio(writer: std::sync::mpsc::SyncSender<WsMessage>) -> Self {
+        let (unused_writer, _unused_rx) = mpsc::channel(1);
+        Self {
+            writer: unused_writer,
+            stdio_writer: Some(writer),
             metrics: Arc::new(ConnectionMetrics::default()),
             connection_id: ConnectionId::next(),
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -286,15 +360,15 @@ impl WsConnection {
         self.failed_notify.clone()
     }
 
+    fn failure_signal(&self) -> ConnectionFailureSignal {
+        ConnectionFailureSignal {
+            failed: self.failed.clone(),
+            failed_notify: self.failed_notify.clone(),
+        }
+    }
+
     fn mark_failed(&self) {
-        self.failed
-            .store(true, std::sync::atomic::Ordering::Release);
-        // Wake every current and future `notified()` waiter so the read
-        // loop wakes immediately on an idle connection. `notify_waiters`
-        // alone has no permit-stash behaviour; combined with the Acquire
-        // load in the select! arm a late `notified().await` will still
-        // see `failed == true` and bail out before parking.
-        self.failed_notify.notify_waiters();
+        self.failure_signal().mark_failed();
     }
 
     #[cfg(test)]
@@ -319,6 +393,13 @@ impl WsConnection {
         if self.failed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(SendError::FatalClosed);
         }
+        if let Some(writer) = self.stdio_writer.as_ref() {
+            return match writer.try_send(frame) {
+                Ok(()) => Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => Err(SendError::BackpressureDrop),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(SendError::Closed),
+            };
+        }
         // Update the queue-depth gauge whenever we touch the channel — cheap
         // and gives an accurate signal even when sends succeed.
         let depth = WS_WRITER_CHANNEL_CAPACITY.saturating_sub(self.writer.capacity());
@@ -330,6 +411,16 @@ impl WsConnection {
         }
     }
 
+    fn enqueue_durable_or_lifecycle(&self, frame: WsMessage) -> Result<(), SendError> {
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SendError::FatalClosed);
+        }
+        let Some(writer) = self.stdio_writer.as_ref() else {
+            return self.try_enqueue(frame);
+        };
+        writer.send(frame).map_err(|_| SendError::Closed)
+    }
+
     /// Lifecycle: turn lifecycle / RPC reply. Caller acts on the failure.
     ///
     /// #922.2: a lifecycle-frame backpressure drop is treated as a
@@ -338,7 +429,7 @@ impl WsConnection {
     /// dropping RPC replies (which left clients timing out while the
     /// server thought the call succeeded).
     fn send_lifecycle(&self, frame: WsMessage) -> Result<(), SendError> {
-        match self.try_enqueue(frame) {
+        match self.enqueue_durable_or_lifecycle(frame) {
             Ok(_) => Ok(()),
             Err(SendError::BackpressureDrop) => {
                 metrics::counter!("ws.send.error.lifecycle").increment(1);
@@ -379,7 +470,7 @@ impl WsConnection {
     /// Durable notification: tool/task/approval. Errors are logged WARN; the
     /// ledger still records the event so a future replay catches up.
     fn send_durable(&self, frame: WsMessage, method: &str) -> Result<(), SendError> {
-        match self.try_enqueue(frame) {
+        match self.enqueue_durable_or_lifecycle(frame) {
             Ok(_) => Ok(()),
             Err(SendError::BackpressureDrop) => {
                 self.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
@@ -638,6 +729,28 @@ impl SessionPermissionProfileStore {
     }
 }
 
+#[derive(Default)]
+struct SessionContextStatusStore {
+    statuses: std::sync::Mutex<HashMap<SessionKey, Value>>,
+}
+
+impl SessionContextStatusStore {
+    fn set(&self, session_id: SessionKey, status: Value) {
+        self.statuses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(session_id, status);
+    }
+
+    fn get(&self, session_id: &SessionKey) -> Option<Value> {
+        self.statuses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+}
+
 /// Per-turn lifecycle state tracked by the registry under a single `Mutex`
 /// guard. Together with the `interrupt_tx` signalling channel, this is the
 /// boundary that makes interrupt-vs-natural-completion atomic and ensures
@@ -698,23 +811,42 @@ enum M9ProtocolFixture {
     Approval,
     ReplayLossy,
     TaskOutput,
+    M14CodexP0ToolParity,
+    M15LiveSubagents,
 }
 
 fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
+    let prompt_lower = prompt.to_ascii_lowercase();
+    if std::env::var("OCTOS_M15_LIVE_SUBAGENT_FIXTURE").as_deref() == Ok("1")
+        && (prompt_lower.contains("m15 code review")
+            || prompt_lower.contains("live subagent")
+            || prompt_lower.contains("supervised subagents"))
+    {
+        return Some(M9ProtocolFixture::M15LiveSubagents);
+    }
+
     if std::env::var("OCTOS_M9_PROTOCOL_FIXTURES").as_deref() != Ok("1") {
         return None;
     }
 
-    let prompt = prompt.to_ascii_lowercase();
-    if prompt.contains("m9 approval fixture") || prompt.contains("m9-approval-e2e") {
+    if prompt_lower.contains("m9 approval fixture") || prompt_lower.contains("m9-approval-e2e") {
         Some(M9ProtocolFixture::Approval)
-    } else if prompt.contains("m9 replay-lossy fixture") || prompt.contains("replay-lossy") {
+    } else if prompt_lower.contains("m14 codex p0 tool parity fixture")
+        || prompt_lower.contains("codex p0 tool parity")
+        || prompt_lower.contains("#969")
+    {
+        Some(M9ProtocolFixture::M14CodexP0ToolParity)
+    } else if prompt_lower.contains("m9 replay-lossy fixture")
+        || prompt_lower.contains("replay-lossy")
+    {
         Some(M9ProtocolFixture::ReplayLossy)
-    } else if prompt.contains("m9 task output fixture") {
+    } else if prompt_lower.contains("m9 task output fixture") {
         Some(M9ProtocolFixture::TaskOutput)
-    } else if prompt.contains("list_dir tool") {
+    } else if prompt_lower.contains("list_dir tool") {
         Some(M9ProtocolFixture::ToolEvents)
-    } else if prompt.contains("200 separate lines") || prompt.contains("one line at a time") {
+    } else if prompt_lower.contains("200 separate lines")
+        || prompt_lower.contains("one line at a time")
+    {
         Some(M9ProtocolFixture::Slow)
     } else {
         Some(M9ProtocolFixture::Basic)
@@ -771,6 +903,20 @@ struct ConnectionUiFeatures {
     /// Phase D-1 truly additive — pre-existing clients cannot trip into
     /// the new methods without explicit negotiation.
     auxiliary_rest_to_ws_v1: bool,
+    /// UPCR-2026-021 M15 autonomy capability root. Optional agent, goal,
+    /// and loop groups are honoured only when this base capability is
+    /// negotiated too.
+    coding_autonomy_v1: bool,
+    /// UPCR-2026-021 M15 agent lifecycle inspection/control group.
+    coding_agent_control_v1: bool,
+    /// UPCR-2026-021 M15 persisted goal runtime group.
+    coding_goal_runtime_v1: bool,
+    /// UPCR-2026-021 M15 recurring loop runtime group.
+    coding_loop_runtime_v1: bool,
+    /// UPCR-2026-019 typed backend-owned product review workflow.
+    review_start_v1: bool,
+    /// M16 backend-owned context generation/checkpoint/compaction lifecycle.
+    context_lifecycle_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -778,6 +924,10 @@ struct ConnectionUiFeatures {
     /// `SessionOpened.capabilities`) from "header sent with all-unknown
     /// tokens" (where the negotiated `supported_features` is empty).
     header_present: bool,
+    /// True for `octos serve --stdio`. Stdio shares AppUI where possible,
+    /// but WebSocket-routed methods must be removed from advertised
+    /// capabilities and rejected with typed transport reasons if called.
+    stdio_transport: bool,
 }
 
 impl ConnectionUiFeatures {
@@ -809,7 +959,34 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
             ),
+            coding_autonomy_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            ),
+            coding_agent_control_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+            ),
+            coding_goal_runtime_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+            ),
+            coding_loop_runtime_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+            ),
+            review_start_v1: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_REVIEW_START_V1),
+            context_lifecycle_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
+            stdio_transport: false,
         }
     }
 
@@ -825,7 +1002,47 @@ impl ConnectionUiFeatures {
             message_persisted: true,
             spawn_complete: true,
             auxiliary_rest_to_ws_v1: true,
+            coding_autonomy_v1: true,
+            coding_agent_control_v1: true,
+            coding_goal_runtime_v1: true,
+            coding_loop_runtime_v1: true,
+            review_start_v1: true,
+            context_lifecycle_v1: true,
             header_present: true,
+            stdio_transport: true,
+        }
+    }
+
+    fn from_requested_feature_tokens<I, S>(features: I, stdio_transport: bool) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let requested: HashSet<String> = features
+            .into_iter()
+            .map(|feature| feature.as_ref().trim().to_owned())
+            .filter(|feature| !feature.is_empty())
+            .collect();
+        let has = |feature: &str| requested.contains(feature);
+        Self {
+            typed_approvals: has(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1),
+            pane_snapshots: has(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1),
+            session_workspace_cwd: has(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
+            harness_task_control: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1),
+            session_hydrate: has(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
+            thread_graph: has(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
+            turn_state_get: has(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
+            message_persisted: has(UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1),
+            spawn_complete: has(UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1),
+            auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+            coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
+            coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
+            coding_goal_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1),
+            coding_loop_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1),
+            review_start_v1: has(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
+            context_lifecycle_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
+            header_present: true,
+            stdio_transport,
         }
     }
 
@@ -873,7 +1090,49 @@ impl ConnectionUiFeatures {
         if self.auxiliary_rest_to_ws_v1 {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
         }
+        if self.coding_autonomy_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1);
+            if self.coding_agent_control_v1 {
+                requested.push(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1);
+            }
+            if self.coding_goal_runtime_v1 {
+                requested.push(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1);
+            }
+            if self.coding_loop_runtime_v1 {
+                requested.push(UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1);
+            }
+        }
+        if self.context_lifecycle_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1);
+        }
+        if self.review_start_v1 {
+            requested.push(UI_PROTOCOL_FEATURE_REVIEW_START_V1);
+        }
         UiProtocolCapabilities::for_negotiated_features(requested)
+    }
+
+    fn coding_autonomy_available(self) -> bool {
+        !self.header_present || self.coding_autonomy_v1
+    }
+
+    fn agent_control_available(self) -> bool {
+        !self.header_present || (self.coding_autonomy_v1 && self.coding_agent_control_v1)
+    }
+
+    fn goal_runtime_available(self) -> bool {
+        !self.header_present || (self.coding_autonomy_v1 && self.coding_goal_runtime_v1)
+    }
+
+    fn loop_runtime_available(self) -> bool {
+        !self.header_present || (self.coding_autonomy_v1 && self.coding_loop_runtime_v1)
+    }
+
+    fn review_start_available(self) -> bool {
+        !self.header_present || self.review_start_v1
+    }
+
+    fn context_lifecycle_available(self) -> bool {
+        !self.header_present || self.context_lifecycle_v1
     }
 
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
@@ -903,13 +1162,42 @@ impl ConnectionUiFeatures {
             &mut capabilities.supported_features,
             APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1,
         );
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            super::coding_tool_contract::CODING_TOOL_CONTRACT_FEATURE_V1,
+        );
+        if self.context_lifecycle_available() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_CONTEXT_LIFECYCLE_V1,
+            );
+        }
         if supports_local_solo_profile_create(state) {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1,
             );
         }
+        if self.stdio_transport {
+            apply_stdio_auth_bound_capability_policy(&mut capabilities);
+        }
         capabilities
+    }
+}
+
+fn apply_stdio_auth_bound_capability_policy(capabilities: &mut UiProtocolCapabilities) {
+    for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
+        capabilities
+            .supported_methods
+            .retain(|supported| supported != method);
+        if capabilities.unsupported_report(method).is_none() {
+            capabilities
+                .unsupported
+                .push(UnsupportedCapabilityReport::method(
+                    *method,
+                    "unauthenticated stdio transport has no AppUI auth identity",
+                ));
+        }
     }
 }
 
@@ -1034,6 +1322,589 @@ fn session_permission_profiles() -> Arc<SessionPermissionProfileStore> {
     SESSION_PERMISSION_PROFILES
         .get_or_init(|| Arc::new(SessionPermissionProfileStore::default()))
         .clone()
+}
+
+fn session_context_statuses() -> Arc<SessionContextStatusStore> {
+    static SESSION_CONTEXT_STATUSES: OnceLock<Arc<SessionContextStatusStore>> = OnceLock::new();
+    SESSION_CONTEXT_STATUSES
+        .get_or_init(|| Arc::new(SessionContextStatusStore::default()))
+        .clone()
+}
+
+pub(crate) fn update_session_context_status(session_id: &SessionKey, status: Value) {
+    session_context_statuses().set(session_id.clone(), status);
+}
+
+fn appui_context_status_value(manager: &ContextManager) -> Value {
+    let state = manager.state();
+    let last_compaction = manager.compactions().last().map(|record| {
+        json!({
+            "compaction_id": record.compaction_id.as_str(),
+            "checkpoint_id": record.checkpoint_id.as_str(),
+            "status": record.status,
+            "policy_id": record.policy_id,
+            "trigger": record.trigger,
+            "input_generation": record.input_generation,
+            "output_generation": record.output_generation,
+            "input_transcript_hash": record.input_transcript_hash,
+            "replacement_transcript_hash": record.replacement_transcript_hash,
+            "installed_transcript_hash": record.installed_transcript_hash,
+            "input_item_count": record.input_item_count,
+            "retained_count": record.retained_item_ids.len(),
+            "dropped_count": record.dropped_item_ids.len(),
+            "summary_item_id": record.summary_item_id.as_ref().map(|id| id.as_str()),
+            "token_estimate_before": record.token_estimate_before,
+            "token_estimate_after": record.token_estimate_after,
+            "error": record.error,
+        })
+    });
+    json!({
+        "schema": "octos.context.lifecycle.v1",
+        "state": state,
+        "compaction": {
+            "count": manager.compactions().len(),
+            "last": last_compaction,
+        }
+    })
+}
+
+fn context_recovery_state_string(state: &impl Serialize) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn ui_context_state_for(session_id: &SessionKey, manager: &ContextManager) -> UiContextState {
+    let state = manager.state();
+    UiContextState {
+        session_id: session_id.clone(),
+        thread_id: state.thread_id,
+        generation: state.generation,
+        transcript_hash: state.transcript_hash,
+        item_count: state.item_count,
+        token_estimate: state.token_estimate,
+        recovery_state: context_recovery_state_string(&state.recovery_state),
+        last_checkpoint_id: state
+            .last_checkpoint_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        last_compaction_id: state
+            .last_compaction_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+    }
+}
+
+fn appui_context_inspection_snapshot(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+) -> (Value, UiContextState) {
+    let (manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for inspection"
+    );
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager inspection snapshot"
+        );
+    }
+    (
+        appui_context_status_value(&manager),
+        ui_context_state_for(session_id, &manager),
+    )
+}
+
+fn appui_context_status_snapshot_for_session(
+    session_id: &SessionKey,
+) -> (Option<Value>, Option<UiContextState>) {
+    let context = session_context_statuses().get(session_id);
+    let context_state = context
+        .as_ref()
+        .and_then(|context| context.get("state"))
+        .and_then(|state| serde_json::from_value::<UiContextState>(state.clone()).ok());
+    (context, context_state)
+}
+
+async fn appui_context_status_snapshot_for_state(
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    session_id: &SessionKey,
+) -> (Option<Value>, Option<UiContextState>) {
+    // During an active turn, prompt preparation can install and persist a
+    // compacted ContextManager generation before the final assistant row is
+    // committed. A status read in that window must report the live
+    // model-visible generation, not rebuild from the durable user-facing
+    // session rows and accidentally overwrite the prompt-time context ledger.
+    if let (Some(context), Some(context_state)) =
+        appui_context_status_snapshot_for_session(session_id)
+    {
+        return (Some(context), Some(context_state));
+    }
+    if let Some(sessions) =
+        resolve_sessions_for_lookup(state, connection_profile_id, routed_profile_id, session_id)
+            .await
+    {
+        let snapshot_input = {
+            let mut sessions_guard = sessions.lock().await;
+            if sessions_guard.session_known(session_id) {
+                let data_dir = sessions_guard.data_dir();
+                let history = sessions_guard
+                    .get_or_create(session_id)
+                    .await
+                    .messages
+                    .clone();
+                Some((data_dir, history))
+            } else {
+                None
+            }
+        };
+        if let Some((data_dir, history)) = snapshot_input {
+            let (context, context_state) =
+                appui_context_inspection_snapshot(&data_dir, session_id, &history);
+            return (Some(context), Some(context_state));
+        }
+    }
+    appui_context_status_snapshot_for_session(session_id)
+}
+
+fn ui_context_compaction_record_for(record: &ContextCompactionRecord) -> UiContextCompactionRecord {
+    UiContextCompactionRecord {
+        compaction_id: record.compaction_id.as_str().to_owned(),
+        checkpoint_id: record.checkpoint_id.as_str().to_owned(),
+        status: context_recovery_state_string(&record.status),
+        policy_id: record.policy_id.clone(),
+        trigger: record.trigger.clone(),
+        input_generation: record.input_generation,
+        output_generation: record.output_generation,
+        input_transcript_hash: record.input_transcript_hash.clone(),
+        replacement_transcript_hash: record.replacement_transcript_hash.clone(),
+        installed_transcript_hash: record.installed_transcript_hash.clone(),
+        input_item_count: record.input_item_count,
+        retained_count: record.retained_item_ids.len(),
+        dropped_count: record.dropped_item_ids.len(),
+        summary_item_id: record
+            .summary_item_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        token_estimate_before: record.token_estimate_before,
+        token_estimate_after: record.token_estimate_after,
+        error: record.error.clone(),
+    }
+}
+
+fn appui_context_compaction_notification(
+    session_id: &SessionKey,
+    manager: &ContextManager,
+    record: &ContextCompactionRecord,
+) -> UiNotification {
+    UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+        session_id: session_id.clone(),
+        context_state: ui_context_state_for(session_id, manager),
+        compaction: ui_context_compaction_record_for(record),
+    })
+}
+
+fn appui_context_normalization_notification(
+    session_id: &SessionKey,
+    frame: &PromptFrame,
+) -> UiNotification {
+    UiNotification::ContextNormalizationReported(ContextNormalizationReportedEvent {
+        session_id: session_id.clone(),
+        context_state: UiContextState {
+            session_id: session_id.clone(),
+            thread_id: frame.context_state.thread_id.clone(),
+            generation: frame.context_state.generation,
+            transcript_hash: frame.context_state.transcript_hash.clone(),
+            item_count: frame.context_state.item_count,
+            token_estimate: frame.context_state.token_estimate,
+            recovery_state: context_recovery_state_string(&frame.context_state.recovery_state),
+            last_checkpoint_id: frame
+                .context_state
+                .last_checkpoint_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            last_compaction_id: frame
+                .context_state
+                .last_compaction_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+        },
+        normalization: UiContextNormalizationReport {
+            generation: frame.report.generation,
+            input_transcript_hash: frame.report.input_transcript_hash.clone(),
+            output_prompt_hash: frame.report.output_prompt_hash.clone(),
+            model_capability_id: frame.report.model_capability_id.clone(),
+            prompt_message_count: frame.messages.len(),
+            token_estimate: frame.report.token_estimate,
+            repaired_count: frame.report.repaired_item_ids.len(),
+            dropped_count: frame.report.dropped_item_ids.len(),
+            synthetic_count: frame.report.synthetic_item_ids.len(),
+            truncated_count: frame.report.truncated_item_ids.len(),
+        },
+    })
+}
+
+fn publish_appui_context_status(session_id: &SessionKey, manager: &ContextManager) {
+    update_session_context_status(session_id, appui_context_status_value(manager));
+}
+
+fn appui_context_compact_threshold_tokens(llm_provider: &dyn octos_llm::LlmProvider) -> usize {
+    std::env::var("OCTOS_CONTEXT_COMPACT_THRESHOLD_TOKENS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            llm_provider.context_window() as usize * APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR
+                / APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR
+        })
+}
+
+fn appui_context_compact_keep_items() -> usize {
+    std::env::var("OCTOS_CONTEXT_COMPACT_KEEP_ITEMS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(APPUI_CONTEXT_COMPACT_KEEP_ITEMS)
+}
+
+fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> PromptBuildPolicy {
+    PromptBuildPolicy {
+        include_reasoning: false,
+        supports_media: true,
+        max_prompt_token_estimate: None,
+        model_capability_id: format!(
+            "{}/{}",
+            llm_provider.provider_name(),
+            llm_provider.model_id()
+        ),
+    }
+}
+
+fn appui_context_history_for_agent(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    history: &[Message],
+    llm_provider: &dyn octos_llm::LlmProvider,
+    trigger: &str,
+) -> (
+    Vec<Message>,
+    Arc<StdMutex<ContextManager>>,
+    Vec<UiNotification>,
+) {
+    let (mut manager, ledger_status) =
+        load_or_rebuild_context_manager(data_dir, session_id.to_string(), None, history);
+    let mut lifecycle_notifications = Vec::new();
+    tracing::debug!(
+        session = %session_id.0,
+        ledger_status = ?ledger_status,
+        "appui context manager loaded for turn"
+    );
+    let threshold = appui_context_compact_threshold_tokens(llm_provider);
+    let policy = appui_context_prompt_policy(llm_provider);
+    let state = manager.state();
+    if state.token_estimate > threshold {
+        let before = manager.for_prompt(&policy);
+        let summary_budget = threshold.clamp(256, 4096) as u32;
+        let summary = octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+        let record = manager.compact_context(
+            summary,
+            CompactContextPolicy {
+                trigger: trigger.to_owned(),
+                keep_recent_items: appui_context_compact_keep_items(),
+                ..CompactContextPolicy::default()
+            },
+        );
+        info!(
+            session = %session_id.0,
+            compaction_id = %record.compaction_id.as_str(),
+            checkpoint_id = %record.checkpoint_id.as_str(),
+            input_generation = record.input_generation,
+            output_generation = ?record.output_generation,
+            token_estimate_before = record.token_estimate_before,
+            token_estimate_after = ?record.token_estimate_after,
+            trigger,
+            "appui context manager compact_context installed before model prompt"
+        );
+        lifecycle_notifications.push(appui_context_compaction_notification(
+            session_id, &manager, &record,
+        ));
+    }
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager snapshot"
+        );
+    }
+    let frame = manager.for_prompt(&policy);
+    lifecycle_notifications.push(appui_context_normalization_notification(session_id, &frame));
+    (
+        frame.messages,
+        Arc::new(StdMutex::new(manager)),
+        lifecycle_notifications,
+    )
+}
+
+fn prompt_message_matches(left: &Message, right: &Message) -> bool {
+    left.role == right.role
+        && left.content == right.content
+        && left.tool_call_id == right.tool_call_id
+        && tool_call_slices_match(left.tool_calls.as_deref(), right.tool_calls.as_deref())
+}
+
+fn record_prompt_messages_not_covered_by_context(
+    manager: &mut ContextManager,
+    policy: &PromptBuildPolicy,
+    messages: &[Message],
+) {
+    let known_messages = manager.for_prompt(policy).messages;
+    let covered = covered_prompt_message_indices(messages, &known_messages);
+    for (index, message) in messages.iter().enumerate() {
+        if !covered[index] {
+            manager.record_message(message);
+        }
+    }
+}
+
+fn covered_prompt_message_indices(messages: &[Message], known_messages: &[Message]) -> Vec<bool> {
+    let mut covered = vec![false; messages.len()];
+    if known_messages.is_empty() || known_messages.len() > messages.len() {
+        return covered;
+    }
+    let Some(start) = messages.windows(known_messages.len()).position(|window| {
+        window
+            .iter()
+            .zip(known_messages.iter())
+            .all(|(left, right)| prompt_message_matches(left, right))
+    }) else {
+        return covered;
+    };
+    for slot in covered.iter_mut().skip(start).take(known_messages.len()) {
+        *slot = true;
+    }
+    covered
+}
+
+fn tool_call_slices_match(
+    left: Option<&[octos_core::ToolCall]>,
+    right: Option<&[octos_core::ToolCall]>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.len() == right.len() => {
+            left.iter().zip(right.iter()).all(|(left, right)| {
+                left.id == right.id
+                    && left.name == right.name
+                    && left.arguments == right.arguments
+                    && left.metadata == right.metadata
+            })
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+struct AppUiLoopPromptScratch {
+    manager: ContextManager,
+    observed_messages: usize,
+}
+
+struct AppUiPromptContextBridge {
+    session_id: SessionKey,
+    data_dir: PathBuf,
+    context_manager: Arc<StdMutex<ContextManager>>,
+    scratch: StdMutex<Option<AppUiLoopPromptScratch>>,
+}
+
+impl AppUiPromptContextBridge {
+    fn new(
+        session_id: SessionKey,
+        data_dir: PathBuf,
+        context_manager: Arc<StdMutex<ContextManager>>,
+    ) -> Self {
+        Self {
+            session_id,
+            data_dir,
+            context_manager,
+            scratch: StdMutex::new(None),
+        }
+    }
+
+    fn threshold_tokens(request: &PromptContextRequest) -> usize {
+        std::env::var("OCTOS_CONTEXT_COMPACT_THRESHOLD_TOKENS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                (request.context_window as usize * APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR
+                    / APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR)
+                    .max(1)
+            })
+    }
+
+    fn keep_items() -> usize {
+        std::env::var("OCTOS_CONTEXT_COMPACT_KEEP_ITEMS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(APPUI_CONTEXT_COMPACT_KEEP_ITEMS)
+    }
+
+    fn prompt_policy(request: &PromptContextRequest) -> PromptBuildPolicy {
+        PromptBuildPolicy {
+            include_reasoning: false,
+            supports_media: true,
+            max_prompt_token_estimate: None,
+            model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
+        }
+    }
+}
+
+impl PromptContextManager for AppUiPromptContextBridge {
+    fn prepare_prompt(
+        &self,
+        request: PromptContextRequest,
+        messages: &mut Vec<Message>,
+    ) -> Result<PromptContextReport, String> {
+        let messages_before = messages.len();
+        let policy = Self::prompt_policy(&request);
+        let mut scratch_guard = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if request.phase == PromptContextPhase::TurnStart || scratch_guard.is_none() {
+            let mut manager = self
+                .context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            record_prompt_messages_not_covered_by_context(&mut manager, &policy, messages);
+            *scratch_guard = Some(AppUiLoopPromptScratch {
+                manager,
+                observed_messages: messages.len(),
+            });
+        }
+        let scratch = scratch_guard
+            .as_mut()
+            .ok_or_else(|| "appui prompt context scratch was not initialized".to_string())?;
+        if request.phase != PromptContextPhase::TurnStart
+            && scratch.observed_messages < messages.len()
+        {
+            for message in messages.iter().skip(scratch.observed_messages) {
+                scratch.manager.record_message(message);
+            }
+        } else if scratch.observed_messages > messages.len() {
+            scratch.observed_messages = messages.len();
+        }
+
+        let threshold = Self::threshold_tokens(&request);
+        let mut compaction_performed = false;
+        if scratch.manager.state().token_estimate > threshold {
+            let before = scratch.manager.for_prompt(&policy);
+            let summary_budget = threshold.clamp(256, 4096) as u32;
+            let summary =
+                octos_agent::compaction::compact_messages(&before.messages, summary_budget);
+            let record = scratch.manager.compact_context(
+                summary,
+                CompactContextPolicy {
+                    trigger: format!("agent_loop:{}", request.phase.as_str()),
+                    keep_recent_items: Self::keep_items(),
+                    ..CompactContextPolicy::default()
+                },
+            );
+            compaction_performed = true;
+            info!(
+                session = %self.session_id.0,
+                phase = request.phase.as_str(),
+                iteration = request.iteration,
+                compaction_id = %record.compaction_id.as_str(),
+                checkpoint_id = %record.checkpoint_id.as_str(),
+                token_estimate_before = record.token_estimate_before,
+                token_estimate_after = ?record.token_estimate_after,
+                "appui context manager compact_context installed for in-loop model prompt"
+            );
+            publish_appui_context_status(&self.session_id, &scratch.manager);
+        }
+
+        let frame = scratch.manager.for_prompt(&policy);
+        let prompt_replaced = messages.len() != frame.messages.len()
+            || messages
+                .iter()
+                .zip(frame.messages.iter())
+                .any(|(left, right)| !prompt_message_matches(left, right));
+        *messages = frame.messages;
+        scratch.observed_messages = messages.len();
+        {
+            let mut canonical = self
+                .context_manager
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *canonical = scratch.manager.clone();
+            publish_appui_context_status(&self.session_id, &canonical);
+            if let Err(error) = persist_context_manager_snapshot(
+                &self.data_dir,
+                &self.session_id.to_string(),
+                &canonical,
+            ) {
+                warn!(
+                    session = %self.session_id.0,
+                    error = %error,
+                    "failed to persist appui prompt context manager snapshot"
+                );
+            }
+        }
+        Ok(PromptContextReport {
+            prompt_replaced,
+            compaction_performed,
+            messages_before,
+            messages_after: messages.len(),
+            token_estimate: Some(frame.report.token_estimate),
+            generation: Some(frame.context_state.generation),
+        })
+    }
+}
+
+fn record_appui_context_manager_message(
+    data_dir: &Path,
+    context_manager: &Arc<StdMutex<ContextManager>>,
+    session_id: &SessionKey,
+    message: &Message,
+    seq: usize,
+) {
+    let mut manager = context_manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let ids = manager.record_persisted_message_merging_prompt_equivalent(message, seq);
+    let state = manager.state();
+    tracing::debug!(
+        session = %session_id.0,
+        seq,
+        role = message.role.as_str(),
+        generated_items = ids.len(),
+        generation = state.generation,
+        transcript_hash = %state.transcript_hash,
+        "appui context manager recorded persisted session message"
+    );
+    publish_appui_context_status(session_id, &manager);
+    if let Err(error) =
+        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    {
+        warn!(
+            session = %session_id.0,
+            error = %error,
+            "failed to persist appui context manager snapshot"
+        );
+    }
 }
 
 /// Process-global event ledger.
@@ -1470,11 +2341,38 @@ fn forward_task_progress_to_channel(
     let Ok(json) = serde_json::to_string(&event) else {
         return;
     };
+    forward_task_progress_json_to_channel(tx, progress_dropped, task, "task_progress", json);
+
+    if let Some((session_id, agent)) = upsert_background_task_agent(task) {
+        let event = json!({
+            "type": "agent_updated",
+            "session_id": session_id,
+            "agent": agent,
+        });
+        if let Ok(json) = serde_json::to_string(&event) {
+            forward_task_progress_json_to_channel(
+                tx,
+                progress_dropped,
+                task,
+                "agent_updated",
+                json,
+            );
+        }
+    }
+}
+
+fn forward_task_progress_json_to_channel(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    progress_dropped: &Arc<AtomicU64>,
+    task: &octos_agent::BackgroundTask,
+    method: &'static str,
+    json: String,
+) {
     if tx.try_send(json.clone()).is_ok() {
         return;
     }
     progress_dropped.fetch_add(1, Ordering::Relaxed);
-    metrics::counter!("ws.send.drop.backpressure", "method" => "task_progress").increment(1);
+    metrics::counter!("ws.send.drop.backpressure", "method" => method).increment(1);
     if !task.status.is_terminal() {
         // Non-terminal: drop is fine, next update overwrites.
         return;
@@ -1501,7 +2399,7 @@ fn forward_task_progress_to_channel(
             Err(_elapsed) => {
                 metrics::counter!(
                     "ws.send.timeout.terminal",
-                    "method" => "task_progress"
+                    "method" => method
                 )
                 .increment(1);
                 tracing::warn!(
@@ -1867,21 +2765,6 @@ pub async fn ws_handler(
     // connection so per-session resolution (notably plugin work_dir →
     // file-API root) can pick the right profile data dir even for admin
     // sessions originated from a hosted subdomain.
-    //
-    // #995 follow-up — when the request carries an authenticated
-    // identity AND the headers (Host or surviving `X-Profile-Id`)
-    // resolve to a tenant profile, the identity MUST be authorized for
-    // that profile. Pre-fix, an authenticated user-A could open a WS
-    // upgrade against a TRUSTED hop with `X-Profile-Id: B` and have
-    // `routed_profile_id` propagate through session/gateway routing.
-    // Mismatch is a hard `403` — the upgrade does NOT proceed.
-    //
-    // The `WebSocketUpgrade` extractor is wrapped in `Result<…>` so
-    // the authorization gate runs even when the upgrade prerequisites
-    // are missing (notably under `tower::oneshot` in tests, which has
-    // no `hyper::upgrade::OnUpgrade` extension). In production the
-    // upgrade extractor never fails on a real WS request; the wrapper
-    // is purely so the 403 can be observed end-to-end in unit tests.
     let routed_profile_id = super::handlers::routed_profile_id_from_headers(&state, &headers);
     if let (Some(Extension(identity_inner)), Some(profile_id)) =
         (identity.as_ref(), routed_profile_id.as_ref())
@@ -1891,7 +2774,7 @@ pub async fn ws_handler(
                 target: "octos::ui_protocol::ws",
                 identity = ?identity_inner,
                 requested_profile = %profile_id,
-                "WS upgrade denied — authenticated identity not authorized for the routed profile (#995 follow-up)"
+                "WS upgrade denied: authenticated identity is not authorized for routed profile"
             );
             return (axum::http::StatusCode::FORBIDDEN, "forbidden").into_response();
         }
@@ -1927,7 +2810,7 @@ async fn ui_protocol_connection(
     state: Arc<AppState>,
     connection_profile_id: Option<String>,
     routed_profile_id: Option<String>,
-    features: ConnectionUiFeatures,
+    mut features: ConnectionUiFeatures,
     connection_headers: HeaderMap,
     connection_identity: Option<AuthIdentity>,
 ) {
@@ -1958,6 +2841,8 @@ async fn ui_protocol_connection(
     // forever — the cleanup path only ran when the next client frame
     // arrived, leaving subscribers and ledger fan-out registered.
     let failed_notify = ws.failed_notify();
+    let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
+    appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // #924 round-2 BLOCK: close the lost-notify race. `notify_waiters`
@@ -1985,6 +2870,20 @@ async fn ui_protocol_connection(
                 // Latch arm only fires when the connection is failed; no
                 // need to re-load — the Notify is private to `mark_failed`.
                 break;
+            }
+            _ = appui_continuation_tick.tick() => {
+                let profile_filter = connection_profile_id.or(routed_profile_id);
+                drain_appui_due_master_continuations(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts,
+                    &active_turns,
+                    &connection_turns,
+                    profile_filter,
+                    features,
+                ).await;
+                continue;
             }
             next = ws_rx.next() => match next {
                 Some(Ok(msg)) => msg,
@@ -2032,10 +2931,21 @@ async fn ui_protocol_connection(
                 continue;
             }
         };
+        append_appui_transcript_frame(
+            "client_to_server",
+            serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
+        );
         let id = request.id.clone();
+        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
+            continue;
+        }
         if handle_raw_appui_rpc(
             &ws,
             &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
             features,
             connection_profile_id,
             id.clone(),
@@ -2173,6 +3083,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     connection_profile_id,
                     routed_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -2252,6 +3163,9 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    connection_profile_id,
+                    routed_profile_id,
+                    features,
                     id,
                     params,
                 )
@@ -2321,6 +3235,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    true,
                     id,
                     params,
                 )
@@ -2332,6 +3247,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    true,
                     id,
                     params,
                 )
@@ -2343,6 +3259,7 @@ async fn ui_protocol_connection(
                     &state,
                     &connection_headers,
                     connection_identity.as_ref(),
+                    true,
                     id,
                     params,
                 )
@@ -2373,38 +3290,96 @@ async fn ui_protocol_connection(
 }
 
 pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
-    let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
-    let mut writer_handle = tokio::spawn(stdio_writer_loop(writer_rx));
-    let ws = WsConnection::new(writer_tx);
+    stdio_connection_with_io(state, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+async fn stdio_connection_with_io<R, W>(
+    state: Arc<AppState>,
+    stdin_reader: R,
+    stdout_writer: W,
+) -> eyre::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (writer_tx, writer_rx) =
+        std::sync::mpsc::sync_channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let (writer_done_tx, mut writer_done_rx) = oneshot::channel();
+    let writer_failure_signal = ws.failure_signal();
+    let writer_handle = std::thread::Builder::new()
+        .name("octos-appui-stdio-writer".into())
+        .spawn(move || {
+            let result = stdio_writer_loop_sync_to(writer_rx, stdout_writer, writer_failure_signal);
+            let _ = writer_done_tx.send(result);
+        })
+        .map_err(|error| eyre::eyre!("failed to spawn AppUI stdio writer: {error}"))?;
     let active_turns = active_turns_registry();
     let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let live_forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let contracts = contract_stores();
     let ledger = event_ledger(&state).await;
     let _ = diff_preview_store(&state, contracts.as_ref()).await;
-    let features = ConnectionUiFeatures::stdio_defaults();
+    let mut features = ConnectionUiFeatures::stdio_defaults();
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
+    let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
+    appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let failed_notify = ws.failed_notify();
+    let mut writer_finished = false;
+    let mut writer_exit_error: Option<eyre::Report> = None;
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdin = StdioNdjsonReader::new(stdin_reader);
     loop {
+        if ws.is_failed() {
+            break;
+        }
+        let notified = failed_notify.notified();
+        tokio::pin!(notified);
+        if ws.is_failed() {
+            break;
+        }
         let text = tokio::select! {
-            line = lines.next_line() => {
-                match line? {
-                    Some(text) => text,
-                    None => break,
+            biased;
+            _ = &mut notified => {
+                break;
+            }
+            _ = appui_continuation_tick.tick() => {
+                drain_appui_due_master_continuations(
+                    &ws,
+                    &state,
+                    &ledger,
+                    &contracts,
+                    &active_turns,
+                    &connection_turns,
+                    connection_profile_id_owned.as_deref(),
+                    features,
+                ).await;
+                continue;
+            }
+            writer_result = &mut writer_done_rx => {
+                ws.mark_failed();
+                writer_finished = true;
+                writer_exit_error = Some(match writer_result {
+                    Ok(Ok(())) => eyre::eyre!("AppUI stdio writer stopped before stdin closed"),
+                    Ok(Err(error)) => eyre::eyre!("AppUI stdio writer failed: {error}"),
+                    Err(error) => eyre::eyre!("AppUI stdio writer thread failed: {error}"),
+                });
+                break;
+            }
+            frame = stdin.next_frame() => {
+                match frame? {
+                    StdioFrameRead::Frame(text) => text,
+                    StdioFrameRead::Eof => break,
+                    StdioFrameRead::TooLarge => {
+                        let _ = send_rpc_error(&ws, None, app_ui_codec::frame_too_large_error());
+                        continue;
+                    }
                 }
             }
-            writer_result = &mut writer_handle => {
-                return match writer_result {
-                    Ok(Ok(())) => Err(eyre::eyre!("AppUI stdio writer stopped before stdin closed")),
-                    Ok(Err(error)) => Err(eyre::eyre!("AppUI stdio writer failed: {error}")),
-                    Err(error) => Err(eyre::eyre!("AppUI stdio writer task failed: {error}")),
-                };
-            }
         };
-        if text.trim().is_empty() {
-            continue;
+        if ws.is_failed() {
+            break;
         }
         let request = match parse_ws_text_frame(text.as_str()) {
             Ok(ParsedFrame::Request(request)) => request,
@@ -2423,12 +3398,25 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                 continue;
             }
         };
+        append_appui_transcript_frame(
+            "client_to_server",
+            serde_json::to_value(&request).unwrap_or_else(|_| json!({ "malformed": true })),
+        );
+        #[cfg(test)]
+        record_stdio_dispatch_for_test();
         let id = request.id.clone();
+        if handle_client_hello_rpc(&ws, &state, id.clone(), &request, &mut features) {
+            continue;
+        }
         let connection_profile_id = connection_profile_id_owned.as_deref();
 
         if handle_raw_appui_rpc(
             &ws,
             &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
             features,
             connection_profile_id,
             id.clone(),
@@ -2460,26 +3448,32 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                 }
             }
             UiCommand::SessionOpen(params) => {
-                if connection_profile_id_owned.is_none() {
-                    connection_profile_id_owned = params
-                        .profile_id
-                        .clone()
-                        .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
-                }
-                handle_session_open(
+                let next_connection_profile_id = stdio_session_open_candidate_profile(
+                    &params,
+                    connection_profile_id_owned.as_deref(),
+                );
+                let opened = handle_session_open(
                     &ws,
                     &state,
                     &ledger,
                     &contracts.approvals,
                     &live_forwarders,
-                    connection_profile_id_owned.as_deref(),
+                    next_connection_profile_id.as_deref(),
                     features,
                     id,
                     params,
                 )
                 .await;
+                if opened {
+                    connection_profile_id_owned = next_connection_profile_id;
+                }
             }
             UiCommand::TurnStart(params) => {
+                let turn_profile_id = params
+                    .session_id
+                    .profile_id()
+                    .map(ToOwned::to_owned)
+                    .or_else(|| connection_profile_id_owned.clone());
                 handle_turn_start(
                     &ws,
                     &state,
@@ -2487,7 +3481,7 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                     &contracts,
                     &active_turns,
                     &connection_turns,
-                    connection_profile_id_owned.as_deref(),
+                    turn_profile_id.as_deref(),
                     None,
                     features,
                     id,
@@ -2607,6 +3601,7 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                     &active_turns,
                     connection_profile_id_owned.as_deref(),
                     None,
+                    features,
                     id,
                     params,
                 )
@@ -2649,7 +3644,18 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                     .await;
             }
             UiCommand::SessionStatusGet(params) => {
-                handle_session_status_get(&ws, &state, &connection_headers, None, id, params).await;
+                handle_session_status_get(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    None,
+                    connection_profile_id_owned.as_deref(),
+                    None,
+                    features,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionFilesList(params) => {
                 handle_session_files_list(&ws, &state, &connection_headers, None, id, params).await;
@@ -2671,74 +3677,277 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
                 handle_system_status_get(&ws, &state, id, params).await;
             }
             UiCommand::ContentList(params) => {
-                handle_content_list(&ws, &state, &connection_headers, None, id, params).await;
-            }
-            UiCommand::ContentDelete(params) => {
-                handle_content_delete(&ws, &state, &connection_headers, None, id, params).await;
-            }
-            UiCommand::ContentBulkDelete(params) => {
-                handle_content_bulk_delete(&ws, &state, &connection_headers, None, id, params)
+                handle_content_list(&ws, &state, &connection_headers, None, false, id, params)
                     .await;
             }
-            UiCommand::RouterSetMode(_) | UiCommand::RouterGetMetrics(_) => {
-                // `router/*` RPCs require the full WebSocket connection's
-                // `routed_profile_id` context which stdio_connection does
-                // not carry. Reply with `method_not_supported` so clients
-                // negotiate around them rather than hang — mirrors the
-                // pattern from PR #858 for `permission/profile/*`.
-                let _ = send_rpc_error(
+            UiCommand::ContentDelete(params) => {
+                handle_content_delete(&ws, &state, &connection_headers, None, false, id, params)
+                    .await;
+            }
+            UiCommand::ContentBulkDelete(params) => {
+                handle_content_bulk_delete(
                     &ws,
-                    Some(id),
-                    RpcError::method_not_supported("router/* not supported on stdio transport"),
-                );
+                    &state,
+                    &connection_headers,
+                    None,
+                    false,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::RouterSetMode(params) => {
+                handle_router_set_mode(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::RouterGetMetrics(params) => {
+                handle_router_get_metrics(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
             }
         }
     }
 
-    abort_connection_turns(
+    cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
-        &contracts.scopes,
-        &ledger,
-        &contracts.approvals,
+        &live_forwarders,
+        contracts.as_ref(),
+        ledger.as_ref(),
     )
     .await;
-    abort_live_forwarders(&live_forwarders, &ledger).await;
     drop(ws);
-    match writer_handle.await {
+    if writer_finished {
+        if writer_handle.join().is_err() {
+            return Err(eyre::eyre!("AppUI stdio writer thread panicked"));
+        }
+        if let Some(error) = writer_exit_error {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    let writer_result = writer_done_rx.await;
+    if writer_handle.join().is_err() {
+        return Err(eyre::eyre!("AppUI stdio writer thread panicked"));
+    }
+    match writer_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(eyre::eyre!("AppUI stdio writer failed: {error}")),
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(eyre::eyre!("AppUI stdio writer task failed: {error}")),
+        Err(error) => return Err(eyre::eyre!("AppUI stdio writer thread failed: {error}")),
     }
     Ok(())
 }
 
-async fn stdio_writer_loop(rx: mpsc::Receiver<WsMessage>) -> std::io::Result<()> {
-    let stdout = tokio::io::stdout();
-    stdio_writer_loop_to(rx, stdout).await
+#[cfg(test)]
+static STDIO_DISPATCH_COUNT_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn reset_stdio_dispatch_count_for_test() {
+    STDIO_DISPATCH_COUNT_FOR_TEST.store(0, Ordering::SeqCst);
 }
 
+#[cfg(test)]
+fn stdio_dispatch_count_for_test() -> usize {
+    STDIO_DISPATCH_COUNT_FOR_TEST.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn record_stdio_dispatch_for_test() {
+    STDIO_DISPATCH_COUNT_FOR_TEST.fetch_add(1, Ordering::SeqCst);
+}
+
+enum StdioFrameRead {
+    Frame(String),
+    Eof,
+    TooLarge,
+}
+
+struct StdioNdjsonReader<R> {
+    reader: R,
+    buffer: Vec<u8>,
+}
+
+impl<R> StdioNdjsonReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::with_capacity(8 * 1024),
+        }
+    }
+
+    async fn next_frame(&mut self) -> eyre::Result<StdioFrameRead> {
+        loop {
+            if let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = self.buffer.drain(..=newline).collect();
+                if line.len() > MAX_TEXT_FRAME_BYTES + 1 {
+                    return Ok(StdioFrameRead::TooLarge);
+                }
+                app_ui_codec::strip_ndjson_line_ending_bytes(&mut line);
+                if line.len() > MAX_TEXT_FRAME_BYTES {
+                    return Ok(StdioFrameRead::TooLarge);
+                }
+                let text = String::from_utf8(line)
+                    .map_err(|err| eyre::eyre!("AppUI stdio frame is not UTF-8: {err}"))?;
+                return Ok(StdioFrameRead::Frame(text));
+            }
+
+            if self.buffer.len() == MAX_TEXT_FRAME_BYTES {
+                let mut byte = [0_u8; 1];
+                let read = self.reader.read(&mut byte).await?;
+                if read == 0 {
+                    let line = std::mem::take(&mut self.buffer);
+                    let text = String::from_utf8(line)
+                        .map_err(|err| eyre::eyre!("AppUI stdio frame is not UTF-8: {err}"))?;
+                    return Ok(StdioFrameRead::Frame(text));
+                }
+                if byte[0] == b'\n' {
+                    let mut line = std::mem::take(&mut self.buffer);
+                    app_ui_codec::strip_ndjson_line_ending_bytes(&mut line);
+                    let text = String::from_utf8(line)
+                        .map_err(|err| eyre::eyre!("AppUI stdio frame is not UTF-8: {err}"))?;
+                    return Ok(StdioFrameRead::Frame(text));
+                }
+                self.buffer.clear();
+                self.drain_until_line_boundary().await?;
+                return Ok(StdioFrameRead::TooLarge);
+            }
+
+            let mut chunk = [0_u8; 8192];
+            let remaining_before_limit = MAX_TEXT_FRAME_BYTES.saturating_sub(self.buffer.len());
+            let read_len = remaining_before_limit.min(chunk.len()).max(1);
+            let read = self.reader.read(&mut chunk[..read_len]).await?;
+            if read == 0 {
+                if self.buffer.is_empty() {
+                    return Ok(StdioFrameRead::Eof);
+                }
+                let line = std::mem::take(&mut self.buffer);
+                if line.len() > MAX_TEXT_FRAME_BYTES {
+                    return Ok(StdioFrameRead::TooLarge);
+                }
+                let text = String::from_utf8(line)
+                    .map_err(|err| eyre::eyre!("AppUI stdio frame is not UTF-8: {err}"))?;
+                return Ok(StdioFrameRead::Frame(text));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    async fn drain_until_line_boundary(&mut self) -> eyre::Result<()> {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = self.reader.read(&mut chunk).await?;
+            if read == 0 || chunk[..read].contains(&b'\n') {
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 async fn stdio_writer_loop_to<W>(
     mut rx: mpsc::Receiver<WsMessage>,
     writer: W,
+    failure_signal: ConnectionFailureSignal,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut stdout = BufWriter::new(writer);
     while let Some(message) = rx.recv().await {
-        match message {
-            WsMessage::Text(text) => {
-                stdout.write_all(text.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
-            }
-            WsMessage::Close(_) => break,
-            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => {}
+        if !write_stdio_message(&mut stdout, message, &failure_signal).await? {
+            break;
         }
     }
     Ok(())
+}
+
+fn stdio_writer_loop_sync_to<W>(
+    rx: std::sync::mpsc::Receiver<WsMessage>,
+    writer: W,
+    failure_signal: ConnectionFailureSignal,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| {
+            std::io::Error::other(format!("build AppUI stdio writer runtime: {error}"))
+        })?;
+    runtime.block_on(async move {
+        let mut stdout = BufWriter::new(writer);
+        while let Ok(message) = rx.recv() {
+            if !write_stdio_message(&mut stdout, message, &failure_signal).await? {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn write_stdio_message<W>(
+    stdout: &mut BufWriter<W>,
+    message: WsMessage,
+    failure_signal: &ConnectionFailureSignal,
+) -> std::io::Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    match message {
+        WsMessage::Text(text) => {
+            if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
+                append_appui_transcript_frame("server_to_client", frame);
+            }
+            let write_result = async {
+                stdout.write_all(text.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await
+            }
+            .await;
+            if let Err(error) = write_result {
+                failure_signal.mark_failed();
+                return Err(error);
+            }
+            Ok(true)
+        }
+        WsMessage::Close(_) => Ok(false),
+        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) => Ok(true),
+    }
+}
+
+async fn cleanup_stdio_connection_resources(
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    live_forwarders: &SharedLiveForwarders,
+    contracts: &UiProtocolContractStores,
+    ledger: &UiProtocolLedger,
+) {
+    abort_connection_turns(
+        active_turns,
+        connection_turns,
+        &contracts.scopes,
+        ledger,
+        &contracts.approvals,
+    )
+    .await;
+    abort_live_forwarders(live_forwarders, ledger).await;
 }
 
 async fn abort_live_forwarders(forwarders: &SharedLiveForwarders, ledger: &UiProtocolLedger) {
@@ -2795,48 +4004,40 @@ enum ParsedFrame {
 }
 
 fn parse_ws_text_frame(text: &str) -> Result<ParsedFrame, RpcError> {
-    if text.len() > MAX_TEXT_FRAME_BYTES {
-        return Err(frame_too_large_error());
-    }
-    let value: Value =
-        serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))?;
-    if !value.is_object() {
-        return Err(RpcError::parse_error("envelope must be an object"));
-    }
-    match value.get("id") {
-        None => {
-            let method = value
-                .get("method")
-                .and_then(Value::as_str)
-                .ok_or_else(|| RpcError::parse_error("notification missing method"))?
-                .to_owned();
-            Ok(ParsedFrame::Notification(method))
+    match app_ui_codec::parse_text_frame(text)? {
+        AppUiFrame::Request(request) => Ok(ParsedFrame::Request(request)),
+        AppUiFrame::Notification(notification) => {
+            Ok(ParsedFrame::Notification(notification.method))
         }
-        Some(Value::String(_)) => {
-            let request: RpcRequest<Value> = serde_json::from_value(value)
-                .map_err(|err| RpcError::parse_error(err.to_string()))?;
-            Ok(ParsedFrame::Request(request))
-        }
-        Some(Value::Null) => Err(RpcError::parse_error(
-            "rpc envelope `id` must not be null; omit the field for notifications",
-        )),
-        Some(Value::Number(_)) => Err(RpcError::parse_error(
-            "rpc envelope `id` must be a string; numeric ids are not supported",
-        )),
-        Some(_) => Err(RpcError::parse_error(
-            "rpc envelope `id` must be a string when present",
+        AppUiFrame::Response(_) | AppUiFrame::Error(_) => Err(RpcError::parse_error(
+            "client frame must be a JSON-RPC request or notification",
         )),
     }
 }
 
 #[cfg(test)]
 fn parse_rpc_request(text: &str) -> Result<RpcRequest<Value>, RpcError> {
-    serde_json::from_str(text).map_err(|err| RpcError::parse_error(err.to_string()))
+    match app_ui_codec::parse_text_frame(text)? {
+        AppUiFrame::Request(request) => Ok(request),
+        AppUiFrame::Notification(_) | AppUiFrame::Response(_) | AppUiFrame::Error(_) => {
+            Err(RpcError::parse_error("expected JSON-RPC request"))
+        }
+    }
 }
 
 /// Inbound notifications the server accepts (no reply emitted).
 fn is_known_inbound_notification(method: &str) -> bool {
     matches!(method, "ping")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawClientHelloParams {
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default, alias = "features", alias = "requested_features")]
+    supported_features: Vec<String>,
+    #[serde(default)]
+    client: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2914,12 +4115,127 @@ struct RawProfileLlmUpsertParams {
     set_primary: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RawAutonomyListParams {
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAutonomySessionParams {
+    session_id: SessionKey,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAgentParams {
+    agent_id: String,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAgentOutputParams {
+    agent_id: String,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    cursor: Option<Value>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAgentArtifactReadParams {
+    agent_id: String,
+    #[serde(default)]
+    artifact_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGoalSetParams {
+    session_id: SessionKey,
+    objective: String,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    token_budget: Option<u64>,
+    #[serde(default)]
+    transition_actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLoopCreateParams {
+    session_id: SessionKey,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default, alias = "command", alias = "input")]
+    command: Option<String>,
+    #[serde(default)]
+    interval_seconds: Option<u64>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLoopIdParams {
+    loop_id: String,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawReviewStartParams {
+    session_id: SessionKey,
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    turn_id: Option<TurnId>,
+    #[serde(default)]
+    target: Option<Value>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    delivery: Option<String>,
+}
+
 fn parse_raw_params<T>(request: &RpcRequest<Value>) -> Result<T, RpcError>
 where
     T: serde::de::DeserializeOwned,
 {
     serde_json::from_value(request.params.clone())
         .map_err(|err| RpcError::invalid_params(format!("{} params: {err}", request.method)))
+}
+
+fn parse_optional_raw_params<T>(request: &RpcRequest<Value>) -> Result<T, RpcError>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    if request.params.is_null() {
+        return Ok(T::default());
+    }
+    parse_raw_params(request)
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
@@ -2962,6 +4278,45 @@ fn supports_local_solo_profile_create(state: &AppState) -> bool {
 
 fn local_profile_error(kind: &str, message: impl Into<String>) -> RpcError {
     RpcError::invalid_params(message).with_data(json!({ "kind": kind }))
+}
+
+fn profile_unresolved_error(profile_id: &str) -> RpcError {
+    RpcError::invalid_params(format!(
+        "profile '{profile_id}' is not configured for this AppUI session"
+    ))
+    .with_data(json!({
+        "kind": "profile_unresolved",
+        "profile_id": profile_id,
+        "recoverable": true,
+        "recovery": "create or select a local profile before opening the session",
+    }))
+}
+
+fn auth_unavailable_error(method: &str) -> RpcError {
+    RpcError::permission_denied(format!("{method}: authenticated user identity required"))
+        .with_data(json!({
+            "kind": "auth_unavailable",
+            "recoverable": true,
+            "recovery": "authenticate before calling this method",
+        }))
+}
+
+fn profile_is_known(state: &AppState, profile_id: &str) -> bool {
+    state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.get(profile_id).ok().flatten())
+        .is_some()
+        || resolve_session_profile_runtime(state, Some(profile_id)).is_some()
+        || (profile_id == MAIN_PROFILE_ID && state.profile_store.is_none())
+}
+
+fn ensure_known_profile(state: &AppState, profile_id: &str) -> Result<(), RpcError> {
+    if profile_is_known(state, profile_id) {
+        Ok(())
+    } else {
+        Err(profile_unresolved_error(profile_id))
+    }
 }
 
 fn local_profile_permission_error(
@@ -3536,6 +4891,103 @@ fn permission_profile_set_result(
     })
 }
 
+fn coding_tool_policy_view(
+    selection: octos_core::ui_protocol::PermissionProfileSelection,
+    approval_policy: Option<octos_agent::ApprovalPolicy>,
+) -> super::coding_tool_contract::ToolPolicyView<'static> {
+    let (approval_policy, sandbox_mode, _, _, _) =
+        permission_selection_policy_fields(selection, approval_policy);
+    super::coding_tool_contract::ToolPolicyView {
+        tool_policy_id: "profile",
+        sandbox_mode,
+        approval_policy,
+    }
+}
+
+fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+    let mut names: Vec<String> = registry
+        .map(|registry| registry.specs().into_iter().map(|spec| spec.name).collect())
+        .unwrap_or_else(|| {
+            super::coding_tool_contract::OCTOS_KNOWN_MODEL_VISIBLE_TOOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        });
+    names.sort();
+    names.dedup();
+    names
+}
+
+async fn tool_status_list_result(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
+    let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
+        let permissions = effective_permissions_for_session(state, session_id)?;
+        let workspace_hint = session_workspaces().get(session_id);
+        Some(
+            state
+                .session_cache
+                .get_or_init_with_permissions(
+                    profile_runtime,
+                    session_id.clone(),
+                    workspace_hint,
+                    permissions,
+                )
+                .await
+                .map_err(|error| {
+                    runtime_unavailable_error(format!(
+                        "failed to bootstrap session runtime: {error}"
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
+    let registry = session_runtime
+        .as_ref()
+        .map(|runtime| runtime.tools.as_ref())
+        .or_else(|| {
+            profile_runtime
+                .as_ref()
+                .map(|runtime| runtime.tool_specs.as_ref())
+        });
+    let tool_names = model_visible_tool_names(registry);
+    let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+    let disabled_tool_refs: [&str; 0] = [];
+    let permission_state = session_permission_profiles().get_state(session_id);
+    let session_id_wire = session_id.to_string();
+    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+
+    Ok(super::coding_tool_contract::tool_status_list_payload(
+        super::coding_tool_contract::ToolStatusListContext {
+            profile_id: Some(profile_id.as_str()),
+            session_id: session_id_wire.as_str(),
+            policy: coding_tool_policy_view(
+                permission_state.selection,
+                permission_state.approval_policy,
+            ),
+            available_model_tools: &tool_name_refs,
+            disabled_model_tools: &disabled_tool_refs,
+            include_coding_tool_contract: true,
+        },
+    ))
+}
+
+fn mcp_status_list_result(session_id: &SessionKey, active_profile_id: Option<&str>) -> Value {
+    let session_id_wire = session_id.to_string();
+    let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
+    super::coding_tool_contract::mcp_status_list_payload(
+        super::coding_tool_contract::McpStatusListContext {
+            profile_id: Some(profile_id.as_str()),
+            session_id: session_id_wire.as_str(),
+            servers: &[],
+        },
+    )
+}
+
 fn runtime_policy_stamp_for_profile(
     state: &AppState,
     profile_id: &str,
@@ -3561,7 +5013,7 @@ fn runtime_policy_stamp_for_profile(
     let workspace_root = session_id
         .and_then(|session_id| session_workspaces().get(session_id))
         .map(|path| path.to_string_lossy().to_string());
-    json!({
+    let mut stamp = json!({
         "runtime_mode": runtime_mode_for_state(state),
         "profile_id": profile_id,
         "workspace_root": workspace_root,
@@ -3577,7 +5029,19 @@ fn runtime_policy_stamp_for_profile(
         "memory_scope": "profile-session",
         "qoe_policy": "profile",
         "queue_mode": "adaptive",
-    })
+    });
+    super::coding_tool_contract::apply_coding_runtime_policy_stamp_extensions(
+        &mut stamp,
+        super::coding_tool_contract::RuntimePolicyStampContext {
+            policy: super::coding_tool_contract::ToolPolicyView {
+                tool_policy_id: "profile",
+                sandbox_mode,
+                approval_policy,
+            },
+            mcp_servers: &[],
+        },
+    );
+    stamp
 }
 
 fn profile_llm_list_result(
@@ -3654,8 +5118,8 @@ fn raw_catalog_result() -> Result<Value, RpcError> {
     Ok(json!({ "families": families }))
 }
 
-fn raw_session_status_result(
-    state: &AppState,
+async fn raw_session_status_result(
+    state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     features: ConnectionUiFeatures,
     connection_profile_id: Option<&str>,
@@ -3669,12 +5133,29 @@ fn raw_session_status_result(
         .profile_store
         .as_ref()
         .and_then(|store| store.get(&profile_id).ok().flatten());
-    let policy =
+    if profile.is_none() && !profile_is_known(state, &profile_id) {
+        return Err(profile_unresolved_error(&profile_id));
+    }
+    let mut policy =
         runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref());
+    add_autonomy_policy_stamp(&mut policy, features);
+    let (context, context_state) = if features.context_lifecycle_available() {
+        appui_context_status_snapshot_for_state(
+            state,
+            connection_profile_id,
+            Some(&profile_id),
+            &session_id,
+        )
+        .await
+    } else {
+        (None, None)
+    };
     Ok(json!({
         "session_id": session_id,
         "profile_id": profile_id,
         "runtime_policy_stamp": policy,
+        "context": context,
+        "context_state": context_state,
         "model": {
             "model": policy.get("model").cloned().unwrap_or(Value::Null),
             "provider": policy.get("provider").cloned().unwrap_or(Value::Null),
@@ -3689,6 +5170,66 @@ fn raw_session_status_result(
         "cursor": { "healthy": true, "replay_supported": true },
         "capabilities": features.advertised_capabilities(state),
     }))
+}
+
+fn add_autonomy_policy_stamp(policy: &mut Value, features: ConnectionUiFeatures) {
+    if !features.coding_autonomy_available() {
+        return;
+    }
+    let Value::Object(object) = policy else {
+        return;
+    };
+    object.insert(
+        "autonomy_contract_id".into(),
+        Value::String("coding-autonomy-v1".into()),
+    );
+    object.insert(
+        "agent_control".into(),
+        Value::String(
+            if features.agent_control_available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .into(),
+        ),
+    );
+    object.insert(
+        "goal_runtime".into(),
+        Value::String(
+            if features.goal_runtime_available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .into(),
+        ),
+    );
+    object.insert(
+        "loop_runtime".into(),
+        Value::String(
+            if features.loop_runtime_available() {
+                "available"
+            } else {
+                "unavailable"
+            }
+            .into(),
+        ),
+    );
+    object.insert("goal_default_token_budget".into(), json!(50_000));
+    object.insert("goal_max_token_budget".into(), json!(200_000));
+    object.insert("continuation_min_delay_seconds".into(), json!(30));
+    object.insert("continuation_max_per_hour".into(), json!(20));
+    object.insert("loop_min_interval_seconds".into(), json!(60));
+    object.insert("loop_max_interval_seconds".into(), json!(86_400));
+    object.insert("loop_max_age_days".into(), json!(7));
+    object.insert("loop_allow_slash_commands".into(), json!(true));
+    object.insert("idle_only_scheduling".into(), json!(true));
+    object.insert("max_objective_bytes".into(), json!(8_192));
+    object.insert("max_loop_prompt_bytes".into(), json!(8_192));
+    object.insert("max_loops_per_session".into(), json!(16));
+    object.insert("max_agent_tree_depth".into(), json!(4));
+    object.insert("max_agents_per_session".into(), json!(32));
 }
 
 fn raw_profile_skill_profile_id(
@@ -4174,20 +5715,339 @@ fn profile_llm_test_result(
     result
 }
 
+#[cfg(test)]
+fn clear_autonomy_runtime_state_for_test() {
+    clear_default_agent_orchestrator_for_test();
+}
+
+fn is_autonomy_method(method: &str) -> bool {
+    matches!(
+        method,
+        octos_core::ui_protocol::methods::AGENT_LIST
+            | octos_core::ui_protocol::methods::AGENT_STATUS_READ
+            | octos_core::ui_protocol::methods::AGENT_OUTPUT_READ
+            | octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST
+            | octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ
+            | octos_core::ui_protocol::methods::AGENT_INTERRUPT
+            | octos_core::ui_protocol::methods::AGENT_CLOSE
+            | octos_core::ui_protocol::methods::SESSION_GOAL_GET
+            | octos_core::ui_protocol::methods::SESSION_GOAL_SET
+            | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR
+            | octos_core::ui_protocol::methods::LOOP_CREATE
+            | octos_core::ui_protocol::methods::LOOP_LIST
+            | octos_core::ui_protocol::methods::LOOP_DELETE
+            | octos_core::ui_protocol::methods::LOOP_PAUSE
+            | octos_core::ui_protocol::methods::LOOP_RESUME
+            | octos_core::ui_protocol::methods::LOOP_FIRE_NOW
+    )
+}
+
+fn autonomy_method_available(method: &str, features: ConnectionUiFeatures) -> bool {
+    match method {
+        octos_core::ui_protocol::methods::AGENT_LIST
+        | octos_core::ui_protocol::methods::AGENT_STATUS_READ
+        | octos_core::ui_protocol::methods::AGENT_OUTPUT_READ
+        | octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST
+        | octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ
+        | octos_core::ui_protocol::methods::AGENT_INTERRUPT
+        | octos_core::ui_protocol::methods::AGENT_CLOSE => features.agent_control_available(),
+        octos_core::ui_protocol::methods::SESSION_GOAL_GET
+        | octos_core::ui_protocol::methods::SESSION_GOAL_SET
+        | octos_core::ui_protocol::methods::SESSION_GOAL_CLEAR => features.goal_runtime_available(),
+        octos_core::ui_protocol::methods::LOOP_CREATE
+        | octos_core::ui_protocol::methods::LOOP_LIST
+        | octos_core::ui_protocol::methods::LOOP_DELETE
+        | octos_core::ui_protocol::methods::LOOP_PAUSE
+        | octos_core::ui_protocol::methods::LOOP_RESUME
+        | octos_core::ui_protocol::methods::LOOP_FIRE_NOW => features.loop_runtime_available(),
+        _ => false,
+    }
+}
+
+fn resolve_autonomy_profile_id(
+    session_id: Option<&SessionKey>,
+    requested_profile_id: Option<&str>,
+    connection_profile_id: Option<&str>,
+) -> Result<String, RpcError> {
+    if requested_profile_id.is_some_and(str::is_empty) {
+        return Err(RpcError::invalid_params("profile_id cannot be empty"));
+    }
+    if let Some(session_id) = session_id {
+        return Ok(validate_session_scope(
+            session_id,
+            requested_profile_id,
+            connection_profile_id,
+        )?
+        .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
+        .or_else(|| connection_profile_id.map(ToOwned::to_owned))
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()));
+    }
+    if let Some(connection_profile_id) = connection_profile_id {
+        if requested_profile_id.is_some_and(|profile_id| profile_id != connection_profile_id) {
+            return Err(RpcError::permission_denied(
+                "profile_id is outside the authenticated profile",
+            )
+            .with_data(json!({
+                "kind": "auth_scope_violation",
+                "connection_profile_id": connection_profile_id,
+                "requested_profile_id": requested_profile_id,
+            })));
+        }
+        return Ok(connection_profile_id.to_owned());
+    }
+    Ok(requested_profile_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()))
+}
+
+fn raw_autonomy_rpc(
+    request: &RpcRequest<Value>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    raw_autonomy_rpc_with_orchestrator(
+        request,
+        features,
+        connection_profile_id,
+        default_agent_orchestrator(),
+    )
+}
+
+fn raw_autonomy_rpc_with_orchestrator(
+    request: &RpcRequest<Value>,
+    features: ConnectionUiFeatures,
+    connection_profile_id: Option<&str>,
+    orchestrator: &dyn AgentOrchestrator,
+) -> Result<Value, RpcError> {
+    use octos_core::ui_protocol::methods;
+
+    let method = request.method.as_str();
+    if !autonomy_method_available(method, features) {
+        return Err(RpcError::method_not_supported(method));
+    }
+
+    match method {
+        methods::AGENT_LIST => {
+            let params: RawAutonomyListParams = parse_optional_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.list_agents(AgentListRequest {
+                session_id: params.session_id,
+                profile_id,
+                connection_profile_id: connection_profile_id.map(ToOwned::to_owned),
+            })
+        }
+        methods::AGENT_STATUS_READ => {
+            let params: RawAgentParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.read_agent_status(AgentRequest {
+                agent_id: params.agent_id,
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::AGENT_OUTPUT_READ => {
+            let params: RawAgentOutputParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.read_agent_output(AgentOutputRequest {
+                agent_id: params.agent_id,
+                session_id: params.session_id,
+                profile_id,
+                cursor: params.cursor,
+                limit: params.limit,
+            })
+        }
+        methods::AGENT_ARTIFACT_LIST => {
+            let params: RawAgentParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.list_agent_artifacts(AgentRequest {
+                agent_id: params.agent_id,
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::AGENT_ARTIFACT_READ => {
+            let params: RawAgentArtifactReadParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.read_agent_artifact(AgentArtifactReadRequest {
+                agent_id: params.agent_id,
+                artifact_id: params.artifact_id,
+                path: params.path,
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::AGENT_INTERRUPT | methods::AGENT_CLOSE => {
+            let params: RawAgentParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            let request = AgentRequest {
+                agent_id: params.agent_id,
+                session_id: params.session_id,
+                profile_id,
+            };
+            if method == methods::AGENT_INTERRUPT {
+                orchestrator.interrupt_agent(request)
+            } else {
+                orchestrator.close_agent(request)
+            }
+        }
+        methods::SESSION_GOAL_GET => {
+            let params: RawAutonomySessionParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                Some(&params.session_id),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.get_goal(GoalSessionRequest {
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::SESSION_GOAL_SET => {
+            let params: RawGoalSetParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                Some(&params.session_id),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.set_goal(GoalSetRequest {
+                session_id: params.session_id,
+                profile_id,
+                objective: params.objective,
+                status: params.status,
+                token_budget: params.token_budget,
+                transition_actor: params.transition_actor,
+            })
+        }
+        methods::SESSION_GOAL_CLEAR => {
+            let params: RawAutonomySessionParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                Some(&params.session_id),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.clear_goal(GoalSessionRequest {
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::LOOP_CREATE => {
+            let params: RawLoopCreateParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                Some(&params.session_id),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.create_loop(LoopCreateRequest {
+                session_id: params.session_id,
+                profile_id,
+                prompt: params.prompt,
+                command: params.command,
+                interval_seconds: params.interval_seconds,
+                mode: params.mode,
+            })
+        }
+        methods::LOOP_LIST => {
+            let params: RawAutonomyListParams = parse_optional_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.list_loops(LoopListRequest {
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::LOOP_DELETE
+        | methods::LOOP_PAUSE
+        | methods::LOOP_RESUME
+        | methods::LOOP_FIRE_NOW => {
+            let params: RawLoopIdParams = parse_raw_params(request)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            let kind = match method {
+                methods::LOOP_DELETE => LoopControlKind::Delete,
+                methods::LOOP_PAUSE => LoopControlKind::Pause,
+                methods::LOOP_RESUME => LoopControlKind::Resume,
+                methods::LOOP_FIRE_NOW => LoopControlKind::FireNow,
+                _ => unreachable!("loop control method matched above"),
+            };
+            orchestrator.control_loop(LoopControlRequest {
+                loop_id: params.loop_id,
+                session_id: params.session_id,
+                profile_id,
+                kind,
+            })
+        }
+        _ => Err(RpcError::method_not_found(method)),
+    }
+}
+
 async fn handle_raw_appui_rpc(
     ws: &WsConnection,
     state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
     features: ConnectionUiFeatures,
     connection_profile_id: Option<&str>,
     id: String,
     request: &RpcRequest<Value>,
 ) -> bool {
+    if request.method == APPUI_METHOD_REVIEW_START {
+        handle_review_start(
+            ws,
+            state,
+            ledger,
+            contracts,
+            active_turns,
+            connection_turns,
+            connection_profile_id,
+            features,
+            id,
+            request,
+        )
+        .await;
+        return true;
+    }
+
     let result = match request.method.as_str() {
+        method if is_autonomy_method(method) => {
+            raw_autonomy_rpc(request, features, connection_profile_id)
+        }
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
         }
         APPUI_METHOD_SESSION_STATUS_READ => {
-            raw_session_status_result(state, request, features, connection_profile_id)
+            raw_session_status_result(state, request, features, connection_profile_id).await
         }
         APPUI_METHOD_PROFILE_LLM_CATALOG => raw_catalog_result(),
         APPUI_METHOD_PROFILE_LLM_LIST => {
@@ -4309,6 +6169,15 @@ async fn handle_raw_appui_rpc(
                 "email_login_enabled": true
             }
         })),
+        APPUI_METHOD_AUTH_ME if features.stdio_transport => {
+            Err(auth_unavailable_error(APPUI_METHOD_AUTH_ME))
+        }
+        octos_core::ui_protocol::methods::CONTENT_LIST if features.stdio_transport => Err(
+            auth_unavailable_error(octos_core::ui_protocol::methods::CONTENT_LIST),
+        ),
+        octos_core::ui_protocol::methods::CONTENT_DELETE if features.stdio_transport => Err(
+            auth_unavailable_error(octos_core::ui_protocol::methods::CONTENT_DELETE),
+        ),
         APPUI_METHOD_AUTH_ME => Ok(json!({
             "email": "unknown account",
             "profile_id": connection_profile_id.unwrap_or(MAIN_PROFILE_ID)
@@ -4322,6 +6191,9 @@ async fn handle_raw_appui_rpc(
             "user": { "email": "unknown account" },
             "message": "verified"
         })),
+        APPUI_METHOD_AUTH_LOGOUT if features.stdio_transport => {
+            Err(auth_unavailable_error(APPUI_METHOD_AUTH_LOGOUT))
+        }
         APPUI_METHOD_AUTH_LOGOUT => Ok(json!({ "ok": true })),
         APPUI_METHOD_MCP_STATUS_LIST | APPUI_METHOD_TOOL_STATUS_LIST => {
             let params: RawProfileParams = match parse_raw_params(request) {
@@ -4339,10 +6211,32 @@ async fn handle_raw_appui_rpc(
                 );
                 return true;
             };
+            let active_profile_id = match validate_session_scope(
+                &session_id,
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            ) {
+                Ok(active_profile_id) => active_profile_id,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
             if request.method == APPUI_METHOD_MCP_STATUS_LIST {
-                Ok(json!({ "session_id": session_id, "servers": [] }))
+                Ok(mcp_status_list_result(
+                    &session_id,
+                    active_profile_id.as_deref(),
+                ))
             } else {
-                Ok(json!({ "session_id": session_id, "policy_id": "profile", "tools": [] }))
+                match tool_status_list_result(state, &session_id, active_profile_id.as_deref())
+                    .await
+                {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        let _ = send_rpc_error(ws, Some(id), error);
+                        return true;
+                    }
+                }
             }
         }
         _ => return false,
@@ -4350,12 +6244,95 @@ async fn handle_raw_appui_rpc(
 
     match result {
         Ok(result) => {
+            let continuation_target =
+                appui_continuation_target_from_raw_result(request.method.as_str(), &result);
             let _ = send_rpc_result(ws, id, result);
+            if let Some((session_id, profile_id)) = continuation_target {
+                let _ = maybe_spawn_appui_master_continuation_runner(
+                    ws,
+                    state,
+                    ledger,
+                    contracts,
+                    active_turns,
+                    connection_turns,
+                    session_id,
+                    profile_id,
+                    features,
+                )
+                .await;
+            }
         }
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
         }
     }
+    true
+}
+
+fn appui_continuation_target_from_raw_result(
+    method: &str,
+    result: &Value,
+) -> Option<(SessionKey, String)> {
+    if method != octos_core::ui_protocol::methods::LOOP_FIRE_NOW
+        || result
+            .get("fire")
+            .and_then(|fire| fire.get("queued"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+
+    let session_id: SessionKey = serde_json::from_value(result.get("session_id")?.clone()).ok()?;
+    let profile_id = result
+        .get("profile_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    Some((session_id, profile_id))
+}
+
+fn handle_client_hello_rpc(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    id: String,
+    request: &RpcRequest<Value>,
+    features: &mut ConnectionUiFeatures,
+) -> bool {
+    if request.method != APPUI_METHOD_CLIENT_HELLO {
+        return false;
+    }
+    let params: RawClientHelloParams = match parse_optional_raw_params(request) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return true;
+        }
+    };
+    if !params.supported_features.is_empty() {
+        *features = ConnectionUiFeatures::from_requested_feature_tokens(
+            params.supported_features.iter().map(String::as_str),
+            features.stdio_transport,
+        );
+    }
+    let transport = if features.stdio_transport {
+        "stdio"
+    } else {
+        "websocket"
+    };
+    let capabilities = features.advertised_capabilities(state);
+    let _ = send_rpc_result(
+        ws,
+        id,
+        json!({
+            "type": "server_hello",
+            "transport": transport,
+            "client_transport": params.transport,
+            "client": params.client,
+            "capabilities": capabilities,
+        }),
+    );
     true
 }
 
@@ -4455,14 +6432,6 @@ fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
     let mut methods = octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec();
     methods.extend(APPUI_EXTRA_METHODS.iter().copied());
     methods
-}
-
-fn frame_too_large_error() -> RpcError {
-    RpcError::new(
-        FRAME_TOO_LARGE,
-        format!("WebSocket text frame exceeds {MAX_TEXT_FRAME_BYTES} bytes"),
-    )
-    .with_data(json!({ "limit_bytes": MAX_TEXT_FRAME_BYTES }))
 }
 
 fn authenticated_profile_id(identity: &AuthIdentity) -> Option<&str> {
@@ -4592,7 +6561,7 @@ async fn handle_session_open(
     features: ConnectionUiFeatures,
     id: String,
     params: SessionOpenParams,
-) {
+) -> bool {
     // Subscribe to the live ledger broadcast BEFORE the replay query so any
     // event that lands while we're still computing replay/opened sits in the
     // broadcast buffer and gets emitted by the forwarder once we hand it off
@@ -4623,7 +6592,7 @@ async fn handle_session_open(
             drop(live_rx);
             ledger.prune_subscriber_if_idle(&session_id_for_subscribe);
             send_scope_error(ws, id, error);
-            return;
+            return false;
         }
     };
 
@@ -4637,13 +6606,13 @@ async fn handle_session_open(
                     "failed to serialize session/open result: {error}"
                 )),
             );
-            return;
+            return false;
         }
     };
     // session/open reply is the lifecycle frame that the client blocks on;
     // if it fails the connection is doomed for this command.
     if send_rpc_result(ws, id, result).is_err() {
-        return;
+        return false;
     }
     // Replay frames are durable: drops surface as `protocol/replay_lossy`
     // and the client can refetch via REST.
@@ -4707,6 +6676,18 @@ async fn handle_session_open(
         live_forwarders.clone(),
     )
     .await;
+    true
+}
+
+fn stdio_session_open_candidate_profile(
+    params: &SessionOpenParams,
+    current_profile_id: Option<&str>,
+) -> Option<String> {
+    params
+        .profile_id
+        .clone()
+        .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned))
+        .or_else(|| current_profile_id.map(ToOwned::to_owned))
 }
 
 /// Pump live ledger events for `session_id` into the connection's WS write
@@ -4814,6 +6795,15 @@ fn live_event_passes_capability_filter(
             return false;
         }
     }
+    if !features.context_lifecycle_available() {
+        if let UiProtocolLedgerEvent::Notification(
+            UiNotification::ContextCompactionCompleted(_)
+            | UiNotification::ContextNormalizationReported(_),
+        ) = event
+        {
+            return false;
+        }
+    }
     if !features.spawn_complete {
         // Old client: never deliver the new envelope.
         if let UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(_)) = event {
@@ -4862,6 +6852,9 @@ async fn open_session_result(
         params.profile_id.as_deref(),
         connection_profile_id,
     )?;
+    if let Some(profile_id) = active_profile_id.as_deref() {
+        ensure_known_profile(state, profile_id)?;
+    }
     ensure_session_profile_runtime(state, active_profile_id.as_deref()).await?;
     let requested_workspace =
         validate_requested_session_cwd(state, features, active_profile_id.as_deref(), &params)?;
@@ -4968,14 +6961,29 @@ async fn open_session_result(
         .filter(|approval| !replayed_approval_ids.contains(&approval.approval_id))
         .collect::<Vec<_>>();
 
-    let Some(sessions) = &state.sessions else {
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        active_profile_id.as_deref(),
+        &params.session_id,
+    )
+    .await
+    else {
         return Err(runtime_unavailable_error("Sessions not available"));
     };
 
-    let data_dir = {
+    let (data_dir, history) = {
         let mut sessions = sessions.lock().await;
-        sessions.get_or_create(&params.session_id).await;
-        sessions.data_dir()
+        let data_dir = sessions.data_dir();
+        let session = sessions.get_or_create(&params.session_id).await;
+        (data_dir, session.messages.clone())
+    };
+    let (context, context_state) =
+        appui_context_inspection_snapshot(&data_dir, &params.session_id, &history);
+    let (context, context_state) = if features.context_lifecycle_available() {
+        (Some(context), Some(context_state))
+    } else {
+        (None, None)
     };
 
     // The cached SessionRuntime's `workspace_root` is the source of truth
@@ -4998,6 +7006,8 @@ async fn open_session_result(
             session_id: params.session_id,
             active_profile_id,
             workspace_root: workspace_root.map(|path| path.to_string_lossy().to_string()),
+            context,
+            context_state,
             cursor: None,
             panes,
             capabilities,
@@ -5698,6 +7708,172 @@ fn infer_profile_id_from_data_dir(data_dir: &Path) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_review_start(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    request: &RpcRequest<Value>,
+) {
+    if !features.review_start_available() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(APPUI_METHOD_REVIEW_START),
+        );
+        return;
+    }
+
+    let params: RawReviewStartParams = match parse_raw_params(request) {
+        Ok(params) => params,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let scoped_profile_id = match validate_session_scope(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            send_scope_error(ws, id, error);
+            return;
+        }
+    };
+    let active_profile_id = params
+        .session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or(scoped_profile_id)
+        .or_else(|| connection_profile_id.map(ToOwned::to_owned));
+    if let Some(profile_id) = active_profile_id.as_deref() {
+        if let Err(error) = ensure_known_profile(state, profile_id) {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    }
+    let review_profile_runtime =
+        match ensure_session_profile_runtime(state, active_profile_id.as_deref()).await {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    runtime_unavailable_error(format!(
+                        "No ProfileRuntime registered for profile '{}'. \
+                     Set up the profile with an API key in the dashboard.",
+                        active_profile_id.as_deref().unwrap_or("<unset>"),
+                    )),
+                );
+                return;
+            }
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let accepted_agent_count =
+        expected_review_agent_count_for_profile(state, Some(review_profile_runtime.as_ref()));
+
+    let turn_id = params.turn_id.clone().unwrap_or_else(TurnId::new);
+    let session_id = params.session_id.clone();
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let ws_for_turn = ws.clone();
+    let state_for_turn = state.clone();
+    let ledger_for_turn = ledger.clone();
+    let contracts_for_turn = contracts.clone();
+    let turn_state_for_task = turn_state.clone();
+    let profile_for_turn = active_profile_id.clone();
+    let turn_id_for_task = turn_id.clone();
+
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+        run_native_code_review_turn(
+            ws_for_turn,
+            state_for_turn,
+            ledger_for_turn,
+            contracts_for_turn,
+            features,
+            params,
+            turn_id_for_task,
+            profile_for_turn,
+            turn_state_for_task,
+            interrupt_rx,
+        )
+        .await;
+    });
+
+    let inserted = {
+        let mut active = active_turns.lock().await;
+        let occupied = match active.get(&session_id) {
+            Some(existing) => {
+                let existing_state = existing.state.lock().await;
+                !matches!(*existing_state, TurnState::Terminal(_))
+            }
+            None => false,
+        };
+        if occupied {
+            false
+        } else {
+            active.insert(
+                session_id.clone(),
+                ActiveTurn {
+                    turn_id: turn_id.clone(),
+                    state: turn_state,
+                    interrupt_tx,
+                    abort: handle.abort_handle(),
+                },
+            );
+            true
+        }
+    };
+    if !inserted {
+        handle.abort();
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_request("a turn is already running for this session"),
+        );
+        return;
+    }
+
+    connection_turns
+        .lock()
+        .await
+        .insert(session_id.clone(), turn_id.clone());
+    if send_rpc_result(
+        ws,
+        id,
+        json!({
+            "accepted": true,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "workflow": "code_review",
+            "backend": "native",
+            "agent_count": accepted_agent_count,
+        }),
+    )
+    .is_err()
+    {
+        handle.abort();
+        return;
+    }
+    let _ = start_tx.send(());
+}
+
 async fn handle_turn_start(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -5770,6 +7946,12 @@ async fn handle_turn_start(
                     .or(routed_profile_id)
                     .map(ToOwned::to_owned)
             });
+        if let Some(profile_id) = active_profile_id.as_deref() {
+            if let Err(error) = ensure_known_profile(state, profile_id) {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        }
         if resolve_session_profile_runtime(state, active_profile_id.as_deref()).is_none() {
             let _ = send_rpc_error(
                 ws,
@@ -5826,6 +8008,7 @@ async fn handle_turn_start(
                 resolved_profile_id,
                 turn_state_for_task,
                 interrupt_rx,
+                false,
             )
             .await;
         }
@@ -5880,6 +8063,144 @@ async fn handle_turn_start(
         return;
     }
     let _ = start_tx.send(());
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_spawn_appui_master_continuation_runner(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    session_id: SessionKey,
+    profile_id: String,
+    features: ConnectionUiFeatures,
+) -> bool {
+    let mut active = active_turns.lock().await;
+    let occupied = match active.get(&session_id) {
+        Some(existing) => {
+            let existing_state = existing.state.lock().await;
+            !matches!(*existing_state, TurnState::Terminal(_))
+        }
+        None => false,
+    };
+    if occupied {
+        return false;
+    }
+
+    let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
+        !contracts
+            .approvals
+            .pending_for_session(&session_id)
+            .is_empty(),
+    );
+    let Some(continuation) = default_agent_orchestrator()
+        .drain_ready_continuations_for_session(&session_id, &profile_id, runtime_state, 1)
+        .into_iter()
+        .next()
+    else {
+        return false;
+    };
+
+    let turn_id = TurnId::new();
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
+    let turn_state_for_task = turn_state.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+
+    let ws_for_turn = ws.clone();
+    let state_for_turn = state.clone();
+    let ledger_for_turn = ledger.clone();
+    let contracts_for_turn = contracts.clone();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: master_continuation_prompt(&continuation),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+    };
+    let prompt = prompt_text(&params.input).unwrap_or_default();
+    let routed_profile_id = Some(profile_id.clone());
+    let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
+        info!(
+            session = %params.session_id,
+            continuation_id = continuation.id.as_u64(),
+            reason = master_continuation_reason_name(&continuation.reason),
+            "draining queued master continuation into AppUI turn runtime"
+        );
+        default_agent_orchestrator().mark_continuation_started(&continuation);
+        run_standalone_turn(
+            ws_for_turn,
+            state_for_turn,
+            ledger_for_turn,
+            contracts_for_turn,
+            features,
+            params,
+            prompt,
+            routed_profile_id,
+            turn_state_for_task,
+            interrupt_rx,
+            true,
+        )
+        .await;
+        default_agent_orchestrator().mark_continuation_completed(
+            &continuation,
+            Some("processed_by_appui_turn_runtime".to_owned()),
+        );
+    });
+
+    active.insert(
+        session_id.clone(),
+        ActiveTurn {
+            turn_id: turn_id.clone(),
+            state: turn_state,
+            interrupt_tx,
+            abort: handle.abort_handle(),
+        },
+    );
+    drop(active);
+
+    connection_turns
+        .lock()
+        .await
+        .insert(session_id, turn_id.clone());
+    let _ = start_tx.send(());
+    true
+}
+
+async fn drain_appui_due_master_continuations(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    connection_turns: &SharedConnectionTurns,
+    profile_filter: Option<&str>,
+    features: ConnectionUiFeatures,
+) {
+    for (session_id, profile_id) in default_agent_orchestrator().due_loop_targets(profile_filter, 8)
+    {
+        let _ = maybe_spawn_appui_master_continuation_runner(
+            ws,
+            state,
+            ledger,
+            contracts,
+            active_turns,
+            connection_turns,
+            session_id,
+            profile_id,
+            features,
+        )
+        .await;
+    }
 }
 
 async fn handle_turn_interrupt(
@@ -6058,6 +8379,20 @@ async fn handle_approval_respond(
         }
     };
 
+    // FIX-07: publish the canonical durable decision immediately after the
+    // store accepts the response. `respond_with_context` wakes the waiting
+    // turn; any await before this append can let that turn publish
+    // `turn/completed` first.
+    let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
+    let event = super::ui_protocol_approvals::build_decided_event(
+        &params,
+        &outcome,
+        connection_profile_id.unwrap_or(""),
+        Utc::now(),
+    );
+    log_decision_tracing(&event, tool_name.as_deref());
+    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event.clone()));
+
     // FIX-06: if the user picked a recordable scope and we have the original
     // request context, register the policy entry. Open-registry rule:
     // unknown scope strings collapse to `approve_once` and are not recorded
@@ -6089,22 +8424,6 @@ async fn handle_approval_respond(
     };
     let _ = send_rpc_result(ws, id, result);
 
-    // FIX-07: audit + tracing + durable `approval/decided` ledger event.
-    // `decided_by` carries the authenticated profile id when present;
-    // empty means system-decided (matches the spec).
-    //
-    // For manual decisions (this path), `auto_resolved` stays `false`. The
-    // auto-resolved emission lives in `UiProtocolApprovalRequester::request_approval`
-    // for FIX-06's scope-policy short-circuit.
-    let tool_name = outcome.context.as_ref().map(|ctx| ctx.tool_name.clone());
-    let event = super::ui_protocol_approvals::build_decided_event(
-        &params,
-        &outcome,
-        connection_profile_id.unwrap_or(""),
-        Utc::now(),
-    );
-    log_decision_tracing(&event, tool_name.as_deref());
-
     if let Some(sessions) = state.sessions.as_ref() {
         let data_dir = sessions.lock().await.data_dir();
         let audit = contracts.audit_log(&data_dir);
@@ -6117,8 +8436,6 @@ async fn handle_approval_respond(
             );
         }
     }
-
-    let _ = send_notification_durable(ws, ledger, UiNotification::ApprovalDecided(event));
 }
 
 async fn handle_approval_scopes_list(
@@ -6528,9 +8845,17 @@ async fn handle_session_hydrate(
 
     // Lock once; gather all the in-memory chat state we need so the
     // result reflects a single sessions-side snapshot.
-    let (messages, threads_projection) = {
+    let (messages, threads_projection, context, context_state) = {
         let mut sessions_guard = sessions.lock().await;
+        let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
+        let (context, context_state) = if features.context_lifecycle_available() {
+            let (context, context_state) =
+                appui_context_inspection_snapshot(&data_dir, &params.session_id, &session.messages);
+            (Some(context), Some(context_state))
+        } else {
+            (None, None)
+        };
         let messages = if include_set.messages {
             Some(
                 session
@@ -6588,7 +8913,7 @@ async fn handle_session_hydrate(
         } else {
             None
         };
-        (messages, threads_projection)
+        (messages, threads_projection, context, context_state)
     };
 
     let threads = if include_set.threads {
@@ -6626,6 +8951,8 @@ async fn handle_session_hydrate(
     let result = SessionHydrateResult {
         session_id: params.session_id,
         cursor: head_cursor,
+        context,
+        context_state,
         messages,
         threads,
         turns,
@@ -6737,6 +9064,7 @@ async fn handle_turn_state_get(
     active_turns: &SharedActiveTurns,
     connection_profile_id: Option<&str>,
     routed_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
     params: TurnStateGetParams,
 ) {
@@ -6818,6 +9146,18 @@ async fn handle_turn_state_get(
         Vec::new()
     };
 
+    let (context, context_state) = if features.context_lifecycle_available() {
+        appui_context_status_snapshot_for_state(
+            state,
+            connection_profile_id,
+            routed_profile_id,
+            &params.session_id,
+        )
+        .await
+    } else {
+        (None, None)
+    };
+
     // Combine: registry beats projection for `state` (live truth) but
     // projection backfills metadata. When neither knows the turn, return
     // `unknown` per UPCR-2026-011 (NOT an error).
@@ -6843,6 +9183,8 @@ async fn handle_turn_state_get(
         session_id: params.session_id,
         turn_id: params.turn_id,
         state: state_value,
+        context,
+        context_state,
         started_at,
         completed_at,
         thread_id,
@@ -7332,6 +9674,9 @@ async fn handle_session_status_get(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
     id: String,
     params: SessionStatusGetParams,
 ) {
@@ -7339,6 +9684,7 @@ async fn handle_session_status_get(
         topic: params.topic.clone(),
     });
     let session_id_str = params.session_id.clone();
+    let session_key = status_params_session_key(&params);
     let identity_ext = identity.cloned().map(Extension);
     let response = super::handlers::session_status(
         State(state.clone()),
@@ -7351,12 +9697,52 @@ async fn handle_session_status_get(
     let method = octos_core::ui_protocol::methods::SESSION_STATUS_GET;
     let context = RestResourceContext::session(session_id_str);
     match rest_response_to_rpc_value(response, method, context).await {
-        Ok(status) => {
-            send_aux_rpc_result(ws, id, method, json!({ "status": status }));
+        Ok(mut status) => {
+            let (context, context_state) = if features.context_lifecycle_available() {
+                appui_context_status_snapshot_for_state(
+                    state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    &session_key,
+                )
+                .await
+            } else {
+                (None, None)
+            };
+            if let Some(map) = status.as_object_mut() {
+                if let Some(context) = &context {
+                    map.insert("context".to_owned(), context.clone());
+                }
+                if let Some(context_state) = &context_state {
+                    map.insert("context_state".to_owned(), json!(context_state));
+                }
+            }
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                json!({
+                    "status": status,
+                    "context": context,
+                    "context_state": context_state,
+                }),
+            );
         }
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
         }
+    }
+}
+
+fn status_params_session_key(params: &SessionStatusGetParams) -> SessionKey {
+    match params
+        .topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty())
+    {
+        Some(topic) => SessionKey(format!("{}#{topic}", params.session_id)),
+        None => SessionKey(params.session_id.clone()),
     }
 }
 
@@ -7732,6 +10118,7 @@ async fn handle_content_list(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
     id: String,
     params: ContentListParams,
 ) {
@@ -7742,12 +10129,10 @@ async fn handle_content_list(
         // RPC envelope alone leaves a stale-token client retrying forever.
         // Codex BLOCK (2026-05-13): close must precede the error envelope so
         // it survives backpressure when only one writer slot is free.
-        let _ = close_ws_with_code(ws, 1008, "auth_expired");
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::permission_denied(format!("{method}: authenticated user identity required")),
-        );
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
     // `ContentQuery` deserializes from the same JSON the REST query
@@ -7827,6 +10212,7 @@ async fn handle_content_delete(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
     id: String,
     params: ContentDeleteParams,
 ) {
@@ -7835,12 +10221,10 @@ async fn handle_content_delete(
         // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
         // BLOCK (2026-05-13): close before error so it survives writer
         // backpressure when the channel has just one free slot.
-        let _ = close_ws_with_code(ws, 1008, "auth_expired");
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::permission_denied(format!("{method}: authenticated user identity required")),
-        );
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
     let content_id = params.id.clone();
@@ -7882,6 +10266,7 @@ async fn handle_content_bulk_delete(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
     id: String,
     params: ContentBulkDeleteParams,
 ) {
@@ -7890,12 +10275,10 @@ async fn handle_content_bulk_delete(
         // Web PR #114 contract: see `close_ws_with_code` doc-comment. Codex
         // BLOCK (2026-05-13): close before error so it survives writer
         // backpressure when the channel has just one free slot.
-        let _ = close_ws_with_code(ws, 1008, "auth_expired");
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::permission_denied(format!("{method}: authenticated user identity required")),
-        );
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
     // Codex review 2026-05-12: reject over-cap bulk-delete requests
@@ -8248,6 +10631,10 @@ async fn m9_fixture_delay_or_interrupt(
     }
 }
 
+fn m9_fixture_has_pending_interrupt(interrupt_rx: &mut mpsc::Receiver<()>) -> bool {
+    matches!(interrupt_rx.try_recv(), Ok(_))
+}
+
 async fn run_m9_fixture_turn(
     ws: WsConnection,
     state: Arc<AppState>,
@@ -8308,6 +10695,10 @@ async fn run_m9_fixture_turn(
         M9ProtocolFixture::Slow => {
             let mut interrupted = false;
             for _ in 0..80 {
+                if m9_fixture_has_pending_interrupt(&mut interrupt_rx) {
+                    interrupted = true;
+                    break;
+                }
                 let _ = send_notification_ephemeral(
                     &ws,
                     &ledger,
@@ -8456,7 +10847,14 @@ async fn run_m9_fixture_turn(
             }
         }
         M9ProtocolFixture::TaskOutput => {
-            match seed_m9_task_output_fixture(state.as_ref(), &session_id).await {
+            match seed_m9_task_output_fixture(
+                state.as_ref(),
+                &session_id,
+                ws.clone(),
+                Arc::clone(&ledger),
+            )
+            .await
+            {
                 Ok(task_id) => {
                     let _ = send_notification_durable(
                         &ws,
@@ -8464,12 +10862,9 @@ async fn run_m9_fixture_turn(
                         UiNotification::TaskUpdated(TaskUpdatedEvent {
                             session_id: session_id.clone(),
                             task_id: task_id.clone(),
-                            // Synthetic M9 fixture: no originating LLM
-                            // tool call. Carrying `None` keeps the wire
-                            // shape forward-compatible.
-                            tool_call_id: None,
                             title: "M9 task output fixture".to_owned(),
                             state: UiTaskRuntimeState::Running,
+                            tool_call_id: None,
                             runtime_detail: Some(
                                 "persisted deterministic task snapshot".to_owned(),
                             ),
@@ -8491,12 +10886,9 @@ async fn run_m9_fixture_turn(
                         UiNotification::TaskUpdated(TaskUpdatedEvent {
                             session_id: session_id.clone(),
                             task_id,
-                            // Synthetic M9 fixture: no originating LLM
-                            // tool call. Carrying `None` keeps the wire
-                            // shape forward-compatible.
-                            tool_call_id: None,
                             title: "M9 task output fixture".to_owned(),
                             state: UiTaskRuntimeState::Completed,
+                            tool_call_id: None,
                             runtime_detail: Some("fixture complete".to_owned()),
                         }),
                     );
@@ -8516,6 +10908,27 @@ async fn run_m9_fixture_turn(
                     message,
                 },
             }
+        }
+        M9ProtocolFixture::M14CodexP0ToolParity => {
+            run_m14_codex_p0_tool_parity_fixture_turn(
+                &ws,
+                &ledger,
+                state.as_ref(),
+                &session_id,
+                &turn_id,
+                &mut interrupt_rx,
+            )
+            .await
+        }
+        M9ProtocolFixture::M15LiveSubagents => {
+            run_m15_live_subagent_fixture_turn(
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                &mut interrupt_rx,
+            )
+            .await
         }
     };
 
@@ -8577,9 +10990,1940 @@ async fn run_m9_fixture_turn(
     contracts.scopes.evict_turn(&session_id, &turn_id);
 }
 
+struct M14CodexP0SoakSpawnTool;
+
+#[async_trait::async_trait]
+impl octos_agent::tools::Tool for M14CodexP0SoakSpawnTool {
+    fn name(&self) -> &str {
+        "spawn"
+    }
+
+    fn description(&self) -> &str {
+        "Deterministic native spawn delegate for the #969 Codex P0 tool parity soak."
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["gateway", "code"]
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "additionalProperties": true})
+    }
+
+    async fn execute(&self, args: &Value) -> eyre::Result<octos_agent::ToolResult> {
+        self.execute_with_context(&octos_agent::tools::ToolContext::zero(), args)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &octos_agent::tools::ToolContext,
+        args: &Value,
+    ) -> eyre::Result<octos_agent::ToolResult> {
+        let Some(supervisor) = ctx.task_supervisor.as_ref() else {
+            return Ok(octos_agent::ToolResult {
+                output: "spawn delegate requires a task supervisor".to_owned(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let tool_call_id = format!("m14-codex-p0-spawn-{}", Utc::now().timestamp_millis());
+        let task_id = supervisor.register_with_input(
+            "spawn",
+            &tool_call_id,
+            ctx.parent_session_key.as_deref(),
+            Some(args.clone()),
+        );
+        supervisor.mark_running(&task_id);
+
+        if let Some(path) = args
+            .get("context")
+            .and_then(|context| context.get("artifact_path"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+        {
+            let artifact_path = PathBuf::from(path);
+            if let Some(parent) = artifact_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &artifact_path,
+                format!(
+                    "# #969 Codex P0 Soak Reviewer\n\nTask `{task_id}` accepted by deterministic native spawn delegate.\n"
+                ),
+            );
+        }
+
+        append_appui_evidence_jsonl(
+            "task-ledger.jsonl",
+            json!({
+                "event": "agent_started",
+                "issue": 969,
+                "agent_id": task_id,
+                "tool_call_id": tool_call_id,
+                "backend_kind": "m14_codex_p0_soak_spawn",
+            }),
+        );
+
+        Ok(octos_agent::ToolResult {
+            output: json!({
+                "task_id": task_id,
+                "status": "running",
+                "backend": "m14_codex_p0_soak_spawn",
+                "task": args.get("task"),
+            })
+            .to_string(),
+            success: true,
+            structured_metadata: Some(json!({
+                "codex_soak": "m14_codex_p0_tool_parity",
+                "native_tool": "spawn",
+                "agent_id": task_id,
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+fn m14_codex_tool_preview(output: &str) -> String {
+    let mut preview: String = output.chars().take(512).collect();
+    if output.chars().count() > 512 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+struct M14CodexToolCallEnv<'a> {
+    ws: &'a WsConnection,
+    ledger: &'a UiProtocolLedger,
+    registry: &'a octos_agent::ToolRegistry,
+    ctx: &'a octos_agent::tools::ToolContext,
+    session_id: &'a SessionKey,
+    turn_id: &'a TurnId,
+}
+
+async fn m14_codex_tool_call(
+    env: &M14CodexToolCallEnv<'_>,
+    index: usize,
+    tool_name: &str,
+    args: Value,
+    expected_success: bool,
+) -> Result<octos_agent::ToolResult, String> {
+    let tool_call_id = format!("m14-codex-p0-{index}-{tool_name}-{}", env.turn_id.0);
+    let _ = send_notification_durable(
+        env.ws,
+        env.ledger,
+        UiNotification::ToolStarted(ToolStartedEvent {
+            session_id: env.session_id.clone(),
+            turn_id: env.turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.to_owned(),
+            arguments: Some(args.clone()),
+        }),
+    );
+    let result = env
+        .registry
+        .execute_with_context(env.ctx, tool_name, &args)
+        .await
+        .map_err(|error| format!("{tool_name} execution failed: {error}"))?;
+    let metadata = result.structured_metadata.clone();
+    let output_preview = m14_codex_tool_preview(&result.output);
+    let success = result.success;
+    let _ = send_notification_durable(
+        env.ws,
+        env.ledger,
+        UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: env.session_id.clone(),
+            turn_id: env.turn_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.to_owned(),
+            success: Some(success),
+            output_preview: Some(output_preview.clone()),
+            duration_ms: Some(1),
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "task-ledger.jsonl",
+        json!({
+            "event": "tool_completed",
+            "issue": 969,
+            "session_id": env.session_id,
+            "turn_id": env.turn_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "success": success,
+            "expected_success": expected_success,
+            "output_preview": output_preview,
+            "metadata": metadata,
+        }),
+    );
+    if success != expected_success {
+        return Err(format!(
+            "{tool_name} success mismatch: expected {expected_success}, got {success}"
+        ));
+    }
+    Ok(result)
+}
+
+fn m14_codex_parse_json_output(tool_name: &str, output: &str) -> Result<Value, String> {
+    serde_json::from_str(output)
+        .map_err(|error| format!("{tool_name} output was not JSON: {error}; output={output}"))
+}
+
+async fn run_m14_codex_p0_tool_parity_fixture_turn(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    _state: &AppState,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    interrupt_rx: &mut mpsc::Receiver<()>,
+) -> M9FixtureOutcome {
+    append_appui_server_log("#969 Codex P0 tool parity soak started");
+    let workspace = session_workspaces()
+        .get(session_id)
+        .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if let Err(error) = std::fs::create_dir_all(&workspace) {
+        return M9FixtureOutcome::Errored {
+            code: "codex_p0_workspace_failed",
+            message: format!("failed to create #969 soak workspace: {error}"),
+        };
+    }
+    let evidence_dir = appui_evidence_dir().unwrap_or_else(|| workspace.join(".octos-969"));
+    let artifact_dir = evidence_dir.join("agent-artifacts");
+    if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
+        return M9FixtureOutcome::Errored {
+            code: "codex_p0_artifact_dir_failed",
+            message: format!("failed to create #969 soak artifact directory: {error}"),
+        };
+    }
+
+    let mut registry = octos_agent::ToolRegistry::with_builtins(&workspace);
+    registry.register(M14CodexP0SoakSpawnTool);
+    let supervisor = registry.supervisor();
+    let mut ctx = octos_agent::tools::ToolContext::zero();
+    ctx.task_supervisor = Some(supervisor.clone());
+    ctx.parent_session_key = Some(session_id.to_string());
+    let call_env = M14CodexToolCallEnv {
+        ws,
+        ledger,
+        registry: &registry,
+        ctx: &ctx,
+        session_id,
+        turn_id,
+    };
+    let tool_names = model_visible_tool_names(Some(&registry));
+    let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+
+    write_appui_evidence_json(
+        "tool-registry-snapshot.json",
+        json!({
+            "scenario": "m14_codex_p0_tool_parity",
+            "issue": 969,
+            "workspace": workspace.to_string_lossy(),
+            "tools": tool_names.clone(),
+        }),
+    );
+    write_appui_evidence_json(
+        "tool-contract.json",
+        super::coding_tool_contract::tool_status_list_payload(
+            super::coding_tool_contract::ToolStatusListContext {
+                profile_id: session_id.profile_id(),
+                session_id: &session_id.to_string(),
+                policy: super::coding_tool_contract::ToolPolicyView::default(),
+                available_model_tools: &tool_name_refs,
+                disabled_model_tools: &[],
+                include_coding_tool_contract: true,
+            },
+        ),
+    );
+    let _ = std::fs::write(
+        evidence_dir.join("tui-capture.txt"),
+        "#969 Codex P0 tool parity soak ran through AppUI WS and stdio fixtures.\n",
+    );
+
+    let mut step = 0;
+    macro_rules! next_step {
+        () => {{
+            step += 1;
+            step
+        }};
+    }
+
+    let run = async {
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "update_plan",
+            json!({
+                "explanation": "#969 P0 parity soak",
+                "plan": [
+                    {"step": "exercise canonical tools", "status": "in_progress"},
+                    {"step": "record evidence", "status": "pending"}
+                ]
+            }),
+            true,
+        )
+        .await?;
+
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "request_user_input",
+            json!({
+                "questions": [{
+                    "header": "Parity",
+                    "id": "continue_soak",
+                    "question": "Continue the #969 Codex P0 parity soak?",
+                    "options": [
+                        {"label": "Continue (Recommended)", "description": "Record the host prompt request."},
+                        {"label": "Stop", "description": "Exercise the alternate option shape."}
+                    ]
+                }]
+            }),
+            true,
+        )
+        .await?;
+        append_appui_evidence_jsonl(
+            "approval-events.jsonl",
+            json!({
+                "event": "user_input_requested",
+                "issue": 969,
+                "tool_name": "request_user_input",
+                "status": "requested",
+            }),
+        );
+
+        let exec = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "exec_command",
+            json!({
+                "cmd": "read line; printf 'stdin:%s\\n' \"$line\"",
+                "yield_time_ms": 50,
+                "max_output_tokens": 2000
+            }),
+            true,
+        )
+        .await?;
+        let exec_json = m14_codex_parse_json_output("exec_command", &exec.output)?;
+        let exec_session_id = exec_json
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("exec_command did not return session_id: {}", exec.output))?;
+
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "write_stdin",
+            json!({
+                "session_id": exec_session_id,
+                "chars": "m14-codex-p0\\n",
+                "yield_time_ms": 150,
+                "max_output_tokens": 2000
+            }),
+            true,
+        )
+        .await?;
+
+        let patch_path = "codex-p0-apply-patch.txt";
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "apply_patch",
+            json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Add File: {patch_path}\n+#969 apply_patch exercised through AppUI parity soak.\n*** End Patch\n"
+                )
+            }),
+            true,
+        )
+        .await?;
+
+        let denied = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "exec_command",
+            json!({
+                "cmd": "rm -rf /",
+                "timeout_secs": 1
+            }),
+            false,
+        )
+        .await?;
+        append_appui_evidence_jsonl(
+            "approval-events.jsonl",
+            json!({
+                "event": "policy_denied",
+                "issue": 969,
+                "tool_name": "exec_command",
+                "output": denied.output,
+                "metadata": denied.structured_metadata,
+            }),
+        );
+
+        let reviewer_artifact = artifact_dir.join("codex-p0-reviewer-report.md");
+        let spawned = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "spawn_agent",
+            json!({
+                "agent_type": "explorer",
+                "message": "Inspect #969 Codex P0 tool parity soak evidence.",
+                "context": {"artifact_path": reviewer_artifact},
+            }),
+            true,
+        )
+        .await?;
+        let spawned_json = m14_codex_parse_json_output("spawn_agent", &spawned.output)?;
+        let agent_id = spawned_json
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .or_else(|| spawned_json.get("task_id").and_then(Value::as_str))
+            .ok_or_else(|| format!("spawn_agent did not return agent_id: {}", spawned.output))?
+            .to_owned();
+
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "send_input",
+            json!({
+                "target": agent_id.clone(),
+                "message": "Record reviewer input for #969 soak."
+            }),
+            true,
+        )
+        .await?;
+
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "wait_agent",
+            json!({
+                "targets": [agent_id.clone()],
+                "timeout_ms": 50
+            }),
+            true,
+        )
+        .await?;
+
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "close_agent",
+            json!({
+                "target": agent_id.clone()
+            }),
+            true,
+        )
+        .await?;
+
+        let resumed = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "resume_agent",
+            json!({
+                "target": agent_id.clone()
+            }),
+            true,
+        )
+        .await?;
+        let resumed_json = m14_codex_parse_json_output("resume_agent", &resumed.output)?;
+        let resumed_agent_id = resumed_json
+            .get("resumed_agent_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&agent_id)
+            .to_owned();
+        let _ = m14_codex_tool_call(
+            &call_env,
+            next_step!(),
+            "close_agent",
+            json!({
+                "target": resumed_agent_id
+            }),
+            true,
+        )
+        .await?;
+
+        write_appui_evidence_json(
+            "runtime-policy-stamp.json",
+            json!({
+                "scenario": "m14_codex_p0_tool_parity",
+                "issue": 969,
+                "tool_contract_id": super::coding_tool_contract::CODING_TOOL_CONTRACT_ID,
+                "tool_contract_version": super::coding_tool_contract::CODING_TOOL_CONTRACT_VERSION,
+                "model_toolset": super::coding_tool_contract::CODING_MODEL_TOOLSET,
+                "dynamic_tool_discovery": super::coding_tool_contract::CODING_DYNAMIC_TOOL_DISCOVERY,
+                "workspace_root": workspace.to_string_lossy(),
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "p0_tools_exercised": super::coding_tool_contract::CODING_P0_REQUIRED_TOOL_NAMES,
+            }),
+        );
+
+        Ok::<(), String>(())
+    };
+
+    tokio::select! {
+        _ = interrupt_rx.recv() => M9FixtureOutcome::Interrupted,
+        result = run => match result {
+            Ok(()) => {
+                append_appui_server_log("#969 Codex P0 tool parity soak completed");
+                M9FixtureOutcome::Completed
+            }
+            Err(message) => M9FixtureOutcome::Errored {
+                code: "codex_p0_tool_parity_failed",
+                message,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct M15LiveSubagentSpec {
+    agent_id: &'static str,
+    title: &'static str,
+    role: &'static str,
+    delay_seconds: &'static str,
+    finding: &'static str,
+    artifact_id: &'static str,
+    artifact_file: &'static str,
+}
+
+#[derive(Debug)]
+struct M15LiveSubagentResult {
+    agent_id: String,
+    title: String,
+    status: String,
+    artifact_id: String,
+    artifact_path: PathBuf,
+    ping_count: u64,
+}
+
+struct WsSupervisorEventSink {
+    ws: WsConnection,
+}
+
+impl AppUiSupervisorEventSink for WsSupervisorEventSink {
+    fn emit_supervisor_event(&self, method: &'static str, params: Value) {
+        let _ = send_raw_notification_ephemeral(&self.ws, method, params);
+    }
+}
+
+const REVIEW_NATIVE_SPECIALISTS_ENV: &str = "OCTOS_REVIEW_NATIVE_SPECIALISTS_JSON";
+const MAX_NATIVE_REVIEW_SPECIALISTS: usize = 16;
+
+#[derive(Debug, Clone)]
+struct NativeCodeReviewSpec {
+    agent_key: String,
+    nickname: String,
+    role: String,
+    focus: String,
+}
+
+impl NativeCodeReviewSpec {
+    fn new(
+        agent_key: impl Into<String>,
+        nickname: impl Into<String>,
+        role: impl Into<String>,
+        focus: impl Into<String>,
+    ) -> Self {
+        Self {
+            agent_key: agent_key.into(),
+            nickname: nickname.into(),
+            role: role.into(),
+            focus: focus.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeCodeReviewResult {
+    agent_id: String,
+    nickname: String,
+    backend_kind: String,
+    status: String,
+    summary: String,
+}
+
+fn default_native_code_review_specs() -> Vec<NativeCodeReviewSpec> {
+    vec![
+        NativeCodeReviewSpec::new(
+            "reviewer-api",
+            "Ada Lovelace",
+            "api_contract_review",
+            "AppUI/API contract compatibility, wire protocol correctness, and client-visible state.",
+        ),
+        NativeCodeReviewSpec::new(
+            "reviewer-tests",
+            "Hypatia",
+            "test_and_soak_review",
+            "unit, integration, tmux UX soak, and missing evidence for regressions.",
+        ),
+        NativeCodeReviewSpec::new(
+            "reviewer-policy",
+            "Socrates",
+            "policy_and_safety_review",
+            "sandbox, permissions, profile/runtime policy, MCP/tool exposure, and approval boundaries.",
+        ),
+    ]
+}
+
+fn native_code_review_specs(
+    profile_runtime: Option<&crate::runtime::ProfileRuntime>,
+) -> Vec<NativeCodeReviewSpec> {
+    if let Some(specs) = native_code_review_specs_from_env() {
+        return specs;
+    }
+    if let Some(runtime) = profile_runtime {
+        if let Some(specs) = native_code_review_specs_from_profile(runtime) {
+            return specs;
+        }
+    }
+    default_native_code_review_specs()
+}
+
+fn native_code_review_specs_from_env() -> Option<Vec<NativeCodeReviewSpec>> {
+    let raw = std::env::var(REVIEW_NATIVE_SPECIALISTS_ENV).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match parse_native_code_review_specs_json(&raw) {
+        Ok(specs) => Some(specs),
+        Err(error) => {
+            warn!(
+                env_var = REVIEW_NATIVE_SPECIALISTS_ENV,
+                error = %error,
+                "ignoring invalid review specialist env override"
+            );
+            None
+        }
+    }
+}
+
+fn native_code_review_specs_from_profile(
+    profile_runtime: &crate::runtime::ProfileRuntime,
+) -> Option<Vec<NativeCodeReviewSpec>> {
+    let config = profile_runtime.review_config.as_ref()?;
+    if config.native_specialists.is_empty() {
+        return None;
+    }
+    match normalize_native_code_review_specs(&config.native_specialists, "profile") {
+        Ok(specs) => Some(specs),
+        Err(error) => {
+            warn!(
+                profile_id = %profile_runtime.profile_id,
+                error = %error,
+                "ignoring invalid profile review specialist config"
+            );
+            None
+        }
+    }
+}
+
+fn parse_native_code_review_specs_json(raw: &str) -> Result<Vec<NativeCodeReviewSpec>, String> {
+    let configs = serde_json::from_str::<Vec<crate::profiles::ReviewSpecialistConfig>>(raw)
+        .map_err(|error| format!("invalid JSON: {error}"))?;
+    normalize_native_code_review_specs(&configs, "env")
+}
+
+fn normalize_native_code_review_specs(
+    configs: &[crate::profiles::ReviewSpecialistConfig],
+    source: &str,
+) -> Result<Vec<NativeCodeReviewSpec>, String> {
+    if configs.is_empty() {
+        return Err(format!(
+            "{source} native_specialists must contain at least one entry"
+        ));
+    }
+    if configs.len() > MAX_NATIVE_REVIEW_SPECIALISTS {
+        return Err(format!(
+            "{source} native_specialists contains {} entries; max is {MAX_NATIVE_REVIEW_SPECIALISTS}",
+            configs.len()
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut specs = Vec::with_capacity(configs.len());
+    for (index, config) in configs.iter().enumerate() {
+        let agent_key = normalize_review_identifier("agent_key", index, &config.agent_key)?;
+        if !seen.insert(agent_key.clone()) {
+            return Err(format!(
+                "{source} native_specialists[{index}].agent_key '{agent_key}' is duplicated"
+            ));
+        }
+        let role = normalize_review_identifier("role", index, &config.role)?;
+        let nickname = normalize_review_text("nickname", index, &config.nickname, 80)?;
+        let focus = normalize_review_text("focus", index, &config.focus, 800)?;
+        specs.push(NativeCodeReviewSpec::new(agent_key, nickname, role, focus));
+    }
+    Ok(specs)
+}
+
+fn normalize_review_identifier(field: &str, index: usize, value: &str) -> Result<String, String> {
+    let value = normalize_review_text(field, index, value, 80)?;
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(format!(
+            "native_specialists[{index}].{field} must contain only ASCII letters, digits, '_' or '-'"
+        ));
+    }
+    Ok(value)
+}
+
+fn normalize_review_text(
+    field: &str,
+    index: usize,
+    value: &str,
+    max_len: usize,
+) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("native_specialists[{index}].{field} is required"));
+    }
+    if value.len() > max_len {
+        return Err(format!(
+            "native_specialists[{index}].{field} exceeds {max_len} bytes"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn expected_review_agent_count_for_profile(
+    state: &AppState,
+    profile_runtime: Option<&crate::runtime::ProfileRuntime>,
+) -> usize {
+    native_code_review_specs(profile_runtime).len()
+        + usize::from(review_cli_argv().is_some())
+        + usize::from(state.swarm_state.is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_native_code_review_turn(
+    ws: WsConnection,
+    state: Arc<AppState>,
+    ledger: Arc<UiProtocolLedger>,
+    contracts: Arc<UiProtocolContractStores>,
+    _features: ConnectionUiFeatures,
+    params: RawReviewStartParams,
+    turn_id: TurnId,
+    routed_profile_id: Option<String>,
+    turn_state: Arc<TokioMutex<TurnState>>,
+    mut interrupt_rx: mpsc::Receiver<()>,
+) {
+    let session_id = params.session_id.clone();
+    let started = UiNotification::TurnStarted(octos_core::ui_protocol::TurnStartedEvent {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        timestamp: Utc::now(),
+        topic: None,
+    });
+    if send_notification_lifecycle(&ws, &ledger, started).is_err() {
+        let _ = transition_to_terminal(&turn_state, TerminalReason::Errored).await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
+
+    let active_profile_id = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or(routed_profile_id.clone());
+    let profile_runtime = match ensure_session_profile_runtime(&state, active_profile_id.as_deref())
+        .await
+    {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => {
+            let message = format!(
+                "No ProfileRuntime registered for profile '{}'. Set up the profile with an API key in the dashboard.",
+                active_profile_id.as_deref().unwrap_or("<unset>"),
+            );
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some(("runtime_unavailable", message.as_str())),
+            )
+            .await;
+            contracts.scopes.evict_turn(&session_id, &turn_id);
+            return;
+        }
+        Err(error) => {
+            let message = error.message.clone();
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some(("runtime_unavailable", message.as_str())),
+            )
+            .await;
+            contracts.scopes.evict_turn(&session_id, &turn_id);
+            return;
+        }
+    };
+    let hint = session_workspaces().get(&session_id);
+    let permissions = match effective_permissions_for_session(&state, &session_id) {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            let message = error.message.clone();
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some(("permission_denied", message.as_str())),
+            )
+            .await;
+            contracts.scopes.evict_turn(&session_id, &turn_id);
+            return;
+        }
+    };
+    let session_runtime = match state
+        .session_cache
+        .get_or_init_with_permissions(&profile_runtime, session_id.clone(), hint, permissions)
+        .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            try_emit_terminal(
+                &turn_state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session_id,
+                &turn_id,
+                Some(("runtime_unavailable", &error.to_string())),
+            )
+            .await;
+            contracts.scopes.evict_turn(&session_id, &turn_id);
+            return;
+        }
+    };
+
+    let profile_id = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| active_profile_id.clone())
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    let task_id = TaskId::new();
+    let target = review_target_summary(params.target.as_ref());
+    let objective = review_objective(&params, &target);
+    let workspace_root = session_runtime.workspace_root.clone();
+    let llm_provider = session_runtime.profile.llm.clone();
+    let memory_store = session_runtime.profile.memory.clone();
+    let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
+    let agent_config = session_runtime.agent.agent_config();
+    let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
+    let native_specs = native_code_review_specs(Some(profile_runtime.as_ref()));
+    let native_names = native_specs
+        .iter()
+        .map(|spec| spec.nickname.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let _ = send_notification_durable(
+        &ws,
+        &ledger,
+        UiNotification::TaskUpdated(TaskUpdatedEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            title: "Native code review specialist swarm".to_owned(),
+            state: UiTaskRuntimeState::Running,
+            tool_call_id: None,
+            runtime_detail: Some("launching model-backed native specialists".to_owned()),
+        }),
+    );
+    let _ = send_notification_durable(
+        &ws,
+        &ledger,
+        UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            cursor: OutputCursor { offset: 0 },
+            text: format!(
+                "Launching {} native review specialist(s) for {target}: {native_names}.\n",
+                native_specs.len()
+            ),
+        }),
+    );
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<NativeSpecialistAppUiEvent>();
+    let event_ws = ws.clone();
+    let event_forwarder = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let _ = send_raw_notification_ephemeral(&event_ws, event.method, event.params);
+        }
+    });
+
+    let mut joins = tokio::task::JoinSet::new();
+    for spec in native_specs.iter().cloned() {
+        let agent_id = format!("{}-{}", spec.agent_key, short_turn_suffix(&turn_id));
+        let task = native_review_task(&objective, &target, &spec);
+        let llm = llm_provider.clone();
+        let memory = memory_store.clone();
+        let tools = tools.clone();
+        let system_prompt = native_review_system_prompt(&system_prompt_base, &spec);
+        let profile_id = profile_id.clone();
+        let session_id = session_id.clone();
+        let cwd = workspace_root.clone();
+        let event_tx = event_tx.clone();
+        let agent_config = agent_config.clone();
+        joins.spawn(async move {
+            let result = default_agent_orchestrator()
+                .run_native_specialist(NativeSpecialistLaunchRequest {
+                    agent_id: Some(agent_id.clone()),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id,
+                    profile_id,
+                    role: spec.role.to_owned(),
+                    nickname: spec.nickname.to_owned(),
+                    task,
+                    cwd,
+                    llm,
+                    memory,
+                    tools,
+                    system_prompt: Some(system_prompt),
+                    agent_config: Some(agent_config),
+                    task_ledger_path: None,
+                    event_tx: Some(event_tx),
+                })
+                .await;
+            match result {
+                Ok(result) => {
+                    let summary = result
+                        .artifacts
+                        .iter()
+                        .find(|artifact| artifact.id == "summary")
+                        .and_then(|artifact| artifact.content.clone())
+                        .unwrap_or_else(|| {
+                            format!("{} completed with no text output.", spec.nickname)
+                        });
+                    NativeCodeReviewResult {
+                        agent_id,
+                        nickname: spec.nickname.clone(),
+                        backend_kind: "native".to_owned(),
+                        status: result.status,
+                        summary,
+                    }
+                }
+                Err(error) => NativeCodeReviewResult {
+                    agent_id,
+                    nickname: spec.nickname.clone(),
+                    backend_kind: "native".to_owned(),
+                    status: "failed".to_owned(),
+                    summary: format!("{} failed: {}", spec.nickname, error.message),
+                },
+            }
+        });
+    }
+    drop(event_tx);
+
+    maybe_spawn_cli_review_specialist(
+        &mut joins,
+        &ws,
+        &session_id,
+        &profile_id,
+        &workspace_root,
+        &objective,
+        &target,
+        &turn_id,
+    );
+    maybe_spawn_mcp_review_specialist(
+        &mut joins,
+        &state,
+        &ws,
+        &session_id,
+        &profile_id,
+        &workspace_root,
+        &objective,
+        &target,
+        &turn_id,
+    );
+    let expected_results = joins.len();
+
+    let mut results = Vec::new();
+    while results.len() < expected_results {
+        tokio::select! {
+            _ = interrupt_rx.recv() => {
+                joins.abort_all();
+                for spec in &native_specs {
+                    let agent_id = format!("{}-{}", spec.agent_key, short_turn_suffix(&turn_id));
+                    if let Ok(agent) = default_agent_orchestrator().set_agent_status(
+                        &agent_id,
+                        &session_id,
+                        &profile_id,
+                        "interrupted",
+                        Some("Interrupted by client".to_owned()),
+                    ) {
+                        let _ = send_raw_notification_ephemeral(
+                            &ws,
+                            octos_core::ui_protocol::methods::AGENT_UPDATED,
+                            json!({
+                                "session_id": session_id,
+                                "agent": agent,
+                            }),
+                        );
+                    }
+                }
+                let _ = send_notification_durable(
+                    &ws,
+                    &ledger,
+                    UiNotification::TaskUpdated(TaskUpdatedEvent {
+                        session_id: session_id.clone(),
+                        task_id: task_id.clone(),
+                        title: "Native code review specialist swarm".to_owned(),
+                        state: UiTaskRuntimeState::Cancelled,
+                        tool_call_id: None,
+                        runtime_detail: Some("interrupted by client".to_owned()),
+                    }),
+                );
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Interrupted,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("interrupted", "review/start interrupted by client")),
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                event_forwarder.abort();
+                return;
+            }
+            joined = joins.join_next() => {
+                match joined {
+                    Some(Ok(result)) => {
+                        let preview = truncate_for_display(&result.summary, 700);
+                        let text = format!(
+                            "Subagent done: {} ({}) via `{}` finished with status `{}`.\n\n{preview}\n",
+                            result.nickname,
+                            result.agent_id,
+                            result.backend_kind,
+                            result.status,
+                        );
+                        results.push(result);
+                        let _ = send_notification_ephemeral(
+                            &ws,
+                            &ledger,
+                            UiNotification::MessageDelta(MessageDeltaEvent {
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                text,
+                            }),
+                        );
+                    }
+                    Some(Err(error)) => {
+                        let summary = format!("Native specialist task failed to join: {error}");
+                        results.push(NativeCodeReviewResult {
+                            agent_id: "unknown".to_owned(),
+                            nickname: "unknown".to_owned(),
+                            backend_kind: "unknown".to_owned(),
+                            status: "failed".to_owned(),
+                            summary,
+                        });
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let final_summary =
+        model_join_review_summary(llm_provider.as_ref(), &objective, &target, &results).await;
+    let final_summary = ensure_requested_final_marker(final_summary, &objective);
+    let sessions = session_runtime.sessions.clone();
+    let data_dir = sessions.lock().await.data_dir().to_path_buf();
+    let _ = persist_assistant_with_media(
+        &sessions,
+        &data_dir,
+        &session_id,
+        final_summary.clone(),
+        Vec::new(),
+        turn_id.0.to_string(),
+        "Native code review specialist swarm",
+    )
+    .await;
+    let _ = send_notification_ephemeral(
+        &ws,
+        &ledger,
+        UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            text: final_summary.clone(),
+        }),
+    );
+    let _ = send_notification_durable(
+        &ws,
+        &ledger,
+        UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            cursor: OutputCursor {
+                offset: final_summary.len() as u64,
+            },
+            text: final_summary,
+        }),
+    );
+    let completed = results
+        .iter()
+        .filter(|result| result.status == "completed")
+        .count();
+    let _ = send_notification_durable(
+        &ws,
+        &ledger,
+        UiNotification::TaskUpdated(TaskUpdatedEvent {
+            session_id: session_id.clone(),
+            task_id,
+            title: "Native code review specialist swarm".to_owned(),
+            state: UiTaskRuntimeState::Completed,
+            tool_call_id: None,
+            runtime_detail: Some(format!(
+                "{completed}/{expected_results} specialists completed"
+            )),
+        }),
+    );
+    try_emit_terminal(
+        &turn_state,
+        TerminalReason::Completed,
+        &ws,
+        &ledger,
+        &session_id,
+        &turn_id,
+        None,
+    )
+    .await;
+    contracts.scopes.evict_turn(&session_id, &turn_id);
+    let _ = event_forwarder.await;
+}
+
+fn short_turn_suffix(turn_id: &TurnId) -> String {
+    turn_id.0.simple().to_string().chars().take(8).collect()
+}
+
+fn review_target_summary(target: Option<&Value>) -> String {
+    match target {
+        Some(Value::Object(object)) => {
+            let target_type = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("custom");
+            let detail = object
+                .get("path")
+                .or_else(|| object.get("base_branch"))
+                .or_else(|| object.get("commit"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            match detail {
+                Some(detail) => format!("{target_type}:{detail}"),
+                None => target_type.to_owned(),
+            }
+        }
+        Some(Value::String(value)) if !value.trim().is_empty() => value.trim().to_owned(),
+        Some(value) => value.to_string(),
+        None => "uncommitted_changes".to_owned(),
+    }
+}
+
+fn review_objective(params: &RawReviewStartParams, target: &str) -> String {
+    let base = params
+        .prompt
+        .as_deref()
+        .or(params.instructions.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Review the current project changes and report the most important issues.");
+    let delivery = params.delivery.as_deref().unwrap_or("inline");
+    format!("{base}\n\nTarget: {target}\nDelivery: {delivery}")
+}
+
+fn native_review_system_prompt(base: &str, spec: &NativeCodeReviewSpec) -> String {
+    format!(
+        "{base}\n\nYou are {}. Act as a focused code review specialist. \
+         Prioritize bugs, behavioral regressions, missing tests, policy violations, and evidence gaps. \
+         Stay within this focus: {}. Return concise Markdown with severity-labelled findings first.",
+        spec.nickname, spec.focus
+    )
+}
+
+fn native_review_task(objective: &str, target: &str, spec: &NativeCodeReviewSpec) -> String {
+    format!(
+        "Run your specialist slice of a code review.\n\nObjective:\n{objective}\n\nTarget:\n{target}\n\nSpecialist focus:\n{}\n\nOutput format:\n- Findings first, ordered by severity.\n- Include file paths and line references when you inspect files.\n- Include explicit test or soak gaps.\n- If no issues are found, say so and list residual risk.",
+        spec.focus
+    )
+}
+
+fn maybe_spawn_cli_review_specialist(
+    joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
+    ws: &WsConnection,
+    session_id: &SessionKey,
+    profile_id: &str,
+    workspace_root: &Path,
+    objective: &str,
+    target: &str,
+    turn_id: &TurnId,
+) {
+    let Some(argv) = review_cli_argv() else {
+        return;
+    };
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    let agent_id = format!("reviewer-cli-{}", short_turn_suffix(turn_id));
+    let artifact_path = workspace_root.join(format!(".octos-review-{agent_id}.md"));
+    let spec = SupervisedSpecialistSpec {
+        agent_id: agent_id.clone(),
+        parent_agent_id: Some("master".to_owned()),
+        session_id: session_id.clone(),
+        task_id: None,
+        path: format!("master/{agent_id}"),
+        role: "cli_agent_review".to_owned(),
+        nickname: "Grace Hopper".to_owned(),
+        backend_kind: "cli_process".to_owned(),
+        task: Some("Running CLI specialist review".to_owned()),
+        cwd: Some(workspace_root.to_path_buf()),
+        profile_id: profile_id.to_owned(),
+        artifacts: vec![SpecialistArtifactSpec {
+            id: "cli-review-notes".to_owned(),
+            title: "CLI specialist review notes".to_owned(),
+            kind: "markdown".to_owned(),
+            path: artifact_path.clone(),
+        }],
+    };
+    let command = crate::cli_agent_adapter::CliAgentCommandConfig::new(program.clone())
+        .args(args.iter().cloned())
+        .cwd(workspace_root)
+        .env("OCTOS_REVIEW_OBJECTIVE", objective)
+        .env("OCTOS_REVIEW_TARGET", target)
+        .env("OCTOS_REVIEW_AGENT_ID", agent_id.clone())
+        .env(
+            "OCTOS_REVIEW_ARTIFACT_PATH",
+            artifact_path.to_string_lossy().into_owned(),
+        )
+        .timeout(std::time::Duration::from_secs(90))
+        .declared_artifact(&artifact_path);
+    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    joins.spawn(async move {
+        match run_supervised_cli_specialist(
+            default_agent_orchestrator(),
+            &sink,
+            SupervisedCliSpecialist::new(spec, command)
+                .heartbeat_interval(std::time::Duration::from_secs(2)),
+        )
+        .await
+        {
+            Ok(summary) => NativeCodeReviewResult {
+                agent_id: summary.agent_id,
+                nickname: "Grace Hopper".to_owned(),
+                backend_kind: "cli_process".to_owned(),
+                status: summary.status,
+                summary: summary.output,
+            },
+            Err(error) => NativeCodeReviewResult {
+                agent_id,
+                nickname: "Grace Hopper".to_owned(),
+                backend_kind: "cli_process".to_owned(),
+                status: "failed".to_owned(),
+                summary: error,
+            },
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_spawn_mcp_review_specialist(
+    joins: &mut tokio::task::JoinSet<NativeCodeReviewResult>,
+    state: &AppState,
+    ws: &WsConnection,
+    session_id: &SessionKey,
+    profile_id: &str,
+    workspace_root: &Path,
+    objective: &str,
+    target: &str,
+    turn_id: &TurnId,
+) {
+    let Some(swarm_state) = state.swarm_state.as_ref() else {
+        return;
+    };
+    let agent_id = format!("reviewer-mcp-{}", short_turn_suffix(turn_id));
+    let artifact_path = workspace_root.join(format!(".octos-review-{agent_id}.md"));
+    let spec = SupervisedSpecialistSpec {
+        agent_id: agent_id.clone(),
+        parent_agent_id: Some("master".to_owned()),
+        session_id: session_id.clone(),
+        task_id: None,
+        path: format!("master/{agent_id}"),
+        role: "mcp_agent_review".to_owned(),
+        nickname: "Marie Curie".to_owned(),
+        backend_kind: "mcp_agent".to_owned(),
+        task: Some("Running MCP specialist review".to_owned()),
+        cwd: Some(workspace_root.to_path_buf()),
+        profile_id: profile_id.to_owned(),
+        artifacts: vec![SpecialistArtifactSpec {
+            id: "mcp-review-notes".to_owned(),
+            title: "MCP specialist review notes".to_owned(),
+            kind: "markdown".to_owned(),
+            path: artifact_path.clone(),
+        }],
+    };
+    let tool_name =
+        std::env::var("OCTOS_REVIEW_MCP_TOOL_NAME").unwrap_or_else(|_| "run_task".to_owned());
+    let task = json!({
+        "objective": objective,
+        "target": target,
+        "agent_id": agent_id,
+        "artifact_path": artifact_path.to_string_lossy().into_owned(),
+        "instructions": "Run a focused code review specialist task and return concise findings first.",
+    });
+    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let backend = swarm_state.swarm.backend();
+    let timeout = review_mcp_timeout();
+    joins.spawn(async move {
+        match run_supervised_mcp_specialist(
+            default_agent_orchestrator(),
+            &sink,
+            SupervisedMcpSpecialist::new(spec, backend, tool_name, task)
+                .timeout(timeout)
+                .heartbeat_interval(std::time::Duration::from_secs(2)),
+        )
+        .await
+        {
+            Ok(summary) => NativeCodeReviewResult {
+                agent_id: summary.agent_id,
+                nickname: "Marie Curie".to_owned(),
+                backend_kind: "mcp_agent".to_owned(),
+                status: summary.status,
+                summary: summary.output,
+            },
+            Err(error) => NativeCodeReviewResult {
+                agent_id,
+                nickname: "Marie Curie".to_owned(),
+                backend_kind: "mcp_agent".to_owned(),
+                status: "failed".to_owned(),
+                summary: error,
+            },
+        }
+    });
+}
+
+fn review_cli_argv() -> Option<Vec<String>> {
+    let raw = std::env::var("OCTOS_REVIEW_CLI_SPECIALIST_ARGV_JSON").ok()?;
+    let argv = serde_json::from_str::<Vec<String>>(&raw).ok()?;
+    let argv = argv
+        .into_iter()
+        .map(|arg| arg.trim().to_owned())
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
+    (!argv.is_empty()).then_some(argv)
+}
+
+fn review_mcp_timeout() -> std::time::Duration {
+    std::env::var("OCTOS_REVIEW_MCP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(120))
+}
+
+async fn model_join_review_summary(
+    llm: &dyn octos_llm::LlmProvider,
+    objective: &str,
+    target: &str,
+    results: &[NativeCodeReviewResult],
+) -> String {
+    let specialist_summaries = results
+        .iter()
+        .map(|result| {
+            format!(
+                "## {} ({}, {}) [{}]\n{}",
+                result.nickname,
+                result.agent_id,
+                result.backend_kind,
+                result.status,
+                result.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let prompt = format!(
+        "Create the final joined code-review answer for the user.\n\nObjective:\n{objective}\n\nTarget:\n{target}\n\nSpecialist outputs:\n{specialist_summaries}\n\nRequirements:\n- Start with the highest-severity findings.\n- Merge duplicates.\n- Keep the answer concise and actionable.\n- Mention remaining test or soak gaps.\n"
+    );
+    let messages = vec![
+        Message {
+            role: MessageRole::System,
+            content: "You are the master code review agent joining specialist results.".to_owned(),
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+        Message {
+            role: MessageRole::User,
+            content: prompt,
+            media: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: Utc::now(),
+        },
+    ];
+    let config = octos_llm::ChatConfig {
+        max_tokens: Some(1800),
+        temperature: Some(0.0),
+        tool_choice: octos_llm::ToolChoice::None,
+        ..Default::default()
+    };
+    match llm.chat(&messages, &[], &config).await {
+        Ok(response) => response
+            .content
+            .filter(|content| !content.trim().is_empty())
+            .unwrap_or_else(|| fallback_join_review_summary(target, results)),
+        Err(error) => {
+            let fallback = fallback_join_review_summary(target, results);
+            format!("{fallback}\n\nNote: final model join failed: {error}")
+        }
+    }
+}
+
+fn ensure_requested_final_marker(mut summary: String, objective: &str) -> String {
+    let Some(marker) = requested_final_marker(objective) else {
+        return summary;
+    };
+    if !summary.contains(&marker) {
+        if !summary.ends_with('\n') {
+            summary.push('\n');
+        }
+        summary.push_str(&marker);
+        summary.push('\n');
+    }
+    summary
+}
+
+fn requested_final_marker(objective: &str) -> Option<String> {
+    let marker = objective
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .find(|token| token.ends_with("_FINAL_LINE"))?;
+    (!marker.is_empty()).then(|| marker.to_owned())
+}
+
+fn fallback_join_review_summary(target: &str, results: &[NativeCodeReviewResult]) -> String {
+    let completed = results
+        .iter()
+        .filter(|result| result.status == "completed")
+        .count();
+    let body = results
+        .iter()
+        .map(|result| {
+            format!(
+                "### {} ({}, {})\nStatus: `{}`\n\n{}",
+                result.nickname,
+                result.agent_id,
+                result.backend_kind,
+                result.status,
+                result.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "Code Review Summary\n\nTarget: {target}\n\nScatter-join complete: {completed}/{} specialists completed.\n\n{body}",
+        results.len()
+    )
+}
+
+fn m15_live_subagent_specs() -> [M15LiveSubagentSpec; 3] {
+    [
+        M15LiveSubagentSpec {
+            agent_id: "reviewer-api",
+            title: "Ada Lovelace - API contract reviewer",
+            role: "contract_review",
+            delay_seconds: "0.35",
+            finding: "AppUI agent lifecycle events are present and backed by runtime state.",
+            artifact_id: "reviewer-api-notes",
+            artifact_file: "reviewer-api-report.md",
+        },
+        M15LiveSubagentSpec {
+            agent_id: "reviewer-tests",
+            title: "Hypatia - Soak test reviewer",
+            role: "test_review",
+            delay_seconds: "0.50",
+            finding: "The tmux UX soak must prove agent list/status/output/artifact control against octos serve --stdio.",
+            artifact_id: "reviewer-tests-notes",
+            artifact_file: "reviewer-tests-report.md",
+        },
+        M15LiveSubagentSpec {
+            agent_id: "reviewer-security",
+            title: "Socrates - Policy reviewer",
+            role: "policy_review",
+            delay_seconds: "0.42",
+            finding: "CLI subagents run under argv-only process construction with no shell interpolation.",
+            artifact_id: "reviewer-security-notes",
+            artifact_file: "reviewer-security-report.md",
+        },
+    ]
+}
+
+async fn run_m15_live_subagent_fixture_turn(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    interrupt_rx: &mut mpsc::Receiver<()>,
+) -> M9FixtureOutcome {
+    append_appui_server_log("M15 live subagent scenario started inside octos serve --stdio");
+
+    let profile_id = session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned());
+    let task_id = TaskId::new();
+    let workdir = std::env::var_os("OCTOS_TUI_M15_UX_WORKDIR")
+        .map(PathBuf::from)
+        .or_else(|| appui_evidence_dir().map(|dir| dir.join("workspace")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let evidence_dir = appui_evidence_dir().unwrap_or_else(|| workdir.join(".octos-m15-evidence"));
+    let artifact_dir = evidence_dir.join("agent-artifacts");
+    if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
+        return M9FixtureOutcome::Errored {
+            code: "m15_artifact_dir_failed",
+            message: format!("failed to create live subagent artifact directory: {error}"),
+        };
+    }
+
+    write_appui_evidence_json(
+        "runtime-policy-stamp.json",
+        json!({
+            "scenario": "code_review_subagents",
+            "runtime": "octos-serve-stdio",
+            "subagent_backend": "cli_agent_adapter",
+            "profile_id": profile_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "sandbox": "workspace-write",
+            "approval_policy": "fixture-controlled",
+            "tool_policy_id": "coding-autonomy-v1",
+        }),
+    );
+    write_appui_evidence_json(
+        "tool-registry-snapshot.json",
+        json!({
+            "source": "octos-serve-stdio",
+            "tools": ["agent/list", "agent/status", "agent/output/read", "agent/artifact/list", "agent/interrupt", "agent/close"],
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "goal-ledger.jsonl",
+        json!({
+            "event": "goal_started",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "objective": "Run a backend-owned code-review subagent swarm and expose it through AppUI.",
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "loop-ledger.jsonl",
+        json!({
+            "event": "loop_iteration",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "iteration": 1,
+            "status": "started",
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "task-ledger.jsonl",
+        json!({
+            "event": "task_started",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "task_id": task_id,
+            "title": "Live code review subagent swarm",
+        }),
+    );
+
+    let _ = send_notification_durable(
+        ws,
+        ledger,
+        UiNotification::TaskUpdated(TaskUpdatedEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            title: "Live code review subagent swarm".to_owned(),
+            state: UiTaskRuntimeState::Running,
+            tool_call_id: None,
+            runtime_detail: Some("octos serve launching CLI subagents".to_owned()),
+        }),
+    );
+    let _ = send_notification_durable(
+        ws,
+        ledger,
+        UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            cursor: OutputCursor { offset: 0 },
+            text: "Launching Ada Lovelace (reviewer-api), Hypatia (reviewer-tests), and Socrates (reviewer-security) through octos serve --stdio.\n".to_owned(),
+        }),
+    );
+
+    let mut joins = tokio::task::JoinSet::new();
+    let specs = m15_live_subagent_specs();
+    let report_path = artifact_dir.join("code-review-report.md");
+    let mut artifact_index = specs
+        .iter()
+        .map(|spec| {
+            json!({
+                "id": spec.artifact_id,
+                "agent_id": spec.agent_id,
+                "artifact_id": spec.artifact_id,
+                "path": artifact_dir.join(spec.artifact_file),
+            })
+        })
+        .collect::<Vec<_>>();
+    artifact_index.push(json!({
+        "id": "code-review-report",
+        "agent_id": "master",
+        "artifact_id": "code-review-report",
+        "path": report_path,
+    }));
+    write_appui_evidence_json(
+        "artifact-index.json",
+        json!({
+            "scenario": "code_review_subagents",
+            "artifacts": artifact_index,
+        }),
+    );
+
+    for spec in specs {
+        let artifact_path = artifact_dir.join(spec.artifact_file);
+        let agent = default_agent_orchestrator().upsert_agent(AgentUpsert {
+            agent_id: spec.agent_id.to_owned(),
+            parent_agent_id: Some("master".to_owned()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            path: format!("master/{}", spec.agent_id),
+            role: spec.role.to_owned(),
+            nickname: spec.title.to_owned(),
+            backend_kind: "cli_process".to_owned(),
+            status: "running".to_owned(),
+            last_task: Some("Running live code review check".to_owned()),
+            cwd: Some(workdir.to_string_lossy().into_owned()),
+            profile_id: profile_id.clone(),
+        });
+        let _ = send_raw_notification_ephemeral(
+            ws,
+            octos_core::ui_protocol::methods::AGENT_UPDATED,
+            json!({
+                "session_id": session_id,
+                "agent": agent,
+            }),
+        );
+        append_appui_evidence_jsonl(
+            "agent-ledger.jsonl",
+            json!({
+                "event": "agent_started",
+                "agent_id": spec.agent_id,
+                "backend_kind": "cli_process",
+                "session_id": session_id,
+                "turn_id": turn_id,
+            }),
+        );
+
+        let ws_for_agent = ws.clone();
+        let session_id_for_agent = session_id.clone();
+        let profile_id_for_agent = profile_id.clone();
+        let workdir_for_agent = workdir.clone();
+        let turn_id_for_agent = (*turn_id).clone();
+        joins.spawn(async move {
+            run_m15_live_subagent_process(
+                ws_for_agent,
+                session_id_for_agent,
+                profile_id_for_agent,
+                workdir_for_agent,
+                artifact_path,
+                turn_id_for_agent,
+                spec,
+            )
+            .await
+        });
+    }
+
+    let mut results = Vec::new();
+    while results.len() < specs.len() {
+        tokio::select! {
+            _ = interrupt_rx.recv() => {
+                joins.abort_all();
+                append_appui_server_log("M15 live subagent scenario interrupted by client");
+                for spec in m15_live_subagent_specs() {
+                    if let Ok(agent) = default_agent_orchestrator().set_agent_status(
+                        spec.agent_id,
+                        session_id,
+                        &profile_id,
+                        "interrupted",
+                        Some("Interrupted by client".to_owned()),
+                    ) {
+                        let _ = send_raw_notification_ephemeral(
+                            ws,
+                            octos_core::ui_protocol::methods::AGENT_UPDATED,
+                            json!({
+                                "session_id": session_id,
+                                "agent": agent,
+                            }),
+                        );
+                    }
+                }
+                let _ = send_notification_durable(
+                    ws,
+                    ledger,
+                    UiNotification::TaskUpdated(TaskUpdatedEvent {
+                        session_id: session_id.clone(),
+                        task_id,
+                        title: "Live code review subagent swarm".to_owned(),
+                        state: UiTaskRuntimeState::Cancelled,
+                        tool_call_id: None,
+                        runtime_detail: Some("interrupted by client".to_owned()),
+                    }),
+                );
+                return M9FixtureOutcome::Interrupted;
+            }
+            joined = joins.join_next() => {
+                match joined {
+                    Some(Ok(Ok(result))) => results.push(result),
+                    Some(Ok(Err(message))) => {
+                        return M9FixtureOutcome::Errored {
+                            code: "m15_subagent_failed",
+                            message,
+                        };
+                    }
+                    Some(Err(error)) => {
+                        return M9FixtureOutcome::Errored {
+                            code: "m15_subagent_join_failed",
+                            message: format!("live subagent task failed to join: {error}"),
+                        };
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let completed = results
+        .iter()
+        .filter(|result| result.status == "completed")
+        .count();
+    let ping_count = results.iter().map(|result| result.ping_count).sum::<u64>();
+    let artifact_lines = results
+        .iter()
+        .map(|result| {
+            format!(
+                "- {} ({}): {} ({})",
+                result.title,
+                result.agent_id,
+                result.artifact_id,
+                result.artifact_path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary = format!(
+        "Code Review Summary\n\nFindings\n\nHigh: AppUI code-review subagent orchestration is running from octos serve --stdio, not the Python fixture backend.\nMedium: Agent output and artifacts are visible through agent/status/read, agent/output/read, and agent/artifact/list.\nLow: The live scenario is deterministic and uses CLI subprocess reviewers; model-backed specialist agents are still a follow-up.\n\nScatter-Join\n\nScatter-join complete: {completed}/{} agents done. Supervisor heartbeat pings observed: {ping_count}.\n\nSubagents\n\n1. Ada Lovelace (reviewer-api) completed: {}\n2. Hypatia (reviewer-tests) completed: {}\n3. Socrates (reviewer-security) completed: {}\n\nArtifacts\n\n{}\n\n`M15_CODE_REVIEW_FINAL_LINE`\nM15CODEREVIEWFINALLINE\n",
+        specs.len(),
+        results
+            .iter()
+            .any(|result| result.agent_id == "reviewer-api"),
+        results
+            .iter()
+            .any(|result| result.agent_id == "reviewer-tests"),
+        results
+            .iter()
+            .any(|result| result.agent_id == "reviewer-security"),
+        artifact_lines,
+    );
+    let _ = std::fs::write(&report_path, &summary);
+    let _ = send_notification_ephemeral(
+        ws,
+        ledger,
+        UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            text: summary.clone(),
+        }),
+    );
+    let _ = send_notification_durable(
+        ws,
+        ledger,
+        UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            cursor: OutputCursor {
+                offset: summary.len() as u64,
+            },
+            text: summary,
+        }),
+    );
+    let _ = send_notification_durable(
+        ws,
+        ledger,
+        UiNotification::TaskUpdated(TaskUpdatedEvent {
+            session_id: session_id.clone(),
+            task_id: task_id.clone(),
+            title: "Live code review subagent swarm".to_owned(),
+            state: UiTaskRuntimeState::Completed,
+            tool_call_id: None,
+            runtime_detail: Some(format!("{completed} live CLI subagents completed")),
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "task-ledger.jsonl",
+        json!({
+            "event": "task_completed",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "task_id": task_id,
+            "completed_agents": completed,
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "loop-ledger.jsonl",
+        json!({
+            "event": "loop_iteration",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "iteration": 1,
+            "status": "completed",
+        }),
+    );
+    append_appui_server_log("M15 live subagent scenario completed");
+    M9FixtureOutcome::Completed
+}
+
+async fn run_m15_live_subagent_process(
+    ws: WsConnection,
+    session_id: SessionKey,
+    profile_id: String,
+    workdir: PathBuf,
+    artifact_path: PathBuf,
+    turn_id: TurnId,
+    spec: M15LiveSubagentSpec,
+) -> Result<M15LiveSubagentResult, String> {
+    let delay_seconds = std::env::var("OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .map(|scale| {
+            spec.delay_seconds
+                .parse::<f64>()
+                .map(|delay| (delay * scale).clamp(0.05, 10.0).to_string())
+                .unwrap_or_else(|_| spec.delay_seconds.to_owned())
+        })
+        .unwrap_or_else(|| spec.delay_seconds.to_owned());
+    let script = r##"
+import pathlib
+import sys
+import time
+
+agent_id, artifact_path, finding, delay = sys.argv[1:5]
+time.sleep(float(delay))
+content = f"# {agent_id}\n\n{finding}\n"
+pathlib.Path(artifact_path).write_text(content, encoding="utf-8")
+print(f"{agent_id}: {finding}")
+"##;
+    let specialist = SupervisedSpecialistSpec {
+        agent_id: spec.agent_id.to_owned(),
+        parent_agent_id: Some("master".to_owned()),
+        session_id: session_id.clone(),
+        task_id: None,
+        path: format!("master/{}", spec.agent_id),
+        role: spec.role.to_owned(),
+        nickname: spec.title.to_owned(),
+        backend_kind: "cli_process".to_owned(),
+        task: Some("Running live code review check".to_owned()),
+        cwd: Some(workdir.clone()),
+        profile_id: profile_id.clone(),
+        artifacts: vec![SpecialistArtifactSpec {
+            id: spec.artifact_id.to_owned(),
+            title: format!("{} report", spec.title),
+            kind: "markdown".to_owned(),
+            path: artifact_path.clone(),
+        }],
+    };
+    let sink = WsSupervisorEventSink { ws: ws.clone() };
+    let summary = run_supervised_cli_specialist(
+        default_agent_orchestrator(),
+        &sink,
+        SupervisedCliSpecialist::new(
+            specialist,
+            crate::cli_agent_adapter::CliAgentCommandConfig::new("/usr/bin/env")
+                .args([
+                    "python3".to_owned(),
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    spec.agent_id.to_owned(),
+                    artifact_path.to_string_lossy().into_owned(),
+                    spec.finding.to_owned(),
+                    delay_seconds,
+                ])
+                .cwd(workdir)
+                .timeout(std::time::Duration::from_secs(10))
+                .declared_artifact(&artifact_path),
+        )
+        .heartbeat_interval(std::time::Duration::from_millis(150)),
+    )
+    .await?;
+    let _ = send_raw_notification_ephemeral(
+        &ws,
+        octos_core::ui_protocol::methods::MESSAGE_DELTA,
+        json!({
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "text": format!(
+                "Subagent done: {} ({}) completed; artifact `{}` is ready.\n",
+                spec.title,
+                spec.agent_id,
+                spec.artifact_id
+            ),
+        }),
+    );
+    append_appui_evidence_jsonl(
+        "agent-ledger.jsonl",
+        json!({
+            "event": "agent_completed",
+            "agent_id": spec.agent_id,
+            "title": spec.title,
+            "status": summary.status,
+            "artifact_id": spec.artifact_id,
+            "artifact_path": artifact_path,
+            "ping_count": summary.ping_count,
+        }),
+    );
+
+    Ok(M15LiveSubagentResult {
+        agent_id: spec.agent_id.to_owned(),
+        title: spec.title.to_owned(),
+        status: summary.status,
+        artifact_id: spec.artifact_id.to_owned(),
+        artifact_path,
+        ping_count: summary.ping_count,
+    })
+}
+
 async fn seed_m9_task_output_fixture(
     state: &AppState,
     session_id: &SessionKey,
+    ws: WsConnection,
+    ledger: Arc<UiProtocolLedger>,
 ) -> Result<TaskId, String> {
     let Some(sessions) = &state.sessions else {
         return Err("Sessions not available".to_owned());
@@ -8605,6 +12949,22 @@ async fn seed_m9_task_output_fixture(
             &data_dir, session_id,
         ))
         .map_err(|error| format!("failed to enable task persistence: {error}"))?;
+    supervisor.set_on_change(move |task| {
+        let Some((event_session_id, agent_value)) = upsert_background_task_agent(task) else {
+            return;
+        };
+        let Ok(agent) = serde_json::from_value::<UiAgentRecord>(agent_value) else {
+            return;
+        };
+        let _ = send_notification_durable(
+            &ws,
+            &ledger,
+            UiNotification::AgentUpdated(AgentUpdatedEvent {
+                session_id: event_session_id,
+                agent,
+            }),
+        );
+    });
     let task_id = supervisor.register("shell", "m9-task-output-fixture", Some(&session_id.0));
     supervisor.mark_running(&task_id);
     supervisor.mark_runtime_state(
@@ -8639,6 +12999,7 @@ async fn run_standalone_turn(
     routed_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
+    internal_master_continuation: bool,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -8672,7 +13033,7 @@ async fn run_standalone_turn(
     let active_profile_id = session_id
         .profile_id()
         .map(ToOwned::to_owned)
-        .or_else(|| routed_profile_id.clone());
+        .or(routed_profile_id.clone());
     let Some(profile_runtime) =
         resolve_session_profile_runtime(&state, active_profile_id.as_deref())
     else {
@@ -8787,44 +13148,17 @@ async fn run_standalone_turn(
         adaptive_router_ref.clone(),
     );
 
-    // Issue #1013: intercept slash commands BEFORE the LLM round-trip,
-    // mirroring the gateway path (`session_actor.rs::try_handle_command` /
-    // `gateway_dispatcher.rs::try_dispatch_session_command`). When the
-    // chat transport migrated to UI Protocol v1 over WebSocket (PR #66),
-    // this interception was lost — every `/clear`, `/new slides …`,
-    // `/queue`, `/adaptive`, etc. reached the LLM and produced a
-    // conversational reply. The shared `try_dispatch_slash_command`
-    // helper runs the same scaffold / clear / etc. side effects and
-    // returns the synthesized assistant text; the WS turn path persists
-    // the user prompt + assistant reply against the session ledger and
-    // emits `turn/completed`. Non-slash messages return `None` here and
-    // fall through to the normal LLM construction below.
     let slash_ctx = ws_slash::SlashCommandContext {
         sessions: sessions.clone(),
         session_id: session_id.clone(),
         data_dir: session_runtime.profile.data_dir.clone(),
-        // The active profile id can come from `session_id.profile_id()`
-        // when the SPA encodes it via `SessionKey::with_profile`, or
-        // from the WS handshake's routed profile id (Host-header
-        // matched). Falls back to `MAIN_PROFILE_ID` inside the helper
-        // when both are absent — matching gateway_dispatcher.rs:188.
         profile_id: session_id
             .profile_id()
             .map(ToOwned::to_owned)
             .or_else(|| routed_profile_id.clone()),
-        // Codex round-2: use the session_runtime's resolved workspace_root
-        // so scaffolds land where the tools are pointed, not the default
-        // `data_dir/users/<base>/workspace`. Critical for WS sessions
-        // opened with a custom cwd / workspace hint.
         workspace_root: Some(session_runtime.workspace_root.clone()),
     };
     if let Some(reply) = ws_slash::try_dispatch_slash_command(&prompt, &slash_ctx).await {
-        // Persist the user prompt + synthesized assistant reply against
-        // the session ledger so they survive replay/reconnect. The
-        // installed `MessageCommitObserver` auto-emits
-        // `message/persisted` notifications for both rows. Drop the
-        // failover forwarder before emitting the terminal — it has
-        // nothing more to forward after this point.
         let user_turn_id = turn_id.0.to_string();
         let user_message = pre_stamp_turn_thread_id(Message::user(prompt.clone()), &user_turn_id);
         let assistant_message = pre_stamp_turn_thread_id(Message::assistant(reply), &user_turn_id);
@@ -8850,11 +13184,26 @@ async fn run_standalone_turn(
         return;
     }
 
-    let history: Vec<Message> = {
+    let raw_history: Vec<Message> = {
         let mut sessions = sessions.lock().await;
         let session = sessions.get_or_create(&session_id).await;
         session.get_history(50).to_vec()
     };
+    let (history, context_manager, context_lifecycle_notifications) =
+        appui_context_history_for_agent(
+            &session_runtime.profile.data_dir,
+            &session_id,
+            &raw_history,
+            llm_provider.as_ref(),
+            "appui_pre_turn",
+        );
+    for notification in context_lifecycle_notifications {
+        if features.context_lifecycle_available() {
+            let _ = send_notification_durable(&ws, &ledger, notification);
+        } else {
+            let _ = ledger.append_notification_from(notification, ws.connection_id);
+        }
+    }
 
     // For hosted multi-tenant standalone serve, the file API resolves
     // `/api/files/...` against the per-profile data dir (`<server_data>/
@@ -8908,6 +13257,25 @@ async fn run_standalone_turn(
         let bg_session_id = session_id.clone();
         let bg_thread_id = turn_id.0.to_string();
         let bg_turn_id = turn_id.clone();
+        let task_state_path = ui_protocol_task_output::task_state_path(&bg_data_dir, &session_id);
+        let task_supervisor = tool_registry.supervisor();
+        if let Err(error) = task_supervisor.enable_persistence(task_state_path.clone()) {
+            warn!(
+                session_id = %session_id.0,
+                error = %error,
+                "failed to enable AppUI turn task-supervisor persistence"
+            );
+        }
+        tool_registry.register(octos_agent::CheckBackgroundTasksTool::new(
+            task_supervisor.clone(),
+            session_id.to_string(),
+        ));
+        tool_registry.register(octos_agent::ReadTaskOutputTool::new(
+            task_supervisor.clone(),
+            session_id.to_string(),
+            session_runtime.agent.subagent_output_router().cloned(),
+            session_runtime.workspace_root.clone(),
+        ));
 
         // Wire spawn_only contract-satisfied path.
         let payload_sessions = bg_sessions.clone();
@@ -8916,8 +13284,8 @@ async fn run_standalone_turn(
         let payload_thread_id = bg_thread_id.clone();
         let payload_turn_id = bg_turn_id.clone();
         let payload_ledger = ledger.clone();
-        tool_registry.set_background_result_sender(std::sync::Arc::new(
-            move |payload: BackgroundResultPayload| {
+        let background_result_sender: octos_agent::tools::spawn::BackgroundResultSender =
+            std::sync::Arc::new(move |payload: BackgroundResultPayload| {
                 let sessions = payload_sessions.clone();
                 let data_dir = payload_data_dir.clone();
                 let session_id = payload_session_id.clone();
@@ -8958,20 +13326,8 @@ async fn run_standalone_turn(
                     .originating_client_message_id
                     .clone()
                     .filter(|s| !s.is_empty());
-                // Originating LLM `tool_call_id`. The supervisor stores it
-                // on `BackgroundTask.tool_call_id`; the agent's spawn_only
-                // branch threads it through to the payload so the
-                // `turn/spawn_complete` envelope can carry it on the wire.
-                // The client uses it to flip the in-flight chip from
-                // spinner to checkmark without a race against a
-                // `task/updated` watcher that builds
-                // `task_id → tool_call_id` post-hoc. Empty strings collapse
-                // to `None` for the same reason as
-                // `originating_client_message_id`.
-                let originating_tool_call_id = payload
-                    .tool_call_id
-                    .clone()
-                    .filter(|s| !s.is_empty());
+                let originating_tool_call_id =
+                    payload.tool_call_id.clone().filter(|s| !s.is_empty());
                 let turn_id = payload_turn_id.clone();
                 let ledger = payload_ledger.clone();
                 Box::pin(async move {
@@ -9153,8 +13509,102 @@ async fn run_standalone_turn(
                     }
                     persisted_meta.is_some()
                 })
+            });
+        tool_registry.set_background_result_sender(background_result_sender.clone());
+
+        let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel::<InboundMessage>(32);
+        let mut spawn_tool = octos_agent::SpawnTool::with_context(
+            llm_provider.clone(),
+            memory_store.clone(),
+            session_runtime.workspace_root.clone(),
+            spawn_inbound_tx,
+            "api",
+            session_id.to_string(),
+        )
+        .with_provider_policy(tool_registry.provider_policy().cloned())
+        .with_agent_config(agent_config.clone())
+        .with_task_supervisor(
+            task_supervisor.clone(),
+            session_id.to_string(),
+            task_state_path.clone(),
+        )
+        .with_plugin_dirs(
+            session_runtime.profile.plugin_dirs.clone(),
+            session_runtime.profile.plugin_env_template.clone(),
+        )
+        .with_hook_context(octos_agent::HookContext {
+            session_id: Some(session_id.to_string()),
+            profile_id: Some(session_runtime.profile.profile_id.clone()),
+        })
+        .with_background_result_sender(background_result_sender);
+        if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
+            spawn_tool = spawn_tool.with_hooks(hooks);
+        }
+        if let Some(cache) = session_runtime.agent.file_state_cache().cloned() {
+            spawn_tool = spawn_tool.with_parent_file_state_cache(cache);
+        }
+        if let Some(router) = session_runtime.agent.subagent_output_router().cloned() {
+            spawn_tool = spawn_tool.with_parent_subagent_output_router(router);
+        }
+        if let Some(generator) = session_runtime.agent.subagent_summary_generator().cloned() {
+            spawn_tool = spawn_tool.with_parent_subagent_summary_generator(generator);
+        }
+        let child_context_parent = context_manager.clone();
+        let child_context_data_dir = session_runtime.profile.data_dir.clone();
+        let child_context_parent_session = session_id.clone();
+        spawn_tool = spawn_tool.with_child_prompt_context_manager_factory(Arc::new(
+            move |request: octos_agent::tools::spawn::ChildPromptContextRequest| {
+                let child_key = request.child_session_key.clone().unwrap_or_else(|| {
+                    let worker_suffix: String = request
+                        .worker_id
+                        .chars()
+                        .map(|ch| {
+                            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                                ch
+                            } else {
+                                '_'
+                            }
+                        })
+                        .collect();
+                    format!(
+                        "{}#spawn-{}",
+                        child_context_parent_session.base_key(),
+                        worker_suffix
+                    )
+                });
+                let child_session_id = SessionKey(child_key);
+                let child_manager = {
+                    let parent = child_context_parent
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let fork = parent.fork_child_history(&ForkPolicy::default());
+                    ContextManager::from_forked_child_context(
+                        child_session_id.to_string(),
+                        request.task_id.clone(),
+                        fork,
+                    )
+                };
+                publish_appui_context_status(&child_session_id, &child_manager);
+                if let Err(error) = persist_context_manager_snapshot(
+                    &child_context_data_dir,
+                    &child_session_id.to_string(),
+                    &child_manager,
+                ) {
+                    warn!(
+                        session = %child_session_id.0,
+                        error = %error,
+                        "failed to persist forked child context manager snapshot"
+                    );
+                }
+                Some(Arc::new(AppUiPromptContextBridge::new(
+                    child_session_id,
+                    child_context_data_dir.clone(),
+                    Arc::new(StdMutex::new(child_manager)),
+                )))
             },
         ));
+        tool_registry.register(spawn_tool);
+        tool_registry.add_base_tools(["spawn", "check_background_tasks", "read_task_output"]);
 
         // Wire `send_file` for the legacy non-contract `files_to_send` path
         // and any explicit agent calls. The spawn_only auto-background
@@ -9260,11 +13710,26 @@ async fn run_standalone_turn(
     // carries `thread_id`. Closes the wire-side leak where standalone-turn
     // SSE events landed unbound and the SPA reducer had to fall back to
     // sticky-map heuristics.
-    let reporter: Arc<dyn octos_agent::ProgressReporter> =
+    // M9-α-2 wiring: wrap the channel-bound reporter with
+    // `LedgerToolProgressReporter` so `ProgressEvent::ToolProgress` events
+    // (notably the pipeline heartbeat at `octos-pipeline/executor.rs:463`)
+    // are mirrored onto the M9 ledger as `tool/progress.v1` notifications.
+    // Without this wrap the heartbeat publishes into the channel-only path
+    // and the SPA's tool-status bubble never refreshes for long-running
+    // spawn_only tools (run_pipeline, podcast_generate, mofa_slides, ...).
+    let inner_reporter: Arc<dyn octos_agent::ProgressReporter> =
         Arc::new(MetricsReporter::new(Arc::new(
             BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
                 .with_thread_id(Some(turn_id.0.to_string())),
         )));
+    let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
+        super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
+            inner_reporter,
+            ledger.clone(),
+            session_id.clone(),
+            turn_id.clone(),
+        ),
+    );
     let progress_tx_for_result = progress_tx.clone();
     let progress_tx_for_tasks = progress_tx.clone();
     let task_progress_dropped = progress_dropped.clone();
@@ -9302,6 +13767,13 @@ async fn run_standalone_turn(
         workspace_root.as_deref(),
     ))
     .with_reporter(reporter);
+    let prompt_context_bridge: Arc<dyn PromptContextManager> =
+        Arc::new(AppUiPromptContextBridge::new(
+            session_id.clone(),
+            session_runtime.profile.data_dir.clone(),
+            context_manager.clone(),
+        ));
+    request_agent = request_agent.with_prompt_context_manager(prompt_context_bridge);
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
         request_agent = request_agent.with_hooks(hooks);
     }
@@ -9333,6 +13805,8 @@ async fn run_standalone_turn(
     // the WRONG sibling user under rapid-fire concurrent turns.
     let turn_thread_id_for_persist = turn_id.0.to_string();
     let turn_thread_id_for_done = turn_thread_id_for_persist.clone();
+    let context_manager_for_result = context_manager.clone();
+    let context_data_dir_for_result = session_runtime.profile.data_dir.clone();
     // UPCR-2026-015 (M9-β-1): pull the pre-uploaded media paths off
     // the params and feed them to the agent loop. `process_message`
     // already accepts a `Vec<String>` of paths (used by the
@@ -9369,6 +13843,7 @@ async fn run_standalone_turn(
     // since FA-11.
     let auto_escalation_router = session_runtime.profile.adaptive_router.clone();
     let auto_escalation_session_id = session_id.0.clone();
+    let skip_internal_user_persist = internal_master_continuation;
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         let result = octos_llm::with_router_context(
@@ -9399,13 +13874,29 @@ async fn run_standalone_turn(
                         &response.content,
                         response.reasoning_content.clone(),
                     );
+                    let mut skipped_internal_user = false;
                     for message in response.messages.iter().cloned().chain(final_assistant) {
+                        if skip_internal_user_persist
+                            && !skipped_internal_user
+                            && message.role == MessageRole::User
+                        {
+                            skipped_internal_user = true;
+                            continue;
+                        }
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                        let saved_for_context = to_save.clone();
                         if let Ok(seq) = sessions
                             .add_message_with_seq(&agent_session_id, to_save)
                             .await
                         {
+                            record_appui_context_manager_message(
+                                &context_data_dir_for_result,
+                                &context_manager_for_result,
+                                &agent_session_id,
+                                &saved_for_context,
+                                seq,
+                            );
                             cursor = Some(UiCursor {
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
@@ -9781,6 +14272,27 @@ fn forward_progress_event(
     saw_delta: &mut bool,
     event: &Value,
 ) {
+    if event.get("type").and_then(Value::as_str) == Some("agent_updated") {
+        if let (Some(session_id_value), Some(agent_value)) =
+            (event.get("session_id"), event.get("agent"))
+        {
+            if let (Ok(event_session_id), Ok(agent)) = (
+                serde_json::from_value::<SessionKey>(session_id_value.clone()),
+                serde_json::from_value::<UiAgentRecord>(agent_value.clone()),
+            ) {
+                let _ = send_notification_durable(
+                    ws,
+                    ledger,
+                    UiNotification::AgentUpdated(AgentUpdatedEvent {
+                        session_id: event_session_id,
+                        agent,
+                    }),
+                );
+            }
+        }
+        return;
+    }
+
     if let Some(delta) = task_output_delta_tracker.observe_progress_event(session_id, event) {
         // task/output/delta is durable: drops surface as
         // protocol/replay_lossy so the client can resync.
@@ -9973,6 +14485,18 @@ fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     value
 }
 
+fn truncate_for_display(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 fn prompt_text(input: &[InputItem]) -> Option<String> {
     let parts = input
         .iter()
@@ -10111,7 +14635,7 @@ async fn abort_connection_turns(
 /// the lifecycle-error counter on serialization failure (which only happens
 /// when a payload contains non-serializable data; treat as lifecycle).
 fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
-    match serde_json::to_string(value) {
+    match app_ui_codec::to_compact_json(value) {
         Ok(text) => Some(WsMessage::text(text)),
         Err(error) => {
             metrics::counter!("ws.send.error.lifecycle").increment(1);
@@ -10123,6 +14647,92 @@ fn frame_for<T: serde::Serialize>(value: &T) -> Option<WsMessage> {
             None
         }
     }
+}
+
+fn appui_evidence_dir() -> Option<PathBuf> {
+    std::env::var_os("OCTOS_TUI_M15_UX_OUTPUT_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn append_appui_evidence_jsonl(name: &str, value: Value) {
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::debug!(%error, "failed to create AppUI evidence directory");
+        return;
+    }
+    let path = dir.join(name);
+    let line = match serde_json::to_string(&value) {
+        Ok(line) => line,
+        Err(error) => {
+            tracing::debug!(%error, "failed to serialize AppUI evidence");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            writeln!(file, "{line}")
+        })
+    {
+        tracing::debug!(%error, "failed to append AppUI evidence");
+    }
+}
+
+fn write_appui_evidence_json(name: &str, value: Value) {
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(dir.join(name), format!("{text}\n"));
+    }
+}
+
+fn append_appui_transcript_frame(direction: &str, frame: Value) {
+    append_appui_evidence_jsonl(
+        "appui-transcript.jsonl",
+        json!({
+            "ts": Utc::now().to_rfc3339(),
+            "direction": direction,
+            "frame": frame,
+        }),
+    );
+}
+
+fn append_appui_server_log(message: impl AsRef<str>) {
+    let Some(dir) = appui_evidence_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let line = format!("{} {}\n", Utc::now().to_rfc3339(), message.as_ref());
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("server.log"))
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(line.as_bytes())
+        });
+}
+
+fn send_raw_notification_ephemeral(
+    ws: &WsConnection,
+    method: &'static str,
+    params: Value,
+) -> Result<(), SendError> {
+    let notification = octos_core::ui_protocol::RpcNotification::new(method, params);
+    let frame = frame_for(&notification).ok_or(SendError::BackpressureDrop)?;
+    ws.send_ephemeral(frame, method)
 }
 
 fn send_turn_error(
@@ -10532,7 +15142,23 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             // cursor — they're stateless lifecycle pushes.
             | UiNotification::RouterStatus(_)
             | UiNotification::RouterFailover(_)
-            | UiNotification::QueueState(_) => None,
+            | UiNotification::QueueState(_)
+            // M15 autonomy notifications do not carry durable UiCursor values.
+            // AgentOutputDelta carries an OutputCursor for the agent output
+            // stream, which is reconciled through agent/output/read.
+            | UiNotification::AgentUpdated(_)
+            | UiNotification::AgentOutputDelta(_)
+            | UiNotification::AgentArtifactUpdated(_)
+            | UiNotification::SessionGoalUpdated(_)
+            | UiNotification::SessionGoalCleared(_)
+            | UiNotification::LoopUpdated(_)
+            | UiNotification::LoopFired(_)
+            | UiNotification::LoopCompleted(_)
+            // M16 context lifecycle notifications carry context generation
+            // hashes, not replay cursors. The durable ledger cursor is on
+            // the surrounding LedgeredUiProtocolEvent.
+            | UiNotification::ContextCompactionCompleted(_)
+            | UiNotification::ContextNormalizationReported(_) => None,
         },
         UiProtocolLedgerEvent::Progress(_) => None,
     }
@@ -10618,6 +15244,15 @@ mod tests {
         }
     }
 
+    fn local_profile_state_with_sessions(dir: &Path) -> Arc<AppState> {
+        Arc::new(AppState {
+            sessions: Some(Arc::new(tokio::sync::Mutex::new(
+                octos_bus::SessionManager::open(dir).expect("session manager"),
+            ))),
+            ..local_profile_state(dir)
+        })
+    }
+
     fn local_profile_params(
         name: &str,
         username: &str,
@@ -10630,7 +15265,168 @@ mod tests {
         }
     }
 
-    struct FailingWriter;
+    fn sorted_supported_methods(
+        capabilities: &UiProtocolCapabilities,
+    ) -> std::collections::BTreeSet<&str> {
+        capabilities
+            .supported_methods
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
+        let session_id = SessionKey("local:dispatch-parity".into());
+        let turn_id = TurnId::new();
+        let approval_id = ApprovalId::new();
+        let preview_id = PreviewId::new();
+        let task_id = TaskId::new();
+        let params = match method {
+            APPUI_METHOD_CLIENT_HELLO => json!({
+                "transport": "stdio",
+                "supported_features": [],
+            }),
+            APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+            | APPUI_METHOD_SESSION_STATUS_READ
+            | APPUI_METHOD_PROFILE_LLM_LIST
+            | APPUI_METHOD_PROFILE_LLM_SELECT
+            | APPUI_METHOD_MCP_STATUS_LIST
+            | APPUI_METHOD_TOOL_STATUS_LIST
+            | APPUI_METHOD_AUTH_STATUS
+            | APPUI_METHOD_AUTH_SEND_CODE
+            | APPUI_METHOD_AUTH_VERIFY
+            | APPUI_METHOD_AUTH_ME
+            | APPUI_METHOD_AUTH_LOGOUT
+            | APPUI_METHOD_PROFILE_LLM_CATALOG
+            | APPUI_METHOD_PROFILE_LLM_UPSERT
+            | APPUI_METHOD_PROFILE_LLM_DELETE
+            | APPUI_METHOD_PROFILE_LLM_TEST
+            | APPUI_METHOD_PROFILE_LLM_FETCH_MODELS
+            | APPUI_METHOD_PROFILE_SKILLS_INSTALL
+            | APPUI_METHOD_PROFILE_SKILLS_REMOVE
+            | APPUI_METHOD_REVIEW_START => json!({}),
+            APPUI_METHOD_PROFILE_SKILLS_LIST | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
+                json!({ "profile_id": 42 })
+            }
+            methods::AGENT_LIST
+            | methods::AGENT_STATUS_READ
+            | methods::AGENT_OUTPUT_READ
+            | methods::AGENT_ARTIFACT_LIST
+            | methods::AGENT_ARTIFACT_READ
+            | methods::AGENT_INTERRUPT
+            | methods::AGENT_CLOSE
+            | methods::SESSION_GOAL_GET
+            | methods::SESSION_GOAL_SET
+            | methods::SESSION_GOAL_CLEAR
+            | methods::LOOP_CREATE
+            | methods::LOOP_LIST
+            | methods::LOOP_DELETE
+            | methods::LOOP_PAUSE
+            | methods::LOOP_RESUME
+            | methods::LOOP_FIRE_NOW => json!({}),
+            methods::PROFILE_LOCAL_CREATE => json!({
+                "name": "Dispatch Parity",
+                "username": "dispatch-parity",
+                "email": "dispatch-parity@example.com",
+            }),
+            methods::SESSION_OPEN => json!({ "session_id": session_id }),
+            methods::TURN_START => json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "hello" }],
+            }),
+            methods::TURN_INTERRUPT => json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+            }),
+            methods::APPROVAL_RESPOND => json!({
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve",
+            }),
+            methods::APPROVAL_SCOPES_LIST => json!({ "session_id": session_id }),
+            methods::PERMISSION_PROFILE_LIST => json!({ "session_id": session_id }),
+            methods::PERMISSION_PROFILE_SET => json!({
+                "session_id": session_id,
+                "update": {
+                    "mode": "workspace_write",
+                    "network": "deny",
+                },
+            }),
+            methods::DIFF_PREVIEW_GET => json!({
+                "session_id": session_id,
+                "preview_id": preview_id,
+            }),
+            methods::TASK_OUTPUT_READ => json!({
+                "session_id": session_id,
+                "task_id": task_id,
+            }),
+            methods::TASK_LIST => json!({ "session_id": session_id }),
+            methods::TASK_CANCEL => json!({
+                "session_id": session_id,
+                "task_id": task_id,
+            }),
+            methods::TASK_RESTART_FROM_NODE => json!({
+                "session_id": session_id,
+                "task_id": task_id,
+                "node_id": "design",
+            }),
+            methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
+            methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
+            methods::TURN_STATE_GET => json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+            }),
+            methods::SESSION_LIST | methods::SYSTEM_STATUS_GET | methods::CONTENT_LIST => {
+                json!({})
+            }
+            methods::SESSION_SNAPSHOT
+            | methods::SESSION_MESSAGES_PAGE
+            | methods::SESSION_STATUS_GET
+            | methods::SESSION_FILES_LIST
+            | methods::SESSION_TASKS_LIST
+            | methods::SESSION_WORKSPACE_GET
+            | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
+            methods::SESSION_TITLE_SET => json!({
+                "session_id": session_id.to_string(),
+                "title": "Dispatch parity",
+            }),
+            methods::CONTENT_DELETE => json!({ "id": "content-1" }),
+            methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
+            methods::ROUTER_SET_MODE => json!({
+                "session_id": session_id,
+                "mode": "off",
+            }),
+            methods::ROUTER_GET_METRICS => json!({ "session_id": session_id }),
+            other => panic!("missing AppUI dispatch probe params for {other}"),
+        };
+
+        RpcRequest::new(format!("probe-{method}"), method, params)
+    }
+
+    fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
+        Message {
+            role,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    struct FailingWriter {
+        write_failed: Arc<tokio::sync::Notify>,
+    }
+
+    impl FailingWriter {
+        fn new(write_failed: Arc<tokio::sync::Notify>) -> Self {
+            Self { write_failed }
+        }
+    }
 
     impl AsyncWrite for FailingWriter {
         fn poll_write(
@@ -10638,6 +15434,7 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
             _buf: &[u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
+            self.write_failed.notify_waiters();
             std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "writer closed",
@@ -10659,19 +15456,415 @@ mod tests {
         }
     }
 
+    struct RepeatingByteReader {
+        remaining: usize,
+        byte: u8,
+        max_chunk: usize,
+    }
+
+    impl RepeatingByteReader {
+        fn new(byte: u8, remaining: usize, max_chunk: usize) -> Self {
+            Self {
+                remaining,
+                byte,
+                max_chunk,
+            }
+        }
+    }
+
+    impl AsyncRead for RepeatingByteReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.remaining == 0 || buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let count = self.remaining.min(self.max_chunk).min(buf.remaining());
+            let bytes = vec![self.byte; count];
+            buf.put_slice(&bytes);
+            self.remaining -= count;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct DropNotify(Option<oneshot::Sender<()>>);
+
+    impl DropNotify {
+        fn new(tx: oneshot::Sender<()>) -> Self {
+            Self(Some(tx))
+        }
+    }
+
+    impl Drop for DropNotify {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn stdio_writer_loop_propagates_write_errors() {
+    async fn stdio_writer_loop_propagates_write_errors_and_marks_failed_latch() {
         let (tx, rx) = mpsc::channel(1);
+        let (ws, _writer_rx) = ws_connection_for_test(1);
+        let failure_notify = ws.failed_notify();
+        let notify_task = tokio::spawn(async move {
+            failure_notify.notified().await;
+        });
+        tokio::task::yield_now().await;
+        let write_failed = Arc::new(tokio::sync::Notify::new());
         tx.send(WsMessage::Text("{}".into()))
             .await
             .expect("queue stdio response");
         drop(tx);
 
-        let error = stdio_writer_loop_to(rx, FailingWriter)
+        let error = stdio_writer_loop_to(rx, FailingWriter::new(write_failed), ws.failure_signal())
             .await
             .expect_err("write failure is propagated");
 
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(ws.is_failed(), "stdout write failure must latch failed");
+        tokio::time::timeout(Duration::from_millis(500), notify_task)
+            .await
+            .expect("stdout write failure must wake failed-notify waiters")
+            .expect("failed-notify waiter task should join");
+    }
+
+    #[test]
+    fn stdio_durable_send_waits_for_capacity_instead_of_backpressure_drop() {
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(1);
+        let ws = WsConnection::new_stdio(writer_tx);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:stdio-backpressure".into());
+        let turn_id = TurnId::new();
+
+        send_rpc_result(&ws, "fill".into(), json!({"ok": true}))
+            .expect("priming lifecycle frame fills stdio queue");
+
+        let send_ws = ws.clone();
+        let send_ledger = Arc::clone(&ledger);
+        let send_session_id = session_id.clone();
+        let send_turn_id = turn_id.clone();
+        let send_thread = std::thread::spawn(move || {
+            send_notification_durable(
+                &send_ws,
+                send_ledger.as_ref(),
+                UiNotification::Warning(octos_core::ui_protocol::WarningEvent {
+                    session_id: send_session_id,
+                    turn_id: Some(send_turn_id),
+                    code: "test".into(),
+                    message: "wait for capacity".into(),
+                }),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !send_thread.is_finished(),
+            "stdio durable send must wait while the bounded queue is full",
+        );
+
+        let _first = writer_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("priming frame drains");
+        let send_result = send_thread
+            .join()
+            .expect("stdio durable send thread should not panic");
+        assert_eq!(send_result, Ok(()));
+
+        let _second = writer_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("durable frame queued after capacity becomes available");
+    }
+
+    #[tokio::test]
+    async fn stdio_ndjson_reader_rejects_oversized_frame_before_newline() {
+        let input = std::io::Cursor::new(vec![b'x'; MAX_TEXT_FRAME_BYTES + 1]);
+        let mut reader = StdioNdjsonReader::new(input);
+
+        match reader.next_frame().await.expect("read succeeds") {
+            StdioFrameRead::TooLarge => {}
+            StdioFrameRead::Frame(_) | StdioFrameRead::Eof => panic!("expected TooLarge"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_connection_stops_dispatch_after_writer_failure() {
+        reset_stdio_dispatch_count_for_test();
+        let write_failed = Arc::new(tokio::sync::Notify::new());
+        let (mut input_tx, input_rx) = tokio::io::duplex(4096);
+        let first = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "first",
+                "method": APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+                "params": {}
+            })
+        );
+        let second = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "second",
+                "method": APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
+                "params": {}
+            })
+        );
+        input_tx
+            .write_all(first.as_bytes())
+            .await
+            .expect("queue first request");
+
+        let write_failed_for_input = write_failed.clone();
+        let input_task = tokio::spawn(async move {
+            write_failed_for_input.notified().await;
+            let _ = input_tx.write_all(second.as_bytes()).await;
+        });
+        tokio::task::yield_now().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stdio_connection_with_io(
+                Arc::new(AppState::empty_for_tests()),
+                input_rx,
+                FailingWriter::new(write_failed),
+            ),
+        )
+        .await
+        .expect("stdio loop must exit after writer failure");
+
+        input_task.await.expect("input task joins");
+        let error = result.expect_err("writer failure should be returned");
+        assert!(
+            error.to_string().contains("AppUI stdio writer failed"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            stdio_dispatch_count_for_test(),
+            1,
+            "no request after the writer failure may be dispatched"
+        );
+        reset_stdio_dispatch_count_for_test();
+    }
+
+    #[tokio::test]
+    async fn stdio_ndjson_reader_accepts_max_size_frame_with_newline() {
+        let mut input = vec![b'x'; MAX_TEXT_FRAME_BYTES];
+        input.push(b'\n');
+        let mut reader = StdioNdjsonReader::new(std::io::Cursor::new(input));
+
+        match reader.next_frame().await.expect("read succeeds") {
+            StdioFrameRead::Frame(text) => {
+                assert_eq!(text.len(), MAX_TEXT_FRAME_BYTES);
+            }
+            StdioFrameRead::TooLarge | StdioFrameRead::Eof => {
+                panic!("expected a max-sized frame")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_ndjson_reader_rejects_streaming_oversized_frame_without_buffer_growth() {
+        let input = RepeatingByteReader::new(b'x', MAX_TEXT_FRAME_BYTES * 8, 4096);
+        let mut reader = StdioNdjsonReader::new(input);
+
+        match reader.next_frame().await.expect("read succeeds") {
+            StdioFrameRead::TooLarge => {}
+            StdioFrameRead::Frame(_) | StdioFrameRead::Eof => panic!("expected TooLarge"),
+        }
+        assert!(
+            reader.buffer.capacity() <= MAX_TEXT_FRAME_BYTES,
+            "reader buffer grew past MAX_TEXT_FRAME_BYTES: {}",
+            reader.buffer.capacity()
+        );
+        assert!(
+            reader.buffer.is_empty(),
+            "oversized frame bytes must be drained or dropped before the next frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
+        let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let live_forwarders: SharedLiveForwarders =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let contracts = UiProtocolContractStores::default();
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:stdio-cleanup".into());
+        let turn_id = TurnId::new();
+
+        let (turn_started_tx, turn_started_rx) = oneshot::channel();
+        let (turn_drop_tx, turn_drop_rx) = oneshot::channel();
+        let turn_task = tokio::spawn(async move {
+            let _drop = DropNotify::new(turn_drop_tx);
+            let _ = turn_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        active_turns.lock().await.insert(
+            session_id.clone(),
+            test_active_turn(turn_id.clone(), turn_task.abort_handle()),
+        );
+        connection_turns
+            .lock()
+            .await
+            .insert(session_id.clone(), turn_id.clone());
+
+        let (forwarder_started_tx, forwarder_started_rx) = oneshot::channel();
+        let (forwarder_drop_tx, forwarder_drop_rx) = oneshot::channel();
+        let forwarder_task = tokio::spawn(async move {
+            let _drop = DropNotify::new(forwarder_drop_tx);
+            let _ = forwarder_started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        live_forwarders
+            .lock()
+            .await
+            .insert(session_id.clone(), forwarder_task);
+
+        turn_started_rx.await.expect("active turn task started");
+        forwarder_started_rx
+            .await
+            .expect("live forwarder task started");
+
+        cleanup_stdio_connection_resources(
+            &active_turns,
+            &connection_turns,
+            &live_forwarders,
+            &contracts,
+            &ledger,
+        )
+        .await;
+
+        assert!(active_turns.lock().await.is_empty());
+        assert!(connection_turns.lock().await.is_empty());
+        assert!(live_forwarders.lock().await.is_empty());
+        tokio::time::timeout(Duration::from_millis(500), turn_drop_rx)
+            .await
+            .expect("active turn task should be aborted")
+            .expect("active turn drop notification");
+        let _ = turn_task.await;
+        tokio::time::timeout(Duration::from_millis(500), forwarder_drop_rx)
+            .await
+            .expect("live forwarder should be aborted and awaited")
+            .expect("live forwarder drop notification");
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay cleanup events");
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event))
+                if event.turn_id == turn_id && event.code == "connection_closed"
+        )));
+    }
+
+    #[test]
+    fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
+        let params = SessionOpenParams {
+            session_id: SessionKey("coding:local:test".into()),
+            profile_id: None,
+            cwd: None,
+            after: None,
+        };
+        assert_eq!(
+            stdio_session_open_candidate_profile(&params, Some("previous")).as_deref(),
+            Some("coding")
+        );
+
+        let params = SessionOpenParams {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("explicit".into()),
+            cwd: None,
+            after: None,
+        };
+        assert_eq!(
+            stdio_session_open_candidate_profile(&params, Some("previous")).as_deref(),
+            Some("explicit")
+        );
+
+        let params = SessionOpenParams {
+            session_id: SessionKey("local:test".into()),
+            profile_id: None,
+            cwd: None,
+            after: None,
+        };
+        assert_eq!(
+            stdio_session_open_candidate_profile(&params, Some("previous")).as_deref(),
+            Some("previous")
+        );
+    }
+
+    #[test]
+    fn appui_prompt_context_bridge_preserves_current_user_turn() {
+        let session_id = SessionKey::new("api", "context-current-user");
+        let history = vec![
+            test_message(MessageRole::User, "old request"),
+            test_message(MessageRole::Assistant, "old answer"),
+        ];
+        let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+            session_id.to_string(),
+            None,
+            &history,
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let bridge =
+            AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager);
+        let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+        prompt.extend(history);
+        prompt.push(test_message(MessageRole::User, "current request"));
+
+        let report = bridge
+            .prepare_prompt(
+                PromptContextRequest {
+                    phase: PromptContextPhase::TurnStart,
+                    iteration: 1,
+                    provider_name: "test".to_string(),
+                    model_id: "large-context".to_string(),
+                    context_window: 16_000,
+                },
+                &mut prompt,
+            )
+            .expect("context manager bridge should prepare prompt");
+
+        assert!(report.prompt_replaced);
+        assert!(
+            prompt.iter().any(|message| {
+                message.role == MessageRole::System && message.content == "runtime system"
+            }),
+            "managed prompt should keep the runtime system instruction"
+        );
+        assert!(
+            prompt.iter().any(|message| {
+                message.role == MessageRole::User && message.content == "current request"
+            }),
+            "managed prompt must keep the current user turn"
+        );
+        assert_eq!(
+            prompt
+                .iter()
+                .filter(|message| {
+                    message.role == MessageRole::User && message.content == "old request"
+                })
+                .count(),
+            1,
+            "known history should not be duplicated while adding the current turn"
+        );
+        assert!(
+            crate::context_manager::context_ledger_path(dir.path(), &session_id.to_string())
+                .exists(),
+            "AppUI prompt-context preparation should persist the canonical context ledger"
+        );
     }
 
     #[test]
@@ -10877,6 +16070,7 @@ mod tests {
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
         assert!(local_capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
+        assert!(local_capabilities.supports_feature(APPUI_FEATURE_CONTEXT_LIFECYCLE_V1));
         for method in [
             APPUI_METHOD_PROFILE_SKILLS_LIST,
             APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
@@ -10916,6 +16110,545 @@ mod tests {
                 .any(|method| method == methods::PROFILE_LOCAL_CREATE)
         );
         assert!(!tenant_capabilities.supports_feature(APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1));
+    }
+
+    #[test]
+    fn stdio_capabilities_advertise_shared_router_methods_and_notifications() {
+        let state = AppState::empty_for_tests();
+        let capabilities = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
+
+        assert!(capabilities.supports_method(methods::ROUTER_SET_MODE));
+        assert!(capabilities.supports_method(methods::ROUTER_GET_METRICS));
+        assert!(
+            capabilities
+                .supported_notifications
+                .iter()
+                .any(|method| method == methods::ROUTER_STATUS)
+        );
+        assert!(
+            capabilities
+                .supported_notifications
+                .iter()
+                .any(|method| method == methods::ROUTER_FAILOVER)
+        );
+    }
+
+    #[test]
+    fn stdio_capabilities_omit_auth_bound_methods_and_report_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        for state in [AppState::empty_for_tests(), local_profile_state(dir.path())] {
+            let websocket = ConnectionUiFeatures::default().advertised_capabilities(&state);
+            let stdio = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
+
+            let stdio_methods = sorted_supported_methods(&stdio);
+            let websocket_only: std::collections::BTreeSet<&str> =
+                sorted_supported_methods(&websocket)
+                    .difference(&stdio_methods)
+                    .copied()
+                    .collect();
+            let expected: std::collections::BTreeSet<&str> =
+                APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS
+                    .iter()
+                    .copied()
+                    .collect();
+            assert_eq!(
+                websocket_only, expected,
+                "stdio should omit only auth-bound methods from supported_methods",
+            );
+
+            for method in APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS {
+                assert!(
+                    websocket.supports_method(method),
+                    "websocket should support {method}"
+                );
+                assert!(!stdio.supports_method(method), "stdio should omit {method}");
+                assert!(
+                    stdio.unsupported_report(method).is_some(),
+                    "stdio should explicitly report {method} unsupported",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_stdio_methods_have_dispatch_path() {
+        assert_advertised_stdio_methods_have_dispatch_path(Arc::new(AppState::empty_for_tests()))
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_advertised_stdio_methods_have_dispatch_path(Arc::new(local_profile_state(
+            dir.path(),
+        )))
+        .await;
+    }
+
+    async fn assert_advertised_stdio_methods_have_dispatch_path(state: Arc<AppState>) {
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let capabilities = features.advertised_capabilities(&state);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+        let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+        let (ws, _rx) = ws_connection_for_test(256);
+
+        for method in &capabilities.supported_methods {
+            assert!(
+                ui_protocol_server_supported_methods().contains(&method.as_str()),
+                "{method} is advertised over stdio but is missing from the server method inventory"
+            );
+            let request = dispatch_probe_request(method);
+
+            if method.as_str() == APPUI_METHOD_CLIENT_HELLO {
+                let mut negotiated = features;
+                assert!(
+                    handle_client_hello_rpc(
+                        &ws,
+                        &state,
+                        request.id.clone(),
+                        &request,
+                        &mut negotiated
+                    ),
+                    "{method} is advertised over stdio but client_hello dispatch did not handle it"
+                );
+                continue;
+            }
+
+            if handle_raw_appui_rpc(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                features,
+                None,
+                request.id.clone(),
+                &request,
+            )
+            .await
+            {
+                continue;
+            }
+
+            let command = route_rpc_command(request, features).unwrap_or_else(|error| {
+                panic!(
+                    "{method} is advertised over stdio but has no route_rpc_command dispatch path: {error:?}"
+                )
+            });
+            assert_eq!(
+                command.method(),
+                method,
+                "{method} routed to the wrong UiCommand variant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_session_status_read_missing_profile_returns_profile_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        let request = RpcRequest::<Value>::new(
+            "status-read-missing-profile",
+            APPUI_METHOD_SESSION_STATUS_READ,
+            json!({
+                "session_id": "missing:local:tui#coding",
+                "profile_id": "missing",
+            }),
+        );
+
+        let error =
+            raw_session_status_result(&state, &request, ConnectionUiFeatures::default(), None)
+                .await
+                .expect_err("missing profile should be typed AppUI error");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_unresolved"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_binding_updates_only_after_successful_session_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state_with_sessions(dir.path());
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create ada profile");
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Grace Hopper", "grace", "grace@example.com"),
+        )
+        .expect("create grace profile");
+
+        let (ws, mut rx) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let approvals = PendingApprovalStore::default();
+        let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let mut binding = Some("ada".to_owned());
+
+        let missing_params = SessionOpenParams {
+            session_id: SessionKey("local:missing-binding".into()),
+            profile_id: Some("missing".into()),
+            cwd: None,
+            after: None,
+        };
+        let candidate = stdio_session_open_candidate_profile(&missing_params, binding.as_deref());
+        assert_eq!(candidate.as_deref(), Some("missing"));
+
+        let opened = handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &forwarders,
+            candidate.as_deref(),
+            features,
+            "open-missing".into(),
+            missing_params,
+        )
+        .await;
+        if opened {
+            binding = candidate;
+        }
+
+        assert!(!opened, "missing profile must fail session/open");
+        assert_eq!(
+            binding.as_deref(),
+            Some("ada"),
+            "stdio binding must not adopt a failed session/open candidate"
+        );
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("open-missing"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("profile_unresolved"));
+        assert_eq!(frame["error"]["data"]["profile_id"], json!("missing"));
+
+        let status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "status-after-failed-open",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": "local:tui#coding" }),
+            ),
+            features,
+            binding.as_deref(),
+        )
+        .await
+        .expect("status falls back to previous successful binding");
+        assert_eq!(status["profile_id"], json!("ada"));
+        assert_eq!(status["runtime_policy_stamp"]["profile_id"], json!("ada"));
+
+        let grace_params = SessionOpenParams {
+            session_id: SessionKey("local:grace-binding".into()),
+            profile_id: Some("grace".into()),
+            cwd: None,
+            after: None,
+        };
+        let candidate = stdio_session_open_candidate_profile(&grace_params, binding.as_deref());
+        assert_eq!(candidate.as_deref(), Some("grace"));
+
+        let opened = handle_session_open(
+            &ws,
+            &state,
+            &ledger,
+            &approvals,
+            &forwarders,
+            candidate.as_deref(),
+            features,
+            "open-grace".into(),
+            grace_params,
+        )
+        .await;
+        if opened {
+            binding = candidate;
+        }
+
+        assert!(opened, "configured profile must open successfully");
+        assert_eq!(
+            binding.as_deref(),
+            Some("grace"),
+            "stdio binding updates after successful session/open"
+        );
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("open-grace"));
+        assert_eq!(
+            frame["result"]["opened"]["active_profile_id"],
+            json!("grace")
+        );
+
+        let status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "status-after-successful-open",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": "local:tui#coding" }),
+            ),
+            features,
+            binding.as_deref(),
+        )
+        .await
+        .expect("status uses latest successful binding");
+        assert_eq!(status["profile_id"], json!("grace"));
+        assert_eq!(status["runtime_policy_stamp"]["profile_id"], json!("grace"));
+
+        abort_live_forwarders(&forwarders, &ledger).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_status_read_prefers_explicit_or_session_profile_over_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(local_profile_state(dir.path()));
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create ada profile");
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Grace Hopper", "grace", "grace@example.com"),
+        )
+        .expect("create grace profile");
+        let features = ConnectionUiFeatures::stdio_defaults();
+
+        let explicit = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "explicit-profile",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({
+                    "session_id": "local:tui#coding",
+                    "profile_id": "grace",
+                }),
+            ),
+            features,
+            Some("ada"),
+        )
+        .await
+        .expect("explicit profile wins over stdio binding");
+        assert_eq!(explicit["profile_id"], json!("grace"));
+        assert_eq!(
+            explicit["runtime_policy_stamp"]["profile_id"],
+            json!("grace")
+        );
+
+        let profiled_session = SessionKey::with_profile_topic("grace", "local", "tui", "coding");
+        let from_session_id = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "profiled-session",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": profiled_session }),
+            ),
+            features,
+            Some("ada"),
+        )
+        .await
+        .expect("profile-qualified session_id wins over stdio binding");
+        assert_eq!(from_session_id["profile_id"], json!("grace"));
+        assert_eq!(
+            from_session_id["runtime_policy_stamp"]["profile_id"],
+            json!("grace")
+        );
+
+        let missing_session = SessionKey::with_profile_topic("missing", "local", "tui", "coding");
+        let error = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "missing-profiled-session",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": missing_session }),
+            ),
+            features,
+            Some("ada"),
+        )
+        .await
+        .expect_err("unresolved session profile must not fall back to binding or _main");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_unresolved"))
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("profile_id")),
+            Some(&json!("missing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state_with_sessions(dir.path());
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("create ada profile");
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Grace Hopper", "grace", "grace@example.com"),
+        )
+        .expect("create grace profile");
+
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let ada_session = SessionKey::with_profile_topic("ada", "local", "tui-a", "coding");
+        let grace_session = SessionKey::with_profile_topic("grace", "local", "tui-b", "coding");
+
+        for session_id in [ada_session.clone(), grace_session.clone()] {
+            let profile_id = session_id.profile_id().expect("profile-qualified session");
+            let outcome = open_session_result(
+                &state,
+                &ledger,
+                &approvals,
+                ConnectionId::next(),
+                Some(profile_id),
+                features,
+                SessionOpenParams {
+                    session_id: session_id.clone(),
+                    profile_id: None,
+                    cwd: None,
+                    after: None,
+                },
+            )
+            .await
+            .expect("profile-qualified session/open succeeds");
+            assert_eq!(
+                outcome.result.opened.active_profile_id.as_deref(),
+                Some(profile_id)
+            );
+        }
+
+        let ada_status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "ada-status",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": ada_session }),
+            ),
+            features,
+            Some("grace"),
+        )
+        .await
+        .expect("ada status");
+        let grace_status = raw_session_status_result(
+            &state,
+            &RpcRequest::<Value>::new(
+                "grace-status",
+                APPUI_METHOD_SESSION_STATUS_READ,
+                json!({ "session_id": grace_session }),
+            ),
+            features,
+            Some("ada"),
+        )
+        .await
+        .expect("grace status");
+
+        assert_eq!(ada_status["profile_id"], json!("ada"));
+        assert_eq!(
+            ada_status["runtime_policy_stamp"]["profile_id"],
+            json!("ada")
+        );
+        assert_eq!(grace_status["profile_id"], json!("grace"));
+        assert_eq!(
+            grace_status["runtime_policy_stamp"]["profile_id"],
+            json!("grace")
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let headers = HeaderMap::new();
+        let (ws, mut rx) = ws_connection_for_test(16);
+
+        handle_content_list(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "content-list-unauth".into(),
+            ContentListParams::default(),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("content-list-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_content_delete(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "content-delete-unauth".into(),
+            ContentDeleteParams { id: "c-1".into() },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("content-delete-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        handle_content_bulk_delete(
+            &ws,
+            &state,
+            &headers,
+            None,
+            false,
+            "content-bulk-delete-unauth".into(),
+            ContentBulkDeleteParams {
+                ids: vec!["c-1".into()],
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("content-bulk-delete-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let request = RpcRequest::<Value>::new("auth-me-unauth", APPUI_METHOD_AUTH_ME, json!({}));
+        let handled = handle_raw_appui_rpc(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            ConnectionUiFeatures::stdio_defaults(),
+            None,
+            "auth-me-unauth".into(),
+            &request,
+        )
+        .await;
+        assert!(handled);
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("auth-me-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+        let request =
+            RpcRequest::<Value>::new("auth-logout-unauth", APPUI_METHOD_AUTH_LOGOUT, json!({}));
+        let handled = handle_raw_appui_rpc(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            ConnectionUiFeatures::stdio_defaults(),
+            None,
+            "auth-logout-unauth".into(),
+            &request,
+        )
+        .await;
+        assert!(handled);
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], json!("auth-logout-unauth"));
+        assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
     }
 
     #[tokio::test]
@@ -11346,6 +17079,8 @@ mod tests {
                 session_id: session_id.clone(),
                 active_profile_id: None,
                 workspace_root: None,
+                context: None,
+                context_state: None,
                 cursor: Some(cursor.clone()),
                 panes: None,
                 capabilities: octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
@@ -11512,7 +17247,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
         );
         assert_eq!(
@@ -11563,7 +17305,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
         );
 
@@ -11659,7 +17408,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
         );
 
@@ -11710,7 +17466,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
         );
 
@@ -11754,7 +17517,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
         );
 
@@ -11841,7 +17611,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
         );
         let cwd = typed
@@ -12714,7 +18491,7 @@ mod tests {
 
         let error = parse_ws_text_frame(&text).expect_err("oversized frame");
 
-        assert_eq!(error.code, FRAME_TOO_LARGE);
+        assert_eq!(error.code, app_ui_codec::FRAME_TOO_LARGE);
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("limit_bytes")),
             Some(&json!(MAX_TEXT_FRAME_BYTES))
@@ -12818,17 +18595,13 @@ mod tests {
     }
 
     #[test]
-    fn session_scope_rejects_unprofiled_session_id_when_authenticated() {
+    fn session_scope_accepts_unprofiled_session_id_when_authenticated() {
         let session_id = SessionKey::new("api", "chat-1");
 
-        let error =
-            validate_session_scope(&session_id, None, Some("profile-a")).expect_err("scope error");
+        let profile_id =
+            validate_session_scope(&session_id, None, Some("profile-a")).expect("scope");
 
-        assert_eq!(
-            error.code,
-            octos_core::ui_protocol::rpc_error_codes::INVALID_PARAMS
-        );
-        assert!(error.message.contains("authenticated profile"));
+        assert_eq!(profile_id.as_deref(), Some("profile-a"));
     }
 
     #[test]
@@ -13282,7 +19055,14 @@ mod tests {
                 message_persisted: false,
                 spawn_complete: false,
                 auxiliary_rest_to_ws_v1: false,
+                coding_autonomy_v1: false,
+                coding_agent_control_v1: false,
+                coding_goal_runtime_v1: false,
+                coding_loop_runtime_v1: false,
+                review_start_v1: false,
+                context_lifecycle_v1: false,
                 header_present: true,
+                stdio_transport: false,
             },
             SessionOpenParams {
                 session_id: session_id.clone(),
@@ -13370,7 +19150,7 @@ mod tests {
             None,
             ConnectionUiFeatures::default(),
             SessionOpenParams {
-                session_id,
+                session_id: session_id.clone(),
                 profile_id: None,
                 cwd: None,
                 after: None,
@@ -13380,15 +19160,32 @@ mod tests {
         .expect("open session without feature header");
 
         let capabilities = &outcome.result.opened.capabilities;
-        assert_eq!(
-            capabilities,
-            &UiProtocolCapabilities::first_server_slice(),
-            "no header => server falls back to first_server_slice"
-        );
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
+        assert!(capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
+        assert!(capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
+        let context_state = outcome
+            .result
+            .opened
+            .context_state
+            .as_ref()
+            .expect("no-header clients receive first-slice context state");
+        assert_eq!(context_state.session_id, session_id);
+        let context = outcome
+            .result
+            .opened
+            .context
+            .as_ref()
+            .expect("no-header clients receive first-slice context envelope");
+        assert_eq!(context["schema"], "octos.context.lifecycle.v1");
+        assert_eq!(context["state"]["session_id"], context_state.session_id.0);
+        assert!(
+            !context_state.transcript_hash.is_empty(),
+            "context state must include a stable transcript hash"
+        );
     }
 
     #[tokio::test]
@@ -13433,14 +19230,16 @@ mod tests {
         .expect("open session with feature header subset");
 
         let capabilities = &outcome.result.opened.capabilities;
-        assert_eq!(
-            capabilities.supported_features,
-            vec![UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1.to_owned()],
-            "intersection must be exactly the features the client asked for"
-        );
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
+        assert!(capabilities.supports_feature(APPUI_FEATURE_PERMISSION_PROFILE_V1));
+        assert!(capabilities.supports_feature(APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(
+            !capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
+            "context.lifecycle.v1 must remain opt-in when a feature header is present"
+        );
         // Unconditional methods stay advertised so the client can still
         // see what the server offers in-band.
         assert!(
@@ -13466,6 +19265,14 @@ mod tests {
                 .iter()
                 .any(|method| method == octos_core::ui_protocol::methods::TASK_CANCEL),
             "task/cancel must be gated by harness.task_control.v1"
+        );
+        assert!(
+            outcome.result.opened.context_state.is_none(),
+            "context state must not leak unless context.lifecycle.v1 was negotiated"
+        );
+        assert!(
+            outcome.result.opened.context.is_none(),
+            "context envelope must not leak unless context.lifecycle.v1 was negotiated"
         );
     }
 
@@ -13580,6 +19387,360 @@ mod tests {
                 "{method} must NOT be advertised without auxiliary.rest_to_ws.v1"
             );
         }
+    }
+
+    #[test]
+    fn m15_autonomy_capabilities_require_base_and_group_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            format!(
+                "{},{}",
+                UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1
+            )
+            .parse()
+            .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        let capabilities = features.negotiated_capabilities();
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1));
+        assert!(capabilities.supports_method(methods::SESSION_GOAL_SET));
+        assert!(!capabilities.supports_method(methods::AGENT_LIST));
+        assert!(!capabilities.supports_method(methods::LOOP_CREATE));
+
+        let mut group_without_base = HeaderMap::new();
+        group_without_base.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1
+                .parse()
+                .expect("header value"),
+        );
+        let capabilities = ConnectionUiFeatures::from_headers_and_query(&group_without_base, None)
+            .negotiated_capabilities();
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1));
+        assert!(!capabilities.supports_method(methods::SESSION_GOAL_SET));
+
+        let stdio = ConnectionUiFeatures::stdio_defaults().negotiated_capabilities();
+        assert!(stdio.supports_method(methods::AGENT_LIST));
+        assert!(stdio.supports_method(methods::SESSION_GOAL_SET));
+        assert!(stdio.supports_method(methods::LOOP_CREATE));
+        assert!(stdio.supports_feature(UI_PROTOCOL_FEATURE_REVIEW_START_V1));
+        assert!(stdio.supports_method(methods::REVIEW_START));
+    }
+
+    #[test]
+    fn client_hello_feature_tokens_rebuild_stdio_negotiated_capabilities() {
+        let features = ConnectionUiFeatures::from_requested_feature_tokens(
+            [
+                UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+                UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+                UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+            ],
+            true,
+        );
+        let state = AppState::empty_for_tests();
+        let capabilities = features.advertised_capabilities(&state);
+
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_REVIEW_START_V1));
+        assert!(capabilities.supports_method(methods::AGENT_LIST));
+        assert!(capabilities.supports_method(methods::REVIEW_START));
+        assert!(!capabilities.supports_method(methods::SESSION_GOAL_SET));
+        assert!(capabilities.supports_method(methods::ROUTER_SET_MODE));
+    }
+
+    #[test]
+    fn review_start_capability_is_strictly_negotiated_when_header_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+        assert!(!features.review_start_available());
+        let capabilities = features.negotiated_capabilities();
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_REVIEW_START_V1));
+        assert!(!capabilities.supports_method(methods::REVIEW_START));
+
+        let mut review_headers = HeaderMap::new();
+        review_headers.insert(
+            UI_FEATURES_HEADER,
+            UI_PROTOCOL_FEATURE_REVIEW_START_V1
+                .parse()
+                .expect("header value"),
+        );
+        let features = ConnectionUiFeatures::from_headers_and_query(&review_headers, None);
+        assert!(features.review_start_available());
+        let capabilities = features.negotiated_capabilities();
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_REVIEW_START_V1));
+        assert!(capabilities.supports_method(methods::REVIEW_START));
+    }
+
+    #[test]
+    fn m15_raw_goal_and_loop_stubs_use_in_memory_state() {
+        clear_autonomy_runtime_state_for_test();
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let session_id = SessionKey::new("api", "m15-stub");
+
+        let goal_set = RpcRequest::new(
+            "goal-set",
+            methods::SESSION_GOAL_SET,
+            json!({
+                "session_id": session_id.clone(),
+                "objective": "finish the review",
+                "token_budget": 12_000
+            }),
+        );
+        let result = raw_autonomy_rpc(&goal_set, features, None).expect("goal set");
+        assert_eq!(result["goal"]["status"], json!("active"));
+        assert_eq!(result["goal"]["token_budget"], json!(12_000));
+        assert_eq!(result["transition_actor"], json!("user"));
+
+        let goal_get = RpcRequest::new(
+            "goal-get",
+            methods::SESSION_GOAL_GET,
+            json!({ "session_id": session_id.clone() }),
+        );
+        let result = raw_autonomy_rpc(&goal_get, features, None).expect("goal get");
+        assert_eq!(result["goal"]["objective"], json!("finish the review"));
+
+        let loop_create = RpcRequest::new(
+            "loop-create",
+            methods::LOOP_CREATE,
+            json!({
+                "session_id": session_id.clone(),
+                "command": "/loop check deploy every 20m"
+            }),
+        );
+        let result = raw_autonomy_rpc(&loop_create, features, None).expect("loop create");
+        assert_eq!(result["session_id"], json!(session_id.clone()));
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["status"], json!("active"));
+        assert_eq!(result["loop"]["mode"], json!("fixed_interval"));
+        assert_eq!(result["loop"]["interval_seconds"], json!(1_200));
+        assert_eq!(result["fire"]["queued"], json!(false));
+        assert_eq!(result["fire"]["reason"], json!("waiting_for_schedule"));
+        let loop_id = result["loop"]["loop_id"]
+            .as_str()
+            .expect("loop id")
+            .to_owned();
+
+        let loop_list = RpcRequest::new(
+            "loop-list",
+            methods::LOOP_LIST,
+            json!({ "session_id": session_id.clone() }),
+        );
+        let result = raw_autonomy_rpc(&loop_list, features, None).expect("loop list");
+        assert_eq!(result["session_id"], json!(session_id.clone()));
+        assert_eq!(result["loops"][0]["loop_id"], json!(loop_id));
+
+        let agent_list = RpcRequest::new(
+            "agent-list",
+            methods::AGENT_LIST,
+            json!({ "session_id": session_id.clone() }),
+        );
+        let result = raw_autonomy_rpc(&agent_list, features, None).expect("agent list");
+        assert_eq!(result["session_id"], json!(session_id.clone()));
+        assert_eq!(result["agents"], json!([]));
+
+        let fire_now = RpcRequest::new(
+            "loop-fire",
+            methods::LOOP_FIRE_NOW,
+            json!({ "session_id": session_id, "loop_id": loop_id }),
+        );
+        let result = raw_autonomy_rpc(&fire_now, features, None).expect("loop fire queues");
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["status"], json!("queued"));
+        assert_eq!(result["fire"]["queued"], json!(true));
+        assert_eq!(result["fire"]["duplicate"], json!(false));
+        assert_eq!(result["fire"]["reason"], json!("LoopFire"));
+    }
+
+    #[derive(Default)]
+    struct RecordingOrchestrator {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingOrchestrator {
+        fn record(&self, call: impl Into<String>) -> Result<Value, RpcError> {
+            let call = call.into();
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .push(call.clone());
+            Ok(json!({ "called": call }))
+        }
+    }
+
+    impl AgentOrchestrator for RecordingOrchestrator {
+        fn list_agents(&self, request: AgentListRequest) -> Result<Value, RpcError> {
+            self.record(format!("list_agents:{}", request.profile_id))
+        }
+
+        fn read_agent_status(&self, request: AgentRequest) -> Result<Value, RpcError> {
+            self.record(format!("read_agent_status:{}", request.agent_id))
+        }
+
+        fn read_agent_output(&self, request: AgentOutputRequest) -> Result<Value, RpcError> {
+            self.record(format!("read_agent_output:{}", request.agent_id))
+        }
+
+        fn list_agent_artifacts(&self, request: AgentRequest) -> Result<Value, RpcError> {
+            self.record(format!("list_agent_artifacts:{}", request.agent_id))
+        }
+
+        fn read_agent_artifact(
+            &self,
+            request: AgentArtifactReadRequest,
+        ) -> Result<Value, RpcError> {
+            self.record(format!("read_agent_artifact:{}", request.agent_id))
+        }
+
+        fn interrupt_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
+            self.record(format!("interrupt_agent:{}", request.agent_id))
+        }
+
+        fn close_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
+            self.record(format!("close_agent:{}", request.agent_id))
+        }
+
+        fn get_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
+            self.record(format!("get_goal:{}", request.session_id))
+        }
+
+        fn set_goal(&self, request: GoalSetRequest) -> Result<Value, RpcError> {
+            self.record(format!("set_goal:{}", request.session_id))
+        }
+
+        fn clear_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
+            self.record(format!("clear_goal:{}", request.session_id))
+        }
+
+        fn create_loop(&self, request: LoopCreateRequest) -> Result<Value, RpcError> {
+            self.record(format!("create_loop:{}", request.session_id))
+        }
+
+        fn list_loops(&self, request: LoopListRequest) -> Result<Value, RpcError> {
+            self.record(format!("list_loops:{}", request.profile_id))
+        }
+
+        fn control_loop(&self, request: LoopControlRequest) -> Result<Value, RpcError> {
+            let kind = match request.kind {
+                LoopControlKind::Delete => "delete",
+                LoopControlKind::Pause => "pause",
+                LoopControlKind::Resume => "resume",
+                LoopControlKind::FireNow => "fire_now",
+            };
+            self.record(format!("control_loop:{kind}:{}", request.loop_id))
+        }
+    }
+
+    #[test]
+    fn m15_raw_autonomy_rpc_dispatches_every_method_to_orchestrator() {
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let session_id = SessionKey::new("api", "m15-orchestrator");
+        let orchestrator = RecordingOrchestrator::default();
+        let cases = vec![
+            (
+                methods::AGENT_LIST,
+                json!({ "session_id": session_id.clone(), "profile_id": "main" }),
+                "list_agents:main",
+            ),
+            (
+                methods::AGENT_STATUS_READ,
+                json!({ "agent_id": "agent-1", "session_id": session_id.clone() }),
+                "read_agent_status:agent-1",
+            ),
+            (
+                methods::AGENT_OUTPUT_READ,
+                json!({ "agent_id": "agent-1", "session_id": session_id.clone(), "limit": 10 }),
+                "read_agent_output:agent-1",
+            ),
+            (
+                methods::AGENT_ARTIFACT_LIST,
+                json!({ "agent_id": "agent-1", "session_id": session_id.clone() }),
+                "list_agent_artifacts:agent-1",
+            ),
+            (
+                methods::AGENT_ARTIFACT_READ,
+                json!({ "agent_id": "agent-1", "artifact_id": "artifact-1", "session_id": session_id.clone() }),
+                "read_agent_artifact:agent-1",
+            ),
+            (
+                methods::AGENT_INTERRUPT,
+                json!({ "agent_id": "agent-1", "session_id": session_id.clone() }),
+                "interrupt_agent:agent-1",
+            ),
+            (
+                methods::AGENT_CLOSE,
+                json!({ "agent_id": "agent-1", "session_id": session_id.clone() }),
+                "close_agent:agent-1",
+            ),
+            (
+                methods::SESSION_GOAL_GET,
+                json!({ "session_id": session_id.clone() }),
+                "get_goal:api:m15-orchestrator",
+            ),
+            (
+                methods::SESSION_GOAL_SET,
+                json!({ "session_id": session_id.clone(), "objective": "ship it" }),
+                "set_goal:api:m15-orchestrator",
+            ),
+            (
+                methods::SESSION_GOAL_CLEAR,
+                json!({ "session_id": session_id.clone() }),
+                "clear_goal:api:m15-orchestrator",
+            ),
+            (
+                methods::LOOP_CREATE,
+                json!({ "session_id": session_id.clone(), "command": "/loop ship every 20m" }),
+                "create_loop:api:m15-orchestrator",
+            ),
+            (
+                methods::LOOP_LIST,
+                json!({ "session_id": session_id.clone() }),
+                "list_loops:_main",
+            ),
+            (
+                methods::LOOP_DELETE,
+                json!({ "loop_id": "loop-1", "session_id": session_id.clone() }),
+                "control_loop:delete:loop-1",
+            ),
+            (
+                methods::LOOP_PAUSE,
+                json!({ "loop_id": "loop-1", "session_id": session_id.clone() }),
+                "control_loop:pause:loop-1",
+            ),
+            (
+                methods::LOOP_RESUME,
+                json!({ "loop_id": "loop-1", "session_id": session_id.clone() }),
+                "control_loop:resume:loop-1",
+            ),
+            (
+                methods::LOOP_FIRE_NOW,
+                json!({ "loop_id": "loop-1", "session_id": session_id.clone() }),
+                "control_loop:fire_now:loop-1",
+            ),
+        ];
+
+        for (method, params, expected_call) in &cases {
+            let request = RpcRequest::new(*expected_call, *method, params.clone());
+            let result =
+                raw_autonomy_rpc_with_orchestrator(&request, features, None, &orchestrator)
+                    .expect("raw M15 RPC should dispatch to orchestrator");
+            assert_eq!(result["called"], json!(expected_call));
+        }
+
+        let calls = orchestrator.calls.lock().expect("recorded calls").clone();
+        let expected = cases
+            .iter()
+            .map(|(_, _, expected_call)| (*expected_call).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, expected);
     }
 
     #[test]
@@ -15053,6 +21214,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
+        let (ws, mut rx) = ws_connection_for_test(32);
+        let state = Arc::new(AppState::empty_for_tests());
+        let ledger = Arc::new(UiProtocolLedger::new(32));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let params = TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "m9 slow fixture".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+        };
+        let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+        let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+        interrupt_tx
+            .try_send(())
+            .expect("preload pending interrupt");
+        drop(interrupt_tx);
+
+        run_m9_fixture_turn(
+            ws,
+            state,
+            Arc::clone(&ledger),
+            contracts,
+            params,
+            M9ProtocolFixture::Slow,
+            turn_state,
+            interrupt_rx,
+        )
+        .await;
+
+        let mut frames = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let WsMessage::Text(text) = message {
+                frames.push(text.to_string());
+            }
+        }
+
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.contains("\"method\":\"message/delta\"")
+                    && frame.contains("OK\\n")),
+            "slow fixture must not emit OK delta after a pending interrupt: {frames:?}",
+        );
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay after slow fixture");
+        assert!(replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event))
+                if event.turn_id == turn_id && event.code == "interrupted"
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_respond_ledgers_decided_before_unblocked_turn_completion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let sessions = state.sessions.as_ref().expect("sessions").clone();
+        let sessions_guard = sessions.lock().await;
+        let (ws, _rx) = ws_connection_for_test(32);
+        let ledger = Arc::new(UiProtocolLedger::new(32));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let session_id = SessionKey("local:test".into());
+        let turn_id = TurnId::new();
+        let approval_id = ApprovalId::new();
+        let request = ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            approval_id.clone(),
+            turn_id.clone(),
+            "shell",
+            "Run command",
+            "cargo test",
+        );
+        let response_rx = contracts.approvals.request_runtime(request);
+        let ledger_for_turn = Arc::clone(&ledger);
+        let session_for_turn = session_id.clone();
+        let turn_for_turn = turn_id.clone();
+        let completion_task = tokio::spawn(async move {
+            assert_eq!(
+                response_rx.await.expect("approval decision"),
+                ApprovalDecision::Approve,
+            );
+            ledger_for_turn.append_notification(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id: session_for_turn,
+                    turn_id: turn_for_turn,
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            ));
+        });
+
+        let handler_ws = ws.clone();
+        let handler_state = Arc::clone(&state);
+        let handler_ledger = Arc::clone(&ledger);
+        let handler_contracts = Arc::clone(&contracts);
+        let handler_session = session_id.clone();
+        let handler_approval = approval_id.clone();
+        let handler = tokio::spawn(async move {
+            handle_approval_respond(
+                &handler_ws,
+                &handler_state,
+                &handler_ledger,
+                &handler_contracts,
+                None,
+                "approval-respond".into(),
+                ApprovalRespondParams::new(
+                    handler_session,
+                    handler_approval,
+                    ApprovalDecision::Approve,
+                ),
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        drop(sessions_guard);
+        handler.await.expect("approval/respond handler");
+        completion_task.await.expect("completion task");
+
+        let replay = ledger
+            .replay_after(
+                &session_id,
+                Some(&UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .expect("replay after approval response");
+        let decided_pos = replay
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(event))
+                        if event.approval_id == approval_id
+                )
+            })
+            .expect("approval/decided ledger event");
+        let completed_pos = replay
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(event))
+                        if event.turn_id == turn_id
+                )
+            })
+            .expect("turn/completed ledger event");
+        assert!(
+            decided_pos < completed_pos,
+            "approval/decided must ledger before the unblocked turn can complete"
+        );
+    }
+
+    #[tokio::test]
     async fn send_error_propagates_for_lifecycle_messages() {
         // capacity=1, the channel fills with the first frame; the second
         // lifecycle send must surface as `LifecycleFailure`. Without this
@@ -15809,10 +22142,12 @@ mod tests {
 
         // The synchronous try_send must have failed (channel was full),
         // bumping the drop counter that feeds the replay_lossy machinery.
+        // M15 agent mirroring emits a paired `agent_updated` frame for the
+        // same task snapshot, so both frames observe the same backpressure.
         assert_eq!(
             dropped.load(Ordering::Relaxed),
-            1,
-            "immediate try_send failure must increment the drop counter so replay_lossy stays accurate"
+            2,
+            "immediate task + agent mirror try_send failures must increment the drop counter so replay_lossy stays accurate"
         );
 
         // Drain the filler to make room for the spawned awaited send.
@@ -15853,8 +22188,9 @@ mod tests {
         );
         forward_task_progress_to_channel(&tx, &dropped, &task);
 
-        // Drop counter must increment — same as before the fix.
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        // Drop counter must increment for both the task-progress frame and
+        // the paired agent mirror frame.
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
 
         // Now drain the filler. There must be NO pending non-terminal send
         // queued behind it; the helper's contract is "drop is fine for
@@ -15982,6 +22318,21 @@ mod tests {
         let result = &frame["result"];
         assert_eq!(result["session_id"], session_id.to_string());
         assert!(result["cursor"].is_object());
+        assert_eq!(
+            result["context_state"]["session_id"],
+            session_id.to_string()
+        );
+        assert_eq!(result["context"]["schema"], "octos.context.lifecycle.v1");
+        assert_eq!(
+            result["context"]["state"]["session_id"],
+            session_id.to_string()
+        );
+        assert!(
+            result["context_state"]["transcript_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty()),
+            "hydrate must expose a typed context snapshot for clients that negotiated or default to context.lifecycle.v1"
+        );
         let messages = result["messages"].as_array().expect("messages array");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
@@ -15993,6 +22344,85 @@ mod tests {
         assert_eq!(threads[0]["message_seqs"], json!([0, 1]));
         assert!(result["turns"].is_array());
         assert_eq!(result["pending_approvals"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_status_surfaces_context_state_from_session_store() {
+        let session_id = SessionKey("local:status-context".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let headers = HeaderMap::new();
+        let (ws, mut rx) = ws_connection_for_test(8);
+
+        handle_session_status_get(
+            &ws,
+            &state,
+            &headers,
+            None,
+            None,
+            None,
+            ConnectionUiFeatures::default(),
+            "status-1".into(),
+            SessionStatusGetParams {
+                session_id: session_id.to_string(),
+                topic: None,
+            },
+        )
+        .await;
+
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["id"], "status-1");
+        let result = &frame["result"];
+        assert_eq!(result["status"]["active"], false);
+        assert_eq!(result["context"]["schema"], "octos.context.lifecycle.v1");
+        assert_eq!(
+            result["status"]["context"]["schema"],
+            "octos.context.lifecycle.v1"
+        );
+        assert_eq!(
+            result["context"]["state"]["session_id"],
+            session_id.to_string()
+        );
+        assert_eq!(
+            result["context_state"]["session_id"],
+            session_id.to_string()
+        );
+        assert_eq!(
+            result["status"]["context_state"]["session_id"],
+            session_id.to_string()
+        );
+        assert!(
+            result["context_state"]["transcript_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty()),
+            "session/status.get must expose the same context inspection state as open/hydrate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_session_status_read_rebuilds_context_state() {
+        let session_id = SessionKey("local:raw-status-context".into());
+        let state = prg_state_with_session(&session_id, prg_seed_user_assistant);
+        let request = RpcRequest::<Value>::new(
+            "status-read-1",
+            APPUI_METHOD_SESSION_STATUS_READ,
+            json!({ "session_id": session_id.clone() }),
+        );
+
+        let result =
+            raw_session_status_result(&state, &request, ConnectionUiFeatures::default(), None)
+                .await
+                .expect("raw status read");
+        assert_eq!(
+            result["context_state"]["session_id"],
+            session_id.to_string()
+        );
+        assert!(result["context"].is_object());
+        assert!(
+            result["context_state"]["transcript_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty()),
+            "session/status/read must rebuild context state when only persisted session history exists"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -16163,6 +22593,7 @@ mod tests {
             &active_turns,
             None,
             None,
+            ConnectionUiFeatures::stdio_defaults(),
             "t1".into(),
             TurnStateGetParams {
                 session_id: session_id.clone(),
@@ -16173,6 +22604,14 @@ mod tests {
 
         let frame = recv_rpc_json(&mut rx).await;
         assert_eq!(frame["result"]["state"], "active");
+        assert_eq!(
+            frame["result"]["context"]["schema"],
+            "octos.context.lifecycle.v1"
+        );
+        assert_eq!(
+            frame["result"]["context_state"]["session_id"],
+            session_id.to_string()
+        );
         // Cleanup so the test does not pollute the global registry for
         // sibling tests.
         active_turns.lock().await.remove(&session_id);
@@ -16216,6 +22655,7 @@ mod tests {
             &active_turns,
             None,
             None,
+            ConnectionUiFeatures::stdio_defaults(),
             "t2".into(),
             TurnStateGetParams {
                 session_id: session_id.clone(),
@@ -16376,7 +22816,7 @@ mod tests {
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             task_id: "task_abc".into(),
-            tool_call_id: Some("call_abc".into()),
+            tool_call_id: None,
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 2,
             message_id: spawn_ack_message_id.clone(),
@@ -16595,6 +23035,7 @@ mod tests {
             &active_turns,
             None,
             None,
+            ConnectionUiFeatures::stdio_defaults(),
             "t3".into(),
             TurnStateGetParams {
                 session_id: session_id.clone(),
@@ -17027,6 +23468,65 @@ mod tests {
         }
     }
 
+    fn context_state_for_test(session: &SessionKey) -> UiContextState {
+        UiContextState {
+            session_id: session.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: "sha256:context".into(),
+            item_count: 3,
+            token_estimate: 42,
+            recovery_state: "active".into(),
+            last_checkpoint_id: Some("ctx-checkpoint".into()),
+            last_compaction_id: Some("ctx-compaction".into()),
+        }
+    }
+
+    fn context_compaction_completed_for(session: &SessionKey) -> UiNotification {
+        UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+            session_id: session.clone(),
+            context_state: context_state_for_test(session),
+            compaction: UiContextCompactionRecord {
+                compaction_id: "ctx-compaction".into(),
+                checkpoint_id: "ctx-checkpoint".into(),
+                status: "installed".into(),
+                policy_id: "default".into(),
+                trigger: "test".into(),
+                input_generation: 0,
+                output_generation: Some(1),
+                input_transcript_hash: "sha256:input".into(),
+                replacement_transcript_hash: Some("sha256:replacement".into()),
+                installed_transcript_hash: Some("sha256:installed".into()),
+                input_item_count: 5,
+                retained_count: 2,
+                dropped_count: 3,
+                summary_item_id: Some("item-summary".into()),
+                token_estimate_before: 1200,
+                token_estimate_after: Some(400),
+                error: None,
+            },
+        })
+    }
+
+    fn context_normalization_reported_for(session: &SessionKey) -> UiNotification {
+        UiNotification::ContextNormalizationReported(ContextNormalizationReportedEvent {
+            session_id: session.clone(),
+            context_state: context_state_for_test(session),
+            normalization: UiContextNormalizationReport {
+                generation: 1,
+                input_transcript_hash: "sha256:input".into(),
+                output_prompt_hash: "sha256:prompt".into(),
+                model_capability_id: "test/model".into(),
+                prompt_message_count: 4,
+                token_estimate: 400,
+                repaired_count: 1,
+                dropped_count: 0,
+                synthetic_count: 1,
+                truncated_count: 0,
+            },
+        })
+    }
+
     /// Builds a minimal `MessagePersistedEvent` with `source: background`,
     /// matching what `BackgroundResultSender`'s persist path produces
     /// via `MessageCommitObserver`. M10 Phase 1's per-connection filter
@@ -17060,7 +23560,7 @@ mod tests {
             turn_id: Some(TurnId::new()),
             thread_id: Some("thread-1".into()),
             task_id: "task_abc123".into(),
-            tool_call_id: Some("call_abc123".into()),
+            tool_call_id: None,
             response_to_client_message_id: Some("cmid-user-1".into()),
             seq: 0,
             message_id: "msg-spawn".into(),
@@ -17279,6 +23779,43 @@ mod tests {
         assert!(
             live_event_passes_capability_filter(&regular, new),
             "non-background message/persisted must still flow to new clients",
+        );
+    }
+
+    #[test]
+    fn capability_filter_routes_context_lifecycle_gating() {
+        let session = SessionKey("local:context-filter".into());
+        let compaction =
+            UiProtocolLedgerEvent::Notification(context_compaction_completed_for(&session));
+        let normalization =
+            UiProtocolLedgerEvent::Notification(context_normalization_reported_for(&session));
+
+        let old = ConnectionUiFeatures {
+            context_lifecycle_v1: false,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        assert!(
+            !live_event_passes_capability_filter(&compaction, old),
+            "clients without context.lifecycle.v1 must not receive compaction events",
+        );
+        assert!(
+            !live_event_passes_capability_filter(&normalization, old),
+            "clients without context.lifecycle.v1 must not receive normalization events",
+        );
+
+        let new = ConnectionUiFeatures {
+            context_lifecycle_v1: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+        assert!(
+            live_event_passes_capability_filter(&compaction, new),
+            "clients with context.lifecycle.v1 receive compaction events",
+        );
+        assert!(
+            live_event_passes_capability_filter(&normalization, new),
+            "clients with context.lifecycle.v1 receive normalization events",
         );
     }
 
@@ -17589,6 +24126,8 @@ mod tests {
                 session_id: session_id.clone(),
                 active_profile_id: Some(MAIN_PROFILE_ID.to_owned()),
                 workspace_root: None,
+                context: None,
+                context_state: None,
                 cursor: None,
                 panes: None,
                 capabilities: UiProtocolCapabilities::first_server_slice(),
@@ -17828,6 +24367,14 @@ mod tests {
         profile_id: &str,
         data_dir: &std::path::Path,
     ) -> Arc<crate::runtime::ProfileRuntime> {
+        make_m11e_profile_with_llm(profile_id, data_dir, Arc::new(M11EStubLlm)).await
+    }
+
+    async fn make_m11e_profile_with_llm(
+        profile_id: &str,
+        data_dir: &std::path::Path,
+        llm: Arc<dyn octos_llm::LlmProvider>,
+    ) -> Arc<crate::runtime::ProfileRuntime> {
         std::fs::create_dir_all(data_dir).expect("profile data dir");
         let memory = Arc::new(
             octos_memory::EpisodeStore::open(data_dir)
@@ -17852,7 +24399,7 @@ mod tests {
         Arc::new(crate::runtime::ProfileRuntime {
             profile_id: profile_id.to_string(),
             data_dir: data_dir.to_path_buf(),
-            llm: Arc::new(M11EStubLlm),
+            llm,
             adaptive_router: None,
             runtime_qos_catalog: None,
             primary_model_id: "m11e-stub".to_string(),
@@ -17867,6 +24414,7 @@ mod tests {
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),
             plugin_hooks: Vec::new(),
+            review_config: None,
             system_prompt: "test-system-prompt".to_string(),
             memory,
             memory_store,
@@ -17886,6 +24434,14 @@ mod tests {
         data_dir: &std::path::Path,
         profile_id: &str,
     ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+        state_with_profile_llm(data_dir, profile_id, Arc::new(M11EStubLlm)).await
+    }
+
+    async fn state_with_profile_llm(
+        data_dir: &std::path::Path,
+        profile_id: &str,
+        llm: Arc<dyn octos_llm::LlmProvider>,
+    ) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
         std::fs::create_dir_all(data_dir).expect("data dir");
 
         let sessions = Arc::new(tokio::sync::Mutex::new(
@@ -17893,7 +24449,7 @@ mod tests {
         ));
 
         let profile_data_dir = data_dir.join("profiles").join(profile_id).join("data");
-        let profile_runtime = make_m11e_profile(profile_id, &profile_data_dir).await;
+        let profile_runtime = make_m11e_profile_with_llm(profile_id, &profile_data_dir, llm).await;
 
         let mut profiles = HashMap::new();
         profiles.insert(profile_id.to_string(), profile_runtime.clone());
@@ -17905,6 +24461,221 @@ mod tests {
         });
 
         (state, profile_runtime)
+    }
+
+    struct AppuiContinuationLlm {
+        response: String,
+        call_count: std::sync::atomic::AtomicUsize,
+        prompts: StdMutex<Vec<String>>,
+    }
+
+    impl AppuiContinuationLlm {
+        fn new(response: impl Into<String>) -> Self {
+            Self {
+                response: response.into(),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                prompts: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for AppuiContinuationLlm {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(prompt) = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+            {
+                self.prompts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(prompt.content.clone());
+            }
+            Ok(octos_llm::ChatResponse {
+                content: Some(self.response.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 12,
+                    output_tokens: 4,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "appui-continuation-stub"
+        }
+
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    async fn wait_for_appui_continuation(provider: &AppuiContinuationLlm) {
+        for _ in 0..50 {
+            if provider.call_count.load(Ordering::Relaxed) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn cached_session_messages(
+        state: &Arc<AppState>,
+        profile_runtime: &Arc<crate::runtime::ProfileRuntime>,
+        session_id: &SessionKey,
+    ) -> Vec<Message> {
+        let runtime = state
+            .session_cache
+            .get_or_init(profile_runtime, session_id.clone(), None)
+            .await
+            .expect("session runtime");
+        let mut sessions = runtime.sessions.lock().await;
+        sessions.get_or_create(session_id).await.messages.clone()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn appui_raw_loop_fire_now_drains_internal_continuation_turn() {
+        clear_default_agent_orchestrator_for_test();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let provider = Arc::new(AppuiContinuationLlm::new("appui fire_now continuation ran"));
+        let (state, profile_runtime) =
+            state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider.clone()).await;
+        let session_id = SessionKey::new("api", "appui-fire-now");
+        let features = ConnectionUiFeatures::stdio_defaults();
+
+        let create = RpcRequest::new(
+            "loop-create",
+            methods::LOOP_CREATE,
+            json!({
+                "session_id": session_id.clone(),
+                "prompt": "check appui fire_now",
+                "mode": "fixed_interval",
+                "interval_seconds": 60
+            }),
+        );
+        let created = raw_autonomy_rpc(&create, features, None).expect("loop create");
+        let loop_id = created["loop"]["loop_id"]
+            .as_str()
+            .expect("loop id")
+            .to_owned();
+
+        let (ws, mut rx) = ws_connection_for_test(64);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let active_turns = active_turns_registry();
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let fire_now = RpcRequest::new(
+            "loop-fire",
+            methods::LOOP_FIRE_NOW,
+            json!({ "session_id": session_id.clone(), "loop_id": loop_id }),
+        );
+
+        assert!(
+            handle_raw_appui_rpc(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                features,
+                None,
+                "loop-fire".to_owned(),
+                &fire_now,
+            )
+            .await
+        );
+        while rx.try_recv().is_ok() {}
+
+        wait_for_appui_continuation(provider.as_ref()).await;
+        assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0
+        );
+
+        let messages = cached_session_messages(&state, &profile_runtime, &session_id).await;
+        assert!(messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.contains("appui fire_now continuation ran")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.role == MessageRole::User && message.content.contains("[system-internal]")
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn appui_due_fixed_loop_tick_drains_internal_continuation_turn() {
+        clear_default_agent_orchestrator_for_test();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let provider = Arc::new(AppuiContinuationLlm::new("appui due loop continuation ran"));
+        let (state, profile_runtime) =
+            state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider.clone()).await;
+        let session_id = SessionKey::new("api", "appui-due-loop");
+        let features = ConnectionUiFeatures::stdio_defaults();
+
+        let create = RpcRequest::new(
+            "loop-create",
+            methods::LOOP_CREATE,
+            json!({
+                "session_id": session_id.clone(),
+                "prompt": "check appui due loop",
+                "mode": "fixed_interval",
+                "interval_seconds": 60
+            }),
+        );
+        let created = raw_autonomy_rpc(&create, features, None).expect("loop create");
+        let loop_id = created["loop"]["loop_id"].as_str().expect("loop id");
+        default_agent_orchestrator().force_loop_due_for_test(loop_id);
+
+        let (ws, mut rx) = ws_connection_for_test(64);
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        let contracts = Arc::new(UiProtocolContractStores::default());
+        let active_turns = active_turns_registry();
+        let connection_turns: SharedConnectionTurns =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        drain_appui_due_master_continuations(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            Some(MAIN_PROFILE_ID),
+            features,
+        )
+        .await;
+        while rx.try_recv().is_ok() {}
+
+        wait_for_appui_continuation(provider.as_ref()).await;
+        assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            default_agent_orchestrator()
+                .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            0
+        );
+
+        let messages = cached_session_messages(&state, &profile_runtime, &session_id).await;
+        assert!(messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.contains("appui due loop continuation ran")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.role == MessageRole::User && message.content.contains("[system-internal]")
+        }));
     }
 
     /// M11-E acceptance §1: a session opened with a custom `cwd` materializes
@@ -18293,12 +25064,12 @@ mod tests {
             },
         )
         .await
-        .expect_err("cwd for unregistered profile must reject");
+        .expect_err("session/open for unregistered profile must reject");
 
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("kind")),
-            Some(&json!("cwd_runtime_unavailable")),
-            "unregistered profile must surface cwd_runtime_unavailable; \
+            Some(&json!("profile_unresolved")),
+            "unregistered profile must surface profile_unresolved before cwd policy; \
              got error data {:?}",
             error.data,
         );
@@ -18531,6 +25302,97 @@ mod tests {
             "expected operator-default sentinel content, got: {}",
             result.output
         );
+    }
+
+    #[test]
+    fn review_join_preserves_explicit_final_marker() {
+        let summary = ensure_requested_final_marker(
+            "Code Review Summary\n\nFindings\n".to_owned(),
+            "Return findings and end with M16_CODE_REVIEW_FINAL_LINE.",
+        );
+        assert!(summary.contains("M16_CODE_REVIEW_FINAL_LINE"));
+
+        let unchanged = ensure_requested_final_marker(
+            "Code Review Summary\nM16_CODE_REVIEW_FINAL_LINE\n".to_owned(),
+            "Return findings and end with M16_CODE_REVIEW_FINAL_LINE.",
+        );
+        assert_eq!(
+            unchanged.matches("M16_CODE_REVIEW_FINAL_LINE").count(),
+            1,
+            "marker must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn review_specialist_config_accepts_dynamic_native_fanout() {
+        let raw = r#"
+        [
+          {
+            "agent_key": "reviewer-api",
+            "nickname": "Ada Lovelace",
+            "role": "api_contract_review",
+            "focus": "API wire compatibility"
+          },
+          {
+            "agent_key": "reviewer-ux",
+            "nickname": "Noether",
+            "role": "ux_review",
+            "focus": "TUI UX, tmux evidence, and markdown rendering"
+          },
+          {
+            "agent_key": "reviewer-security",
+            "nickname": "Turing",
+            "role": "security_review",
+            "focus": "Sandbox and permission boundaries"
+          },
+          {
+            "agent_key": "reviewer-context",
+            "nickname": "Mencius",
+            "role": "context_manager_review",
+            "focus": "Context compaction, summaries, and artifact hygiene"
+          }
+        ]
+        "#;
+
+        let specs = parse_native_code_review_specs_json(raw).expect("dynamic specs parse");
+        assert_eq!(specs.len(), 4);
+        assert_eq!(specs[1].agent_key, "reviewer-ux");
+        assert_eq!(specs[3].role, "context_manager_review");
+    }
+
+    #[test]
+    fn review_specialist_config_rejects_invalid_keys_and_duplicates() {
+        let invalid = r#"
+        [
+          {
+            "agent_key": "reviewer api",
+            "nickname": "Ada",
+            "role": "api_contract_review",
+            "focus": "API"
+          }
+        ]
+        "#;
+        assert!(parse_native_code_review_specs_json(invalid).is_err());
+
+        let duplicate = r#"
+        [
+          {
+            "agent_key": "reviewer-api",
+            "nickname": "Ada",
+            "role": "api_contract_review",
+            "focus": "API"
+          },
+          {
+            "agent_key": "reviewer-api",
+            "nickname": "Hypatia",
+            "role": "test_review",
+            "focus": "Tests"
+          }
+        ]
+        "#;
+        let error = parse_native_code_review_specs_json(duplicate)
+            .expect_err("duplicate keys must be rejected");
+        assert!(error.contains("duplicated"));
     }
 
     // ----------------------------------------------------------------

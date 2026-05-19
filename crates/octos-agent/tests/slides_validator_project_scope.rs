@@ -594,6 +594,7 @@ async fn agent_mcp_slides_writes_project_ledger() {
                 outcome: DispatchOutcome::Success,
                 output: "Generated PPTX: ok".into(),
                 files_to_send: vec![self.pptx_abs_path.clone()],
+                context_contract: None,
                 error: None,
             }
         }

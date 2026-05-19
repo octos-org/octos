@@ -22,6 +22,7 @@ use crate::harness_errors::HarnessError;
 use crate::harness_events::write_event_to_sink;
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
+use crate::prompt_context::PromptContextPhase;
 use crate::session::SessionLimits;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
@@ -431,6 +432,11 @@ impl Agent {
                     "loop retry: compacting context before retry"
                 );
                 self.maybe_run_turn_compaction(messages, iteration);
+                self.prepare_prompt_with_context_manager(
+                    messages,
+                    PromptContextPhase::Retry,
+                    iteration,
+                );
                 LoopErrorAction::Retry
             }
             LoopDecision::RotateAndRetry => {
@@ -821,6 +827,15 @@ impl Agent {
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
                     self.maybe_run_turn_compaction(&mut messages, iteration);
+                    self.prepare_prompt_with_context_manager(
+                        &mut messages,
+                        if iteration == 1 {
+                            PromptContextPhase::TurnStart
+                        } else {
+                            PromptContextPhase::Iteration
+                        },
+                        iteration,
+                    );
                     let total_usage = turn.total_usage().clone();
 
                     if iteration == 1 && tools_spec.len() > 25 {
@@ -1332,6 +1347,15 @@ impl Agent {
                 let protected_ids = collect_protected_tool_call_ids(&messages);
                 self.run_tier1_compaction(&mut messages, &protected_ids);
                 prepare_task_messages(self, &mut messages, &mut turn);
+                self.prepare_prompt_with_context_manager(
+                    &mut messages,
+                    if iteration == 1 {
+                        PromptContextPhase::TurnStart
+                    } else {
+                        PromptContextPhase::Iteration
+                    },
+                    iteration,
+                );
                 let total_usage = turn.total_usage().clone();
 
                 // M8.5 tier 2: decorate the config with the Anthropic header.
@@ -2096,6 +2120,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
@@ -2107,6 +2132,9 @@ mod tests {
 
     use crate::plugins::PluginTool;
     use crate::plugins::manifest::PluginToolDef;
+    use crate::prompt_context::{
+        PromptContextManager, PromptContextPhase, PromptContextReport, PromptContextRequest,
+    };
     use crate::tools::{Tool, ToolRegistry, ToolResult, TurnAttachmentContext};
 
     struct FilesToSendOnlyTool {
@@ -2186,6 +2214,108 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct RecordingToolThenEndProvider {
+        calls: AtomicUsize,
+        observed_prompts: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RecordingToolThenEndProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.observed_prompts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(
+                    messages
+                        .iter()
+                        .map(|message| message.content.clone())
+                        .collect(),
+                );
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_alpha".to_string(),
+                        name: "alpha".to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct SpyPromptContextManager {
+        phases: Arc<StdMutex<Vec<PromptContextPhase>>>,
+    }
+
+    impl PromptContextManager for SpyPromptContextManager {
+        fn prepare_prompt(
+            &self,
+            request: PromptContextRequest,
+            messages: &mut Vec<Message>,
+        ) -> Result<PromptContextReport, String> {
+            self.phases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request.phase);
+            let before = messages.len();
+            let mut prompt_replaced = false;
+            if request.phase == PromptContextPhase::Iteration {
+                messages.insert(
+                    0,
+                    Message {
+                        role: MessageRole::System,
+                        content: "[managed prompt from context manager]".to_string(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: chrono::Utc::now(),
+                    },
+                );
+                prompt_replaced = true;
+            }
+            Ok(PromptContextReport {
+                prompt_replaced,
+                compaction_performed: false,
+                messages_before: before,
+                messages_after: messages.len(),
+                token_estimate: Some(messages.iter().map(|message| message.content.len()).sum()),
+                generation: Some(request.iteration as u64),
+            })
         }
     }
 
@@ -2547,6 +2677,53 @@ mod tests {
         assert_eq!(
             result.messages[5].tool_call_id.as_deref(),
             Some("call_gamma")
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_uses_prompt_context_manager_before_each_llm_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(NamedEchoTool {
+            name: "alpha",
+            output: "alpha ok",
+        });
+        let observed_prompts = Arc::new(StdMutex::new(Vec::new()));
+        let provider: Arc<dyn LlmProvider> = Arc::new(RecordingToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+            observed_prompts: Arc::clone(&observed_prompts),
+        });
+        let phases = Arc::new(StdMutex::new(Vec::new()));
+        let context_manager: Arc<dyn PromptContextManager> = Arc::new(SpyPromptContextManager {
+            phases: Arc::clone(&phases),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory)
+            .with_prompt_context_manager(context_manager);
+
+        let result = agent.process_message("do work", &[], vec![]).await.unwrap();
+
+        assert_eq!(result.content, "done");
+        let phases = phases.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            phases.as_slice(),
+            [PromptContextPhase::TurnStart, PromptContextPhase::Iteration]
+        );
+        let prompts = observed_prompts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            !prompts[0]
+                .iter()
+                .any(|content| content.contains("[managed prompt from context manager]")),
+            "turn-start prompt should remain unchanged in this spy"
+        );
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|content| content.contains("[managed prompt from context manager]")),
+            "second LLM call must use the prompt vector prepared by the context manager"
         );
     }
 

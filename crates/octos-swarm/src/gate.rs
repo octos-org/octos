@@ -434,6 +434,7 @@ mod tests {
                 output: String::new(),
                 files_to_send: Vec::new(),
                 error: None,
+                context_contract: None,
             }
         }
     }

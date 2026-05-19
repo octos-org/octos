@@ -1,0 +1,214 @@
+# M18 AppUI Stdio Transport Parity Contract
+
+Status: implementation verified; GitHub issue updates blocked by expired connector token
+Owner: Octos backend plus octos-tui client workers
+Date: 2026-05-17
+
+## Goal
+
+Make AppUI stdio a production transport on par with WebSocket for supported coding-client workflows. Passing M18 means the same AppUI protocol contract can run over WebSocket and stdio with explicit, tested differences only where the transport itself requires them.
+
+M18 must not claim full parity based only on a short TUI happy path. It requires protocol spec updates, backend transport refactor, lifecycle/backpressure semantics, auth/profile semantics, capability negotiation, golden conformance fixtures, and live tmux UX evidence.
+
+## Current Evidence
+
+Completed audits found:
+
+1. PRs #819-#822 are prep work, not finished stdio parity.
+   - #819 adds pre-stdio golden fixtures.
+   - #820 extracts a connection driver but remains WebSocket-centered.
+   - #821 adds shared JSON/NDJSON codec but explicitly does not add stdio server mode.
+   - #822 adds client_hello capability negotiation but is not merged.
+
+2. Initial stdio implementation gaps found by audit:
+   - stdio does not terminate on send failure/backpressure like WebSocket.
+   - stdio lacks transport-neutral client_hello capability negotiation.
+   - stdio and WebSocket still have duplicated dispatch surfaces.
+   - stdio routes some aux methods without equivalent auth/profile context.
+   - stdio profile binding is first-session sticky.
+   - router/* was treated as stdio-only unsupported even though the same
+     AppUI handlers can run over stdio.
+   - stdio line size validation happens after an unbounded line read.
+   - stdio lacks heartbeat or a documented pipe-liveness replacement.
+   - existing tests do not prove WS-vs-stdio conformance for the same scenarios.
+
+## Non-Goals
+
+- Do not build a stdio-to-WebSocket bridge.
+- Do not hide transport gaps behind TUI-only workarounds.
+- Do not silently fallback to default profile/model/session state when stdio cannot resolve server truth.
+- Do not advertise AppUI capabilities over stdio unless the backend implements or intentionally rejects them with typed errors.
+
+## Workstreams
+
+### M18-A: Shared AppUI Transport Core
+
+Deliverables:
+
+- Land or recreate the useful parts of PRs #819-#822 on current mainline.
+- Extract shared AppUI request parsing, response serialization, route dispatch, and lifecycle delivery out of WebSocket-only code.
+- Introduce shared JSON and NDJSON codec modules.
+- Keep WebSocket and stdio as thin adapters over the same protocol driver.
+
+Acceptance:
+
+- WebSocket and stdio route through one driver for all shared AppUI commands.
+- Transport-specific code only owns framing, connection identity, and liveness.
+- Tests fail if a new AppUI command is added to one transport and not the other.
+
+### M18-B: Stdio Client Hello And Capability Negotiation
+
+Deliverables:
+
+- Add transport-neutral `client_hello` / capability handshake.
+- Support stdio clients that cannot send HTTP headers.
+- Expose negotiated capabilities in `server_hello`, `session/status/read`, and logs.
+- Ensure unsupported stdio methods are omitted or explicitly marked unsupported.
+
+Acceptance:
+
+- TUI can open stdio and discover exact server-supported methods.
+- `router/*` is advertised over stdio only when it routes to the same handlers
+  and returns the same result/error shape as WebSocket.
+- Capability fixture proves WebSocket and stdio produce compatible negotiated method sets.
+
+### M18-C: Profile, Auth, And Session Semantics
+
+Deliverables:
+
+- Define stdio identity/profile model in AppUI spec.
+- Remove first-session sticky profile assumptions unless explicitly documented and tested.
+- Make `session/open`, `turn/start`, `session/list`, content methods, and permission/profile methods resolve profile state consistently.
+- Return typed AppUI errors for unsupported auth-bound methods.
+
+Acceptance:
+
+- Missing profile returns structured `profile_unresolved`.
+- Auth-required methods over unauthenticated stdio are omitted from advertised
+  `supported_methods`, listed as explicit `unsupported` capabilities, and direct
+  calls return typed `auth_unavailable` (`-32120`), not silent defaults.
+- Multi-session stdio tests prove profile isolation or document a deliberate single-profile contract.
+
+### M18-D: Lifecycle, Backpressure, And Frame Bounds
+
+Deliverables:
+
+- Stdio must stop dispatching after outbound lifecycle delivery fails.
+- Add failed-latch/backpressure behavior equivalent to WebSocket.
+- Replace unbounded `read_line` with bounded NDJSON frame reading.
+- Define pipe liveness semantics. Either implement heartbeat-equivalent events or document why process/pipe liveness replaces heartbeat.
+
+Acceptance:
+
+- Broken stdout pipe terminates connection and cleans session state.
+- Oversized stdin frame is rejected before unbounded allocation.
+- Reconnect/interrupt soak can observe clean failure and recovery.
+
+### M18-E: Protocol Spec And Golden Conformance Fixtures
+
+Deliverables:
+
+- Update `api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md` before code behavior changes are considered complete.
+- Add fixtures for WebSocket JSON frames and stdio NDJSON frames.
+- Cover session lifecycle, turn lifecycle, tool events, approval events, profile errors, auth errors, capability negotiation, disconnect, interrupt, and reconnect.
+- Provide a conformance runner that can execute the same scenario over both transports and diff normalized transcripts.
+
+Acceptance:
+
+- `cargo test` includes AppUI route parity and golden fixture tests.
+- E2E artifacts include `ws-transcript.jsonl`, `stdio-transcript.jsonl`, normalized diff, and server log.
+- Any intentional non-parity is listed in a checked-in allowlist with a reason.
+  Runtime-path differences such as advertised methods returning transport-only
+  unsupported errors are not acceptable allowances.
+
+### M18-F: octos-tui Stdio UX And Validation
+
+Deliverables:
+
+- TUI must use stdio capability negotiation and server truth.
+- TUI must surface typed stdio errors clearly.
+- TUI must not call unsupported methods when server capability says unavailable.
+- Add live tmux UX soak comparing stdio and WebSocket for the same coding task.
+
+Acceptance:
+
+- TUI stdio launch can create/select session, send turns, interrupt, reconnect, switch model/profile if supported, and show unsupported-method reasons if not.
+- Tmux capture proves no hidden task errors, no blocked chat bottom, and no stale sticky panels during stdio runs.
+- 249 deployment smoke test uses latest backend and TUI binaries with stdio mode.
+
+## Evidence Required For Closure
+
+Each issue must attach or link:
+
+- protocol spec diff
+- unit/integration test command output
+- `appui-stdio-transcript.jsonl`
+- `appui-ws-transcript.jsonl`
+- normalized WS-vs-stdio diff
+- `server.log`
+- `runtime-policy-stamp.json` when sessions/turns are involved
+- TUI tmux capture for UX-facing tasks
+
+## Milestone Verdict Rule
+
+M18 is complete only when:
+
+1. Existing PR stack #819-#822 is merged, superseded, or closed with equivalent current-branch work landed.
+2. Backend AppUI stdio passes shared conformance tests.
+3. octos-tui passes live tmux stdio UX soak against the real backend.
+4. The AppUI spec documents all supported and intentionally unsupported stdio behaviors.
+5. No issue can be closed with only a short happy-path model answer.
+
+## Closure Evidence 2026-05-18
+
+Backend verification:
+
+- `cargo test -p octos-cli --features api --lib -- --nocapture`
+  passed: 1111 passed, 0 failed, 4 ignored.
+- `cargo build -p octos-cli --features api --bin octos` passed.
+- `npm --prefix e2e run soak:m18:appui-transport-parity` passed.
+- WS-vs-stdio normalized diff: 0 unexpected differences and 0
+  allowlisted differences; unauthenticated stdio auth-bound methods are capability
+  omissions with explicit unsupported reports, not allowlisted runtime diffs.
+- Backend evidence directory:
+  `/Users/yuechen/home/octos/e2e/test-results-m18-appui-transport-parity/20260518T011535Z`.
+
+TUI verification:
+
+- `cargo test --all --workspace` passed:
+  321 lib tests, 3 AppUI UX fixture tests, 2 solo-permissions tests.
+- `cargo clippy --all --workspace -- -D warnings` passed.
+- Live tmux UX soak passed:
+  `/Users/yuechen/home/octos-tui/e2e/test-results-m15-live-tmux-ux/m18-stdio-parity-20260518T011554Z/ux-validation.json`.
+
+Claude review:
+
+- Backend focused review:
+  `/tmp/octos-m18-claude-backend-focused-review.txt`, verdict:
+  "No must-fix findings".
+- TUI focused review:
+  `/tmp/octos-m18-claude-tui-focused-review.txt`, verdict:
+  "No must-fix findings".
+- Claude backend follow-ups addressed before final verification:
+  stdio profile binding now updates only after successful `session/open`;
+  `StdioNdjsonReader` clamps reads near `MAX_TEXT_FRAME_BYTES`; the spec
+  clarifies AppUI `session/status/read` versus legacy
+  `session/status.get`.
+
+GitHub issue update status:
+
+- Attempted to comment on `octos-org/octos#1028`, but the GitHub connector
+  returned `401 token_expired`: "Provided authentication token is expired.
+  Please try signing in again."
+- Issue comments/closures for `octos#1028`-`#1032` and `octos-tui#48`-`#49`
+  still need to be posted after GitHub app authentication is refreshed.
+
+## Backing-Store Replay Soak 2026-05-18
+
+Issue octos#1044 adds a second mode to the existing headless M18 AppUI transport parity soak:
+
+- Default/headless mode remains unchanged and continues to verify matching typed -32140 session/messages_page failures when the sessions REST backing store is unavailable.
+- Backing-store mode runs with `OCTOS_M18_APPUI_PARITY_MODE=backing-store` or `node e2e/scripts/m18-appui-transport-parity-soak.mjs --backing-store`.
+- The backing-store mode seeds deterministic local session JSONL history into both the WebSocket and stdio data dirs before opening the same session id over each transport.
+- The mode verifies populated `session/messages_page` first, middle, tail, beyond-end, and clamped-limit pages, plus typed invalid-params edge errors for malformed pagination requests.
+- Artifacts include `appui-ws-transcript.jsonl`, `appui-stdio-transcript.jsonl`, `normalized-diff.json`, `runtime-policy-stamp.json`, `backing-store-seed.json`, and `server.log` under the run directory.

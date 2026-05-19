@@ -29,7 +29,7 @@ pub struct ShellTool {
     /// Runtime approval behavior for commands that request approval.
     approval_policy: ApprovalPolicy,
     /// Sandbox for command isolation.
-    sandbox: Box<dyn Sandbox>,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl ShellTool {
@@ -40,7 +40,7 @@ impl ShellTool {
             cwd: cwd.into(),
             policy: Arc::new(SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
-            sandbox: Box::new(NoSandbox),
+            sandbox: Arc::new(NoSandbox),
         }
     }
 
@@ -64,6 +64,12 @@ impl ShellTool {
 
     /// Set a sandbox for command isolation.
     pub fn with_sandbox(mut self, sandbox: Box<dyn Sandbox>) -> Self {
+        self.sandbox = Arc::from(sandbox);
+        self
+    }
+
+    /// Set a shared sandbox for command isolation.
+    pub fn with_shared_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
         self.sandbox = sandbox;
         self
     }

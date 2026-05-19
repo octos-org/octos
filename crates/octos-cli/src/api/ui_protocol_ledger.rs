@@ -1501,6 +1501,16 @@ fn notification_session_id(notification: &UiNotification) -> &SessionKey {
         UiNotification::RouterStatus(event) => &event.session_id,
         UiNotification::RouterFailover(event) => &event.session_id,
         UiNotification::QueueState(event) => &event.session_id,
+        UiNotification::AgentUpdated(event) => &event.session_id,
+        UiNotification::AgentOutputDelta(event) => &event.session_id,
+        UiNotification::AgentArtifactUpdated(event) => &event.session_id,
+        UiNotification::SessionGoalUpdated(event) => &event.session_id,
+        UiNotification::SessionGoalCleared(event) => &event.session_id,
+        UiNotification::LoopUpdated(event) => &event.session_id,
+        UiNotification::LoopFired(event) => &event.session_id,
+        UiNotification::LoopCompleted(event) => &event.session_id,
+        UiNotification::ContextCompactionCompleted(event) => &event.session_id,
+        UiNotification::ContextNormalizationReported(event) => &event.session_id,
     }
 }
 
