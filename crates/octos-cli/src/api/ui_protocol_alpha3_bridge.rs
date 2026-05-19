@@ -302,6 +302,7 @@ mod tests {
             },
             persisted_at: DateTime::from_timestamp(0, 0).unwrap(),
             media: vec![],
+            content: None,
         });
         let _ = ledger.append_notification(observer_event);
 

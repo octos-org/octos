@@ -2204,6 +2204,24 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
                 // serialises to omitted (back-compat for clients
                 // that don't yet understand the field).
                 media: message.media.clone(),
+                // PR-content-on-persist (2026-05-19): carry text on
+                // the wire so a media-bearing row's caption / summary
+                // reaches the SPA. Pre-fix the SPA hardcoded
+                // `content: ""` (ui-protocol-event-router.ts), and
+                // any text accompanying a `send_file` / mofa_slides
+                // / fm_tts delivery was lost. Emit `None` for empty
+                // strings so legacy text-only rows that already
+                // arrive via `message/delta`+`turn/completed` don't
+                // resend their full body here (the metadata-only
+                // wire shape stays bandwidth-efficient).
+                content: {
+                    let trimmed = message.content.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(message.content.clone())
+                    }
+                },
             };
             // Append to the ledger; the ledger stamps the cursor onto
             // both the envelope AND the `MessagePersistedEvent.cursor`
@@ -17112,6 +17130,7 @@ mod tests {
                 cursor: cursor.clone(),
                 persisted_at: chrono::Utc::now(),
                 media: Vec::new(),
+                content: None,
             },
         ));
         assert_eq!(ledger_event_cursor(&persisted), Some(cursor.clone()));
@@ -22794,6 +22813,7 @@ mod tests {
             },
             persisted_at: Utc::now(),
             media: vec!["research/_report.md".into()],
+            content: None,
         }));
         ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session_id.clone(),
@@ -22810,6 +22830,7 @@ mod tests {
             },
             persisted_at: Utc::now(),
             media: vec!["research/_report.md".into()],
+            content: None,
         }));
         ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
             session_id: session_id.clone(),
@@ -23442,6 +23463,7 @@ mod tests {
             },
             persisted_at: Utc::now(),
             media: vec![],
+            content: None,
         })
     }
 
@@ -23548,6 +23570,7 @@ mod tests {
             },
             persisted_at: Utc::now(),
             media: vec!["research/_report.md".into()],
+            content: None,
         })
     }
 

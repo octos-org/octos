@@ -2604,6 +2604,19 @@ pub struct MessagePersistedEvent {
     /// running older protocol versions see the same wire shape they used to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
+    /// Optional text content of the persisted row. Pre-fix this field was
+    /// omitted from the wire — `message/persisted` carried only metadata
+    /// + `media`, and the SPA hardcoded `content: ""` when rebuilding
+    /// the message. That dropped the assistant's caption / summary text
+    /// whenever a row carried BOTH text and a file (e.g.
+    /// `send_file` with a caption, mofa_slides delivery with a
+    /// summary). Carry the content here when non-empty so clients can
+    /// render the bubble with text + file together.
+    ///
+    /// Wire compatibility: serialized as omitted when empty, so legacy
+    /// clients that don't read the field continue to behave as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 // ----- M10 Phase 1 `turn/spawn_complete` -----
@@ -7802,11 +7815,29 @@ mod tests {
             },
             persisted_at: sample_persisted_at(),
             media: vec!["report.md".into()],
+            content: Some("Here is the report.".into()),
         };
         let value = serde_json::to_value(&event).expect("serialize");
         assert_eq!(value.get("source"), Some(&json!("assistant")));
+        assert_eq!(value.get("content"), Some(&json!("Here is the report.")));
         let parsed: MessagePersistedEvent = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed, event);
+
+        // content=None must be omitted from the wire (legacy compat
+        // for clients that don't read the field).
+        let event_no_content = MessagePersistedEvent {
+            content: None,
+            ..event.clone()
+        };
+        let value_no_content = serde_json::to_value(&event_no_content).expect("serialize");
+        assert_eq!(
+            value_no_content.get("content"),
+            None,
+            "content=None must be omitted from the wire"
+        );
+        let parsed_no_content: MessagePersistedEvent =
+            serde_json::from_value(value_no_content).expect("deserialize none");
+        assert_eq!(parsed_no_content, event_no_content);
 
         // All five source variants round-trip.
         for source in [
@@ -7831,6 +7862,7 @@ mod tests {
                 },
                 persisted_at: sample_persisted_at(),
                 media: vec![],
+                content: None,
             };
             let v = serde_json::to_value(&e).expect("serialize source");
             let p: MessagePersistedEvent = serde_json::from_value(v).expect("deserialize source");
