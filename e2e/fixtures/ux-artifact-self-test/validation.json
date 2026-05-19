@@ -47,7 +47,7 @@
     {
       "id": "rendered_screen_no_known_bug_patterns",
       "status": "passed",
-      "detail": "tui-capture.txt and server.log do not match known tmux UX bug patterns",
+      "detail": "tui-capture*.txt and server.log do not match known tmux UX bug patterns",
       "evidence": [
         "tui-capture.txt",
         "server.log"

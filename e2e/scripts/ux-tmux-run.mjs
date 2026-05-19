@@ -111,10 +111,8 @@ const scenarios = new Map([
       id: 'task-subagent-tree',
       title: 'Task Subagent Tree',
       transport: 'stdio',
-      runner: null,
-      blockedMessage:
-        'Current octos-tui renders a generic agent task for this prompt but does not produce the M15 live-subagent final marker or m15-evidence transcript yet.',
-      finalMarker: 'M19_TASK_SUBAGENT_TREE_FINAL_LINE',
+      runner: 'task-subagent-tree',
+      finalMarker: 'M15CODEREVIEWFINALLINE',
       prompt:
         'Run M15 code review with live subagent orchestration through octos serve --stdio. Use supervised subagents and produce the final marker.',
     },
@@ -254,6 +252,29 @@ function stablePortForRunId(runId) {
   return 51000 + (hash % 10000);
 }
 
+function taskSubagentFixtureEnv(scenario, workdir) {
+  if (scenario.runner !== 'task-subagent-tree') return {};
+  return {
+    OCTOS_M15_LIVE_SUBAGENT_FIXTURE: '1',
+    OCTOS_TUI_M15_UX_OUTPUT_DIR: path.join(workdir, '.octos-m15-evidence'),
+    OCTOS_TUI_M15_UX_WORKDIR: workdir,
+    OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE:
+      process.env.OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE || '0.25',
+  };
+}
+
+function backendFixtureEnv(scenario, workdir) {
+  return {
+    OCTOS_M9_PROTOCOL_FIXTURES: '1',
+    DEEPSEEK_API_KEY: 'dummy-key-for-ux-tmux',
+    ...taskSubagentFixtureEnv(scenario, workdir),
+  };
+}
+
+function shellEnvAssignments(env) {
+  return Object.entries(env).map(([name, value]) => `${name}=${shellQuote(value)}`);
+}
+
 function isExecutable(file) {
   try {
     fs.accessSync(file, fs.constants.X_OK);
@@ -337,12 +358,13 @@ function resolveContext({ scenarioId, selfTest }) {
     process.env.OCTOS_UX_TMUX_SESSION_ID || `${profileId}:local:ux:${scenario.id}:${runId}`;
   const sessionName =
     process.env.OCTOS_UX_TMUX_SESSION || `octos-ux-${safeSlug(runId)}-${safeSlug(scenario.id)}`;
+  const fixtureEnv = taskSubagentFixtureEnv(scenario, workdir);
+  const backendEnv = backendFixtureEnv(scenario, workdir);
   const backendCommand =
     process.env.OCTOS_UX_TMUX_BACKEND_COMMAND
     || [
       'env',
-      'OCTOS_M9_PROTOCOL_FIXTURES=1',
-      'DEEPSEEK_API_KEY=dummy-key-for-ux-tmux',
+      ...shellEnvAssignments(backendEnv),
       shellQuote(octosBin),
       'serve',
       '--stdio',
@@ -381,6 +403,8 @@ function resolveContext({ scenarioId, selfTest }) {
     profileId,
     sessionId,
     sessionName,
+    fixtureEnv,
+    backendEnv,
     backendCommand,
     launchCommand,
   };
@@ -434,6 +458,7 @@ function writeRuntimePolicyStamp(ctx, generatedAt, { force = false } = {}) {
       cols: ctx.cols,
       rows: ctx.rows,
     },
+    fixture_env: ctx.fixtureEnv,
   });
 }
 
@@ -490,6 +515,7 @@ function writeArtifactSkeleton(ctx, options) {
     profile_id: ctx.profileId,
     final_marker: ctx.scenario.finalMarker,
     lower_runner: ctx.lowerRunner,
+    fixture_env: ctx.fixtureEnv,
     required_artifacts: requiredArtifacts,
   });
 
@@ -877,15 +903,7 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
     OCTOS_M9_PROTOCOL_FIXTURES: '1',
-    ...(ctx.scenario.runner === 'task-subagent-tree'
-      ? {
-        OCTOS_M15_LIVE_SUBAGENT_FIXTURE: '1',
-        OCTOS_TUI_M15_UX_OUTPUT_DIR: path.join(ctx.workdir, '.octos-m15-evidence'),
-        OCTOS_TUI_M15_UX_WORKDIR: ctx.workdir,
-        OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE:
-          process.env.OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE || '0.25',
-      }
-      : {}),
+    ...ctx.fixtureEnv,
   };
 
   const action = (name, inherit = true, envOverrides = {}) => spawnSync(ctx.lowerRunner, [name], {

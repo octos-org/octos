@@ -590,14 +590,27 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
   const scenarioId = scenario.ok
     ? (scenario.value.id || scenario.value.scenario_id || '')
     : '';
-  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const captureNames = fs.existsSync(artifactDir)
+    ? fs
+      .readdirSync(artifactDir)
+      .filter((name) => /^tui-capture.*\.txt$/.test(name))
+      .sort()
+    : ['tui-capture.txt'];
+  if (!captureNames.includes('tui-capture.txt')) captureNames.unshift('tui-capture.txt');
   const serverLog = readText(artifactPath(artifactDir, 'server.log'));
   const problems = [];
-  if (!capture.ok) {
-    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
-  } else if (capture.text.trim().length === 0) {
-    problems.push('tui-capture.txt is empty after stripping ANSI escapes');
-  } else {
+  let mainCaptureText = '';
+  for (const captureName of captureNames) {
+    const capture = readText(artifactPath(artifactDir, captureName));
+    if (!capture.ok) {
+      problems.push(`${captureName} could not be read: ${capture.error}`);
+      continue;
+    }
+    if (captureName === 'tui-capture.txt') mainCaptureText = capture.text;
+    if (capture.text.trim().length === 0) {
+      problems.push(`${captureName} is empty after stripping ANSI escapes`);
+      continue;
+    }
     for (const pattern of KNOWN_CAPTURE_BUG_PATTERNS) {
       if (
         scenarioId === 'restart-reconnect'
@@ -608,7 +621,7 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
       }
       const match = lineMatches(capture.text, pattern.regex);
       if (match) {
-        problems.push(`${pattern.id} at line ${match.line}: ${pattern.detail}`);
+        problems.push(`${pattern.id} in ${captureName} at line ${match.line}: ${pattern.detail}`);
       }
     }
   }
@@ -619,7 +632,7 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     if (serverDrop) {
       problems.push(`server_dropped_turn_completed at line ${serverDrop.line}: server log contains dropped turn/completed lifecycle evidence`);
     }
-    if (capture.ok && CAPTURE_STUCK_RUNNING_PATTERN.test(capture.text) && serverDrop) {
+    if (mainCaptureText && CAPTURE_STUCK_RUNNING_PATTERN.test(mainCaptureText) && serverDrop) {
       problems.push('capture_stuck_running_after_server_drop: capture still shows running state after dropped completion evidence');
     }
   }
@@ -627,9 +640,9 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     'rendered_screen_no_known_bug_patterns',
     problems.length === 0,
     problems.length === 0
-      ? 'tui-capture.txt and server.log do not match known tmux UX bug patterns'
+      ? 'tui-capture*.txt and server.log do not match known tmux UX bug patterns'
       : `known rendered-screen bug patterns found: ${problems.join('; ')}`,
-    ['tui-capture.txt', 'server.log'],
+    [...captureNames, 'server.log'],
   );
 }
 
@@ -880,7 +893,17 @@ function checkTaskSubagentTreeScenario(artifactDir) {
 
   const runningCapture = readText(artifactPath(artifactDir, 'tui-capture-task-subagent-tree-running.txt'));
   const finalCapture = readText(artifactPath(artifactDir, 'tui-capture-task-subagent-tree-final.txt'));
+  const summaryCapture = readText(artifactPath(artifactDir, 'tui-capture-task-subagent-tree-summary.txt'));
+  const launchCommand = readText(artifactPath(artifactDir, 'launch-command.txt'));
   const transcriptPath = artifactPath(artifactDir, path.join('m15-evidence', 'appui-transcript.jsonl'));
+  const codeReviewReportPath = artifactPath(
+    artifactDir,
+    path.join('m15-evidence', 'agent-artifacts', 'code-review-report.md'),
+  );
+  const codeReviewReport = readText(codeReviewReportPath);
+  const finalMarker = typeof scenario.value.final_marker === 'string' && scenario.value.final_marker.length > 0
+    ? scenario.value.final_marker
+    : 'M15CODEREVIEWFINALLINE';
   const parsed = parseJsonl(transcriptPath);
   const frameRows = parsed.rows
     .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value) }))
@@ -908,15 +931,65 @@ function checkTaskSubagentTreeScenario(artifactDir) {
   if (!finalCapture.ok) {
     problems.push(`tui-capture-task-subagent-tree-final.txt could not be read: ${finalCapture.error}`);
   } else {
-    if (!/Code Review Summary|Review Summary/.test(finalCapture.text)) {
-      problems.push('final task/subagent capture is missing review summary heading');
-    }
-    for (const expected of ['Scatter-join complete', 'M15CODEREVIEWFINALLINE']) {
+    for (const expected of [
+      'Scatter-join complete',
+      'Subagents',
+      'Ada Lovelace',
+      'Hypatia',
+      'Socrates',
+      'Artifacts',
+      finalMarker,
+      'Done',
+    ]) {
       if (!finalCapture.text.includes(expected)) problems.push(`final task/subagent capture is missing ${expected}`);
+    }
+  }
+  if (!summaryCapture.ok) {
+    problems.push(`tui-capture-task-subagent-tree-summary.txt could not be read: ${summaryCapture.error}`);
+  } else {
+    if (!/Code\s+Review Summary|Review Summary/.test(summaryCapture.text)) {
+      problems.push('scrolled task/subagent summary capture is missing Code Review Summary');
+    }
+    for (const expected of ['Findings', 'High:']) {
+      if (!summaryCapture.text.includes(expected)) {
+        problems.push(`scrolled task/subagent summary capture is missing ${expected}`);
+      }
     }
   }
   if (!fs.existsSync(transcriptPath)) {
     problems.push('m15-evidence/appui-transcript.jsonl is missing');
+  }
+  if (!codeReviewReport.ok) {
+    problems.push(`m15-evidence/agent-artifacts/code-review-report.md could not be read: ${codeReviewReport.error}`);
+  } else if (!/Code Review Summary|Review Summary/.test(codeReviewReport.text)) {
+    problems.push('m15-evidence/agent-artifacts/code-review-report.md is missing review summary heading');
+  }
+  if (!launchCommand.ok) {
+    problems.push(`launch-command.txt could not be read: ${launchCommand.error}`);
+  } else {
+    for (const expected of [
+      'OCTOS_M15_LIVE_SUBAGENT_FIXTURE=',
+      'OCTOS_TUI_M15_UX_OUTPUT_DIR=',
+      'OCTOS_TUI_M15_UX_WORKDIR=',
+      'OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE=',
+    ]) {
+      if (!launchCommand.text.includes(expected)) {
+        problems.push(`launch-command.txt is missing ${expected}`);
+      }
+    }
+  }
+  const fixtureEnv = isPlainObject(scenario.value.fixture_env) ? scenario.value.fixture_env : {};
+  if (fixtureEnv.OCTOS_M15_LIVE_SUBAGENT_FIXTURE !== '1') {
+    problems.push('scenario fixture_env missing OCTOS_M15_LIVE_SUBAGENT_FIXTURE=1');
+  }
+  for (const expected of [
+    'OCTOS_TUI_M15_UX_OUTPUT_DIR',
+    'OCTOS_TUI_M15_UX_WORKDIR',
+    'OCTOS_M15_LIVE_SUBAGENT_DELAY_SCALE',
+  ]) {
+    if (typeof fixtureEnv[expected] !== 'string' || fixtureEnv[expected].length === 0) {
+      problems.push(`scenario fixture_env missing ${expected}`);
+    }
   }
   for (const error of parsed.errors) {
     problems.push(`m15 evidence transcript line ${error.line}: ${error.error}`);
@@ -936,7 +1009,10 @@ function checkTaskSubagentTreeScenario(artifactDir) {
     [
       'tui-capture-task-subagent-tree-running.txt',
       'tui-capture-task-subagent-tree-final.txt',
+      'tui-capture-task-subagent-tree-summary.txt',
+      'launch-command.txt',
       'm15-evidence/appui-transcript.jsonl',
+      'm15-evidence/agent-artifacts/code-review-report.md',
     ],
   );
 }
