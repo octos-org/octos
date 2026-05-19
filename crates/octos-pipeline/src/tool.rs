@@ -251,10 +251,15 @@ impl Tool for RunPipelineTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a multi-step pipeline defined as an inline DOT graph. Each node runs a \
-         specialized agent with its own prompt, model, and output limits. \
-         ALWAYS write inline DOT graphs — do NOT use pre-built pipeline names. \
-         This lets you pick optimal models per node (cheap for search, high-output for synthesis)."
+        "Run a sanctioned multi-step pipeline by NAME. The only currently \
+         sanctioned pipeline is `deep_research` — use it when the user asks \
+         for in-depth, multi-source, source-citing research that needs \
+         parallel search workers + synthesis. Do NOT compose your own \
+         inline DOT graph for ad-hoc tasks (slides, media, code edits, \
+         partial regenerations, etc.) — those have purpose-built tools \
+         (`mofa_slides`, `podcast_generate`, etc.). If no purpose-built \
+         tool exists for what the user asked, surface that as a limitation \
+         rather than improvising a custom pipeline."
     }
 
     fn tags(&self) -> &[&str] {
@@ -262,25 +267,25 @@ impl Tool for RunPipelineTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        let adaptive_hints = include_str!("prompts/adaptive_hints.txt");
-        let node_attrs = include_str!("prompts/node_attrs.txt");
-        let example = include_str!("prompts/example_dot.txt");
-
-        let pipeline_desc = format!(
-            "Inline DOT graph. ALWAYS write a custom digraph.\n\n\
-             Do NOT specify model= attributes — the system selects optimal models automatically.\n\
-             Focus on writing good prompts, choosing tools, and structuring the pipeline.\n\n\
-             {node_attrs}\n\n\
-             {adaptive_hints}\n\n\
-             {example}"
-        );
+        let pipeline_desc = "Name of the sanctioned pipeline to run. The only currently \
+             sanctioned name is `deep_research`. Do NOT pass an inline \
+             DOT graph here — inline DOT was the legacy free-form \
+             contract; the executor still accepts it for operator \
+             debugging but agent-driven runs MUST use the name form. If \
+             you find yourself wanting to compose your own DOT, the \
+             correct response is to use the purpose-built tool for that \
+             domain (`mofa_slides` for slides, `podcast_generate` for \
+             podcasts, `voice_synthesize` for TTS, etc.), or tell the \
+             user no such tool exists for their request."
+            .to_string();
 
         serde_json::json!({
             "type": "object",
             "properties": {
                 "pipeline": {
                     "type": "string",
-                    "description": pipeline_desc
+                    "description": pipeline_desc,
+                    "enum": ["deep_research"]
                 },
                 "input": {
                     "type": "string",
