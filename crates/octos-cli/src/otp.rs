@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use eyre::{Result, bail};
@@ -43,8 +44,16 @@ fn default_smtp_port() -> u16 {
 /// Dashboard authentication configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardAuthConfig {
-    /// SMTP configuration for sending OTP emails.
-    pub smtp: SmtpConfig,
+    /// SMTP configuration for sending OTP emails. Optional so a partial
+    /// `dashboard_auth` block (e.g. `{"allow_self_registration": true}`
+    /// with no SMTP yet — the wizard's mid-setup state, or
+    /// cloud-host-deploy.sh's "SMTP disabled" leftover) parses cleanly
+    /// instead of crashing on startup. `None` here is functionally the
+    /// same as no `dashboard_auth.smtp` at all: OTP delivery falls
+    /// through to the console-log path, and the wizard surfaces the
+    /// "SMTP not configured" warning.
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
     /// Session expiry in hours.
     #[serde(default = "default_session_hours")]
     pub session_expiry_hours: u64,
@@ -94,7 +103,12 @@ pub struct AuthManager {
     /// dashboard-configured SMTP credentials.
     smtp_password: Option<String>,
     session_expiry_hours: u64,
-    pub allow_self_registration: bool,
+    /// Whether unknown emails auto-register on first OTP verify. Stored as
+    /// AtomicBool so the admin SMTP-save endpoint can flip it without a
+    /// server restart (matches the hot-reload behaviour of `smtp_config`).
+    /// Read via `allow_self_registration()`, write via
+    /// `set_allow_self_registration()`.
+    allow_self_registration_flag: AtomicBool,
     /// Static tokens that bypass OTP (for E2E testing).
     pub static_tokens: Vec<String>,
     user_store: Arc<UserStore>,
@@ -111,7 +125,7 @@ impl AuthManager {
         let (smtp_config, session_expiry_hours, allow_self_registration, static_tokens) =
             match config {
                 Some(c) => (
-                    Some(c.smtp),
+                    c.smtp,
                     c.session_expiry_hours,
                     c.allow_self_registration,
                     c.static_tokens,
@@ -124,7 +138,7 @@ impl AuthManager {
             smtp_config: RwLock::new(smtp_config),
             smtp_password: None,
             session_expiry_hours,
-            allow_self_registration,
+            allow_self_registration_flag: AtomicBool::new(allow_self_registration),
             static_tokens,
             user_store,
             sessions_path: None,
@@ -274,9 +288,35 @@ impl AuthManager {
         *self.smtp_config.write().await = cfg;
     }
 
+    /// Whether SMTP delivery is currently usable. Returns true only when a
+    /// host is set; password presence is checked at send time. Used by
+    /// auth/status to drive `email_login_enabled` honestly and by send_code
+    /// to short-circuit with a server-state error when SMTP isn't configured
+    /// (vs. silently logging the OTP to the server console).
+    pub async fn smtp_configured(&self) -> bool {
+        match &*self.smtp_config.read().await {
+            Some(cfg) => !cfg.host.trim().is_empty(),
+            None => false,
+        }
+    }
+
+    /// Read the current `allow_self_registration` flag. Used by send_code,
+    /// verify, and auth_status to decide whether unknown emails can
+    /// auto-register.
+    pub fn allow_self_registration(&self) -> bool {
+        self.allow_self_registration_flag.load(Ordering::Relaxed)
+    }
+
+    /// Live-update the `allow_self_registration` flag (admin save path).
+    /// Takes effect immediately; no `octos serve` restart required.
+    pub fn set_allow_self_registration(&self, value: bool) {
+        self.allow_self_registration_flag
+            .store(value, Ordering::Relaxed);
+    }
+
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
     pub async fn send_otp(&self, email: &str) -> Result<bool> {
-        self.send_otp_with_registration(email, self.allow_self_registration)
+        self.send_otp_with_registration(email, self.allow_self_registration())
             .await
     }
 
@@ -388,7 +428,7 @@ impl AuthManager {
     }
 
     pub async fn verify_otp(&self, email: &str, code: &str) -> Result<Option<String>> {
-        self.verify_otp_with_registration(email, code, self.allow_self_registration)
+        self.verify_otp_with_registration(email, code, self.allow_self_registration())
             .await
     }
 
@@ -828,7 +868,7 @@ mod tests {
         };
         let mgr = AuthManager::new(
             Some(DashboardAuthConfig {
-                smtp: smtp.clone(),
+                smtp: Some(smtp.clone()),
                 session_expiry_hours: 24,
                 allow_self_registration: false,
                 static_tokens: Vec::new(),
@@ -956,8 +996,8 @@ mod tests {
         let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
 
         // Use None for smtp to trigger dev mode (console log instead of email)
-        let mut mgr = AuthManager::new(None, user_store.clone());
-        mgr.allow_self_registration = true;
+        let mgr = AuthManager::new(None, user_store.clone());
+        mgr.set_allow_self_registration(true);
         mgr.send_otp("newuser@example.com").await.unwrap();
 
         let code = {

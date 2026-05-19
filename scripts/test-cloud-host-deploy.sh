@@ -64,7 +64,7 @@ EOF
     grep -q '^SMTP_HOST=smtp.example.com$' "$state_file" || fail "state file missing SMTP_HOST"
     grep -q '^SMTP_PORT=465$' "$state_file" || fail "state file missing SMTP_PORT"
     grep -q '^SMTP_USERNAME=noreply@example.com$' "$state_file" || fail "state file missing SMTP_USERNAME"
-    grep -q '^SMTP_FROM=noreply@example.com$' "$state_file" || fail "state file missing SMTP_FROM"
+    grep -q "^SMTP_FROM='noreply@example.com'$" "$state_file" || fail "state file missing SMTP_FROM"
     grep -q '^ALLOW_SELF_REGISTRATION=true$' "$state_file" || fail "state file missing ALLOW_SELF_REGISTRATION"
     if grep -q '^SMTP_PASSWORD=' "$state_file"; then
         fail "state file should not store SMTP_PASSWORD"
@@ -139,6 +139,133 @@ EOF
     if grep -q 'io.octos.frps' "$purge_only_out"; then
         fail "standalone purge should not remove frps service"
     fi
+
+    # ── Test: re-running cloud-host-deploy.sh preserves auth_token from
+    # an existing config.json when --auth-token is not provided. Avoids
+    # silently invalidating live dashboard sessions on subsequent runs
+    # (e.g. operator re-runs to flip HTTPS on, no expectation that
+    # tokens get regenerated).
+    local preserve_data_dir="$test_root/home-preserve/.octos"
+    local preserve_state="$test_root/preserve-bootstrap.env"
+    mkdir -p "$preserve_data_dir"
+    cat >"$preserve_data_dir/config.json" <<'EOF'
+{
+  "auth_token": "ORIGINAL_TOKEN_DO_NOT_OVERWRITE",
+  "mode": "cloud",
+  "tunnel_domain": "octos.example.com",
+  "frps_server": "relay.octos.example.com",
+  "provider": "openai",
+  "model": "gpt-4.1-mini",
+  "api_key_env": "OPENAI_API_KEY"
+}
+EOF
+    local preserve_config="$test_root/preserve.env"
+    cat >"$preserve_config" <<'EOF'
+TUNNEL_DOMAIN=octos.example.com
+FRPS_SERVER=relay.octos.example.com
+ENABLE_HTTPS=false
+ENABLE_SMTP=false
+FRPS_TOKEN=test-shared-frps-token
+EOF
+    local preserve_out="$test_root/preserve.out"
+    bash "$CLOUD_DEPLOY" \
+        --config "$preserve_config" \
+        --non-interactive \
+        --dry-run \
+        --data-dir "$preserve_data_dir" \
+        --prefix "$test_root/home-preserve/.octos/bin" \
+        --state-file "$preserve_state" \
+        >"$preserve_out" 2>&1 \
+        || fail "preserve-auth-token run should succeed"
+    grep -q '"auth_token": "ORIGINAL_TOKEN_DO_NOT_OVERWRITE"' "$preserve_data_dir/config.json" \
+        || fail "auth_token must be preserved across re-runs when --auth-token is not provided (saw: $(grep auth_token "$preserve_data_dir/config.json"))"
+
+    # ── Test: explicit --auth-token still overwrites (operator intent).
+    local rotate_out="$test_root/rotate.out"
+    AUTH_TOKEN="EXPLICIT_NEW_TOKEN" bash "$CLOUD_DEPLOY" \
+        --config "$preserve_config" \
+        --non-interactive \
+        --dry-run \
+        --data-dir "$preserve_data_dir" \
+        --prefix "$test_root/home-preserve/.octos/bin" \
+        --state-file "$preserve_state" \
+        >"$rotate_out" 2>&1 \
+        || fail "explicit-auth-token rotate should succeed"
+    grep -q '"auth_token": "EXPLICIT_NEW_TOKEN"' "$preserve_data_dir/config.json" \
+        || fail "explicit AUTH_TOKEN env should overwrite the existing config.json value"
+
+    # ── Test: ENABLE_SMTP=false with no ALLOW_SELF_REGISTRATION succeeds.
+    # Regression test for the validator failure where the
+    # `ALLOW_SELF_REGISTRATION must be true or false` error fired when the
+    # operator declined SMTP — the variable was never prompted (the prompt
+    # is gated on ENABLE_SMTP=true), left empty, and then validated as
+    # required. The fix forces it to "false" when SMTP is off, since
+    # self-registration via OTP is meaningless without SMTP delivery.
+    local no_smtp_config="$test_root/no-smtp.env"
+    cat >"$no_smtp_config" <<'EOF'
+TUNNEL_DOMAIN=octos.example.com
+FRPS_SERVER=relay.octos.example.com
+ENABLE_HTTPS=false
+ENABLE_SMTP=false
+AUTH_TOKEN=test-auth-token
+FRPS_TOKEN=test-shared-frps-token
+EOF
+
+    local no_smtp_data_dir="$test_root/home-nosmtp/.octos"
+    local no_smtp_prefix="$test_root/home-nosmtp/.octos/bin"
+    local no_smtp_state="$test_root/no-smtp-bootstrap.env"
+    local no_smtp_out="$test_root/no-smtp.out"
+    bash "$CLOUD_DEPLOY" \
+        --config "$no_smtp_config" \
+        --non-interactive \
+        --dry-run \
+        --data-dir "$no_smtp_data_dir" \
+        --prefix "$no_smtp_prefix" \
+        --state-file "$no_smtp_state" \
+        >"$no_smtp_out" 2>&1 \
+        || fail "ENABLE_SMTP=false with no ALLOW_SELF_REGISTRATION should succeed (saw: $(tail -3 "$no_smtp_out"))"
+
+    [ -f "$no_smtp_data_dir/config.json" ] \
+        || fail "no-smtp run did not create config.json"
+    if grep -q '"dashboard_auth"' "$no_smtp_data_dir/config.json"; then
+        fail "no-smtp config.json should not contain a dashboard_auth block (SMTP off ⇒ no OTP block)"
+    fi
+    if grep -q '"allow_self_registration"' "$no_smtp_data_dir/config.json"; then
+        fail "no-smtp config.json should not contain allow_self_registration (lives inside dashboard_auth, which is omitted)"
+    fi
+    [ -f "$no_smtp_state" ] || fail "no-smtp state file was not written"
+    grep -q '^ENABLE_SMTP=false$' "$no_smtp_state" \
+        || fail "no-smtp state file missing ENABLE_SMTP=false"
+    grep -q '^ALLOW_SELF_REGISTRATION=false$' "$no_smtp_state" \
+        || fail "no-smtp state file should record ALLOW_SELF_REGISTRATION=false even when omitted from the config (regression: the validator used to fail on empty value)"
+
+    # ── Test: ENABLE_SMTP=false ignores any pre-set ALLOW_SELF_REGISTRATION=true.
+    # If a previous run had SMTP on and self-registration on, switching SMTP
+    # off must coerce self-reg back to false — leaving it true would persist
+    # a flag that has no working delivery mechanism.
+    local no_smtp_force_config="$test_root/no-smtp-force.env"
+    cat >"$no_smtp_force_config" <<'EOF'
+TUNNEL_DOMAIN=octos.example.com
+FRPS_SERVER=relay.octos.example.com
+ENABLE_HTTPS=false
+ENABLE_SMTP=false
+ALLOW_SELF_REGISTRATION=true
+AUTH_TOKEN=test-auth-token
+FRPS_TOKEN=test-shared-frps-token
+EOF
+    local no_smtp_force_state="$test_root/no-smtp-force-bootstrap.env"
+    local no_smtp_force_out="$test_root/no-smtp-force.out"
+    bash "$CLOUD_DEPLOY" \
+        --config "$no_smtp_force_config" \
+        --non-interactive \
+        --dry-run \
+        --data-dir "$test_root/home-nosmtp-force/.octos" \
+        --prefix "$test_root/home-nosmtp-force/.octos/bin" \
+        --state-file "$no_smtp_force_state" \
+        >"$no_smtp_force_out" 2>&1 \
+        || fail "ENABLE_SMTP=false with ALLOW_SELF_REGISTRATION=true should still succeed"
+    grep -q '^ALLOW_SELF_REGISTRATION=false$' "$no_smtp_force_state" \
+        || fail "ENABLE_SMTP=false should coerce ALLOW_SELF_REGISTRATION to false in state, even when the config explicitly set it to true"
 
     # ── Test: missing SMTP_PASSWORD fails early with clear message ───────
     local no_smtp_secret_config="$test_root/no-smtp-secret.env"

@@ -33,9 +33,6 @@ cargo install --path crates/octos-cli
 # 启用消息渠道
 cargo install --path crates/octos-cli --features telegram,discord,slack,whatsapp,feishu,email,wecom
 
-# 启用浏览器自动化（需要 Chrome/Chromium）
-cargo install --path crates/octos-cli --features browser
-
 # 启用 Web 界面和 REST API
 cargo install --path crates/octos-cli --features api
 
@@ -70,6 +67,10 @@ octos --version
 - 如果你希望保留同一个公网地址，尽量不要使用只适合当前临时状态的一次性名称。
 
 ## 各平台安装指南
+
+### NixOS
+
+如果你使用 Nix，Octos 提供了包含软件包、开发环境以及 NixOS / nix-darwin 模块的 Flake。详见 [Nix](nix.md) 页面。
 
 ### macOS
 
