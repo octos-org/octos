@@ -207,17 +207,23 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         description: "Repository / code reviewer. Walks the diff and emits structured findings; \
                       does not mutate workspace files.",
         // Reviewers READ files, search, and may fetch reference docs.
-        // Explicit `read_file` + `recall_memory` instead of `group:fs`
-        // / `group:memory` because those groups expand to mutating
-        // tools (`write_file`, `apply_patch`, `edit_file`,
-        // `save_memory`) the role doc/prompt promises NOT to grant.
-        // No write/edit, no shell, no spawning further children.
+        // Every entry below is either an exact read-only tool name or
+        // a group that contains ONLY read-only tools — because if a
+        // future caller pipes `allowed_tools` straight into
+        // `ToolPolicy.allow`, group expansion would silently grant
+        // every member tool. The set below deliberately excludes:
+        // `group:fs` (`write_file`/`edit_file`/...), `group:memory`
+        // (`save_memory`), `group:web` (`browser` persists
+        // screenshots), and `group:research` (`deep_crawl` /
+        // `search` persist crawled pages and research dirs to disk).
+        // Reviewers stay strictly stateless.
         allowed_tools: &[
             "read_file",
             "group:search",
-            "group:web",
+            "web_search",
+            "web_fetch",
             "recall_memory",
-            "group:research",
+            "synthesize_research",
         ],
         default_sandbox_mode: SANDBOX_NONE,
         default_approval_policy: APPROVAL_NEVER,
@@ -281,16 +287,20 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         display_name: "Explorer",
         description: "Read-only codebase analyst. Gathers context (files, call sites, prior \
                       art) for an upstream planner; never mutates state.",
-        // Explorers are STRICTLY READ-ONLY. Explicit `read_file`
-        // (NOT `group:fs`) + search + web + research. No runtime, no
-        // sessions, no memory writes — `recall_memory` only, not the
-        // `group:memory` group that would smuggle in `save_memory`.
+        // Explorers are STRICTLY READ-ONLY. Same caveats as reviewer:
+        // every entry is either an exact read-only tool name or a
+        // group containing only read-only tools. `group:web` is NOT
+        // used (browser persists screenshots); `group:research` is
+        // NOT used (deep_crawl / search persist crawled pages). The
+        // explorer can still fetch a page via `web_fetch` and
+        // summarise via `synthesize_research` without writing files.
         allowed_tools: &[
             "read_file",
             "group:search",
-            "group:web",
+            "web_search",
+            "web_fetch",
             "recall_memory",
-            "group:research",
+            "synthesize_research",
         ],
         default_sandbox_mode: SANDBOX_NONE,
         default_approval_policy: APPROVAL_NEVER,
@@ -360,15 +370,26 @@ mod tests {
         // Permitted: explicit read tools + non-mutating groups only.
         assert!(tpl.permits("read_file"));
         assert!(tpl.permits("group:search"));
+        assert!(tpl.permits("web_search"));
+        assert!(tpl.permits("web_fetch"));
         assert!(tpl.permits("recall_memory"));
-        // Denied: every mutating group + every runtime/sessions group.
+        assert!(tpl.permits("synthesize_research"));
+        // Denied: every mutating group AND every group that contains
+        // at least one disk-writing tool. The reviewer prompt promises
+        // "do not edit files, do not run the test suite, do not spawn
+        // further agents" — group expansion would silently smuggle in
+        // write tools that violate the promise.
         assert!(!tpl.permits("group:fs"));
         assert!(!tpl.permits("group:memory"));
         assert!(!tpl.permits("group:runtime"));
         assert!(!tpl.permits("group:sessions"));
+        assert!(!tpl.permits("group:web"));
+        assert!(!tpl.permits("group:research"));
         assert!(!tpl.permits("save_memory"));
         assert!(!tpl.permits("write_file"));
         assert!(!tpl.permits("edit_file"));
+        assert!(!tpl.permits("browser"));
+        assert!(!tpl.permits("deep_crawl"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_NONE);
         assert_eq!(tpl.default_approval_policy, APPROVAL_NEVER);
         assert_eq!(tpl.model_preference, ModelPreference::Coding);
@@ -386,7 +407,9 @@ mod tests {
         assert!(tpl.permits("group:fs"));
         assert!(tpl.permits("group:runtime"));
         assert!(tpl.permits("group:sessions"));
+        assert!(tpl.permits("group:memory"));
         assert!(!tpl.permits("group:research"));
+        assert!(!tpl.permits("group:web"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_AUTO);
         assert_eq!(tpl.default_approval_policy, APPROVAL_ASK);
         assert_eq!(tpl.model_preference, ModelPreference::Coding);
@@ -423,13 +446,20 @@ mod tests {
         let tpl = RoleTemplate::for_name(ROLE_EXPLORER).expect("explorer must be registered");
         assert!(tpl.permits("read_file"));
         assert!(tpl.permits("group:search"));
+        assert!(tpl.permits("web_search"));
+        assert!(tpl.permits("web_fetch"));
         assert!(tpl.permits("recall_memory"));
+        assert!(tpl.permits("synthesize_research"));
         assert!(!tpl.permits("group:fs"));
         assert!(!tpl.permits("group:memory"));
         assert!(!tpl.permits("group:runtime"));
         assert!(!tpl.permits("group:sessions"));
+        assert!(!tpl.permits("group:web"));
+        assert!(!tpl.permits("group:research"));
         assert!(!tpl.permits("save_memory"));
         assert!(!tpl.permits("write_file"));
+        assert!(!tpl.permits("browser"));
+        assert!(!tpl.permits("deep_crawl"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_NONE);
         assert_eq!(tpl.default_approval_policy, APPROVAL_NEVER);
         assert_eq!(tpl.model_preference, ModelPreference::Cheap);
@@ -437,28 +467,42 @@ mod tests {
 
     /// Safety guard (post codex review): roles whose `prompt_prefix`
     /// promises "do not edit" / "never mutates state" must not
-    /// transitively grant a mutating tool through a coarse group
-    /// (`group:fs`, `group:memory`). This is the property the codex
-    /// P1 review flagged: a read-only role docs / sandbox-none /
-    /// approval-never config paired with `group:fs` in the budget
-    /// silently grants `write_file` / `edit_file` / `apply_patch` /
-    /// `diff_edit` once the registry is wired into `ToolPolicy.allow`.
+    /// transitively grant a mutating tool through a coarse group.
+    /// The set below covers every `tools::policy::TOOL_GROUPS` entry
+    /// whose expansion contains at least one tool that writes to
+    /// disk, mutates session/profile state, or spawns further work:
+    ///
+    /// - `group:fs` -> write_file / apply_patch / edit_file / diff_edit
+    /// - `group:memory` -> save_memory
+    /// - `group:runtime` -> shell / exec_command / write_stdin
+    /// - `group:sessions` -> spawn / spawn_agent / ...
+    /// - `group:admin` -> manage_skills / configure_tool / model_check
+    /// - `group:media` -> mofa_* / fm_tts (write generated media)
+    /// - `group:web` -> browser (persists screenshots to disk)
+    /// - `group:research` -> deep_crawl / search (persist crawled pages)
+    ///
+    /// Read-only roles (`reviewer`, `explorer`) MUST advertise none
+    /// of these; `test_worker` is allowed `group:runtime` because
+    /// running commands IS the role's job. This catches the codex P1
+    /// (smuggling `group:fs` into a non-mutating role) and the
+    /// follow-up codex P2 (`group:research` / `group:web` smuggling
+    /// in `deep_crawl` / `browser` disk writes).
     #[test]
     fn read_only_roles_do_not_advertise_mutating_groups() {
-        const MUTATING_GROUPS: &[&str] = &[
+        const ALL_MUTATING_GROUPS: &[&str] = &[
             "group:fs",
             "group:memory",
             "group:runtime",
             "group:sessions",
             "group:admin",
             "group:media",
+            "group:web",
+            "group:research",
         ];
-        // Explorer, reviewer, and test_worker are documented as
-        // non-edit roles. (test_worker DOES need runtime — that's the
-        // role's job — so we check it separately below.)
+        // Reviewer + explorer are documented as fully read-only.
         for name in [ROLE_REVIEWER, ROLE_EXPLORER] {
             let tpl = RoleTemplate::for_name(name).unwrap();
-            for group in MUTATING_GROUPS {
+            for group in ALL_MUTATING_GROUPS {
                 assert!(
                     !tpl.permits(group),
                     "{name} advertises mutating group {group:?} but its prompt_prefix \
@@ -466,21 +510,18 @@ mod tests {
                 );
             }
         }
-        // test_worker is allowed `group:runtime` (it's the role's
-        // job to run commands) but MUST NOT advertise mutating fs /
-        // memory groups.
+        // test_worker is allowed `group:runtime` (running commands
+        // IS the role's job) but MUST NOT advertise any other
+        // mutating group.
         let test_worker = RoleTemplate::for_name(ROLE_TEST_WORKER).unwrap();
-        for group in [
-            "group:fs",
-            "group:memory",
-            "group:sessions",
-            "group:admin",
-            "group:media",
-        ] {
+        for group in ALL_MUTATING_GROUPS {
+            if *group == "group:runtime" {
+                continue;
+            }
             assert!(
                 !test_worker.permits(group),
                 "test_worker advertises mutating group {group:?} but the role docs forbid \
-                 editing source files",
+                 anything beyond running test/lint/build commands",
             );
         }
     }
