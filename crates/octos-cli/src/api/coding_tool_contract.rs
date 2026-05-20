@@ -32,6 +32,30 @@ pub(crate) const CODING_EXEC_SESSION_CAPABILITY_V1: &str = "coding.exec_session.
 pub(crate) const CODING_PLAN_TOOL_CAPABILITY_V1: &str = "coding.plan_tool.v1";
 pub(crate) const CODING_USER_INPUT_TOOL_CAPABILITY_V1: &str = "coding.user_input_tool.v1";
 pub(crate) const CODING_SUBAGENT_ALIASES_CAPABILITY_V1: &str = "coding.subagent_aliases.v1";
+// Optional capabilities declared by UPCR-2026-020 §3 that have no canonical
+// P0 tool yet. The constants exist so the protocol vocabulary is single-
+// sourced; an actual server advertises them only when the underlying
+// feature is wired (see UPCR §5 "Capability-gated fields must be omitted
+// when the corresponding capability is not negotiated").
+#[allow(dead_code)]
+pub(crate) const CODING_IMAGE_VIEW_CAPABILITY_V1: &str = "coding.image_view.v1";
+#[allow(dead_code)]
+pub(crate) const CODING_DYNAMIC_TOOL_SEARCH_CAPABILITY_V1: &str = "coding.dynamic_tool_search.v1";
+#[allow(dead_code)]
+pub(crate) const CODING_IMAGE_GENERATION_CAPABILITY_V1: &str = "coding.image_generation.v1";
+
+// UPCR-2026-020 §8 typed error kinds. Used in structured RpcError `data.kind`
+// fields when the corresponding failure mode is hit. Declared centrally so
+// callers and tests agree on the wire strings; not all are emitted yet, see
+// #970 for the wiring work.
+#[allow(dead_code)]
+pub(crate) const ERROR_KIND_TOOL_CONTRACT_UNAVAILABLE: &str = "tool_contract_unavailable";
+#[allow(dead_code)]
+pub(crate) const ERROR_KIND_CODING_TOOL_DENIED: &str = "coding_tool_denied";
+#[allow(dead_code)]
+pub(crate) const ERROR_KIND_CODING_TOOL_MISSING: &str = "coding_tool_missing";
+#[allow(dead_code)]
+pub(crate) const ERROR_KIND_EXEC_SESSION_UNKNOWN: &str = "exec_session_unknown";
 
 pub(crate) const CODING_P0_REQUIRED_TOOL_NAMES: &[&str] = &[
     "apply_patch",
@@ -741,6 +765,45 @@ fn first_present<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #970 — protocol vocabulary smoke test. Pins the wire strings of the
+    /// UPCR-2026-020 optional capability flags and typed error kinds so a
+    /// future rename (`coding.image_generation.v1` -> `…image_gen.v1`,
+    /// `coding_tool_denied` -> `tool_denied`, etc.) becomes a compile-time
+    /// diff against the spec instead of a silent break.
+    #[test]
+    fn upcr_2026_020_vocabulary_matches_spec_strings() {
+        // Optional capability flags (UPCR §3).
+        assert_eq!(CODING_PATCH_TOOL_CAPABILITY_V1, "coding.patch_tool.v1");
+        assert_eq!(CODING_EXEC_SESSION_CAPABILITY_V1, "coding.exec_session.v1");
+        assert_eq!(CODING_PLAN_TOOL_CAPABILITY_V1, "coding.plan_tool.v1");
+        assert_eq!(
+            CODING_USER_INPUT_TOOL_CAPABILITY_V1,
+            "coding.user_input_tool.v1"
+        );
+        assert_eq!(
+            CODING_SUBAGENT_ALIASES_CAPABILITY_V1,
+            "coding.subagent_aliases.v1"
+        );
+        assert_eq!(CODING_IMAGE_VIEW_CAPABILITY_V1, "coding.image_view.v1");
+        assert_eq!(
+            CODING_DYNAMIC_TOOL_SEARCH_CAPABILITY_V1,
+            "coding.dynamic_tool_search.v1"
+        );
+        assert_eq!(
+            CODING_IMAGE_GENERATION_CAPABILITY_V1,
+            "coding.image_generation.v1"
+        );
+
+        // Typed error kinds (UPCR §8).
+        assert_eq!(
+            ERROR_KIND_TOOL_CONTRACT_UNAVAILABLE,
+            "tool_contract_unavailable"
+        );
+        assert_eq!(ERROR_KIND_CODING_TOOL_DENIED, "coding_tool_denied");
+        assert_eq!(ERROR_KIND_CODING_TOOL_MISSING, "coding_tool_missing");
+        assert_eq!(ERROR_KIND_EXEC_SESSION_UNKNOWN, "exec_session_unknown");
+    }
 
     fn required_tool<'a>(contract: &'a Value, name: &str) -> &'a Value {
         contract["required_tools"]
