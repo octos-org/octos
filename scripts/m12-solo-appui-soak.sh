@@ -49,6 +49,83 @@ The live runner captures, per transport:
 USAGE
 }
 
+scrub_secrets() {
+  # #1024 parity — seed_profile_runtime_config writes the operator's
+  # provider API key into $data_dir/profiles/$profile_id.json. The
+  # captured server.log and probe transcripts may also surface it.
+  # Walk the artifact and runtime trees, redact provider key shapes,
+  # and emit a secret-scan-report.txt next to the soak evidence.
+  node - "$artifact_dir" "$data_dir" "$runtime_root" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const roots = process.argv.slice(2);
+
+const patterns = [
+  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g,
+  /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g,
+  /AIza[0-9A-Za-z_\-]{30,}/g,
+  /AC[0-9a-f]{32}/g,
+  /Bearer [A-Za-z0-9._\-]{32,}/g,
+];
+
+const scanExtensions = /\.(json|jsonl|log|txt|md|env|sh|mjs|yaml|yml|toml|conf|ini)$/i;
+const skipDirs = new Set(['.git', 'node_modules', 'target', '__pycache__']);
+
+const report = [];
+let totalRedactions = 0;
+let filesScanned = 0;
+
+function redact(text) {
+  let next = text;
+  let count = 0;
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    next = next.replace(pattern, () => { count += 1; return '<redacted>'; });
+  }
+  return { next, count };
+}
+
+function walk(p) {
+  if (!p || !fs.existsSync(p)) return;
+  const st = fs.statSync(p);
+  if (st.isDirectory()) {
+    for (const name of fs.readdirSync(p)) {
+      if (skipDirs.has(name)) continue;
+      walk(path.join(p, name));
+    }
+    return;
+  }
+  if (!scanExtensions.test(p)) return;
+  filesScanned += 1;
+  let text;
+  try { text = fs.readFileSync(p, 'utf8'); } catch { return; }
+  const { next, count } = redact(text);
+  if (count > 0) {
+    fs.writeFileSync(p, next);
+    report.push({ path: p, count });
+    totalRedactions += count;
+  }
+}
+
+for (const root of roots) walk(root);
+
+const evidenceRoot = roots[0];
+if (evidenceRoot && fs.existsSync(evidenceRoot)) {
+  const lines = [
+    '# M12 solo AppUI soak secret-scan report',
+    `roots: ${roots.join(', ')}`,
+    `files_scanned: ${filesScanned}`,
+    `total_redactions: ${totalRedactions}`,
+    '',
+    ...report.map((e) => `${e.count}\t${e.path}`),
+  ];
+  try {
+    fs.writeFileSync(path.join(evidenceRoot, 'secret-scan-report.txt'), `${lines.join('\n')}\n`);
+  } catch { /* don't crash the trap */ }
+}
+NODE
+}
+
 seed_profile_runtime_config() {
   mkdir -p "$data_dir/profiles"
   local profile_path="$data_dir/profiles/$profile_id.json"
@@ -215,6 +292,11 @@ run_fixture() {
 run_all() {
   require_node
   mkdir -p "$artifact_dir" "$workspace" "$data_dir" "$logs_dir"
+  # #1024 parity — register the scrub BEFORE any provider key is
+  # written by seed_profile_runtime_config, and fire on signals so a
+  # Ctrl-C between server start and validator still leaves a clean
+  # evidence tree.
+  trap scrub_secrets EXIT INT TERM
   case "$transport" in
     ws) run_ws ;;
     stdio) run_stdio ;;
