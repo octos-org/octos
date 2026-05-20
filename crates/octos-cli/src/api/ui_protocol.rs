@@ -22572,6 +22572,11 @@ mod tests {
             session_key: Some("local:test".into()),
             tool_input: None,
             originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }
     }
 

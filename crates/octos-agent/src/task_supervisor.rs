@@ -236,6 +236,38 @@ pub struct BackgroundTask {
     /// still deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub originating_client_message_id: Option<String>,
+
+    // ── #966 / M13-B projection fields ──────────────────────────────
+    // The AppUI TaskListEntry already accepts these optional fields
+    // (see octos-cli `TaskListProjection`); populating them here at
+    // register-time threads them into `task/list` and `task/updated`
+    // payloads so clients can render bounded child-task UX without
+    // probing free-form text. All five use `#[serde(default)]` so
+    // pre-M13-B persisted snapshots still deserialize as None.
+    /// Origin of this task: `"model"` (LLM scheduled via
+    /// spawn_agent/spawn/delegate), `"supervisor"` (backend), or
+    /// `"user"` (rare).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Role label assigned at spawn — mirrors M14-C role templates
+    /// (`"reviewer"`, `"implementer"`, `"test_worker"`, `"explorer"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Bounded summary capsule mirroring ChildResultSummary.summary
+    /// for terminal children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Number of artifacts emitted so far so UX can badge tasks
+    /// without resolving task/artifact/list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    /// Effective runtime policy stamp captured at spawn — clients
+    /// rendering reconnect hydration should display the stamp the
+    /// task originally announced, not the current session policy.
+    /// Stored as raw JSON so the agent crate doesn't depend on the
+    /// AppUI `runtime_policy_stamp` schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<Value>,
 }
 
 impl BackgroundTask {
@@ -1207,6 +1239,17 @@ impl TaskSupervisor {
             session_key: session_key.map(|s| s.to_string()),
             tool_input,
             originating_client_message_id,
+            // #966 / M13-B — set None at register time. Callers that
+            // know the spawn source/role (model vs supervisor, role
+            // template, runtime policy stamp) populate via the new
+            // `with_m13b_projection(...)` setter immediately after
+            // `register_*`. Future supervisor refactors can thread
+            // these through register_* directly when convenient.
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         };
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         tasks.insert(id.clone(), task);
@@ -1221,6 +1264,69 @@ impl TaskSupervisor {
             },
         );
         Ok(id)
+    }
+
+    /// #966 / M13-B — attach the projection metadata (origin, role,
+    /// summary, artifact count, runtime policy stamp) to an already-
+    /// registered task. Designed for callers who already know how to
+    /// derive each piece at spawn time but want to avoid expanding
+    /// every `register_*` signature with five new optional args.
+    /// Pass `None` for any field whose value is not yet known; the
+    /// underlying [`BackgroundTask`] keeps any already-populated value
+    /// when the corresponding argument is `None`.
+    pub fn set_m13b_projection(
+        &self,
+        task_id: &str,
+        source: Option<String>,
+        role: Option<String>,
+        summary: Option<String>,
+        artifact_count: Option<u32>,
+        runtime_policy_stamp: Option<Value>,
+    ) {
+        // Codex P2 fix: also persist + notify + emit_progress so the
+        // reconnect-hydration and `task/updated` subscribers actually
+        // observe the new metadata. Without this the projection fields
+        // sit in-memory until some unrelated state change fires the
+        // callbacks. Mirror the persist/notify/emit pattern used by
+        // mark_running / mark_completed / cancel.
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            let mut changed = false;
+            if source.is_some() {
+                task.source = source;
+                changed = true;
+            }
+            if role.is_some() {
+                task.role = role;
+                changed = true;
+            }
+            if summary.is_some() {
+                task.summary = summary;
+                changed = true;
+            }
+            if artifact_count.is_some() {
+                task.artifact_count = artifact_count;
+                changed = true;
+            }
+            if runtime_policy_stamp.is_some() {
+                task.runtime_policy_stamp = runtime_policy_stamp;
+                changed = true;
+            }
+            if !changed {
+                return;
+            }
+            // Stamp updated_at so reconnect hydration / dashboards see
+            // the projection update even when no lifecycle transition
+            // fires.
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
+        self.emit_progress_for_state(&snapshot);
     }
 
     /// Attach (or replace) the tool input for an already-registered task.
@@ -1786,6 +1892,132 @@ mod tests {
         assert!(tasks[0].child_failure_action.is_none());
         assert!(tasks[0].completed_at.is_none());
         assert!(tasks[0].updated_at >= tasks[0].started_at);
+    }
+
+    /// #966 / M13-B — the projection setter populates the new
+    /// optional fields. Verifies that:
+    /// - Newly-registered tasks start with all five fields None.
+    /// - `set_m13b_projection` overwrites the fields that were
+    ///   supplied as Some and leaves the rest untouched.
+    /// - The persisted JSON round-trips through serde and the
+    ///   default-omitted fields stay invisible until populated.
+    #[test]
+    fn set_m13b_projection_populates_optional_fields() {
+        use serde_json::json;
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("tts", "call-m13b", None);
+
+        let initial = supervisor.get_task(&id).expect("task");
+        assert!(initial.source.is_none());
+        assert!(initial.role.is_none());
+        assert!(initial.summary.is_none());
+        assert!(initial.artifact_count.is_none());
+        assert!(initial.runtime_policy_stamp.is_none());
+
+        supervisor.set_m13b_projection(
+            &id,
+            Some("model".into()),
+            Some("reviewer".into()),
+            Some("found 1 issue".into()),
+            Some(2),
+            Some(json!({ "approval_policy": "on-request" })),
+        );
+
+        let updated = supervisor.get_task(&id).expect("task");
+        assert_eq!(updated.source.as_deref(), Some("model"));
+        assert_eq!(updated.role.as_deref(), Some("reviewer"));
+        assert_eq!(updated.summary.as_deref(), Some("found 1 issue"));
+        assert_eq!(updated.artifact_count, Some(2));
+        assert_eq!(
+            updated.runtime_policy_stamp,
+            Some(json!({ "approval_policy": "on-request" }))
+        );
+
+        // Partial update — only the artifact_count moves; the rest stay.
+        supervisor.set_m13b_projection(&id, None, None, None, Some(5), None);
+        let after_partial = supervisor.get_task(&id).expect("task");
+        assert_eq!(after_partial.source.as_deref(), Some("model"));
+        assert_eq!(after_partial.role.as_deref(), Some("reviewer"));
+        assert_eq!(after_partial.artifact_count, Some(5));
+
+        // Wire-shape: legacy snapshots without the fields round-trip
+        // cleanly thanks to `#[serde(default)]`, AND newly-populated
+        // ones surface every field.
+        let json_form = serde_json::to_value(&after_partial).unwrap();
+        assert_eq!(json_form["source"], "model");
+        assert_eq!(json_form["role"], "reviewer");
+        assert_eq!(json_form["summary"], "found 1 issue");
+        assert_eq!(json_form["artifact_count"], 5);
+
+        let bare = supervisor.register("podcast_generate", "call-bare", None);
+        let bare_json = serde_json::to_value(supervisor.get_task(&bare).unwrap()).unwrap();
+        assert!(bare_json.as_object().unwrap().get("source").is_none());
+        assert!(
+            bare_json
+                .as_object()
+                .unwrap()
+                .get("artifact_count")
+                .is_none()
+        );
+    }
+
+    /// Codex P2 fix: `set_m13b_projection` must persist + notify so
+    /// reconnect hydration and `task/updated` subscribers observe the
+    /// new metadata without waiting for an unrelated lifecycle event.
+    /// Pins the on_change callback firing AND `updated_at` advancing.
+    #[test]
+    fn set_m13b_projection_fires_on_change_and_bumps_updated_at() {
+        use std::sync::{Arc, Mutex};
+
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("tts", "call-m13b-notify", None);
+        let before = supervisor.get_task(&id).expect("task").updated_at;
+
+        let notifications: Arc<Mutex<Vec<BackgroundTask>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notifications);
+        supervisor.set_on_change(move |task: &BackgroundTask| {
+            sink.lock().unwrap().push(task.clone());
+        });
+
+        // Sleep so updated_at is observably greater than registered_at.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        supervisor.set_m13b_projection(
+            &id,
+            Some("model".into()),
+            Some("reviewer".into()),
+            None,
+            None,
+            None,
+        );
+
+        let updated = supervisor.get_task(&id).expect("task");
+        assert!(
+            updated.updated_at > before,
+            "set_m13b_projection must bump updated_at; before={before:?} after={:?}",
+            updated.updated_at
+        );
+
+        let observed_len = notifications.lock().unwrap().len();
+        assert_eq!(observed_len, 1, "on_change should fire exactly once");
+        let event = notifications.lock().unwrap()[0].clone();
+        assert_eq!(event.source.as_deref(), Some("model"));
+        assert_eq!(event.role.as_deref(), Some("reviewer"));
+
+        // No-op call (every arg None) must NOT fire the callback or
+        // bump updated_at — defensive, avoids spurious update spam.
+        let after_change = updated.updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        supervisor.set_m13b_projection(&id, None, None, None, None, None);
+        let after_noop = supervisor.get_task(&id).expect("task");
+        assert_eq!(
+            after_noop.updated_at, after_change,
+            "no-op call must NOT bump updated_at"
+        );
+        assert_eq!(
+            notifications.lock().unwrap().len(),
+            1,
+            "no-op call must NOT fire on_change"
+        );
     }
 
     #[test]

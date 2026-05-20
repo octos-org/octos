@@ -4046,6 +4046,11 @@ mod tests {
             session_key: Some(session_id.to_string()),
             tool_input: Some(json!({"task": "review"})),
             originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         };
 
         let (mirrored_session, agent) =

@@ -495,14 +495,39 @@ pub(crate) fn background_task_to_progress_json(task: &octos_agent::BackgroundTas
     // mapper below threads it onto `TaskUpdatedEvent`. The client uses
     // the wire-side mapping instead of racing a `task/updated` watcher
     // to build `task_id → tool_call_id` post-hoc.
-    json!({
+    //
+    // Codex P2 follow-up (#1113): the M13-B projection fields
+    // (source/role/summary/artifact_count/runtime_policy_stamp) live
+    // on `BackgroundTask` after `set_m13b_projection` runs, but the
+    // live `task/updated` JSON used to drop them, so connected
+    // subscribers had to refresh `task/list` to see the metadata.
+    // Include them here so the live wire matches the snapshot view.
+    let mut payload = json!({
         "type": "task_updated",
         "task_id": task.id,
         "tool_call_id": task.tool_call_id,
         "title": task.tool_name,
         "state": task.lifecycle_state(),
         "runtime_detail": stable_task_runtime_detail(task),
-    })
+    });
+    if let Value::Object(obj) = &mut payload {
+        if let Some(source) = task.source.as_ref() {
+            obj.insert("source".into(), json!(source));
+        }
+        if let Some(role) = task.role.as_ref() {
+            obj.insert("role".into(), json!(role));
+        }
+        if let Some(summary) = task.summary.as_ref() {
+            obj.insert("summary".into(), json!(summary));
+        }
+        if let Some(count) = task.artifact_count {
+            obj.insert("artifact_count".into(), json!(count));
+        }
+        if let Some(stamp) = task.runtime_policy_stamp.as_ref() {
+            obj.insert("runtime_policy_stamp".into(), stamp.clone());
+        }
+    }
+    payload
 }
 
 fn stable_task_runtime_detail(task: &octos_agent::BackgroundTask) -> Option<String> {
@@ -983,6 +1008,11 @@ mod tests {
             session_key: Some("local:demo".into()),
             tool_input: None,
             originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         };
 
         let event = background_task_to_progress_json(&task);
@@ -991,5 +1021,94 @@ mod tests {
         assert_eq!(event["title"], "search");
         assert_eq!(event["state"], "verifying");
         assert_eq!(event["runtime_detail"], "Writing report");
+    }
+
+    /// #1113 codex P2 follow-up: when `set_m13b_projection` populates
+    /// the source/role/summary/artifact_count/runtime_policy_stamp
+    /// fields, the live `task/updated` JSON used to drop them, leaving
+    /// connected subscribers to refresh `task/list` to see the
+    /// metadata. Pin that the live JSON now carries the projection
+    /// fields when they're populated, AND that unset fields stay
+    /// absent (no `null` leakage that would clobber a prior value).
+    #[test]
+    fn background_task_progress_json_carries_m13b_projection_fields() {
+        let task = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000004".into(),
+            tool_name: "review".into(),
+            tool_call_id: "call-r".into(),
+            parent_session_key: Some("local:demo".into()),
+            child_session_key: Some("local:demo#child-r".into()),
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::ExecutingTool,
+            runtime_detail: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: Some("local:demo".into()),
+            tool_input: None,
+            originating_client_message_id: None,
+            source: Some("model".into()),
+            role: Some("reviewer".into()),
+            summary: Some("found 1 issue".into()),
+            artifact_count: Some(2),
+            runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+        };
+
+        let event = background_task_to_progress_json(&task);
+        assert_eq!(event["source"], "model");
+        assert_eq!(event["role"], "reviewer");
+        assert_eq!(event["summary"], "found 1 issue");
+        assert_eq!(event["artifact_count"], 2);
+        assert_eq!(
+            event["runtime_policy_stamp"]["approval_policy"],
+            "on-request"
+        );
+
+        // Now exercise the absent-field path — unset fields must NOT
+        // appear (no `null`) so a stale subscriber doesn't observe a
+        // spurious "reset" of fields it had already cached.
+        let bare = octos_agent::BackgroundTask {
+            id: "01900000-0000-7000-8000-000000000005".into(),
+            tool_name: "search".into(),
+            tool_call_id: "call-s".into(),
+            parent_session_key: None,
+            child_session_key: None,
+            child_terminal_state: None,
+            child_join_state: None,
+            child_joined_at: None,
+            child_failure_action: None,
+            task_ledger_path: None,
+            status: octos_agent::TaskStatus::Running,
+            runtime_state: octos_agent::TaskRuntimeState::ExecutingTool,
+            runtime_detail: None,
+            started_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: None,
+            output_files: Vec::new(),
+            error: None,
+            session_key: None,
+            tool_input: None,
+            originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+
+        let bare_event = background_task_to_progress_json(&bare);
+        let obj = bare_event.as_object().expect("object");
+        assert!(!obj.contains_key("source"));
+        assert!(!obj.contains_key("role"));
+        assert!(!obj.contains_key("summary"));
+        assert!(!obj.contains_key("artifact_count"));
+        assert!(!obj.contains_key("runtime_policy_stamp"));
     }
 }
