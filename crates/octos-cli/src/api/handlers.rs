@@ -1746,6 +1746,39 @@ async fn read_profile_session_messages(
     None
 }
 
+/// Reject bare `session_id`s that could escape the `users/<id>/workspace`
+/// subtree once joined as a raw path component.
+///
+/// The other candidates in [`api_session_workspace_dirs`] percent-encode
+/// the id via [`octos_bus::session::encode_path_component`], so traversal
+/// bytes (`/`, `\`, `..`, NUL, control chars) are neutralized. The
+/// SPA-bare candidate, however, joins the id verbatim so it lines up with
+/// what SPA writers (`slides-…`, `web-…`, `site-…`) put on disk — which
+/// means a request-supplied id like `../escape`, `/abs`, or `foo/bar`
+/// would land outside the intended profile subtree.
+///
+/// We allow only the alphanumeric + `-` + `_` + `#` alphabet that the SPA
+/// actually uses (`#` separates the optional topic suffix). Anything else
+/// — including `/`, `\`, `:`, `.`, NUL, and any non-ASCII byte — causes
+/// the bare candidate to be skipped. The encoded candidates still cover
+/// the request, so callers don't lose any legitimate lookup capability;
+/// they just don't get the unsafe raw-join shortcut.
+///
+/// Codex P1 follow-up to #1069.
+fn is_bare_path_safe_session_id(session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    // Reject `.` / `..` outright — even surrounded by safe chars, a literal
+    // path component of `..` is unambiguous traversal once joined.
+    if session_id == "." || session_id == ".." {
+        return false;
+    }
+    session_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'#')
+}
+
 fn api_session_workspace_dirs(
     data_dir: &std::path::Path,
     session_id: &str,
@@ -1775,9 +1808,18 @@ fn api_session_workspace_dirs(
     // (live mini3 regression 2026-05-18 for session
     // `slides-1779125959003-ugtbaa`, even though the scaffold itself
     // succeeded server-side and the 3 expected files were on disk).
-    let bare_path = data_dir.join("users").join(session_id).join("workspace");
-    if seen.insert(bare_path.clone()) {
-        dirs.push(bare_path);
+    //
+    // SECURITY: the bare candidate joins `session_id` verbatim, so a
+    // request-supplied id containing `/`, `\`, `..`, or NUL would escape
+    // the intended `users/<id>/workspace` subtree (codex P1 review of
+    // #1069). Gate this candidate behind a strict allowlist; the other
+    // three (percent-encoded) candidates still cover any caller, they
+    // just don't pick up the SPA-bare on-disk shape.
+    if is_bare_path_safe_session_id(session_id) {
+        let bare_path = data_dir.join("users").join(session_id).join("workspace");
+        if seen.insert(bare_path.clone()) {
+            dirs.push(bare_path);
+        }
     }
 
     dirs
@@ -3731,6 +3773,88 @@ mod tests {
             dirs[3],
             base.join("users").join("slides-123").join("workspace")
         );
+    }
+
+    #[test]
+    fn api_session_workspace_dirs_rejects_path_traversal_session_ids() {
+        // Codex P1 follow-up to #1069. The bare-id candidate joins
+        // `session_id` verbatim into `users/<id>/workspace`, so request-
+        // supplied ids that contain `/`, `..`, an absolute path, or
+        // Windows-style `\` must NOT round-trip through this candidate.
+        // The other (percent-encoded) candidates still appear, but the
+        // bare one is dropped, keeping the lookup inside the profile
+        // data dir.
+        let base = std::path::Path::new("/tmp/octos-data/profiles/dspfac/data");
+
+        for bad_id in ["foo/bar", "../escape", "/abs", "foo\\bar", "..", ".", ""] {
+            let dirs = api_session_workspace_dirs(base, bad_id);
+            let users_dir = base.join("users");
+            // The bare candidate must NOT be present — it's the only
+            // one that joins `bad_id` verbatim. Every other candidate
+            // percent-encodes via `encode_path_component`, so traversal
+            // bytes turn into `%XX` sequences and stay inside `users/`.
+            let bare = users_dir.join(bad_id).join("workspace");
+            assert!(
+                !dirs.iter().any(|d| d == &bare),
+                "session_id {bad_id:?} unexpectedly kept the bare-join candidate {bare:?}"
+            );
+            // Defence-in-depth: walk every returned dir and assert no
+            // literal `..` or `.` component leaked through.
+            for dir in &dirs {
+                assert!(
+                    dir.starts_with(&users_dir),
+                    "session_id {bad_id:?} produced dir {dir:?} that escapes {users_dir:?}"
+                );
+                for component in dir
+                    .strip_prefix(&users_dir)
+                    .expect("starts_with checked above")
+                    .components()
+                {
+                    let s = component
+                        .as_os_str()
+                        .to_str()
+                        .expect("ASCII path component");
+                    assert_ne!(
+                        s, "..",
+                        "session_id {bad_id:?} surfaced a literal `..` component in {dir:?}"
+                    );
+                    assert_ne!(
+                        s, ".",
+                        "session_id {bad_id:?} surfaced a literal `.` component in {dir:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_bare_path_safe_session_id_allows_spa_shapes_only() {
+        // Canonical SPA shapes — must pass so live workspaces keep
+        // resolving.
+        assert!(is_bare_path_safe_session_id("slides-1779125959003-ugtbaa"));
+        assert!(is_bare_path_safe_session_id("web-7c9e"));
+        assert!(is_bare_path_safe_session_id("site-abc_42"));
+        assert!(is_bare_path_safe_session_id(
+            "slides-1779125959003-ugtbaa#deck-foo"
+        ));
+
+        // Path-traversal / unsafe shapes must be rejected.
+        assert!(!is_bare_path_safe_session_id("foo/bar"));
+        assert!(!is_bare_path_safe_session_id("../escape"));
+        assert!(!is_bare_path_safe_session_id("/abs"));
+        assert!(!is_bare_path_safe_session_id("foo\\bar"));
+        assert!(!is_bare_path_safe_session_id(".."));
+        assert!(!is_bare_path_safe_session_id("."));
+        assert!(!is_bare_path_safe_session_id(""));
+        // Colon would let an attacker inject a channel-prefix shape
+        // through the raw-join candidate; reject it for consistency
+        // with `is_safe_bare_session_id`.
+        assert!(!is_bare_path_safe_session_id("api:web-7c9e"));
+        // NUL and control bytes must be rejected.
+        assert!(!is_bare_path_safe_session_id("foo\0bar"));
+        assert!(!is_bare_path_safe_session_id("foo\nbar"));
+        // Non-ASCII bytes (could decompose into traversal on some FS).
+        assert!(!is_bare_path_safe_session_id("café"));
     }
 
     #[tokio::test]
