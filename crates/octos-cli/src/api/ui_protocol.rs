@@ -5672,6 +5672,65 @@ async fn raw_profile_llm_test(
     }
 }
 
+async fn raw_profile_llm_fetch_models(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawProfileLlmUpsertParams = parse_raw_params(request)?;
+    let profile_id = raw_profile_id(
+        &RawProfileParams {
+            profile_id: params.profile_id.clone(),
+            session_id: None,
+        },
+        connection_profile_id,
+    );
+    let profile = state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.get(&profile_id).ok().flatten());
+
+    let family_id = nonempty(params.selection.family_id)
+        .ok_or_else(|| RpcError::invalid_params("selection.family_id is required"))?;
+    let base_url = nonempty(params.selection.route.base_url);
+    let api_key_env = nonempty(params.selection.route.api_key_env)
+        .or_else(|| dashboard_family_api_key_env(&family_id));
+
+    let api_key = secret_from_value(params.api_key).or_else(|| {
+        api_key_env
+            .as_ref()
+            .and_then(|env_name| profile.as_ref()?.config.env_vars.get(env_name).cloned())
+    });
+
+    let Some(api_key) = api_key else {
+        return Ok(json!({
+            "profile_id": profile_id,
+            "family_id": family_id,
+            "models": [],
+            "reason": "no_api_key",
+        }));
+    };
+
+    let models =
+        crate::api::admin::fetch_provider_models(&family_id, &api_key, base_url.as_deref())
+            .await
+            .unwrap_or_default();
+    let reason = if models.is_empty() {
+        Some("provider_unavailable")
+    } else {
+        None
+    };
+    let mut result = json!({
+        "profile_id": profile_id,
+        "family_id": family_id,
+        "models": models,
+    });
+    if let (Some(reason), Value::Object(object)) = (reason, &mut result) {
+        object.insert("reason".into(), Value::String(reason.into()));
+    }
+    Ok(result)
+}
+
 fn build_test_llm_provider(
     family_id: &str,
     model_id: &str,
@@ -6169,7 +6228,9 @@ async fn handle_raw_appui_rpc(
                 false,
             ))
         }
-        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => Ok(json!({ "models": [] })),
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS => {
+            raw_profile_llm_fetch_models(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -16792,6 +16853,75 @@ mod tests {
                 .as_str()
                 .is_some_and(|error| error.contains("No API key"))
         );
+    }
+
+    #[tokio::test]
+    async fn profile_llm_fetch_models_without_api_key_returns_no_api_key_reason() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let request = RpcRequest::new(
+            "1",
+            APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            json!({
+                "selection": {
+                    "family_id": "custom",
+                    "route": {
+                        "route_id": "custom",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_type": "openai"
+                    }
+                }
+            }),
+        );
+
+        let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+            .await
+            .expect("fetch_models result");
+
+        assert_eq!(result["profile_id"], json!("ada"));
+        assert_eq!(result["family_id"], json!("custom"));
+        assert_eq!(result["models"], json!([]));
+        assert_eq!(result["reason"], json!("no_api_key"));
+    }
+
+    #[tokio::test]
+    async fn profile_llm_fetch_models_requires_family_id() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let request = RpcRequest::new(
+            "1",
+            APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            json!({ "selection": {} }),
+        );
+        let error = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+            .await
+            .expect_err("missing family_id should error");
+        assert!(error.message.contains("family_id"));
+    }
+
+    #[tokio::test]
+    async fn profile_llm_fetch_models_returns_empty_with_reason_when_provider_unreachable() {
+        let state = Arc::new(AppState::empty_for_tests());
+        let request = RpcRequest::new(
+            "1",
+            APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+            json!({
+                "selection": {
+                    "family_id": "custom",
+                    "route": {
+                        "route_id": "custom",
+                        "base_url": "http://127.0.0.1:1/v1",
+                        "api_type": "openai"
+                    }
+                },
+                "api_key": "sk-fake"
+            }),
+        );
+
+        let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+            .await
+            .expect("fetch_models result");
+
+        assert_eq!(result["models"], json!([]));
+        assert_eq!(result["reason"], json!("provider_unavailable"));
     }
 
     #[tokio::test]

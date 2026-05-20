@@ -805,7 +805,7 @@ pub async fn provider_models(
 }
 
 /// Fetch available models from a provider's /v1/models endpoint.
-async fn fetch_provider_models(
+pub(crate) async fn fetch_provider_models(
     provider: &str,
     api_key: &str,
     base_url: Option<&str>,
