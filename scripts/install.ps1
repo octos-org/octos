@@ -1379,30 +1379,26 @@ $Domain {
     }
 }
 
-https:// {
+https://*.$Domain {
     tls {
         on_demand
     }
 
-    @sub host *.$Domain
+    @api path /api/*
+    @admin path /admin*
+    @auth path /auth/*
 
-    handle @sub {
-        @api path /api/*
-        @admin path /admin*
-        @auth path /auth/*
-
-        handle @api {
-            reverse_proxy $caddyUpstream
-        }
-        handle @admin {
-            reverse_proxy $caddyUpstream
-        }
-        handle @auth {
-            reverse_proxy $caddyUpstream
-        }
-        handle {
-            reverse_proxy $caddyUpstream
-        }
+    handle @api {
+        reverse_proxy $caddyUpstream
+    }
+    handle @admin {
+        reverse_proxy $caddyUpstream
+    }
+    handle @auth {
+        reverse_proxy $caddyUpstream
+    }
+    handle {
+        reverse_proxy $caddyUpstream
     }
 }
 "@ | Set-Content -Path $caddyfile -Encoding UTF8
