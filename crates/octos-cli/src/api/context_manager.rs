@@ -708,6 +708,20 @@ impl ContextManager {
             .with_tool_output_policy(self.tool_output_policy.clone());
         probe.record_message(message);
 
+        // #982: the probe was built from a fresh, empty transcript so its
+        // Tool branch resolved to `tool_name: "unknown"`. Rewrite any
+        // freshly-built `ToolOutput` envelope with the real tool_name
+        // we can look up against `self.items`.
+        for probe_item in probe.items.iter_mut() {
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut probe_item.kind {
+                if envelope.tool_name == "unknown" {
+                    if let Some(real_name) = self.tool_name_for_call_id(&envelope.tool_call_id) {
+                        envelope.tool_name = real_name;
+                    }
+                }
+            }
+        }
+
         let mut ids = Vec::new();
         for probe_item in probe.items {
             if let Some(existing) = self
@@ -784,9 +798,19 @@ impl ContextManager {
             }
             MessageRole::Tool => {
                 if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+                    // #982: resolve the real tool_name from a prior
+                    // AssistantToolCall transcript entry instead of
+                    // burning the placeholder "unknown" into the
+                    // ToolOutputEnvelope. Replay over the persisted
+                    // transcript must reconstruct identical model-visible
+                    // tool output, which means the envelope must carry
+                    // the same tool_name the LLM saw.
+                    let tool_name = self
+                        .tool_name_for_call_id(tool_call_id)
+                        .unwrap_or_else(|| "unknown".to_owned());
                     ids.push(self.record_tool_output_with_source_ref(
                         tool_call_id,
-                        "unknown",
+                        tool_name,
                         &message.content,
                         source_ref.clone(),
                     ));
@@ -794,6 +818,21 @@ impl ContextManager {
             }
         }
         ids
+    }
+
+    /// Walk `self.items` from newest to oldest looking for an
+    /// `AssistantToolCall` matching `tool_call_id`, returning its
+    /// `name` for envelope wiring. #982: lets `MessageRole::Tool`
+    /// recording carry the real tool name into `ToolOutputEnvelope`.
+    fn tool_name_for_call_id(&self, tool_call_id: &str) -> Option<String> {
+        self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::AssistantToolCall { call_id, name, .. }
+                if call_id == tool_call_id =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })
     }
 
     pub(crate) fn record_tool_output(
@@ -1766,6 +1805,88 @@ mod tests {
                 .starts_with("tool-output/sha256:")
         );
         assert!(envelope.raw_sha256.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn tool_output_envelope_inherits_real_tool_name_from_prior_assistant_call() {
+        // #982: recording a Tool MessageRole used to bake the placeholder
+        // tool_name "unknown" into the envelope. The envelope now resolves
+        // the real name from a prior AssistantToolCall transcript entry.
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&assistant_tool_call("call-7"));
+        let tool_message = {
+            let mut message = Message::assistant("");
+            message.role = MessageRole::Tool;
+            message.tool_call_id = Some("call-7".to_owned());
+            message.content = "output for call-7".into();
+            message
+        };
+        manager.record_message(&tool_message);
+
+        let envelope = manager
+            .items()
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ToolOutput { envelope } => Some(envelope),
+                _ => None,
+            })
+            .expect("recorded tool output");
+        assert_eq!(envelope.tool_call_id, "call-7");
+        assert_eq!(envelope.tool_name, "shell");
+    }
+
+    #[test]
+    fn tool_output_envelope_resolves_real_tool_name_through_persisted_merge_path() {
+        // #982: the merging-prompt-equivalent path runs a fresh probe
+        // ContextManager and so cannot resolve the prior AssistantToolCall
+        // on its own. Verify the post-probe patch-up still wires the real
+        // tool_name onto the merged envelope.
+        let mut manager = ContextManager::new("s", None);
+        manager.record_persisted_message(&assistant_tool_call("call-9"), 0);
+
+        let tool_message = {
+            let mut message = Message::assistant("");
+            message.role = MessageRole::Tool;
+            message.tool_call_id = Some("call-9".to_owned());
+            message.content = "merged output for call-9".into();
+            message
+        };
+        manager.record_persisted_message_merging_prompt_equivalent(&tool_message, 1);
+
+        let envelope = manager
+            .items()
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ToolOutput { envelope } => Some(envelope),
+                _ => None,
+            })
+            .expect("persisted merge produced tool output");
+        assert_eq!(envelope.tool_name, "shell");
+    }
+
+    #[test]
+    fn tool_output_envelope_falls_back_to_unknown_without_prior_tool_call() {
+        // #982: when no prior AssistantToolCall is present (orphan tool
+        // message), the envelope still records the output with the
+        // legacy "unknown" name so replay does not lose data.
+        let mut manager = ContextManager::new("s", None);
+        let tool_message = {
+            let mut message = Message::assistant("");
+            message.role = MessageRole::Tool;
+            message.tool_call_id = Some("orphan-call".to_owned());
+            message.content = "orphan output".into();
+            message
+        };
+        manager.record_message(&tool_message);
+        let envelope = manager
+            .items()
+            .iter()
+            .find_map(|item| match &item.kind {
+                TranscriptItemKind::ToolOutput { envelope } => Some(envelope),
+                _ => None,
+            })
+            .expect("orphan tool output");
+        assert_eq!(envelope.tool_name, "unknown");
     }
 
     #[test]
