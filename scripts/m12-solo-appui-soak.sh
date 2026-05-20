@@ -242,6 +242,7 @@ self_test() {
   [ -f "$out_dir/tool-registry-snapshot.json" ] || die "self-test missing tool-registry-snapshot.json"
   [ -f "$out_dir/approval-events.jsonl" ] || die "self-test missing approval-events.jsonl"
   [ -f "$out_dir/filesystem-probe.json" ] || die "self-test missing filesystem-probe.json"
+  [ -f "$out_dir/workspace-contract-status.json" ] || die "self-test missing workspace-contract-status.json"
   if grep -E 'auth/(send_code|verify)' "$out_dir/appui-transcript.jsonl" >/dev/null 2>&1; then
     die "self-test transcript contains OTP method traffic"
   fi
