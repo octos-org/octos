@@ -331,9 +331,9 @@ const roots = process.argv.slice(2);
 
 const patterns = [
   // OpenAI / DeepSeek / generic OpenAI-compatible
-  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g,
+  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9._\-]{20,}/g,
   // Anthropic OAuth bearer tokens (sk-ant-oat01-...)
-  /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g,
+  /sk-ant-oat01-[A-Za-z0-9._\-]{20,}/g,
   // Google Gemini AIza... keys
   /AIza[0-9A-Za-z_\-]{30,}/g,
   // Twilio account/auth pairs
@@ -496,11 +496,19 @@ google: AIzaSyA-1234567890abcdefghijklmnopqrstuv
 TXT
   cat > "$out_dir/anthropic.env" <<TXT
 ANTHROPIC_API_KEY=sk-ant-oat01-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+# codex P1+P3 follow-up to #1089: dotted JWT-shaped OAuth tokens must
+# be scrubbed in full, not just up to the first \`.\` separator. The
+# first JWT segment below is intentionally short so the old (no-\`.\`)
+# regex cannot match the prefix-with-segment as a 20+ char run either;
+# without dot-aware redaction the entire token survives. The residual
+# grep then matches distinctive payload and signature markers so any
+# regression that drops \`.\` from the char class fails this self-test.
+ANTHROPIC_OAUTH_JWT=sk-ant-oat01-jwthdr.octosjwtpayloadABCDEFGH.octosjwtsignatureIJKLMNOP
 TXT
   scrub_secrets
-  if grep -RIEq -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij' "$fixture_root"; then
+  if grep -RIEq -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij|octosjwtpayload|octosjwtsignature' "$fixture_root"; then
     echo "scrub_secrets self-test FAIL: residual secrets in $fixture_root" >&2
-    grep -RIEn -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij' "$fixture_root" || true
+    grep -RIEn -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij|octosjwtpayload|octosjwtsignature' "$fixture_root" || true
     out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
     return 1
   fi
