@@ -494,7 +494,7 @@ impl Agent {
     ) -> bool {
         if !matches!(
             stop,
-            BudgetStop::MaxIterations | BudgetStop::MaxTokens { .. }
+            BudgetStop::MaxIterations { .. } | BudgetStop::MaxTokens { .. }
         ) {
             return false;
         }

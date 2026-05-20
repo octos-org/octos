@@ -12,7 +12,17 @@ use crate::progress::ProgressEvent;
 /// Reason why the agent loop stopped due to budget constraints.
 pub(super) enum BudgetStop {
     Shutdown,
-    MaxIterations,
+    /// The agent reached its per-turn iteration limit (`max_iterations`).
+    ///
+    /// We carry the limit so the user-facing message can name the exact
+    /// number of iterations that elapsed and the user (or downstream
+    /// tool) can recognise this as the iteration-cap path rather than
+    /// the bare "Reached max iterations." stub that pre-2026-05 builds
+    /// emitted. See the silent-failure bug where a missing `run_pipeline`
+    /// pipeline rejection cascaded into ~20 rounds of manual `web_fetch`
+    /// until the loop hit `max_iterations` and persisted only "Reached
+    /// max iterations." as the assistant reply.
+    MaxIterations { limit: u32 },
     MaxTokens { used: u32, limit: u32 },
     ActivityTimeout { limit: Duration },
     IdleProgressTimeout { limit: Duration },
@@ -22,7 +32,25 @@ impl BudgetStop {
     pub(super) fn message(&self) -> String {
         match self {
             Self::Shutdown => String::new(),
-            Self::MaxIterations => "Reached max iterations.".into(),
+            Self::MaxIterations { limit } => {
+                // Surface the iteration count and a concrete hint about
+                // what the user can do next. The previous bare "Reached
+                // max iterations." string left users with no signal
+                // about what the agent was trying to do, whether any
+                // partial work landed, or how to retry. The hint about
+                // `run_pipeline` is intentional — the common path into
+                // this stop is a manual `web_fetch` / `web_search` loop
+                // that should have been a single `run_pipeline` call.
+                format!(
+                    "The agent did not complete within {limit} iterations. \
+                     The task may be too broad for a single turn — try \
+                     breaking it into smaller steps, or, if this was a \
+                     research/multi-step task, ask the agent to use \
+                     `run_pipeline` (deep research) which delegates the \
+                     work to specialised sub-agents instead of iterating \
+                     one tool call at a time."
+                )
+            }
             Self::MaxTokens { used, limit } => {
                 format!("Token budget exceeded ({used} of {limit}).")
             }
@@ -54,7 +82,9 @@ impl Agent {
             return Some(BudgetStop::Shutdown);
         }
         if iteration >= self.config.max_iterations {
-            return Some(BudgetStop::MaxIterations);
+            return Some(BudgetStop::MaxIterations {
+                limit: self.config.max_iterations,
+            });
         }
         let idle_timeout = Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS);
         if activity.has_timed_out(idle_timeout) {
@@ -88,15 +118,10 @@ impl Agent {
                     iterations: iteration,
                 });
             }
-            BudgetStop::MaxIterations => {
-                warn!(
-                    iteration,
-                    max = self.config.max_iterations,
-                    "hit max iterations limit"
-                );
-                self.reporter().report(ProgressEvent::MaxIterationsReached {
-                    limit: self.config.max_iterations,
-                });
+            BudgetStop::MaxIterations { limit } => {
+                warn!(iteration, max = *limit, "hit max iterations limit");
+                self.reporter()
+                    .report(ProgressEvent::MaxIterationsReached { limit: *limit });
             }
             BudgetStop::MaxTokens { used, limit } => {
                 warn!(used, max = limit, "hit token budget limit");
@@ -178,10 +203,44 @@ mod tests {
     }
 
     #[test]
-    fn budget_stop_max_iterations_message() {
-        assert_eq!(
-            BudgetStop::MaxIterations.message(),
-            "Reached max iterations."
+    fn budget_stop_max_iterations_message_surfaces_iteration_count_and_hint() {
+        // Regression: prior to 2026-05 the bare "Reached max iterations."
+        // string was persisted as the assistant reply when the loop hit
+        // its iteration cap. That gave the user no signal about what the
+        // agent was attempting, no way to recognise the iteration-cap
+        // path, and no actionable next step. The fixture below pins the
+        // new message contract: (1) the iteration count is named so the
+        // user can tell whether the cap was 5 or 500, and (2) a hint
+        // about `run_pipeline` is included because the common path into
+        // this stop is an LLM that should have called `run_pipeline`
+        // once, didn't, and burned its iteration budget on manual
+        // `web_fetch` / `web_search` instead.
+        let msg = BudgetStop::MaxIterations { limit: 50 }.message();
+        assert!(
+            msg.contains("50"),
+            "expected iteration count '50' in: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("iteration"),
+            "expected the word 'iteration' in: {msg}"
+        );
+        assert!(
+            msg.contains("run_pipeline"),
+            "expected a hint about 'run_pipeline' (the canonical \
+             multi-step research path) in: {msg}"
+        );
+    }
+
+    #[test]
+    fn budget_stop_max_iterations_message_uses_actual_limit() {
+        // Different iteration caps should surface different numbers.
+        let msg = BudgetStop::MaxIterations { limit: 3 }.message();
+        assert!(msg.contains("3"), "expected '3' in: {msg}");
+        // Sanity: the 50 from the other test must NOT appear when the
+        // limit is 3 — guards against a hardcoded constant slipping in.
+        assert!(
+            !msg.contains("50 iterations") && !msg.contains("50 itr"),
+            "limit must not be hardcoded; got: {msg}"
         );
     }
 
