@@ -1353,7 +1353,15 @@ if ($Domain -and (Test-Command "caddy")) {
 }
 
 :9999 {
-    respond /check 200
+    # On-demand TLS gate. Only the configured apex/subdomains may
+    # trigger ACME issuance — any other SNI returns 403 so Caddy
+    # refuses to ask Let's Encrypt for a cert. This is the security
+    # boundary that prevents arbitrary DNS pointed at this server
+    # from burning ACME rate limits. See codex P1 follow-up to
+    # #380 / #1070.
+    @octos_tls expression ``{query.domain} == "$Domain" || {query.domain}.endsWith(".$Domain")``
+    respond @octos_tls 200
+    respond /check 403
 }
 
 http:// {
@@ -1380,6 +1388,12 @@ $Domain {
 }
 
 https:// {
+    # Site address is intentionally catch-all so Caddy issues per-host
+    # on-demand certs via HTTP/TLS-ALPN challenges (a wildcard site
+    # address would force Caddy to manage a literal *.$Domain subject,
+    # which Let's Encrypt only issues via DNS challenge). The security
+    # boundary is the /check ask endpoint above, which only green-lights
+    # ACME for $Domain and its subdomains.
     tls {
         on_demand
     }
