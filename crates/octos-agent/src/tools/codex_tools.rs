@@ -316,6 +316,12 @@ impl ApplyPatchTool {
         }
 
         let mut modified = Vec::new();
+        // #972 / M14-B — capture a per-section operation summary so the
+        // AppUI diff preview flow can render an "applied X to Y files"
+        // card without round-tripping back through `read_file` to figure
+        // out which paths changed. Each entry mirrors the parsed patch
+        // section: { op: add|update|delete, path }.
+        let mut diff_preview = Vec::new();
         for section in sections {
             let path = match super::resolve_path_with_scope(
                 &self.base_dir,
@@ -331,7 +337,7 @@ impl ApplyPatchTool {
                     });
                 }
             };
-            match section.kind {
+            let op_label = match section.kind {
                 PatchSectionKind::Add => {
                     let content = section
                         .lines
@@ -343,19 +349,23 @@ impl ApplyPatchTool {
                         tokio::fs::create_dir_all(parent).await?;
                     }
                     super::write_no_follow(&path, content.as_bytes()).await?;
+                    "add"
                 }
                 PatchSectionKind::Delete => {
                     tokio::fs::remove_file(&path).await?;
+                    "delete"
                 }
                 PatchSectionKind::Update => {
                     let content = super::read_no_follow(&path).await?;
                     let updated = apply_exact_update_hunks(&content, &section.lines)?;
                     super::write_no_follow(&path, updated.as_bytes()).await?;
+                    "update"
                 }
-            }
+            };
             if let Some(cache) = ctx.file_state_cache.as_ref() {
                 cache.invalidate(&path);
             }
+            diff_preview.push(json!({ "op": op_label, "path": section.path.clone() }));
             modified.push(section.path);
         }
 
@@ -363,6 +373,15 @@ impl ApplyPatchTool {
             output: format!("Applied patch to {}", modified.join(", ")),
             success: true,
             file_modified: modified.first().map(|path| self.base_dir.join(path)),
+            // #972 / M14-B — structured diff preview event consumed by the
+            // AppUI diff flow. `codex_tool = "apply_patch"` matches the
+            // model-visible tool name so the client routing stays uniform
+            // with `update_plan` / `request_user_input`.
+            structured_metadata: Some(json!({
+                "codex_tool": "apply_patch",
+                "diff_preview": diff_preview,
+                "modified_paths": modified,
+            })),
             ..Default::default()
         })
     }
@@ -1490,6 +1509,121 @@ mod tests {
         for name in CODEX_P0 {
             assert!(names.contains(*name), "{name} should be model-visible");
         }
+    }
+
+    /// #972 / M14-B acceptance: `apply_patch` MUST produce a diff
+    /// preview compatible with the AppUI diff flow. The contract is a
+    /// `structured_metadata` envelope with `codex_tool = "apply_patch"`,
+    /// a `diff_preview` array of `{ op, path }` entries (one per parsed
+    /// patch section), and a flat `modified_paths` list the diff panel
+    /// can render without re-parsing the patch envelope.
+    #[tokio::test]
+    async fn apply_patch_emits_diff_preview_structured_metadata() {
+        use std::path::PathBuf;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace: PathBuf = temp.path().to_path_buf();
+        let tool = ApplyPatchTool::new(workspace.clone());
+        // Add a fresh file via the Codex patch envelope.
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: hello.txt\n",
+            "+hello\n",
+            "+world\n",
+            "*** End Patch\n",
+        );
+        let result = tool
+            .execute(&json!({ "patch": patch }))
+            .await
+            .expect("apply_patch ok");
+        assert!(result.success, "apply_patch must succeed on Add File");
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("apply_patch must emit structured_metadata");
+        assert_eq!(meta["codex_tool"], json!("apply_patch"));
+        assert_eq!(meta["modified_paths"], json!(["hello.txt"]));
+        let preview = meta["diff_preview"]
+            .as_array()
+            .expect("diff_preview must be an array");
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0]["op"], json!("add"));
+        assert_eq!(preview[0]["path"], json!("hello.txt"));
+        // Sanity: the file we asked for actually exists with the
+        // intended content (this also guards against the metadata
+        // claim drifting from the underlying write).
+        let contents = std::fs::read_to_string(workspace.join("hello.txt"))
+            .expect("created file must be readable");
+        assert!(contents.contains("hello"));
+        assert!(contents.contains("world"));
+    }
+
+    /// #972 / M14-B acceptance: `update_plan` MUST generate a structured
+    /// UI event so the AppUI layer can render the plan card without
+    /// parsing free-form `output` text. The contract is the
+    /// `structured_metadata` envelope with `codex_tool = "update_plan"`
+    /// and the model-provided plan echoed under `plan`.
+    #[tokio::test]
+    async fn update_plan_emits_structured_metadata_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let tool = registry
+            .get("update_plan")
+            .expect("update_plan tool registered");
+        let plan_args = json!({
+            "plan": [
+                { "id": "p1", "title": "scaffold", "status": "in_progress" },
+                { "id": "p2", "title": "tests", "status": "pending" }
+            ]
+        });
+        let result = tool.execute(&plan_args).await.expect("update_plan ok");
+        assert!(result.success, "update_plan must succeed");
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("update_plan must emit structured_metadata");
+        assert_eq!(meta["codex_tool"], json!("update_plan"));
+        assert_eq!(
+            meta["plan"], plan_args,
+            "echoed plan must match the model-provided arguments"
+        );
+    }
+
+    /// #972 / M14-B acceptance: `request_user_input` MUST generate a
+    /// structured UI event so the AppUI layer can render the user-input
+    /// request without parsing the `output` blob. The contract is the
+    /// `structured_metadata` envelope with `codex_tool = "request_user_input"`,
+    /// the original request echoed under `request`, and a `host_response_channel`
+    /// hint that lets the client tell whether a synchronous response path
+    /// is wired (M14-E live soak scope) or not (current state).
+    #[tokio::test]
+    async fn request_user_input_emits_structured_metadata_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let tool = registry
+            .get("request_user_input")
+            .expect("request_user_input tool registered");
+        let request_args = json!({
+            "prompt": "Pick a deploy target",
+            "choices": ["staging", "prod"],
+        });
+        let result = tool
+            .execute(&request_args)
+            .await
+            .expect("request_user_input ok");
+        assert!(result.success);
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("request_user_input must emit structured_metadata");
+        assert_eq!(meta["codex_tool"], json!("request_user_input"));
+        assert_eq!(
+            meta["request"], request_args,
+            "request payload must round-trip into the structured event"
+        );
+        assert!(
+            meta.get("host_response_channel").is_some(),
+            "structured event must declare host response channel state for the client"
+        );
     }
 
     struct FakeSpawnTool;
