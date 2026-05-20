@@ -884,11 +884,25 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     .as_ref()
                     .is_some_and(|path| artifact.path.as_ref() == Some(path))
         }) {
+            // #967 / M13-C — redact well-known credential patterns from
+            // artifact `content` before returning it to the AppUI client.
+            // The orchestrator may surface child-task artifacts to a
+            // parent session through this RPC, and any leaked provider
+            // key / bearer token / AWS access key in the payload would
+            // become reachable by every successful parent-controls-child
+            // caller. See `redact_artifact_secrets` for the full pattern
+            // set (intentionally a conservative subset of
+            // `octos_agent::sanitize` so legitimate evidence payloads —
+            // long hex digests, base64 blobs — pass through unchanged).
+            let content = artifact
+                .content
+                .as_deref()
+                .map(|raw| redact_artifact_secrets(raw).into_owned());
             return Ok(json!({
                 "agent_id": agent.agent_id,
                 "session_id": agent.session_id,
                 "artifact": agent_artifact_json(artifact),
-                "content": artifact.content,
+                "content": content,
             }));
         }
         Err(autonomy_error(
@@ -2636,6 +2650,81 @@ fn agent_artifact_json(artifact: &AgentArtifactRecord) -> Value {
     })
 }
 
+/// #967 / M13-C — strip well-known credential patterns from an artifact
+/// `content` payload before it is returned through `task/artifact/read`
+/// or `agent/artifact/read`. The matching rules are intentionally a
+/// conservative subset of the broader tool-output sanitizer in the
+/// agent crate: only deterministic credential prefixes (api keys,
+/// bearer tokens, AWS access keys, secret-assignment patterns). Base64
+/// blobs / long hex strings are NOT redacted because legitimate artifact
+/// payloads (e.g. validator-results.jsonl, captured diffs, log files)
+/// regularly contain such substrings and stripping them would mangle
+/// evidence.
+///
+/// Returns the input unchanged when no pattern matches.
+fn redact_artifact_secrets(input: &str) -> std::borrow::Cow<'_, str> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    /// Anthropic API keys (must run before the generic `sk-` pattern).
+    static ANTHROPIC_KEY_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"sk-ant-[A-Za-z0-9_-]{20,}").unwrap());
+    /// OpenAI-style `sk-` keys (catches OpenAI, OpenRouter, Together, ...).
+    static OPENAI_KEY_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap());
+    /// AWS access key IDs.
+    static AWS_KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"AKIA[0-9A-Z]{16}").unwrap());
+    /// GitHub PAT / OAuth / server / refresh / fine-grained PAT prefixes.
+    static GITHUB_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:ghp_|gho_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}").unwrap()
+    });
+    /// GitLab personal access tokens.
+    static GITLAB_TOKEN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"glpat-[A-Za-z0-9_-]{20,}").unwrap());
+    /// `Authorization: Bearer <token>` header values.
+    static BEARER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"Bearer\s+[A-Za-z0-9_.+/=-]{20,}").unwrap());
+    /// Generic `password|secret|token|api_key = "..."` assignments.
+    static SECRET_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)(?:password|secret|api_key|apikey|access_token|auth_token|private_key)\s*[=:]\s*["']?[A-Za-z0-9_.+/=-]{8,}["']?"#,
+        )
+        .unwrap()
+    });
+
+    fn redact(text: &str) -> String {
+        let prefix: String = text.chars().take(4).collect();
+        format!("{}...[credential-redacted]", prefix)
+    }
+
+    let after_anth = ANTHROPIC_KEY_RE
+        .replace_all(input, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    let after_openai = OPENAI_KEY_RE
+        .replace_all(&after_anth, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    let after_aws = AWS_KEY_RE
+        .replace_all(&after_openai, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    let after_gh = GITHUB_TOKEN_RE
+        .replace_all(&after_aws, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    let after_gl = GITLAB_TOKEN_RE
+        .replace_all(&after_gh, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    let after_bearer = BEARER_RE
+        .replace_all(&after_gl, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    let after_assign = SECRET_ASSIGN_RE
+        .replace_all(&after_bearer, |caps: &regex::Captures<'_>| redact(&caps[0]))
+        .into_owned();
+    if after_assign == input {
+        std::borrow::Cow::Borrowed(input)
+    } else {
+        std::borrow::Cow::Owned(after_assign)
+    }
+}
+
 fn emit_native_specialist_event(
     sender: &Option<NativeSpecialistEventSender>,
     method: &'static str,
@@ -3499,6 +3588,70 @@ mod tests {
             })
             .expect("parent must read child artifact via base_key");
         assert_eq!(read["artifact"]["id"], json!("report"));
+    }
+
+    /// #967 / M13-C secret-redaction acceptance: artifact `content`
+    /// returned through `read_agent_artifact` (and its `task/artifact/read`
+    /// alias) must have well-known credential prefixes redacted so a
+    /// child task that captured a provider key into its log/output cannot
+    /// leak it to the parent session via the AppUI read RPC.
+    #[test]
+    fn read_agent_artifact_redacts_credential_patterns_from_content() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut agent = sample_agent("agent-leak", "tenant-a");
+        agent.artifacts = vec![AgentArtifactRecord {
+            id: "trace".into(),
+            title: "Run trace".into(),
+            kind: "trace_log".into(),
+            status: "ready".into(),
+            path: Some("trace.log".into()),
+            content: Some(
+                concat!(
+                    "step 1: GET https://api.example.com\n",
+                    "Authorization: Bearer abcdef0123456789ABCDEF0123\n",
+                    "OPENAI_API_KEY=sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                    "ANTHROPIC_API_KEY=sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa\n",
+                    "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
+                    "GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                    "step N: done",
+                )
+                .into(),
+            ),
+        }];
+        let session_id = agent.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+
+        let read = orchestrator
+            .read_agent_artifact(AgentArtifactReadRequest {
+                agent_id: "agent-leak".into(),
+                artifact_id: Some("trace".into()),
+                path: None,
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("artifact read");
+        let content = read["content"].as_str().expect("content present");
+        // Structure preserved.
+        assert!(content.starts_with("step 1: "));
+        assert!(content.contains("step N: done"));
+        // Every leaked credential pattern is redacted.
+        for needle in [
+            "sk-proj-aaaaaaaaaaaaaaaaaaaa",
+            "sk-ant-aaaaaaaaaaaaaaaaaaaa",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_aaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                !content.contains(needle),
+                "raw credential pattern {needle:?} leaked through artifact content"
+            );
+        }
+        // The redaction marker shows up at least once per credential
+        // family so the consumer can audit redaction count if needed.
+        assert!(content.matches("[credential-redacted]").count() >= 4);
     }
 
     #[test]
