@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use metrics::counter;
 use octos_agent::compaction::CompactionRunner;
 use octos_agent::tools::spawn::{
-    ChildSessionFailureAction, ChildSessionLifecycleKind, ChildSessionLifecyclePayload,
+    ChildPromptContextRequest, ChildSessionFailureAction, ChildSessionLifecycleKind,
+    ChildSessionLifecyclePayload,
 };
 use octos_agent::tools::{
     BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
@@ -55,8 +56,8 @@ use crate::api::master_continuation_scheduler::{
 };
 use crate::config::QueueMode;
 use crate::context_manager::{
-    CompactContextPolicy, ContextManager, PromptBuildPolicy, load_or_rebuild_context_manager,
-    persist_context_manager_snapshot,
+    CompactContextPolicy, ContextManager, ForkPolicy, PromptBuildPolicy,
+    load_or_rebuild_context_manager, persist_context_manager_snapshot,
 };
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
@@ -289,6 +290,54 @@ fn persist_context_manager_snapshot_for_session(
             "failed to persist context manager snapshot"
         );
     }
+}
+
+/// Build a per-child [`ContextManager`] by forking the parent session's
+/// context (mirroring the AppUI path in
+/// `crates/octos-cli/src/api/ui_protocol.rs`). Centralises the wiring so
+/// `SessionActor`-spawned children and AppUI-spawned children both
+/// inherit a sanitised slice of the parent transcript instead of starting
+/// from an ad-hoc empty context. The returned manager is also persisted
+/// so resume-from-disk sees the forked state.
+fn build_forked_child_context_for_session_actor(
+    parent_manager: &Arc<StdMutex<ContextManager>>,
+    parent_data_dir: &Path,
+    parent_session_key: &SessionKey,
+    request: &ChildPromptContextRequest,
+) -> (SessionKey, ContextManager) {
+    let child_key_string = request.child_session_key.clone().unwrap_or_else(|| {
+        let worker_suffix: String = request
+            .worker_id
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("{}#spawn-{}", parent_session_key.base_key(), worker_suffix)
+    });
+    let child_session_key = SessionKey(child_key_string);
+    let child_manager = {
+        let parent = parent_manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fork = parent.fork_child_history(&ForkPolicy::default());
+        ContextManager::from_forked_child_context(
+            child_session_key.to_string(),
+            request.task_id.clone(),
+            fork,
+        )
+    };
+    publish_context_manager_status(&child_session_key, &child_manager);
+    persist_context_manager_snapshot_for_session(
+        parent_data_dir,
+        &child_session_key,
+        &child_manager,
+    );
+    (child_session_key, child_manager)
 }
 
 fn record_context_manager_message(
@@ -2640,6 +2689,32 @@ impl ActorFactory {
                         }
                     }
                 })
+            },
+        ));
+
+        // Issue #1019: wire the same per-child `ContextManager` fork that
+        // AppUI already installs at `api/ui_protocol.rs:13741`. Without
+        // this factory, gateway/session-actor-spawned children start from
+        // an ad-hoc empty context — diverging from the AppUI path and
+        // silently bypassing the fork sanitiser that drops parent
+        // reasoning, tool calls, tool outputs and context injections.
+        let child_context_parent = context_manager.clone();
+        let child_context_parent_session = session_key.clone();
+        let child_context_data_dir = self.data_dir.clone();
+        spawn_tool = spawn_tool.with_child_prompt_context_manager_factory(Arc::new(
+            move |request: ChildPromptContextRequest| {
+                let (child_session_key, child_manager) =
+                    build_forked_child_context_for_session_actor(
+                        &child_context_parent,
+                        &child_context_data_dir,
+                        &child_context_parent_session,
+                        &request,
+                    );
+                Some(Arc::new(SessionActorPromptContextBridge::new(
+                    child_session_key,
+                    child_context_data_dir.clone(),
+                    Arc::new(StdMutex::new(child_manager)),
+                )) as Arc<dyn PromptContextManager>)
             },
         ));
 
@@ -7774,6 +7849,142 @@ mod tests {
             crate::context_manager::context_ledger_path(dir.path(), &session_key.to_string())
                 .exists(),
             "prompt-context preparation should persist the canonical context ledger"
+        );
+    }
+
+    /// Regression for issue #1019. Ensures gateway/session_actor-spawned
+    /// children inherit the parent session's [`ContextManager`] via the
+    /// shared fork sanitiser instead of starting from an ad-hoc empty
+    /// context — matching AppUI's existing wiring at
+    /// `api/ui_protocol.rs:13741`.
+    #[test]
+    fn session_actor_child_context_factory_inherits_parent_fork() {
+        use crate::context_manager::TranscriptItemKind;
+
+        let parent_session_key = SessionKey::new("cli", "parent-1019");
+        let mut parent = ContextManager::new(parent_session_key.to_string(), None);
+        parent.record_message(&test_message(MessageRole::System, "parent system"));
+        parent.record_message(&test_message(MessageRole::User, "parent user turn"));
+        parent.record_message(&test_message(
+            MessageRole::Assistant,
+            "parent assistant reply",
+        ));
+        let parent_generation_before = parent.generation();
+        let parent_item_count_before = parent.items().len();
+        let parent_arc = Arc::new(StdMutex::new(parent));
+        let data_dir = tempfile::TempDir::new().unwrap();
+
+        let request = ChildPromptContextRequest {
+            parent_session_key: Some(parent_session_key.to_string()),
+            child_session_key: None,
+            task_id: Some("task-1019".to_string()),
+            worker_id: "worker-A".to_string(),
+            task_label: "spawn task".to_string(),
+        };
+        let (child_session_key, child_manager) = build_forked_child_context_for_session_actor(
+            &parent_arc,
+            data_dir.path(),
+            &parent_session_key,
+            &request,
+        );
+
+        // Synthesised child key uses the parent's base_key + worker suffix.
+        assert_eq!(
+            child_session_key.to_string(),
+            format!("{}#spawn-worker-A", parent_session_key.base_key()),
+            "child session key should derive from the parent base_key + worker_id"
+        );
+
+        // The child must descend from the parent (not be an ad-hoc fresh
+        // manager). `from_forked_child_context` sets the child generation
+        // to `parent.generation + 1`, so a freshly-empty manager (gen 0)
+        // would fail this assertion.
+        assert_eq!(
+            child_manager.generation(),
+            parent_generation_before + 1,
+            "child context generation must be parent_generation + 1 (fork)"
+        );
+
+        // The fork sanitiser appends a `ForkBoundary` item carrying the
+        // parent's transcript hash. Without the fork wiring (the bug
+        // #1019 calls out) the child manager would have NO ForkBoundary
+        // because it would be a fresh `ContextManager::new`.
+        let has_fork_boundary = child_manager.items().iter().any(|item| {
+            matches!(
+                item.kind,
+                TranscriptItemKind::ForkBoundary {
+                    parent_generation: pg,
+                    ..
+                } if pg == parent_generation_before
+            )
+        });
+        assert!(
+            has_fork_boundary,
+            "child context must include a ForkBoundary referencing the parent generation"
+        );
+
+        // Parent must not be mutated by the fork.
+        let parent_after = parent_arc.lock().unwrap();
+        assert_eq!(
+            parent_after.generation(),
+            parent_generation_before,
+            "fork must not advance the parent generation"
+        );
+        assert_eq!(
+            parent_after.items().len(),
+            parent_item_count_before,
+            "fork must not append items to the parent transcript"
+        );
+
+        // Snapshot must have been persisted to data_dir (mirrors AppUI).
+        assert!(
+            crate::context_manager::context_ledger_path(
+                data_dir.path(),
+                &child_session_key.to_string(),
+            )
+            .exists(),
+            "child context snapshot should be persisted under data_dir"
+        );
+
+        // Sanity: a default ForkPolicy fork of the parent shares the
+        // same parent generation — confirms the helper used the
+        // canonical fork API and not an ad-hoc clone.
+        let direct_fork = parent_after.fork_child_history(&ForkPolicy::default());
+        assert_eq!(
+            direct_fork.parent_generation, parent_generation_before,
+            "direct ForkPolicy::default fork should observe the same parent generation"
+        );
+    }
+
+    /// Issue #1019 follow-up: when the caller supplies an explicit
+    /// `child_session_key` (e.g. for resumed workers), the helper must
+    /// honour it instead of synthesising from `worker_id`.
+    #[test]
+    fn session_actor_child_context_factory_honours_explicit_child_session_key() {
+        let parent_session_key = SessionKey::new("cli", "parent-1019-explicit");
+        let mut parent = ContextManager::new(parent_session_key.to_string(), None);
+        parent.record_message(&test_message(MessageRole::User, "p"));
+        let parent_arc = Arc::new(StdMutex::new(parent));
+        let data_dir = tempfile::TempDir::new().unwrap();
+
+        let request = ChildPromptContextRequest {
+            parent_session_key: Some(parent_session_key.to_string()),
+            child_session_key: Some("explicit:child:key".to_string()),
+            task_id: None,
+            worker_id: "worker-Z".to_string(),
+            task_label: "explicit key".to_string(),
+        };
+        let (child_session_key, _child_manager) = build_forked_child_context_for_session_actor(
+            &parent_arc,
+            data_dir.path(),
+            &parent_session_key,
+            &request,
+        );
+
+        assert_eq!(
+            child_session_key.to_string(),
+            "explicit:child:key",
+            "explicit child_session_key should take precedence over worker_id derivation"
         );
     }
 
