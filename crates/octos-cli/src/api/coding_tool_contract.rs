@@ -21,6 +21,11 @@ pub(crate) const TOOL_STATUS_ALIASED: &str = "aliased";
 pub(crate) const TOOL_STATUS_DISABLED_BY_POLICY: &str = "disabled_by_policy";
 pub(crate) const TOOL_STATUS_MISSING: &str = "missing";
 pub(crate) const TOOL_STATUS_UNIMPLEMENTED: &str = "unimplemented";
+/// #970 — the tool is registered but currently in the deferred set (LRU
+/// auto-eviction). The model can recover it via `activate_tools`, so for
+/// contract purposes it counts as available; the explicit status lets
+/// clients render "available, currently inactive" UX.
+pub(crate) const TOOL_STATUS_DEFERRED: &str = "deferred";
 
 pub(crate) const MCP_STATUS_CONNECTED: &str = "connected";
 pub(crate) const MCP_STATUS_CONNECTING: &str = "connecting";
@@ -127,6 +132,11 @@ pub(crate) struct ToolStatusListContext<'a> {
     pub policy: ToolPolicyView<'a>,
     pub available_model_tools: &'a [&'a str],
     pub disabled_model_tools: &'a [&'a str],
+    /// #970 — names of tools currently in the LRU deferred set. Empty by
+    /// default; populated from `ToolRegistry::deferred_tool_names()` so
+    /// the contract resolver can distinguish "registered but inactive"
+    /// from "not registered at all".
+    pub deferred_model_tools: &'a [&'a str],
     pub include_coding_tool_contract: bool,
 }
 
@@ -139,6 +149,7 @@ impl<'a> ToolStatusListContext<'a> {
             policy: ToolPolicyView::default(),
             available_model_tools: OCTOS_KNOWN_MODEL_VISIBLE_TOOLS,
             disabled_model_tools: &[],
+            deferred_model_tools: &[],
             include_coding_tool_contract: true,
         }
     }
@@ -500,6 +511,7 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
 pub(crate) fn tool_status_list_payload(context: ToolStatusListContext<'_>) -> Value {
     let available = names_set(context.available_model_tools);
     let disabled = names_set(context.disabled_model_tools);
+    let deferred = names_set(context.deferred_model_tools);
     let mut payload = json!({
         "profile_id": context.profile_id,
         "session_id": context.session_id,
@@ -509,7 +521,7 @@ pub(crate) fn tool_status_list_payload(context: ToolStatusListContext<'_>) -> Va
 
     if context.include_coding_tool_contract {
         payload["coding_tool_contract"] =
-            coding_tool_contract_payload(context.policy, &available, &disabled);
+            coding_tool_contract_payload(context.policy, &available, &disabled, &deferred);
     }
 
     payload
@@ -554,15 +566,23 @@ pub(crate) fn coding_tool_contract_payload(
     policy: ToolPolicyView<'_>,
     available_model_tools: &HashSet<&str>,
     disabled_model_tools: &HashSet<&str>,
+    deferred_model_tools: &HashSet<&str>,
 ) -> Value {
-    let required_tools = required_tool_status_entries(available_model_tools, disabled_model_tools);
+    let required_tools = required_tool_status_entries(
+        available_model_tools,
+        disabled_model_tools,
+        deferred_model_tools,
+    );
     let missing_required_tools: Vec<String> = required_tools
         .iter()
         .filter_map(|entry| {
             let status = entry.get("status").and_then(Value::as_str);
             let name = entry.get("name").and_then(Value::as_str);
             match (status, name) {
-                (Some(TOOL_STATUS_AVAILABLE | TOOL_STATUS_ALIASED), Some(_)) => None,
+                (
+                    Some(TOOL_STATUS_AVAILABLE | TOOL_STATUS_ALIASED | TOOL_STATUS_DEFERRED),
+                    Some(_),
+                ) => None,
                 (_, Some(name)) => Some(name.to_owned()),
                 _ => None,
             }
@@ -574,6 +594,12 @@ pub(crate) fn coding_tool_contract_payload(
         "incomplete"
     };
 
+    // #970 — emit the deferred set for evidence/observability. Clients
+    // that render the coding tool contract can show "registered but
+    // currently auto-deferred" alongside the per-tool status.
+    let mut deferred_names: Vec<&str> = deferred_model_tools.iter().copied().collect();
+    deferred_names.sort();
+
     json!({
         "id": CODING_TOOL_CONTRACT_ID,
         "version": CODING_TOOL_CONTRACT_VERSION,
@@ -582,6 +608,7 @@ pub(crate) fn coding_tool_contract_payload(
         "required_tool_names": CODING_P0_REQUIRED_TOOL_NAMES,
         "required_tools": required_tools,
         "missing_required_tools": missing_required_tools,
+        "deferred_model_tools": deferred_names,
         "policy": {
             "tool_policy_id": policy.tool_policy_id,
             "sandbox_mode": policy.sandbox_mode,
@@ -593,10 +620,18 @@ pub(crate) fn coding_tool_contract_payload(
 fn required_tool_status_entries(
     available_model_tools: &HashSet<&str>,
     disabled_model_tools: &HashSet<&str>,
+    deferred_model_tools: &HashSet<&str>,
 ) -> Vec<Value> {
     REQUIRED_CODING_TOOLS
         .iter()
-        .map(|spec| required_tool_status_entry(spec, available_model_tools, disabled_model_tools))
+        .map(|spec| {
+            required_tool_status_entry(
+                spec,
+                available_model_tools,
+                disabled_model_tools,
+                deferred_model_tools,
+            )
+        })
         .collect()
 }
 
@@ -604,6 +639,7 @@ fn required_tool_status_entry(
     spec: &RequiredToolSpec,
     available_model_tools: &HashSet<&str>,
     disabled_model_tools: &HashSet<&str>,
+    deferred_model_tools: &HashSet<&str>,
 ) -> Value {
     let mut entry = Map::new();
     entry.insert("name".into(), json!(spec.name));
@@ -625,12 +661,38 @@ fn required_tool_status_entry(
         return Value::Object(entry);
     }
 
+    // #970: a tool registered but currently in the deferred set is
+    // recoverable through `activate_tools`. Surface it as `deferred` so
+    // clients can render "available, currently inactive" UX; it counts
+    // as available for the contract's `missing_required_tools` filter.
+    if deferred_model_tools.contains(spec.name) {
+        entry.insert("status".into(), json!(TOOL_STATUS_DEFERRED));
+        entry.insert("backend_tool".into(), json!(spec.name));
+        entry.insert(
+            "detail".into(),
+            json!("registered but currently auto-deferred; recoverable via activate_tools"),
+        );
+        return Value::Object(entry);
+    }
+
     if let Some(alias) = first_present(spec.aliases, available_model_tools) {
         entry.insert("status".into(), json!(TOOL_STATUS_UNIMPLEMENTED));
         entry.insert("backend_tool".into(), json!(alias));
         if let Some(detail) = spec.partial_alias_detail {
             entry.insert("detail".into(), json!(detail));
         }
+        return Value::Object(entry);
+    }
+
+    // Same alias check, but against the deferred set: an alias that's
+    // registered yet deferred still beats reporting the tool as missing.
+    if let Some(alias) = first_present(spec.aliases, deferred_model_tools) {
+        entry.insert("status".into(), json!(TOOL_STATUS_DEFERRED));
+        entry.insert("backend_tool".into(), json!(alias));
+        let detail = spec.partial_alias_detail.unwrap_or(
+            "alias registered but currently auto-deferred; recoverable via activate_tools",
+        );
+        entry.insert("detail".into(), json!(detail));
         return Value::Object(entry);
     }
 
@@ -853,6 +915,77 @@ mod tests {
                 json!(TOOL_STATUS_AVAILABLE)
             );
         }
+    }
+
+    #[test]
+    fn deferred_canonical_tool_is_reported_as_available_via_deferred_status() {
+        // #970: when ProfileRuntime auto-defers `group:runtime` /
+        // `group:sessions`, the P0 tools `shell`, `exec_command`,
+        // `spawn_agent`, ... move out of `specs()` but stay registered.
+        // The contract used to report them as `missing` and the soak's
+        // tool-registry snapshot showed 7 of 10 P0 tools missing. With
+        // the deferred-aware resolver, they surface as `deferred` and
+        // drop out of `missing_required_tools`.
+        let deferred = &[
+            "exec_command",
+            "write_stdin",
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ];
+        let available = &["apply_patch", "update_plan", "request_user_input"];
+        let context = ToolStatusListContext {
+            available_model_tools: available,
+            deferred_model_tools: deferred,
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let contract = &payload["coding_tool_contract"];
+
+        assert_eq!(contract["status"], json!("ready"));
+        assert_eq!(contract["missing_required_tools"], json!([]));
+
+        let exec_command = required_tool(contract, "exec_command");
+        assert_eq!(exec_command["status"], json!(TOOL_STATUS_DEFERRED));
+        assert_eq!(exec_command["backend_tool"], json!("exec_command"));
+        assert!(
+            exec_command["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("activate_tools"))
+        );
+
+        let apply_patch = required_tool(contract, "apply_patch");
+        assert_eq!(apply_patch["status"], json!(TOOL_STATUS_AVAILABLE));
+    }
+
+    #[test]
+    fn deferred_alias_resolves_required_tool_as_deferred_not_missing() {
+        // #970: also exercise the alias-deferred path — when the
+        // canonical name is absent but a deferred alias is registered
+        // (e.g. `shell` aliasing `exec_command`), the contract should
+        // surface `deferred` against the alias rather than `missing`.
+        let context = ToolStatusListContext {
+            available_model_tools: &["apply_patch", "update_plan", "request_user_input"],
+            deferred_model_tools: &["shell", "spawn"],
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let contract = &payload["coding_tool_contract"];
+
+        let exec_command = required_tool(contract, "exec_command");
+        assert_eq!(exec_command["status"], json!(TOOL_STATUS_DEFERRED));
+        assert_eq!(exec_command["backend_tool"], json!("shell"));
+
+        let spawn_agent = required_tool(contract, "spawn_agent");
+        assert_eq!(spawn_agent["status"], json!(TOOL_STATUS_DEFERRED));
+        assert_eq!(spawn_agent["backend_tool"], json!("spawn"));
+
+        // Tools with no canonical or deferred coverage still report
+        // missing — verify by leaving write_stdin out of every set.
+        let write_stdin = required_tool(contract, "write_stdin");
+        assert_eq!(write_stdin["status"], json!(TOOL_STATUS_MISSING));
     }
 
     #[test]
