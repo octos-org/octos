@@ -631,6 +631,18 @@ class FixtureTransport {
             { name: "shell", enabled: true, approval_policy: this.permission.approval_policy },
             { name: "filesystem", enabled: true, scope: this.permission.mode },
           ],
+          // #969 — the fixture transport must also include a minimal
+          // `coding_tool_contract` so the probe's `coding-tool-contract-
+          // ready` assertion stays satisfied in self-test mode. The
+          // real backend builds this in `coding_tool_contract_payload`.
+          coding_tool_contract: {
+            id: "codex-compatible-coding-v1",
+            version: "1",
+            feature: "coding.tool_contract.v1",
+            status: "ready",
+            missing_required_tools: [],
+            deferred_model_tools: [],
+          },
         };
       case "turn/start":
         return { accepted: true };
@@ -968,6 +980,48 @@ async function main() {
       policy_id: tools.result?.policy_id,
       tool_count: Array.isArray(tools.result?.tools) ? tools.result.tools.length : undefined,
     }));
+
+    // #969 / M14-E — the M14 coding tool contract must reach `ready`
+    // status with no `missing_required_tools` on live runs, otherwise
+    // P0 tool parity has regressed (either a tool was de-registered or
+    // the deferred-aware resolver introduced in #1092 stopped seeing
+    // the deferred set). Pin the property as a strict-soak invariant.
+    const contract = tools.result?.coding_tool_contract;
+    if (contract) {
+      const contractStatus = contract.status;
+      const missing = Array.isArray(contract.missing_required_tools)
+        ? contract.missing_required_tools
+        : [];
+      if (contractStatus === "ready" && missing.length === 0) {
+        summary.cases.push(caseRecord("coding-tool-contract-ready", "ok", {
+          contract_status: contractStatus,
+          missing_required_tools: missing,
+          deferred_model_tools: Array.isArray(contract.deferred_model_tools)
+            ? contract.deferred_model_tools
+            : undefined,
+        }));
+      } else {
+        summary.failures.push({
+          area: "M14-E",
+          reason:
+            "coding_tool_contract reports incomplete P0 coverage — either a required tool was de-registered or the deferred-aware path regressed",
+          contract_status: contractStatus,
+          missing_required_tools: missing,
+        });
+        summary.cases.push(caseRecord("coding-tool-contract-ready", "failed", {
+          contract_status: contractStatus,
+          missing_required_tools: missing,
+        }));
+      }
+    } else {
+      summary.blockers.push({
+        area: "M14-E",
+        reason: "tool/status/list response is missing coding_tool_contract — M14 contract not advertised",
+      });
+      summary.cases.push(caseRecord("coding-tool-contract-ready", "blocked", {
+        reason: "no coding_tool_contract field on tool/status/list result",
+      }));
+    }
   } else {
     latestToolRegistry = {
       unavailable: true,
