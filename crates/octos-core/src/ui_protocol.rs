@@ -113,6 +113,24 @@ pub const UI_PROTOCOL_FEATURE_REVIEW_START_V1: &str = "review.start.v1";
 /// compaction lifecycle inspection.
 pub const UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
 
+/// #965 / UPCR-2026-019 — spec-canonical feature name for the
+/// supervised-task inspection surface (`task/list`, `task/updated`,
+/// `task/output/read`, `agent/list`, `agent/status/read`, `agent/output/read`,
+/// `agent/interrupt`, `agent/close`). The methods themselves stay gated on
+/// [`UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1`] so older clients keep
+/// working; this constant is advertised in parallel so the protocol
+/// vocabulary matches the M13-A spec strings.
+pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1: &str =
+    "harness.task_supervision_inspection.v1";
+
+/// #965 / UPCR-2026-019 — spec-canonical feature name for the
+/// supervised-task artifact surface (`task/artifact/list`, `task/artifact/read`,
+/// `agent/artifact/list`, `agent/artifact/read`, `agent/artifact/updated`).
+/// Advertised alongside [`UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1`] so
+/// clients that look for the M13-A name find it; method gating stays on the
+/// existing consolidated flag.
+pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -136,6 +154,8 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
 ];
 
 /// Returns the feature flag that gates `method` per spec § 7 capability
@@ -5288,6 +5308,14 @@ mod tests {
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             "context.lifecycle.v1"
         );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
+            "harness.task_supervision_inspection.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            "harness.task_artifacts.v1"
+        );
 
         assert_eq!(
             UI_PROTOCOL_COMMAND_METHODS,
@@ -5561,7 +5589,9 @@ mod tests {
                     "coding.goal_runtime.v1",
                     "coding.loop_runtime.v1",
                     "review.start.v1",
-                    "context.lifecycle.v1"
+                    "context.lifecycle.v1",
+                    "harness.task_supervision_inspection.v1",
+                    "harness.task_artifacts.v1"
                 ]
             })
         );

@@ -1172,6 +1172,21 @@ impl ConnectionUiFeatures {
                 APPUI_FEATURE_CONTEXT_LIFECYCLE_V1,
             );
         }
+        // #965 / UPCR-2026-019 — advertise the M13-A canonical capability
+        // names alongside the consolidated `coding.agent_control.v1` so
+        // clients that look for the spec strings find them. The methods
+        // themselves still gate on `coding.agent_control.v1`, so older
+        // clients negotiating only that flag keep working unchanged.
+        if self.agent_control_available() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
+            );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            );
+        }
         if supports_local_solo_profile_create(state) {
             push_capability_feature(
                 &mut capabilities.supported_features,
