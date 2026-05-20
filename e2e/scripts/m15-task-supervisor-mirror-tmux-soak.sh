@@ -169,8 +169,8 @@ const roots = process.argv.slice(2);
 
 const patterns = [
   { regex: /dummy-key-for-m15-task-supervisor-fixture/g, label: '<fixture-key>' },
-  { regex: /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g, label: '<redacted>' },
-  { regex: /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g, label: '<redacted>' },
+  { regex: /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9._\-]{20,}/g, label: '<redacted>' },
+  { regex: /sk-ant-oat01-[A-Za-z0-9._\-]{20,}/g, label: '<redacted>' },
   { regex: /AIza[0-9A-Za-z_\-]{30,}/g, label: '<redacted>' },
   { regex: /AC[0-9a-f]{32}/g, label: '<redacted>' },
   { regex: /Bearer [A-Za-z0-9._\-]{32,}/g, label: 'Bearer <redacted>' },

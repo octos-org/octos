@@ -331,9 +331,9 @@ const roots = process.argv.slice(2);
 
 const patterns = [
   // OpenAI / DeepSeek / generic OpenAI-compatible
-  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g,
+  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9._\-]{20,}/g,
   // Anthropic OAuth bearer tokens (sk-ant-oat01-...)
-  /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g,
+  /sk-ant-oat01-[A-Za-z0-9._\-]{20,}/g,
   // Google Gemini AIza... keys
   /AIza[0-9A-Za-z_\-]{30,}/g,
   // Twilio account/auth pairs
@@ -496,6 +496,11 @@ google: AIzaSyA-1234567890abcdefghijklmnopqrstuv
 TXT
   cat > "$out_dir/anthropic.env" <<TXT
 ANTHROPIC_API_KEY=sk-ant-oat01-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+# codex P1 follow-up to #1089: dotted JWT-shaped OAuth tokens must be
+# scrubbed in full, not just up to the first \`.\` separator. The token
+# below uses three JWT-style segments and is included in the residual
+# grep so a regression that drops \`.\` from the char class fails here.
+ANTHROPIC_OAUTH_JWT=sk-ant-oat01-abcdefghijklmnopqr.stuvwxyz0123456789.ABCDEFGHIJKLMNOPQR
 TXT
   scrub_secrets
   if grep -RIEq -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij' "$fixture_root"; then
