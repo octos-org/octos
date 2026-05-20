@@ -762,11 +762,19 @@ impl SpawnTool {
             .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
 
         let request = DispatchRequest::new(tool_name, task).with_context_contract(
+            // #1021 / M17-C — populate backend_kind/agent_id/risk so the
+            // evidence ledger can identify this unmanaged dispatch
+            // without parsing free-form text. Direct MCP dispatch never
+            // forks the Octos prompt context manager, so we tag it
+            // `risk: medium` (external transport, no managed context).
             DispatchContextContract::external_unmanaged(
                 "direct_mcp_dispatch_has_no_octos_context_manager_payload",
             )
             .with_parent_session_key(Some(session_id.to_string()))
-            .with_child_session_key(Some(task_id.to_string())),
+            .with_child_session_key(Some(task_id.to_string()))
+            .with_backend_kind("mcp")
+            .with_agent_id(task_id.to_string())
+            .with_risk("medium"),
         );
         let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
         let payload = build_dispatch_event_payload(
@@ -1969,11 +1977,20 @@ impl Tool for SpawnTool {
             let (response, event) = {
                 let request = DispatchRequest::new(tool_name, dispatch_payload)
                     .with_context_contract(
+                        // #1021 / M17-C — backend_kind/agent_id/risk
+                        // identify this unmanaged dispatch in the
+                        // evidence ledger. Same medium-risk tagging as
+                        // the direct dispatch path: external MCP
+                        // transport that never forks the Octos prompt
+                        // context manager.
                         DispatchContextContract::external_unmanaged(
                             "mcp_agent_backend_does_not_consume_octos_prompt_context_manager",
                         )
                         .with_parent_session_key(self.session_key.clone())
-                        .with_child_session_key(Some(task_id_for_event.clone())),
+                        .with_child_session_key(Some(task_id_for_event.clone()))
+                        .with_backend_kind("mcp")
+                        .with_agent_id(task_id_for_event.clone())
+                        .with_risk("medium"),
                     );
                 let (response, _summary) = dispatch_with_metrics(backend.as_ref(), request).await;
                 let payload = build_dispatch_event_payload(
