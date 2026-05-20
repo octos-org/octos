@@ -1289,6 +1289,17 @@ fn sanitize_task_for_response(
         "child_join_state": task.child_join_state,
         "child_joined_at": task.child_joined_at,
         "child_failure_action": task.child_failure_action,
+        // #966 / M13-B — surface the new BackgroundTask projection
+        // fields. Each is Option-typed; absent values serialize as
+        // null, which the AppUI TaskListProjection treats as None
+        // (its fields use `#[serde(default)]`). Existing snapshots
+        // without these fields surface as null/None, so the wire
+        // shape stays backwards-compatible.
+        "source": task.source,
+        "role": task.role,
+        "summary": task.summary,
+        "artifact_count": task.artifact_count,
+        "runtime_policy_stamp": task.runtime_policy_stamp,
         "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
         "error": task.error,
         "session_key": task.session_key,
@@ -13053,6 +13064,11 @@ mod tests {
             session_key: Some("local:test".into()),
             tool_input: None,
             originating_client_message_id: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }
     }
 
