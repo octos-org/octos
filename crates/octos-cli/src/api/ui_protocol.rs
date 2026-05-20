@@ -4833,12 +4833,22 @@ fn permission_selection_allowed(
     state: &AppState,
     selection: octos_core::ui_protocol::PermissionProfileSelection,
     approval_policy: Option<octos_agent::ApprovalPolicy>,
+    requested_runtime_mode: Option<&str>,
 ) -> bool {
     use octos_core::ui_protocol::{
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
     };
 
-    state.deployment_mode == crate::config::DeploymentMode::Local
+    let request_wants_tenant_or_cloud = matches!(
+        requested_runtime_mode
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("tenant") | Some("cloud")
+    );
+    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    let effective_local = server_is_local && !request_wants_tenant_or_cloud;
+
+    effective_local
         || (selection.mode != Mode::DangerFullAccess
             && selection.network != Network::Allow
             && approval_policy != Some(octos_agent::ApprovalPolicy::Never))
@@ -4904,7 +4914,12 @@ fn permission_profile_set_result(
         parse_permission_approval_policy(params.update.approval_policy.as_deref())?
             .or(previous_state.approval_policy);
     let requested = params.update.apply_to(previous);
-    if !permission_selection_allowed(state, requested, approval_policy) {
+    if !permission_selection_allowed(
+        state,
+        requested,
+        approval_policy,
+        params.runtime_mode.as_deref(),
+    ) {
         return Err(permission_profile_disallowed_error(
             state,
             requested,
@@ -16129,12 +16144,13 @@ mod tests {
         let denied = permission_profile_set_result(
             &tenant,
             PermissionProfileSetParams {
-                session_id,
+                session_id: session_id.clone(),
                 update: PermissionProfileUpdate {
                     mode: Some(Mode::DangerFullAccess),
                     network: Some(Network::Allow),
                     approval_policy: Some("never".into()),
                 },
+                runtime_mode: None,
             },
         )
         .expect_err("danger rejected outside local");
@@ -16142,6 +16158,55 @@ mod tests {
         assert_eq!(
             denied.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("permission_profile_disallowed"))
+        );
+
+        // Even when the server runs in Local mode, an explicit
+        // `runtime_mode: "tenant"` in the request must tighten the gate so
+        // dangerous mode is rejected. This is the M12 soak negative-probe
+        // contract (#951).
+        let tenant_request_denied = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("tenant".into()),
+            },
+        )
+        .expect_err("tenant runtime_mode override rejects danger");
+        assert_eq!(
+            tenant_request_denied.code,
+            rpc_error_codes::PERMISSION_DENIED
+        );
+        assert_eq!(
+            tenant_request_denied
+                .data
+                .as_ref()
+                .and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+
+        // Reverse direction must not relax: server in Tenant + request
+        // `runtime_mode: "solo"` still rejects danger.
+        let solo_override_denied = permission_profile_set_result(
+            &tenant,
+            PermissionProfileSetParams {
+                session_id,
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("solo".into()),
+            },
+        )
+        .expect_err("solo override cannot relax tenant gate");
+        assert_eq!(
+            solo_override_denied.code,
+            rpc_error_codes::PERMISSION_DENIED
         );
     }
 

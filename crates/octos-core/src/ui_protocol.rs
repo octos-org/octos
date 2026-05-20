@@ -1684,6 +1684,12 @@ pub struct PermissionProfileListParams {
 pub struct PermissionProfileSetParams {
     pub session_id: SessionKey,
     pub update: PermissionProfileUpdate,
+    /// Optional runtime-mode override the client asserts for gating
+    /// (`"tenant"`, `"cloud"`, `"local"`, `"solo"`). When provided and
+    /// stricter than the server's deployment mode, the gate uses the
+    /// requested mode. The override can only TIGHTEN gating, never relax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
