@@ -61,8 +61,8 @@ const path = require('path');
 const roots = process.argv.slice(2);
 
 const patterns = [
-  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g,
-  /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g,
+  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9._\-]{20,}/g,
+  /sk-ant-oat01-[A-Za-z0-9._\-]{20,}/g,
   /AIza[0-9A-Za-z_\-]{30,}/g,
   /AC[0-9a-f]{32}/g,
   /Bearer [A-Za-z0-9._\-]{32,}/g,
