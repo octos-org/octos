@@ -111,6 +111,31 @@ pub struct PipelineRunSummary {
     pub total_tokens: TokenUsage,
     pub nodes_executed: usize,
     pub start_time: String,
+    /// #1020 / M17-B — explicit context mode marker. Pipeline workers
+    /// today run with their own per-node prompt context rather than a
+    /// fork of the parent's ContextManager, so the summary records
+    /// `external_context_unmanaged` with a reason. Evidence validators
+    /// can inspect this to confirm the M17-B acceptance bullet
+    /// "run_pipeline workers have child context ledger evidence or
+    /// external_context_unmanaged with reason" is satisfied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<String>,
+    /// #1020 / M17-B — paired free-form reason explaining why the
+    /// pipeline is in `external_context_unmanaged` mode (or, in the
+    /// future, the managed-payload variant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_reason: Option<String>,
+}
+
+impl PipelineRunSummary {
+    /// #1020 — convenience constructor stamping the M17-B
+    /// `external_context_unmanaged` marker. Use this when the pipeline
+    /// runs in isolated per-node context (the current production path).
+    pub fn with_external_context_unmanaged(mut self, reason: impl Into<String>) -> Self {
+        self.context_mode = Some("external_context_unmanaged".to_string());
+        self.context_reason = Some(reason.into());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -191,10 +216,69 @@ mod tests {
             total_tokens: TokenUsage::default(),
             nodes_executed: 3,
             start_time: "2026-03-06T12:00:00Z".into(),
+            context_mode: None,
+            context_reason: None,
         };
 
         run_dir.write_summary(&summary).unwrap();
         let summary_path = run_dir.path().unwrap().join("summary.json");
+        assert!(summary_path.exists());
+    }
+
+    /// #1020 / M17-B — when the pipeline stamps the marker via
+    /// `with_external_context_unmanaged(reason)`, the resulting
+    /// summary JSON carries `context_mode: "external_context_unmanaged"`
+    /// plus the reason string. Evidence validators can grep this from
+    /// `summary.json` to confirm the M17-B acceptance bullet.
+    #[test]
+    fn pipeline_summary_records_external_context_unmanaged_marker() {
+        let dir = TempDir::new().unwrap();
+        let run_dir = RunDir::new(dir.path(), "run_006").unwrap();
+
+        let summary = PipelineRunSummary {
+            graph_id: "ctx_pipeline".into(),
+            success: true,
+            duration_ms: 1234,
+            total_tokens: TokenUsage::default(),
+            nodes_executed: 2,
+            start_time: "2026-05-20T17:00:00Z".into(),
+            context_mode: None,
+            context_reason: None,
+        }
+        .with_external_context_unmanaged(
+            "pipeline workers run with isolated per-node prompt context",
+        );
+
+        run_dir.write_summary(&summary).unwrap();
+        let summary_path = run_dir.path().unwrap().join("summary.json");
+        let contents = std::fs::read_to_string(&summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert_eq!(
+            json["context_reason"],
+            "pipeline workers run with isolated per-node prompt context"
+        );
+
+        // The unset/legacy form must omit the fields entirely, not
+        // emit them as null — keeps the wire backwards-compatible.
+        let bare = PipelineRunSummary {
+            graph_id: "bare".into(),
+            success: true,
+            duration_ms: 0,
+            total_tokens: TokenUsage::default(),
+            nodes_executed: 0,
+            start_time: "1970-01-01T00:00:00Z".into(),
+            context_mode: None,
+            context_reason: None,
+        };
+        let bare_json = serde_json::to_value(&bare).unwrap();
+        assert!(!bare_json.as_object().unwrap().contains_key("context_mode"));
+        assert!(
+            !bare_json
+                .as_object()
+                .unwrap()
+                .contains_key("context_reason")
+        );
         assert!(summary_path.exists());
     }
 
