@@ -988,6 +988,37 @@ mod tests {
         assert_eq!(write_stdin["status"], json!(TOOL_STATUS_MISSING));
     }
 
+    /// #972 — guard against accidental removal of any P0 canonical tool
+    /// from the per-session tool registry. The M14 contract relies on
+    /// every name in `CODING_P0_REQUIRED_TOOL_NAMES` being registered
+    /// (whether active or deferred). If a future change drops one of
+    /// the registrations in `with_builtins_and_permissions`, this test
+    /// fails loudly instead of letting the live contract silently
+    /// regress to `status: incomplete` only when the strict M12 soak
+    /// runs in CI.
+    #[test]
+    fn p0_canonical_tools_are_registered_by_session_builtins() {
+        use octos_agent::ToolRegistry;
+        use octos_agent::sandbox::NoSandbox;
+
+        let cwd = std::path::Path::new("/tmp");
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
+        let names: std::collections::HashSet<String> = registry.tool_names().into_iter().collect();
+
+        let mut missing: Vec<&str> = Vec::new();
+        for required in CODING_P0_REQUIRED_TOOL_NAMES {
+            if !names.contains(*required) {
+                missing.push(*required);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "P0 canonical tools must be registered by ToolRegistry::with_builtins_and_sandbox \
+             so the M14 coding tool contract can resolve them as active or deferred. \
+             Missing: {missing:?}. Registered tool names: {names:?}"
+        );
+    }
+
     #[test]
     fn disabled_canonical_tool_is_reported_as_policy_gap() {
         let context = ToolStatusListContext {
