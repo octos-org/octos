@@ -5845,6 +5845,8 @@ fn is_autonomy_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::AGENT_OUTPUT_READ
             | octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST
             | octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ
+            | octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST
+            | octos_core::ui_protocol::methods::TASK_ARTIFACT_READ
             | octos_core::ui_protocol::methods::AGENT_INTERRUPT
             | octos_core::ui_protocol::methods::AGENT_CLOSE
             | octos_core::ui_protocol::methods::SESSION_GOAL_GET
@@ -5866,6 +5868,8 @@ fn autonomy_method_available(method: &str, features: ConnectionUiFeatures) -> bo
         | octos_core::ui_protocol::methods::AGENT_OUTPUT_READ
         | octos_core::ui_protocol::methods::AGENT_ARTIFACT_LIST
         | octos_core::ui_protocol::methods::AGENT_ARTIFACT_READ
+        | octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST
+        | octos_core::ui_protocol::methods::TASK_ARTIFACT_READ
         | octos_core::ui_protocol::methods::AGENT_INTERRUPT
         | octos_core::ui_protocol::methods::AGENT_CLOSE => features.agent_control_available(),
         octos_core::ui_protocol::methods::SESSION_GOAL_GET
@@ -5985,7 +5989,7 @@ fn raw_autonomy_rpc_with_orchestrator(
                 limit: params.limit,
             })
         }
-        methods::AGENT_ARTIFACT_LIST => {
+        methods::AGENT_ARTIFACT_LIST | methods::TASK_ARTIFACT_LIST => {
             let params: RawAgentParams = parse_raw_params(request)?;
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
@@ -5998,7 +6002,7 @@ fn raw_autonomy_rpc_with_orchestrator(
                 profile_id,
             })
         }
-        methods::AGENT_ARTIFACT_READ => {
+        methods::AGENT_ARTIFACT_READ | methods::TASK_ARTIFACT_READ => {
             let params: RawAgentArtifactReadParams = parse_raw_params(request)?;
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
@@ -15459,6 +15463,8 @@ mod tests {
             | methods::AGENT_OUTPUT_READ
             | methods::AGENT_ARTIFACT_LIST
             | methods::AGENT_ARTIFACT_READ
+            | methods::TASK_ARTIFACT_LIST
+            | methods::TASK_ARTIFACT_READ
             | methods::AGENT_INTERRUPT
             | methods::AGENT_CLOSE
             | methods::SESSION_GOAL_GET
@@ -19985,6 +19991,20 @@ mod tests {
                 methods::AGENT_ARTIFACT_READ,
                 json!({ "agent_id": "agent-1", "artifact_id": "artifact-1", "session_id": session_id.clone() }),
                 "read_agent_artifact:agent-1",
+            ),
+            // #965 — task/artifact/* must route through the same
+            // orchestrator handlers as agent/artifact/* so the M13
+            // contract direction (task/* canonical names) works
+            // alongside the legacy agent/* aliases.
+            (
+                methods::TASK_ARTIFACT_LIST,
+                json!({ "agent_id": "agent-2", "session_id": session_id.clone() }),
+                "list_agent_artifacts:agent-2",
+            ),
+            (
+                methods::TASK_ARTIFACT_READ,
+                json!({ "agent_id": "agent-2", "artifact_id": "artifact-2", "session_id": session_id.clone() }),
+                "read_agent_artifact:agent-2",
             ),
             (
                 methods::AGENT_INTERRUPT,
