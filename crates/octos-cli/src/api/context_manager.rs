@@ -170,7 +170,17 @@ pub(crate) enum TranscriptItemKind {
         /// prompt as `References: …` so the model sees pointers, not
         /// copied artifacts. Empty by default; populated only when the
         /// join policy is `reference` rather than `merge`.
-        #[serde(default)]
+        ///
+        /// `skip_serializing_if = "Vec::is_empty"` is a backwards-compat
+        /// guard (codex P2 follow-up to #1111): legacy snapshots persisted
+        /// before this field existed omit the key entirely. Without
+        /// `skip_serializing_if`, a freshly-constructed
+        /// `ChildResultSummary` with an empty `reference_artifact_refs`
+        /// would serialize `"reference_artifact_refs": []` into
+        /// `StableTranscriptHashItem`, drifting the transcript hash away
+        /// from any pre-#1111 snapshot. Skipping the empty case keeps the
+        /// canonical hash identical to the legacy form.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reference_artifact_refs: Vec<String>,
     },
     CompactionSummary {
@@ -890,6 +900,43 @@ impl ContextManager {
             },
             TranscriptItemSource::ToolRuntime,
             source_ref,
+        )
+    }
+
+    /// #1022 / M17-D — production writer for a bounded
+    /// `ChildResultSummary` capsule.
+    ///
+    /// Called by the parent session's join site when a child task
+    /// terminates: it folds a model-generated `summary` plus the
+    /// artifact-ref pointers (`artifact_refs` for owned, joined-into
+    /// artifacts; `reference_artifact_refs` for pointer-only references
+    /// the parent can see but does not own) into the parent's transcript
+    /// as a single supervisor-sourced item. The capsule is then rendered
+    /// by `for_prompt` as a bounded assistant message with the form
+    /// `[child <id> summary]\n<summary>\nArtifacts: …\nReferences: …`,
+    /// keeping the child's raw transcript out of the parent's prompt
+    /// (see SubagentResultCapsule contract).
+    ///
+    /// The `summary` argument is the caller's responsibility to bound —
+    /// the writer does not re-summarize or truncate, by design: the
+    /// model that produced the summary already knows the bound. The
+    /// writer's job is only to install the capsule into the parent's
+    /// transcript with the correct `Supervisor` source attribution.
+    pub(crate) fn record_child_result_summary(
+        &mut self,
+        child_agent_id: impl Into<String>,
+        summary: impl Into<String>,
+        artifact_refs: Vec<String>,
+        reference_artifact_refs: Vec<String>,
+    ) -> TranscriptItemId {
+        self.record_item(
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id: child_agent_id.into(),
+                summary: summary.into(),
+                artifact_refs,
+                reference_artifact_refs,
+            },
+            TranscriptItemSource::Supervisor,
         )
     }
 
@@ -2148,6 +2195,144 @@ mod tests {
             .expect("legacy child summary message");
         assert!(capsule.content.contains("Artifacts: agent/legacy/old.md"));
         assert!(!capsule.content.contains("References:"));
+    }
+
+    /// #1022 / M17-D — the production writer
+    /// `record_child_result_summary` is the canonical fold point for the
+    /// parent session's join. It must:
+    ///   1. produce a `Supervisor`-sourced transcript item,
+    ///   2. round-trip through `for_prompt` into a bounded assistant
+    ///      capsule with the documented `[child <id> summary]` shape,
+    ///   3. carry both owned `Artifacts:` and pointer-only `References:`
+    ///      lines when the join is mixed,
+    ///   4. surface ZERO raw child transcript content into the parent's
+    ///      prompt (the writer's whole job is to act as the bounded
+    ///      capsule that prevents that leakage).
+    ///
+    /// This pins the writer to the SubagentResultCapsule contract end
+    /// to end: caller -> ContextManager -> rendered prompt.
+    #[test]
+    fn record_child_result_summary_writes_supervisor_sourced_bounded_capsule() {
+        let mut manager = ContextManager::new("parent-session", None);
+        manager.record_message(&Message::system("parent system prompt"));
+        manager.record_message(&Message::user("please review the change"));
+
+        let id = manager.record_child_result_summary(
+            "reviewer-7",
+            "found 1 P0: missing null check in foo.rs:12",
+            vec!["agent/reviewer-7/finding.md".to_owned()],
+            vec!["agent/sibling-archive/prior-finding.md".to_owned()],
+        );
+
+        // The writer must produce a Supervisor-sourced item with the
+        // requested kind.
+        let item = manager
+            .items()
+            .iter()
+            .find(|item| item.id == id)
+            .expect("writer-produced item");
+        assert_eq!(item.source, TranscriptItemSource::Supervisor);
+        match &item.kind {
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id,
+                summary,
+                artifact_refs,
+                reference_artifact_refs,
+            } => {
+                assert_eq!(child_agent_id, "reviewer-7");
+                assert!(summary.contains("missing null check"));
+                assert_eq!(
+                    artifact_refs,
+                    &vec!["agent/reviewer-7/finding.md".to_owned()]
+                );
+                assert_eq!(
+                    reference_artifact_refs,
+                    &vec!["agent/sibling-archive/prior-finding.md".to_owned()]
+                );
+            }
+            other => panic!("expected ChildResultSummary, got {other:?}"),
+        }
+
+        // for_prompt renders the capsule as a single bounded assistant
+        // message — and absolutely nothing else from the child world.
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let capsule = frame
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("[child reviewer-7 summary]"))
+            .expect("rendered child summary capsule");
+        assert_eq!(capsule.role, MessageRole::Assistant);
+        assert!(capsule.content.contains("missing null check"));
+        assert!(
+            capsule
+                .content
+                .contains("Artifacts: agent/reviewer-7/finding.md")
+        );
+        assert!(
+            capsule
+                .content
+                .contains("References: agent/sibling-archive/prior-finding.md")
+        );
+        // Owned-vs-reference separation: a reference must never appear
+        // inside the Artifacts: list.
+        assert!(
+            !capsule
+                .content
+                .contains("Artifacts: agent/reviewer-7/finding.md, agent/sibling-archive")
+        );
+        assert!(capsule.tool_calls.is_none());
+        assert!(capsule.tool_call_id.is_none());
+    }
+
+    /// codex P2 follow-up to #1111 — the legacy form of a
+    /// `ChildResultSummary` snapshot did NOT contain
+    /// `reference_artifact_refs` at all. The post-#1111 in-memory form
+    /// has an empty `Vec<String>` for the same shape.
+    ///
+    /// Without `#[serde(skip_serializing_if = "Vec::is_empty")]` on
+    /// `reference_artifact_refs`, `StableTranscriptHashItem` would
+    /// serialize `"reference_artifact_refs": []` into the canonical
+    /// hash bytes, drifting the transcript hash away from any pre-#1111
+    /// snapshot. This test pins that the hash of an
+    /// in-memory-constructed summary (empty references) is identical to
+    /// the hash of the same summary parsed from a legacy JSON snapshot
+    /// that lacked the field entirely.
+    #[test]
+    fn transcript_hash_stable_for_empty_reference_artifact_refs() {
+        // (1) In-memory form: empty Vec for the new field.
+        let mut modern = ContextManager::new("s", None);
+        modern.record_item(
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id: "agent-x".to_owned(),
+                summary: "ok".to_owned(),
+                artifact_refs: vec!["agent/x/artifact.md".to_owned()],
+                reference_artifact_refs: vec![],
+            },
+            TranscriptItemSource::Supervisor,
+        );
+
+        // (2) Legacy form: same summary deserialized from JSON that
+        // omits `reference_artifact_refs` entirely.
+        let legacy_kind: TranscriptItemKind = serde_json::from_value(serde_json::json!({
+            "type": "child_result_summary",
+            "child_agent_id": "agent-x",
+            "summary": "ok",
+            "artifact_refs": ["agent/x/artifact.md"]
+        }))
+        .expect("legacy ChildResultSummary deserializes");
+        let mut legacy = ContextManager::new("s", None);
+        legacy.record_item(legacy_kind, TranscriptItemSource::Supervisor);
+
+        // Hashes are computed over `StableTranscriptHashItem`, which
+        // serializes `kind` via the canonical `TranscriptItemKind`
+        // serde. With `skip_serializing_if = "Vec::is_empty"`, both
+        // forms canonicalize to the same JSON and therefore the same
+        // sha256.
+        assert_eq!(
+            modern.transcript_hash(),
+            legacy.transcript_hash(),
+            "empty reference_artifact_refs must hash identically to a legacy snapshot that omits the field"
+        );
     }
 
     #[test]
