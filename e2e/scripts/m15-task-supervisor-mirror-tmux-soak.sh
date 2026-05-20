@@ -157,24 +157,85 @@ REPLAY
 }
 
 scrub_fixture_key() {
+  # #1024 parity — broaden the secret pattern set so an operator who
+  # ran this soak with `DEEPSEEK_API_KEY=$REAL_KEY` (instead of the
+  # built-in fixture) still gets the key stripped before validation.
+  # Also emits a `secret-scan-report.txt` with per-file redaction
+  # counts (no secret values printed).
   node - "$out_dir" "$data_dir" "$runtime_root" <<'NODE'
 const fs = require('fs');
 const path = require('path');
 const roots = process.argv.slice(2);
-const fixtureKey = /dummy-key-for-m15-task-supervisor-fixture/g;
+
+const patterns = [
+  { regex: /dummy-key-for-m15-task-supervisor-fixture/g, label: '<fixture-key>' },
+  { regex: /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g, label: '<redacted>' },
+  { regex: /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g, label: '<redacted>' },
+  { regex: /AIza[0-9A-Za-z_\-]{30,}/g, label: '<redacted>' },
+  { regex: /AC[0-9a-f]{32}/g, label: '<redacted>' },
+  { regex: /Bearer [A-Za-z0-9._\-]{32,}/g, label: 'Bearer <redacted>' },
+];
+
+const scanExtensions = /\.(json|jsonl|log|txt|env|sh|md|yaml|yml|toml|conf|ini|mjs)$/i;
+const skipDirs = new Set(['.git', 'node_modules', 'target', '__pycache__']);
+
+const report = [];
+let totalRedactions = 0;
+let filesScanned = 0;
+
+function redact(text) {
+  let next = text;
+  let count = 0;
+  for (const { regex, label } of patterns) {
+    regex.lastIndex = 0;
+    next = next.replace(regex, () => {
+      count += 1;
+      return label;
+    });
+  }
+  return { next, count };
+}
+
 function walk(p) {
   if (!p || !fs.existsSync(p)) return;
   const st = fs.statSync(p);
   if (st.isDirectory()) {
-    for (const name of fs.readdirSync(p)) walk(path.join(p, name));
+    for (const name of fs.readdirSync(p)) {
+      if (skipDirs.has(name)) continue;
+      walk(path.join(p, name));
+    }
     return;
   }
-  if (!/\.(json|jsonl|log|txt|env|sh)$/.test(p)) return;
-  const text = fs.readFileSync(p, 'utf8');
-  const next = text.replace(fixtureKey, '<fixture-key>');
-  if (next !== text) fs.writeFileSync(p, next);
+  if (!scanExtensions.test(p)) return;
+  filesScanned += 1;
+  let text;
+  try { text = fs.readFileSync(p, 'utf8'); } catch { return; }
+  const { next, count } = redact(text);
+  if (count > 0) {
+    fs.writeFileSync(p, next);
+    report.push({ path: p, count });
+    totalRedactions += count;
+  }
 }
+
 for (const root of roots) walk(root);
+
+const evidenceRoot = roots[0];
+if (evidenceRoot && fs.existsSync(evidenceRoot)) {
+  const lines = [
+    '# M15 task-supervisor-mirror soak secret-scan report',
+    `roots: ${roots.join(', ')}`,
+    `files_scanned: ${filesScanned}`,
+    `total_redactions: ${totalRedactions}`,
+    '',
+    ...report.map((e) => `${e.count}\t${e.path}`),
+  ];
+  try {
+    fs.writeFileSync(path.join(evidenceRoot, 'secret-scan-report.txt'), `${lines.join('\n')}\n`);
+  } catch {
+    // don't crash the trap on report write failure
+  }
+}
 NODE
 }
 
@@ -182,7 +243,10 @@ run_soak() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required"
   ensure_binaries
   mkdir -p "$out_dir" "$runtime_root" "$data_dir" "$workdir"
-  trap scrub_fixture_key EXIT
+  # #1024 parity — fire the scrub on signals as well as EXIT so a
+  # Ctrl-C between profile config write and validator still leaves a
+  # clean evidence tree.
+  trap scrub_fixture_key EXIT INT TERM
   write_profile_config
   write_replay
 
@@ -224,6 +288,45 @@ run_soak() {
 self_test() {
   bash -n "$0"
   python3 -m py_compile "$script_dir/validate-m15-task-supervisor-mirror-tmux.py"
+  # #1024 parity self-test — exercise the scrub against a synthetic
+  # tree containing both the fixture key and broader provider key
+  # shapes, and verify the report records redactions.
+  local fixture_root
+  fixture_root="$(mktemp -d -t m15-scrub-test-XXXXXX)"
+  trap 'rm -rf "$fixture_root"' RETURN
+  local old_out_dir="${out_dir:-}"
+  local old_data_dir="${data_dir:-}"
+  local old_runtime_root="${runtime_root:-}"
+  out_dir="$fixture_root/out"
+  data_dir="$fixture_root/data"
+  runtime_root="$fixture_root/runtime"
+  mkdir -p "$out_dir" "$data_dir" "$runtime_root"
+  cat > "$data_dir/profile.json" <<TXT
+{ "fixture": "dummy-key-for-m15-task-supervisor-fixture",
+  "real_api_key": "sk-proj-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+TXT
+  cat > "$runtime_root/log.txt" <<TXT
+google: AIzaSyA-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+auth: Bearer cccccccccccccccccccccccccccccccccccc
+TXT
+  scrub_fixture_key
+  if grep -RIEq -- 'dummy-key-for-m15-task-supervisor-fixture|sk-proj|AIzaSy|Bearer cccc' "$fixture_root"; then
+    echo "scrub_fixture_key self-test FAIL: residual secrets in $fixture_root" >&2
+    grep -RIEn -- 'dummy-key-for-m15-task-supervisor-fixture|sk-proj|AIzaSy|Bearer cccc' "$fixture_root" || true
+    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+    return 1
+  fi
+  if [[ ! -s "$out_dir/secret-scan-report.txt" ]]; then
+    echo "scrub_fixture_key self-test FAIL: secret-scan-report.txt missing or empty" >&2
+    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+    return 1
+  fi
+  if ! grep -q '^total_redactions: [1-9]' "$out_dir/secret-scan-report.txt"; then
+    echo "scrub_fixture_key self-test FAIL: report did not record redactions" >&2
+    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+    return 1
+  fi
+  out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
   echo "Self-test passed"
 }
 
