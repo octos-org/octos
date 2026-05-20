@@ -1798,6 +1798,37 @@ pub struct TaskListEntry {
     pub status: String,
     pub lifecycle_state: String,
     pub runtime_state: String,
+    /// #966 / M13-B — origin of this child task. One of `"model"` (the
+    /// LLM scheduled it via spawn_agent / spawn / delegate), `"supervisor"`
+    /// (a backend supervisor created it, e.g. review/start), or `"user"`
+    /// (explicit user-driven schedule, rare). Lets clients tell apart
+    /// LLM-owned children from user-initiated tasks without parsing
+    /// free-form fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// #966 / M13-B — role label assigned at spawn (e.g.
+    /// `"reviewer"`, `"implementer"`, `"test_worker"`, `"explorer"`).
+    /// Pairs with the M14-C role templates and lets the UX render
+    /// "Reviewer running" instead of "task-xxx running".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// #966 / M13-B — bounded summary capsule for the task (mirrors
+    /// `ChildResultSummary.summary` for terminal children). Short text
+    /// that clients can render inline without fetching the full
+    /// artifact list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// #966 / M13-B — number of artifacts the child has emitted so
+    /// far. Lets the UX badge tasks with their artifact count without
+    /// resolving `task/artifact/list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    /// #966 / M13-B — runtime policy stamp captured at spawn time
+    /// (model, sandbox, approval policy, …). Lets reconnect hydration
+    /// surface the same effective state the original task/updated
+    /// notifications announced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_key: Option<SessionKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6404,6 +6435,11 @@ mod tests {
                 status: "running".into(),
                 lifecycle_state: "running".into(),
                 runtime_state: "executing_tool".into(),
+                source: None,
+                role: None,
+                summary: None,
+                artifact_count: None,
+                runtime_policy_stamp: None,
                 parent_session_key: Some(SessionKey("local:demo".into())),
                 child_session_key: Some(SessionKey("local:demo#child-1".into())),
                 child_terminal_state: None,
