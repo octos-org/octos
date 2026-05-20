@@ -297,6 +297,24 @@ pub struct DispatchContextContract {
     pub parent_session_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_session_key: Option<String>,
+    /// #1021 / M17-C — which kind of backend is consuming this dispatch
+    /// (`"native"`, `"cli"`, or `"mcp"`). Lets validators and AppUI
+    /// evidence ledgers tell apart context modes per specialist kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<String>,
+    /// #1021 / M17-C — agent id (M13 task id) for evidence cross-
+    /// referencing. Pairs with `backend_kind` so a single line of the
+    /// evidence ledger fully identifies the child the contract belongs
+    /// to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// #1021 / M17-C — risk indicator when emitting
+    /// `external_context_unmanaged` (e.g. `"low"`, `"medium"`, `"high"`).
+    /// Captures whether the unmanaged dispatch leaks privileged data or
+    /// runs in a read-only context so consumers can prioritise follow-
+    /// up. Free-form by convention to stay forward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
 }
 
 impl DispatchContextContract {
@@ -307,6 +325,9 @@ impl DispatchContextContract {
             context_ref: None,
             parent_session_key: None,
             child_session_key: None,
+            backend_kind: None,
+            agent_id: None,
+            risk: None,
         }
     }
 
@@ -317,6 +338,9 @@ impl DispatchContextContract {
             context_ref: Some(context_ref.into()),
             parent_session_key: None,
             child_session_key: None,
+            backend_kind: None,
+            agent_id: None,
+            risk: None,
         }
     }
 
@@ -327,6 +351,25 @@ impl DispatchContextContract {
 
     pub fn with_child_session_key(mut self, value: Option<String>) -> Self {
         self.child_session_key = value;
+        self
+    }
+
+    /// #1021 — set the backend kind (`"native"` / `"cli"` / `"mcp"`).
+    pub fn with_backend_kind(mut self, value: impl Into<String>) -> Self {
+        self.backend_kind = Some(value.into());
+        self
+    }
+
+    /// #1021 — set the agent id (M13 task id) the contract applies to.
+    pub fn with_agent_id(mut self, value: impl Into<String>) -> Self {
+        self.agent_id = Some(value.into());
+        self
+    }
+
+    /// #1021 — set the risk indicator (e.g. `"low"`, `"medium"`,
+    /// `"high"`). Most useful alongside `external_unmanaged`.
+    pub fn with_risk(mut self, value: impl Into<String>) -> Self {
+        self.risk = Some(value.into());
         self
     }
 }
@@ -1098,6 +1141,51 @@ mod tests {
         assert_eq!(args["context_contract"]["reason"], "fixture");
         assert_eq!(args["context_contract"]["parent_session_key"], "parent");
         assert_eq!(args["context_contract"]["child_session_key"], "child");
+    }
+
+    /// #1021 / M17-C — backend_kind, agent_id, and risk are all
+    /// optional fields. Empty Options must not appear on the wire.
+    #[test]
+    fn dispatch_context_contract_omits_unset_m17c_fields() {
+        let json = serde_json::to_value(
+            DispatchContextContract::external_unmanaged("fixture")
+                .with_parent_session_key(Some("parent".into()))
+                .with_child_session_key(Some("child".into())),
+        )
+        .expect("serialize");
+        let object = json.as_object().expect("object");
+        assert!(!object.contains_key("backend_kind"));
+        assert!(!object.contains_key("agent_id"));
+        assert!(!object.contains_key("risk"));
+    }
+
+    /// #1021 / M17-C — when an unmanaged dispatch is emitted, the
+    /// contract should carry enough diagnostic info to identify the
+    /// child: backend kind, agent id, and risk classification.
+    #[test]
+    fn dispatch_context_contract_carries_backend_kind_agent_id_and_risk() {
+        let contract = DispatchContextContract::external_unmanaged(
+            "mcp specialist cannot consume managed payload",
+        )
+        .with_parent_session_key(Some("parent".into()))
+        .with_child_session_key(Some("child".into()))
+        .with_backend_kind("mcp")
+        .with_agent_id("reviewer-42")
+        .with_risk("medium");
+
+        let json = serde_json::to_value(&contract).expect("serialize");
+        assert_eq!(json["mode"], "external_context_unmanaged");
+        assert_eq!(json["backend_kind"], "mcp");
+        assert_eq!(json["agent_id"], "reviewer-42");
+        assert_eq!(json["risk"], "medium");
+        assert_eq!(json["parent_session_key"], "parent");
+        assert_eq!(json["child_session_key"], "child");
+
+        // Round-trip via Deserialize keeps the new fields intact.
+        let parsed: DispatchContextContract = serde_json::from_value(json).expect("round trip");
+        assert_eq!(parsed.backend_kind.as_deref(), Some("mcp"));
+        assert_eq!(parsed.agent_id.as_deref(), Some("reviewer-42"));
+        assert_eq!(parsed.risk.as_deref(), Some("medium"));
     }
 
     #[test]
