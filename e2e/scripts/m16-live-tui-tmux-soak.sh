@@ -317,24 +317,100 @@ NODE
 }
 
 scrub_secrets() {
+  # Walks every artifact / runtime tree the soak writes and redacts
+  # provider keys in place. Writes a `secret-scan-report.txt` next to
+  # the soak evidence with per-file redaction counts (no secret values
+  # are printed). #1024 — the prior implementation matched only a
+  # narrow `sk-[A-Za-z0-9]{20,}` pattern and emitted no report, so
+  # provider-specific shapes (`sk-ant-*`, `sk-proj-*`, gemini bearer
+  # tokens, JWT-shaped Anthropic OAuth) could slip through unscanned.
   node - "$out_dir" "$data_dir" "$runtime_root" <<'NODE'
 const fs = require('fs');
 const path = require('path');
 const roots = process.argv.slice(2);
-const secretPattern = /sk-[A-Za-z0-9]{20,}/g;
+
+const patterns = [
+  // OpenAI / DeepSeek / generic OpenAI-compatible
+  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_\-]{20,}/g,
+  // Anthropic OAuth bearer tokens (sk-ant-oat01-...)
+  /sk-ant-oat01-[A-Za-z0-9_\-]{20,}/g,
+  // Google Gemini AIza... keys
+  /AIza[0-9A-Za-z_\-]{30,}/g,
+  // Twilio account/auth pairs
+  /AC[0-9a-f]{32}/g,
+  // Generic Bearer secrets in headers/log lines
+  /Bearer [A-Za-z0-9._\-]{32,}/g,
+];
+
+const scanExtensions = /\.(json|jsonl|log|txt|md|env|sh|mjs|yaml|yml|toml|conf|ini)$/i;
+const skipDirs = new Set(['.git', 'node_modules', 'target', '__pycache__']);
+
+const report = [];
+let totalRedactions = 0;
+let filesScanned = 0;
+
+function redact(text) {
+  let next = text;
+  let count = 0;
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    next = next.replace(pattern, (match) => {
+      count += 1;
+      return '<redacted>';
+    });
+  }
+  return { next, count };
+}
+
 function walk(p) {
   if (!p || !fs.existsSync(p)) return;
   const st = fs.statSync(p);
   if (st.isDirectory()) {
-    for (const name of fs.readdirSync(p)) walk(path.join(p, name));
+    for (const name of fs.readdirSync(p)) {
+      if (skipDirs.has(name)) continue;
+      walk(path.join(p, name));
+    }
     return;
   }
-  if (!/\.(json|jsonl|log|txt|md|env|sh|mjs)$/.test(p)) return;
-  const text = fs.readFileSync(p, 'utf8');
-  const next = text.replace(secretPattern, '<redacted>');
-  if (next !== text) fs.writeFileSync(p, next);
+  if (!scanExtensions.test(p)) return;
+  filesScanned += 1;
+  let text;
+  try {
+    text = fs.readFileSync(p, 'utf8');
+  } catch {
+    return;
+  }
+  const { next, count } = redact(text);
+  if (count > 0) {
+    fs.writeFileSync(p, next);
+    report.push({ path: p, count });
+    totalRedactions += count;
+  }
 }
+
 for (const root of roots) walk(root);
+
+// Emit the report under the FIRST root (out_dir). Pass arg-0 (out_dir)
+// is the canonical evidence directory.
+const evidenceRoot = roots[0];
+if (evidenceRoot && fs.existsSync(evidenceRoot)) {
+  const lines = [
+    `# M16 tmux soak secret-scan report`,
+    `roots: ${roots.join(', ')}`,
+    `files_scanned: ${filesScanned}`,
+    `total_redactions: ${totalRedactions}`,
+    '',
+    ...report.map((entry) => `${entry.count}\t${entry.path}`),
+  ];
+  try {
+    fs.writeFileSync(path.join(evidenceRoot, 'secret-scan-report.txt'), `${lines.join('\n')}\n`);
+  } catch {
+    // Don't crash the trap on report write failure.
+  }
+}
+
+// Non-zero exit on detected redactions would block the soak validator
+// from running; surface the count via the report only.
 NODE
 }
 
@@ -343,7 +419,12 @@ run_soak() {
   [[ -x "$tui_runner" ]] || die "octos-tui tmux runner not found or not executable: $tui_runner"
   ensure_binaries
   mkdir -p "$out_dir" "$runtime_root" "$data_dir" "$workdir"
-  trap scrub_secrets EXIT
+  # Register the secret scrub BEFORE any provider config / key is
+  # written so a startup failure between mkdir and the actual write
+  # still emits a clean evidence tree. Catching INT/TERM as well
+  # closes the gap #1024 flagged where Ctrl-C during the bootstrap
+  # left the unscanned provider config behind.
+  trap scrub_secrets EXIT INT TERM
   write_review_workspace_fixture
   write_review_fixtures
   write_replay
@@ -394,6 +475,46 @@ run_soak() {
 self_test() {
   bash -n "$0"
   python3 -m py_compile "$script_dir/validate-m16-tmux-orchestration.py"
+  # #1024: exercise scrub_secrets against a synthetic tree so the
+  # broadened pattern set + report emission stay regression-tested.
+  local fixture_root
+  fixture_root="$(mktemp -d -t m16-scrub-test-XXXXXX)"
+  trap 'rm -rf "$fixture_root"' RETURN
+  local old_out_dir="${out_dir:-}"
+  local old_data_dir="${data_dir:-}"
+  local old_runtime_root="${runtime_root:-}"
+  out_dir="$fixture_root/out"
+  data_dir="$fixture_root/data"
+  runtime_root="$fixture_root/runtime"
+  mkdir -p "$out_dir" "$data_dir" "$runtime_root"
+  cat > "$data_dir/profile.json" <<JSON
+{ "api_key": "sk-test-${RANDOM}1234567890ABCDEFG1234567890" }
+JSON
+  cat > "$runtime_root/log.txt" <<TXT
+auth: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD
+google: AIzaSyA-1234567890abcdefghijklmnopqrstuv
+TXT
+  cat > "$out_dir/anthropic.env" <<TXT
+ANTHROPIC_API_KEY=sk-ant-oat01-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+TXT
+  scrub_secrets
+  if grep -RIEq -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij' "$fixture_root"; then
+    echo "scrub_secrets self-test FAIL: residual secrets in $fixture_root" >&2
+    grep -RIEn -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij' "$fixture_root" || true
+    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+    return 1
+  fi
+  if [[ ! -s "$out_dir/secret-scan-report.txt" ]]; then
+    echo "scrub_secrets self-test FAIL: secret-scan-report.txt missing or empty" >&2
+    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+    return 1
+  fi
+  if ! grep -q '^total_redactions: [1-9]' "$out_dir/secret-scan-report.txt"; then
+    echo "scrub_secrets self-test FAIL: report did not record redactions" >&2
+    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+    return 1
+  fi
+  out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
   echo "Self-test passed"
 }
 
