@@ -480,6 +480,8 @@ mod tests {
     /// - `group:media` -> mofa_* / fm_tts (write generated media)
     /// - `group:web` -> browser (persists screenshots to disk)
     /// - `group:research` -> deep_crawl / search (persist crawled pages)
+    /// - `group:delegated` -> delegate_task / spawn / send_message /
+    ///   save_memory / execute_code (every kind of side effect at once)
     ///
     /// Read-only roles (`reviewer`, `explorer`) MUST advertise none
     /// of these; `test_worker` is allowed `group:runtime` because
@@ -498,6 +500,7 @@ mod tests {
             "group:media",
             "group:web",
             "group:research",
+            "group:delegated",
         ];
         // Reviewer + explorer are documented as fully read-only.
         for name in [ROLE_REVIEWER, ROLE_EXPLORER] {
