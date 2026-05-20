@@ -10536,6 +10536,18 @@ struct TaskListProjection {
     lifecycle_state: String,
     #[serde(default)]
     runtime_state: String,
+    // #966 / M13-B — extended projection fields. Optional so legacy
+    // snapshots from older TaskSupervisor query JSON deserialize cleanly.
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    artifact_count: Option<u32>,
+    #[serde(default)]
+    runtime_policy_stamp: Option<Value>,
     #[serde(default)]
     child_terminal_state: Option<String>,
     #[serde(default)]
@@ -10578,6 +10590,15 @@ fn task_list_entry_from_value(value: Value) -> Result<TaskListEntry, RpcError> {
         status: projected.status,
         lifecycle_state: projected.lifecycle_state,
         runtime_state: projected.runtime_state,
+        // #966 / M13-B — extended projection fields. Backed by
+        // additional optional fields in the TaskSupervisor query
+        // JSON; when absent (legacy snapshots), these stay None and
+        // are omitted from the wire.
+        source: projected.source,
+        role: projected.role,
+        summary: projected.summary,
+        artifact_count: projected.artifact_count,
+        runtime_policy_stamp: projected.runtime_policy_stamp,
         parent_session_key: projected.parent_session_key,
         child_session_key: projected.child_session_key,
         child_terminal_state: projected.child_terminal_state,
