@@ -18208,6 +18208,89 @@ mod tests {
         }
     }
 
+    /// #966 / M13-B projection contract: when the `TaskSupervisor`
+    /// query JSON carries the M13-B extension fields (`source`, `role`,
+    /// `summary`, `artifact_count`, `runtime_policy_stamp`), the
+    /// `task_list_entry_from_value` projection MUST round-trip them
+    /// onto the wire `TaskListEntry` so downstream `task/list` and
+    /// `task/updated` payloads include them verbatim.
+    ///
+    /// PR #1103 added the wire fields and the supervisor-side projection
+    /// fields. This guard pins the deserialization end-to-end so a
+    /// future supervisor that emits these fields is read correctly with
+    /// no further wire wiring needed.
+    #[test]
+    fn task_list_entry_from_value_round_trips_m13b_projection_fields() {
+        let now = Utc::now();
+        let raw = json!({
+            "id": "0190d000-0000-7000-8000-000000000001",
+            "tool_name": "spawn_agent",
+            "tool_call_id": "call-1",
+            "status": "running",
+            "lifecycle_state": "running",
+            "runtime_state": "executing_tool",
+            "source": "model",
+            "role": "reviewer",
+            "summary": "scanning diff for P0 findings",
+            "artifact_count": 3,
+            "runtime_policy_stamp": {
+                "model": "claude-opus-4-7",
+                "sandbox": "macos",
+                "approval_policy": "ask",
+            },
+            "parent_session_key": "api:parent",
+            "child_session_key": "api:parent#child-1",
+            "started_at": now,
+            "updated_at": now,
+        });
+        let entry =
+            task_list_entry_from_value(raw).expect("M13-B projection JSON must deserialize");
+        assert_eq!(entry.source.as_deref(), Some("model"));
+        assert_eq!(entry.role.as_deref(), Some("reviewer"));
+        assert_eq!(
+            entry.summary.as_deref(),
+            Some("scanning diff for P0 findings")
+        );
+        assert_eq!(entry.artifact_count, Some(3));
+        let stamp = entry
+            .runtime_policy_stamp
+            .as_ref()
+            .expect("runtime_policy_stamp must round-trip");
+        assert_eq!(stamp["model"], json!("claude-opus-4-7"));
+        assert_eq!(stamp["sandbox"], json!("macos"));
+        assert_eq!(stamp["approval_policy"], json!("ask"));
+        // Legacy fields still round-trip.
+        assert_eq!(entry.tool_name, "spawn_agent");
+        assert_eq!(entry.status, "running");
+    }
+
+    /// #966 / M13-B back-compat: a legacy `TaskSupervisor` query JSON
+    /// payload that does NOT include the M13-B extension fields must
+    /// still deserialize cleanly with `None` for each new field. Guards
+    /// against a future change that accidentally makes any new field
+    /// required (which would break every existing supervisor).
+    #[test]
+    fn task_list_entry_from_value_tolerates_legacy_supervisor_json() {
+        let now = Utc::now();
+        let raw = json!({
+            "id": "0190d000-0000-7000-8000-000000000002",
+            "tool_name": "run_pipeline",
+            "tool_call_id": "call-2",
+            "status": "completed",
+            "lifecycle_state": "ready",
+            "runtime_state": "completed",
+            "started_at": now,
+            "updated_at": now,
+        });
+        let entry =
+            task_list_entry_from_value(raw).expect("legacy supervisor JSON must deserialize");
+        assert!(entry.source.is_none());
+        assert!(entry.role.is_none());
+        assert!(entry.summary.is_none());
+        assert!(entry.artifact_count.is_none());
+        assert!(entry.runtime_policy_stamp.is_none());
+    }
+
     #[tokio::test]
     async fn appui_task_list_returns_runtime_snapshot() {
         let session_id = SessionKey("local:test".into());
