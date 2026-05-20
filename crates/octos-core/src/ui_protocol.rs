@@ -5196,6 +5196,44 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_capabilities_hide_task_and_agent_artifact_methods_without_feature() {
+        // #965 — UPCR-2026-019 capability gating: `task/artifact/list`
+        // and `task/artifact/read` (plus the legacy `agent/artifact/*`
+        // aliases that route through the same handlers) must not appear
+        // in `supported_methods` unless the negotiated capability set
+        // includes `coding.agent_control.v1`. Without the gate the
+        // server would advertise an RPC that immediately returns
+        // `agent_control_unavailable` for every caller.
+        let capabilities = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_task_and_agent_artifact_methods_when_feature_requested() {
+        // #965 — counterpart to the gate-off test above. When the
+        // client requests `coding.agent_control.v1` (paired with the
+        // `coding.autonomy.v1` base, since `agent_control` is an
+        // autonomy-optional add-on), both the canonical `task/artifact/*`
+        // names and the legacy `agent/artifact/*` aliases appear in
+        // the negotiated method set so the dispatcher
+        // (`task/artifact/* | agent/artifact/* => handler`) is reachable
+        // by name in either direction.
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+            UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+        ]);
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+    }
+
+    #[test]
     fn ui_protocol_v1_wire_contract_is_golden() {
         assert_eq!(UI_PROTOCOL_V1, "octos-ui/v1alpha1");
         assert_eq!(UI_PROTOCOL_SCHEMA_VERSION, 1);
