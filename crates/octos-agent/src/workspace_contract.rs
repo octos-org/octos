@@ -928,6 +928,128 @@ mod tests {
         }
     }
 
+    /// octos #1035 P1 follow-up: a `mofa-podcast` payload that carries only
+    /// the final audio (no `seg_*.wav` segment scratch files) MUST satisfy
+    /// the default `podcast_generate` contract end-to-end through the
+    /// validator runner. This pins the regression where a `PerFileNonSilent`
+    /// gate over `**/segments/seg_*.wav` was declared on the contract: the
+    /// deployed plugin does not preserve segments after assembly, so the
+    /// gate matched zero files and `require_at_least:1` hard-failed every
+    /// podcast call with "expected >=1 audio files, found 0" (mini3 live
+    /// regression 2026-05-18, dropped at commit e68f9f487).
+    ///
+    /// We retain the validator chain shape (MagicBytes + AudioNonSilent over
+    /// `SpawnOnlyFiles`) but flip the audio format from MP3 to WAV so the
+    /// validator runner can decode the fixture without the optional
+    /// `audio_mp3` feature. The structural assertion — final-audio-only
+    /// `files_to_send` passes both whole-file checks with no per-segment
+    /// gate failing — is identical for MP3 once the feature is enabled.
+    #[tokio::test]
+    async fn podcast_contract_satisfied_by_final_audio_only_payload_for_octos_1035() {
+        use crate::workspace_policy::{MagicByteKind, SpawnTaskValidatorSpec, ValidatorSpec};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = WorkspacePolicy::for_session();
+        let task = policy
+            .spawn_tasks
+            .get_mut("podcast_generate")
+            .expect("podcast_generate contract");
+
+        // Rewrite the on_completion chain to validate WAV bytes so the
+        // decoder runs without the optional `audio_mp3` feature. The shape
+        // (MagicBytes + AudioNonSilent over SpawnOnlyFiles, no per-segment
+        // gate) mirrors the deployed contract on main exactly.
+        let mut rewritten = Vec::with_capacity(task.on_completion.len());
+        for entry in std::mem::take(&mut task.on_completion) {
+            let spec = match entry {
+                SpawnTaskValidatorSpec::Bare(spec) => spec,
+                SpawnTaskValidatorSpec::Full(validator) => validator.spec,
+            };
+            let rewritten_spec = match spec {
+                ValidatorSpec::MagicBytes {
+                    glob,
+                    source,
+                    extension,
+                    ..
+                } => ValidatorSpec::MagicBytes {
+                    glob,
+                    format: MagicByteKind::Wav,
+                    source,
+                    extension: extension.map(|ext| if ext == "mp3" { "wav".into() } else { ext }),
+                },
+                ValidatorSpec::AudioNonSilent {
+                    glob,
+                    min_ratio,
+                    source,
+                    extension,
+                } => ValidatorSpec::AudioNonSilent {
+                    glob,
+                    min_ratio,
+                    source,
+                    extension: extension.map(|ext| if ext == "mp3" { "wav".into() } else { ext }),
+                },
+                other => other,
+            };
+            rewritten.push(SpawnTaskValidatorSpec::Bare(rewritten_spec));
+        }
+        task.on_completion = rewritten;
+
+        write_workspace_policy(temp.path(), &policy).unwrap();
+        // Topic-suffixed output dir mirrors the mini5 regression shape
+        // (chat topic 《逐玉》 → `mofa-podcast-zhuyu/`).
+        let output = temp
+            .path()
+            .join("skill-output/mofa-podcast-zhuyu/podcast_full_1779067937.wav");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        write_sine_wav_for_test(&output, 8_000);
+
+        // The crux of the test: files_to_send carries ONLY the final audio
+        // path — no `seg_*.wav` segment scratch files, mirroring the
+        // deployed mofa-podcast plugin's actual output shape.
+        let result = enforce_spawn_task_contract(
+            &ToolRegistry::with_builtins(temp.path()),
+            "podcast_generate",
+            "tool-call-final-audio-only",
+            std::slice::from_ref(&output),
+            UNIX_EPOCH,
+            None,
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Satisfied { output_files } => {
+                assert_eq!(output_files, vec![output.to_string_lossy().to_string()]);
+            }
+            other => panic!(
+                "final-audio-only payload must satisfy podcast contract \
+                 (regression guard for the PerFileNonSilent segment gate \
+                 dropped in octos #1035 follow-up): {other:?}"
+            ),
+        }
+    }
+
+    /// Generate a loud sine WAV at `path` whose samples sit above the
+    /// `AudioNonSilent` floor so the validator passes.
+    fn write_sine_wav_for_test(path: &Path, samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        let amplitude = i16::MAX / 2;
+        for index in 0..samples {
+            let phase = (index as f32) * std::f32::consts::TAU * 440.0 / 8_000.0;
+            let value = (phase.sin() * amplitude as f32) as i16;
+            // Keep value away from zero crossings so every sample is above
+            // the non-silent floor.
+            let value = if value.abs() < 4_000 { 4_000 } else { value };
+            writer.write_sample(value).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
     #[tokio::test]
     async fn session_contract_resolves_multiple_artifact_sources_for_runtime_verification() {
         let temp = tempfile::tempdir().unwrap();
