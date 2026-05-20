@@ -7227,6 +7227,32 @@ fn validate_session_workspace_allowed(
     // connection-profile gate (`validate_session_scope`), not the cwd
     // validator.
     if resolve_session_profile_runtime(state, active_profile_id).is_none() {
+        // Distinguish "profile exists but no LLM configured" from "no
+        // profile registered at all" so the client can route the user
+        // to the right setup flow. #952: solo `session/open` previously
+        // returned the generic `cwd_runtime_unavailable` even when the
+        // profile was simply missing its LLM selection — replace with
+        // typed `profile_unconfigured`.
+        let candidate = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
+        if let Some(store) = state.profile_store.as_ref() {
+            if let Ok(Some(profile)) = store.get(candidate) {
+                if profile.enabled
+                    && profile.parent_id.is_none()
+                    && !profile.config.has_llm_selection()
+                {
+                    return Err(RpcError::invalid_params(
+                        "session/open requires the routed profile to have an LLM selection",
+                    )
+                    .with_data(json!({
+                        "kind": "profile_unconfigured",
+                        "cwd": workspace_root.to_string_lossy(),
+                        "active_profile_id": candidate,
+                        "missing": "llm",
+                    })));
+                }
+            }
+        }
+
         return Err(RpcError::invalid_params(
             "session/open cwd requires a configured profile runtime",
         )
@@ -16099,6 +16125,56 @@ mod tests {
         assert_eq!(
             unsupported.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("profile_local_unsupported"))
+        );
+    }
+
+    #[test]
+    fn session_workspace_allowed_returns_profile_unconfigured_when_profile_has_no_llm() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        create_or_get_local_solo_profile(
+            &state,
+            local_profile_params("Ada Lovelace", "ada", "ada@example.com"),
+        )
+        .expect("local profile created");
+
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let workspace = std::fs::canonicalize(&workspace).expect("canonical workspace");
+
+        let error = validate_session_workspace_allowed(&state, Some("ada"), &workspace)
+            .expect_err("missing LLM should be rejected");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_unconfigured"))
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("missing")),
+            Some(&json!("llm"))
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("active_profile_id")),
+            Some(&json!("ada"))
+        );
+    }
+
+    #[test]
+    fn session_workspace_allowed_returns_cwd_runtime_unavailable_when_profile_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let workspace = std::fs::canonicalize(&workspace).expect("canonical workspace");
+
+        let error = validate_session_workspace_allowed(&state, Some("nobody"), &workspace)
+            .expect_err("unknown profile is rejected");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("cwd_runtime_unavailable"))
         );
     }
 
