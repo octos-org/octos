@@ -286,6 +286,11 @@ class Recorder {
       runtimePolicy: path.join(options.outDir, "runtime-policy-stamp.json"),
       toolRegistry: path.join(options.outDir, "tool-registry-snapshot.json"),
       filesystemProbe: path.join(options.outDir, "filesystem-probe.json"),
+      // #906 — broader M12 evidence bundle. The workspace contract
+      // status is fetched via session/workspace.get and written here
+      // so soak runs without a live TUI can still prove the
+      // workspace-contract surface is reachable.
+      workspaceContract: path.join(options.outDir, "workspace-contract-status.json"),
       summary: path.join(options.outDir, "soak-summary.json"),
     };
     this.sentMethods = [];
@@ -646,6 +651,11 @@ class FixtureTransport {
         };
       case "turn/start":
         return { accepted: true };
+      // #906 — fixture transport stub so the workspace-contract probe
+      // doesn't fall over in self-test. Solo runs without tracked
+      // workspace repos return an empty contracts list.
+      case "session/workspace.get":
+        return { session_id: params.session_id, contracts: [] };
       default:
         throw new RpcError({
           code: -32601,
@@ -1108,6 +1118,53 @@ async function main() {
     snapshot: latestToolRegistry,
   });
   writeJson(recorder.paths.filesystemProbe, filesystemProbe);
+
+  // #906 — probe the workspace-contract surface and write the result
+  // to workspace-contract-status.json. Local solo runs may have no
+  // tracked repos under the workspace; the artifact still records the
+  // (possibly empty) response shape so downstream evidence consumers
+  // can rely on the file being present.
+  let workspaceContract = null;
+  const workspaceProbe = await callRpc({
+    transport,
+    recorder,
+    method: "session/workspace.get",
+    params: { session_id: options.sessionId, profile_id: options.profileId },
+    caseName: "workspace-contract-snapshot",
+  });
+  if (workspaceProbe.ok) {
+    workspaceContract = workspaceProbe.result;
+    const contracts = Array.isArray(workspaceProbe.result?.contracts)
+      ? workspaceProbe.result.contracts
+      : [];
+    summary.cases.push(caseRecord("workspace-contract-snapshot", "ok", {
+      contract_count: contracts.length,
+    }));
+  } else if (isUnsupported(workspaceProbe.error)) {
+    workspaceContract = { unavailable: true, reason: "method_not_supported" };
+    summary.cases.push(caseRecord("workspace-contract-snapshot", "blocked", {
+      reason: "session/workspace.get not negotiated",
+      error: workspaceProbe.rpcError,
+    }));
+    summary.blockers.push({
+      area: "M12-evidence",
+      reason: "session/workspace.get unavailable on this transport",
+      error: workspaceProbe.rpcError,
+    });
+  } else {
+    workspaceContract = { unavailable: true, error: workspaceProbe.rpcError };
+    summary.cases.push(caseRecord("workspace-contract-snapshot", "failed", {
+      error: workspaceProbe.rpcError,
+    }));
+  }
+  writeJson(recorder.paths.workspaceContract, {
+    schema: "octos-m12-workspace-contract-status-v1",
+    captured_at: nowIso(),
+    transport: options.transport,
+    session_id: options.sessionId,
+    profile_id: options.profileId,
+    response: workspaceContract,
+  });
 
   summary.finished_at = nowIso();
   summary.status = summary.failures.length > 0
