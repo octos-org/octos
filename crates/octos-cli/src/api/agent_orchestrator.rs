@@ -14,6 +14,7 @@ use super::supervisor_store::{
     SupervisorMetadata, SupervisorState, SupervisorStore, TerminalKind, TerminalState,
 };
 use chrono::Utc;
+use octos_agent::tools::mcp_agent::DispatchContextContract;
 use octos_agent::{Agent, AgentConfig, ToolRegistry};
 use octos_core::ui_protocol::{
     OutputCursor, RpcError, autonomy_error_kinds as kinds, methods, rpc_error_codes,
@@ -305,6 +306,7 @@ impl InProcessAgentOrchestrator {
                     artifacts: Vec::new(),
                     created_at_ms: now,
                     updated_at_ms: now,
+                    context_contract: None,
                 });
             entry.parent_agent_id = upsert.parent_agent_id;
             entry.session_id = upsert.session_id;
@@ -391,7 +393,7 @@ impl InProcessAgentOrchestrator {
             );
         }
 
-        let agent = self.upsert_agent(AgentUpsert {
+        let initial_agent = self.upsert_agent(AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: parent_agent_id.clone(),
             session_id: session_id.clone(),
@@ -405,6 +407,18 @@ impl InProcessAgentOrchestrator {
             cwd: Some(cwd.to_string_lossy().into_owned()),
             profile_id: profile_id.clone(),
         });
+        // #1021 / M17-C — native specialists currently run on the parent session's context manager without forking; from the dispatch contract's perspective that is `external_context_unmanaged` with `risk: "medium"`. When the native runner starts forking child contexts via `ContextManager::from_forked_child_context` this should switch to `managed_payload(context_ref)` with `risk: "low"` (see #1022).
+        let native_contract = DispatchContextContract::external_unmanaged(
+            "native_specialist_context_not_yet_managed",
+        )
+        .with_backend_kind(NATIVE_SPECIALIST_BACKEND_KIND)
+        .with_agent_id(agent_id.clone())
+        .with_risk("medium")
+        .with_parent_session_key(Some(session_id.to_string()))
+        .with_child_session_key(Some(agent_id.clone()));
+        let agent = self
+            .set_agent_context_contract(&agent_id, &session_id, &profile_id, native_contract)
+            .unwrap_or(initial_agent);
         emit_native_specialist_event(
             &event_tx,
             methods::AGENT_UPDATED,
@@ -526,6 +540,30 @@ impl InProcessAgentOrchestrator {
     fn agent_status_is_terminal(&self, agent_id: &str) -> bool {
         self.agent_status(agent_id)
             .is_some_and(|status| is_agent_terminal_status(&status))
+    }
+
+    /// #1021 / M17-C — stamp the dispatch context contract onto the agent record so subsequent `agent/updated` events surface `context_mode` / `context_refs` / `context_contract` to AppUI clients. Returns the freshly serialised agent JSON so callers can emit it through the supervisor event sink. Idempotent: the stored contract is overwritten on each call, mirroring how MCP dispatches stamp the most-recent contract on every response.
+    pub(crate) fn set_agent_context_contract(
+        &self,
+        agent_id: &str,
+        session_id: &SessionKey,
+        profile_id: &str,
+        contract: DispatchContextContract,
+    ) -> Result<Value, RpcError> {
+        let mut state = self.state();
+        let request = AgentRequest {
+            agent_id: agent_id.to_owned(),
+            session_id: Some(session_id.clone()),
+            profile_id: profile_id.to_owned(),
+        };
+        let agent = state
+            .agents
+            .get_mut(agent_id)
+            .ok_or_else(|| agent_not_found_error(&request))?;
+        ensure_agent_control_scope(agent, Some(session_id), profile_id)?;
+        agent.context_contract = Some(contract);
+        agent.updated_at_ms = now_ms();
+        Ok(autonomy_agent_json(agent))
     }
 
     pub(crate) fn set_agent_status(
@@ -1314,6 +1352,8 @@ struct AutonomyAgentRecord {
     artifacts: Vec<AgentArtifactRecord>,
     created_at_ms: i64,
     updated_at_ms: i64,
+    /// #1021 / M17-C — most-recent dispatch context contract for this child agent. Populated by specialist runners (CLI / native / MCP) when they emit a dispatch and surfaced through `agent/updated` so AppUI clients can tell `managed_payload` from `external_context_unmanaged` per child.
+    context_contract: Option<DispatchContextContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -2166,6 +2206,7 @@ fn restore_agents_from_supervisor_state(
             artifacts,
             created_at_ms,
             updated_at_ms,
+            context_contract: None,
         };
         state.agents.insert(agent.agent_id.clone(), agent);
     }
@@ -2608,6 +2649,21 @@ fn ensure_loop_scope(
 }
 
 fn autonomy_agent_json(agent: &AutonomyAgentRecord) -> Value {
+    // #1021 / M17-C — surface `context_mode` / `context_refs` per child so AppUI clients can tell which dispatch context regime each specialist child is running under. `context_refs` is an array even though we only ever emit one ref today, so future managed-multiplex contracts (e.g. parent + sidecar) can extend it without a wire-format break.
+    let context_mode = agent
+        .context_contract
+        .as_ref()
+        .map(|contract| contract.mode.clone());
+    let context_refs: Vec<String> = agent
+        .context_contract
+        .as_ref()
+        .and_then(|contract| contract.context_ref.clone())
+        .map(|context_ref| vec![context_ref])
+        .unwrap_or_default();
+    let context_contract = agent
+        .context_contract
+        .as_ref()
+        .and_then(|contract| serde_json::to_value(contract).ok());
     json!({
         "agent_id": agent.agent_id,
         "parent_agent_id": agent.parent_agent_id,
@@ -2636,6 +2692,9 @@ fn autonomy_agent_json(agent: &AutonomyAgentRecord) -> Value {
         },
         "artifact_count": agent.artifacts.len(),
         "artifacts": agent.artifacts.iter().map(agent_artifact_json).collect::<Vec<_>>(),
+        "context_mode": context_mode,
+        "context_refs": context_refs,
+        "context_contract": context_contract,
         "created_at_ms": agent.created_at_ms,
         "updated_at_ms": agent.updated_at_ms,
     })
@@ -3136,6 +3195,7 @@ mod tests {
             artifacts: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 2,
+            context_contract: None,
         }
     }
 
