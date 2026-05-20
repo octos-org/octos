@@ -428,6 +428,37 @@ pub async fn list_sessions(
         Err(response) => return response,
     };
 
+    // M11-F per-profile SessionManager listing. Mirrors the
+    // `session_messages` fix in commit 10cc9378d (`fix(api): route
+    // session_messages through per-profile SessionManager`): the
+    // WS turn handler (`run_standalone_turn`) writes session history
+    // through `SessionRuntime.sessions` which opens against the
+    // profile's own `data_dir` (`<profile>/data/sessions/...`). The
+    // process-wide `state.sessions` walk below opens against the
+    // top-level home (`<home>/sessions/`) and never sees those
+    // per-profile JSONLs — so for an authenticated tenant request
+    // (e.g. dspfac listing its own chat history on
+    // `https://dspfac.octos.ominix.io/chat`), the legacy walk
+    // returns 0 sessions and the chat sidebar renders empty.
+    //
+    // The fix opens a transient `SessionManager` against the
+    // resolved profile_data_dir and walks the bare on-disk ids the
+    // SPA actually uses — no prefix strip, because the per-profile
+    // sessions/ directory is itself the tenant boundary, so on-disk
+    // ids are already chat-bare. The process-wide walk below remains
+    // as an admin / legacy fallback (still strips `<profile>:api:`
+    // for legacy entries).
+    if let Ok(profile_data_dir) = resolve_profile_data_dir(&state, &headers, identity_ref).await {
+        let profile_sessions = list_profile_sessions(&profile_data_dir);
+        let existing: std::collections::HashSet<String> =
+            all.iter().map(|s| s.id.clone()).collect();
+        all.extend(
+            profile_sessions
+                .into_iter()
+                .filter(|s| !existing.contains(&s.id)),
+        );
+    }
+
     if let Some(sessions) = &state.sessions {
         let sess = sessions.lock().await;
         let prefix = format!("{profile_id}:api:");
@@ -437,12 +468,17 @@ pub async fn list_sessions(
         // `is_internal_api_session_id` belt-and-suspenders check is kept for
         // legacy entries that might slip through (e.g. flat layout files
         // pre-dating the encoder rules).
+        let existing: std::collections::HashSet<String> =
+            all.iter().map(|s| s.id.clone()).collect();
         all.extend(
             sess.list_top_level_sessions_with_title()
                 .into_iter()
                 .filter_map(|(id, count, title)| {
                     let chat_id = id.strip_prefix(&prefix)?;
                     if is_internal_api_session_id(chat_id) {
+                        return None;
+                    }
+                    if existing.contains(chat_id) {
                         return None;
                     }
                     Some(SessionInfo {
@@ -467,7 +503,7 @@ pub async fn list_sessions(
         if proxy_resp.status().is_success() {
             if let Ok(body) = axum::body::to_bytes(proxy_resp.into_body(), 10 * 1024 * 1024).await {
                 if let Ok(gateway_sessions) = serde_json::from_slice::<Vec<SessionInfo>>(&body) {
-                    // Merge, dedup by id (standalone wins)
+                    // Merge, dedup by id (per-profile / standalone wins).
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
                     all.extend(gateway_sessions.into_iter().filter(|s| {
@@ -487,6 +523,46 @@ pub async fn list_sessions(
     }
 
     Json(all).into_response()
+}
+
+/// List top-level sessions persisted under a per-profile data_dir.
+///
+/// Mirrors [`read_profile_session_messages`] (the `session_messages`
+/// fix in commit `10cc9378d`): opens a transient `SessionManager`
+/// against the resolved profile_data_dir and walks
+/// `list_top_level_sessions_with_title()`. The on-disk session ids are
+/// already chat-bare (the SPA-supplied `web-<N>` / `slides-<N>` form),
+/// so we emit them as-is without stripping a `<profile>:api:` prefix —
+/// that prefix only applies to the process-wide `state.sessions` store
+/// which opens against the top-level home.
+///
+/// Internal runtime topics (`child-*` and `*.tasks` sidecars) are
+/// already filtered at the `list_top_level_sessions` directory walk;
+/// the `is_internal_api_session_id` check belt-and-suspenders any
+/// legacy flat-layout entries.
+///
+/// The per-profile sessions/ directory IS the tenant boundary — only
+/// that profile's JSONLs live there — so no further authorization gate
+/// is needed inside this helper. The caller (`list_sessions`) handles
+/// header/identity authorization via [`resolve_profile_data_dir`]
+/// before invoking us.
+fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo> {
+    let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
+        return Vec::new();
+    };
+    mgr.list_top_level_sessions_with_title()
+        .into_iter()
+        .filter_map(|(id, count, title)| {
+            if is_internal_api_session_id(&id) {
+                return None;
+            }
+            Some(SessionInfo {
+                id,
+                message_count: count,
+                title,
+            })
+        })
+        .collect()
 }
 
 // Helper for `ui_protocol::handle_session_messages_page` (M12 Phase D-5).
@@ -3903,6 +3979,201 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi back");
+    }
+
+    /// Reproduces the dspfac mini regression 2026-05-19: the WS turn
+    /// handler writes session history under the SPA-bare key
+    /// `web-<N>` in `profile_data_dir/sessions/`, but the legacy
+    /// process-wide store walk at `state.sessions` never sees it
+    /// because it opens against a different `data_dir`. The
+    /// per-profile helper must enumerate those JSONLs directly so the
+    /// sidebar listing on `https://dspfac.octos.ominix.io/chat`
+    /// renders past chats instead of an empty pane.
+    #[tokio::test]
+    async fn list_profile_sessions_returns_bare_web_session_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+
+        // Persist three sessions under the per-profile data dir using
+        // the on-disk keys the SPA writes via the WS turn handler:
+        //   • `web-101` — canonical chat (bare key)
+        //   • `web-202` — second canonical chat (bare key)
+        //   • `web-303#child-task-1` — internal child fanout (MUST be
+        //     filtered by `is_internal_api_session_id`)
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-101".to_string()),
+                octos_core::Message::user("hi from 101"),
+            )
+            .await
+            .unwrap();
+            let mut a1 = octos_core::Message::assistant("hello from 101");
+            a1.thread_id = Some("turn-101".to_string());
+            mgr.add_message(&SessionKey("web-101".to_string()), a1)
+                .await
+                .unwrap();
+
+            mgr.add_message(
+                &SessionKey("web-202".to_string()),
+                octos_core::Message::user("hi from 202"),
+            )
+            .await
+            .unwrap();
+
+            // Child fanout that must NOT show up in the sidebar.
+            mgr.add_message(
+                &SessionKey("web-303#child-task-1".to_string()),
+                octos_core::Message::user("child task body"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut sessions = list_profile_sessions(profile_data_dir);
+        sessions.sort_by(|a, b| a.id.cmp(&b.id));
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+
+        // Two top-level web chats should be enumerated; the child
+        // fanout must be filtered out.
+        assert_eq!(
+            sessions.len(),
+            2,
+            "expected exactly two top-level web chats; got {ids:?}"
+        );
+        assert_eq!(sessions[0].id, "web-101");
+        // message_count is the JSONL line count returned by
+        // `list_top_level_sessions_with_title`: 1 meta line + N
+        // message lines. web-101 has 2 messages → 3 lines. This
+        // matches the contract the existing process-wide walk emits.
+        assert_eq!(sessions[0].message_count, 3);
+        assert_eq!(sessions[1].id, "web-202");
+        // web-202 has 1 message → 2 lines (1 meta + 1 user).
+        assert_eq!(sessions[1].message_count, 2);
+
+        // Explicit confirmation that the child fanout did not leak.
+        assert!(
+            !sessions.iter().any(|s| s.id.starts_with("web-303")),
+            "child-* fanouts must be filtered: {ids:?}"
+        );
+    }
+
+    /// Empty / missing profile data_dir returns an empty list rather
+    /// than panicking — the caller (`list_sessions`) falls back to
+    /// the process-wide `state.sessions` walk in that case.
+    #[tokio::test]
+    async fn list_profile_sessions_returns_empty_when_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = list_profile_sessions(tmp.path());
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            sessions.is_empty(),
+            "missing sessions/ dir must yield empty list; got {ids:?}"
+        );
+    }
+
+    /// Non-admin / profile-scoped probe: a request that resolves to
+    /// a specific profile data_dir (the way Caddy /
+    /// `resolve_profile_data_dir` would route a dspfac chat
+    /// request) MUST surface the seeded `web-<N>` session via
+    /// `list_profile_sessions`. This is the regression test for the
+    /// user-visible bug (`/chat` sidebar empty on
+    /// `dspfac.octos.ominix.io`) and is MANDATORY per
+    /// `feedback_admin_token_masks_bugs` — the bug was hidden for a
+    /// week because the previous test harness only used admin auth,
+    /// which walks a different code path (the process-wide
+    /// `state.sessions` store at `<home>/sessions/`).
+    ///
+    /// We test the helper directly because the bug is in *which
+    /// directory we open*, not in *which identity is allowed to call
+    /// us*. The handler-level path (`list_sessions` →
+    /// `resolve_profile_data_dir`) requires wiring a
+    /// `process_manager` with a registered API port for the
+    /// synthetic profile, which the public `ProcessManager` surface
+    /// doesn't expose for tests. The sibling
+    /// `list_sessions_admin_legacy_path_still_emits_session`
+    /// confirms the handler's legacy path still works end-to-end.
+    #[tokio::test]
+    async fn list_profile_sessions_handles_non_admin_profile_scope() {
+        // Seed a synthetic profile data_dir as if `dspfac` had
+        // written several web chats through the WS turn handler.
+        let tmp = tempfile::tempdir().unwrap();
+        let profile_data_dir = tmp.path();
+        {
+            let mut mgr = octos_bus::SessionManager::open(profile_data_dir).unwrap();
+            mgr.add_message(
+                &SessionKey("web-1779100000001-aa".to_string()),
+                octos_core::Message::user("dspfac chat 1"),
+            )
+            .await
+            .unwrap();
+            mgr.add_message(
+                &SessionKey("web-1779100000002-bb".to_string()),
+                octos_core::Message::user("dspfac chat 2"),
+            )
+            .await
+            .unwrap();
+        }
+
+        // The helper does not consult the request identity — it
+        // operates on the resolved profile_data_dir directly. The
+        // tenant boundary is the on-disk scope, not an identity
+        // check inside the helper. This mirrors the production
+        // call site, where `resolve_profile_data_dir` runs the
+        // identity check FIRST and only hands us a path the
+        // request is authorized to read.
+        let sessions = list_profile_sessions(profile_data_dir);
+        assert_eq!(sessions.len(), 2, "expected dspfac's two web chats");
+        let ids: std::collections::HashSet<_> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains("web-1779100000001-aa"));
+        assert!(ids.contains("web-1779100000002-bb"));
+    }
+
+    /// Bonus: admin scope still works through the legacy process-wide
+    /// `state.sessions` path. Confirms the new per-profile branch did
+    /// not regress the admin / legacy fallback. We exercise
+    /// `list_sessions` directly with admin identity and a populated
+    /// `state.sessions` to assert the standalone walk still emits the
+    /// stripped chat id.
+    #[tokio::test]
+    async fn list_sessions_admin_legacy_path_still_emits_session() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let sessions = std::sync::Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(data_dir.path()).unwrap(),
+        ));
+
+        // Persist a profiled-key session under the process-wide store
+        // (legacy / admin path) — `_main:api:web-legacy-1` is the
+        // canonical shape that `list_sessions` strips the prefix from.
+        let key = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "web-legacy-1");
+        {
+            let mut sess = sessions.lock().await;
+            sess.add_message(&key, Message::user("legacy admin chat"))
+                .await
+                .unwrap();
+        }
+
+        let state = std::sync::Arc::new(AppState {
+            sessions: Some(sessions),
+            ..AppState::empty_for_tests()
+        });
+
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            Some(Extension(AuthIdentity::Admin)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let list: Vec<SessionInfo> = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            list.iter().any(|s| s.id == "web-legacy-1"),
+            "admin legacy path must still surface profiled sessions: {ids:?}"
+        );
     }
 
     #[test]
