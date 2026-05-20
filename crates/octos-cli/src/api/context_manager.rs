@@ -158,8 +158,20 @@ pub(crate) enum TranscriptItemKind {
     ChildResultSummary {
         child_agent_id: String,
         summary: String,
+        /// Owned artifact refs — the parent has join-level ownership
+        /// of these artifacts and may read them through
+        /// `task/artifact/read`.
         #[serde(default)]
         artifact_refs: Vec<String>,
+        /// #1022 / M17-D — reference-join artifact refs. The parent
+        /// can SEE these refs (pointers to the child's artifacts) but
+        /// does NOT inherit ownership; the child remains the
+        /// authoritative owner. Rendered separately in the parent's
+        /// prompt as `References: …` so the model sees pointers, not
+        /// copied artifacts. Empty by default; populated only when the
+        /// join policy is `reference` rather than `merge`.
+        #[serde(default)]
+        reference_artifact_refs: Vec<String>,
     },
     CompactionSummary {
         compaction_id: ContextCompactionId,
@@ -1180,17 +1192,26 @@ impl ContextManager {
                     child_agent_id,
                     summary,
                     artifact_refs,
+                    reference_artifact_refs,
                 } => {
                     let artifacts = if artifact_refs.is_empty() {
                         String::new()
                     } else {
                         format!("\nArtifacts: {}", artifact_refs.join(", "))
                     };
+                    // #1022 / M17-D — reference-join refs render as a
+                    // separate "References:" line so the model can tell
+                    // pointer-to-child from owned-by-join artifacts.
+                    let references = if reference_artifact_refs.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nReferences: {}", reference_artifact_refs.join(", "))
+                    };
+                    let summary_text = format!(
+                        "[child {child_agent_id} summary]\n{summary}{artifacts}{references}"
+                    );
                     entries.push(PromptMessageEntry::new(
-                        message(
-                            MessageRole::Assistant,
-                            format!("[child {child_agent_id} summary]\n{summary}{artifacts}"),
-                        ),
+                        message(MessageRole::Assistant, summary_text),
                         item.id.clone(),
                     ));
                     index += 1;
@@ -1908,6 +1929,7 @@ mod tests {
                     "agent/reviewer-42/finding.md".to_owned(),
                     "agent/reviewer-42/diff.patch".to_owned(),
                 ],
+                reference_artifact_refs: vec![],
             },
             TranscriptItemSource::Supervisor,
         );
@@ -1981,6 +2003,7 @@ mod tests {
                 child_agent_id: "reviewer".to_owned(),
                 summary: "Reviewer found 1 issue. See finding.md.".to_owned(),
                 artifact_refs: vec!["agent/reviewer/finding.md".to_owned()],
+                reference_artifact_refs: vec![],
             },
             TranscriptItemSource::Supervisor,
         );
@@ -2024,6 +2047,107 @@ mod tests {
             .expect("parent must render the result capsule");
         assert_eq!(capsule.role, MessageRole::Assistant);
         assert!(capsule.tool_calls.is_none());
+    }
+
+    /// #1022 / M17-D — reference-join artifact refs must render as a
+    /// separate `References:` line in the prompt, distinct from the
+    /// `Artifacts:` owned-list. This pins the pointer-vs-ownership
+    /// distinction at the rendering layer so future code that copies
+    /// references into the owned list would surface as a test failure.
+    #[test]
+    fn child_result_summary_renders_reference_refs_separately_from_owned() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_item(
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id: "reviewer-99".to_owned(),
+                summary: "merged finding".to_owned(),
+                artifact_refs: vec!["agent/reviewer-99/owned.md".to_owned()],
+                reference_artifact_refs: vec![
+                    "agent/sibling-1/ref-a.md".to_owned(),
+                    "agent/sibling-2/ref-b.md".to_owned(),
+                ],
+            },
+            TranscriptItemSource::Supervisor,
+        );
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let capsule = frame
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("[child reviewer-99 summary]"))
+            .expect("child summary message");
+        assert!(
+            capsule
+                .content
+                .contains("Artifacts: agent/reviewer-99/owned.md")
+        );
+        assert!(
+            capsule
+                .content
+                .contains("References: agent/sibling-1/ref-a.md, agent/sibling-2/ref-b.md")
+        );
+        // Critically: the two lines must be separate. Reference refs
+        // must NOT appear inside the Artifacts list.
+        assert!(
+            !capsule
+                .content
+                .contains("Artifacts: agent/reviewer-99/owned.md, agent/sibling-1/ref-a.md")
+        );
+    }
+
+    /// #1022 / M17-D — when a summary has only references and no
+    /// owned artifacts, the prompt must still render the References:
+    /// line (and must NOT pretend it's an Artifacts: list).
+    #[test]
+    fn child_result_summary_renders_pure_reference_join() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_item(
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id: "browser".to_owned(),
+                summary: "pointer-only join".to_owned(),
+                artifact_refs: vec![],
+                reference_artifact_refs: vec!["agent/sibling/ref.md".to_owned()],
+            },
+            TranscriptItemSource::Supervisor,
+        );
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let capsule = frame
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("[child browser summary]"))
+            .expect("child summary message");
+        assert!(capsule.content.contains("References: agent/sibling/ref.md"));
+        // The Artifacts: prefix must NOT appear at all when only
+        // references are present — the parent did not gain ownership.
+        assert!(!capsule.content.contains("Artifacts:"));
+    }
+
+    /// #1022 / M17-D — older snapshots (and migration shims) that
+    /// omit `reference_artifact_refs` entirely must round-trip cleanly
+    /// thanks to `#[serde(default)]`, and must render the same prompt
+    /// shape as before (no spurious References: line).
+    #[test]
+    fn child_result_summary_legacy_snapshot_without_reference_refs_round_trips() {
+        let legacy = serde_json::json!({
+            "type": "child_result_summary",
+            "child_agent_id": "legacy",
+            "summary": "old",
+            "artifact_refs": ["agent/legacy/old.md"]
+        });
+        let kind: TranscriptItemKind =
+            serde_json::from_value(legacy).expect("legacy ChildResultSummary deserializes");
+        let mut manager = ContextManager::new("s", None);
+        manager.record_item(kind, TranscriptItemSource::Supervisor);
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let capsule = frame
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("[child legacy summary]"))
+            .expect("legacy child summary message");
+        assert!(capsule.content.contains("Artifacts: agent/legacy/old.md"));
+        assert!(!capsule.content.contains("References:"));
     }
 
     #[test]
