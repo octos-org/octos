@@ -174,6 +174,8 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::AGENT_OUTPUT_READ
         | methods::AGENT_ARTIFACT_LIST
         | methods::AGENT_ARTIFACT_READ
+        | methods::TASK_ARTIFACT_LIST
+        | methods::TASK_ARTIFACT_READ
         | methods::AGENT_INTERRUPT
         | methods::AGENT_CLOSE => Some(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
         methods::SESSION_GOAL_GET | methods::SESSION_GOAL_SET | methods::SESSION_GOAL_CLEAR => {
@@ -793,6 +795,12 @@ pub mod methods {
     pub const AGENT_OUTPUT_READ: &str = "agent/output/read";
     pub const AGENT_ARTIFACT_LIST: &str = "agent/artifact/list";
     pub const AGENT_ARTIFACT_READ: &str = "agent/artifact/read";
+    /// #965 / UPCR-2026-019 — spec-canonical names for the same payloads
+    /// served by `agent/artifact/*`. Servers dispatch both into the same
+    /// handlers; clients can use either name (the `task/*` form is the
+    /// long-term direction per the M13 contract).
+    pub const TASK_ARTIFACT_LIST: &str = "task/artifact/list";
+    pub const TASK_ARTIFACT_READ: &str = "task/artifact/read";
     pub const AGENT_INTERRUPT: &str = "agent/interrupt";
     pub const AGENT_CLOSE: &str = "agent/close";
 
@@ -961,6 +969,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::AGENT_OUTPUT_READ,
     methods::AGENT_ARTIFACT_LIST,
     methods::AGENT_ARTIFACT_READ,
+    methods::TASK_ARTIFACT_LIST,
+    methods::TASK_ARTIFACT_READ,
     methods::AGENT_INTERRUPT,
     methods::AGENT_CLOSE,
     methods::SESSION_GOAL_GET,
@@ -1050,6 +1060,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::AGENT_OUTPUT_READ,
     methods::AGENT_ARTIFACT_LIST,
     methods::AGENT_ARTIFACT_READ,
+    methods::TASK_ARTIFACT_LIST,
+    methods::TASK_ARTIFACT_READ,
     methods::AGENT_INTERRUPT,
     methods::AGENT_CLOSE,
     methods::SESSION_GOAL_GET,
@@ -5232,6 +5244,8 @@ mod tests {
                 "agent/output/read",
                 "agent/artifact/list",
                 "agent/artifact/read",
+                "task/artifact/list",
+                "task/artifact/read",
                 "agent/interrupt",
                 "agent/close",
                 "session/goal/get",
@@ -5323,6 +5337,8 @@ mod tests {
                 "agent/output/read",
                 "agent/artifact/list",
                 "agent/artifact/read",
+                "task/artifact/list",
+                "task/artifact/read",
                 "agent/interrupt",
                 "agent/close",
                 "session/goal/get",
@@ -5393,6 +5409,8 @@ mod tests {
                     "agent/output/read",
                     "agent/artifact/list",
                     "agent/artifact/read",
+                    "task/artifact/list",
+                    "task/artifact/read",
                     "agent/interrupt",
                     "agent/close",
                     "session/goal/get",
