@@ -1783,30 +1783,26 @@ ${CADDY_DOMAIN} {
     }
 }
 
-https:// {
+https://*.${CADDY_DOMAIN} {
     tls {
         on_demand
     }
 
-    @sub host *.${CADDY_DOMAIN}
+    @api path /api/*
+    @admin path /admin*
+    @auth path /auth/*
 
-    handle @sub {
-        @api path /api/*
-        @admin path /admin*
-        @auth path /auth/*
-
-        handle @api {
-            reverse_proxy ${CADDY_UPSTREAM}
-        }
-        handle @admin {
-            reverse_proxy ${CADDY_UPSTREAM}
-        }
-        handle @auth {
-            reverse_proxy ${CADDY_UPSTREAM}
-        }
-        handle {
-            reverse_proxy ${CADDY_UPSTREAM}
-        }
+    handle @api {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle @admin {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle @auth {
+        reverse_proxy ${CADDY_UPSTREAM}
+    }
+    handle {
+        reverse_proxy ${CADDY_UPSTREAM}
     }
 }
 CADDYEOF
