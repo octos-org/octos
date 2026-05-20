@@ -4961,6 +4961,18 @@ fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec
     names
 }
 
+/// Names of tools currently in the deferred set (registered but filtered
+/// out of `specs()` for LRU efficiency). These remain recoverable via
+/// `activate_tools`, so the M14 coding tool contract treats them as
+/// available — otherwise core P0 tools like `shell`, `exec_command`, and
+/// `spawn_agent` would be reported as missing whenever a profile carries
+/// enough skill plugins to trip the auto-defer threshold. #970.
+fn deferred_model_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+    registry
+        .map(|registry| registry.deferred_tool_names())
+        .unwrap_or_default()
+}
+
 async fn tool_status_list_result(
     state: &Arc<AppState>,
     session_id: &SessionKey,
@@ -4999,6 +5011,8 @@ async fn tool_status_list_result(
         });
     let tool_names = model_visible_tool_names(registry);
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+    let deferred_names = deferred_model_tool_names(registry);
+    let deferred_name_refs: Vec<&str> = deferred_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: [&str; 0] = [];
     let permission_state = session_permission_profiles().get_state(session_id);
     let session_id_wire = session_id.to_string();
@@ -5014,6 +5028,7 @@ async fn tool_status_list_result(
             ),
             available_model_tools: &tool_name_refs,
             disabled_model_tools: &disabled_tool_refs,
+            deferred_model_tools: &deferred_name_refs,
             include_coding_tool_contract: true,
         },
     ))
@@ -11362,6 +11377,7 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
                 policy: super::coding_tool_contract::ToolPolicyView::default(),
                 available_model_tools: &tool_name_refs,
                 disabled_model_tools: &[],
+                deferred_model_tools: &[],
                 include_coding_tool_contract: true,
             },
         ),

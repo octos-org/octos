@@ -841,6 +841,19 @@ impl ToolRegistry {
             .is_empty()
     }
 
+    /// Names of tools currently in the deferred set. Deferred tools are
+    /// registered but filtered out of `specs()` (typically because the
+    /// auto-eviction step removed them to keep the LLM tool-count low).
+    /// They remain recoverable via the `activate_tools` tool, so AppUI
+    /// surfaces (e.g. the M14 coding tool contract) should treat them as
+    /// available rather than missing. Sorted for deterministic output.
+    pub fn deferred_tool_names(&self) -> Vec<String> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = deferred.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
     // -- LRU auto-eviction --------------------------------------------------
 
     /// Mark a set of tool names as "base" -- never auto-evicted.
@@ -1316,6 +1329,36 @@ mod estimate_tests {
 mod cwd_isolation_tests {
     use super::*;
     use crate::sandbox::NoSandbox;
+
+    /// #970 — when a tool group is deferred at the profile level, the
+    /// session-level registry produced by `rebind_cwd_with_permissions`
+    /// must carry the same deferred names so the M14 coding tool
+    /// contract can still see them as "registered but deferred" rather
+    /// than reporting them as missing.
+    #[test]
+    fn deferred_group_survives_rebind_cwd_to_per_session_registry() {
+        let cwd = std::path::Path::new("/tmp");
+        let mut profile_tools = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
+        profile_tools.defer_group("group:runtime");
+
+        let session_tools = profile_tools.rebind_cwd(cwd, Box::new(NoSandbox));
+        let deferred = session_tools.deferred_tool_names();
+        assert!(
+            deferred.contains(&"shell".to_string()),
+            "shell should remain deferred after session rebind; deferred={:?}",
+            deferred
+        );
+        assert!(
+            deferred.contains(&"exec_command".to_string()),
+            "exec_command should remain deferred after session rebind; deferred={:?}",
+            deferred
+        );
+        assert!(
+            deferred.contains(&"write_stdin".to_string()),
+            "write_stdin should remain deferred after session rebind; deferred={:?}",
+            deferred
+        );
+    }
 
     #[tokio::test]
     async fn test_rebind_cwd_file_tools_reject_outside_paths() {
