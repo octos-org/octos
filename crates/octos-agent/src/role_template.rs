@@ -142,11 +142,16 @@ pub struct RoleTemplate {
     /// One-line description of what the role does. Bounded so it can
     /// be surfaced in tooltips without truncation.
     pub description: &'static str,
-    /// The tool groups (matching `tools::policy::TOOL_GROUPS` names)
-    /// the role advertises as in-budget. The runtime is free to
-    /// further restrict via `ToolPolicy`; this is the role's declared
-    /// surface, not the only enforcement.
-    pub allowed_tool_groups: &'static [&'static str],
+    /// The tools the role advertises as in-budget. Each entry is
+    /// either a group identifier (e.g. `"group:search"`, matching
+    /// `tools::policy::TOOL_GROUPS`) OR a single exact tool name
+    /// (e.g. `"read_file"`). This matches the shape `ToolPolicy.allow`
+    /// already accepts, so a downstream caller can feed this slice
+    /// straight into the policy. Mixing the two is intentional:
+    /// read-only roles need to grant `read_file` WITHOUT pulling in
+    /// the mutating tools that `group:fs` expands to (`write_file`,
+    /// `apply_patch`, `edit_file`, `diff_edit`).
+    pub allowed_tools: &'static [&'static str],
     /// Default sandbox mode the role suggests. One of `SANDBOX_AUTO`
     /// or `SANDBOX_NONE`. Templates intentionally do not advertise
     /// "bwrap" / "docker" — backend selection is environment-driven.
@@ -178,11 +183,16 @@ impl RoleTemplate {
         ROLE_TEMPLATES
     }
 
-    /// True if `tool_group` is advertised as in-budget for this role.
-    /// Pure-string equality on the group name — the registry stores
-    /// strings that match `tools::policy::TOOL_GROUPS` names verbatim.
-    pub fn permits_group(&self, tool_group: &str) -> bool {
-        self.allowed_tool_groups.contains(&tool_group)
+    /// True if `entry` is advertised as in-budget for this role.
+    /// Pure-string equality — the registry stores either group
+    /// identifiers (`"group:search"`) or exact tool names
+    /// (`"read_file"`). Callers asking "is `group:fs` in the budget?"
+    /// should pass `"group:fs"` literally; callers asking "is
+    /// `read_file` in the budget?" should pass `"read_file"`. To
+    /// expand groups to their tool members use
+    /// `tools::policy::tool_group_info`.
+    pub fn permits(&self, entry: &str) -> bool {
+        self.allowed_tools.contains(&entry)
     }
 }
 
@@ -197,12 +207,16 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         description: "Repository / code reviewer. Walks the diff and emits structured findings; \
                       does not mutate workspace files.",
         // Reviewers READ files, search, and may fetch reference docs.
+        // Explicit `read_file` + `recall_memory` instead of `group:fs`
+        // / `group:memory` because those groups expand to mutating
+        // tools (`write_file`, `apply_patch`, `edit_file`,
+        // `save_memory`) the role doc/prompt promises NOT to grant.
         // No write/edit, no shell, no spawning further children.
-        allowed_tool_groups: &[
-            "group:fs",
+        allowed_tools: &[
+            "read_file",
             "group:search",
             "group:web",
-            "group:memory",
+            "recall_memory",
             "group:research",
         ],
         default_sandbox_mode: SANDBOX_NONE,
@@ -220,8 +234,9 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
                       may run shell commands inside the session sandbox.",
         // Implementers need fs read/write, search, shell, and the
         // delegated-child sessions group so they can fan out to
-        // test_worker for verification.
-        allowed_tool_groups: &[
+        // test_worker for verification. `group:fs` is appropriate
+        // here because the role IS supposed to mutate files.
+        allowed_tools: &[
             "group:fs",
             "group:search",
             "group:runtime",
@@ -244,8 +259,15 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
                       task implies and reports concrete failures.",
         // Test workers run commands and read files. They should not
         // edit files (a fix is the implementer's job) and should not
-        // spawn further children.
-        allowed_tool_groups: &["group:fs", "group:search", "group:runtime", "group:memory"],
+        // spawn further children. Same as reviewer: explicit
+        // `read_file` + `recall_memory` so `group:fs` / `group:memory`
+        // mutating tools do NOT leak in.
+        allowed_tools: &[
+            "read_file",
+            "group:search",
+            "group:runtime",
+            "recall_memory",
+        ],
         default_sandbox_mode: SANDBOX_AUTO,
         default_approval_policy: APPROVAL_ASK,
         model_preference: ModelPreference::Analyst,
@@ -259,9 +281,17 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
         display_name: "Explorer",
         description: "Read-only codebase analyst. Gathers context (files, call sites, prior \
                       art) for an upstream planner; never mutates state.",
-        // Explorers are READ-ONLY: fs (read), search, optional web.
-        // No runtime, no sessions, no memory writes.
-        allowed_tool_groups: &["group:fs", "group:search", "group:web", "group:research"],
+        // Explorers are STRICTLY READ-ONLY. Explicit `read_file`
+        // (NOT `group:fs`) + search + web + research. No runtime, no
+        // sessions, no memory writes — `recall_memory` only, not the
+        // `group:memory` group that would smuggle in `save_memory`.
+        allowed_tools: &[
+            "read_file",
+            "group:search",
+            "group:web",
+            "recall_memory",
+            "group:research",
+        ],
         default_sandbox_mode: SANDBOX_NONE,
         default_approval_policy: APPROVAL_NEVER,
         model_preference: ModelPreference::Cheap,
@@ -317,14 +347,28 @@ mod tests {
         assert!(RoleTemplate::for_name("planner").is_none());
     }
 
-    /// Guard: reviewer is read-only. If anyone adds `group:runtime` or `group:fs` write-implying groups to reviewer's budget, this breaks — and the matching `default_sandbox_mode = SANDBOX_NONE` + `default_approval_policy = APPROVAL_NEVER` assertion catches the policy half of the drift.
+    /// Guard: reviewer is read-only. The budget MUST NOT include
+    /// `group:fs` (which expands to write_file / apply_patch /
+    /// edit_file / diff_edit), `group:memory` (which expands to
+    /// save_memory), or `group:runtime` / `group:sessions`. Catches
+    /// the codex P1 from review: granting `group:fs` to a role
+    /// documented as non-mutating silently smuggles in write tools
+    /// once the registry is wired into `ToolPolicy.allow`.
     #[test]
     fn reviewer_is_read_only() {
         let tpl = RoleTemplate::for_name(ROLE_REVIEWER).expect("reviewer must be registered");
-        assert!(tpl.permits_group("group:fs"));
-        assert!(tpl.permits_group("group:search"));
-        assert!(!tpl.permits_group("group:runtime"));
-        assert!(!tpl.permits_group("group:sessions"));
+        // Permitted: explicit read tools + non-mutating groups only.
+        assert!(tpl.permits("read_file"));
+        assert!(tpl.permits("group:search"));
+        assert!(tpl.permits("recall_memory"));
+        // Denied: every mutating group + every runtime/sessions group.
+        assert!(!tpl.permits("group:fs"));
+        assert!(!tpl.permits("group:memory"));
+        assert!(!tpl.permits("group:runtime"));
+        assert!(!tpl.permits("group:sessions"));
+        assert!(!tpl.permits("save_memory"));
+        assert!(!tpl.permits("write_file"));
+        assert!(!tpl.permits("edit_file"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_NONE);
         assert_eq!(tpl.default_approval_policy, APPROVAL_NEVER);
         assert_eq!(tpl.model_preference, ModelPreference::Coding);
@@ -334,47 +378,111 @@ mod tests {
     /// sessions. If a future template adds runtime to test_worker
     /// without dropping it from implementer this still passes — what
     /// it actually pins is that implementer cannot regress out of the
-    /// runtime+sessions budget.
+    /// runtime+sessions budget. Implementer DOES advertise `group:fs`
+    /// because the role's documented purpose is to mutate files.
     #[test]
     fn implementer_has_runtime_and_sessions() {
         let tpl = RoleTemplate::for_name(ROLE_IMPLEMENTER).expect("implementer must be registered");
-        assert!(tpl.permits_group("group:fs"));
-        assert!(tpl.permits_group("group:runtime"));
-        assert!(tpl.permits_group("group:sessions"));
-        assert!(!tpl.permits_group("group:research"));
+        assert!(tpl.permits("group:fs"));
+        assert!(tpl.permits("group:runtime"));
+        assert!(tpl.permits("group:sessions"));
+        assert!(!tpl.permits("group:research"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_AUTO);
         assert_eq!(tpl.default_approval_policy, APPROVAL_ASK);
         assert_eq!(tpl.model_preference, ModelPreference::Coding);
     }
 
     /// Guard: test_worker can run commands but cannot edit files or
-    /// spawn further children. Catches a refactor that conflates
-    /// implementer + test_worker into a single fix-and-verify role.
+    /// spawn further children. Same safety property as reviewer:
+    /// `group:fs` and `group:memory` MUST NOT appear in the budget
+    /// because they expand to mutating tools the role's prompt
+    /// explicitly forbids.
     #[test]
     fn test_worker_runs_commands_but_does_not_spawn() {
         let tpl = RoleTemplate::for_name(ROLE_TEST_WORKER).expect("test_worker must be registered");
-        assert!(tpl.permits_group("group:runtime"));
-        assert!(tpl.permits_group("group:fs"));
-        assert!(!tpl.permits_group("group:sessions"));
-        assert!(!tpl.permits_group("group:web"));
+        assert!(tpl.permits("group:runtime"));
+        assert!(tpl.permits("read_file"));
+        assert!(tpl.permits("recall_memory"));
+        assert!(!tpl.permits("group:fs"));
+        assert!(!tpl.permits("group:memory"));
+        assert!(!tpl.permits("group:sessions"));
+        assert!(!tpl.permits("group:web"));
+        assert!(!tpl.permits("save_memory"));
+        assert!(!tpl.permits("write_file"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_AUTO);
         assert_eq!(tpl.default_approval_policy, APPROVAL_ASK);
         assert_eq!(tpl.model_preference, ModelPreference::Analyst);
     }
 
-    /// Guard: explorer is strictly read-only AND cheap-lane. Pins both
-    /// the no-runtime / no-sessions budget AND the model preference,
-    /// because the UX uses the cheap-lane hint to route fanout.
+    /// Guard: explorer is strictly read-only AND cheap-lane. Pins
+    /// both the no-runtime / no-sessions / no-mutating-groups budget
+    /// AND the model preference, because the UX uses the cheap-lane
+    /// hint to route fanout.
     #[test]
     fn explorer_is_strictly_read_only_and_cheap() {
         let tpl = RoleTemplate::for_name(ROLE_EXPLORER).expect("explorer must be registered");
-        assert!(tpl.permits_group("group:fs"));
-        assert!(tpl.permits_group("group:search"));
-        assert!(!tpl.permits_group("group:runtime"));
-        assert!(!tpl.permits_group("group:sessions"));
+        assert!(tpl.permits("read_file"));
+        assert!(tpl.permits("group:search"));
+        assert!(tpl.permits("recall_memory"));
+        assert!(!tpl.permits("group:fs"));
+        assert!(!tpl.permits("group:memory"));
+        assert!(!tpl.permits("group:runtime"));
+        assert!(!tpl.permits("group:sessions"));
+        assert!(!tpl.permits("save_memory"));
+        assert!(!tpl.permits("write_file"));
         assert_eq!(tpl.default_sandbox_mode, SANDBOX_NONE);
         assert_eq!(tpl.default_approval_policy, APPROVAL_NEVER);
         assert_eq!(tpl.model_preference, ModelPreference::Cheap);
+    }
+
+    /// Safety guard (post codex review): roles whose `prompt_prefix`
+    /// promises "do not edit" / "never mutates state" must not
+    /// transitively grant a mutating tool through a coarse group
+    /// (`group:fs`, `group:memory`). This is the property the codex
+    /// P1 review flagged: a read-only role docs / sandbox-none /
+    /// approval-never config paired with `group:fs` in the budget
+    /// silently grants `write_file` / `edit_file` / `apply_patch` /
+    /// `diff_edit` once the registry is wired into `ToolPolicy.allow`.
+    #[test]
+    fn read_only_roles_do_not_advertise_mutating_groups() {
+        const MUTATING_GROUPS: &[&str] = &[
+            "group:fs",
+            "group:memory",
+            "group:runtime",
+            "group:sessions",
+            "group:admin",
+            "group:media",
+        ];
+        // Explorer, reviewer, and test_worker are documented as
+        // non-edit roles. (test_worker DOES need runtime — that's the
+        // role's job — so we check it separately below.)
+        for name in [ROLE_REVIEWER, ROLE_EXPLORER] {
+            let tpl = RoleTemplate::for_name(name).unwrap();
+            for group in MUTATING_GROUPS {
+                assert!(
+                    !tpl.permits(group),
+                    "{name} advertises mutating group {group:?} but its prompt_prefix \
+                     promises not to mutate state",
+                );
+            }
+        }
+        // test_worker is allowed `group:runtime` (it's the role's
+        // job to run commands) but MUST NOT advertise mutating fs /
+        // memory groups.
+        let test_worker = RoleTemplate::for_name(ROLE_TEST_WORKER).unwrap();
+        for group in [
+            "group:fs",
+            "group:memory",
+            "group:sessions",
+            "group:admin",
+            "group:media",
+        ] {
+            assert!(
+                !test_worker.permits(group),
+                "test_worker advertises mutating group {group:?} but the role docs forbid \
+                 editing source files",
+            );
+        }
     }
 
     /// Guard: every template advertises a non-empty prompt prefix and
@@ -399,27 +507,42 @@ mod tests {
                 tpl.name
             );
             assert!(
-                !tpl.allowed_tool_groups.is_empty(),
-                "{} allowed_tool_groups must be non-empty",
+                !tpl.allowed_tools.is_empty(),
+                "{} allowed_tools must be non-empty",
                 tpl.name
             );
         }
     }
 
-    /// Guard: every advertised tool group string starts with
-    /// `group:`. The matching `tools::policy::TOOL_GROUPS` table
-    /// already uses that prefix; if a template ever advertises a bare
-    /// tool name it would silently never match.
+    /// Guard: every advertised tool entry is either a `group:`
+    /// identifier OR a non-empty bare tool name. Catches typos like
+    /// `"Group:fs"`, `" group:fs"`, or an empty `""` slot. The
+    /// `tools::policy::entry_matches` function treats unknown strings
+    /// as exact-name matches, so silently mis-typed entries would
+    /// never match and the role would lose tools without a build
+    /// error.
     #[test]
-    fn every_advertised_group_uses_group_prefix() {
+    fn every_advertised_tool_entry_is_well_formed() {
         for tpl in RoleTemplate::all() {
-            for group in tpl.allowed_tool_groups {
+            for entry in tpl.allowed_tools {
                 assert!(
-                    group.starts_with("group:"),
-                    "{} advertises {:?} which is not a group: identifier",
-                    tpl.name,
-                    group
+                    !entry.is_empty(),
+                    "{} advertises an empty tool entry",
+                    tpl.name
                 );
+                assert!(
+                    !entry.contains(' '),
+                    "{} advertises {:?} which contains whitespace",
+                    tpl.name,
+                    entry
+                );
+                if let Some(rest) = entry.strip_prefix("group:") {
+                    assert!(
+                        !rest.is_empty(),
+                        "{} advertises bare `group:` with no body",
+                        tpl.name
+                    );
+                }
             }
         }
     }
