@@ -1889,6 +1889,143 @@ mod tests {
         assert_eq!(envelope.tool_name, "unknown");
     }
 
+    /// #1022 — parent prompt generation must surface a child result as
+    /// a bounded `ChildResultSummary` capsule only. The rendered prompt
+    /// entry must be a single assistant message of the form
+    /// `[child <id> summary]\n<summary>\nArtifacts: <refs>`, with no
+    /// other content slipping in from the child's raw transcript.
+    #[test]
+    fn child_result_summary_renders_as_bounded_assistant_capsule() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&Message::system("system"));
+        manager.record_message(&Message::user("review the diff"));
+
+        manager.record_item(
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id: "reviewer-42".to_owned(),
+                summary: "one P0 finding: missing null check in foo.rs:12".to_owned(),
+                artifact_refs: vec![
+                    "agent/reviewer-42/finding.md".to_owned(),
+                    "agent/reviewer-42/diff.patch".to_owned(),
+                ],
+            },
+            TranscriptItemSource::Supervisor,
+        );
+
+        let frame = manager.for_prompt(&PromptBuildPolicy::default());
+        let capsule = frame
+            .messages
+            .iter()
+            .find(|m| m.content.starts_with("[child reviewer-42 summary]"))
+            .expect("child summary message");
+        assert_eq!(capsule.role, MessageRole::Assistant);
+        assert!(
+            capsule.content.contains("one P0 finding"),
+            "summary text must be present"
+        );
+        assert!(
+            capsule
+                .content
+                .contains("Artifacts: agent/reviewer-42/finding.md, agent/reviewer-42/diff.patch"),
+            "artifact refs must be rendered as a bounded comma-separated list"
+        );
+        // Nothing else from a "child world" should leak into the capsule
+        // — the rendering takes only `summary` and `artifact_refs`.
+        assert!(!capsule.content.contains("system"));
+        assert!(!capsule.content.contains("review the diff"));
+        assert!(capsule.tool_calls.is_none());
+        assert!(capsule.tool_call_id.is_none());
+    }
+
+    /// #1022 — even when the child agent had a verbose transcript with
+    /// system instructions, user messages, reasoning, tool calls, and
+    /// raw tool output, the parent context — once the supervisor records
+    /// only a `ChildResultSummary` — must NOT contain any of that raw
+    /// child content in its prompt generation output.
+    ///
+    /// Guards against a future change that, e.g., copies the child's
+    /// full transcript into the parent's `ChildResultSummary.summary`
+    /// field (the parent prompt would still render it, which is exactly
+    /// the pollution this issue forbids — but the join layer is the
+    /// right place to enforce bounded summaries).
+    #[test]
+    fn parent_prompt_contains_no_raw_child_transcript_when_only_summary_is_recorded() {
+        // Build a "child" transcript in a separate ContextManager to
+        // simulate the child agent's local view. We never copy these
+        // items into the parent — the parent only receives a bounded
+        // result capsule.
+        let mut child = ContextManager::new("child", None);
+        child.record_message(&Message::system("you are a code reviewer"));
+        child.record_message(&Message::user("review main.rs"));
+        let mut child_assistant = Message::assistant("");
+        child_assistant.reasoning_content = Some("scanning main.rs for issues".into());
+        child_assistant.tool_calls = Some(vec![ToolCall {
+            id: "child-call-1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "main.rs"}),
+            metadata: None,
+        }]);
+        child.record_message(&child_assistant);
+        child.record_tool_output(
+            "child-call-1",
+            "read_file",
+            "fn main() { let secret = ...; }",
+        );
+
+        // Parent records only a bounded summary derived from the child.
+        let mut parent = ContextManager::new("parent", None);
+        parent.record_message(&Message::system("you are the supervisor"));
+        parent.record_message(&Message::user("kick off the reviewer"));
+        parent.record_item(
+            TranscriptItemKind::ChildResultSummary {
+                child_agent_id: "reviewer".to_owned(),
+                summary: "Reviewer found 1 issue. See finding.md.".to_owned(),
+                artifact_refs: vec!["agent/reviewer/finding.md".to_owned()],
+            },
+            TranscriptItemSource::Supervisor,
+        );
+
+        let frame = parent.for_prompt(&PromptBuildPolicy::default());
+        let parent_blob: String = frame
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+
+        // Bounded summary IS present.
+        assert!(parent_blob.contains("Reviewer found 1 issue"));
+        assert!(parent_blob.contains("agent/reviewer/finding.md"));
+        // Raw child content must NOT leak — none of the strings the
+        // child agent wrote in its own transcript should appear in
+        // the parent's prompt.
+        assert!(
+            !parent_blob.contains("you are a code reviewer"),
+            "child's system instruction must not appear in parent prompt"
+        );
+        assert!(
+            !parent_blob.contains("review main.rs"),
+            "child's user message must not appear in parent prompt"
+        );
+        assert!(
+            !parent_blob.contains("scanning main.rs for issues"),
+            "child's reasoning must not appear in parent prompt"
+        );
+        assert!(
+            !parent_blob.contains("fn main() { let secret"),
+            "child's raw tool output must not appear in parent prompt"
+        );
+        // The parent's own messages also retain no child tool-call
+        // ids — verify the assistant capsule has no tool_calls field.
+        let capsule = frame
+            .messages
+            .iter()
+            .find(|m| m.content.contains("Reviewer found 1 issue"))
+            .expect("parent must render the result capsule");
+        assert_eq!(capsule.role, MessageRole::Assistant);
+        assert!(capsule.tool_calls.is_none());
+    }
+
     #[test]
     fn fork_child_history_drops_parent_reasoning_tool_calls_outputs_and_context_injections() {
         let mut manager = ContextManager::new("s", None);
