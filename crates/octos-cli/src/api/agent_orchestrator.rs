@@ -3352,6 +3352,155 @@ mod tests {
         );
     }
 
+    /// #967 / M13-C — task/artifact/list and task/artifact/read MUST
+    /// deny cross-profile access. ensure_agent_control_scope already
+    /// gates on agent.profile_id, but until now there was no explicit
+    /// guard test for the artifact methods. Pins the property.
+    #[test]
+    fn task_artifact_list_and_read_deny_cross_profile_access() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut agent = sample_agent("agent-ownership", "tenant-a");
+        let session_id = agent.session_id.clone();
+        agent.artifacts = vec![AgentArtifactRecord {
+            id: "report".into(),
+            title: "Report".into(),
+            kind: "review_report".into(),
+            status: "ready".into(),
+            path: Some("report.md".into()),
+            content: Some("secret".into()),
+        }];
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+
+        // Cross-profile list: tenant-b cannot list tenant-a's agent.
+        let forbidden_list = orchestrator
+            .list_agent_artifacts(AgentRequest {
+                agent_id: "agent-ownership".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-b".into(),
+            })
+            .expect_err("cross-profile artifact list must fail closed");
+        assert_eq!(
+            forbidden_list.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_FORBIDDEN)
+        );
+
+        // Cross-profile read: tenant-b cannot read tenant-a's artifact.
+        let forbidden_read = orchestrator
+            .read_agent_artifact(AgentArtifactReadRequest {
+                agent_id: "agent-ownership".into(),
+                artifact_id: Some("report".into()),
+                path: None,
+                session_id: Some(session_id),
+                profile_id: "tenant-b".into(),
+            })
+            .expect_err("cross-profile artifact read must fail closed");
+        assert_eq!(
+            forbidden_read.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_FORBIDDEN)
+        );
+    }
+
+    /// #967 / M13-C — task/artifact/* MUST deny requests whose
+    /// session_id is unrelated (different base_key) from the agent's
+    /// session, even when the profile_id matches. Prevents cross-
+    /// session leakage within the same tenant.
+    #[test]
+    fn task_artifact_list_and_read_deny_unrelated_session_within_profile() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut agent = sample_agent("agent-cross-session", "tenant-a");
+        agent.artifacts = vec![AgentArtifactRecord {
+            id: "report".into(),
+            title: "Report".into(),
+            kind: "review_report".into(),
+            status: "ready".into(),
+            path: Some("report.md".into()),
+            content: Some("data".into()),
+        }];
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+
+        // Unrelated session within the same profile — different base_key.
+        let intruder_session = SessionKey::with_profile("tenant-a", "api", "intruder");
+        let forbidden = orchestrator
+            .list_agent_artifacts(AgentRequest {
+                agent_id: "agent-cross-session".into(),
+                session_id: Some(intruder_session.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect_err("unrelated-session artifact list must fail closed");
+        assert_eq!(
+            forbidden.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_FORBIDDEN)
+        );
+
+        let forbidden_read = orchestrator
+            .read_agent_artifact(AgentArtifactReadRequest {
+                agent_id: "agent-cross-session".into(),
+                artifact_id: Some("report".into()),
+                path: None,
+                session_id: Some(intruder_session),
+                profile_id: "tenant-a".into(),
+            })
+            .expect_err("unrelated-session artifact read must fail closed");
+        assert_eq!(
+            forbidden_read.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_FORBIDDEN)
+        );
+    }
+
+    /// #967 / M13-C — parent sessions whose `base_key` matches the
+    /// child's session can list/read the child's artifacts. This
+    /// pins the merge-join branch of `session_controls_target` so a
+    /// regression to "strict equality only" doesn't silently break
+    /// parent access to child artifacts.
+    #[test]
+    fn task_artifact_list_allows_parent_session_via_base_key() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut agent = sample_agent("agent-child", "tenant-a");
+        // Child session shares the parent's base_key (with a topic suffix).
+        let parent_session = SessionKey::with_profile("tenant-a", "api", "parent");
+        let child_session = SessionKey(format!("{}#child-1", parent_session.base_key()));
+        agent.session_id = child_session.clone();
+        agent.artifacts = vec![AgentArtifactRecord {
+            id: "report".into(),
+            title: "Report".into(),
+            kind: "review_report".into(),
+            status: "ready".into(),
+            path: Some("report.md".into()),
+            content: Some("ok".into()),
+        }];
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+
+        // Parent reads the child's artifact list via base_key match.
+        let listed = orchestrator
+            .list_agent_artifacts(AgentRequest {
+                agent_id: "agent-child".into(),
+                session_id: Some(parent_session.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("parent must read child artifacts via base_key");
+        assert_eq!(listed["artifacts"][0]["id"], json!("report"));
+
+        let read = orchestrator
+            .read_agent_artifact(AgentArtifactReadRequest {
+                agent_id: "agent-child".into(),
+                artifact_id: Some("report".into()),
+                path: None,
+                session_id: Some(parent_session),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("parent must read child artifact via base_key");
+        assert_eq!(read["artifact"]["id"], json!("report"));
+    }
+
     #[test]
     fn interrupt_and_close_enforce_terminal_transitions() {
         let orchestrator = InProcessAgentOrchestrator::default();
