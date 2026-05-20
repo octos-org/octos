@@ -142,11 +142,25 @@ pub(crate) async fn run_supervised_cli_specialist(
                 .push(artifact.path.clone());
         }
     }
-    emit_agent_updated(
-        sink,
-        &request.spec.session_id,
-        orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None)),
-    );
+    let initial_agent = orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None));
+    // #1021 / M17-C — CLI specialists are spawned as external subprocesses that never consume the Octos prompt context manager, so the dispatch contract is `external_context_unmanaged` with `risk: "medium"`. Stamping it here surfaces `context_mode` / `context_refs` on every subsequent `agent/updated` event so AppUI clients can audit context regime per child without polling the MCP path.
+    let cli_contract = DispatchContextContract::external_unmanaged(
+        "cli_specialist_does_not_consume_managed_payload",
+    )
+    .with_backend_kind("cli")
+    .with_agent_id(request.spec.agent_id.clone())
+    .with_risk("medium")
+    .with_parent_session_key(Some(request.spec.session_id.to_string()))
+    .with_child_session_key(Some(request.spec.agent_id.clone()));
+    let agent = orchestrator
+        .set_agent_context_contract(
+            &request.spec.agent_id,
+            &request.spec.session_id,
+            &request.spec.profile_id,
+            cli_contract,
+        )
+        .unwrap_or(initial_agent);
+    emit_agent_updated(sink, &request.spec.session_id, agent);
 
     let process = match CliAgentProcess::spawn(request.command) {
         Ok(process) => process,
@@ -185,17 +199,25 @@ pub(crate) async fn run_supervised_mcp_specialist(
         return Err("MCP specialist timeout must be greater than zero".to_owned());
     }
 
-    emit_agent_updated(
-        sink,
-        &request.spec.session_id,
-        orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None)),
-    );
-
+    let initial_agent = orchestrator.upsert_agent(upsert_for_spec(&request.spec, "running", None));
+    // #1021 / M17-C — MCP supervised specialists dispatch through an external transport that does not yet wire a managed context payload, so the contract is `external_context_unmanaged` with `risk: "medium"`. The same contract is forwarded into the dispatch request below so the remote side and the AppUI event ledger agree on context regime.
     let context_contract = DispatchContextContract::external_unmanaged(
         "supervised_mcp_specialist_context_payload_not_wired",
     )
+    .with_backend_kind("mcp")
+    .with_agent_id(request.spec.agent_id.clone())
+    .with_risk("medium")
     .with_parent_session_key(Some(request.spec.session_id.to_string()))
     .with_child_session_key(Some(request.spec.agent_id.clone()));
+    let agent = orchestrator
+        .set_agent_context_contract(
+            &request.spec.agent_id,
+            &request.spec.session_id,
+            &request.spec.profile_id,
+            context_contract.clone(),
+        )
+        .unwrap_or(initial_agent);
+    emit_agent_updated(sink, &request.spec.session_id, agent);
     let dispatch = request.backend.dispatch(
         DispatchRequest::new(request.tool_name.clone(), request.task.clone())
             .with_context_contract(context_contract.clone()),
@@ -761,6 +783,59 @@ printf 'done\n'
             .unwrap();
         assert!(child.last_heartbeat.is_some());
         assert!(child.terminal.is_some());
+    }
+
+    /// #1021 / M17-C — the CLI specialist runner MUST stamp a `DispatchContextContract::external_unmanaged` onto the agent record before emitting `agent/updated`, with `backend_kind: cli` and `risk: medium`. This pins the wire contract that AppUI clients rely on to tell apart managed-payload children from external-context children.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_specialist_stamps_external_unmanaged_context_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            &dir,
+            "agent",
+            r#"#!/bin/sh
+printf 'done\n'
+"#,
+        );
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let sink = RecordingSink::default();
+        let spec = sample_spec(&dir, "cli-ctx-child");
+        run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                spec.clone(),
+                CliAgentCommandConfig::new(script).cwd(dir.path()),
+            )
+            .heartbeat_interval(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+
+        let events = sink.events();
+        let agent_updated = events
+            .iter()
+            .find_map(|(method, params)| {
+                (*method == methods::AGENT_UPDATED).then_some(params.clone())
+            })
+            .expect("at least one agent/updated event");
+        let agent = &agent_updated["agent"];
+        assert_eq!(agent["context_mode"], json!("external_context_unmanaged"));
+        assert_eq!(agent["context_refs"], json!(Vec::<String>::new()));
+        let contract = &agent["context_contract"];
+        assert_eq!(contract["mode"], json!("external_context_unmanaged"));
+        assert_eq!(contract["backend_kind"], json!("cli"));
+        assert_eq!(contract["risk"], json!("medium"));
+        assert_eq!(contract["agent_id"], json!(spec.agent_id));
+        assert_eq!(
+            contract["reason"],
+            json!("cli_specialist_does_not_consume_managed_payload")
+        );
+        assert_eq!(
+            contract["parent_session_key"],
+            json!(spec.session_id.to_string())
+        );
+        assert_eq!(contract["child_session_key"], json!(spec.agent_id));
     }
 
     #[derive(Default)]
