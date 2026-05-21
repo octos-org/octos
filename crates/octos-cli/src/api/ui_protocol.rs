@@ -8310,6 +8310,7 @@ async fn handle_turn_start(
                 turn_state_for_task,
                 interrupt_rx,
                 false,
+                None,
             )
             .await;
         }
@@ -8427,12 +8428,14 @@ async fn maybe_spawn_appui_master_continuation_runner(
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
     let routed_profile_id = Some(profile_id.clone());
-    // #1128 codex P1 follow-up: capture the loop_id (if any) BEFORE we
-    // consume the continuation into the spawned task so the AppUI
-    // turn path can reschedule self-paced loops the same way
-    // `SessionActor::drain_master_continuations` does. Without this,
-    // self-paced loops fired through the AppUI WS path never persist
-    // the model-selected next delay and only ran once.
+    // #1128 codex P1 re-review #2: capture the loop_id (if any) BEFORE
+    // we consume the continuation into the spawned task. The actual
+    // self-paced rescheduling is now done INSIDE `run_standalone_turn`
+    // where the per-session `SessionRuntime.sessions` manager is in
+    // scope; an earlier shape read from `state.sessions` (AppState's
+    // legacy session manager) and never saw the just-persisted
+    // assistant reply, so self-paced loops fired through AppUI still
+    // stopped after one fire.
     let loop_id_for_self_paced = match continuation.reason {
         MasterContinuationReason::LoopFire => continuation
             .loop_id
@@ -8440,9 +8443,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
             .map(|id| id.as_str().to_owned()),
         _ => None,
     };
-    let appui_sessions_for_reschedule = state.sessions.clone();
-    let session_id_for_reschedule = session_id.clone();
-    let profile_id_for_reschedule = profile_id.clone();
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -8454,27 +8454,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
             "draining queued master continuation into AppUI turn runtime"
         );
         default_agent_orchestrator().mark_continuation_started(&continuation);
-        // Snapshot the pre-turn assistant-message count so we can find
-        // the final reply emitted by THIS continuation after
-        // `run_standalone_turn` returns. Only needed for self-paced
-        // / maintenance loops.
-        let pre_assistant_count: Option<usize> = if loop_id_for_self_paced.is_some() {
-            if let Some(ref sessions) = appui_sessions_for_reschedule {
-                let mut guard = sessions.lock().await;
-                let session = guard.get_or_create(&session_id_for_reschedule).await;
-                Some(
-                    session
-                        .get_history(usize::MAX)
-                        .iter()
-                        .filter(|message| matches!(message.role, MessageRole::Assistant))
-                        .count(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
@@ -8487,48 +8466,9 @@ async fn maybe_spawn_appui_master_continuation_runner(
             turn_state_for_task,
             interrupt_rx,
             true,
+            loop_id_for_self_paced,
         )
         .await;
-        if let (Some(loop_id), Some(pre), Some(sessions)) = (
-            loop_id_for_self_paced.as_ref(),
-            pre_assistant_count,
-            appui_sessions_for_reschedule.as_ref(),
-        ) {
-            // #1128 codex P2 follow-up: the prior shape used `.nth(pre)`
-            // which can land on an assistant tool-call stub when the
-            // loop turn used tools. Walk from the back instead so we
-            // pick the LAST assistant message in the turn that
-            // actually contains content — the
-            // `<<loop-next-in: ...>>` hint, if any, is there.
-            let assistant_reply: Option<String> = {
-                let mut guard = sessions.lock().await;
-                let session = guard.get_or_create(&session_id_for_reschedule).await;
-                let history = session.get_history(usize::MAX);
-                history
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, message)| matches!(message.role, MessageRole::Assistant))
-                    .enumerate()
-                    .filter(|(idx, _)| *idx >= pre)
-                    .filter(|(_, (_, message))| !message.content.is_empty())
-                    .last()
-                    .map(|(_, (_, message))| message.content.clone())
-            };
-            if let Some(reply) = assistant_reply {
-                if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
-                    loop_id,
-                    &profile_id_for_reschedule,
-                    &reply,
-                ) {
-                    info!(
-                        session = %session_id_for_reschedule,
-                        loop_id = %loop_id,
-                        error = %err.message,
-                        "apply_self_paced_response skipped (appui path)"
-                    );
-                }
-            }
-        }
         default_agent_orchestrator().mark_continuation_completed(
             &continuation,
             Some("processed_by_appui_turn_runtime".to_owned()),
@@ -13400,6 +13340,16 @@ async fn run_standalone_turn(
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
     internal_master_continuation: bool,
+    // #1128 codex P1 re-review #2 — when this turn is draining a
+    // self-paced or maintenance LoopFire continuation, pass the loop
+    // id here so `run_standalone_turn` can re-schedule it from the
+    // model's `<<loop-next-in: ...>>` reply hint AFTER the assistant
+    // message has been persisted into the per-session
+    // `SessionRuntime.sessions` manager (which is the source of truth
+    // for the persisted turn). Earlier shapes captured `pre_assistant_count`
+    // off `state.sessions` (AppState's legacy manager) and never saw
+    // the just-written reply.
+    loop_id_for_self_paced: Option<String>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -13510,6 +13460,23 @@ async fn run_standalone_turn(
     // `Arc<ToolRegistry>` so per-turn mutation does not race with the
     // cached SessionRuntime.
     let sessions = session_runtime.sessions.clone();
+    // #1128 codex P1 re-review #2 — pre-turn assistant-message count
+    // snapshot off the SessionRuntime's session manager (the source
+    // of truth for persisted turns). Used at end-of-turn to find the
+    // model's reply and re-schedule self-paced / maintenance loops.
+    let pre_assistant_count_for_self_paced: Option<usize> = if loop_id_for_self_paced.is_some() {
+        let mut guard = sessions.lock().await;
+        let session = guard.get_or_create(&session_id).await;
+        Some(
+            session
+                .get_history(usize::MAX)
+                .iter()
+                .filter(|message| matches!(message.role, MessageRole::Assistant))
+                .count(),
+        )
+    } else {
+        None
+    };
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
     // M11-F regression fix REG-1 follow-up round 2 (codex review):
     // re-register a fresh `ActivateToolsTool` on this per-turn
@@ -14244,6 +14211,11 @@ async fn run_standalone_turn(
     let auto_escalation_router = session_runtime.profile.adaptive_router.clone();
     let auto_escalation_session_id = session_id.0.clone();
     let skip_internal_user_persist = internal_master_continuation;
+    // #1128 codex P1 re-review #2 — clone the session manager Arc
+    // before the agent_task spawn moves the original. We need the
+    // clone alive in this outer scope for the post-turn self-paced
+    // reschedule read below.
+    let sessions_for_reschedule = sessions.clone();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         let result = octos_llm::with_router_context(
@@ -14549,6 +14521,57 @@ async fn run_standalone_turn(
             // post-terminal so the flag is intentionally discarded here.
             let _ = drain_saw_delta;
         });
+    }
+
+    // #1128 codex P1 re-review #2 — apply self-paced rescheduling
+    // AFTER the model reply has been persisted to the per-session
+    // session manager. This is the AppUI parity for what
+    // `SessionActor::drain_master_continuations` does for the chat
+    // path. Reading from `sessions` (= `session_runtime.sessions`)
+    // ensures we observe the assistant message that `run_standalone_turn`
+    // just persisted, NOT a stale `state.sessions` view that never
+    // gets written to in production.
+    if let (Some(loop_id), Some(pre)) = (
+        loop_id_for_self_paced.as_ref(),
+        pre_assistant_count_for_self_paced,
+    ) {
+        let assistant_reply: Option<String> = {
+            let mut guard = sessions_for_reschedule.lock().await;
+            let session = guard.get_or_create(&session_id).await;
+            let history = session.get_history(usize::MAX);
+            // Walk from the back: pick the LAST assistant message
+            // emitted after the pre-count with non-empty content. For
+            // tool-using loop turns, `process_inbound` persists
+            // assistant tool-call stubs before the final text reply
+            // — those have empty content and must be skipped.
+            history
+                .iter()
+                .filter(|message| matches!(message.role, MessageRole::Assistant))
+                .enumerate()
+                .filter(|(idx, _)| *idx >= pre)
+                .filter(|(_, message)| !message.content.is_empty())
+                .last()
+                .map(|(_, message)| message.content.clone())
+        };
+        if let Some(reply) = assistant_reply {
+            let profile_for_reschedule = session_id
+                .profile_id()
+                .map(ToOwned::to_owned)
+                .or_else(|| routed_profile_id.clone())
+                .unwrap_or_default();
+            if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                loop_id,
+                &profile_for_reschedule,
+                &reply,
+            ) {
+                info!(
+                    session = %session_id,
+                    loop_id = %loop_id,
+                    error = %err.message,
+                    "apply_self_paced_response skipped (appui path)"
+                );
+            }
+        }
     }
 
     // FIX-06: a turn that ends — for any reason — must drop its

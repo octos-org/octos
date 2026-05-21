@@ -1977,11 +1977,23 @@ fn enqueue_due_loop_continuations(
                 continue;
             }
         }
+        // #1128 codex P2 follow-up: maintenance loops resolve their
+        // prompt from `.octos/loop.md` / `~/.octos/loop.md` / the
+        // built-in fallback at FIRE time. `fire_now` already does
+        // this; the scheduled-due path now does it too so an operator
+        // edit to `.octos/loop.md` between fires actually takes
+        // effect on the next scheduled tick. fixed_interval and
+        // self_paced keep the persisted prompt.
+        let fire_prompt = if loop_record.mode == "maintenance" {
+            resolve_maintenance_prompt_at_fire_time().prompt
+        } else {
+            loop_record.prompt.clone()
+        };
         due.push(DueLoopFire {
             session_id: loop_record.session_id.clone(),
             profile_id: loop_record.profile_id.clone(),
             loop_id: loop_record.loop_id.clone(),
-            prompt: loop_record.prompt.clone(),
+            prompt: fire_prompt,
             scheduled_for_ms: next_run_at_ms,
         });
         loop_record.last_run_at_ms = Some(now);
