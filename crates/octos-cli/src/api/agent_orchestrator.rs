@@ -941,8 +941,17 @@ impl InProcessAgentOrchestrator {
         let now = now_ms();
         let mut targets = Vec::new();
         for loop_record in state.loops.values() {
+            // #1128 codex P1 follow-up: `due_loop_targets` previously
+            // skipped every loop whose mode was not `fixed_interval`,
+            // which meant self-paced and maintenance loops with a
+            // recorded `next_run_at_ms` (set by
+            // `apply_self_paced_response` after a model
+            // `<<loop-next-in: ...>>` reply) never fired again
+            // automatically. The schedule cue for every active mode is
+            // the same — `next_run_at_ms <= now` — so we drop the mode
+            // filter here and let the per-mode fire-decision logic
+            // handle slash re-auth / budget / wait policies downstream.
             if loop_record.status != "active"
-                || loop_record.mode != "fixed_interval"
                 || loop_record.expires_at_ms <= now
                 || profile_filter.is_some_and(|profile_id| loop_record.profile_id != profile_id)
                 || loop_record
@@ -1917,8 +1926,11 @@ fn enqueue_due_loop_continuations(
     let mut due = Vec::new();
     let mut updated_loops = Vec::new();
     for loop_record in state.loops.values_mut() {
+        // #1128 codex P1 follow-up: drop the `mode != "fixed_interval"`
+        // filter so self-paced and maintenance loops are also drained
+        // when their stamped `next_run_at_ms` is past. The runtime
+        // fire decision below still gates on mode-specific policy.
         if loop_record.status != "active"
-            || loop_record.mode != "fixed_interval"
             || loop_record.profile_id != profile_id
             || !session_controls_target(session_id, &loop_record.session_id)
             || loop_record.expires_at_ms <= now
@@ -1931,9 +1943,15 @@ fn enqueue_due_loop_continuations(
         if next_run_at_ms > now {
             continue;
         }
-        let Some(interval_seconds) = loop_record.interval_seconds else {
+        // #1128 codex P1 follow-up: `interval_seconds` is only required
+        // for fixed_interval mode (used to recompute `next_run_at_ms`
+        // after firing). Self-paced / maintenance loops compute their
+        // own next delay from the model reply (`<<loop-next-in: ...>>`)
+        // and may legitimately omit `interval_seconds` — don't reject
+        // them here; we conditionally update next_run_at_ms below.
+        if loop_record.mode == "fixed_interval" && loop_record.interval_seconds.is_none() {
             continue;
-        };
+        }
         // #977 Bullets 1–2: consult `LoopRuntime` on the scheduled-due
         // path. A scheduled tick is not a fresh user gesture, so slash
         // commands present the `authorized_at_creation_only` claim —
@@ -1959,9 +1977,6 @@ fn enqueue_due_loop_continuations(
                 continue;
             }
         }
-        // Maintenance loops are self-paced in the canonical model; the
-        // scheduled-due path is fixed_interval only, so we never resolve
-        // the project doc here — keep the persisted prompt.
         due.push(DueLoopFire {
             session_id: loop_record.session_id.clone(),
             profile_id: loop_record.profile_id.clone(),
@@ -1970,7 +1985,22 @@ fn enqueue_due_loop_continuations(
             scheduled_for_ms: next_run_at_ms,
         });
         loop_record.last_run_at_ms = Some(now);
-        loop_record.next_run_at_ms = next_loop_run_at(now, interval_seconds);
+        // #1128 codex P1 follow-up: only `fixed_interval` mode
+        // recomputes `next_run_at_ms` here using `interval_seconds`.
+        // Self-paced loops have their next delay parsed from the
+        // model reply (`<<loop-next-in: ...>>`) by
+        // `apply_self_paced_response` after the turn completes, so we
+        // clear the timestamp here to prevent the scheduler from
+        // re-picking-up the same loop in a tight loop before the
+        // response handler has stamped the new delay. Maintenance
+        // loops behave the same way.
+        if loop_record.mode == "fixed_interval" {
+            if let Some(interval_seconds) = loop_record.interval_seconds {
+                loop_record.next_run_at_ms = next_loop_run_at(now, interval_seconds);
+            }
+        } else {
+            loop_record.next_run_at_ms = None;
+        }
         loop_record.updated_at_ms = now;
         updated_loops.push(loop_record.clone());
     }
@@ -5045,6 +5075,62 @@ mod tests {
         assert_eq!(
             drained[0].metadata.get("prompt").map(String::as_str),
             Some("check build health")
+        );
+    }
+
+    /// #1128 codex P1 acceptance: self-paced loops whose `next_run_at_ms`
+    /// is in the past MUST also be picked up by `due_loop_targets` /
+    /// `enqueue_due_loop_continuations`. The prior shape filtered on
+    /// `mode != "fixed_interval"` so the only way to fire a self-paced
+    /// loop was `fire_now` — the model's `<<loop-next-in: ...>>` hint
+    /// was stamped onto the record but never honoured automatically.
+    #[test]
+    fn due_self_paced_loop_queues_master_continuation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "self-paced-due");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("ponder the codebase".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self-paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Simulate the post-fire stamp from `apply_self_paced_response`:
+        // record a past `next_run_at_ms` as if the model had asked for
+        // a near-zero delay.
+        {
+            let mut state = orchestrator.state();
+            let loop_record = state.loops.get_mut(&loop_id).expect("loop record");
+            loop_record.next_run_at_ms = Some(now_ms() - 1);
+        }
+
+        let targets = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            targets.contains(&(session_id.clone(), "tenant-a".to_owned())),
+            "due_loop_targets must include the self-paced loop, got {targets:?}",
+        );
+
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1, "self-paced loop must enqueue a continuation");
+
+        // After firing, the self-paced loop's next_run_at_ms must be
+        // cleared so the scheduler does not pick it up on every tick
+        // until `apply_self_paced_response` stamps a fresh delay.
+        let state = orchestrator.state();
+        let loop_record = state.loops.get(&loop_id).expect("loop record");
+        assert!(
+            loop_record.next_run_at_ms.is_none(),
+            "self-paced loop must clear next_run_at_ms after firing (got {:?}), so scheduler waits for the model reply",
+            loop_record.next_run_at_ms,
         );
     }
 

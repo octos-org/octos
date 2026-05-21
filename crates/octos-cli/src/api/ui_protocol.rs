@@ -77,7 +77,9 @@ use super::agent_orchestrator::{
     NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
     master_continuation_reason_name, upsert_background_task_agent,
 };
-use super::master_continuation_scheduler::MasterContinuationRuntimeState;
+use super::master_continuation_scheduler::{
+    MasterContinuationReason, MasterContinuationRuntimeState,
+};
 use super::metrics::MetricsReporter;
 use super::router::AuthIdentity;
 use super::specialist_runner::{
@@ -8425,6 +8427,22 @@ async fn maybe_spawn_appui_master_continuation_runner(
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
     let routed_profile_id = Some(profile_id.clone());
+    // #1128 codex P1 follow-up: capture the loop_id (if any) BEFORE we
+    // consume the continuation into the spawned task so the AppUI
+    // turn path can reschedule self-paced loops the same way
+    // `SessionActor::drain_master_continuations` does. Without this,
+    // self-paced loops fired through the AppUI WS path never persist
+    // the model-selected next delay and only ran once.
+    let loop_id_for_self_paced = match continuation.reason {
+        MasterContinuationReason::LoopFire => continuation
+            .loop_id
+            .as_ref()
+            .map(|id| id.as_str().to_owned()),
+        _ => None,
+    };
+    let appui_sessions_for_reschedule = state.sessions.clone();
+    let session_id_for_reschedule = session_id.clone();
+    let profile_id_for_reschedule = profile_id.clone();
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -8436,6 +8454,27 @@ async fn maybe_spawn_appui_master_continuation_runner(
             "draining queued master continuation into AppUI turn runtime"
         );
         default_agent_orchestrator().mark_continuation_started(&continuation);
+        // Snapshot the pre-turn assistant-message count so we can find
+        // the final reply emitted by THIS continuation after
+        // `run_standalone_turn` returns. Only needed for self-paced
+        // / maintenance loops.
+        let pre_assistant_count: Option<usize> = if loop_id_for_self_paced.is_some() {
+            if let Some(ref sessions) = appui_sessions_for_reschedule {
+                let mut guard = sessions.lock().await;
+                let session = guard.get_or_create(&session_id_for_reschedule).await;
+                Some(
+                    session
+                        .get_history(usize::MAX)
+                        .iter()
+                        .filter(|message| matches!(message.role, MessageRole::Assistant))
+                        .count(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
@@ -8450,6 +8489,46 @@ async fn maybe_spawn_appui_master_continuation_runner(
             true,
         )
         .await;
+        if let (Some(loop_id), Some(pre), Some(sessions)) = (
+            loop_id_for_self_paced.as_ref(),
+            pre_assistant_count,
+            appui_sessions_for_reschedule.as_ref(),
+        ) {
+            // #1128 codex P2 follow-up: the prior shape used `.nth(pre)`
+            // which can land on an assistant tool-call stub when the
+            // loop turn used tools. Walk from the back instead so we
+            // pick the LAST assistant message in the turn that
+            // actually contains content — the
+            // `<<loop-next-in: ...>>` hint, if any, is there.
+            let assistant_reply: Option<String> = {
+                let mut guard = sessions.lock().await;
+                let session = guard.get_or_create(&session_id_for_reschedule).await;
+                let history = session.get_history(usize::MAX);
+                history
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| matches!(message.role, MessageRole::Assistant))
+                    .enumerate()
+                    .filter(|(idx, _)| *idx >= pre)
+                    .filter(|(_, (_, message))| !message.content.is_empty())
+                    .last()
+                    .map(|(_, (_, message))| message.content.clone())
+            };
+            if let Some(reply) = assistant_reply {
+                if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                    loop_id,
+                    &profile_id_for_reschedule,
+                    &reply,
+                ) {
+                    info!(
+                        session = %session_id_for_reschedule,
+                        loop_id = %loop_id,
+                        error = %err.message,
+                        "apply_self_paced_response skipped (appui path)"
+                    );
+                }
+            }
+        }
         default_agent_orchestrator().mark_continuation_completed(
             &continuation,
             Some("processed_by_appui_turn_runtime".to_owned()),

@@ -3877,14 +3877,27 @@ impl SessionActor {
             // `apply_self_paced_response` no-ops for fixed_interval mode,
             // so this is safe to call for every LoopFire continuation.
             if let (Some(loop_id), Some(pre)) = (loop_id_for_self_paced, pre_assistant_count) {
+                // #1128 codex P2 follow-up: the prior shape used
+                // `.nth(pre)` to find the new assistant reply, but
+                // `process_inbound` persists assistant tool-call stubs
+                // BEFORE the final text reply. For loop turns that
+                // used tools, `.nth(pre)` selected the first new
+                // assistant tool-call message and missed the
+                // `<<loop-next-in: ...>>` hint that lives in the
+                // final text reply. Walk from the back instead and
+                // pick the LAST assistant message with non-empty
+                // content, which is the actual final reply.
                 let assistant_reply: Option<String> = {
                     let handle = self.session_handle.lock().await;
                     handle
                         .get_history(usize::MAX)
                         .iter()
                         .filter(|message| matches!(message.role, MessageRole::Assistant))
-                        .nth(pre)
-                        .map(|message| message.content.clone())
+                        .enumerate()
+                        .filter(|(idx, _)| *idx >= pre)
+                        .filter(|(_, message)| !message.content.is_empty())
+                        .last()
+                        .map(|(_, message)| message.content.clone())
                 };
                 if let Some(reply) = assistant_reply {
                     if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
