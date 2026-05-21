@@ -973,6 +973,24 @@ impl InProcessAgentOrchestrator {
             if pending_continuation_is_schedulable(&state, &item) {
                 kept.push(item);
             } else {
+                // #1159 codex P2 follow-up: persist the discard before
+                // forgetting it. Otherwise on restart, `configure_supervisor_store`
+                // replays the ledger and re-queues any continuation
+                // that lacks a terminal event — so a "dropped" stale
+                // wrap-up resurrects after every restart. Mirror the
+                // existing `mark_continuation_completed` shape: record
+                // a ContinuationCompleted with a `result` tag that
+                // names *why* the entry was discarded, so an operator
+                // reading the ledger can tell stale-drop from genuine
+                // completion.
+                if let Some(store) = state.supervisor_store.as_ref() {
+                    let _ = store.record_continuation_completed(
+                        item.group_id.as_str(),
+                        item.dedupe_key.as_str(),
+                        now_ms_u64(),
+                        Some("discarded:stale_at_drain (#1150)".into()),
+                    );
+                }
                 tracing::debug!(
                     session_key = %session_id.0,
                     profile_id = %profile_id,
@@ -6548,6 +6566,106 @@ mod tests {
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
             0,
             "stale wrap-up must be dropped from the queue, not re-enqueued for next tick",
+        );
+    }
+
+    /// #1159 codex P2 follow-up: when a stale continuation is dropped
+    /// at the drain site, the supervisor store MUST record a terminal
+    /// event for it. Otherwise on restart, `configure_supervisor_store`
+    /// reloads every non-completed queued continuation and the stale
+    /// wrap-up resurrects — defeating the whole point of the #1150 fix.
+    #[test]
+    fn drain_time_stale_drop_persists_to_supervisor_store_per_1159() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store_dir = dir.path().join("supervisor");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(&store_dir)
+            .expect("configure store");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "drain-drop-persists");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "fresh active goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial set_goal continuation AND mark it completed
+        // in the store, so it doesn't get resurrected on restart and
+        // pollute the post-restart pending count we're asserting below.
+        let initial = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        for item in &initial {
+            orchestrator.mark_continuation_started(item);
+            orchestrator.mark_continuation_completed(item, Some("processed".into()));
+        }
+
+        let current_goal_id = orchestrator
+            .state()
+            .goals
+            .get(&session_id)
+            .expect("goal exists")
+            .goal_id
+            .clone();
+        let stale_goal_id = format!("{current_goal_id}-superseded");
+        // Hand-enqueue a stale wrap-up — same shape as #1150 test.
+        {
+            let mut state = orchestrator.state();
+            let stale = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(stale_goal_id.clone())
+            .with_metadata(
+                "wrap_up_prompt",
+                "STALE: summarize a goal that no longer owns this session",
+            );
+            enqueue_and_persist_continuation(&mut state, stale);
+        }
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            1,
+            "stale wrap-up must be queued before drain",
+        );
+
+        // Drain — this drops the stale wrap-up. Without the #1159 fix
+        // we would only remove it from memory; with the fix the
+        // supervisor store gets a ContinuationCompleted ledger entry.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // In-memory queue is empty.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "in-memory queue must be empty after stale drop",
+        );
+
+        // Critical: a fresh orchestrator replaying the SAME store must
+        // also see zero pending continuations. Pre-fix this asserts 1
+        // because the stale wrap-up gets reloaded.
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay store");
+        assert_eq!(
+            restarted.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "restart must not resurrect a stale wrap-up that was dropped at drain time",
         );
     }
 
