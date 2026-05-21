@@ -634,19 +634,27 @@ impl Tool for DelegateTool {
             worker = worker.with_system_prompt(prompt.clone());
         }
         if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
-            // #1126 codex P1: pass `None` so the factory derives a
-            // unique child session key per delegated worker (e.g.
-            // `parent#spawn-<worker>` in the session_actor factory).
-            // Previously this forwarded `self.session_key.clone()`
-            // (the PARENT key), which the factory honours verbatim —
-            // every delegated child then persisted its forked context
-            // back onto the parent's `context_ledgers/<session>.json`,
-            // letting resume/audit observe a child's truncated fork
-            // in place of the parent transcript. Mirrors the SpawnTool
-            // path which already passes `None` (see spawn.rs).
+            // #1132: forward the supervisor-derived `child_session_key`
+            // (`parent#child-<task_id>`) so the persisted context
+            // ledger matches the key recorded in the task ledger.
+            // Audit/resume paths follow `BackgroundTask.child_session_key`,
+            // so synthesising a different key here (PR #1126 passed
+            // `None`, which made the session_actor factory mint a
+            // `parent#spawn-delegate-N` key) silently divorced the
+            // child's forked context from the task it backed.
+            //
+            // Fallback: when no TaskSupervisor is wired (standalone /
+            // legacy tests), keep `None` so the factory mints its own
+            // unique key — there's no registered BackgroundTask to
+            // read a key from.
+            let supervisor_child_session_key = self
+                .task_supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.get_task(&child_task_id))
+                .and_then(|task| task.child_session_key);
             if let Some(manager) = factory(ChildPromptContextRequest {
                 parent_session_key: self.session_key.clone(),
-                child_session_key: None,
+                child_session_key: supervisor_child_session_key,
                 task_id: Some(child_task_id.clone()),
                 worker_id: worker_id_for_context,
                 task_label: label.clone(),

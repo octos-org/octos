@@ -1238,14 +1238,17 @@ impl InProcessAgentOrchestrator {
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
         if let Some(prompt) = wrap_up {
-            // Enqueue a one-shot wrap-up turn at the top of the goal's
-            // queue. Use an explicit dedupe key so the wrap-up cannot
-            // collide with the normal-continuation key shape.
+            // #1131 — Enqueue a one-shot wrap-up turn under the
+            // dedicated `GoalWrapUp` reason so the prompt renderer
+            // emits the wrap-up directive verbatim instead of the
+            // standard "Advance the goal..." template. Use an
+            // explicit dedupe key so the wrap-up cannot collide with
+            // the normal-continuation key shape.
             let mut wrap_up_request = MasterContinuationRequest::new(
                 "coding-autonomy-goal",
                 session_id.to_string(),
                 profile_id.to_owned(),
-                MasterContinuationReason::GoalContinue,
+                MasterContinuationReason::GoalWrapUp,
                 now_system,
             )
             .with_goal_id(goal_id.clone())
@@ -1977,6 +1980,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             expires_at_ms: now + LOOP_MAX_AGE_DAYS * 24 * 60 * 60 * 1_000,
             created_at_ms: now,
             updated_at_ms: now,
+            // #1130 — fresh loop has zero fires consumed.
+            fires_used: 0,
         };
         state
             .loops
@@ -2137,7 +2142,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                         .and_then(|delay_ms| now.checked_add(delay_ms))
                 });
                 loop_record.updated_at_ms = now;
-                let loop_json = autonomy_loop_json(loop_record);
+                // Persist the schedule-side timestamp updates regardless
+                // of enqueue outcome (we still attempted a fire).
                 persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
 
                 let continuation = MasterContinuationRequest::new(
@@ -2150,10 +2156,31 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 .with_loop_id(loop_id.clone())
                 .with_metadata("prompt", resolved_prompt)
                 .with_metadata("prompt_source", prompt_source_label);
-                let fire = master_continuation_enqueue_json(enqueue_and_persist_continuation(
-                    &mut state,
-                    continuation,
-                ));
+                let outcome = enqueue_and_persist_continuation(&mut state, continuation);
+                // #1138 codex P2 follow-up to #1130: only count the
+                // fire toward the persisted `fires_used` budget when a
+                // NEW continuation was actually queued. `Duplicate`
+                // outcomes mean the prior continuation is still
+                // pending — a retry/spam should NOT burn the safety
+                // budget, otherwise users can exhaust a loop early by
+                // repeatedly clicking `fire_now` while a fire is in
+                // flight. `saturating_add` defends against a corrupt
+                // snapshot restore.
+                let newly_queued = matches!(outcome, MasterContinuationEnqueueOutcome::Queued(_));
+                if newly_queued {
+                    let loop_record = state
+                        .loops
+                        .get_mut(&loop_id)
+                        .expect("loop record still present");
+                    loop_record.fires_used = loop_record.fires_used.saturating_add(1);
+                    persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
+                }
+                let loop_json = state
+                    .loops
+                    .get(&loop_id)
+                    .map(autonomy_loop_json)
+                    .unwrap_or(Value::Null);
+                let fire = master_continuation_enqueue_json(outcome);
 
                 Ok(json!({
                     "session_id": session_id,
@@ -2321,6 +2348,14 @@ struct AutonomyLoopRecord {
     expires_at_ms: i64,
     created_at_ms: i64,
     updated_at_ms: i64,
+    /// #1130 — number of fires this loop has consumed against
+    /// `LOOP_DEFAULT_MAX_FIRES`. Persisted to the supervisor store so the
+    /// runtime budget gate is enforced across daemon restarts and across
+    /// repeated `fire_now` invocations (`loop_runtime_view` was previously
+    /// rebuilding the runtime with a zeroed `fires_used` counter, so the
+    /// max-fires safety cap never tripped). Defaults to 0 for legacy
+    /// snapshots that pre-date this field.
+    fires_used: u32,
 }
 
 struct ParsedLoopCreate {
@@ -2335,6 +2370,12 @@ struct DueLoopFire {
     loop_id: String,
     prompt: String,
     scheduled_for_ms: i64,
+    /// #1135: carries the `MaintenancePromptSource` resolved at fire
+    /// time for maintenance loops, so the queued continuation metadata
+    /// reports the same `project` / `user` / `built_in` provenance as
+    /// the `fire_now` path. `None` for non-maintenance modes — those
+    /// fall back to the legacy `"record"` label.
+    prompt_source: Option<MaintenancePromptSource>,
 }
 
 fn enqueue_due_loop_continuations(
@@ -2409,10 +2450,15 @@ fn enqueue_due_loop_continuations(
         // edit to `.octos/loop.md` between fires actually takes
         // effect on the next scheduled tick. fixed_interval and
         // self_paced keep the persisted prompt.
-        let fire_prompt = if loop_record.mode == "maintenance" {
-            resolve_maintenance_prompt_at_fire_time().prompt
+        // #1135: capture the resolved `MaintenancePromptSource` here
+        // and forward it through `DueLoopFire` so the queued
+        // continuation metadata reports `project` / `user` /
+        // `built_in` instead of the legacy `"record"` placeholder.
+        let (fire_prompt, fire_prompt_source) = if loop_record.mode == "maintenance" {
+            let resolution = resolve_maintenance_prompt_at_fire_time();
+            (resolution.prompt, Some(resolution.source))
         } else {
-            loop_record.prompt.clone()
+            (loop_record.prompt.clone(), None)
         };
         due.push(DueLoopFire {
             session_id: loop_record.session_id.clone(),
@@ -2420,6 +2466,7 @@ fn enqueue_due_loop_continuations(
             loop_id: loop_record.loop_id.clone(),
             prompt: fire_prompt,
             scheduled_for_ms: next_run_at_ms,
+            prompt_source: fire_prompt_source,
         });
         loop_record.last_run_at_ms = Some(now);
         // #1128 codex P1 follow-up: only `fixed_interval` mode
@@ -2448,6 +2495,14 @@ fn enqueue_due_loop_continuations(
 
     let mut queued = 0;
     for fire in due {
+        // #1135: align the scheduled-due metadata with `fire_now` —
+        // maintenance loops report the resolved provenance, every
+        // other mode falls back to the legacy `"record"` label.
+        let prompt_source_label = fire
+            .prompt_source
+            .map(maintenance_prompt_source_label)
+            .unwrap_or("record");
+        let loop_id_for_increment = fire.loop_id.clone();
         let continuation = MasterContinuationRequest::new(
             "coding-autonomy",
             fire.session_id.to_string(),
@@ -2457,12 +2512,26 @@ fn enqueue_due_loop_continuations(
         )
         .with_loop_id(fire.loop_id)
         .with_metadata("prompt", fire.prompt)
-        .with_metadata("prompt_source", "record")
+        .with_metadata("prompt_source", prompt_source_label)
         .with_metadata("scheduled_for_ms", fire.scheduled_for_ms.to_string());
-        if enqueue_and_persist_continuation(state, continuation)
-            .queued()
-            .is_some()
-        {
+        let outcome = enqueue_and_persist_continuation(state, continuation);
+        // #1138 codex P2 follow-up to #1130: only count the scheduled
+        // fire toward the persisted `fires_used` budget when a NEW
+        // continuation was actually queued. `Duplicate` outcomes (the
+        // prior continuation is still pending) must not burn the
+        // safety budget, otherwise a sticky pending fire could
+        // exhaust the loop's MAX_FIRES with no real LLM executions.
+        if outcome.queued().is_some() {
+            let snapshot = state
+                .loops
+                .get_mut(&loop_id_for_increment)
+                .map(|loop_record| {
+                    loop_record.fires_used = loop_record.fires_used.saturating_add(1);
+                    loop_record.clone()
+                });
+            if let Some(snapshot) = snapshot {
+                persist_loop_state(state, &snapshot);
+            }
             queued += 1;
         }
     }
@@ -3424,6 +3493,14 @@ fn restore_loop_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             .unwrap_or(group.created_at_ms.try_into().unwrap_or(i64::MAX)),
         updated_at_ms: supervisor_metadata_i64(&group.metadata, "updated_at_ms")
             .unwrap_or(group.updated_at_ms.try_into().unwrap_or(i64::MAX)),
+        // #1130 — replay the persisted `fires_used` counter so the
+        // `LoopRuntime` budget gate sees the real consumed-fires value
+        // (not a fresh zero) after a daemon restart. Legacy snapshots
+        // that pre-date #1130 lack this key — `unwrap_or(0)` keeps them
+        // working without forcing a manual migration.
+        fires_used: supervisor_metadata_u64(&group.metadata, "fires_used")
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
     };
     state.next_loop_seq = state
         .next_loop_seq
@@ -3718,6 +3795,14 @@ fn persist_loop_state_with_store(
     group
         .metadata
         .insert("updated_at_ms".into(), json!(loop_record.updated_at_ms));
+    // #1130 — persist the cumulative fires counter alongside the other
+    // runtime accountants (`next_run_at_ms`, `last_run_at_ms`, …). Without
+    // this every restart resets `fires_used` to zero and the
+    // `LOOP_DEFAULT_MAX_FIRES` safety cap silently becomes unenforceable
+    // for any loop that out-lives the daemon process.
+    group
+        .metadata
+        .insert("fires_used".into(), json!(loop_record.fires_used as u64));
     let event_id = format!(
         "autonomy_loop_state:{}:{}",
         group.group_id,
@@ -3786,6 +3871,7 @@ pub(crate) fn master_continuation_reason_name(reason: &MasterContinuationReason)
         MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete",
         MasterContinuationReason::LoopFire => "loop_fire",
         MasterContinuationReason::GoalContinue => "goal_continue",
+        MasterContinuationReason::GoalWrapUp => "goal_wrap_up",
         MasterContinuationReason::External(_) => "external",
     }
 }
@@ -3824,14 +3910,54 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
         ),
-        MasterContinuationReason::GoalContinue => format!(
-            "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
-            goal_id = continuation
+        MasterContinuationReason::GoalContinue => {
+            // #1139 codex P2 follow-up: legacy promotion — wrap-up
+            // continuations queued by the pre-#1131 wire shape (which
+            // used `GoalContinue` + `wrap_up_prompt` metadata) survive
+            // a restart with the old reason. Detect that legacy shape
+            // here and render it as a wrap-up turn so the in-flight
+            // final turn instructs the model to summarize-and-stop
+            // instead of "Advance the goal...". New continuations
+            // queued post-#1131 use `GoalWrapUp` directly; this
+            // promotion is a one-way restore-time fixup.
+            let goal_id = continuation
                 .goal_id
                 .as_ref()
                 .map(|id| id.as_str())
-                .unwrap_or("unknown"),
-        ),
+                .unwrap_or("unknown");
+            if let Some(directive) = continuation.metadata.get("wrap_up_prompt") {
+                return format!(
+                    "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+                );
+            }
+            format!(
+                "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
+            )
+        }
+        // #1131 — wrap-up turns must instruct the model to summarize
+        // and stop, NOT continue work. Render the per-goal wrap-up
+        // directive (stored in metadata by `record_goal_turn`) as
+        // the actual prompt body so the LLM sees the instruction
+        // verbatim instead of the generic "Advance the goal..."
+        // template. Fall back to a safe default directive if the
+        // metadata is missing (e.g. legacy persisted continuations).
+        MasterContinuationReason::GoalWrapUp => {
+            let goal_id = continuation
+                .goal_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown");
+            let directive = continuation
+                .metadata
+                .get("wrap_up_prompt")
+                .map(String::as_str)
+                .unwrap_or(
+                    "This goal has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                );
+            format!(
+                "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+            )
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
@@ -3845,6 +3971,7 @@ fn master_continuation_reason_wire_name(reason: &MasterContinuationReason) -> St
         MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete".to_owned(),
         MasterContinuationReason::LoopFire => "loop_fire".to_owned(),
         MasterContinuationReason::GoalContinue => "goal_continue".to_owned(),
+        MasterContinuationReason::GoalWrapUp => "goal_wrap_up".to_owned(),
         MasterContinuationReason::External(kind) => format!("external:{kind}"),
     }
 }
@@ -3857,6 +3984,7 @@ fn master_continuation_reason_from_wire_name(value: &str) -> Option<MasterContin
         }
         "loop_fire" | "LoopFire" => Some(MasterContinuationReason::LoopFire),
         "goal_continue" | "GoalContinue" => Some(MasterContinuationReason::GoalContinue),
+        "goal_wrap_up" | "GoalWrapUp" => Some(MasterContinuationReason::GoalWrapUp),
         value => value
             .strip_prefix("external:")
             .map(|kind| MasterContinuationReason::External(kind.to_owned())),
@@ -4468,7 +4596,14 @@ fn loop_runtime_view(record: &AutonomyLoopRecord) -> LoopRuntime {
         "maintenance" => LoopRuntimePolicy::maintenance(LOOP_DEFAULT_MAX_FIRES),
         _ => LoopRuntimePolicy::self_paced(LOOP_DEFAULT_MAX_FIRES),
     };
-    let mut runtime = LoopRuntime::new(record.loop_id.clone(), invocation, policy);
+    // #1130 — seed the runtime with the persisted `fires_used` counter.
+    // Previously `LoopRuntime::new` zeroed this field on every decision
+    // call, so the `LOOP_DEFAULT_MAX_FIRES` safety cap could never trip
+    // for a loop that survived past a single decision (every `fire_now`,
+    // every scheduled tick, every restart). The wire-through makes
+    // `decide_fire` budget-aware across the entire loop lifetime.
+    let mut runtime = LoopRuntime::new(record.loop_id.clone(), invocation, policy)
+        .with_fires_used(record.fires_used);
     match record.status.as_str() {
         "paused" => runtime.pause(),
         "deleted" => runtime.delete(),
@@ -4589,6 +4724,24 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1135 codex P2: serialize all cwd-mutating tests in this module
+    /// (currently `maintenance_loop_resolves_prompt_at_fire_time_from_project_doc`
+    /// and `scheduled_maintenance_fire_emits_resolved_prompt_source`).
+    /// Rust runs tests in parallel by default; both tests `chdir` to
+    /// their own tempdir and write `.octos/loop.md` there. Without a
+    /// shared lock the two tests can overlap, with one resolving the
+    /// OTHER's project doc and producing nondeterministic content
+    /// failures. The lock is poisoning-safe — we recover from a poisoned
+    /// lock so an earlier panic doesn't permanently disable the suite.
+    static CWD_MUTATING_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn cwd_mutating_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CWD_MUTATING_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct NativeMockProvider {
         content: Result<String, String>,
@@ -5975,7 +6128,9 @@ mod tests {
         );
 
         // The wrap-up turn must be queued separately from any prior
-        // GoalContinue.
+        // GoalContinue, and rides the new dedicated `GoalWrapUp`
+        // reason (#1131) so the prompt renderer treats it as a
+        // "summarize and stop" turn instead of a regular advance.
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
             "tenant-a",
@@ -5983,7 +6138,7 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].reason, MasterContinuationReason::GoalContinue);
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
         assert_eq!(
             drained[0].metadata.get("wrap_up").map(String::as_str),
             Some("true")
@@ -6000,6 +6155,115 @@ mod tests {
         // emit a duplicate wrap-up.
         orchestrator.record_goal_turn(&session_id, "tenant-a", 100, 1);
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// #1131 — when the budget-exhaustion wrap-up turn is dispatched,
+    /// the rendered prompt must contain the wrap-up directive
+    /// verbatim (i.e. "Summarize the current state..."), NOT the
+    /// regular "Advance the goal by one bounded step" template that
+    /// the GoalContinue path emits. Otherwise the model keeps
+    /// working instead of summarizing and stopping.
+    #[test]
+    fn goal_wrap_up_turn_uses_wrap_up_text_as_directive() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-wrap-prompt");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust then summarize".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain any goal continuation that the `set_goal` lifecycle
+        // may have queued so we only observe the wrap-up turn below.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 200, 5);
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "wrap-up must be the only queued turn");
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+
+        let rendered = master_continuation_prompt(&drained[0]);
+        let wrap_up_directive = drained[0]
+            .metadata
+            .get("wrap_up_prompt")
+            .cloned()
+            .expect("wrap_up_prompt metadata must be present");
+        assert!(
+            rendered.contains(&wrap_up_directive),
+            "rendered prompt must contain the wrap-up directive verbatim; rendered=\n{rendered}",
+        );
+        assert!(
+            rendered.contains("Summarize the current state"),
+            "rendered prompt must instruct the model to summarize; rendered=\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Advance the goal by one bounded step"),
+            "rendered prompt must NOT use the GoalContinue 'advance' template; rendered=\n{rendered}",
+        );
+    }
+
+    /// #1139 codex P2 acceptance: a legacy wrap-up continuation
+    /// (queued before #1131 with `GoalContinue` + `wrap_up_prompt`
+    /// metadata, then restored after an upgrade/restart) MUST render
+    /// as a wrap-up directive — NOT as the regular "Advance the goal"
+    /// template. This pins the restore-time promotion in
+    /// `master_continuation_prompt`.
+    ///
+    /// We can't ergonomically hand-build a `QueuedMasterContinuation`
+    /// (private fields), so we drive the legacy-shaped enqueue
+    /// directly: `MasterContinuationRequest::new(GoalContinue, …)`
+    /// with a `wrap_up_prompt` metadata key — exactly what
+    /// pre-#1131 code emitted on budget exhaustion.
+    #[test]
+    fn legacy_goal_continue_with_wrap_up_metadata_promotes_to_wrap_up() {
+        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "legacy-wrap-up");
+        let mut state = orchestrator.state();
+        // Hand-enqueue the legacy shape.
+        let legacy = MasterContinuationRequest::new(
+            "coding-autonomy-goal",
+            session_id.to_string(),
+            "tenant-a".to_owned(),
+            MasterContinuationReason::GoalContinue,
+            SystemTime::now(),
+        )
+        .with_goal_id("legacy-goal-id")
+        .with_metadata(
+            "wrap_up_prompt",
+            "LEGACY DIRECTIVE: summarize what you've done and stop.",
+        );
+        let outcome = enqueue_and_persist_continuation(&mut state, legacy);
+        let queued = outcome.queued().expect("legacy enqueue must succeed");
+        let legacy_continuation = queued.clone();
+        drop(state);
+
+        let rendered = master_continuation_prompt(&legacy_continuation);
+        assert!(
+            rendered.contains("LEGACY DIRECTIVE: summarize what you've done and stop."),
+            "legacy promotion must render the persisted wrap-up directive verbatim; rendered=\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Advance the goal by one bounded step"),
+            "legacy promotion must NOT fall through to the regular GoalContinue template; rendered=\n{rendered}",
+        );
     }
 
     /// Bullet 3: a goal in `budget_limited` no longer fires the
@@ -6925,6 +7189,89 @@ mod tests {
         );
     }
 
+    /// #1130 — pin the persisted-`fires_used` enforcement.
+    ///
+    /// Before #1130, `loop_runtime_view` rebuilt a fresh `LoopRuntime`
+    /// on every decision call and `fires_used` never round-tripped
+    /// through the loop record, so the runtime's `LOOP_DEFAULT_MAX_FIRES`
+    /// budget gate could never trip — any loop that burned through the
+    /// budget kept firing forever. This test directly stages a loop at
+    /// `LOOP_DEFAULT_MAX_FIRES - 1` consumed fires, fires it once (must
+    /// succeed, bumps the counter to exactly the cap), then attempts a
+    /// second fire which the runtime must deny with
+    /// `LoopFireDecision::Exhausted` → `LOOP_POLICY_DENIED` on the wire.
+    #[test]
+    fn loop_fires_used_persists_and_caps_at_max() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-fires-cap");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("periodic check".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Stage the loop one fire shy of the cap. The next fire must
+        // succeed (consumes the last unit of budget); the one after must
+        // be rejected with the runtime's exhausted-budget denial.
+        {
+            let mut state = orchestrator.state();
+            let loop_record = state
+                .loops
+                .get_mut(&loop_id)
+                .expect("loop record present after create");
+            loop_record.fires_used = LOOP_DEFAULT_MAX_FIRES - 1;
+        }
+
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id: loop_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("final fire under the cap must succeed");
+        assert_eq!(fired["status"], json!("queued"));
+        // After firing, the persisted counter must sit at exactly the
+        // cap — `loop_runtime_view` will read this back on the next
+        // decision call.
+        assert_eq!(
+            orchestrator
+                .state()
+                .loops
+                .get(&loop_id)
+                .expect("loop record post-fire")
+                .fires_used,
+            LOOP_DEFAULT_MAX_FIRES,
+            "fires_used must be incremented and persisted on successful fire",
+        );
+
+        // The follow-up fire crosses the cap. `decide_fire` must return
+        // `LoopFireDecision::Exhausted` → wire-level
+        // `kinds::LOOP_POLICY_DENIED` with the runtime's
+        // `exhausted budget` reason carried in the data payload.
+        let denied = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect_err("fires_used at cap must deny further fires");
+        let data = denied.data.expect("error data");
+        assert_eq!(data["kind"], json!(kinds::LOOP_POLICY_DENIED));
+        let runtime_reason = data
+            .get("runtime_reason")
+            .and_then(Value::as_str)
+            .expect("loop runtime denial must carry runtime_reason");
+        assert_eq!(runtime_reason, "exhausted budget");
+    }
+
     #[test]
     fn in_process_send_input_rejects_terminal_agent() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -7190,6 +7537,8 @@ mod tests {
     #[test]
     fn maintenance_loop_resolves_prompt_at_fire_time_from_project_doc() {
         use std::env;
+        // #1135 codex P2: serialize cwd-mutating tests in this module.
+        let _cwd_guard = cwd_mutating_test_guard();
         let temp = tempfile::TempDir::new().expect("temp dir");
         let cwd_before = env::current_dir().expect("cwd");
         env::set_current_dir(temp.path()).expect("chdir tmp");
@@ -7245,6 +7594,84 @@ mod tests {
             .cloned()
             .expect("prompt_source metadata");
         assert_eq!(source, "project");
+    }
+
+    /// #1135 acceptance: the scheduled-due path must also report the
+    /// resolved `prompt_source` (`project` / `user` / `built_in`) and
+    /// not the legacy `"record"` placeholder. The continuation prompt
+    /// must match the file content, proving the resolution actually
+    /// ran for the scheduled tick, not just for `fire_now`.
+    #[test]
+    fn scheduled_maintenance_fire_emits_resolved_prompt_source() {
+        use std::env;
+        // #1135 codex P2: serialize cwd-mutating tests in this module.
+        let _cwd_guard = cwd_mutating_test_guard();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let cwd_before = env::current_dir().expect("cwd");
+        env::set_current_dir(temp.path()).expect("chdir tmp");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(
+            octos_dir.join("loop.md"),
+            "scheduled project maintenance steps\n",
+        )
+        .expect("write loop.md");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "sched-loop-maint");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: None,
+                command: None,
+                interval_seconds: None,
+                mode: Some("maintenance".into()),
+            })
+            .expect("create maintenance loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Force the scheduled-due path: stamp a past `next_run_at_ms`
+        // and tick the scheduler. `fire_now` is NOT involved here.
+        {
+            let mut state = orchestrator.state();
+            let loop_record = state.loops.get_mut(&loop_id).expect("loop record");
+            loop_record.next_run_at_ms = Some(now_ms() - 1);
+        }
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1, "scheduled maintenance loop should enqueue");
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        env::set_current_dir(&cwd_before).expect("restore cwd");
+        assert_eq!(drained.len(), 1);
+        let prompt_meta = drained[0]
+            .metadata
+            .get("prompt")
+            .cloned()
+            .expect("prompt metadata");
+        assert_eq!(
+            prompt_meta.trim(),
+            "scheduled project maintenance steps",
+            "scheduled maintenance prompt must be resolved from .octos/loop.md (#1135)"
+        );
+        let source = drained[0]
+            .metadata
+            .get("prompt_source")
+            .cloned()
+            .expect("prompt_source metadata");
+        assert_eq!(
+            source, "project",
+            "scheduled fire must carry the resolved MaintenancePromptSource label (#1135)"
+        );
     }
 
     #[test]

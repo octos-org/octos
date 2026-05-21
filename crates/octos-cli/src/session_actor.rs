@@ -3423,6 +3423,7 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
         MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete",
         MasterContinuationReason::LoopFire => "loop_fire",
         MasterContinuationReason::GoalContinue => "goal_continue",
+        MasterContinuationReason::GoalWrapUp => "goal_wrap_up",
         MasterContinuationReason::External(_) => "external",
     }
 }
@@ -3462,14 +3463,51 @@ fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
         ),
-        MasterContinuationReason::GoalContinue => format!(
-            "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
-            goal_id = continuation
+        MasterContinuationReason::GoalContinue => {
+            // #1139 codex P2 follow-up: legacy wrap-up promotion —
+            // mirrors `agent_orchestrator::master_continuation_prompt`.
+            // A continuation queued by the pre-#1131 wire shape used
+            // `GoalContinue` + `wrap_up_prompt` metadata; promote it
+            // at render time so the in-flight final turn instructs
+            // the model to summarize-and-stop.
+            let goal_id = continuation
                 .goal_id
                 .as_ref()
                 .map(|id| id.as_str())
-                .unwrap_or("unknown"),
-        ),
+                .unwrap_or("unknown");
+            if let Some(directive) = continuation.metadata.get("wrap_up_prompt") {
+                return format!(
+                    "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+                );
+            }
+            format!(
+                "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
+            )
+        }
+        // #1131 — wrap-up turns must instruct the model to summarize
+        // and stop, NOT continue work. Render the per-goal wrap-up
+        // directive (stored in metadata by `record_goal_turn`) as
+        // the actual prompt body so the LLM sees the instruction
+        // verbatim instead of the generic "Advance the goal..."
+        // template. Mirrors the canonical renderer in
+        // `agent_orchestrator::master_continuation_prompt`.
+        MasterContinuationReason::GoalWrapUp => {
+            let goal_id = continuation
+                .goal_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown");
+            let directive = continuation
+                .metadata
+                .get("wrap_up_prompt")
+                .map(String::as_str)
+                .unwrap_or(
+                    "This goal has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                );
+            format!(
+                "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+            )
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
@@ -3843,8 +3881,16 @@ impl SessionActor {
                 reason = master_continuation_reason_name(&continuation.reason),
                 "draining queued master continuation into session actor"
             );
-            let is_goal_turn =
-                matches!(continuation.reason, MasterContinuationReason::GoalContinue);
+            // #1131 — `GoalWrapUp` is the final goal turn under
+            // budget exhaustion. Treat it as a goal turn for runtime
+            // accounting so per-turn elapsed time is still recorded;
+            // `record_goal_turn_internal` is idempotent against the
+            // already-set `wrap_up_emitted` flag and will NOT
+            // re-enqueue a second wrap-up.
+            let is_goal_turn = matches!(
+                continuation.reason,
+                MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp,
+            );
             let goal_turn_start = Instant::now();
             default_agent_orchestrator().mark_continuation_started(&continuation);
             // #977 bullet 4 — capture the loop id (if any) BEFORE we
@@ -8267,6 +8313,207 @@ mod tests {
             child_session_key.to_string(),
             "explicit:child:key",
             "explicit child_session_key should take precedence over worker_id derivation"
+        );
+    }
+
+    /// Regression for issue #1125. The background SpawnTool path used to
+    /// invoke the [`ChildPromptContextRequest`] factory inside the
+    /// detached `tokio::spawn` task AFTER awaiting child-session
+    /// lifecycle persistence. The factory locks the live parent
+    /// [`ContextManager`], so if the parent recorded another turn
+    /// during that await window the child fork inherited a POST-spawn
+    /// snapshot — leaking user messages that were not part of the
+    /// spawning turn into the background worker's context.
+    ///
+    /// The fix invokes the factory synchronously at the SpawnTool
+    /// dispatch site, before any `await`. This test pins that contract
+    /// by:
+    ///   1. Wiring the production-shaped factory onto a real
+    ///      [`SpawnTool`] together with a `child_session_sender` that
+    ///      sleeps to simulate slow persistence.
+    ///   2. Driving a background spawn via `execute_with_context`.
+    ///   3. Recording a "post-spawn" user message on the parent
+    ///      immediately after `execute_with_context` returns.
+    ///   4. Asserting the child manager captured by the factory does
+    ///      NOT contain the post-spawn message.
+    ///
+    /// Without the fix, the factory would still be pending while we
+    /// record the post-spawn message; the eventual fork would include
+    /// it and the test would fail.
+    #[tokio::test]
+    async fn spawn_child_context_fork_uses_pre_spawn_parent_snapshot() {
+        use crate::context_manager::TranscriptItemKind;
+        use octos_agent::tools::Tool;
+        use octos_agent::tools::spawn::{
+            ChildSessionLifecyclePayload, ChildSessionLifecycleSender,
+        };
+
+        const PRE_SPAWN_CONTENT: &str = "pre-spawn user turn that triggered spawn";
+        const POST_SPAWN_CONTENT: &str = "POST-SPAWN user message that MUST NOT leak";
+
+        let parent_session_key = SessionKey::new("cli", "parent-1125");
+        let mut parent = ContextManager::new(parent_session_key.to_string(), None);
+        parent.record_message(&test_message(MessageRole::System, "system"));
+        parent.record_message(&test_message(MessageRole::User, PRE_SPAWN_CONTENT));
+        let parent_arc = Arc::new(StdMutex::new(parent));
+        let data_dir = tempfile::TempDir::new().unwrap();
+
+        // Capture the child manager produced by the production-shaped
+        // factory so the test can introspect what the fork actually
+        // saw. The wrapping factory delegates straight to
+        // `build_forked_child_context_for_session_actor`, mirroring
+        // the production wiring at `session_actor.rs:2740` (issue
+        // #1019).
+        let captured_child: Arc<StdMutex<Option<ContextManager>>> = Arc::new(StdMutex::new(None));
+        let captured_child_for_factory = captured_child.clone();
+        let parent_arc_for_factory = parent_arc.clone();
+        let parent_session_key_for_factory = parent_session_key.clone();
+        let data_dir_for_factory = data_dir.path().to_path_buf();
+        let factory: octos_agent::tools::spawn::ChildPromptContextManagerFactory =
+            Arc::new(move |request: ChildPromptContextRequest| {
+                let (child_session_key, child_manager) =
+                    build_forked_child_context_for_session_actor(
+                        &parent_arc_for_factory,
+                        &data_dir_for_factory,
+                        &parent_session_key_for_factory,
+                        &request,
+                    );
+                // Snapshot the freshly-forked manager BEFORE handing it
+                // to the bridge so the assertions below observe exactly
+                // what the child would consume.
+                {
+                    let mut slot = captured_child_for_factory.lock().unwrap();
+                    *slot = Some(child_manager.clone());
+                }
+                Some(Arc::new(SessionActorPromptContextBridge::new(
+                    child_session_key,
+                    data_dir_for_factory.clone(),
+                    Arc::new(StdMutex::new(child_manager)),
+                )) as Arc<dyn PromptContextManager>)
+            });
+
+        // `child_session_sender` is the first `await` the background
+        // task issues after `tokio::spawn`. The pre-fix code path
+        // invoked the prompt-context factory only AFTER this future
+        // resolved; the post-spawn parent mutation would therefore
+        // race the fork. We sleep here to widen the bug window.
+        let lifecycle_sender: ChildSessionLifecycleSender =
+            Arc::new(|_payload: ChildSessionLifecyclePayload| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    true
+                })
+            });
+
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let memory = Arc::new(
+            EpisodeStore::open(work_dir.path().join(".octos"))
+                .await
+                .unwrap(),
+        );
+        let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel::<InboundMessage>(8);
+        let llm: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "spawn-1125-llm",
+            // The detached worker will call the LLM lazily; an
+            // EndTurn response suffices because the test only cares
+            // about what the factory captured.
+            vec![(
+                Duration::from_millis(0),
+                ChatResponse {
+                    content: Some("ok".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                },
+            )],
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let spawn_tool = SpawnTool::with_context(
+            llm,
+            memory,
+            work_dir.path().to_path_buf(),
+            spawn_inbound_tx,
+            "cli",
+            "test",
+        )
+        .with_task_supervisor(
+            supervisor.clone(),
+            parent_session_key.to_string(),
+            data_dir.path().join("task_ledger.jsonl"),
+        )
+        .with_child_session_sender(lifecycle_sender)
+        .with_child_prompt_context_manager_factory(factory);
+
+        // Dispatch a background spawn. With the fix, the factory runs
+        // synchronously inside this `execute_with_context` future
+        // BEFORE the `tokio::spawn` returns control, so by the time
+        // this `await` completes the child snapshot is already pinned
+        // to the pre-spawn parent generation.
+        let result = spawn_tool
+            .execute(&serde_json::json!({
+                "task": "background task",
+                "label": "1125-probe",
+                "mode": "background",
+            }))
+            .await
+            .expect("background spawn dispatch should succeed");
+        assert!(
+            result.success,
+            "background spawn dispatch should succeed: {}",
+            result.output
+        );
+
+        // Record a "post-spawn" user message on the parent. Before
+        // the fix, this would happen WHILE the factory was still
+        // pending inside the detached task; the fork would then
+        // observe it. After the fix, the fork has already captured
+        // the parent so this message stays parent-only.
+        {
+            let mut parent = parent_arc.lock().unwrap();
+            parent.record_message(&test_message(MessageRole::User, POST_SPAWN_CONTENT));
+        }
+
+        // Give the background task a moment to run through its
+        // lifecycle await so any pre-fix factory invocation would
+        // have fired by now (and observed the post-spawn message).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let captured = captured_child
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("factory must have produced a child ContextManager");
+
+        // Assert the pre-spawn user turn IS in the child fork. If
+        // the fork was somehow skipped or replaced with a fresh
+        // manager, this catches it.
+        let captured_user_contents: Vec<String> = captured
+            .items()
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TranscriptItemKind::UserInput { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            captured_user_contents
+                .iter()
+                .any(|content| content.contains(PRE_SPAWN_CONTENT)),
+            "child fork should retain the pre-spawn user turn; observed user contents: {:?}",
+            captured_user_contents
+        );
+
+        // The critical assertion: the post-spawn user message MUST
+        // NOT appear in the child fork.
+        assert!(
+            !captured_user_contents
+                .iter()
+                .any(|content| content.contains(POST_SPAWN_CONTENT)),
+            "child fork must NOT include the post-spawn user message (issue #1125); \
+             observed user contents: {:?}",
+            captured_user_contents
         );
     }
 
