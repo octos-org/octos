@@ -98,11 +98,17 @@ test('rpc() on a backend that exits with pending requests fails those requests t
   await client.exited;
 
   // The pending promise must resolve (not hang, not reject by
-  // timeout) with a typed backend_exited error.
-  const frame = await Promise.race([
-    pending,
-    new Promise((_, reject) => setTimeout(() => reject(new Error('hung waiting for rejection')), 4_000)),
-  ]);
-  assert.ok(frame.error, 'frame must carry an error');
-  assert.equal(frame.error.data?.kind, 'backend_exited');
+  // timeout) with a typed backend_exited error. Clear the watchdog
+  // when the race completes so the test process exits promptly.
+  let hangTimer;
+  const watchdog = new Promise((_, reject) => {
+    hangTimer = setTimeout(() => reject(new Error('hung waiting for rejection')), 4_000);
+  });
+  try {
+    const frame = await Promise.race([pending, watchdog]);
+    assert.ok(frame.error, 'frame must carry an error');
+    assert.equal(frame.error.data?.kind, 'backend_exited');
+  } finally {
+    clearTimeout(hangTimer);
+  }
 });
