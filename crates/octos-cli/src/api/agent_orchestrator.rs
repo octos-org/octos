@@ -2977,10 +2977,19 @@ fn stale_drop_should_tombstone(
             let Some(loop_id) = item.loop_id.as_ref() else {
                 return false;
             };
-            // Tombstone iff the loop record is genuinely gone. A
-            // paused loop has the record present with a non-"active"
-            // status; resuming it re-enqueues the same dedupe_key.
-            !state.loops.contains_key(loop_id.as_str())
+            // `control_loop` does NOT remove a deleted loop from
+            // `state.loops`; it sets `status = "deleted"`. So a
+            // queued LoopFire whose owning loop has been deleted
+            // still finds a record on lookup. Treat that as
+            // tombstone-worthy: a deleted loop cannot re-queue with
+            // the same dedupe_key (a future loop with the same
+            // user-supplied id would surface as a fresh record on
+            // re-create, but operator deletion is the user's signal
+            // that the stale fire is unwanted).
+            match state.loops.get(loop_id.as_str()) {
+                None => true,
+                Some(loop_record) => loop_record.status == "deleted",
+            }
         }
         MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp => {
             let session_key = SessionKey(item.session_id.as_str().to_owned());
@@ -6850,6 +6859,90 @@ mod tests {
         assert!(
             restarted.pending_continuation_count_for_session_for_test(&session_id, "tenant-a") >= 1,
             "paused-then-resumed continuation must survive restart (pre-fix this asserts 0)",
+        );
+    }
+
+    /// #1159 codex P2 rev3 follow-up: `control_loop` does NOT remove
+    /// a deleted loop from `state.loops` — it keeps the record with
+    /// `status = "deleted"`. So a LoopFire queued before the delete
+    /// is unschedulable, but a naive `state.loops.contains_key` check
+    /// at the drain site would skip the tombstone (record is still
+    /// "present"). Same dedupe_key never recurs after delete, so we
+    /// MUST tombstone — otherwise restart resurrects the stale fire.
+    #[test]
+    fn drain_time_drop_tombstones_deleted_loop_fires_per_1159() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store_dir = dir.path().join("supervisor");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(&store_dir)
+            .expect("configure store");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-deleted-tombstone");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("hourly review".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop"]["loop_id"]
+            .as_str()
+            .expect("loop_id present")
+            .to_owned();
+
+        // Hand-enqueue a LoopFire while the loop is active, then
+        // delete the loop.
+        {
+            let mut state = orchestrator.state();
+            let request = MasterContinuationRequest::new(
+                "coding-autonomy",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::LoopFire,
+                SystemTime::now(),
+            )
+            .with_loop_id(loop_id.clone());
+            enqueue_and_persist_continuation(&mut state, request);
+        }
+        orchestrator
+            .control_loop(LoopControlRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                loop_id: loop_id.clone(),
+                kind: LoopControlKind::Delete,
+            })
+            .expect("delete loop");
+
+        // Sanity: deleted loop is still in state.loops (per
+        // `control_loop` semantics).
+        assert!(
+            orchestrator.state().loops.contains_key(loop_id.as_str()),
+            "control_loop must not REMOVE deleted loops from state.loops",
+        );
+
+        // Drain — the predicate marks unschedulable (status =
+        // "deleted"), the new fix tombstones because the loop is
+        // gone for good.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Restart against the same store. The stale LoopFire must
+        // not resurrect.
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay store");
+        assert_eq!(
+            restarted.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "deleted-loop fire must be tombstoned at drain time, not resurrected on restart",
         );
     }
 
