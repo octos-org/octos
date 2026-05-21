@@ -8458,19 +8458,21 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // dispatches a GoalContinue, advance the goal's
         // `last_continued_at_ms` immediately so the next scheduler
         // tick (every ~2s) doesn't consider the same goal due again
-        // while THIS turn is still running. The actual
-        // token-budget / sentinel accounting happens after the turn
-        // completes below; this dispatch-time record uses zero
-        // tokens / zero seconds, which is correct for the
-        // "preserve min-delay invariant" semantics. Full token
-        // accounting is tracked in a follow-up since `run_standalone_turn`
-        // doesn't surface per-turn LLM token usage here.
+        // while THIS turn is still running.
+        //
+        // #1129 codex P2 re-review #3 — use the dispatch-only
+        // timestamp updater, NOT `record_goal_turn`. The full
+        // accountant increments `continuations_used` and the
+        // rate-window counter, which would exhaust the derived
+        // continuation budget after `ceil(token_budget / 2500)`
+        // dispatches even though no tokens were actually spent. The
+        // dispatch-only updater touches only the timestamp, so the
+        // budget remains aligned with real token spend. Full token
+        // accounting + sentinel detection wiring tracked in #1133.
         if matches!(continuation.reason, MasterContinuationReason::GoalContinue) {
-            default_agent_orchestrator().record_goal_turn(
+            default_agent_orchestrator().record_goal_dispatch_only(
                 &SessionKey(continuation.session_id.as_str().to_owned()),
                 continuation.profile_id.as_str(),
-                0,
-                0,
             );
         }
         run_standalone_turn(

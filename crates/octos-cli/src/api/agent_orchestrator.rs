@@ -1075,6 +1075,37 @@ impl InProcessAgentOrchestrator {
     /// window, token and time counters, and — if this fires the
     /// token-budget exhaustion edge — enqueues the wrap-up turn and
     /// transitions the goal to `budget_limited`.
+    /// #1129 codex P2 re-review #2 — dispatch-only timestamp update
+    /// for the AppUI tick path. Only bumps `last_continued_at_ms` and
+    /// the `updated_at_ms` field so the 30s min-delay gate fires
+    /// immediately on dispatch. Does NOT touch `continuations_used`
+    /// or the sliding rate-window counter — those are the
+    /// caller-budget accountants and must only be incremented when a
+    /// turn actually consumes tokens (which the AppUI path can't
+    /// observe yet — see follow-up #1133).
+    ///
+    /// Returns true if the timestamp was updated, false if the goal
+    /// was not found or the profile didn't match.
+    pub(crate) fn record_goal_dispatch_only(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        let now = now_ms();
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            return false;
+        };
+        if goal.profile_id != profile_id {
+            return false;
+        }
+        goal.last_continued_at_ms = now;
+        goal.updated_at_ms = now;
+        let snapshot = goal.clone();
+        persist_goal_state(&state, session_id, &snapshot, false);
+        true
+    }
+
     pub(crate) fn record_goal_turn(
         &self,
         session_id: &SessionKey,
