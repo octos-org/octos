@@ -8484,10 +8484,16 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // idle and dispatch ANOTHER continuation, bypassing the
         // 30s min-delay.
         if let Some(ref ctx) = goal_context_for_appui {
-            default_agent_orchestrator().record_goal_dispatch_timestamp_only(
-                &SessionKey(continuation.session_id.as_str().to_owned()),
-                &ctx.profile_id,
-            );
+            let session_key = SessionKey(continuation.session_id.as_str().to_owned());
+            default_agent_orchestrator()
+                .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
+            // #1140 codex P2 re-review #3: mark the goal session as
+            // in-flight so `due_loop_targets`'s goal sweep skips it
+            // until the post-turn accountant clears it. This is the
+            // authoritative race-free gate — the timestamp alone is
+            // not enough for goal turns that exceed the 30s
+            // min-delay (the stamp expires mid-turn).
+            default_agent_orchestrator().mark_goal_dispatch_in_flight(&session_key);
         }
         run_standalone_turn(
             ws_for_turn,
@@ -14740,6 +14746,12 @@ async fn run_standalone_turn(
                 &reply,
             );
         }
+        // #1140 codex P2 re-review #3: clear the in-flight marker so
+        // subsequent scheduler ticks can re-dispatch the goal once
+        // the min-delay elapses. Independent of whether
+        // `record_goal_turn` succeeded — the dispatched turn is done
+        // either way.
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
     }
 
     // FIX-06: a turn that ends — for any reason — must drop its

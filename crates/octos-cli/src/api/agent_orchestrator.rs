@@ -1017,6 +1017,21 @@ impl InProcessAgentOrchestrator {
                 if profile_filter.is_some_and(|profile_id| goal.profile_id != profile_id) {
                     continue;
                 }
+                // #1140 codex P2 re-review #3: skip sessions whose
+                // AppUI tick path has already dispatched a goal
+                // continuation that hasn't reached post-accounting
+                // yet. The `last_continued_at_ms` stamp alone is not
+                // enough — for goal turns that run longer than
+                // `GOAL_MIN_CONTINUATION_INTERVAL_MS` (30s), the
+                // stamp expires before `record_goal_turn` re-stamps
+                // it, opening a race where the scheduler tick can
+                // re-dispatch in the await gap. The in-flight set is
+                // cleared by `clear_goal_dispatch_in_flight` from the
+                // post-accountant, so a session leaves the set
+                // exactly when it's safe to re-dispatch.
+                if state.in_flight_goal_sessions.contains(session_id) {
+                    continue;
+                }
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
                     continue;
                 }
@@ -1125,6 +1140,25 @@ impl InProcessAgentOrchestrator {
         let snapshot = goal.clone();
         persist_goal_state(&state, session_id, &snapshot, false);
         true
+    }
+
+    /// #1140 codex P2 re-review #3 — mark a session as having an
+    /// in-flight goal dispatch. `due_loop_targets`'s goal sweep skips
+    /// in-flight sessions so a long-running goal turn (> 30s) can't
+    /// be re-dispatched in the await gap between turn-terminal
+    /// emission and `record_goal_turn`. Idempotent.
+    pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        self.state()
+            .in_flight_goal_sessions
+            .insert(session_id.clone());
+    }
+
+    /// #1140 codex P2 re-review #3 — clear the in-flight marker.
+    /// Called by the post-turn accountant after `record_goal_turn`
+    /// (and on error/interrupt paths) so subsequent scheduler ticks
+    /// can re-dispatch the goal once the min-delay elapses.
+    pub(crate) fn clear_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        self.state().in_flight_goal_sessions.remove(session_id);
     }
 
     /// #1133 — the AppUI tick path no longer calls this helper.
@@ -2148,6 +2182,18 @@ struct AutonomyRuntimeState {
     /// "armed" state (the worker already owns the source of truth via
     /// the agent status transition).
     cancellations: HashMap<String, Arc<tokio::sync::Notify>>,
+    /// #1140 codex P2 re-review #3 — sessions whose AppUI tick path
+    /// has dispatched a goal continuation and not yet finished
+    /// post-turn accounting. `due_loop_targets`'s goal sweep skips
+    /// these so a long-running goal turn (model + tool work > 30s
+    /// `GOAL_MIN_CONTINUATION_INTERVAL_MS`) can't be re-dispatched
+    /// in the await gap between turn-terminal emission and
+    /// `record_goal_turn`. Entries are added by
+    /// `mark_goal_dispatch_in_flight` and cleared by
+    /// `clear_goal_dispatch_in_flight`. Independent of (and
+    /// complementary to) the `last_continued_at_ms` timestamp, which
+    /// remains the authoritative min-delay gate for all other callers.
+    in_flight_goal_sessions: std::collections::HashSet<SessionKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -7345,6 +7391,65 @@ mod tests {
         assert_eq!(
             window_after, 1,
             "AppUI option (b) must produce exactly ONE rate_window_count increment per turn"
+        );
+    }
+
+    /// #1140 codex P2 re-review #3 acceptance: a goal session that
+    /// has been marked in-flight MUST be excluded from
+    /// `due_loop_targets`'s goal sweep, EVEN IF the
+    /// `last_continued_at_ms` timestamp has gone stale (>30s past).
+    /// This is the race-free guard for long-running goal turns —
+    /// without it, a scheduler tick landing in the await gap between
+    /// turn-terminal emission and post-accounting could re-dispatch.
+    #[test]
+    fn in_flight_goal_session_is_excluded_from_due_loop_targets() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-in-flight");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "long-running goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial continuation so the session is "between turns".
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // Force `last_continued_at_ms` to a value > 30s in the past
+        // so the timestamp gate would normally PERMIT a re-dispatch.
+        // The in-flight marker is the ONLY thing that should block it.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+        // Sanity: without the in-flight marker, the goal IS due.
+        let due_before = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            due_before.iter().any(|(s, _)| s == &session_id),
+            "without in-flight marker, stale-timestamp goal must be due (got {due_before:?})",
+        );
+
+        // Mark in-flight. Now the same `due_loop_targets` call MUST
+        // exclude this session.
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        let due_during = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            !due_during.iter().any(|(s, _)| s == &session_id),
+            "in-flight goal session must be excluded from due_loop_targets (got {due_during:?})",
+        );
+
+        // Clearing in-flight restores the session to the due list.
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        let due_after = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            due_after.iter().any(|(s, _)| s == &session_id),
+            "after clearing in-flight, goal must be due again (got {due_after:?})",
         );
     }
 }
