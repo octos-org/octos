@@ -2,8 +2,13 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::goal_loop_runtime::{
+    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, LoopFireContext, LoopFireDecision, LoopFireTrigger,
+    LoopInvocation, LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution,
+    MaintenancePromptSource, SlashCommandAuthorization, WaitUntil, resolve_maintenance_prompt,
+};
 use super::master_continuation_scheduler::{
     MasterContinuationEnqueueOutcome, MasterContinuationReason, MasterContinuationRequest,
     MasterContinuationRuntimeState, MasterContinuationScheduler, QueuedMasterContinuation,
@@ -31,6 +36,15 @@ const GOAL_MAX_TOKEN_BUDGET: u64 = 200_000;
 const LOOP_MIN_INTERVAL_SECONDS: u64 = 60;
 const LOOP_MAX_INTERVAL_SECONDS: u64 = 86_400;
 const LOOP_MAX_AGE_DAYS: i64 = 7;
+/// Default max fires for a single loop record before `LoopRuntime` flags
+/// budget exhaustion. `AutonomyLoopRecord` already enforces 7-day expiry
+/// and a per-session quota, so the per-loop budget is set generously and
+/// is intentionally not user-tunable for the M15-D2 cut. (#977)
+const LOOP_DEFAULT_MAX_FIRES: u32 = 10_000;
+/// Default rescheduling delay when a self-paced loop fires without
+/// emitting a `<<loop-next-in: …>>` hint. Caller can override via
+/// `apply_self_paced_response` once richer config lands. (#977 bullet 4)
+const SELF_PACED_DEFAULT_DELAY_SECONDS: u64 = 60 * 15;
 const MAX_OBJECTIVE_BYTES: usize = 8_192;
 const MAX_LOOP_PROMPT_BYTES: usize = 8_192;
 const MAX_LOOPS_PER_SESSION: usize = 16;
@@ -927,8 +941,17 @@ impl InProcessAgentOrchestrator {
         let now = now_ms();
         let mut targets = Vec::new();
         for loop_record in state.loops.values() {
+            // #1128 codex P1 follow-up: `due_loop_targets` previously
+            // skipped every loop whose mode was not `fixed_interval`,
+            // which meant self-paced and maintenance loops with a
+            // recorded `next_run_at_ms` (set by
+            // `apply_self_paced_response` after a model
+            // `<<loop-next-in: ...>>` reply) never fired again
+            // automatically. The schedule cue for every active mode is
+            // the same — `next_run_at_ms <= now` — so we drop the mode
+            // filter here and let the per-mode fire-decision logic
+            // handle slash re-auth / budget / wait policies downstream.
             if loop_record.status != "active"
-                || loop_record.mode != "fixed_interval"
                 || loop_record.expires_at_ms <= now
                 || profile_filter.is_some_and(|profile_id| loop_record.profile_id != profile_id)
                 || loop_record
@@ -1012,6 +1035,58 @@ impl InProcessAgentOrchestrator {
             loop_record.next_run_at_ms = Some(now_ms().saturating_sub(1));
             loop_record.updated_at_ms = now_ms();
         }
+    }
+
+    /// #977 Bullet 4 — self-paced "model selects next delay".
+    ///
+    /// After a self-paced loop fires, the session actor passes the
+    /// model's response back through this entry point. The parser
+    /// extracts the `<<loop-next-in: …>>` sentinel and reschedules the
+    /// loop's `next_run_at_ms`. Returns the applied delay so callers can
+    /// log / surface it; returns `Ok(None)` when the sentinel is
+    /// absent — the caller decides whether to apply
+    /// [`SELF_PACED_DEFAULT_DELAY_SECONDS`] or to wait for an explicit
+    /// fire_now.
+    pub(crate) fn apply_self_paced_response(
+        &self,
+        loop_id: &str,
+        profile_id: &str,
+        response: &str,
+    ) -> Result<Option<Duration>, RpcError> {
+        let mut state = self.state();
+        let supervisor_store = state.supervisor_store.clone();
+        let Some(loop_record) = state.loops.get_mut(loop_id) else {
+            return Err(autonomy_error(
+                kinds::LOOP_NOT_FOUND,
+                "loop not found",
+                None,
+                Some(profile_id),
+                Some(("loop_id", loop_id)),
+                true,
+            ));
+        };
+        if loop_record.profile_id != profile_id {
+            return Err(autonomy_error(
+                kinds::LOOP_POLICY_DENIED,
+                "loop is outside the requested profile scope",
+                Some(&loop_record.session_id),
+                Some(profile_id),
+                Some(("loop_id", loop_id)),
+                true,
+            ));
+        }
+        if loop_record.mode != "self_paced" && loop_record.mode != "maintenance" {
+            return Ok(None);
+        }
+        let parsed = parse_self_paced_next_delay(response);
+        let delay = parsed.unwrap_or_else(|| Duration::from_secs(SELF_PACED_DEFAULT_DELAY_SECONDS));
+        let now = now_ms();
+        let delay_ms = i64::try_from(delay.as_millis().min(i64::MAX as u128))
+            .unwrap_or(LOOP_MAX_INTERVAL_SECONDS as i64 * 1_000);
+        loop_record.next_run_at_ms = now.checked_add(delay_ms);
+        loop_record.updated_at_ms = now;
+        persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
+        Ok(parsed)
     }
 }
 
@@ -1659,20 +1734,44 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 }))
             }
             LoopControlKind::FireNow => {
-                if loop_record.status != "active" {
-                    return Err(autonomy_error(
-                        kinds::LOOP_POLICY_DENIED,
-                        "loop is not active",
-                        Some(&loop_record.session_id),
-                        Some(&request.profile_id),
-                        Some(("loop_id", loop_record.loop_id.as_str())),
-                        true,
-                    ));
+                // #977 Bullets 1–3: route every fire-now through
+                // `LoopRuntime::decide_fire`. FireNow is a manual user
+                // gesture, so slash commands are authorized "now"; the
+                // runtime still enforces pause/delete/budget/slash-policy
+                // gates and surfaces the denial reason on the wire.
+                let runtime = loop_runtime_view(loop_record);
+                let fire_context = LoopFireContext::idle()
+                    .with_slash_authorization(SlashCommandAuthorization::authorized_now());
+                let decision =
+                    runtime.decide_fire(SystemTime::now(), LoopFireTrigger::FireNow, fire_context);
+                match decision {
+                    LoopFireDecision::Denied(reason) | LoopFireDecision::Exhausted { reason } => {
+                        return Err(loop_runtime_denied_error(loop_record, &reason));
+                    }
+                    LoopFireDecision::WaitUntil(wait) => {
+                        return Err(loop_runtime_wait_error(loop_record, &wait));
+                    }
+                    LoopFireDecision::Fire(_plan) => {}
                 }
+
+                // Bullet 3: resolve maintenance prompts at fire time —
+                // the persisted record may carry the stale create-time
+                // string, but the operator's `.octos/loop.md` is the
+                // source of truth for each individual fire.
+                let (resolved_prompt, prompt_source_label) =
+                    if matches!(runtime.invocation, LoopInvocation::MaintenancePrompt) {
+                        let resolution = resolve_maintenance_prompt_at_fire_time();
+                        (
+                            resolution.prompt,
+                            maintenance_prompt_source_label(resolution.source),
+                        )
+                    } else {
+                        (loop_record.prompt.clone(), "record")
+                    };
+
                 let session_id = loop_record.session_id.clone();
                 let profile_id = loop_record.profile_id.clone();
                 let loop_id = loop_record.loop_id.clone();
-                let prompt = loop_record.prompt.clone();
                 let interval_seconds = loop_record.interval_seconds;
                 loop_record.last_run_at_ms = Some(now);
                 loop_record.next_run_at_ms = interval_seconds.and_then(|seconds| {
@@ -1693,7 +1792,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                     SystemTime::now(),
                 )
                 .with_loop_id(loop_id.clone())
-                .with_metadata("prompt", prompt);
+                .with_metadata("prompt", resolved_prompt)
+                .with_metadata("prompt_source", prompt_source_label);
                 let fire = master_continuation_enqueue_json(enqueue_and_persist_continuation(
                     &mut state,
                     continuation,
@@ -1826,8 +1926,11 @@ fn enqueue_due_loop_continuations(
     let mut due = Vec::new();
     let mut updated_loops = Vec::new();
     for loop_record in state.loops.values_mut() {
+        // #1128 codex P1 follow-up: drop the `mode != "fixed_interval"`
+        // filter so self-paced and maintenance loops are also drained
+        // when their stamped `next_run_at_ms` is past. The runtime
+        // fire decision below still gates on mode-specific policy.
         if loop_record.status != "active"
-            || loop_record.mode != "fixed_interval"
             || loop_record.profile_id != profile_id
             || !session_controls_target(session_id, &loop_record.session_id)
             || loop_record.expires_at_ms <= now
@@ -1840,18 +1943,76 @@ fn enqueue_due_loop_continuations(
         if next_run_at_ms > now {
             continue;
         }
-        let Some(interval_seconds) = loop_record.interval_seconds else {
+        // #1128 codex P1 follow-up: `interval_seconds` is only required
+        // for fixed_interval mode (used to recompute `next_run_at_ms`
+        // after firing). Self-paced / maintenance loops compute their
+        // own next delay from the model reply (`<<loop-next-in: ...>>`)
+        // and may legitimately omit `interval_seconds` — don't reject
+        // them here; we conditionally update next_run_at_ms below.
+        if loop_record.mode == "fixed_interval" && loop_record.interval_seconds.is_none() {
             continue;
+        }
+        // #977 Bullets 1–2: consult `LoopRuntime` on the scheduled-due
+        // path. A scheduled tick is not a fresh user gesture, so slash
+        // commands present the `authorized_at_creation_only` claim —
+        // re-auth-each-fire policy denies them; legacy prompts pass
+        // through. The runtime also enforces budget / pause / idle gates.
+        let runtime = loop_runtime_view(loop_record);
+        let fire_context = LoopFireContext::idle()
+            .with_slash_authorization(SlashCommandAuthorization::authorized_at_creation_only());
+        match runtime.decide_fire(
+            SystemTime::now(),
+            LoopFireTrigger::ScheduledDue,
+            fire_context,
+        ) {
+            LoopFireDecision::Fire(_plan) => {}
+            // Bullet 1: do NOT enqueue if the runtime denies (paused,
+            // exhausted, slash-without-reauth, busy, …). The scheduler
+            // will reconsider the loop on the next tick — if the deny
+            // reason is transient the loop fires then; if it is sticky
+            // (e.g. pause), control_loop will unstick it.
+            LoopFireDecision::Denied(_)
+            | LoopFireDecision::Exhausted { .. }
+            | LoopFireDecision::WaitUntil(_) => {
+                continue;
+            }
+        }
+        // #1128 codex P2 follow-up: maintenance loops resolve their
+        // prompt from `.octos/loop.md` / `~/.octos/loop.md` / the
+        // built-in fallback at FIRE time. `fire_now` already does
+        // this; the scheduled-due path now does it too so an operator
+        // edit to `.octos/loop.md` between fires actually takes
+        // effect on the next scheduled tick. fixed_interval and
+        // self_paced keep the persisted prompt.
+        let fire_prompt = if loop_record.mode == "maintenance" {
+            resolve_maintenance_prompt_at_fire_time().prompt
+        } else {
+            loop_record.prompt.clone()
         };
         due.push(DueLoopFire {
             session_id: loop_record.session_id.clone(),
             profile_id: loop_record.profile_id.clone(),
             loop_id: loop_record.loop_id.clone(),
-            prompt: loop_record.prompt.clone(),
+            prompt: fire_prompt,
             scheduled_for_ms: next_run_at_ms,
         });
         loop_record.last_run_at_ms = Some(now);
-        loop_record.next_run_at_ms = next_loop_run_at(now, interval_seconds);
+        // #1128 codex P1 follow-up: only `fixed_interval` mode
+        // recomputes `next_run_at_ms` here using `interval_seconds`.
+        // Self-paced loops have their next delay parsed from the
+        // model reply (`<<loop-next-in: ...>>`) by
+        // `apply_self_paced_response` after the turn completes, so we
+        // clear the timestamp here to prevent the scheduler from
+        // re-picking-up the same loop in a tight loop before the
+        // response handler has stamped the new delay. Maintenance
+        // loops behave the same way.
+        if loop_record.mode == "fixed_interval" {
+            if let Some(interval_seconds) = loop_record.interval_seconds {
+                loop_record.next_run_at_ms = next_loop_run_at(now, interval_seconds);
+            }
+        } else {
+            loop_record.next_run_at_ms = None;
+        }
         loop_record.updated_at_ms = now;
         updated_loops.push(loop_record.clone());
     }
@@ -1871,6 +2032,7 @@ fn enqueue_due_loop_continuations(
         )
         .with_loop_id(fire.loop_id)
         .with_metadata("prompt", fire.prompt)
+        .with_metadata("prompt_source", "record")
         .with_metadata("scheduled_for_ms", fire.scheduled_for_ms.to_string());
         if enqueue_and_persist_continuation(state, continuation)
             .queued()
@@ -3581,6 +3743,158 @@ fn parse_loop_create(request: &LoopCreateRequest) -> Result<ParsedLoopCreate, Rp
     })
 }
 
+// ───── M15-D2/D3 LoopRuntime fire-path wiring (#977) ─────
+//
+// These helpers translate the persisted `AutonomyLoopRecord` into a
+// `LoopRuntime` view, gate the fire path through `decide_fire`, resolve
+// maintenance prompts at fire time, and parse the self-paced
+// `<<loop-next-in: …>>` sentinel emitted by the model.
+
+/// Project-level maintenance doc — resolved lazily at fire time. The
+/// CLI/serve daemon already runs with the project root as cwd, so a
+/// relative path is sufficient.
+const PROJECT_MAINTENANCE_PROMPT_PATH: &str = ".octos/loop.md";
+/// User-level fallback. Tilde expansion mirrors `tools/hooks` semantics
+/// (HOME-prefixed, no `~user` form).
+const USER_MAINTENANCE_PROMPT_PATH: &str = "~/.octos/loop.md";
+
+/// Build a fresh [`LoopRuntime`] view from the persisted record. The
+/// runtime is stateless across fires — it inspects the record's status,
+/// schedule, and prompt-kind, then runs the policy gate.
+fn loop_runtime_view(record: &AutonomyLoopRecord) -> LoopRuntime {
+    let invocation = if record.mode == "maintenance" {
+        LoopInvocation::maintenance_prompt()
+    } else if record.prompt.trim_start().starts_with('/') {
+        LoopInvocation::slash_command(record.prompt.clone())
+    } else {
+        LoopInvocation::prompt(record.prompt.clone())
+    };
+    let policy = match record.mode.as_str() {
+        "fixed_interval" => LoopRuntimePolicy::fixed_interval(
+            Duration::from_secs(record.interval_seconds.unwrap_or(LOOP_MIN_INTERVAL_SECONDS)),
+            LOOP_DEFAULT_MAX_FIRES,
+        ),
+        "maintenance" => LoopRuntimePolicy::maintenance(LOOP_DEFAULT_MAX_FIRES),
+        _ => LoopRuntimePolicy::self_paced(LOOP_DEFAULT_MAX_FIRES),
+    };
+    let mut runtime = LoopRuntime::new(record.loop_id.clone(), invocation, policy);
+    match record.status.as_str() {
+        "paused" => runtime.pause(),
+        "deleted" => runtime.delete(),
+        _ => {}
+    }
+    runtime
+}
+
+/// Convert a `LoopRuntime` denial into a wire-shaped autonomy error.
+/// Bullet 1 / Bullet 2: every denial path carries `runtime_reason` so
+/// the AppUI can distinguish runtime-policy denials from legacy
+/// validation errors.
+fn loop_runtime_denied_error(record: &AutonomyLoopRecord, reason: &DenyReason) -> RpcError {
+    let kind = match reason {
+        DenyReason::SlashCommandDenied => kinds::LOOP_SLASH_DENIED,
+        DenyReason::Paused | DenyReason::Deleted | DenyReason::ExhaustedBudget => {
+            kinds::LOOP_POLICY_DENIED
+        }
+        DenyReason::RuntimeBusy => kinds::LOOP_BUSY,
+        DenyReason::InvalidInterval | DenyReason::MissingPolicy => kinds::LOOP_INVALID_INTERVAL,
+        DenyReason::PromptResolutionFailed => kinds::LOOP_PROMPT_EMPTY,
+        DenyReason::Failed(_) => kinds::LOOP_RUNTIME_UNAVAILABLE,
+    };
+    let mut error = autonomy_error(
+        kind,
+        format!("loop fire denied by runtime policy: {reason}"),
+        Some(&record.session_id),
+        Some(&record.profile_id),
+        Some(("loop_id", record.loop_id.as_str())),
+        true,
+    );
+    if let Some(Value::Object(data)) = error.data.as_mut() {
+        data.insert("runtime_reason".into(), json!(reason.to_string()));
+    }
+    error
+}
+
+/// Convert a `WaitUntil` outcome into a wire-shaped rate-limited error.
+fn loop_runtime_wait_error(record: &AutonomyLoopRecord, wait: &WaitUntil) -> RpcError {
+    let detail = match wait {
+        WaitUntil::At(_) => "loop is not yet due",
+        WaitUntil::SelfPacedSignal => "self-paced loop is waiting for its next signal",
+        WaitUntil::RuntimeIdle(_) => "runtime is not idle",
+    };
+    let mut error = autonomy_error(
+        kinds::LOOP_BUSY,
+        format!("loop fire deferred: {detail}"),
+        Some(&record.session_id),
+        Some(&record.profile_id),
+        Some(("loop_id", record.loop_id.as_str())),
+        true,
+    );
+    if let Some(Value::Object(data)) = error.data.as_mut() {
+        data.insert("runtime_reason".into(), json!(detail));
+    }
+    error
+}
+
+/// Resolve a maintenance loop's prompt at fire time. Project doc takes
+/// precedence over user doc, which takes precedence over the built-in
+/// fallback. Bullet 3 of #977.
+fn resolve_maintenance_prompt_at_fire_time() -> MaintenancePromptResolution {
+    let project = std::fs::read_to_string(PROJECT_MAINTENANCE_PROMPT_PATH).ok();
+    let user = expand_home_path(USER_MAINTENANCE_PROMPT_PATH)
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    // `resolve_maintenance_prompt` only errors when *every* candidate is
+    // empty; we always pass the built-in as the final fallback, so the
+    // result is infallible here.
+    resolve_maintenance_prompt(
+        project.as_deref(),
+        user.as_deref(),
+        BUILT_IN_MAINTENANCE_PROMPT,
+    )
+    .unwrap_or_else(|_| MaintenancePromptResolution {
+        source: MaintenancePromptSource::BuiltIn,
+        prompt: BUILT_IN_MAINTENANCE_PROMPT.to_owned(),
+    })
+}
+
+fn expand_home_path(input: &str) -> Option<PathBuf> {
+    let suffix = input.strip_prefix("~/")?;
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(suffix))
+}
+
+fn maintenance_prompt_source_label(source: MaintenancePromptSource) -> &'static str {
+    match source {
+        MaintenancePromptSource::Project => "project",
+        MaintenancePromptSource::User => "user",
+        MaintenancePromptSource::BuiltIn => "built_in",
+    }
+}
+
+/// Extract the `<<loop-next-in: N(s|m|h)>>` sentinel from a model
+/// response. The sentinel lets a self-paced loop tell the runtime when
+/// to fire next without round-tripping through a tool call. Returns
+/// `None` when the sentinel is absent or malformed, so callers can fall
+/// back to a configured default. Bullet 4 of #977.
+pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
+    let start = text.find("<<loop-next-in:")?;
+    let after = &text[start + "<<loop-next-in:".len()..];
+    let end = after.find(">>")?;
+    let value = after[..end].trim();
+    let (num, unit) = match value.chars().last()? {
+        's' => (&value[..value.len() - 1], 1),
+        'm' => (&value[..value.len() - 1], 60),
+        'h' => (&value[..value.len() - 1], 3_600),
+        digit if digit.is_ascii_digit() => (value, 1),
+        _ => return None,
+    };
+    let seconds: u64 = num.trim().parse().ok()?;
+    if seconds == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(seconds.saturating_mul(unit)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4776,6 +5090,62 @@ mod tests {
         );
     }
 
+    /// #1128 codex P1 acceptance: self-paced loops whose `next_run_at_ms`
+    /// is in the past MUST also be picked up by `due_loop_targets` /
+    /// `enqueue_due_loop_continuations`. The prior shape filtered on
+    /// `mode != "fixed_interval"` so the only way to fire a self-paced
+    /// loop was `fire_now` — the model's `<<loop-next-in: ...>>` hint
+    /// was stamped onto the record but never honoured automatically.
+    #[test]
+    fn due_self_paced_loop_queues_master_continuation() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "self-paced-due");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("ponder the codebase".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self-paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Simulate the post-fire stamp from `apply_self_paced_response`:
+        // record a past `next_run_at_ms` as if the model had asked for
+        // a near-zero delay.
+        {
+            let mut state = orchestrator.state();
+            let loop_record = state.loops.get_mut(&loop_id).expect("loop record");
+            loop_record.next_run_at_ms = Some(now_ms() - 1);
+        }
+
+        let targets = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            targets.contains(&(session_id.clone(), "tenant-a".to_owned())),
+            "due_loop_targets must include the self-paced loop, got {targets:?}",
+        );
+
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1, "self-paced loop must enqueue a continuation");
+
+        // After firing, the self-paced loop's next_run_at_ms must be
+        // cleared so the scheduler does not pick it up on every tick
+        // until `apply_self_paced_response` stamps a fresh delay.
+        let state = orchestrator.state();
+        let loop_record = state.loops.get(&loop_id).expect("loop record");
+        assert!(
+            loop_record.next_run_at_ms.is_none(),
+            "self-paced loop must clear next_run_at_ms after firing (got {:?}), so scheduler waits for the model reply",
+            loop_record.next_run_at_ms,
+        );
+    }
+
     #[test]
     fn busy_runtime_does_not_fire_due_loop() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -5289,6 +5659,106 @@ mod tests {
         );
     }
 
+    // ───── M15-D2/D3 LoopRuntime wiring (#977) ─────
+    //
+    // These tests pin the production fire path to the `LoopRuntime`
+    // primitives in `goal_loop_runtime.rs`. They cover acceptance bullets
+    // 1–4: runtime-consumed gating, slash re-auth on every fire,
+    // maintenance prompt resolution at fire time, and self-paced next-delay
+    // hint parsing. Bullet 5 (live soak) tracked separately.
+
+    #[test]
+    fn fire_now_consults_loop_runtime_and_denies_paused_loop() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-runtime-paused");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("check runtime gating".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id: loop_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::Pause,
+            })
+            .expect("pause loop");
+
+        let denied = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect_err("paused loop must be denied");
+        let data = denied.data.expect("error data");
+        assert_eq!(data["kind"], json!(kinds::LOOP_POLICY_DENIED));
+        let runtime_reason = data
+            .get("runtime_reason")
+            .and_then(Value::as_str)
+            .expect("loop runtime denial must carry runtime_reason for #977");
+        assert_eq!(runtime_reason, "runtime paused");
+    }
+
+    #[test]
+    fn scheduled_fire_denies_slash_loop_without_reauth_but_fire_now_allows_it() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-slash-reauth");
+        // A slash-command loop: prompt stored as "/status".
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: None,
+                command: Some("/status".into()),
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create slash loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Make the loop due so the scheduled-tick path is exercised.
+        orchestrator.force_loop_due_for_test(&loop_id);
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(
+            ticked, 0,
+            "scheduled-due slash loop without fresh user authorization must be skipped"
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "no continuations should have been enqueued"
+        );
+
+        // FireNow is user-initiated, so it must succeed (authorized_now=true).
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("fire_now on slash loop must be authorized by the user gesture");
+        assert_eq!(fired["status"], json!("queued"));
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            1
+        );
+    }
+
     #[test]
     fn in_process_send_input_rejects_terminal_agent() {
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -5549,5 +6019,126 @@ mod tests {
             }
             std::task::Poll::Pending => {}
         }
+    }
+
+    #[test]
+    fn maintenance_loop_resolves_prompt_at_fire_time_from_project_doc() {
+        use std::env;
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let cwd_before = env::current_dir().expect("cwd");
+        env::set_current_dir(temp.path()).expect("chdir tmp");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(octos_dir.join("loop.md"), "  project maintenance steps\n  ")
+            .expect("write loop.md");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-maint");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: None,
+                command: None,
+                interval_seconds: None,
+                mode: Some("maintenance".into()),
+            })
+            .expect("create maintenance loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("fire maintenance loop");
+        assert_eq!(fired["status"], json!("queued"));
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+        env::set_current_dir(&cwd_before).expect("restore cwd");
+        assert_eq!(drained.len(), 1);
+        let prompt_meta = drained[0]
+            .metadata
+            .get("prompt")
+            .cloned()
+            .expect("prompt metadata");
+        assert_eq!(
+            prompt_meta, "project maintenance steps",
+            "maintenance prompt must be resolved at fire time from .octos/loop.md (#977)"
+        );
+        let source = drained[0]
+            .metadata
+            .get("prompt_source")
+            .cloned()
+            .expect("prompt_source metadata");
+        assert_eq!(source, "project");
+    }
+
+    #[test]
+    fn parse_self_paced_next_delay_recognizes_sentinel_and_falls_back_to_default() {
+        // The model emits a sentinel like `<<loop-next-in: 90s>>` after a
+        // self-paced fire. The parser extracts the delay; absence yields
+        // `None` so the caller can fall back to its configured default.
+        assert_eq!(
+            parse_self_paced_next_delay("ok done <<loop-next-in: 90s>> bye"),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_self_paced_next_delay("status report <<loop-next-in: 5m>>"),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_self_paced_next_delay("no hint emitted by the model here"),
+            None
+        );
+        // Invalid value (zero / non-numeric) yields None.
+        assert_eq!(parse_self_paced_next_delay("<<loop-next-in: 0s>>"), None);
+        assert_eq!(parse_self_paced_next_delay("<<loop-next-in: nope>>"), None);
+    }
+
+    #[test]
+    fn self_paced_loop_reschedules_using_parsed_next_delay() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-self-paced");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("watch for blockers".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self_paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        let before = now_ms();
+        let applied = orchestrator
+            .apply_self_paced_response(
+                &loop_id,
+                "tenant-a",
+                "checked things <<loop-next-in: 120s>>",
+            )
+            .expect("apply self-paced response");
+        assert_eq!(applied, Some(Duration::from_secs(120)));
+
+        let state = orchestrator.state();
+        let next = state
+            .loops
+            .get(&loop_id)
+            .and_then(|record| record.next_run_at_ms)
+            .expect("self-paced loop should have a next_run_at_ms after hint");
+        let delta_ms = next - before;
+        assert!(
+            (110_000..=130_000).contains(&delta_ms),
+            "next_run_at_ms should be roughly 120s in the future (got {delta_ms} ms)",
+        );
     }
 }
