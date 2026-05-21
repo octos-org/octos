@@ -87,6 +87,12 @@ pub(crate) enum MasterContinuationReason {
     ScatterJoinComplete,
     LoopFire,
     GoalContinue,
+    /// #1131 — terminal "summarize and stop" turn enqueued when a
+    /// goal exhausts its token budget. Carries the wrap-up directive
+    /// in `wrap_up_prompt` metadata; the prompt renderer must use
+    /// that text verbatim instead of the standard "Advance the
+    /// goal..." template.
+    GoalWrapUp,
     External(String),
 }
 
@@ -97,7 +103,10 @@ impl MasterContinuationReason {
             Self::ChildCompleted | Self::ScatterJoinComplete => {
                 MasterContinuationPriority::ChildOrScatterJoinComplete
             }
-            Self::GoalContinue => MasterContinuationPriority::GoalContinue,
+            // #1131 — wrap-up rides the same priority lane as a
+            // regular goal continuation. It is the LAST goal turn
+            // before the session pauses, not a privileged one.
+            Self::GoalContinue | Self::GoalWrapUp => MasterContinuationPriority::GoalContinue,
             Self::External(_) => MasterContinuationPriority::External,
         }
     }
@@ -108,6 +117,7 @@ impl MasterContinuationReason {
             Self::ScatterJoinComplete => "scatter_join_complete",
             Self::LoopFire => "loop_fire",
             Self::GoalContinue => "goal_continue",
+            Self::GoalWrapUp => "goal_wrap_up",
             Self::External(_) => "external",
         }
     }
