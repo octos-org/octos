@@ -428,6 +428,26 @@ async function main() {
   let selfPacedLoopId = null;
   if (selfPacedEnabled) {
     try {
+      // #1136 codex P2 — delete the fixed-interval loop BEFORE the
+      // self-paced probe. Otherwise the fixed loop's next scheduled
+      // fire (at the ~60s mark) can complete in the same session
+      // around the time the self-paced re-fire is expected, and the
+      // turn-count-driven `waitFor` below cannot tell them apart —
+      // attributing a fixed-loop reply to the self-paced capture and
+      // counting it as a success.
+      try {
+        await rpc(
+          'loop/delete',
+          {
+            loop_id: fixedLoopId,
+            session_id: sessionId,
+            profile_id: profileId,
+          },
+          5_000,
+        );
+      } catch (deleteErr) {
+        console.error(`warning: failed to pre-delete fixed loop before self-paced probe: ${deleteErr.message ?? deleteErr}`);
+      }
       const selfPaced = await rpc(
         'loop/create',
         {
@@ -573,6 +593,13 @@ async function main() {
   };
   writeJson(summaryPath, summary);
   console.log(JSON.stringify(summary, null, 2));
+  // #1136 codex P2: CI runners look at the exit code, not the
+  // `ok` field inside summary.json. Without this, a soak that flags
+  // `ok: false` (e.g. missing fires, secret-scan offenders) still
+  // exits 0 and would be treated as a pass by downstream automation.
+  if (!summary.ok) {
+    process.exitCode = 1;
+  }
 }
 
 main()

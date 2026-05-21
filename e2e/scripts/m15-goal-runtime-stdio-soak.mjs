@@ -598,6 +598,11 @@ async function main() {
   };
   writeJson(summaryPath, summary);
   console.log(JSON.stringify(summary, null, 2));
+  // #1136 codex P2: surface failure via exit code so CI runners
+  // don't treat an `ok: false` summary as a pass.
+  if (!summary.ok) {
+    process.exitCode = 1;
+  }
 }
 
 main()
