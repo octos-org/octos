@@ -2031,13 +2031,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                         .and_then(|delay_ms| now.checked_add(delay_ms))
                 });
                 loop_record.updated_at_ms = now;
-                // #1130 — count the fire toward the persisted budget.
-                // `saturating_add` so we never wrap past `u32::MAX` (the
-                // budget caps far below that — `LOOP_DEFAULT_MAX_FIRES`
-                // is 10_000 — but the saturating math defends against a
-                // pathological corrupt-snapshot restore).
-                loop_record.fires_used = loop_record.fires_used.saturating_add(1);
-                let loop_json = autonomy_loop_json(loop_record);
+                // Persist the schedule-side timestamp updates regardless
+                // of enqueue outcome (we still attempted a fire).
                 persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
 
                 let continuation = MasterContinuationRequest::new(
@@ -2050,10 +2045,31 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 .with_loop_id(loop_id.clone())
                 .with_metadata("prompt", resolved_prompt)
                 .with_metadata("prompt_source", prompt_source_label);
-                let fire = master_continuation_enqueue_json(enqueue_and_persist_continuation(
-                    &mut state,
-                    continuation,
-                ));
+                let outcome = enqueue_and_persist_continuation(&mut state, continuation);
+                // #1138 codex P2 follow-up to #1130: only count the
+                // fire toward the persisted `fires_used` budget when a
+                // NEW continuation was actually queued. `Duplicate`
+                // outcomes mean the prior continuation is still
+                // pending — a retry/spam should NOT burn the safety
+                // budget, otherwise users can exhaust a loop early by
+                // repeatedly clicking `fire_now` while a fire is in
+                // flight. `saturating_add` defends against a corrupt
+                // snapshot restore.
+                let newly_queued = matches!(outcome, MasterContinuationEnqueueOutcome::Queued(_));
+                if newly_queued {
+                    let loop_record = state
+                        .loops
+                        .get_mut(&loop_id)
+                        .expect("loop record still present");
+                    loop_record.fires_used = loop_record.fires_used.saturating_add(1);
+                    persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
+                }
+                let loop_json = state
+                    .loops
+                    .get(&loop_id)
+                    .map(autonomy_loop_json)
+                    .unwrap_or(Value::Null);
+                let fire = master_continuation_enqueue_json(outcome);
 
                 Ok(json!({
                     "session_id": session_id,
@@ -2309,11 +2325,6 @@ fn enqueue_due_loop_continuations(
             loop_record.next_run_at_ms = None;
         }
         loop_record.updated_at_ms = now;
-        // #1130 — count the scheduled fire toward the persisted budget.
-        // Mirrors the `fire_now` increment so a long-lived fixed-interval
-        // loop draining via the scheduler is held to the same
-        // `LOOP_DEFAULT_MAX_FIRES` cap as one fired manually.
-        loop_record.fires_used = loop_record.fires_used.saturating_add(1);
         updated_loops.push(loop_record.clone());
     }
 
@@ -2330,6 +2341,7 @@ fn enqueue_due_loop_continuations(
             .prompt_source
             .map(maintenance_prompt_source_label)
             .unwrap_or("record");
+        let loop_id_for_increment = fire.loop_id.clone();
         let continuation = MasterContinuationRequest::new(
             "coding-autonomy",
             fire.session_id.to_string(),
@@ -2341,10 +2353,24 @@ fn enqueue_due_loop_continuations(
         .with_metadata("prompt", fire.prompt)
         .with_metadata("prompt_source", prompt_source_label)
         .with_metadata("scheduled_for_ms", fire.scheduled_for_ms.to_string());
-        if enqueue_and_persist_continuation(state, continuation)
-            .queued()
-            .is_some()
-        {
+        let outcome = enqueue_and_persist_continuation(state, continuation);
+        // #1138 codex P2 follow-up to #1130: only count the scheduled
+        // fire toward the persisted `fires_used` budget when a NEW
+        // continuation was actually queued. `Duplicate` outcomes (the
+        // prior continuation is still pending) must not burn the
+        // safety budget, otherwise a sticky pending fire could
+        // exhaust the loop's MAX_FIRES with no real LLM executions.
+        if outcome.queued().is_some() {
+            let snapshot = state
+                .loops
+                .get_mut(&loop_id_for_increment)
+                .map(|loop_record| {
+                    loop_record.fires_used = loop_record.fires_used.saturating_add(1);
+                    loop_record.clone()
+                });
+            if let Some(snapshot) = snapshot {
+                persist_loop_state(state, &snapshot);
+            }
             queued += 1;
         }
     }
