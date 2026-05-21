@@ -151,16 +151,19 @@ function normalizeScenario(row, idx, seenIds) {
   // to null when absent. But if the TOML sets them to a non-string (e.g.
   // `replay = []` or `notes = 42`), the value still slips through and
   // ends up in the --json projection — breaking the README contract
-  // that says these are string-or-null. Validate type when present.
+  // that says these are string-or-null. Validate the *type* when set,
+  // but allow empty strings: the v1 contract is "string-or-null" and
+  // tightening to "non-empty string" would be a schema-breaking change
+  // without a schema_version bump.
   for (const optField of ["replay", "notes"]) {
     if (
       Object.prototype.hasOwnProperty.call(row, optField) &&
       row[optField] !== null &&
       row[optField] !== undefined
     ) {
-      if (typeof row[optField] !== "string" || row[optField].length === 0) {
+      if (typeof row[optField] !== "string") {
         throw new ManifestSchemaError(
-          `scenario "${row.id}" field "${optField}" must be a non-empty string when set (or omitted)`,
+          `scenario "${row.id}" field "${optField}" must be a string or null`,
         );
       }
     }
