@@ -2643,15 +2643,49 @@ fn pending_continuation_is_schedulable(
             let Some(goal) = state.goals.get(&session_key) else {
                 return false;
             };
+            // #1145 codex P2 re-review: pre-#1131 wrap-up turns were
+            // queued as `GoalContinue` + `wrap_up_prompt` metadata,
+            // and the prompt renderer promotes that shape at render
+            // time (see `legacy_goal_continue_with_wrap_up_metadata_promotes_to_wrap_up`).
+            // After budget exhaustion the owning goal is
+            // `budget_limited`, so the active-only gate would
+            // strand legacy persisted wrap-ups indefinitely.
+            // Detect the legacy shape and let it through — the goal
+            // record just has to exist.
+            if item.metadata.contains_key("wrap_up_prompt") || item.metadata.contains_key("wrap_up")
+            {
+                return true;
+            }
+            // #1145 codex P2 re-review: when a user cleared the
+            // old goal and created a new one for the same
+            // `SessionKey`, the queued item still carries the old
+            // `goal_id` while `state.goals` now holds the new goal.
+            // Without a goal-id identity check the stale item would
+            // mark the session schedulable and could drain BEFORE
+            // the new goal's first continuation (the stale item is
+            // the older heap entry).
+            if let Some(item_goal_id) = item.goal_id.as_ref() {
+                if item_goal_id.as_str() != goal.goal_id {
+                    return false;
+                }
+            }
             matches!(goal.status.as_str(), "active")
         }
         MasterContinuationReason::GoalWrapUp => {
             // Wrap-up is the explicit terminal goal turn — must drain
             // even when the goal is `budget_limited`. Skip only if
             // the goal has since been cleared (operator nuked it
-            // mid-wrap-up).
+            // mid-wrap-up) OR was replaced by a different goal.
             let session_key = SessionKey(item.session_id.as_str().to_owned());
-            state.goals.contains_key(&session_key)
+            let Some(goal) = state.goals.get(&session_key) else {
+                return false;
+            };
+            if let Some(item_goal_id) = item.goal_id.as_ref() {
+                if item_goal_id.as_str() != goal.goal_id {
+                    return false;
+                }
+            }
+            true
         }
         // ChildCompleted, ScatterJoinComplete, External — no owning
         // goal/loop record to inspect, pass through.
