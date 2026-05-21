@@ -7643,7 +7643,20 @@ fn onboarding_workspace_probe_result(state: &AppState, path: &str) -> Result<Val
 /// `Permissions.mode()` cannot answer. The probe must reflect the answer
 /// the agent would get when it next tries to write.
 fn directory_is_writable(path: &Path) -> bool {
-    let probe = path.join(".octos-workspace-probe");
+    // #1147 codex P2: use a unique per-call probe filename so a stale
+    // file from a killed prior probe (or a user-created `.octos-workspace-probe`)
+    // doesn't cause `create_new` to fail with `AlreadyExists` and
+    // falsely report `writable=false`. PID + nanos + process-local
+    // atomic counter make collision practically impossible.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let probe = path.join(format!(".octos-workspace-probe-{pid}-{nanos}-{counter}"));
     let attempt = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -7670,7 +7683,13 @@ fn workspace_policy_probe(root: Option<&Path>) -> Value {
             "kind": null,
         });
     };
-    let policy_path = root.join("workspace_policy.toml");
+    // #1147 codex P2: probe the canonical runtime policy filename
+    // (`octos_agent::workspace_policy::WORKSPACE_POLICY_FILE`,
+    // currently `.octos-workspace.toml`) — the previous `workspace_policy.toml`
+    // hardcoded name didn't match what `SessionRuntime::bootstrap`
+    // actually reads, so the probe reported `present=false` for
+    // every real workspace.
+    let policy_path = root.join(octos_agent::workspace_policy::WORKSPACE_POLICY_FILE);
     if !policy_path.exists() {
         return json!({
             "present": false,
@@ -16743,7 +16762,7 @@ mod tests {
         let workspace = dir.path().join("repo");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
         std::fs::write(
-            workspace.join("workspace_policy.toml"),
+            workspace.join(octos_agent::workspace_policy::WORKSPACE_POLICY_FILE),
             "this is = not [valid toml",
         )
         .expect("write malformed policy");
@@ -16782,8 +16801,11 @@ fail_on_error = false
 [tracking]
 ignore = []
 "#;
-        std::fs::write(workspace.join("workspace_policy.toml"), policy)
-            .expect("write valid policy");
+        std::fs::write(
+            workspace.join(octos_agent::workspace_policy::WORKSPACE_POLICY_FILE),
+            policy,
+        )
+        .expect("write valid policy");
 
         let result = onboarding_workspace_probe_result(&state, workspace.to_str().unwrap())
             .expect("probe with valid policy");
@@ -16791,6 +16813,33 @@ ignore = []
         assert_eq!(result["workspace_policy"]["present"], json!(true));
         assert_eq!(result["workspace_policy"]["parse_error"], Value::Null);
         assert_eq!(result["workspace_policy"]["kind"], json!("coding"));
+    }
+
+    /// #1147 codex P2 acceptance: a writability probe must use a
+    /// unique filename per call so a stale leftover file (or a
+    /// user-created `.octos-workspace-probe-*` file) doesn't cause
+    /// `create_new` to fail with `AlreadyExists` and falsely report
+    /// `writable=false`. We simulate the bug by pre-creating a file
+    /// with the OLD fixed name and asserting the probe still reports
+    /// the directory as writable.
+    #[test]
+    fn workspace_probe_is_writable_despite_stale_probe_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        // Pre-create a file that would have collided with the old
+        // fixed `.octos-workspace-probe` name.
+        std::fs::write(workspace.join(".octos-workspace-probe"), "stale leftover")
+            .expect("write stale probe file");
+
+        let result = onboarding_workspace_probe_result(&state, workspace.to_str().unwrap())
+            .expect("probe must run despite stale leftover");
+        assert_eq!(
+            result["writable"],
+            json!(true),
+            "stale leftover file with old fixed name must NOT block writability probe",
+        );
     }
 
     /// #1057 — probe rejects roots that escape into a banned system path
