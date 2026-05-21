@@ -8469,7 +8469,16 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // dispatch-only updater touches only the timestamp, so the
         // budget remains aligned with real token spend. Full token
         // accounting + sentinel detection wiring tracked in #1133.
-        if matches!(continuation.reason, MasterContinuationReason::GoalContinue) {
+        // #1131 — `GoalWrapUp` is also a goal-driven dispatch, so
+        // touch the goal's `last_continued_at_ms` here too. The goal
+        // is already in `budget_limited` and the scheduler will not
+        // re-fire it, but keeping the dispatch path symmetric with
+        // `GoalContinue` avoids drift in any future caller that
+        // inspects the timestamp.
+        if matches!(
+            continuation.reason,
+            MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp,
+        ) {
             default_agent_orchestrator().record_goal_dispatch_only(
                 &SessionKey(continuation.session_id.as_str().to_owned()),
                 continuation.profile_id.as_str(),

@@ -3423,6 +3423,7 @@ fn master_continuation_reason_name(reason: &MasterContinuationReason) -> &str {
         MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete",
         MasterContinuationReason::LoopFire => "loop_fire",
         MasterContinuationReason::GoalContinue => "goal_continue",
+        MasterContinuationReason::GoalWrapUp => "goal_wrap_up",
         MasterContinuationReason::External(_) => "external",
     }
 }
@@ -3462,14 +3463,51 @@ fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
         ),
-        MasterContinuationReason::GoalContinue => format!(
-            "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
-            goal_id = continuation
+        MasterContinuationReason::GoalContinue => {
+            // #1139 codex P2 follow-up: legacy wrap-up promotion —
+            // mirrors `agent_orchestrator::master_continuation_prompt`.
+            // A continuation queued by the pre-#1131 wire shape used
+            // `GoalContinue` + `wrap_up_prompt` metadata; promote it
+            // at render time so the in-flight final turn instructs
+            // the model to summarize-and-stop.
+            let goal_id = continuation
                 .goal_id
                 .as_ref()
                 .map(|id| id.as_str())
-                .unwrap_or("unknown"),
-        ),
+                .unwrap_or("unknown");
+            if let Some(directive) = continuation.metadata.get("wrap_up_prompt") {
+                return format!(
+                    "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+                );
+            }
+            format!(
+                "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
+            )
+        }
+        // #1131 — wrap-up turns must instruct the model to summarize
+        // and stop, NOT continue work. Render the per-goal wrap-up
+        // directive (stored in metadata by `record_goal_turn`) as
+        // the actual prompt body so the LLM sees the instruction
+        // verbatim instead of the generic "Advance the goal..."
+        // template. Mirrors the canonical renderer in
+        // `agent_orchestrator::master_continuation_prompt`.
+        MasterContinuationReason::GoalWrapUp => {
+            let goal_id = continuation
+                .goal_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown");
+            let directive = continuation
+                .metadata
+                .get("wrap_up_prompt")
+                .map(String::as_str)
+                .unwrap_or(
+                    "This goal has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                );
+            format!(
+                "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+            )
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
@@ -3843,8 +3881,16 @@ impl SessionActor {
                 reason = master_continuation_reason_name(&continuation.reason),
                 "draining queued master continuation into session actor"
             );
-            let is_goal_turn =
-                matches!(continuation.reason, MasterContinuationReason::GoalContinue);
+            // #1131 — `GoalWrapUp` is the final goal turn under
+            // budget exhaustion. Treat it as a goal turn for runtime
+            // accounting so per-turn elapsed time is still recorded;
+            // `record_goal_turn_internal` is idempotent against the
+            // already-set `wrap_up_emitted` flag and will NOT
+            // re-enqueue a second wrap-up.
+            let is_goal_turn = matches!(
+                continuation.reason,
+                MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp,
+            );
             let goal_turn_start = Instant::now();
             default_agent_orchestrator().mark_continuation_started(&continuation);
             // #977 bullet 4 — capture the loop id (if any) BEFORE we
