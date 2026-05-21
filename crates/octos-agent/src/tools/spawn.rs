@@ -2559,8 +2559,34 @@ impl Tool for SpawnTool {
             let parent_file_state_cache = self.parent_file_state_cache.clone();
             let parent_subagent_output_router = self.parent_subagent_output_router.clone();
             let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
-            let child_prompt_context_manager_factory =
-                self.child_prompt_context_manager_factory.clone();
+            // Issue #1125: invoke the child prompt-context factory
+            // SYNCHRONOUSLY here (before any `await`) so the fork captures
+            // the parent transcript as it stood at spawn dispatch time.
+            //
+            // The previous wiring deferred this call into the detached
+            // `tokio::spawn` below, AFTER awaiting
+            // `dispatch_child_session_lifecycle`. If the parent recorded
+            // another user turn during that await window, the factory
+            // (which locks the live parent `ContextManager`) would fork a
+            // POST-spawn snapshot — leaking messages that were not part
+            // of the spawning turn into the background child's context.
+            //
+            // Fork-at-dispatch produces a `ContextManager` snapshot pinned
+            // to the pre-spawn parent generation; the detached task just
+            // installs the pre-baked manager on the child Agent without
+            // touching the parent lock.
+            let prebuilt_child_prompt_context_manager = self
+                .child_prompt_context_manager_factory
+                .as_ref()
+                .and_then(|factory| {
+                    factory(ChildPromptContextRequest {
+                        parent_session_key: self.session_key.clone(),
+                        child_session_key: tracked_child_session_key.clone(),
+                        task_id: tracked_task_id.clone(),
+                        worker_id: worker_id.to_string(),
+                        task_label: label.clone(),
+                    })
+                });
             // Guard C (issue #607): snapshot the caller's spawn depth so
             // the detached child Agent dispatched below sees
             // `parent_depth + 1` and the [`MAX_SPAWN_DEPTH`] gate fires
@@ -2724,16 +2750,15 @@ impl Tool for SpawnTool {
                 }) {
                     worker = worker.with_hook_context(ctx);
                 }
-                if let Some(factory) = child_prompt_context_manager_factory.as_ref() {
-                    if let Some(manager) = factory(ChildPromptContextRequest {
-                        parent_session_key: parent_session_key.clone(),
-                        child_session_key: tracked_child_session_key.clone(),
-                        task_id: tracked_task_id.clone(),
-                        worker_id: wid.to_string(),
-                        task_label: task_label.clone(),
-                    }) {
-                        worker = worker.with_prompt_context_manager(manager);
-                    }
+                // Issue #1125: install the pre-spawn-snapshot child
+                // prompt-context manager that we forked synchronously at
+                // dispatch time (see `prebuilt_child_prompt_context_manager`
+                // above). The factory was invoked BEFORE this `tokio::spawn`
+                // entered any await so the fork is pinned to the parent
+                // generation at SpawnTool dispatch — post-spawn user
+                // messages on the parent cannot leak into this child.
+                if let Some(manager) = prebuilt_child_prompt_context_manager {
+                    worker = worker.with_prompt_context_manager(manager);
                 }
 
                 // Review A F-004: propagate the parent's declarative
