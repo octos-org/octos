@@ -4436,6 +4436,24 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    /// #1135 codex P2: serialize all cwd-mutating tests in this module
+    /// (currently `maintenance_loop_resolves_prompt_at_fire_time_from_project_doc`
+    /// and `scheduled_maintenance_fire_emits_resolved_prompt_source`).
+    /// Rust runs tests in parallel by default; both tests `chdir` to
+    /// their own tempdir and write `.octos/loop.md` there. Without a
+    /// shared lock the two tests can overlap, with one resolving the
+    /// OTHER's project doc and producing nondeterministic content
+    /// failures. The lock is poisoning-safe — we recover from a poisoned
+    /// lock so an earlier panic doesn't permanently disable the suite.
+    static CWD_MUTATING_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn cwd_mutating_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CWD_MUTATING_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct NativeMockProvider {
         content: Result<String, String>,
     }
@@ -7036,6 +7054,8 @@ mod tests {
     #[test]
     fn maintenance_loop_resolves_prompt_at_fire_time_from_project_doc() {
         use std::env;
+        // #1135 codex P2: serialize cwd-mutating tests in this module.
+        let _cwd_guard = cwd_mutating_test_guard();
         let temp = tempfile::TempDir::new().expect("temp dir");
         let cwd_before = env::current_dir().expect("cwd");
         env::set_current_dir(temp.path()).expect("chdir tmp");
@@ -7101,6 +7121,8 @@ mod tests {
     #[test]
     fn scheduled_maintenance_fire_emits_resolved_prompt_source() {
         use std::env;
+        // #1135 codex P2: serialize cwd-mutating tests in this module.
+        let _cwd_guard = cwd_mutating_test_guard();
         let temp = tempfile::TempDir::new().expect("temp dir");
         let cwd_before = env::current_dir().expect("cwd");
         env::set_current_dir(temp.path()).expect("chdir tmp");
