@@ -8311,6 +8311,11 @@ async fn handle_turn_start(
                 interrupt_rx,
                 false,
                 None,
+                // #1133 — regular `turn/start` path is user-initiated;
+                // it never runs as a goal continuation, so no goal
+                // accountant wiring. Only the master continuation
+                // runner sets this to `Some(...)` for `GoalContinue`.
+                None,
             )
             .await;
         }
@@ -8443,6 +8448,18 @@ async fn maybe_spawn_appui_master_continuation_runner(
             .map(|id| id.as_str().to_owned()),
         _ => None,
     };
+    // #1133 — when the master continuation runner is draining a
+    // GoalContinue, capture the profile id BEFORE the spawn move so
+    // `run_standalone_turn` can fold the post-turn token spend +
+    // sentinel detection back into the goal record. Reasons other
+    // than `GoalContinue` pass `None` (the post-accountant is a no-op
+    // for them).
+    let goal_context_for_appui = match continuation.reason {
+        MasterContinuationReason::GoalContinue => Some(GoalContinuationContext {
+            profile_id: continuation.profile_id.as_str().to_owned(),
+        }),
+        _ => None,
+    };
     let handle = tokio::spawn(async move {
         if start_rx.await.is_err() {
             return;
@@ -8454,27 +8471,23 @@ async fn maybe_spawn_appui_master_continuation_runner(
             "draining queued master continuation into AppUI turn runtime"
         );
         default_agent_orchestrator().mark_continuation_started(&continuation);
-        // #1129 codex P1 re-review #2 — when the AppUI tick path
-        // dispatches a GoalContinue, advance the goal's
-        // `last_continued_at_ms` immediately so the next scheduler
-        // tick (every ~2s) doesn't consider the same goal due again
-        // while THIS turn is still running.
-        //
-        // #1129 codex P2 re-review #3 — use the dispatch-only
-        // timestamp updater, NOT `record_goal_turn`. The full
-        // accountant increments `continuations_used` and the
-        // rate-window counter, which would exhaust the derived
-        // continuation budget after `ceil(token_budget / 2500)`
-        // dispatches even though no tokens were actually spent. The
-        // dispatch-only updater touches only the timestamp, so the
-        // budget remains aligned with real token spend. Full token
-        // accounting + sentinel detection wiring tracked in #1133.
-        if matches!(continuation.reason, MasterContinuationReason::GoalContinue) {
-            default_agent_orchestrator().record_goal_dispatch_only(
-                &SessionKey(continuation.session_id.as_str().to_owned()),
-                continuation.profile_id.as_str(),
-            );
-        }
+        // #1133 — the AppUI tick path used to call
+        // `record_goal_dispatch_only` here so the next scheduler tick
+        // (~every 2s) would not re-dispatch the same goal while THIS
+        // turn was still running. That stub bumped `continuations_used`
+        // + `rate_window_count` BEFORE the turn even spent any tokens,
+        // which double-counted every fire once #1133 wired the full
+        // post-turn `record_goal_turn` accountant. Option (b) in #1133
+        // is the resolution: skip dispatch-only entirely on the AppUI
+        // path and let the post-turn call below handle ALL accounting
+        // (including `last_continued_at_ms`). The 2s rescan loop is
+        // prevented by `run_standalone_turn` calling `record_goal_turn`
+        // BEFORE the next scheduler tick observes the session as idle
+        // — the goal's `last_continued_at_ms` is stamped while the
+        // post-accountant runs, which is the same wall-clock window
+        // the rescan loop scans. The `record_goal_dispatch_only` helper
+        // stays available for callers that genuinely only need a
+        // timestamp bump.
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
@@ -8488,6 +8501,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             interrupt_rx,
             true,
             loop_id_for_self_paced,
+            goal_context_for_appui,
         )
         .await;
         default_agent_orchestrator().mark_continuation_completed(
@@ -13349,6 +13363,27 @@ async fn seed_m9_task_output_fixture(
         .map_err(|error| format!("failed to parse fixture task id: {error}"))
 }
 
+/// #1133 — context required to fold a finished AppUI goal turn back
+/// into the goal runtime. Carries the profile id so `record_goal_turn`
+/// + `maybe_complete_goal_from_model` can be invoked once the agent
+/// task returns AND the assistant reply has been persisted into the
+/// per-session `SessionRuntime.sessions` manager.
+///
+/// Mirrors the `loop_id_for_self_paced` plumbing added by #1128 — the
+/// caller (`maybe_spawn_appui_master_continuation_runner`) sets this
+/// to `Some(...)` only when `continuation.reason == GoalContinue`.
+/// Regular turn starts (`turn/start`) pass `None`.
+///
+/// Token accounting is captured from the `done` event the agent task
+/// emits over `progress_rx`, NOT re-read from the session — the agent
+/// reply already carries `tokens_in`/`tokens_out` so we avoid a second
+/// pass through the session history.
+#[derive(Debug, Clone)]
+struct GoalContinuationContext {
+    profile_id: String,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
     state: Arc<AppState>,
@@ -13371,6 +13406,13 @@ async fn run_standalone_turn(
     // off `state.sessions` (AppState's legacy manager) and never saw
     // the just-written reply.
     loop_id_for_self_paced: Option<String>,
+    // #1133 — when this turn is draining a `GoalContinue` master
+    // continuation, pass the goal context here so the post-turn
+    // accountant (`record_goal_turn` + `maybe_complete_goal_from_model`)
+    // can fold real `tokens_consumed` + elapsed seconds into the goal
+    // record AND detect the `<goal:complete>` sentinel — parity with the
+    // `SessionActor::maybe_advance_goal_runtime_after_turn` chat path.
+    goal_context: Option<GoalContinuationContext>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -13485,7 +13527,15 @@ async fn run_standalone_turn(
     // snapshot off the SessionRuntime's session manager (the source
     // of truth for persisted turns). Used at end-of-turn to find the
     // model's reply and re-schedule self-paced / maintenance loops.
-    let pre_assistant_count_for_self_paced: Option<usize> = if loop_id_for_self_paced.is_some() {
+    //
+    // #1133 — share the same pre-count between the self-paced loop
+    // reschedule path AND the goal-turn post-accountant path. Both
+    // need to find the LAST assistant message persisted by THIS turn
+    // (the pattern is identical: enumerate + filter idx >= pre +
+    // non-empty + last). Snapshot once when either context is Some
+    // so we don't lock `sessions` twice on the hot path.
+    let needs_pre_assistant_count = loop_id_for_self_paced.is_some() || goal_context.is_some();
+    let pre_assistant_count_for_post_turn: Option<usize> = if needs_pre_assistant_count {
         let mut guard = sessions.lock().await;
         let session = guard.get_or_create(&session_id).await;
         Some(
@@ -13498,6 +13548,12 @@ async fn run_standalone_turn(
     } else {
         None
     };
+    // #1133 — wall-clock start for the goal-turn elapsed accountant.
+    // Captured outside the agent_task spawn so we measure end-to-end
+    // turn wall-clock (LLM + tool roundtrips + persistence), matching
+    // the chat path's `maybe_advance_goal_runtime_after_turn(goal_turn_start)`
+    // pattern in `SessionActor`.
+    let goal_turn_start = goal_context.as_ref().map(|_| std::time::Instant::now());
     let mut tool_registry = session_runtime.tools.snapshot_excluding(&[]);
     // M11-F regression fix REG-1 follow-up round 2 (codex review):
     // re-register a fresh `ActivateToolsTool` on this per-turn
@@ -14324,6 +14380,14 @@ async fn run_standalone_turn(
     let mut task_output_delta_tracker = TaskOutputDeltaTracker::default();
     let progress_context = ProgressMappingContext::new(session_id.clone(), turn_id.clone());
     let mut interrupt_observed = false;
+    // #1133 — fold the `done` event's `tokens_in + tokens_out` into a
+    // running total so the post-turn goal accountant can call
+    // `record_goal_turn(..., tokens_consumed, elapsed)` with real
+    // numbers. The agent_task only ever emits one `done` per turn (the
+    // outer match below breaks immediately), so this is effectively
+    // a once-write; using a mutable u64 keeps the wiring narrow and
+    // avoids a second pass through `response.token_usage`.
+    let mut final_tokens_consumed: u64 = 0;
     loop {
         // Race progress events against the interrupt signal so an interrupt
         // can wake us out of `progress_rx.recv()` even if the agent task is
@@ -14368,6 +14432,17 @@ async fn run_standalone_turn(
                         }
                     }
                 }
+                // #1133 — capture the agent task's reported token spend
+                // for the post-turn goal accountant. The agent_task spawn
+                // builds this JSON from `response.token_usage` so we
+                // observe the SAME numbers that flow through the cost
+                // accountant / supervisor hooks. Saturating add keeps the
+                // accumulator total-safe for malformed payloads.
+                let tokens_in = event.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
+                let tokens_out = event.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
+                final_tokens_consumed = final_tokens_consumed
+                    .saturating_add(tokens_in)
+                    .saturating_add(tokens_out);
                 // FIX-04: flush any accumulated drops before the lifecycle
                 // terminal so the client knows the cursor is incomplete.
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
@@ -14554,7 +14629,7 @@ async fn run_standalone_turn(
     // gets written to in production.
     if let (Some(loop_id), Some(pre)) = (
         loop_id_for_self_paced.as_ref(),
-        pre_assistant_count_for_self_paced,
+        pre_assistant_count_for_post_turn,
     ) {
         let assistant_reply: Option<String> = {
             let mut guard = sessions_for_reschedule.lock().await;
@@ -14592,6 +14667,63 @@ async fn run_standalone_turn(
                     "apply_self_paced_response skipped (appui path)"
                 );
             }
+        }
+    }
+
+    // #1133 — AppUI goal-turn post-accountant. Mirrors the chat path's
+    // `SessionActor::maybe_advance_goal_runtime_after_turn`:
+    //   1. Find the LAST non-empty assistant message persisted by THIS
+    //      turn (same `enumerate + filter idx >= pre + non-empty + last`
+    //      pattern as the self-paced loop case above).
+    //   2. Call `record_goal_turn(session_id, profile_id, tokens, elapsed)`
+    //      so the goal's `tokens_used` / `continuations_used` /
+    //      `rate_window_count` reflect the real turn (instead of the
+    //      pre-#1133 dispatch-only stub that bumped only the timestamp).
+    //   3. Call `maybe_complete_goal_from_model` so a trailing
+    //      `<goal:complete>` sentinel flips the goal to `complete` and
+    //      stops recurrence.
+    //
+    // Token usage comes from `final_tokens_consumed` — populated when the
+    // agent_task's `done` JSON event traversed the main `select!` loop
+    // (`tokens_in + tokens_out`). On interrupt / agent error the value
+    // remains zero, which is the correct conservative behaviour: an
+    // interrupted turn should not exhaust the goal's token budget.
+    if let Some(goal_ctx) = goal_context.as_ref() {
+        let pre = pre_assistant_count_for_post_turn.unwrap_or(0);
+        let assistant_reply: Option<String> = {
+            let mut guard = sessions_for_reschedule.lock().await;
+            let session = guard.get_or_create(&session_id).await;
+            let history = session.get_history(usize::MAX);
+            history
+                .iter()
+                .filter(|message| matches!(message.role, MessageRole::Assistant))
+                .enumerate()
+                .filter(|(idx, _)| *idx >= pre)
+                .filter(|(_, message)| !message.content.is_empty())
+                .last()
+                .map(|(_, message)| message.content.clone())
+        };
+        let elapsed_seconds = goal_turn_start
+            .map(|start| start.elapsed().as_secs())
+            .unwrap_or(0);
+        let orchestrator = default_agent_orchestrator();
+        orchestrator.record_goal_turn(
+            &session_id,
+            &goal_ctx.profile_id,
+            final_tokens_consumed,
+            elapsed_seconds,
+        );
+        if let Some(reply) = assistant_reply {
+            // `maybe_complete_goal_from_model` is idempotent and only
+            // flips when `detect_goal_complete_sentinel` matches the
+            // tail of the reply. The return value is intentionally
+            // unused — the goal is either complete now or stays active
+            // and the next scheduler tick decides whether to re-queue.
+            let _ = orchestrator.maybe_complete_goal_from_model(
+                &session_id,
+                &goal_ctx.profile_id,
+                &reply,
+            );
         }
     }
 

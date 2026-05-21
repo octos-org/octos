@@ -1096,6 +1096,17 @@ impl InProcessAgentOrchestrator {
     /// hard cap fires correctly, and the derived continuation budget
     /// (`token_budget / 2500`) bounds total fires until token-side
     /// accounting catches up.
+    ///
+    /// #1133 — the AppUI tick path no longer calls this helper.
+    /// `run_standalone_turn` now folds real `tokens_consumed +
+    /// elapsed` into `record_goal_turn` AFTER the agent task returns,
+    /// which is the single accountant that bumps every counter
+    /// (`continuations_used`, `rate_window_count`, `tokens_used`,
+    /// `last_continued_at_ms`). The helper is preserved for any
+    /// future caller that genuinely only needs a timestamp bump (e.g.
+    /// a session actor whose tokens aren't known immediately) — the
+    /// `#[allow(dead_code)]` reflects "kept by design", not "stale".
+    #[allow(dead_code)]
     pub(crate) fn record_goal_dispatch_only(
         &self,
         session_id: &SessionKey,
@@ -1235,6 +1246,23 @@ impl InProcessAgentOrchestrator {
             .goals
             .get(session_id)
             .map(|goal| goal.status.clone())
+    }
+
+    /// #1133 — accessor used by the AppUI goal-turn acceptance tests to
+    /// pin that `record_goal_turn` actually bumped `tokens_used` /
+    /// `continuations_used` after a turn completed.
+    #[cfg(test)]
+    pub(crate) fn goal_counters_for_test(
+        &self,
+        session_id: &SessionKey,
+    ) -> Option<(u64, u32, u32)> {
+        self.state().goals.get(session_id).map(|goal| {
+            (
+                goal.tokens_used,
+                goal.continuations_used,
+                goal.rate_window_count,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -7132,6 +7160,161 @@ mod tests {
         assert!(
             (110_000..=130_000).contains(&delta_ms),
             "next_run_at_ms should be roughly 120s in the future (got {delta_ms} ms)",
+        );
+    }
+
+    /// #1133 acceptance 1 — when the AppUI goal-turn path finishes a
+    /// real LLM turn, it must call `record_goal_turn` with the actual
+    /// tokens consumed AND the elapsed seconds, NOT the dispatch-only
+    /// helper. This pins that `tokens_used` is bumped (was permanently
+    /// stuck at 0 in the pre-#1133 shape, hiding `budget_limited`
+    /// transitions from the AppUI goal soak).
+    #[test]
+    fn appui_goal_path_record_goal_turn_with_real_tokens_bumps_counters() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-appui-tokens");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "real tokens please".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial set_goal continuation; #1133 acceptance is
+        // about the POST-turn accountant, not the dispatch-time queue.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Pre-condition: counters all start at zero.
+        let (tokens_before, continuations_before, window_before) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_before, 0);
+        assert_eq!(continuations_before, 0);
+        assert_eq!(window_before, 0);
+
+        // Post-turn AppUI behavior: record a turn that actually consumed
+        // tokens (this is what `run_standalone_turn` does once goal
+        // context + token accounting are wired through).
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 1234, 7);
+
+        let (tokens_after, continuations_after, window_after) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal still exists");
+        assert_eq!(
+            tokens_after, 1234,
+            "record_goal_turn must fold tokens_consumed into goal.tokens_used"
+        );
+        assert_eq!(
+            continuations_after, 1,
+            "record_goal_turn must bump continuations_used by exactly one"
+        );
+        assert_eq!(
+            window_after, 1,
+            "record_goal_turn must bump the sliding rate-window counter",
+        );
+    }
+
+    /// #1133 acceptance 2 — when the AppUI goal turn produces a reply
+    /// ending in `<goal:complete>`, the post-turn
+    /// `maybe_complete_goal_from_model` call flips the goal to
+    /// `complete`. Without this wiring, the sentinel-detection path
+    /// was unreachable from `run_standalone_turn` (only the
+    /// `SessionActor` chat path called it).
+    #[test]
+    fn appui_goal_path_completes_goal_when_reply_ends_with_sentinel() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-appui-sentinel");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "finish via sentinel".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Mid-body sentinel must NOT flip the goal.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "I am about to write <goal:complete> shortly, but step 2 first.",
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+        );
+
+        // Trailing sentinel (the canonical AppUI shape) flips it.
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "All requested checks finished.\n\n<goal:complete>",
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+    }
+
+    /// #1133 acceptance 3 — the AppUI tick path must NOT call
+    /// `record_goal_dispatch_only` for a `GoalContinue` dispatch
+    /// (option (b) in #1133). The post-turn `record_goal_turn` is the
+    /// single accountant that bumps `continuations_used` AND
+    /// `rate_window_count`. Otherwise the AppUI path would double-count
+    /// every fire and exhaust the per-hour cap after ~6 turns instead
+    /// of the documented 12.
+    #[test]
+    fn appui_goal_dispatch_path_does_not_double_count_continuations() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-appui-dispatch");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "one fire counts as one".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Simulate the NEW (#1133 option b) AppUI dispatch path: do NOT
+        // call `record_goal_dispatch_only` at dispatch time. Only call
+        // `record_goal_turn` once the turn returns with real tokens.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 500, 3);
+
+        let (_, continuations_after, window_after) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            continuations_after, 1,
+            "AppUI option (b) must produce exactly ONE continuations_used increment per turn"
+        );
+        assert_eq!(
+            window_after, 1,
+            "AppUI option (b) must produce exactly ONE rate_window_count increment per turn"
         );
     }
 }
