@@ -1044,6 +1044,40 @@ impl InProcessAgentOrchestrator {
                 }
             }
         }
+        // #1141 — sweep the master continuation queue itself so any
+        // session with a pending continuation (e.g. the wrap-up turn
+        // enqueued by `record_goal_turn` when token_budget is
+        // exhausted) gets a scheduler visit even if its owning goal
+        // is no longer `active` (e.g. `budget_limited`) and it has no
+        // active loop. Without this sweep the wrap-up remains queued
+        // indefinitely for goal-only AppUI sessions because the
+        // loop+goal scans above gate on active status.
+        // #1145 codex P1 follow-up: filter the pending-queue sweep so
+        // a paused/cleared goal or paused/deleted loop with a queued
+        // continuation doesn't get woken by the scheduler. The
+        // existing control paths (pause/clear/delete) don't cancel
+        // queued items, so we filter here at scheduling time.
+        if targets.len() < max_items {
+            let mut seen_sessions: std::collections::HashSet<SessionKey> = targets
+                .iter()
+                .map(|(session_id, _)| session_id.clone())
+                .collect();
+            for item in state.continuations.pending_items() {
+                if profile_filter.is_some_and(|profile_id| item.profile_id.as_str() != profile_id) {
+                    continue;
+                }
+                if !pending_continuation_is_schedulable(&state, item) {
+                    continue;
+                }
+                let session_key = SessionKey(item.session_id.as_str().to_owned());
+                if seen_sessions.insert(session_key.clone()) {
+                    targets.push((session_key, item.profile_id.as_str().to_owned()));
+                    if targets.len() >= max_items {
+                        break;
+                    }
+                }
+            }
+        }
         targets
     }
 
@@ -2786,6 +2820,88 @@ fn enqueue_and_persist_continuation(
 /// `record_goal_turn` stamped `last_continued_at_ms = now`, which the
 /// 30s min-delay always denies — so active goals only ever fired
 /// their initial continuation and silently stopped.
+/// #1145 codex P1 follow-up — decide whether a pending master
+/// continuation should still be exposed to the AppUI scheduler.
+/// Goal/loop continuations are filtered when their owning record has
+/// been paused/cleared/deleted so the new pending-queue sweep
+/// (#1141) doesn't reanimate stale autonomy work. Continuations
+/// without an owning goal/loop (e.g. `ChildCompleted`, `External`)
+/// pass through — they were the original wrap-up-style use case for
+/// the sweep.
+fn pending_continuation_is_schedulable(
+    state: &AutonomyRuntimeState,
+    item: &QueuedMasterContinuation,
+) -> bool {
+    match &item.reason {
+        MasterContinuationReason::LoopFire => {
+            // Loop is identified by `loop_id` (string). Skip if the
+            // loop record is absent, deleted, or paused.
+            let Some(loop_id) = item.loop_id.as_ref() else {
+                return true;
+            };
+            let Some(loop_record) = state.loops.get(loop_id.as_str()) else {
+                return false;
+            };
+            matches!(loop_record.status.as_str(), "active")
+        }
+        MasterContinuationReason::GoalContinue => {
+            // Goals are session-scoped. Skip if the goal is paused,
+            // cleared, complete, or absent.
+            let session_key = SessionKey(item.session_id.as_str().to_owned());
+            let Some(goal) = state.goals.get(&session_key) else {
+                return false;
+            };
+            // #1145 codex P2 re-review #2: enforce goal-id identity
+            // BEFORE the legacy wrap-up exemption. When the user
+            // cleared the old goal and created a different one for
+            // the same `SessionKey`, the stale legacy wrap-up still
+            // carries the old `goal_id`. Without this check, the
+            // wrap-up exemption below would bypass the identity
+            // guard and wake the session against the new goal,
+            // letting the stale wrap-up render against an
+            // unrelated objective.
+            if let Some(item_goal_id) = item.goal_id.as_ref() {
+                if item_goal_id.as_str() != goal.goal_id {
+                    return false;
+                }
+            }
+            // #1145 codex P2 re-review: pre-#1131 wrap-up turns were
+            // queued as `GoalContinue` + `wrap_up_prompt` metadata,
+            // and the prompt renderer promotes that shape at render
+            // time (see `legacy_goal_continue_with_wrap_up_metadata_promotes_to_wrap_up`).
+            // After budget exhaustion the owning goal is
+            // `budget_limited`, so the active-only gate would
+            // strand legacy persisted wrap-ups indefinitely.
+            // Detect the legacy shape and let it through — the goal
+            // record's id already matched above.
+            if item.metadata.contains_key("wrap_up_prompt") || item.metadata.contains_key("wrap_up")
+            {
+                return true;
+            }
+            matches!(goal.status.as_str(), "active")
+        }
+        MasterContinuationReason::GoalWrapUp => {
+            // Wrap-up is the explicit terminal goal turn — must drain
+            // even when the goal is `budget_limited`. Skip only if
+            // the goal has since been cleared (operator nuked it
+            // mid-wrap-up) OR was replaced by a different goal.
+            let session_key = SessionKey(item.session_id.as_str().to_owned());
+            let Some(goal) = state.goals.get(&session_key) else {
+                return false;
+            };
+            if let Some(item_goal_id) = item.goal_id.as_ref() {
+                if item_goal_id.as_str() != goal.goal_id {
+                    return false;
+                }
+            }
+            true
+        }
+        // ChildCompleted, ScatterJoinComplete, External — no owning
+        // goal/loop record to inspect, pass through.
+        _ => true,
+    }
+}
+
 fn enqueue_due_goal_continuations(
     state: &mut AutonomyRuntimeState,
     session_id: &SessionKey,
@@ -6155,6 +6271,175 @@ mod tests {
         // emit a duplicate wrap-up.
         orchestrator.record_goal_turn(&session_id, "tenant-a", 100, 1);
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// #1141 — when an AppUI goal turn exhausts `token_budget`,
+    /// `record_goal_turn` transitions the goal to `budget_limited` and
+    /// enqueues a one-shot wrap-up continuation. For a goal-only AppUI
+    /// session (no loop) the only way the scheduler can drain that
+    /// wrap-up is for `due_loop_targets` to surface the session — but
+    /// the active-goal scan gates on `status == "active"`, which
+    /// `budget_limited` is not. The Option B fix sweeps the master
+    /// continuation queue itself so any session with a pending
+    /// continuation still gets a scheduler visit.
+    #[test]
+    fn due_loop_targets_includes_pending_wrap_up_for_budget_limited_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-budget-wrapup");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust then expect wrap-up scheduling".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain whatever the `set_goal` lifecycle queued so the only
+        // pending continuation after exhaustion below is the wrap-up.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Force tokens_used near the budget and record a turn that
+        // exhausts it — this transitions the goal to `budget_limited`
+        // AND enqueues the wrap-up continuation.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 200, 5);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "post-exhaustion goal must be `budget_limited`, not `active`",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "exhausting the budget must enqueue exactly one wrap-up continuation",
+        );
+
+        // Pre-fix this returned an empty vec: the goal-status gate
+        // excludes `budget_limited` and there is no loop for this
+        // session, so the wrap-up would have sat pending indefinitely.
+        let targets = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            targets.contains(&(session_id.clone(), "tenant-a".to_owned())),
+            "due_loop_targets must surface a session with a pending wrap-up \
+             continuation even when its goal is `budget_limited`, got {targets:?}",
+        );
+
+        // And the drain path for that session must actually return the
+        // wrap-up — i.e. the scheduler visit translates into useful
+        // work (not a no-op pickup).
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+    }
+
+    /// #1141 — `due_loop_targets` must respect `profile_filter` when
+    /// sweeping the master continuation queue: a pending continuation
+    /// for profile B must not surface under a query scoped to
+    /// profile A.
+    #[test]
+    fn due_loop_targets_pending_sweep_respects_profile_filter() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_a = SessionKey::with_profile("tenant-a", "api", "goal-a");
+        let session_b = SessionKey::with_profile("tenant-b", "api", "goal-b");
+        for (session, tenant) in [(&session_a, "tenant-a"), (&session_b, "tenant-b")] {
+            orchestrator
+                .set_goal(GoalSetRequest {
+                    session_id: session.clone(),
+                    profile_id: tenant.into(),
+                    objective: "wrap-up profile gating".into(),
+                    status: Some("active".into()),
+                    token_budget: Some(1_000),
+                    transition_actor: None,
+                })
+                .expect("set active goal");
+            let _ = orchestrator.drain_ready_continuations_for_session(
+                session,
+                tenant,
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            orchestrator.force_goal_tokens_used_for_test(session, 900);
+            orchestrator.record_goal_turn(session, tenant, 200, 5);
+        }
+
+        let targets_a = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(targets_a.contains(&(session_a.clone(), "tenant-a".to_owned())));
+        assert!(
+            !targets_a
+                .iter()
+                .any(|(_, profile_id)| profile_id == "tenant-b"),
+            "profile_filter must exclude other tenants' pending wrap-ups, got {targets_a:?}",
+        );
+    }
+
+    /// #1145 codex P1 follow-up: the pending-queue sweep must FILTER
+    /// stale continuations whose owning goal/loop has been
+    /// paused/cleared/deleted. Otherwise pausing a goal mid-flight
+    /// (with a queued GoalContinue) would silently wake the
+    /// continuation on the next AppUI tick, despite the user's
+    /// pause intent.
+    #[test]
+    fn due_loop_targets_pending_sweep_filters_paused_goal_continuations() {
+        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "paused-goal-stale");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "will be paused mid-flight".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial continuation queued by set_goal.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // Hand-enqueue a GoalContinue (simulating the next scheduled
+        // continuation before the user pauses).
+        {
+            let mut state = orchestrator.state();
+            let request = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id("stale-goal-id")
+            .with_metadata("objective", "stale".to_owned());
+            let _ = enqueue_and_persist_continuation(&mut state, request);
+            // Pause the goal AFTER the continuation was queued.
+            state
+                .goals
+                .get_mut(&session_id)
+                .expect("goal exists")
+                .status = "paused".to_owned();
+        }
+        // With the goal now paused, the scheduler MUST NOT include
+        // this session even though it has a pending continuation.
+        let targets = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            !targets.iter().any(|(s, _)| s == &session_id),
+            "paused goal with pending GoalContinue must not appear in due targets (got {targets:?})",
+        );
     }
 
     /// #1131 — when the budget-exhaustion wrap-up turn is dispatched,

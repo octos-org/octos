@@ -584,6 +584,29 @@ impl MasterContinuationScheduler {
             .count()
     }
 
+    /// #1141 — yield every distinct `(session_id, profile_id)` pair
+    /// that still has at least one pending continuation in the master
+    /// queue. The scheduler in `due_loop_targets` uses this to ensure
+    /// wrap-up turns (which can outlive their owning goal's `active`
+    /// status — e.g. after token-budget exhaustion transitions the
+    /// goal to `budget_limited`) still get a scheduler visit. The
+    /// loop+goal scans alone would skip such sessions because they
+    /// gate on `goal.status == "active"`.
+    pub(crate) fn pending_sessions(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.pending_by_key
+            .values()
+            .map(|item| (item.session_id.as_str(), item.profile_id.as_str()))
+    }
+
+    /// #1145 codex P1 follow-up — iterate over every pending
+    /// continuation so callers can filter by reason/goal_id/loop_id
+    /// before deciding to schedule a tick. The orchestrator uses this
+    /// to skip stale `GoalContinue`/`LoopFire` items whose owning
+    /// goal/loop has since been paused, cleared, or deleted.
+    pub(crate) fn pending_items(&self) -> impl Iterator<Item = &QueuedMasterContinuation> + '_ {
+        self.pending_by_key.values()
+    }
+
     fn discard_stale_heap_entries(&mut self) {
         while self
             .heap
