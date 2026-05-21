@@ -140,7 +140,7 @@ async fn should_wire_prompt_context_manager_into_delegated_child() {
     let factory_requests = requests.clone();
 
     let tool = DelegateTool::new(llm("done"), memory, PathBuf::from(dir.path()))
-        .with_task_supervisor(supervisor, "api:test-session")
+        .with_task_supervisor(supervisor.clone(), "api:test-session")
         .with_child_prompt_context_manager_factory(Arc::new(move |request| {
             factory_requests
                 .lock()
@@ -172,20 +172,84 @@ async fn should_wire_prompt_context_manager_into_delegated_child() {
         request.parent_session_key.as_deref(),
         Some("api:test-session")
     );
-    // #1126 codex P1: DelegateTool MUST pass `None` so the factory
-    // derives a unique child session key (mirrors SpawnTool). The
-    // previous shape forwarded the parent key, which made the child
-    // bridge persist its forked context onto the parent's ledger and
-    // let resume/audit observe a truncated child fork in place of the
-    // parent transcript.
+    // #1132: when a TaskSupervisor is wired, DelegateTool MUST forward
+    // the supervisor-registered `child_session_key` so the persisted
+    // context ledger and the supervisor's task ledger share the same
+    // key. Synthesising a separate `parent#spawn-delegate-N` key
+    // (PR #1126) caused audit/resume paths that follow
+    // `child_session_key` to miss the delegated worker's forked context.
+    let registered_tasks = supervisor.get_tasks_for_session("api:test-session");
+    assert_eq!(registered_tasks.len(), 1, "register must record one task");
+    let registered = &registered_tasks[0];
+    let expected_child_key = format!("api:test-session#child-{}", registered.id);
+    assert_eq!(
+        request.child_session_key.as_deref(),
+        Some(expected_child_key.as_str()),
+        "child_session_key must match the supervisor-derived key (got {:?}, expected {:?})",
+        request.child_session_key,
+        expected_child_key,
+    );
+    assert_eq!(
+        registered.child_session_key.as_deref(),
+        Some(expected_child_key.as_str()),
+        "supervisor must persist the same child_session_key it forwarded to the factory"
+    );
+    assert_eq!(request.task_id.as_deref(), Some(registered.id.as_str()));
+    assert_eq!(request.worker_id, "delegate-0");
+    assert_eq!(request.task_label, "managed-delegate");
+}
+
+#[tokio::test]
+async fn should_pass_none_child_session_key_when_supervisor_absent() {
+    // #1132: legacy / standalone path — when no TaskSupervisor is wired
+    // there is no registered BackgroundTask to read a key from, so
+    // DelegateTool must fall back to `None` and let the factory mint a
+    // unique key (mirrors the SpawnTool path).
+    let dir = TempDir::new().unwrap();
+    let memory = memory(&dir).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests: Arc<std::sync::Mutex<Vec<ChildPromptContextRequest>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_calls = calls.clone();
+    let factory_requests = requests.clone();
+
+    let tool = DelegateTool::new(llm("done"), memory, PathBuf::from(dir.path()))
+        .with_child_prompt_context_manager_factory(Arc::new(move |request| {
+            factory_requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request);
+            Some(Arc::new(RecordingPromptContextManager {
+                calls: factory_calls.clone(),
+            }))
+        }));
+
+    let result = tool
+        .execute(&serde_json::json!({
+            "task": "delegate without supervisor",
+            "label": "standalone-delegate"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.success, "child should succeed: {}", result.output);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let captured = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0];
+    assert!(
+        request.parent_session_key.is_none(),
+        "no supervisor means no parent session key (got {:?})",
+        request.parent_session_key,
+    );
     assert!(
         request.child_session_key.is_none(),
-        "child_session_key must be None so the factory mints a unique child key (got {:?})",
+        "without a supervisor the fallback must keep child_session_key=None (got {:?})",
         request.child_session_key,
     );
     assert!(request.task_id.is_some());
     assert_eq!(request.worker_id, "delegate-0");
-    assert_eq!(request.task_label, "managed-delegate");
+    assert_eq!(request.task_label, "standalone-delegate");
 }
 
 #[tokio::test]
