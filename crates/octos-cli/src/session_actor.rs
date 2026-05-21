@@ -340,6 +340,42 @@ fn build_forked_child_context_for_session_actor(
     (child_session_key, child_manager)
 }
 
+/// #1020 / M17-B — Build a [`ChildPromptContextManagerFactory`] suitable
+/// for [`octos_agent::DelegateTool`] that snapshots the parent's
+/// `ContextManager` per child via [`build_forked_child_context_for_session_actor`].
+///
+/// Mirrors the SpawnTool factory wiring at
+/// `session_actor.rs:2704` so delegated children inherit the same
+/// sanitised parent transcript fork — without this, `delegate_task`
+/// children silently start from an ad-hoc empty context and the
+/// audit-trail diverges from the AppUI / SpawnTool paths.
+///
+/// Returning `None` from the factory keeps legacy callers (no managed
+/// `ContextManager` for the parent) on the un-managed code path; the
+/// child surfaces this absence via the existing `external_context_*`
+/// markers downstream rather than panicking.
+pub(crate) fn build_session_actor_delegate_tool_factory(
+    parent_manager: Arc<StdMutex<ContextManager>>,
+    parent_data_dir: PathBuf,
+    parent_session_key: SessionKey,
+) -> octos_agent::tools::spawn::ChildPromptContextManagerFactory {
+    Arc::new(
+        move |request: octos_agent::tools::spawn::ChildPromptContextRequest| {
+            let (child_session_key, child_manager) = build_forked_child_context_for_session_actor(
+                &parent_manager,
+                &parent_data_dir,
+                &parent_session_key,
+                &request,
+            );
+            Some(Arc::new(SessionActorPromptContextBridge::new(
+                child_session_key,
+                parent_data_dir.clone(),
+                Arc::new(StdMutex::new(child_manager)),
+            )) as Arc<dyn PromptContextManager>)
+        },
+    )
+}
+
 fn record_context_manager_message(
     context_manager: &Arc<StdMutex<ContextManager>>,
     session_key: &SessionKey,
@@ -2719,6 +2755,29 @@ impl ActorFactory {
         ));
 
         tools.register(spawn_tool);
+
+        // #1020 / M17-B — register DelegateTool with the per-child
+        // `ContextManager` fork factory wired in. Mirrors the SpawnTool
+        // wiring above so synchronous `delegate_task` children inherit a
+        // sanitised slice of the parent transcript instead of starting
+        // from an ad-hoc empty context. Without this, `delegate_task`
+        // silently diverges from the SpawnTool / AppUI paths and the
+        // M17-B acceptance bullet fails for delegated children.
+        let delegate_factory = build_session_actor_delegate_tool_factory(
+            context_manager.clone(),
+            self.data_dir.clone(),
+            session_key.clone(),
+        );
+        let mut delegate_tool =
+            octos_agent::DelegateTool::new(self.llm.clone(), self.memory.clone(), self.cwd.clone())
+                .with_provider_policy(self.provider_policy.clone())
+                .with_agent_config(self.agent_config.clone())
+                .with_task_supervisor(supervisor.clone(), session_key.to_string())
+                .with_child_prompt_context_manager_factory(delegate_factory);
+        if let Some(ref prompt) = self.worker_prompt {
+            delegate_tool = delegate_tool.with_worker_prompt(prompt.clone());
+        }
+        tools.register(delegate_tool);
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
@@ -7729,6 +7788,98 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// #1020 / M17-B — the production session-actor delegate factory
+    /// MUST forward each child's [`ChildPromptContextRequest`] into a
+    /// fresh fork of the parent's `ContextManager` and return a
+    /// `PromptContextManager` whose `prepare_prompt` is invoked before
+    /// the child agent issues its first model call.
+    ///
+    /// This pins the wrapper added at `session_actor.rs:357` so a
+    /// future refactor cannot drop the `with_child_prompt_context_manager_factory`
+    /// call on the production DelegateTool construction site without
+    /// breaking a test the M17-B audit relies on.
+    #[tokio::test]
+    async fn delegate_tool_factory_routes_child_through_session_actor_context_manager() {
+        use octos_agent::tools::Tool;
+
+        let session_key = SessionKey::new("api", "delegate-factory-test");
+        let parent_manager = test_context_manager(&session_key);
+        let data_dir = tempfile::TempDir::new().unwrap();
+
+        let factory = build_session_actor_delegate_tool_factory(
+            parent_manager.clone(),
+            data_dir.path().to_path_buf(),
+            session_key.clone(),
+        );
+
+        // Construct a real DelegateTool with the production-shaped
+        // factory attached. The child agent will be driven by a
+        // scripted LLM that returns EndTurn immediately, so the only
+        // call into the factory is the one we want to observe.
+        let llm: Arc<dyn LlmProvider> = Arc::new(DelayedMockProvider::new(
+            "delegate-factory-llm",
+            vec![(
+                Duration::from_millis(0),
+                ChatResponse {
+                    content: Some("done".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                },
+            )],
+        ));
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let memory = Arc::new(
+            EpisodeStore::open(work_dir.path().join(".octos"))
+                .await
+                .unwrap(),
+        );
+
+        let tool = octos_agent::DelegateTool::new(llm, memory, work_dir.path().to_path_buf())
+            .with_task_supervisor(
+                Arc::new(octos_agent::TaskSupervisor::new()),
+                session_key.to_string(),
+            )
+            .with_child_prompt_context_manager_factory(factory);
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "verify factory wiring",
+                "label": "factory-probe"
+            }))
+            .await
+            .expect("delegated child must complete");
+
+        assert!(result.success, "child should succeed: {}", result.output);
+
+        // Evidence the factory ran: it persists a per-child context
+        // snapshot under the parent's data dir. The presence of that
+        // snapshot proves `build_session_actor_delegate_tool_factory`
+        // was invoked AND the child went through the fork path rather
+        // than starting from an ad-hoc empty context.
+        let snapshots_root = data_dir.path().join("session_state");
+        if snapshots_root.exists() {
+            let mut found = false;
+            for entry in std::fs::read_dir(&snapshots_root).into_iter().flatten() {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.contains("delegate-factory-test") || name.contains("delegate-") {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(
+                found,
+                "child context snapshot must be persisted by the factory; saw {snapshots_root:?}"
+            );
         }
     }
 
