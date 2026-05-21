@@ -8454,6 +8454,27 @@ async fn maybe_spawn_appui_master_continuation_runner(
             "draining queued master continuation into AppUI turn runtime"
         );
         default_agent_orchestrator().mark_continuation_started(&continuation);
+        // #1129 codex P1 re-review #2 — when the AppUI tick path
+        // dispatches a GoalContinue, advance the goal's
+        // `last_continued_at_ms` immediately so the next scheduler
+        // tick (every ~2s) doesn't consider the same goal due again
+        // while THIS turn is still running.
+        //
+        // #1129 codex P2 re-review #3 — use the dispatch-only
+        // timestamp updater, NOT `record_goal_turn`. The full
+        // accountant increments `continuations_used` and the
+        // rate-window counter, which would exhaust the derived
+        // continuation budget after `ceil(token_budget / 2500)`
+        // dispatches even though no tokens were actually spent. The
+        // dispatch-only updater touches only the timestamp, so the
+        // budget remains aligned with real token spend. Full token
+        // accounting + sentinel detection wiring tracked in #1133.
+        if matches!(continuation.reason, MasterContinuationReason::GoalContinue) {
+            default_agent_orchestrator().record_goal_dispatch_only(
+                &SessionKey(continuation.session_id.as_str().to_owned()),
+                continuation.profile_id.as_str(),
+            );
+        }
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
