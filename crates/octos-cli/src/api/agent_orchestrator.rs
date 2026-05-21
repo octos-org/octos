@@ -6802,11 +6802,7 @@ mod tests {
             .with_goal_id(goal_id.clone());
             enqueue_and_persist_continuation(&mut state, request);
             // Pause the goal — same goal_id stays in state.goals.
-            state
-                .goals
-                .get_mut(&session_id)
-                .expect("goal")
-                .status = "paused".to_owned();
+            state.goals.get_mut(&session_id).expect("goal").status = "paused".to_owned();
         }
 
         // Drain — the predicate marks this unschedulable (goal
@@ -6824,11 +6820,7 @@ mod tests {
         // tombstoned the dedupe_key.
         {
             let mut state = orchestrator.state();
-            state
-                .goals
-                .get_mut(&session_id)
-                .expect("goal")
-                .status = "active".to_owned();
+            state.goals.get_mut(&session_id).expect("goal").status = "active".to_owned();
             let request = MasterContinuationRequest::new(
                 "coding-autonomy-goal",
                 session_id.to_string(),
