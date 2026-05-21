@@ -14,7 +14,16 @@ use serde::Deserialize;
 
 use crate::context::PipelineContext;
 use crate::discovery::PipelineDiscovery;
-use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineStatusBridge};
+use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineResult, PipelineStatusBridge};
+use crate::run_dir::{PipelineRunSummary, RunDir};
+use octos_core::TokenUsage;
+
+/// #1020 / M17-B — reason string stamped onto every pipeline run's
+/// `summary.json` because pipeline workers do not yet propagate the
+/// parent's `ContextManager`. Evidence validators look for this reason
+/// to confirm the acceptance bullet is satisfied.
+pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
+    "pipeline workers don't yet propagate ContextManager (M17-B)";
 
 /// Tool that runs DOT-based pipelines.
 pub struct RunPipelineTool {
@@ -360,6 +369,13 @@ impl Tool for RunPipelineTool {
             "run_pipeline invoked"
         );
 
+        // #1020 / M17-B: capture run start so we can stamp the summary's
+        // `start_time` field with the same instant the pipeline launched.
+        // RFC3339 keeps the audit-trail JSON human-readable.
+        let run_started_at = std::time::SystemTime::now();
+        let run_start_rfc3339 = systemtime_to_rfc3339(run_started_at);
+        let pipeline_started = std::time::Instant::now();
+
         let dot_content = self.resolve_with_fallback(&input.pipeline).await?;
 
         let status_bridge = self
@@ -420,13 +436,50 @@ impl Tool for RunPipelineTool {
         // Signal shutdown to all workers regardless of how we finished
         shutdown.store(true, std::sync::atomic::Ordering::Release);
 
-        let result = result.map_err(|_| {
-            eyre::eyre!(
-                "pipeline timed out after {}s (timeout_secs={})",
-                timeout_secs,
-                timeout_secs
-            )
-        })??;
+        // #1126 codex P2: compute the run_id + graph_id BEFORE we
+        // branch on success vs timeout. The marker write must happen
+        // on the timeout path too (the prior shape only emitted on
+        // success), otherwise timed-out runs were the one scenario
+        // missing audit-trail evidence — exactly the runs validators
+        // most need to inspect.
+        let graph_id = graph_id_from_dot(&dot_content);
+        let run_id = generate_run_id(&graph_id, run_started_at);
+
+        let result = match result {
+            Ok(inner) => inner?,
+            Err(_) => {
+                let duration_ms =
+                    u64::try_from(pipeline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                emit_external_context_unmanaged_timeout_summary(
+                    &self.working_dir,
+                    &run_id,
+                    &graph_id,
+                    duration_ms,
+                    &run_start_rfc3339,
+                    timeout_secs,
+                );
+                return Err(eyre::eyre!(
+                    "pipeline timed out after {}s (timeout_secs={})",
+                    timeout_secs,
+                    timeout_secs
+                ));
+            }
+        };
+
+        // #1020 / M17-B: stamp the run's `summary.json` with the
+        // `external_context_unmanaged` marker so evidence validators can
+        // confirm pipeline workers ran without the parent's ContextManager
+        // propagated. Failures are logged at WARN and never bubble up:
+        // missing audit trail must not regress the user-visible outcome.
+        let duration_ms = u64::try_from(pipeline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        emit_external_context_unmanaged_summary(
+            &self.working_dir,
+            &run_id,
+            &graph_id,
+            &result,
+            duration_ms,
+            &run_start_rfc3339,
+        );
 
         let summary = result
             .node_summaries
@@ -521,6 +574,251 @@ impl Tool for RunPipelineTool {
             named_outputs: None,
         })
     }
+}
+
+/// #1020 / M17-B — Build a [`PipelineRunSummary`] stamped with the
+/// `external_context_unmanaged` marker for a completed pipeline run.
+///
+/// `RunPipelineTool` constructs this for every run because pipeline
+/// workers don't yet propagate the parent's `ContextManager` — workers
+/// run with per-node prompt context instead. Evidence validators look
+/// for `context_mode = "external_context_unmanaged"` plus the reason
+/// string to confirm M17-B's acceptance bullet is satisfied.
+///
+/// `start_time_rfc3339` should be a caller-supplied RFC3339 timestamp
+/// (the pipeline-run start) so the summary on disk is comparable across
+/// runs and matches the `RunDir` audit trail. We accept it as a string
+/// to keep this helper dependency-free of `chrono`.
+pub(crate) fn build_pipeline_run_summary(
+    graph_id: impl Into<String>,
+    result: &PipelineResult,
+    duration_ms: u64,
+    start_time_rfc3339: impl Into<String>,
+) -> PipelineRunSummary {
+    PipelineRunSummary {
+        graph_id: graph_id.into(),
+        success: result.success,
+        duration_ms,
+        total_tokens: result.token_usage.clone(),
+        nodes_executed: result.node_summaries.len(),
+        start_time: start_time_rfc3339.into(),
+        context_mode: None,
+        context_reason: None,
+    }
+    .with_external_context_unmanaged(PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON)
+}
+
+/// #1126 codex P2 follow-up to #1020 / M17-B — write a `summary.json`
+/// for the timeout failure path. Without this, runs that hit the
+/// pipeline-level timeout had no audit-trail marker at all, even
+/// though pipeline workers had been launched and consumed budget.
+/// Records `success: false`, a `duration_ms` equal to the elapsed
+/// wall-clock at the timeout boundary, zero node summaries, and the
+/// same `external_context_unmanaged` marker so validators see a
+/// consistent shape for both success and failure paths.
+fn emit_external_context_unmanaged_timeout_summary(
+    working_dir: &std::path::Path,
+    run_id: &str,
+    graph_id: &str,
+    duration_ms: u64,
+    start_time_rfc3339: &str,
+    timeout_secs: u64,
+) {
+    let run_dir = match RunDir::new(working_dir, run_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "failed to open run dir for M17-B timeout summary; skipping"
+            );
+            return;
+        }
+    };
+    let reason = format!(
+        "{PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON}; pipeline timed out after {timeout_secs}s"
+    );
+    let summary = PipelineRunSummary {
+        graph_id: graph_id.to_string(),
+        success: false,
+        duration_ms,
+        total_tokens: TokenUsage::default(),
+        nodes_executed: 0,
+        start_time: start_time_rfc3339.to_string(),
+        context_mode: None,
+        context_reason: None,
+    }
+    .with_external_context_unmanaged(reason);
+    if let Err(error) = run_dir.write_summary(&summary) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "failed to write M17-B timeout summary; downstream evidence validators may flag this run"
+        );
+    }
+}
+
+/// #1020 / M17-B — write a `summary.json` carrying the
+/// `external_context_unmanaged` marker to the run's `.octos/runs/<run_id>/`
+/// directory. Failures are logged at WARN and never propagated so the
+/// pipeline's user-visible outcome is unchanged when the audit-trail
+/// write fails (e.g. read-only filesystem during tests).
+fn emit_external_context_unmanaged_summary(
+    working_dir: &std::path::Path,
+    run_id: &str,
+    graph_id: &str,
+    result: &PipelineResult,
+    duration_ms: u64,
+    start_time_rfc3339: &str,
+) {
+    let run_dir = match RunDir::new(working_dir, run_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "failed to open run dir for M17-B context-mode summary; skipping"
+            );
+            return;
+        }
+    };
+    let summary = build_pipeline_run_summary(graph_id, result, duration_ms, start_time_rfc3339);
+    if let Err(error) = run_dir.write_summary(&summary) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "failed to write M17-B context-mode summary; downstream evidence validators may flag this run"
+        );
+    }
+}
+
+/// Extract the graph identifier from the resolved DOT body. Falls back
+/// to `"pipeline"` when the header lacks an explicit name (matches the
+/// sanitiser's `digraph { ... }` -> `digraph pipeline { ... }` rewrite).
+fn graph_id_from_dot(dot_content: &str) -> String {
+    let header = dot_content
+        .trim_start()
+        .strip_prefix("digraph")
+        .map(|rest| rest.trim_start())
+        .unwrap_or("");
+    let candidate: String = header
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if candidate.is_empty() {
+        "pipeline".to_string()
+    } else {
+        candidate
+    }
+}
+
+/// Build a filesystem-safe run id of the form
+/// `<graph_id>-<unix_secs>-<nanos>-<pid>-<counter>`.
+/// Matches the `validate_pipeline_id` constraint (no `/`, `\`, `..`, control
+/// chars, <= 128 bytes) and stays unique across simultaneous runs of the
+/// same pipeline so two writers do not race on `summary.json`.
+///
+/// #1126 codex P2: the prior shape `{graph}-{secs}-{pid}` collided when
+/// two `run_pipeline` calls for the same graph started in the same
+/// second within the same process. Nanosecond resolution + a
+/// per-process monotonic counter make collision practically impossible
+/// even for back-to-back synchronous fan-out.
+fn generate_run_id(graph_id: &str, started_at: std::time::SystemTime) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let (secs, nanos) = started_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let pid = std::process::id();
+    let counter = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Sanitize graph_id defensively — `graph_id_from_dot` already strips
+    // unsafe chars but a caller-provided value could be anything.
+    let safe_graph: String = graph_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    let candidate = format!("{safe_graph}-{secs}-{nanos:09}-{pid}-{counter}");
+    if candidate.is_empty() || candidate.len() > 128 {
+        format!("pipeline-{secs}-{nanos:09}-{pid}-{counter}")
+    } else {
+        candidate
+    }
+}
+
+/// Format a `SystemTime` as a coarse RFC3339 timestamp without pulling
+/// in `chrono`. Falls back to the unix epoch on clock skew.
+fn systemtime_to_rfc3339(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Inline a minimal date renderer: we only need year/month/day/hour/min/sec
+    // for the audit trail. `chrono` is intentionally not pulled in here —
+    // keeping octos-pipeline's deps unchanged is a hard rule for #1020.
+    let (year, month, day, hour, min, sec) = unix_secs_to_ymdhms(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Convert unix seconds (UTC) into (year, month, day, hour, minute, second).
+/// Handles dates from 1970-01-01 through 9999-12-31. Returns the epoch on
+/// negative values (clock skew).
+fn unix_secs_to_ymdhms(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    if secs < 0 {
+        return (1970, 1, 1, 0, 0, 0);
+    }
+    let total_secs = secs as u64;
+    let sec = (total_secs % 60) as u32;
+    let total_mins = total_secs / 60;
+    let min = (total_mins % 60) as u32;
+    let total_hours = total_mins / 60;
+    let hour = (total_hours % 24) as u32;
+    let mut days = (total_hours / 24) as i64;
+
+    // Compute year/month/day from days-since-epoch (1970-01-01).
+    let mut year: i32 = 1970;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let year_days = if leap { 366 } else { 365 };
+        if days < year_days as i64 {
+            break;
+        }
+        days -= year_days as i64;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let month_lens: [u32; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month: u32 = 1;
+    for &m_len in &month_lens {
+        if days < m_len as i64 {
+            break;
+        }
+        days -= m_len as i64;
+        month += 1;
+    }
+    let day = (days as u32) + 1;
+    (year, month, day, hour, min, sec)
 }
 
 /// Project a non-empty slice of [`NodeCost`] rows into the
@@ -645,5 +943,183 @@ mod tests {
     #[test]
     fn node_costs_metadata_returns_none_for_empty_rows() {
         assert!(node_costs_metadata(&[]).is_none());
+    }
+
+    /// #1020 / M17-B — `build_pipeline_run_summary` MUST stamp the
+    /// summary with `context_mode = "external_context_unmanaged"` plus
+    /// the canonical M17-B reason string. Evidence validators grep
+    /// these fields off `summary.json`, so any drift here silently
+    /// breaks the M17-B acceptance bullet for `run_pipeline`.
+    #[test]
+    fn build_pipeline_run_summary_stamps_external_context_unmanaged_marker() {
+        use octos_core::TokenUsage;
+        let result = PipelineResult {
+            output: "ok".into(),
+            success: true,
+            token_usage: TokenUsage::default(),
+            node_summaries: Vec::new(),
+            files_modified: Vec::new(),
+            node_costs: Vec::new(),
+        };
+        let summary =
+            build_pipeline_run_summary("test_pipeline", &result, 1234, "2026-05-20T17:00:00Z");
+        assert_eq!(summary.graph_id, "test_pipeline");
+        assert_eq!(
+            summary.context_mode.as_deref(),
+            Some("external_context_unmanaged"),
+            "every run_pipeline summary must carry the M17-B marker"
+        );
+        assert_eq!(
+            summary.context_reason.as_deref(),
+            Some(PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON),
+            "the marker reason must match the canonical M17-B constant"
+        );
+        // The serialized JSON form is what evidence validators actually
+        // see on disk — assert the wire shape directly.
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("M17-B"),
+            "context_reason should reference M17-B for grep-ability"
+        );
+    }
+
+    /// #1020 / M17-B — `emit_external_context_unmanaged_summary` writes
+    /// the marker-stamped summary to disk under
+    /// `<working_dir>/.octos/runs/<run_id>/summary.json` so the audit
+    /// trail satisfies the M17-B evidence requirement at runtime.
+    #[test]
+    fn emit_external_context_unmanaged_summary_writes_marker_to_disk() {
+        use octos_core::TokenUsage;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let result = PipelineResult {
+            output: "ok".into(),
+            success: true,
+            token_usage: TokenUsage::default(),
+            node_summaries: Vec::new(),
+            files_modified: Vec::new(),
+            node_costs: Vec::new(),
+        };
+        emit_external_context_unmanaged_summary(
+            dir.path(),
+            "deep_research-1747800000-12345",
+            "deep_research",
+            &result,
+            5000,
+            "2026-05-20T17:00:00Z",
+        );
+        let summary_path = dir
+            .path()
+            .join(".octos/runs/deep_research-1747800000-12345/summary.json");
+        assert!(
+            summary_path.exists(),
+            "RunPipelineTool must persist summary.json with the M17-B marker"
+        );
+        let contents = std::fs::read_to_string(&summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert_eq!(json["graph_id"], "deep_research");
+        assert_eq!(
+            json["context_reason"], PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON,
+            "summary.json must carry the canonical M17-B reason"
+        );
+    }
+
+    /// Run-id generator must produce a `validate_pipeline_id`-safe id
+    /// even when the graph_id contains unsafe characters (slash, dot,
+    /// control bytes). Without this defensive sanitization a maliciously
+    /// named pipeline would fail to write `summary.json` and the M17-B
+    /// marker would be silently dropped.
+    #[test]
+    fn generate_run_id_is_pipeline_id_safe() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let id = generate_run_id("ev/il..\\name", t);
+        assert!(crate::graph::validate_pipeline_id(&id).is_ok());
+        // The unix secs anchor + the original name's safe chars should
+        // be preserved so operators can correlate the run with its logs.
+        assert!(id.contains("1700000000"));
+    }
+
+    /// `graph_id_from_dot` extracts the digraph name when present and
+    /// falls back to `"pipeline"` for anonymous graphs. The fallback
+    /// path is what inline-DOT LLM calls use, so missing it would mean
+    /// inline runs write `summary.json` under an empty-string run id —
+    /// which `validate_pipeline_id` rejects.
+    #[test]
+    fn graph_id_from_dot_uses_pipeline_fallback_for_anonymous_graphs() {
+        assert_eq!(
+            graph_id_from_dot("digraph deep_research { a -> b }"),
+            "deep_research"
+        );
+        assert_eq!(graph_id_from_dot("digraph { a -> b }"), "pipeline");
+        assert_eq!(graph_id_from_dot("  digraph  research_42 {"), "research_42");
+    }
+
+    /// #1126 codex P2 acceptance: two run_pipeline calls for the same
+    /// graph that start within the same second in the same process
+    /// must produce DISTINCT run ids so their `summary.json` files do
+    /// NOT race / overwrite. Before this fix the id was
+    /// `{graph}-{secs}-{pid}`, which collided. After: nanos + counter
+    /// make collision practically impossible.
+    #[test]
+    fn generate_run_id_distinguishes_concurrent_runs_in_same_second() {
+        let t = std::time::SystemTime::now();
+        let id1 = generate_run_id("deep_research", t);
+        let id2 = generate_run_id("deep_research", t);
+        assert_ne!(
+            id1, id2,
+            "two run ids minted in the same second for the same graph must differ"
+        );
+    }
+
+    /// #1126 codex P2 acceptance: when a pipeline run times out, a
+    /// `summary.json` with the `external_context_unmanaged` marker
+    /// must still be written so evidence validators can confirm the
+    /// run launched workers. The reason string must include the
+    /// timeout duration.
+    #[test]
+    fn emit_external_context_unmanaged_timeout_summary_writes_marker_to_disk() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        emit_external_context_unmanaged_timeout_summary(
+            dir.path(),
+            "deep_research-1747800000-000000001-12345-0",
+            "deep_research",
+            1_800_000,
+            "2026-05-20T17:00:00Z",
+            1800,
+        );
+        let summary_path = dir
+            .path()
+            .join(".octos/runs/deep_research-1747800000-000000001-12345-0/summary.json");
+        assert!(
+            summary_path.exists(),
+            "timeout path must persist summary.json with M17-B marker"
+        );
+        let contents = std::fs::read_to_string(&summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["success"], false, "timeout summary records failure");
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out"),
+            "context_reason must explicitly mention the timeout for audit",
+        );
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("1800"),
+            "context_reason must include the timeout in seconds",
+        );
     }
 }
