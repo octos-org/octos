@@ -3655,14 +3655,30 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
         ),
-        MasterContinuationReason::GoalContinue => format!(
-            "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
-            goal_id = continuation
+        MasterContinuationReason::GoalContinue => {
+            // #1139 codex P2 follow-up: legacy promotion — wrap-up
+            // continuations queued by the pre-#1131 wire shape (which
+            // used `GoalContinue` + `wrap_up_prompt` metadata) survive
+            // a restart with the old reason. Detect that legacy shape
+            // here and render it as a wrap-up turn so the in-flight
+            // final turn instructs the model to summarize-and-stop
+            // instead of "Advance the goal...". New continuations
+            // queued post-#1131 use `GoalWrapUp` directly; this
+            // promotion is a one-way restore-time fixup.
+            let goal_id = continuation
                 .goal_id
                 .as_ref()
                 .map(|id| id.as_str())
-                .unwrap_or("unknown"),
-        ),
+                .unwrap_or("unknown");
+            if let Some(directive) = continuation.metadata.get("wrap_up_prompt") {
+                return format!(
+                    "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+                );
+            }
+            format!(
+                "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
+            )
+        }
         // #1131 — wrap-up turns must instruct the model to summarize
         // and stop, NOT continue work. Render the per-goal wrap-up
         // directive (stored in metadata by `record_goal_turn`) as
@@ -5919,6 +5935,54 @@ mod tests {
         assert!(
             !rendered.contains("Advance the goal by one bounded step"),
             "rendered prompt must NOT use the GoalContinue 'advance' template; rendered=\n{rendered}",
+        );
+    }
+
+    /// #1139 codex P2 acceptance: a legacy wrap-up continuation
+    /// (queued before #1131 with `GoalContinue` + `wrap_up_prompt`
+    /// metadata, then restored after an upgrade/restart) MUST render
+    /// as a wrap-up directive — NOT as the regular "Advance the goal"
+    /// template. This pins the restore-time promotion in
+    /// `master_continuation_prompt`.
+    ///
+    /// We can't ergonomically hand-build a `QueuedMasterContinuation`
+    /// (private fields), so we drive the legacy-shaped enqueue
+    /// directly: `MasterContinuationRequest::new(GoalContinue, …)`
+    /// with a `wrap_up_prompt` metadata key — exactly what
+    /// pre-#1131 code emitted on budget exhaustion.
+    #[test]
+    fn legacy_goal_continue_with_wrap_up_metadata_promotes_to_wrap_up() {
+        use crate::api::master_continuation_scheduler::MasterContinuationRequest;
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "legacy-wrap-up");
+        let mut state = orchestrator.state();
+        // Hand-enqueue the legacy shape.
+        let legacy = MasterContinuationRequest::new(
+            "coding-autonomy-goal",
+            session_id.to_string(),
+            "tenant-a".to_owned(),
+            MasterContinuationReason::GoalContinue,
+            SystemTime::now(),
+        )
+        .with_goal_id("legacy-goal-id")
+        .with_metadata(
+            "wrap_up_prompt",
+            "LEGACY DIRECTIVE: summarize what you've done and stop.",
+        );
+        let outcome = enqueue_and_persist_continuation(&mut state, legacy);
+        let queued = outcome.queued().expect("legacy enqueue must succeed");
+        let legacy_continuation = queued.clone();
+        drop(state);
+
+        let rendered = master_continuation_prompt(&legacy_continuation);
+        assert!(
+            rendered.contains("LEGACY DIRECTIVE: summarize what you've done and stop."),
+            "legacy promotion must render the persisted wrap-up directive verbatim; rendered=\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Advance the goal by one bounded step"),
+            "legacy promotion must NOT fall through to the regular GoalContinue template; rendered=\n{rendered}",
         );
     }
 

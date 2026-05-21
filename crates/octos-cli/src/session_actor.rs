@@ -3463,14 +3463,27 @@ fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
         ),
-        MasterContinuationReason::GoalContinue => format!(
-            "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
-            goal_id = continuation
+        MasterContinuationReason::GoalContinue => {
+            // #1139 codex P2 follow-up: legacy wrap-up promotion —
+            // mirrors `agent_orchestrator::master_continuation_prompt`.
+            // A continuation queued by the pre-#1131 wire shape used
+            // `GoalContinue` + `wrap_up_prompt` metadata; promote it
+            // at render time so the in-flight final turn instructs
+            // the model to summarize-and-stop.
+            let goal_id = continuation
                 .goal_id
                 .as_ref()
                 .map(|id| id.as_str())
-                .unwrap_or("unknown"),
-        ),
+                .unwrap_or("unknown");
+            if let Some(directive) = continuation.metadata.get("wrap_up_prompt") {
+                return format!(
+                    "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+                );
+            }
+            format!(
+                "[system-internal]\nAn active goal continuation is ready.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\nAdvance the goal by one bounded step. If the goal needs user input, ask a numbered choice question and recommend one option.",
+            )
+        }
         // #1131 — wrap-up turns must instruct the model to summarize
         // and stop, NOT continue work. Render the per-goal wrap-up
         // directive (stored in metadata by `record_goal_turn`) as
