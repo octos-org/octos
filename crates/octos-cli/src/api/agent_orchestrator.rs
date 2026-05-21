@@ -1086,6 +1086,16 @@ impl InProcessAgentOrchestrator {
     ///
     /// Returns true if the timestamp was updated, false if the goal
     /// was not found or the profile didn't match.
+    /// #1129 codex P1 re-review #3 — count the dispatch toward the
+    /// continuation budget + sliding-window cap so AppUI-backed
+    /// active goals can't recur indefinitely. We deliberately do NOT
+    /// bump `tokens_used` here — token spend is observed by the real
+    /// LLM turn (only `SessionActor` records this today; AppUI parity
+    /// is tracked in #1133). Counting dispatch against the
+    /// continuation budget is the conservative interim: the 12/hr
+    /// hard cap fires correctly, and the derived continuation budget
+    /// (`token_budget / 2500`) bounds total fires until token-side
+    /// accounting catches up.
     pub(crate) fn record_goal_dispatch_only(
         &self,
         session_id: &SessionKey,
@@ -1100,6 +1110,13 @@ impl InProcessAgentOrchestrator {
             return false;
         }
         goal.last_continued_at_ms = now;
+        goal.continuations_used = goal.continuations_used.saturating_add(1);
+        if now.saturating_sub(goal.rate_window_start_ms) >= GOAL_RATE_WINDOW_MS {
+            goal.rate_window_start_ms = now;
+            goal.rate_window_count = 1;
+        } else {
+            goal.rate_window_count = goal.rate_window_count.saturating_add(1);
+        }
         goal.updated_at_ms = now;
         let snapshot = goal.clone();
         persist_goal_state(&state, session_id, &snapshot, false);
