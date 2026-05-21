@@ -3843,6 +3843,9 @@ impl SessionActor {
                 reason = master_continuation_reason_name(&continuation.reason),
                 "draining queued master continuation into session actor"
             );
+            let is_goal_turn =
+                matches!(continuation.reason, MasterContinuationReason::GoalContinue);
+            let goal_turn_start = Instant::now();
             default_agent_orchestrator().mark_continuation_started(&continuation);
             // #977 bullet 4 — capture the loop id (if any) BEFORE we
             // consume `continuation` into `synthetic_master_continuation_inbound`,
@@ -3918,8 +3921,69 @@ impl SessionActor {
                 &continuation,
                 Some("processed_by_session_actor".to_owned()),
             );
+            if is_goal_turn {
+                self.maybe_advance_goal_runtime_after_turn(&profile_id, goal_turn_start)
+                    .await;
+            }
         }
         drained
+    }
+
+    /// #979 / M15-C2 — after a goal-driven continuation turn finishes,
+    /// (1) record the turn against the goal's `continuations_used` and
+    /// `time_used_seconds` counters so future fires see the updated
+    /// rate-limit + budget state, (2) detect the model's completion
+    /// sentinel and stop re-queueing if matched, (3) re-queue another
+    /// continuation only when the runtime stays idle AND the per-goal
+    /// policy still allows another fire.
+    ///
+    /// Token tracking is wired through the goal record's `tokens_used`
+    /// only when the orchestrator-level `record_goal_turn` is called
+    /// with a non-zero `tokens_consumed`. The per-turn LLM token usage
+    /// is currently still attributed via existing audit paths; surfacing
+    /// it into this hook is a deliberate follow-up so the first
+    /// production cut closes the recurrence + budget-state-machine
+    /// bullets cleanly without restructuring `process_inbound`.
+    #[cfg(feature = "api")]
+    async fn maybe_advance_goal_runtime_after_turn(
+        &mut self,
+        profile_id: &str,
+        goal_turn_start: Instant,
+    ) {
+        let elapsed_seconds = goal_turn_start.elapsed().as_secs();
+        let orchestrator = default_agent_orchestrator();
+        orchestrator.record_goal_turn(&self.session_key, profile_id, 0, elapsed_seconds);
+        // Capture the most recent assistant turn's text content to feed
+        // the completion-sentinel detector. Reading from the durable
+        // session handle keeps the wiring narrow — `process_inbound`
+        // already persisted the assistant rows before returning.
+        let assistant_tail = {
+            let handle = self.session_handle.lock().await;
+            handle
+                .session()
+                .messages
+                .iter()
+                .rev()
+                .find(|msg| msg.role == octos_core::MessageRole::Assistant)
+                .map(|msg| msg.content.clone())
+                .unwrap_or_default()
+        };
+        if orchestrator.maybe_complete_goal_from_model(
+            &self.session_key,
+            profile_id,
+            &assistant_tail,
+        ) {
+            return;
+        }
+        // Re-queue another continuation only if we are still idle AND
+        // policy allows. The idle gate matches `drain_master_continuations`'s
+        // entry idle gate so a goal turn that filled the inbox does not
+        // immediately enqueue another goal turn ahead of pending user
+        // input.
+        let idle_state = crate::api::goal_loop_runtime::RuntimeIdleState::idle()
+            .with_user_input_pending(!self.inbox.is_empty());
+        let _ =
+            orchestrator.maybe_enqueue_goal_after_turn(&self.session_key, profile_id, idle_state);
     }
 
     #[cfg(not(feature = "api"))]

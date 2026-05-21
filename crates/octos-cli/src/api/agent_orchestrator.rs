@@ -5,9 +5,11 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::goal_loop_runtime::{
-    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, LoopFireContext, LoopFireDecision, LoopFireTrigger,
-    LoopInvocation, LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution,
-    MaintenancePromptSource, SlashCommandAuthorization, WaitUntil, resolve_maintenance_prompt,
+    BUILT_IN_MAINTENANCE_PROMPT, DenyReason, GoalPolicyDecision, GoalRuntime, GoalRuntimePolicy,
+    GoalRuntimeState, LoopFireContext, LoopFireDecision, LoopFireTrigger, LoopInvocation,
+    LoopRuntime, LoopRuntimePolicy, MaintenancePromptResolution, MaintenancePromptSource,
+    NextDueState, RuntimeIdleState as GoalRuntimeIdleState, SlashCommandAuthorization, WaitUntil,
+    resolve_maintenance_prompt,
 };
 use super::master_continuation_scheduler::{
     MasterContinuationEnqueueOutcome, MasterContinuationReason, MasterContinuationRequest,
@@ -54,6 +56,26 @@ const AUTONOMY_RECORD_KIND: &str = "autonomy_record_kind";
 const AUTONOMY_RECORD_GOAL: &str = "goal";
 const AUTONOMY_RECORD_LOOP: &str = "loop";
 const AUTONOMY_GOAL_CLEARED: &str = "goal_cleared";
+/// #979 / M15-C2 — minimum spacing between two goal continuation turns
+/// for the same goal. Stops a busy-loop where the model emits an
+/// instant tool turn after each continuation and immediately requeues
+/// itself. Tuned conservatively at 30s.
+const GOAL_MIN_CONTINUATION_INTERVAL_MS: i64 = 30_000;
+/// #979 / M15-C2 — sliding-window cap on goal continuation fires per
+/// hour. Caps the worst-case spend if the model finds a stable
+/// no-progress turn shape.
+const GOAL_MAX_CONTINUATIONS_PER_HOUR: u32 = 12;
+const GOAL_RATE_WINDOW_MS: i64 = 3_600_000;
+/// #979 / M15-C2 — completion sentinels the model can emit at the
+/// trailing edge of a goal turn to mark the goal `complete` without
+/// requiring an out-of-band RPC. Matched case-insensitively after a
+/// whitespace trim of the assistant content.
+const GOAL_COMPLETE_SENTINELS: &[&str] = &[
+    "<goal:complete>",
+    "[goal:complete]",
+    "goal-complete",
+    "goal_complete",
+];
 const NATIVE_SPECIALIST_BACKEND_KIND: &str = "native";
 const NATIVE_SPECIALIST_SUMMARY_ARTIFACT_ID: &str = "summary";
 const NATIVE_SPECIALIST_ARTIFACT_CONTENT_MAX_BYTES: usize = 256 * 1024;
@@ -919,7 +941,16 @@ impl InProcessAgentOrchestrator {
         max_items: usize,
     ) -> Vec<QueuedMasterContinuation> {
         let mut state = self.state();
-        enqueue_due_loop_continuations(&mut state, session_id, profile_id, runtime_state, now_ms());
+        let now = now_ms();
+        enqueue_due_loop_continuations(&mut state, session_id, profile_id, runtime_state, now);
+        // #1129 codex P1 follow-up: active goals whose
+        // `last_continued_at_ms + GOAL_MIN_CONTINUATION_INTERVAL_MS`
+        // is past must also be re-queued here. Previously the only
+        // goal enqueue happened immediately after `record_goal_turn`
+        // (which had just stamped `last_continued_at_ms = now`,
+        // tripping the min-delay gate), so an active goal only ran
+        // its initial continuation and never recurred.
+        enqueue_due_goal_continuations(&mut state, session_id, profile_id, runtime_state, now);
         state.continuations.drain_ready_for_session(
             runtime_state,
             max_items,
@@ -939,6 +970,7 @@ impl InProcessAgentOrchestrator {
 
         let state = self.state();
         let now = now_ms();
+        let now_system = SystemTime::now();
         let mut targets = Vec::new();
         for loop_record in state.loops.values() {
             // #1128 codex P1 follow-up: `due_loop_targets` previously
@@ -968,6 +1000,32 @@ impl InProcessAgentOrchestrator {
                 targets.push(target);
                 if targets.len() >= max_items {
                     break;
+                }
+            }
+        }
+        // #1129 codex P1 follow-up: include sessions whose active goal
+        // is past the min-delay so the AppUI / session-actor scheduler
+        // visits them too. The drain path
+        // (`drain_ready_continuations_for_session`) is where the
+        // actual goal-continuation enqueue happens; this scan only
+        // tells the scheduler WHICH sessions need a visit. Without
+        // this, sessions with a goal but no loop never tick again
+        // after `set_goal`'s initial enqueue.
+        if targets.len() < max_items {
+            let idle_state = GoalRuntimeIdleState::idle();
+            for (session_id, goal) in &state.goals {
+                if profile_filter.is_some_and(|profile_id| goal.profile_id != profile_id) {
+                    continue;
+                }
+                if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
+                    continue;
+                }
+                let target = (session_id.clone(), goal.profile_id.clone());
+                if !targets.contains(&target) {
+                    targets.push(target);
+                    if targets.len() >= max_items {
+                        break;
+                    }
                 }
             }
         }
@@ -1010,6 +1068,173 @@ impl InProcessAgentOrchestrator {
                 result,
             );
         }
+    }
+
+    /// #979 / M15-C2 — record an actual goal continuation turn as
+    /// having fired. Bumps `continuations_used`, the sliding rate
+    /// window, token and time counters, and — if this fires the
+    /// token-budget exhaustion edge — enqueues the wrap-up turn and
+    /// transitions the goal to `budget_limited`.
+    /// #1129 codex P2 re-review #2 — dispatch-only timestamp update
+    /// for the AppUI tick path. Only bumps `last_continued_at_ms` and
+    /// the `updated_at_ms` field so the 30s min-delay gate fires
+    /// immediately on dispatch. Does NOT touch `continuations_used`
+    /// or the sliding rate-window counter — those are the
+    /// caller-budget accountants and must only be incremented when a
+    /// turn actually consumes tokens (which the AppUI path can't
+    /// observe yet — see follow-up #1133).
+    ///
+    /// Returns true if the timestamp was updated, false if the goal
+    /// was not found or the profile didn't match.
+    /// #1129 codex P1 re-review #3 — count the dispatch toward the
+    /// continuation budget + sliding-window cap so AppUI-backed
+    /// active goals can't recur indefinitely. We deliberately do NOT
+    /// bump `tokens_used` here — token spend is observed by the real
+    /// LLM turn (only `SessionActor` records this today; AppUI parity
+    /// is tracked in #1133). Counting dispatch against the
+    /// continuation budget is the conservative interim: the 12/hr
+    /// hard cap fires correctly, and the derived continuation budget
+    /// (`token_budget / 2500`) bounds total fires until token-side
+    /// accounting catches up.
+    pub(crate) fn record_goal_dispatch_only(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        let now = now_ms();
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            return false;
+        };
+        if goal.profile_id != profile_id {
+            return false;
+        }
+        goal.last_continued_at_ms = now;
+        goal.continuations_used = goal.continuations_used.saturating_add(1);
+        if now.saturating_sub(goal.rate_window_start_ms) >= GOAL_RATE_WINDOW_MS {
+            goal.rate_window_start_ms = now;
+            goal.rate_window_count = 1;
+        } else {
+            goal.rate_window_count = goal.rate_window_count.saturating_add(1);
+        }
+        goal.updated_at_ms = now;
+        let snapshot = goal.clone();
+        persist_goal_state(&state, session_id, &snapshot, false);
+        true
+    }
+
+    pub(crate) fn record_goal_turn(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        tokens_consumed: u64,
+        elapsed_seconds: u64,
+    ) {
+        let now = now_ms();
+        let now_system = SystemTime::now();
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            return;
+        };
+        if goal.profile_id != profile_id {
+            return;
+        }
+        let goal_id = goal.goal_id.clone();
+        let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
+        let goal_snapshot = goal.clone();
+        persist_goal_state(&state, session_id, &goal_snapshot, false);
+        if let Some(prompt) = wrap_up {
+            // Enqueue a one-shot wrap-up turn at the top of the goal's
+            // queue. Use an explicit dedupe key so the wrap-up cannot
+            // collide with the normal-continuation key shape.
+            let mut wrap_up_request = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                profile_id.to_owned(),
+                MasterContinuationReason::GoalContinue,
+                now_system,
+            )
+            .with_goal_id(goal_id.clone())
+            .with_metadata("objective", goal_snapshot.objective.clone())
+            .with_metadata("status", "budget_limited".to_owned())
+            .with_metadata("wrap_up", "true".to_owned())
+            .with_metadata("wrap_up_prompt", prompt);
+            wrap_up_request = wrap_up_request.with_dedupe_key(format!(
+                "coding-autonomy-goal/wrap_up/{}/{}",
+                profile_id, goal_id
+            ));
+            enqueue_and_persist_continuation(&mut state, wrap_up_request);
+        }
+    }
+
+    /// #979 / M15-C2 — after a goal-driven turn finishes, re-queue
+    /// another continuation only if the runtime is idle AND the
+    /// per-goal policy still allows another fire. This is the
+    /// recurring path that keeps an active goal alive without
+    /// burst-firing or busy-looping.
+    pub(crate) fn maybe_enqueue_goal_after_turn(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        idle_state: GoalRuntimeIdleState,
+    ) -> bool {
+        let mut state = self.state();
+        let Some(goal) = state.goals.get(session_id).cloned() else {
+            return false;
+        };
+        if goal.profile_id != profile_id {
+            return false;
+        }
+        enqueue_goal_continuation_with_idle(&mut state, session_id, profile_id, &goal, idle_state)
+            .map(|outcome| matches!(outcome, MasterContinuationEnqueueOutcome::Queued(_)))
+            .unwrap_or(false)
+    }
+
+    /// #979 / M15-C2 — flip the goal to `complete` when the model
+    /// emits a known completion sentinel during a goal turn.
+    pub(crate) fn maybe_complete_goal_from_model(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+        assistant_content: &str,
+    ) -> bool {
+        if !detect_goal_complete_sentinel(assistant_content) {
+            return false;
+        }
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            return false;
+        };
+        if goal.profile_id != profile_id {
+            return false;
+        }
+        if goal.status == "complete" {
+            return false;
+        }
+        goal.status = "complete".to_owned();
+        goal.updated_at_ms = now_ms();
+        let snapshot = goal.clone();
+        persist_goal_state(&state, session_id, &snapshot, false);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_goal_tokens_used_for_test(
+        &self,
+        session_id: &SessionKey,
+        tokens_used: u64,
+    ) {
+        if let Some(goal) = self.state().goals.get_mut(session_id) {
+            goal.tokens_used = tokens_used;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn goal_status_for_test(&self, session_id: &SessionKey) -> Option<String> {
+        self.state()
+            .goals
+            .get(session_id)
+            .map(|goal| goal.status.clone())
     }
 
     #[cfg(test)]
@@ -1513,6 +1738,7 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 ));
             }
             goal.objective = objective.to_owned();
+            let prior_status = goal.status.clone();
             if let Some(status) = requested_status {
                 goal.status = status.to_owned();
             }
@@ -1520,6 +1746,20 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 goal.token_budget = token_budget;
             }
             goal.updated_at_ms = now;
+            // #979 / M15-C2 — re-activating a goal (paused/budget_limited
+            // → active) must clear the wrap-up flag so a re-budgeted goal
+            // can fire a fresh exhaustion wrap-up; without this the new
+            // active window silently never emits its summary turn.
+            if goal.status == "active" && prior_status != "active" {
+                goal.wrap_up_emitted = false;
+                if goal.tokens_used < goal.token_budget {
+                    // user-driven re-activation also restarts the
+                    // sliding rate-limit window so the prior burst
+                    // does not penalize a freshly-budgeted goal.
+                    goal.rate_window_start_ms = now;
+                    goal.rate_window_count = 0;
+                }
+            }
             goal.clone()
         } else {
             state.next_goal_seq += 1;
@@ -1533,6 +1773,11 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 time_used_seconds: 0,
                 created_at_ms: now,
                 updated_at_ms: now,
+                continuations_used: 0,
+                last_continued_at_ms: 0,
+                rate_window_start_ms: now,
+                rate_window_count: 0,
+                wrap_up_emitted: false,
             };
             state.goals.insert(request.session_id.clone(), goal.clone());
             goal
@@ -1880,6 +2125,25 @@ struct AutonomyGoalRecord {
     time_used_seconds: u64,
     created_at_ms: i64,
     updated_at_ms: i64,
+    /// #979 / M15-C2 — number of goal continuation turns this goal has
+    /// driven since `set_goal` was first called (or since the goal was
+    /// last reset to `active`). Used together with
+    /// `last_continued_at_ms` and `rate_window_*` to enforce the
+    /// min-delay + max-per-hour fire policy.
+    continuations_used: u32,
+    /// Wall-clock ms of the last successful goal-continuation fire.
+    /// Zero means no continuation has fired yet. Drives the min-delay
+    /// gate on subsequent fires.
+    last_continued_at_ms: i64,
+    /// Start of the current sliding rate-limit window (one hour).
+    rate_window_start_ms: i64,
+    /// Number of continuations counted within `rate_window_start_ms`.
+    rate_window_count: u32,
+    /// `true` once the orchestrator has enqueued the budget-exhaustion
+    /// wrap-up turn so a `record_goal_turn` call after `budget_limited`
+    /// does not re-emit duplicate wrap-ups on every subsequent
+    /// continuation attempt.
+    wrap_up_emitted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2284,23 +2548,241 @@ fn enqueue_and_persist_continuation(
     outcome
 }
 
+/// #1129 codex P1 follow-up to #979 / M15-C2 — scan the session's
+/// active goal (if any) and enqueue a continuation when the policy
+/// gate now allows it. Mirrors `enqueue_due_loop_continuations` for
+/// the goal-recurrence path. Without this scan, the only goal-enqueue
+/// happens inside `maybe_enqueue_goal_after_turn` immediately after
+/// `record_goal_turn` stamped `last_continued_at_ms = now`, which the
+/// 30s min-delay always denies — so active goals only ever fired
+/// their initial continuation and silently stopped.
+fn enqueue_due_goal_continuations(
+    state: &mut AutonomyRuntimeState,
+    session_id: &SessionKey,
+    profile_id: &str,
+    runtime_state: MasterContinuationRuntimeState,
+    now: i64,
+) -> usize {
+    if !runtime_state.is_idle_eligible() {
+        return 0;
+    }
+    let Some(goal) = state.goals.get(session_id).cloned() else {
+        return 0;
+    };
+    if goal.profile_id != profile_id {
+        return 0;
+    }
+    // Re-use the canonical policy gate. `idle_state` is "idle" here
+    // because the AppUI / session-actor tick path only calls into
+    // this drain when no other turn is active.
+    let idle_state = GoalRuntimeIdleState::idle();
+    let now_system = system_time_from_ms(now).unwrap_or_else(SystemTime::now);
+    if !goal_policy_allows_fire(&goal, idle_state, now_system, now) {
+        return 0;
+    }
+    match enqueue_goal_continuation_with_idle(state, session_id, profile_id, &goal, idle_state) {
+        Some(MasterContinuationEnqueueOutcome::Queued(_)) => 1,
+        _ => 0,
+    }
+}
+
 fn enqueue_goal_continuation(
     state: &mut AutonomyRuntimeState,
     session_id: &SessionKey,
     profile_id: &str,
     goal: &AutonomyGoalRecord,
-) {
+) -> Option<MasterContinuationEnqueueOutcome> {
+    enqueue_goal_continuation_with_idle(
+        state,
+        session_id,
+        profile_id,
+        goal,
+        GoalRuntimeIdleState::idle(),
+    )
+}
+
+/// #979 / M15-C2 — gated enqueue path used by every production
+/// `set_goal` and after-turn re-queue. Defers to a transient
+/// [`GoalRuntime`] view so the orchestrator and the standalone runtime
+/// primitives agree on the fire policy: min-delay, total budget,
+/// active/paused state. The hourly rate limit is a thin wrapper on top
+/// of the runtime view since `GoalRuntime` does not natively express a
+/// sliding-window cap. Returns `None` when the policy denies the fire.
+fn enqueue_goal_continuation_with_idle(
+    state: &mut AutonomyRuntimeState,
+    session_id: &SessionKey,
+    profile_id: &str,
+    goal: &AutonomyGoalRecord,
+    idle_state: GoalRuntimeIdleState,
+) -> Option<MasterContinuationEnqueueOutcome> {
+    let now_system = SystemTime::now();
+    let now = now_ms();
+    if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
+        return None;
+    }
     let continuation = MasterContinuationRequest::new(
         "coding-autonomy-goal",
         session_id.to_string(),
         profile_id.to_owned(),
         MasterContinuationReason::GoalContinue,
-        SystemTime::now(),
+        now_system,
     )
     .with_goal_id(goal.goal_id.clone())
     .with_metadata("objective", goal.objective.clone())
     .with_metadata("status", goal.status.clone());
-    enqueue_and_persist_continuation(state, continuation);
+    Some(enqueue_and_persist_continuation(state, continuation))
+}
+
+/// #979 / M15-C2 — build a [`GoalRuntime`] view from the orchestrator
+/// record so policy gates (min-delay, total budget, paused) all derive
+/// from one place. The hourly cap is enforced separately by the caller
+/// (see [`goal_policy_allows_fire`]).
+fn goal_runtime_view(goal: &AutonomyGoalRecord) -> GoalRuntime {
+    let total_budget = goal_total_continuation_budget(goal);
+    let mut runtime = GoalRuntime::new(
+        goal.goal_id.clone(),
+        goal.objective.clone(),
+        GoalRuntimePolicy::fixed_interval(
+            std::time::Duration::from_millis(GOAL_MIN_CONTINUATION_INTERVAL_MS as u64),
+            total_budget,
+        ),
+    );
+    runtime.continuations_used = goal.continuations_used;
+    runtime.state = match goal.status.as_str() {
+        "paused" => GoalRuntimeState::Paused,
+        "complete" | "completed" | "cleared" => GoalRuntimeState::Completed,
+        _ => GoalRuntimeState::Active,
+    };
+    if goal.last_continued_at_ms > 0 {
+        let due_at = goal
+            .last_continued_at_ms
+            .saturating_add(GOAL_MIN_CONTINUATION_INTERVAL_MS);
+        if let Some(system_time) = system_time_from_ms(due_at) {
+            runtime.next_due = NextDueState::ScheduledAt(system_time);
+        }
+    }
+    runtime
+}
+
+/// #979 / M15-C2 — derived total budget for the goal (in continuation
+/// turn count). Token budget is converted with a conservative
+/// per-turn estimate (4 KB ≈ 1000 tokens) so the runtime view's
+/// `max_continuations` matches what the model can actually spend.
+/// Saturating math keeps this safe for `token_budget = 0`.
+fn goal_total_continuation_budget(goal: &AutonomyGoalRecord) -> u32 {
+    const TOKENS_PER_TURN_ESTIMATE: u64 = 2_500;
+    if goal.token_budget == 0 {
+        return 0;
+    }
+    goal.token_budget
+        .div_ceil(TOKENS_PER_TURN_ESTIMATE)
+        .min(u32::MAX as u64) as u32
+}
+
+fn system_time_from_ms(ms: i64) -> Option<SystemTime> {
+    if ms <= 0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(std::time::Duration::from_millis(ms as u64))
+}
+
+/// #979 / M15-C2 — policy gate for goal continuation fires. Combines:
+///   * [`GoalRuntime::decide_when_idle`] — min-delay + total budget +
+///     active/paused/complete state + idle eligibility.
+///   * Sliding-window hourly cap — enforced here because
+///     `GoalRuntime` does not natively express a per-hour cap.
+///   * Token-budget exhaustion — already known by the record.
+fn goal_policy_allows_fire(
+    goal: &AutonomyGoalRecord,
+    idle_state: GoalRuntimeIdleState,
+    now_system: SystemTime,
+    now_ms_value: i64,
+) -> bool {
+    if goal.status != "active" {
+        return false;
+    }
+    if goal.tokens_used >= goal.token_budget && goal.token_budget > 0 {
+        return false;
+    }
+    let runtime = goal_runtime_view(goal);
+    match runtime.decide_when_idle(now_system, idle_state) {
+        GoalPolicyDecision::ContinueNow { .. } => {}
+        _ => return false,
+    }
+    // Sliding-window hourly cap. A fresh window starts whenever the
+    // recorded window is older than GOAL_RATE_WINDOW_MS.
+    let window_age = now_ms_value.saturating_sub(goal.rate_window_start_ms);
+    if window_age < GOAL_RATE_WINDOW_MS && goal.rate_window_count >= GOAL_MAX_CONTINUATIONS_PER_HOUR
+    {
+        return false;
+    }
+    true
+}
+
+/// #979 / M15-C2 — record a goal continuation turn fire, advancing the
+/// per-goal counters used by [`goal_policy_allows_fire`]. The caller
+/// passes `tokens_consumed` so the runtime tracks LLM-side token spend
+/// against the goal's `token_budget`. Returns the wrap-up prompt when
+/// this call exhausts the budget so the session actor can enqueue the
+/// final "summarize and stop" turn.
+fn record_goal_turn_internal(
+    goal: &mut AutonomyGoalRecord,
+    tokens_consumed: u64,
+    elapsed_seconds: u64,
+    now_ms_value: i64,
+) -> Option<String> {
+    goal.continuations_used = goal.continuations_used.saturating_add(1);
+    goal.last_continued_at_ms = now_ms_value;
+    goal.updated_at_ms = now_ms_value;
+    goal.tokens_used = goal.tokens_used.saturating_add(tokens_consumed);
+    goal.time_used_seconds = goal.time_used_seconds.saturating_add(elapsed_seconds);
+    let window_age = now_ms_value.saturating_sub(goal.rate_window_start_ms);
+    if window_age >= GOAL_RATE_WINDOW_MS {
+        goal.rate_window_start_ms = now_ms_value;
+        goal.rate_window_count = 1;
+    } else {
+        goal.rate_window_count = goal.rate_window_count.saturating_add(1);
+    }
+    let budget_exhausted =
+        goal.token_budget > 0 && goal.tokens_used >= goal.token_budget && !goal.wrap_up_emitted;
+    if budget_exhausted {
+        goal.status = "budget_limited".to_owned();
+        goal.wrap_up_emitted = true;
+        Some(format!(
+            "Goal `{}` has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+            goal.goal_id
+        ))
+    } else {
+        None
+    }
+}
+
+/// #979 / M15-C2 — detect the model-driven completion sentinels and
+/// flip the goal to `complete`. Returns `true` if any sentinel matched
+/// so the caller can stop re-queueing.
+fn detect_goal_complete_sentinel(content: &str) -> bool {
+    // #1129 codex P2 follow-up: only match when the sentinel appears
+    // at the END of the assistant reply, not anywhere in the body.
+    // The prior `contains` check meant any assistant message that
+    // merely mentioned `goal_complete` / `<goal:complete>` in prose,
+    // code samples, or instructions silently completed the goal and
+    // stopped recurrence. Anchor to the trimmed last line / trailing
+    // token so the sentinel must be a deliberate end-of-reply
+    // declaration, not an incidental mention.
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let last_line = lower
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    GOAL_COMPLETE_SENTINELS
+        .iter()
+        .any(|sentinel| last_line == *sentinel || last_line.ends_with(sentinel))
 }
 
 fn enqueue_agent_terminal_continuations(
@@ -2720,6 +3202,18 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             .unwrap_or(group.created_at_ms.try_into().unwrap_or(i64::MAX)),
         updated_at_ms: supervisor_metadata_i64(&group.metadata, "updated_at_ms")
             .unwrap_or(group.updated_at_ms.try_into().unwrap_or(i64::MAX)),
+        continuations_used: supervisor_metadata_u64(&group.metadata, "continuations_used")
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        last_continued_at_ms: supervisor_metadata_i64(&group.metadata, "last_continued_at_ms")
+            .unwrap_or(0),
+        rate_window_start_ms: supervisor_metadata_i64(&group.metadata, "rate_window_start_ms")
+            .unwrap_or(0),
+        rate_window_count: supervisor_metadata_u64(&group.metadata, "rate_window_count")
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        wrap_up_emitted: supervisor_metadata_bool(&group.metadata, "wrap_up_emitted")
+            .unwrap_or(false),
     };
     state.next_goal_seq = state.next_goal_seq.max(sequence_suffix(&goal.goal_id));
     state.goals.insert(session_id, goal);
@@ -2902,6 +3396,11 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         time_used_seconds: 0,
         created_at_ms: now,
         updated_at_ms: now,
+        continuations_used: 0,
+        last_continued_at_ms: 0,
+        rate_window_start_ms: now,
+        rate_window_count: 0,
+        wrap_up_emitted: false,
     };
     persist_goal_state(state, session_id, &goal, true);
 }
@@ -2957,6 +3456,25 @@ fn persist_goal_state_with_store(
     group
         .metadata
         .insert("updated_at_ms".into(), json!(goal.updated_at_ms));
+    group.metadata.insert(
+        "continuations_used".into(),
+        json!(goal.continuations_used as u64),
+    );
+    group.metadata.insert(
+        "last_continued_at_ms".into(),
+        json!(goal.last_continued_at_ms),
+    );
+    group.metadata.insert(
+        "rate_window_start_ms".into(),
+        json!(goal.rate_window_start_ms),
+    );
+    group.metadata.insert(
+        "rate_window_count".into(),
+        json!(goal.rate_window_count as u64),
+    );
+    group
+        .metadata
+        .insert("wrap_up_emitted".into(), json!(goal.wrap_up_emitted));
     let event_id = format!(
         "autonomy_goal_state:{}:{}",
         group.group_id,
@@ -5040,6 +5558,481 @@ mod tests {
         assert_eq!(
             drained[0].metadata.get("objective").map(String::as_str),
             Some("keep reviewing until clean")
+        );
+    }
+
+    // ── #979 / M15-C2: GoalRuntime production wiring ────────────────────────
+
+    /// Bullet 2: idle-only recurrence — after a goal turn fires, the
+    /// orchestrator should re-queue another GoalContinue only when the
+    /// runtime is still idle. A busy idle state must suppress the
+    /// re-queue path.
+    #[test]
+    fn maybe_enqueue_goal_after_turn_respects_idle_gate() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-recurrence");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "advance one bounded step at a time".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        // Drain the initial fire so the queue is empty.
+        let initial = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(initial.len(), 1);
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            0,
+            "queue should be empty after draining the initial goal continuation"
+        );
+
+        // Busy idle state → no re-queue.
+        let busy_idle = GoalRuntimeIdleState::busy();
+        assert!(!orchestrator.maybe_enqueue_goal_after_turn(&session_id, "tenant-a", busy_idle,));
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+
+        // User input pending → no re-queue.
+        let pending_input = GoalRuntimeIdleState::idle().with_user_input_pending(true);
+        assert!(!orchestrator.maybe_enqueue_goal_after_turn(
+            &session_id,
+            "tenant-a",
+            pending_input,
+        ));
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+
+        // Recording a turn advances `last_continued_at_ms` to now, so the
+        // next fire is gated by the 30s min-delay policy. Force it back to
+        // 0 so the policy permits an immediate re-queue.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        {
+            if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+                goal.last_continued_at_ms = 0;
+            }
+        }
+
+        // Fully idle → re-queue succeeds.
+        assert!(orchestrator.maybe_enqueue_goal_after_turn(
+            &session_id,
+            "tenant-a",
+            GoalRuntimeIdleState::idle(),
+        ));
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+    }
+
+    /// #1129 codex P1 acceptance: after a goal turn, the
+    /// `drain_ready_continuations_for_session` tick path MUST pick up
+    /// the goal and re-queue once the 30s min-delay window has elapsed.
+    /// The prior shape never enqueued a delayed continuation, so a
+    /// goal that recorded a turn could only run again if the operator
+    /// re-called `set_goal`. We simulate the elapsed delay by forcing
+    /// `last_continued_at_ms` to the past and assert the next drain
+    /// observes a queued GoalContinue.
+    #[test]
+    fn drain_path_picks_up_active_goal_after_min_delay() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-recurrence");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "keep going".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Consume the initial continuation queued by `set_goal`.
+        let initial = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            initial.len(),
+            1,
+            "set_goal must queue exactly one initial continuation"
+        );
+
+        // Record a turn (this stamps `last_continued_at_ms = now`).
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+
+        // Right after the turn, the drain path is still gated by the
+        // 30s min-delay — no new continuation should be queued.
+        let drained_immediately = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained_immediately.is_empty(),
+            "min-delay gate must block immediate recurrence (got {drained_immediately:?})",
+        );
+
+        // Simulate the min-delay window having passed.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - GOAL_MIN_CONTINUATION_INTERVAL_MS - 1;
+        }
+
+        // Now the drain path MUST observe a queued GoalContinue.
+        let drained_after_delay = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            drained_after_delay.len(),
+            1,
+            "after min-delay elapses, active goal must re-queue (got {drained_after_delay:?})",
+        );
+        assert_eq!(
+            drained_after_delay[0].reason,
+            MasterContinuationReason::GoalContinue,
+            "drained continuation must be a GoalContinue",
+        );
+    }
+
+    /// #1129 codex P2 acceptance: `detect_goal_complete_sentinel` must
+    /// only match when the sentinel appears at the END of the reply,
+    /// not anywhere in the body. Otherwise an assistant message that
+    /// merely mentions `goal_complete` in prose silently completes the
+    /// goal and stops recurrence.
+    #[test]
+    fn detect_goal_complete_sentinel_requires_trailing_position() {
+        // Trailing sentinels match — happy path preserved.
+        assert!(detect_goal_complete_sentinel(
+            "All steps done.\ngoal_complete"
+        ));
+        assert!(detect_goal_complete_sentinel("<goal:complete>"));
+        assert!(detect_goal_complete_sentinel(
+            "Summary…\n\n<goal:complete>\n"
+        ));
+
+        // Sentinel in the body but with other content after must NOT match.
+        assert!(!detect_goal_complete_sentinel(
+            "I noticed the sentinel is goal_complete, but I'll keep working on step 2."
+        ));
+        assert!(!detect_goal_complete_sentinel(
+            "If you say <goal:complete>, recurrence stops. For now, advancing step 3."
+        ));
+        // Empty/whitespace inputs still produce no match.
+        assert!(!detect_goal_complete_sentinel(""));
+        assert!(!detect_goal_complete_sentinel("   \n\n"));
+    }
+
+    /// Bullet 1 / 2: min-delay gate — a fire that happened less than
+    /// `GOAL_MIN_CONTINUATION_INTERVAL_MS` ago must NOT be allowed to
+    /// re-queue immediately.
+    #[test]
+    fn maybe_enqueue_goal_after_turn_respects_min_delay() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-min-delay");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "respect min delay".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+
+        // last_continued_at_ms is now wall-clock now → re-queue must be
+        // denied by the min-delay gate.
+        assert!(!orchestrator.maybe_enqueue_goal_after_turn(
+            &session_id,
+            "tenant-a",
+            GoalRuntimeIdleState::idle(),
+        ));
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// Bullet 3: budget exhaustion → enqueue a wrap-up turn AND
+    /// transition the goal to `budget_limited`. Subsequent calls must
+    /// be idempotent (no duplicate wrap-up).
+    #[test]
+    fn record_goal_turn_emits_wrap_up_on_budget_exhaustion() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-budget");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust the budget".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Force tokens_used near the budget so the next recorded turn
+        // exhausts it.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 200, 5);
+
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+        );
+
+        // The wrap-up turn must be queued separately from any prior
+        // GoalContinue.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalContinue);
+        assert_eq!(
+            drained[0].metadata.get("wrap_up").map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            drained[0]
+                .metadata
+                .get("wrap_up_prompt")
+                .map(|prompt| prompt.contains("exhausted"))
+                .unwrap_or(false)
+        );
+
+        // Idempotency — a second turn record after exhaustion must NOT
+        // emit a duplicate wrap-up.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 100, 1);
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// Bullet 3: a goal in `budget_limited` no longer fires the
+    /// regular GoalContinue path even if min-delay/idle conditions
+    /// are otherwise met.
+    #[test]
+    fn budget_limited_goal_blocks_further_continuations() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-blocked");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "test blocked".into(),
+                status: Some("active".into()),
+                token_budget: Some(500),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 500);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        // Drain the wrap-up turn enqueued by the exhaustion above.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Even with the rate window cleared and last_continued_at_ms
+        // forced into the past, the budget_limited status must block
+        // further fires.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = 0;
+        }
+        assert!(!orchestrator.maybe_enqueue_goal_after_turn(
+            &session_id,
+            "tenant-a",
+            GoalRuntimeIdleState::idle(),
+        ));
+        assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// Bullet 4: model-marks-complete — when an assistant turn ends
+    /// with a known completion sentinel, the goal transitions to
+    /// `complete` and recurrence stops.
+    #[test]
+    fn maybe_complete_goal_from_model_recognizes_sentinels() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-complete");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "finish up".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Plain content → no transition.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "still working on it",
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+        );
+
+        // Sentinel content → transition to `complete`.
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "All done. <goal:complete>",
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+
+        // Subsequent re-queue attempts must fail because the goal is
+        // no longer active.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = 0;
+        }
+        assert!(!orchestrator.maybe_enqueue_goal_after_turn(
+            &session_id,
+            "tenant-a",
+            GoalRuntimeIdleState::idle(),
+        ));
+    }
+
+    /// `detect_goal_complete_sentinel` covers all canonical sentinels
+    /// case-insensitively and ignores plain content.
+    #[test]
+    fn goal_complete_sentinel_detector_is_case_insensitive() {
+        assert!(detect_goal_complete_sentinel("<goal:complete>"));
+        assert!(detect_goal_complete_sentinel("<GOAL:COMPLETE>"));
+        assert!(detect_goal_complete_sentinel("[goal:complete]"));
+        assert!(detect_goal_complete_sentinel(
+            "Wrap-up notes…\n\nGOAL-COMPLETE"
+        ));
+        assert!(detect_goal_complete_sentinel("done -- goal_complete"));
+        assert!(!detect_goal_complete_sentinel("still goal-complementary"));
+        assert!(!detect_goal_complete_sentinel(
+            "active progress, nothing yet"
+        ));
+        assert!(!detect_goal_complete_sentinel(""));
+    }
+
+    /// `set_goal` should populate the new policy fields with sensible
+    /// defaults and not regress the prior persistence shape.
+    #[test]
+    fn set_goal_initializes_policy_fields() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-init");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "initialize".into(),
+                status: Some("active".into()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+
+        let state = orchestrator.state();
+        let goal = state.goals.get(&session_id).expect("goal must exist");
+        assert_eq!(goal.continuations_used, 0);
+        assert_eq!(goal.last_continued_at_ms, 0);
+        assert_eq!(goal.rate_window_count, 0);
+        assert!(!goal.wrap_up_emitted);
+        assert!(goal.rate_window_start_ms > 0, "window start initialized");
+    }
+
+    /// Re-activating a paused goal must clear `wrap_up_emitted` so a
+    /// re-budgeted goal can fire a fresh wrap-up when it next
+    /// exhausts.
+    #[test]
+    fn reactivating_goal_resets_wrap_up_emitted_flag() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-reactivate");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "test".into(),
+                status: Some("active".into()),
+                token_budget: Some(500),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 500);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+        );
+
+        // Drain the wrap-up so the queue is empty.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Re-activate by setting a larger budget and flipping to active.
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "test".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("reactivate");
+
+        let state = orchestrator.state();
+        let goal = state.goals.get(&session_id).expect("goal must exist");
+        assert!(
+            !goal.wrap_up_emitted,
+            "wrap_up_emitted must reset on re-activation"
         );
     }
 
