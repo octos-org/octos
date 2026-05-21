@@ -8454,6 +8454,25 @@ async fn maybe_spawn_appui_master_continuation_runner(
             "draining queued master continuation into AppUI turn runtime"
         );
         default_agent_orchestrator().mark_continuation_started(&continuation);
+        // #1129 codex P1 re-review #2 — when the AppUI tick path
+        // dispatches a GoalContinue, advance the goal's
+        // `last_continued_at_ms` immediately so the next scheduler
+        // tick (every ~2s) doesn't consider the same goal due again
+        // while THIS turn is still running. The actual
+        // token-budget / sentinel accounting happens after the turn
+        // completes below; this dispatch-time record uses zero
+        // tokens / zero seconds, which is correct for the
+        // "preserve min-delay invariant" semantics. Full token
+        // accounting is tracked in a follow-up since `run_standalone_turn`
+        // doesn't surface per-turn LLM token usage here.
+        if matches!(continuation.reason, MasterContinuationReason::GoalContinue) {
+            default_agent_orchestrator().record_goal_turn(
+                &SessionKey(continuation.session_id.as_str().to_owned()),
+                continuation.profile_id.as_str(),
+                0,
+                0,
+            );
+        }
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
