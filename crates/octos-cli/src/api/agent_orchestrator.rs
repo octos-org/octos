@@ -1144,14 +1144,17 @@ impl InProcessAgentOrchestrator {
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
         if let Some(prompt) = wrap_up {
-            // Enqueue a one-shot wrap-up turn at the top of the goal's
-            // queue. Use an explicit dedupe key so the wrap-up cannot
-            // collide with the normal-continuation key shape.
+            // #1131 — Enqueue a one-shot wrap-up turn under the
+            // dedicated `GoalWrapUp` reason so the prompt renderer
+            // emits the wrap-up directive verbatim instead of the
+            // standard "Advance the goal..." template. Use an
+            // explicit dedupe key so the wrap-up cannot collide with
+            // the normal-continuation key shape.
             let mut wrap_up_request = MasterContinuationRequest::new(
                 "coding-autonomy-goal",
                 session_id.to_string(),
                 profile_id.to_owned(),
-                MasterContinuationReason::GoalContinue,
+                MasterContinuationReason::GoalWrapUp,
                 now_system,
             )
             .with_goal_id(goal_id.clone())
@@ -3613,6 +3616,7 @@ pub(crate) fn master_continuation_reason_name(reason: &MasterContinuationReason)
         MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete",
         MasterContinuationReason::LoopFire => "loop_fire",
         MasterContinuationReason::GoalContinue => "goal_continue",
+        MasterContinuationReason::GoalWrapUp => "goal_wrap_up",
         MasterContinuationReason::External(_) => "external",
     }
 }
@@ -3659,6 +3663,30 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .map(|id| id.as_str())
                 .unwrap_or("unknown"),
         ),
+        // #1131 — wrap-up turns must instruct the model to summarize
+        // and stop, NOT continue work. Render the per-goal wrap-up
+        // directive (stored in metadata by `record_goal_turn`) as
+        // the actual prompt body so the LLM sees the instruction
+        // verbatim instead of the generic "Advance the goal..."
+        // template. Fall back to a safe default directive if the
+        // metadata is missing (e.g. legacy persisted continuations).
+        MasterContinuationReason::GoalWrapUp => {
+            let goal_id = continuation
+                .goal_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("unknown");
+            let directive = continuation
+                .metadata
+                .get("wrap_up_prompt")
+                .map(String::as_str)
+                .unwrap_or(
+                    "This goal has exhausted its continuation budget. Summarize the current state, call out remaining work, and stop starting new work.",
+                );
+            format!(
+                "[system-internal]\nThe active goal exhausted its continuation budget. This is the final wrap-up turn.\n\nGoal: {goal_id}\nMetadata:\n{metadata}\n\n{directive}",
+            )
+        }
         MasterContinuationReason::External(kind) => format!(
             "[system-internal]\nAn external master continuation was requested.\n\nKind: {kind}\nGroup: {group}\nMetadata:\n{metadata}\n\nHandle the continuation conservatively and summarize the visible state for the user.",
             group = continuation.group_id.as_str(),
@@ -3672,6 +3700,7 @@ fn master_continuation_reason_wire_name(reason: &MasterContinuationReason) -> St
         MasterContinuationReason::ScatterJoinComplete => "scatter_join_complete".to_owned(),
         MasterContinuationReason::LoopFire => "loop_fire".to_owned(),
         MasterContinuationReason::GoalContinue => "goal_continue".to_owned(),
+        MasterContinuationReason::GoalWrapUp => "goal_wrap_up".to_owned(),
         MasterContinuationReason::External(kind) => format!("external:{kind}"),
     }
 }
@@ -3684,6 +3713,7 @@ fn master_continuation_reason_from_wire_name(value: &str) -> Option<MasterContin
         }
         "loop_fire" | "LoopFire" => Some(MasterContinuationReason::LoopFire),
         "goal_continue" | "GoalContinue" => Some(MasterContinuationReason::GoalContinue),
+        "goal_wrap_up" | "GoalWrapUp" => Some(MasterContinuationReason::GoalWrapUp),
         value => value
             .strip_prefix("external:")
             .map(|kind| MasterContinuationReason::External(kind.to_owned())),
@@ -5802,7 +5832,9 @@ mod tests {
         );
 
         // The wrap-up turn must be queued separately from any prior
-        // GoalContinue.
+        // GoalContinue, and rides the new dedicated `GoalWrapUp`
+        // reason (#1131) so the prompt renderer treats it as a
+        // "summarize and stop" turn instead of a regular advance.
         let drained = orchestrator.drain_ready_continuations_for_session(
             &session_id,
             "tenant-a",
@@ -5810,7 +5842,7 @@ mod tests {
             usize::MAX,
         );
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].reason, MasterContinuationReason::GoalContinue);
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
         assert_eq!(
             drained[0].metadata.get("wrap_up").map(String::as_str),
             Some("true")
@@ -5827,6 +5859,67 @@ mod tests {
         // emit a duplicate wrap-up.
         orchestrator.record_goal_turn(&session_id, "tenant-a", 100, 1);
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// #1131 — when the budget-exhaustion wrap-up turn is dispatched,
+    /// the rendered prompt must contain the wrap-up directive
+    /// verbatim (i.e. "Summarize the current state..."), NOT the
+    /// regular "Advance the goal by one bounded step" template that
+    /// the GoalContinue path emits. Otherwise the model keeps
+    /// working instead of summarizing and stopping.
+    #[test]
+    fn goal_wrap_up_turn_uses_wrap_up_text_as_directive() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-wrap-prompt");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust then summarize".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain any goal continuation that the `set_goal` lifecycle
+        // may have queued so we only observe the wrap-up turn below.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 200, 5);
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1, "wrap-up must be the only queued turn");
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+
+        let rendered = master_continuation_prompt(&drained[0]);
+        let wrap_up_directive = drained[0]
+            .metadata
+            .get("wrap_up_prompt")
+            .cloned()
+            .expect("wrap_up_prompt metadata must be present");
+        assert!(
+            rendered.contains(&wrap_up_directive),
+            "rendered prompt must contain the wrap-up directive verbatim; rendered=\n{rendered}",
+        );
+        assert!(
+            rendered.contains("Summarize the current state"),
+            "rendered prompt must instruct the model to summarize; rendered=\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("Advance the goal by one bounded step"),
+            "rendered prompt must NOT use the GoalContinue 'advance' template; rendered=\n{rendered}",
+        );
     }
 
     /// Bullet 3: a goal in `budget_limited` no longer fires the
