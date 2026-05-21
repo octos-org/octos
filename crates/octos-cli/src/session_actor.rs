@@ -3844,9 +3844,76 @@ impl SessionActor {
                 "draining queued master continuation into session actor"
             );
             default_agent_orchestrator().mark_continuation_started(&continuation);
+            // #977 bullet 4 — capture the loop id (if any) BEFORE we
+            // consume `continuation` into `synthetic_master_continuation_inbound`,
+            // so we can re-schedule the loop's next fire from the
+            // model's `<<loop-next-in: …>>` reply hint. We only snapshot
+            // assistant-reply count for LoopFire continuations to keep
+            // the non-loop fast-path unchanged.
+            let loop_id_for_self_paced = match continuation.reason {
+                MasterContinuationReason::LoopFire => continuation
+                    .loop_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned()),
+                _ => None,
+            };
+            let pre_assistant_count = if loop_id_for_self_paced.is_some() {
+                let handle = self.session_handle.lock().await;
+                Some(
+                    handle
+                        .get_history(usize::MAX)
+                        .iter()
+                        .filter(|message| matches!(message.role, MessageRole::Assistant))
+                        .count(),
+                )
+            } else {
+                None
+            };
             let synthetic = self.synthetic_master_continuation_inbound(&continuation);
             self.process_inbound(synthetic, Vec::new(), Vec::new(), None)
                 .await;
+            // If this fire was a self-paced or maintenance loop, peek at
+            // the model's reply and re-schedule via the orchestrator.
+            // `apply_self_paced_response` no-ops for fixed_interval mode,
+            // so this is safe to call for every LoopFire continuation.
+            if let (Some(loop_id), Some(pre)) = (loop_id_for_self_paced, pre_assistant_count) {
+                // #1128 codex P2 follow-up: the prior shape used
+                // `.nth(pre)` to find the new assistant reply, but
+                // `process_inbound` persists assistant tool-call stubs
+                // BEFORE the final text reply. For loop turns that
+                // used tools, `.nth(pre)` selected the first new
+                // assistant tool-call message and missed the
+                // `<<loop-next-in: ...>>` hint that lives in the
+                // final text reply. Walk from the back instead and
+                // pick the LAST assistant message with non-empty
+                // content, which is the actual final reply.
+                let assistant_reply: Option<String> = {
+                    let handle = self.session_handle.lock().await;
+                    handle
+                        .get_history(usize::MAX)
+                        .iter()
+                        .filter(|message| matches!(message.role, MessageRole::Assistant))
+                        .enumerate()
+                        .filter(|(idx, _)| *idx >= pre)
+                        .filter(|(_, message)| !message.content.is_empty())
+                        .last()
+                        .map(|(_, message)| message.content.clone())
+                };
+                if let Some(reply) = assistant_reply {
+                    if let Err(err) = default_agent_orchestrator().apply_self_paced_response(
+                        &loop_id,
+                        &profile_id,
+                        &reply,
+                    ) {
+                        info!(
+                            session = %self.session_key,
+                            loop_id = %loop_id,
+                            error = %err.message,
+                            "apply_self_paced_response skipped"
+                        );
+                    }
+                }
+            }
             default_agent_orchestrator().mark_continuation_completed(
                 &continuation,
                 Some("processed_by_session_actor".to_owned()),
