@@ -16,6 +16,7 @@ use crate::context::PipelineContext;
 use crate::discovery::PipelineDiscovery;
 use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineResult, PipelineStatusBridge};
 use crate::run_dir::{PipelineRunSummary, RunDir};
+use octos_core::TokenUsage;
 
 /// #1020 / M17-B — reason string stamped onto every pipeline run's
 /// `summary.json` because pipeline workers do not yet propagate the
@@ -435,23 +436,41 @@ impl Tool for RunPipelineTool {
         // Signal shutdown to all workers regardless of how we finished
         shutdown.store(true, std::sync::atomic::Ordering::Release);
 
-        let result = result.map_err(|_| {
-            eyre::eyre!(
-                "pipeline timed out after {}s (timeout_secs={})",
-                timeout_secs,
-                timeout_secs
-            )
-        })??;
+        // #1126 codex P2: compute the run_id + graph_id BEFORE we
+        // branch on success vs timeout. The marker write must happen
+        // on the timeout path too (the prior shape only emitted on
+        // success), otherwise timed-out runs were the one scenario
+        // missing audit-trail evidence — exactly the runs validators
+        // most need to inspect.
+        let graph_id = graph_id_from_dot(&dot_content);
+        let run_id = generate_run_id(&graph_id, run_started_at);
+
+        let result = match result {
+            Ok(inner) => inner?,
+            Err(_) => {
+                let duration_ms =
+                    u64::try_from(pipeline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                emit_external_context_unmanaged_timeout_summary(
+                    &self.working_dir,
+                    &run_id,
+                    &graph_id,
+                    duration_ms,
+                    &run_start_rfc3339,
+                    timeout_secs,
+                );
+                return Err(eyre::eyre!(
+                    "pipeline timed out after {}s (timeout_secs={})",
+                    timeout_secs,
+                    timeout_secs
+                ));
+            }
+        };
 
         // #1020 / M17-B: stamp the run's `summary.json` with the
         // `external_context_unmanaged` marker so evidence validators can
         // confirm pipeline workers ran without the parent's ContextManager
         // propagated. Failures are logged at WARN and never bubble up:
         // missing audit trail must not regress the user-visible outcome.
-        // The graph id is derived from the resolved DOT (named pipelines
-        // carry a stable id; inline DOT falls back to "pipeline").
-        let graph_id = graph_id_from_dot(&dot_content);
-        let run_id = generate_run_id(&graph_id, run_started_at);
         let duration_ms = u64::try_from(pipeline_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         emit_external_context_unmanaged_summary(
             &self.working_dir,
@@ -589,6 +608,56 @@ pub(crate) fn build_pipeline_run_summary(
     .with_external_context_unmanaged(PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON)
 }
 
+/// #1126 codex P2 follow-up to #1020 / M17-B — write a `summary.json`
+/// for the timeout failure path. Without this, runs that hit the
+/// pipeline-level timeout had no audit-trail marker at all, even
+/// though pipeline workers had been launched and consumed budget.
+/// Records `success: false`, a `duration_ms` equal to the elapsed
+/// wall-clock at the timeout boundary, zero node summaries, and the
+/// same `external_context_unmanaged` marker so validators see a
+/// consistent shape for both success and failure paths.
+fn emit_external_context_unmanaged_timeout_summary(
+    working_dir: &std::path::Path,
+    run_id: &str,
+    graph_id: &str,
+    duration_ms: u64,
+    start_time_rfc3339: &str,
+    timeout_secs: u64,
+) {
+    let run_dir = match RunDir::new(working_dir, run_id) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "failed to open run dir for M17-B timeout summary; skipping"
+            );
+            return;
+        }
+    };
+    let reason = format!(
+        "{PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON}; pipeline timed out after {timeout_secs}s"
+    );
+    let summary = PipelineRunSummary {
+        graph_id: graph_id.to_string(),
+        success: false,
+        duration_ms,
+        total_tokens: TokenUsage::default(),
+        nodes_executed: 0,
+        start_time: start_time_rfc3339.to_string(),
+        context_mode: None,
+        context_reason: None,
+    }
+    .with_external_context_unmanaged(reason);
+    if let Err(error) = run_dir.write_summary(&summary) {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "failed to write M17-B timeout summary; downstream evidence validators may flag this run"
+        );
+    }
+}
+
 /// #1020 / M17-B — write a `summary.json` carrying the
 /// `external_context_unmanaged` marker to the run's `.octos/runs/<run_id>/`
 /// directory. Failures are logged at WARN and never propagated so the
@@ -643,16 +712,27 @@ fn graph_id_from_dot(dot_content: &str) -> String {
     }
 }
 
-/// Build a filesystem-safe run id of the form `<graph_id>-<unix_secs>-<pid>`.
+/// Build a filesystem-safe run id of the form
+/// `<graph_id>-<unix_secs>-<nanos>-<pid>-<counter>`.
 /// Matches the `validate_pipeline_id` constraint (no `/`, `\`, `..`, control
-/// chars, <= 128 bytes) and stays unique enough across simultaneous runs
-/// of the same pipeline that two writers do not race on `summary.json`.
+/// chars, <= 128 bytes) and stays unique across simultaneous runs of the
+/// same pipeline so two writers do not race on `summary.json`.
+///
+/// #1126 codex P2: the prior shape `{graph}-{secs}-{pid}` collided when
+/// two `run_pipeline` calls for the same graph started in the same
+/// second within the same process. Nanosecond resolution + a
+/// per-process monotonic counter make collision practically impossible
+/// even for back-to-back synchronous fan-out.
 fn generate_run_id(graph_id: &str, started_at: std::time::SystemTime) -> String {
-    let secs = started_at
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let (secs, nanos) = started_at
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0));
     let pid = std::process::id();
+    let counter = RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
     // Sanitize graph_id defensively — `graph_id_from_dot` already strips
     // unsafe chars but a caller-provided value could be anything.
     let safe_graph: String = graph_id
@@ -666,9 +746,9 @@ fn generate_run_id(graph_id: &str, started_at: std::time::SystemTime) -> String 
         })
         .take(64)
         .collect();
-    let candidate = format!("{safe_graph}-{secs}-{pid}");
+    let candidate = format!("{safe_graph}-{secs}-{nanos:09}-{pid}-{counter}");
     if candidate.is_empty() || candidate.len() > 128 {
-        format!("pipeline-{secs}-{pid}")
+        format!("pipeline-{secs}-{nanos:09}-{pid}-{counter}")
     } else {
         candidate
     }
@@ -979,5 +1059,67 @@ mod tests {
         );
         assert_eq!(graph_id_from_dot("digraph { a -> b }"), "pipeline");
         assert_eq!(graph_id_from_dot("  digraph  research_42 {"), "research_42");
+    }
+
+    /// #1126 codex P2 acceptance: two run_pipeline calls for the same
+    /// graph that start within the same second in the same process
+    /// must produce DISTINCT run ids so their `summary.json` files do
+    /// NOT race / overwrite. Before this fix the id was
+    /// `{graph}-{secs}-{pid}`, which collided. After: nanos + counter
+    /// make collision practically impossible.
+    #[test]
+    fn generate_run_id_distinguishes_concurrent_runs_in_same_second() {
+        let t = std::time::SystemTime::now();
+        let id1 = generate_run_id("deep_research", t);
+        let id2 = generate_run_id("deep_research", t);
+        assert_ne!(
+            id1, id2,
+            "two run ids minted in the same second for the same graph must differ"
+        );
+    }
+
+    /// #1126 codex P2 acceptance: when a pipeline run times out, a
+    /// `summary.json` with the `external_context_unmanaged` marker
+    /// must still be written so evidence validators can confirm the
+    /// run launched workers. The reason string must include the
+    /// timeout duration.
+    #[test]
+    fn emit_external_context_unmanaged_timeout_summary_writes_marker_to_disk() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        emit_external_context_unmanaged_timeout_summary(
+            dir.path(),
+            "deep_research-1747800000-000000001-12345-0",
+            "deep_research",
+            1_800_000,
+            "2026-05-20T17:00:00Z",
+            1800,
+        );
+        let summary_path = dir
+            .path()
+            .join(".octos/runs/deep_research-1747800000-000000001-12345-0/summary.json");
+        assert!(
+            summary_path.exists(),
+            "timeout path must persist summary.json with M17-B marker"
+        );
+        let contents = std::fs::read_to_string(&summary_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(json["success"], false, "timeout summary records failure");
+        assert_eq!(json["context_mode"], "external_context_unmanaged");
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out"),
+            "context_reason must explicitly mention the timeout for audit",
+        );
+        assert!(
+            json["context_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("1800"),
+            "context_reason must include the timeout in seconds",
+        );
     }
 }

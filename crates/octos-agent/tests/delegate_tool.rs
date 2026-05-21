@@ -172,9 +172,16 @@ async fn should_wire_prompt_context_manager_into_delegated_child() {
         request.parent_session_key.as_deref(),
         Some("api:test-session")
     );
-    assert_eq!(
-        request.child_session_key.as_deref(),
-        Some("api:test-session")
+    // #1126 codex P1: DelegateTool MUST pass `None` so the factory
+    // derives a unique child session key (mirrors SpawnTool). The
+    // previous shape forwarded the parent key, which made the child
+    // bridge persist its forked context onto the parent's ledger and
+    // let resume/audit observe a truncated child fork in place of the
+    // parent transcript.
+    assert!(
+        request.child_session_key.is_none(),
+        "child_session_key must be None so the factory mints a unique child key (got {:?})",
+        request.child_session_key,
     );
     assert!(request.task_id.is_some());
     assert_eq!(request.worker_id, "delegate-0");
