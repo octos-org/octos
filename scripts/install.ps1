@@ -1345,6 +1345,10 @@ if ($Domain -and (Test-Command "caddy")) {
     Section "Configuring Caddy for $Domain"
     $caddyfile = Join-Path $DataDir "Caddyfile"
     $caddyUpstream = "localhost:$Port"
+    # Regex-escape the configured domain so dots match literally
+    # (each '.' becomes '\\.' in the emitted Caddyfile, which CEL parses
+    # to '\.' and RE2 then treats as a literal dot). Closes #1124.
+    $DomainRe = $Domain.Replace('.', '\\.')
     @"
 {
     on_demand_tls {
@@ -1353,13 +1357,16 @@ if ($Domain -and (Test-Command "caddy")) {
 }
 
 :9999 {
-    # On-demand TLS gate. Only the configured apex/subdomains may
+    # On-demand TLS gate. Only the configured apex or exactly one
+    # label before it (matching the *.$Domain route below) may
     # trigger ACME issuance — any other SNI returns 403 so Caddy
-    # refuses to ask Let's Encrypt for a cert. This is the security
+    # refuses to ask Let's Encrypt for a cert. Deeper names like
+    # a.b.$Domain are NOT routed and must not consume the
+    # configured domain's ACME rate limit. This is the security
     # boundary that prevents arbitrary DNS pointed at this server
     # from burning ACME rate limits. See codex P1 follow-up to
-    # #380 / #1070.
-    @octos_tls expression ``{query.domain} == "$Domain" || {query.domain}.endsWith(".$Domain")``
+    # #380 / #1070, and #1124 for the apex+single-label tightening.
+    @octos_tls expression ``{query.domain}.matches("^([^.]+\\.)?$DomainRe`$")``
     respond @octos_tls 200
     respond /check 403
 }
