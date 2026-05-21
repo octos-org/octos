@@ -161,12 +161,30 @@ const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
 const APPUI_METHOD_PROFILE_SKILLS_REMOVE: &str = "profile/skills/remove";
+/// #1057: M22 TUI Solo Onboarding backend support contract.
+///
+/// Backend-owned workspace validation/status for onboarding. Resolves the
+/// canonical path, reports existence and writability, parses
+/// `workspace_policy.toml` (presence + parse-error surfacing), and rejects
+/// candidates that root under a banned system path
+/// (`validate_session_workspace_path_safety`). Local-solo only — tenant /
+/// cloud deployments reject with `profile_local_unsupported` so TUI clients
+/// see the same typed shape they get from `profile/local/create`.
+const APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE: &str = "onboarding/workspace_probe";
 const APPUI_METHOD_REVIEW_START: &str = octos_core::ui_protocol::methods::REVIEW_START;
 const DASHBOARD_PROVIDERS_JSON: &str = include_str!("../../../../dashboard/src/providers.json");
 const APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1: &str = "profile.local_create.v1";
 const APPUI_FEATURE_PERMISSION_PROFILE_V1: &str = "permission.profile.v1";
 const APPUI_FEATURE_RUNTIME_POLICY_STAMP_V1: &str = "runtime.policy_stamp.v1";
 const APPUI_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1";
+/// #1057: backend onboarding support contract — TUI Solo Onboarding (M22).
+/// Advertises `onboarding/workspace_probe`, which canonicalizes a workspace
+/// candidate path, reports existence/writability, surfaces
+/// `workspace_policy.toml` presence + parse errors, and rejects roots that
+/// escape under banned system paths. Backend-owned runtime truth so the TUI
+/// (a separate `octos-tui` repo) only stages user intent — the canonical
+/// answer is the server's.
+const APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1: &str = "onboarding.workspace_probe.v1";
 const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_CLIENT_HELLO,
     APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
@@ -190,6 +208,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
     APPUI_METHOD_PROFILE_SKILLS_REMOVE,
+    APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
 ];
 const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_AUTH_ME,
@@ -1145,6 +1164,15 @@ impl ConnectionUiFeatures {
             {
                 continue;
             }
+            // #1057: `onboarding/workspace_probe` is a local-solo onboarding
+            // helper. Tenant/cloud deployments do not expose it because their
+            // workspace lifecycle is owned by their control plane, not by
+            // per-session canonicalize/probe calls.
+            if *method == APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
+                && !supports_local_solo_profile_create(state)
+            {
+                continue;
+            }
             if is_profile_skill_appui_method(*method) && state.profile_store.is_none() {
                 continue;
             }
@@ -1193,6 +1221,13 @@ impl ConnectionUiFeatures {
             push_capability_feature(
                 &mut capabilities.supported_features,
                 APPUI_FEATURE_PROFILE_LOCAL_CREATE_V1,
+            );
+            // #1057: workspace probe ships next to local-solo onboarding so
+            // the TUI can advertise the recovery UX only when the backend
+            // can answer canonical-path / workspace-policy questions.
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1,
             );
         }
         if self.stdio_transport {
@@ -6514,6 +6549,16 @@ async fn handle_raw_appui_rpc(
                 }
             }
         }
+        APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => {
+            let params: OnboardingWorkspaceProbeParams = match parse_raw_params(request) {
+                Ok(params) => params,
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
+                }
+            };
+            onboarding_workspace_probe_result(state, &params.path)
+        }
         _ => return false,
     };
 
@@ -7469,6 +7514,211 @@ fn validate_session_workspace_path_safety(workspace_root: &Path) -> Result<(), R
         }
     }
     Ok(())
+}
+
+/// #1057: shared root-escape detector for `onboarding/workspace_probe`.
+///
+/// Mirrors `validate_session_workspace_path_safety` but returns the banned
+/// system-root component (if any) instead of an `RpcError`. The probe
+/// surfaces `root_escape: true` plus the banned component so the TUI can
+/// render a typed recovery hint without first eating an `invalid_params`
+/// error on `session/open`.
+///
+/// "Root escape" here means "the resolved canonical workspace would land
+/// the agent under a banned OS path (`/etc`, `/usr`, `/proc`, ...)", i.e.
+/// the same safety gate `session/open` enforces. We don't add the
+/// `bin`/`sbin`/`var` set used by some validators because the probe is the
+/// onboarding gate and we want the same answer the runtime would give.
+fn workspace_root_escape_under_system_path(path: &Path) -> Option<&'static str> {
+    let mut components = path.components();
+    let _root = components.next();
+    let Some(first) = components.next() else {
+        return None;
+    };
+    let first = first.as_os_str();
+    const BANNED: &[&str] = &[
+        "etc", "sbin", "bin", "boot", "dev", "proc", "sys", "usr", "var", "root",
+    ];
+    for entry in BANNED {
+        if first == std::ffi::OsStr::new(entry) {
+            return Some(*entry);
+        }
+    }
+    None
+}
+
+/// #1057: parameters for `onboarding/workspace_probe`.
+#[derive(Debug, Deserialize)]
+struct OnboardingWorkspaceProbeParams {
+    /// User-supplied path string (may contain `~/`, may not exist yet, may
+    /// be a regular file rather than a directory). The probe canonicalizes
+    /// when possible and reports the answer truthfully — it does not error
+    /// on missing paths because the TUI uses this RPC to walk users through
+    /// recovery.
+    path: String,
+}
+
+/// #1057: backend-owned workspace status for TUI onboarding.
+///
+/// Resolves `params.path` against the local filesystem and returns a
+/// summary the TUI can show in its onboarding/setup wizard:
+///
+/// - `requested_path`: the unmodified input (with `~` expansion noted via
+///   `expanded_path`).
+/// - `expanded_path`: the `~/`-expanded path before canonicalization. Equal
+///   to `requested_path` when no expansion happened.
+/// - `canonical_path`: `std::fs::canonicalize` result (string) or `null`
+///   when the path doesn't exist.
+/// - `exists`, `is_directory`, `writable`: filesystem state.
+/// - `workspace_policy.present`: whether `workspace_policy.toml` exists in
+///   the resolved root.
+/// - `workspace_policy.parse_error`: `null` when the file parses, otherwise
+///   the toml parser's error string.
+/// - `workspace_policy.kind`: parsed `workspace.kind` (e.g. `"coding"`)
+///   when the file parses, else `null`.
+/// - `root_escape`: `true` when the canonical (or expanded) path roots
+///   under a banned system path (`/etc`, `/usr`, …). The TUI uses this to
+///   show a "pick another directory" prompt without running `session/open`
+///   first.
+/// - `banned_root`: the banned system component (`"etc"`, …) when
+///   `root_escape == true`, else `null`.
+fn onboarding_workspace_probe_result(state: &AppState, path: &str) -> Result<Value, RpcError> {
+    if !supports_local_solo_profile_create(state) {
+        // #1057 bullet 4: tenant / cloud rejection is typed so TUI clients
+        // get the same shape as `profile/local/create`.
+        return Err(local_profile_permission_error(
+            "profile_local_unsupported",
+            "onboarding/workspace_probe is available only in local solo mode",
+            state,
+        ));
+    }
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(
+            RpcError::invalid_params("path is required").with_data(json!({
+                "kind": "workspace_probe_invalid_path",
+                "reason": "empty",
+            })),
+        );
+    }
+    let expanded = expand_home_path(trimmed);
+    let canonical = std::fs::canonicalize(&expanded).ok();
+
+    // Determine what path to evaluate "root escape" against: prefer the
+    // canonical answer (truthful for symlinks) and fall back to the
+    // expanded literal so non-existent paths still get a typed answer.
+    let evaluated_path: &Path = canonical.as_deref().unwrap_or(expanded.as_path());
+    let banned_root = workspace_root_escape_under_system_path(evaluated_path);
+    let root_escape = banned_root.is_some();
+
+    let metadata = canonical.as_deref().and_then(|p| std::fs::metadata(p).ok());
+    let exists = metadata.is_some();
+    let is_directory = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let writable = canonical
+        .as_deref()
+        .filter(|_| is_directory)
+        .map(directory_is_writable)
+        .unwrap_or(false);
+
+    let policy = workspace_policy_probe(canonical.as_deref());
+
+    Ok(json!({
+        "requested_path": trimmed,
+        "expanded_path": expanded.to_string_lossy(),
+        "canonical_path": canonical.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "exists": exists,
+        "is_directory": is_directory,
+        "writable": writable,
+        "workspace_policy": policy,
+        "root_escape": root_escape,
+        "banned_root": banned_root,
+        "runtime_mode": runtime_mode_for_state(state),
+    }))
+}
+
+/// #1057: probe writability by attempting to create + delete a temp file in
+/// the resolved workspace root. We do NOT fall back to filesystem-permission
+/// bit inspection because on macOS / Linux the effective writability
+/// depends on ACLs, mount-time `ro` flags, and capability sets that
+/// `Permissions.mode()` cannot answer. The probe must reflect the answer
+/// the agent would get when it next tries to write.
+fn directory_is_writable(path: &Path) -> bool {
+    // #1147 codex P2: use a unique per-call probe filename so a stale
+    // file from a killed prior probe (or a user-created `.octos-workspace-probe`)
+    // doesn't cause `create_new` to fail with `AlreadyExists` and
+    // falsely report `writable=false`. PID + nanos + process-local
+    // atomic counter make collision practically impossible.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let probe = path.join(format!(".octos-workspace-probe-{pid}-{nanos}-{counter}"));
+    let attempt = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match attempt {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// #1057: report `workspace_policy.toml` presence + parse status. We do not
+/// load the policy into the runtime here — that responsibility lives with
+/// `SessionRuntime::bootstrap`. The probe only answers "would a future
+/// session/open against this directory hit a policy parse failure?".
+fn workspace_policy_probe(root: Option<&Path>) -> Value {
+    let Some(root) = root else {
+        return json!({
+            "present": false,
+            "parse_error": null,
+            "kind": null,
+        });
+    };
+    // #1147 codex P2: probe the canonical runtime policy filename
+    // (`octos_agent::workspace_policy::WORKSPACE_POLICY_FILE`,
+    // currently `.octos-workspace.toml`) — the previous `workspace_policy.toml`
+    // hardcoded name didn't match what `SessionRuntime::bootstrap`
+    // actually reads, so the probe reported `present=false` for
+    // every real workspace.
+    let policy_path = root.join(octos_agent::workspace_policy::WORKSPACE_POLICY_FILE);
+    if !policy_path.exists() {
+        return json!({
+            "present": false,
+            "parse_error": null,
+            "kind": null,
+        });
+    }
+    let raw = match std::fs::read_to_string(&policy_path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return json!({
+                "present": true,
+                "parse_error": format!("read error: {error}"),
+                "kind": null,
+            });
+        }
+    };
+    match toml::from_str::<octos_agent::workspace_policy::WorkspacePolicy>(&raw) {
+        Ok(policy) => json!({
+            "present": true,
+            "parse_error": null,
+            "kind": policy.workspace.kind.as_str(),
+        }),
+        Err(error) => json!({
+            "present": true,
+            "parse_error": error.to_string(),
+            "kind": null,
+        }),
+    }
 }
 
 /// Resolve the `ProfileRuntime` for the routed session, mirroring
@@ -15925,6 +16175,7 @@ mod tests {
             APPUI_METHOD_PROFILE_SKILLS_LIST | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH => {
                 json!({ "profile_id": 42 })
             }
+            APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => json!({ "path": "." }),
             methods::AGENT_LIST
             | methods::AGENT_STATUS_READ
             | methods::AGENT_OUTPUT_READ
@@ -16614,6 +16865,247 @@ mod tests {
         assert_eq!(
             unsupported.data.as_ref().and_then(|data| data.get("kind")),
             Some(&json!("profile_local_unsupported"))
+        );
+    }
+
+    /// #1057 / M22 — backend workspace probe reports canonical path,
+    /// existence, writability, and absent workspace_policy.toml for an
+    /// existing directory the user could plausibly pick during onboarding.
+    #[test]
+    fn workspace_probe_reports_canonical_path_and_writability_for_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+
+        let result = onboarding_workspace_probe_result(&state, workspace.to_str().unwrap())
+            .expect("probe an existing writable dir");
+
+        assert_eq!(result["exists"], json!(true));
+        assert_eq!(result["is_directory"], json!(true));
+        assert_eq!(result["writable"], json!(true));
+        assert_eq!(result["root_escape"], json!(false));
+        assert_eq!(result["banned_root"], Value::Null);
+        assert_eq!(result["runtime_mode"], json!("solo"));
+        assert_eq!(
+            result["canonical_path"].as_str().unwrap(),
+            canonical.to_string_lossy()
+        );
+        assert_eq!(result["workspace_policy"]["present"], json!(false));
+        assert_eq!(result["workspace_policy"]["parse_error"], Value::Null);
+        assert_eq!(result["workspace_policy"]["kind"], Value::Null);
+    }
+
+    /// #1057 — probe reports non-existence truthfully without erroring so
+    /// the TUI can guide users through "directory not found" recovery.
+    #[test]
+    fn workspace_probe_reports_missing_path_without_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let missing = dir.path().join("not-yet-created");
+
+        let result = onboarding_workspace_probe_result(&state, missing.to_str().unwrap())
+            .expect("probe a missing path");
+
+        assert_eq!(result["exists"], json!(false));
+        assert_eq!(result["is_directory"], json!(false));
+        assert_eq!(result["writable"], json!(false));
+        assert_eq!(result["canonical_path"], Value::Null);
+        // Workspace policy can't be inspected when the dir doesn't exist.
+        assert_eq!(result["workspace_policy"]["present"], json!(false));
+    }
+
+    /// #1057 — probe surfaces a parse error when `workspace_policy.toml`
+    /// exists but cannot be parsed, so the TUI can show the user the
+    /// underlying parser message before session/open eats the same error.
+    #[test]
+    fn workspace_probe_surfaces_workspace_policy_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(
+            workspace.join(octos_agent::workspace_policy::WORKSPACE_POLICY_FILE),
+            "this is = not [valid toml",
+        )
+        .expect("write malformed policy");
+
+        let result = onboarding_workspace_probe_result(&state, workspace.to_str().unwrap())
+            .expect("probe with malformed policy");
+
+        assert_eq!(result["workspace_policy"]["present"], json!(true));
+        assert!(
+            result["workspace_policy"]["parse_error"]
+                .as_str()
+                .is_some_and(|err| !err.is_empty()),
+            "parse_error should be a non-empty string, got {:?}",
+            result["workspace_policy"]["parse_error"],
+        );
+        assert_eq!(result["workspace_policy"]["kind"], Value::Null);
+    }
+
+    /// #1057 — probe parses a well-formed policy and reports the workspace
+    /// kind so the TUI can preview the harness that will run.
+    #[test]
+    fn workspace_probe_reports_parsed_workspace_policy_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let policy = r#"
+schema_version = 1
+[workspace]
+kind = "coding"
+[version_control]
+provider = "git"
+auto_init = true
+trigger = "turn_end"
+fail_on_error = false
+[tracking]
+ignore = []
+"#;
+        std::fs::write(
+            workspace.join(octos_agent::workspace_policy::WORKSPACE_POLICY_FILE),
+            policy,
+        )
+        .expect("write valid policy");
+
+        let result = onboarding_workspace_probe_result(&state, workspace.to_str().unwrap())
+            .expect("probe with valid policy");
+
+        assert_eq!(result["workspace_policy"]["present"], json!(true));
+        assert_eq!(result["workspace_policy"]["parse_error"], Value::Null);
+        assert_eq!(result["workspace_policy"]["kind"], json!("coding"));
+    }
+
+    /// #1147 codex P2 acceptance: a writability probe must use a
+    /// unique filename per call so a stale leftover file (or a
+    /// user-created `.octos-workspace-probe-*` file) doesn't cause
+    /// `create_new` to fail with `AlreadyExists` and falsely report
+    /// `writable=false`. We simulate the bug by pre-creating a file
+    /// with the OLD fixed name and asserting the probe still reports
+    /// the directory as writable.
+    #[test]
+    fn workspace_probe_is_writable_despite_stale_probe_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        // Pre-create a file that would have collided with the old
+        // fixed `.octos-workspace-probe` name.
+        std::fs::write(workspace.join(".octos-workspace-probe"), "stale leftover")
+            .expect("write stale probe file");
+
+        let result = onboarding_workspace_probe_result(&state, workspace.to_str().unwrap())
+            .expect("probe must run despite stale leftover");
+        assert_eq!(
+            result["writable"],
+            json!(true),
+            "stale leftover file with old fixed name must NOT block writability probe",
+        );
+    }
+
+    /// #1057 — probe rejects roots that escape into a banned system path
+    /// (`/etc`, `/usr`, ...) so the TUI can preflight the same gate that
+    /// `session/open` enforces.
+    #[test]
+    fn workspace_probe_flags_root_escape_under_banned_system_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let result =
+            onboarding_workspace_probe_result(&state, "/etc/octos-test-not-a-real-path-1057")
+                .expect("probe an /etc candidate");
+
+        assert_eq!(result["root_escape"], json!(true));
+        assert_eq!(result["banned_root"], json!("etc"));
+        // Banned-root candidates may not even exist; the gate must fire
+        // regardless of existence.
+    }
+
+    /// #1057 bullet 4 — probe returns a typed `profile_local_unsupported`
+    /// error on tenant / cloud deployments (matching `profile/local/create`
+    /// so TUI clients can handle the rejection uniformly).
+    #[test]
+    fn workspace_probe_rejects_tenant_deployment_with_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile_state(dir.path());
+        let tenant = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            profile_store: local.profile_store.clone(),
+            user_store: local.user_store.clone(),
+            ..AppState::empty_for_tests()
+        };
+
+        let error = onboarding_workspace_probe_result(&tenant, dir.path().to_str().unwrap())
+            .expect_err("tenant rejection");
+        assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("profile_local_unsupported"))
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("runtime_mode")),
+            Some(&json!("multi_tenant"))
+        );
+    }
+
+    /// #1057 — probe rejects an empty path with a typed invalid-params
+    /// error so TUI clients get a structured shape to react to.
+    #[test]
+    fn workspace_probe_rejects_empty_path_with_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+
+        let error =
+            onboarding_workspace_probe_result(&state, "   ").expect_err("empty path rejected");
+        assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("workspace_probe_invalid_path"))
+        );
+    }
+
+    /// #1057 — `onboarding/workspace_probe` is advertised as a method +
+    /// feature flag for local-solo deployments and omitted for tenant.
+    #[test]
+    fn workspace_probe_capability_is_local_solo_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_profile_state(dir.path());
+        let local_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&local);
+        assert!(
+            local_capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE),
+            "local solo deployment must advertise the workspace probe method",
+        );
+        assert!(
+            local_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1),
+            "local solo deployment must advertise the workspace probe feature",
+        );
+
+        let tenant = AppState {
+            deployment_mode: crate::config::DeploymentMode::Tenant,
+            profile_store: local.profile_store.clone(),
+            user_store: local.user_store.clone(),
+            ..AppState::empty_for_tests()
+        };
+        let tenant_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&tenant);
+        assert!(
+            !tenant_capabilities
+                .supported_methods
+                .iter()
+                .any(|method| method == APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE),
+            "tenant deployment must NOT advertise the workspace probe method",
+        );
+        assert!(
+            !tenant_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1),
+            "tenant deployment must NOT advertise the workspace probe feature",
         );
     }
 
