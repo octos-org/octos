@@ -1,0 +1,309 @@
+# M19 Octos UX Scenario Manifest
+#
+# Schema version is the contract between `ux:scenario:list` (M19-A, #1063),
+# the artifact ABI (#1064), the tmux wrapper (#1065), and the validator
+# registry (#1066). When the schema changes, bump `schema_version`.
+#
+# Each `[[scenario]]` table declares one UX scenario the gate can list, plan,
+# and (in follow-up PRs) actually run through real tmux against a real
+# `octos` plus real `octos-tui`.
+#
+# Mandatory fields per scenario:
+#   id                 - kebab-case identifier, unique
+#   title              - one-line human label
+#   description        - why this scenario exists; what it proves
+#   tier               - "fast" | "local" | "release"
+#   transport          - "stdio" | "ws"
+#   provider           - "fixture" | "live" | "none"
+#   terminal           - "80x24" | "100x30" | "120x40" | "narrow"
+#   tui_binary         - logical name; resolved by the runner (#1065)
+#   tmux_command       - logical command label; the runner picks the script
+#   required_tools     - host binaries that must be on PATH
+#   required_capabilities - AppUI capability flags (see UPCR-2026-019)
+#   expected_artifacts - filenames the runner MUST emit under
+#                        e2e/test-results-ux/<run-id>/<scenario-id>/
+#   acceptance         - validator IDs (implementations land in #1066)
+#
+# Optional:
+#   replay             - path to a replay script (driver input)
+#   notes              - free-form
+
+schema_version = 1
+pack = "octos-ux"
+owner = "M19 UX gate"
+
+[[scenario]]
+id = "tui-solo-onboarding"
+title = "Solo onboarding first-run"
+description = "Fresh profile boots into Solo mode, capability gate reports no-OTP path, runtime policy stamp lands in artifacts."
+tier = "fast"
+transport = "stdio"
+provider = "fixture"
+terminal = "80x24"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-solo-onboarding"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["onboarding/workspace_probe", "runtime/policy_stamp"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+]
+acceptance = [
+  "appui.no_otp_calls",
+  "appui.profile_id_consistent",
+  "tui.first_frame_not_blank",
+  "runtime.policy_stamp_present",
+]
+replay = "e2e/ux/replays/tui-solo-onboarding.replay"
+notes = "Mirrors M22-H onboarding pack but focused on the UX gate plumbing."
+
+[[scenario]]
+id = "provider-missing-recoverable"
+title = "Provider missing, recoverable"
+description = "Boot without a configured provider; UX should surface a recoverable banner, not crash, and validators should see a typed error in appui-transcript."
+tier = "fast"
+transport = "stdio"
+provider = "none"
+terminal = "80x24"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-provider-missing"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["onboarding/workspace_probe"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+]
+acceptance = [
+  "appui.provider_missing_banner_present",
+  "appui.no_panic",
+  "tui.first_frame_not_blank",
+]
+
+[[scenario]]
+id = "permission-selection"
+title = "Permission profile selection"
+description = "User toggles between Solo and Dangerous permission profiles; selection persists and policy stamp updates accordingly."
+tier = "local"
+transport = "stdio"
+provider = "fixture"
+terminal = "80x24"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-permission-selection"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["runtime/policy_stamp", "permission/profile_select"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+]
+acceptance = [
+  "runtime.policy_stamp_present",
+  "runtime.policy_stamp_matches_selection",
+  "appui.no_otp_calls",
+]
+
+[[scenario]]
+id = "stdio-happy-path"
+title = "stdio coding-session happy path"
+description = "Send a prompt over stdio transport, receive a response, capture the final TUI frame. The canonical M19 happy-path scenario."
+tier = "local"
+transport = "stdio"
+provider = "fixture"
+terminal = "100x30"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-stdio-happy"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["chat/send_prompt", "chat/receive_response"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+]
+acceptance = [
+  "tui.first_frame_not_blank",
+  "appui.assistant_response_present",
+  "appui.no_unsupported_method",
+]
+replay = "e2e/ux/replays/stdio-happy-path.replay"
+
+[[scenario]]
+id = "websocket-happy-path"
+title = "WebSocket coding-session happy path"
+description = "Same happy-path shape as stdio-happy-path but via the WS transport. Required to keep both transports green."
+tier = "local"
+transport = "ws"
+provider = "fixture"
+terminal = "100x30"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-ws-happy"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["chat/send_prompt", "chat/receive_response"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+]
+acceptance = [
+  "tui.first_frame_not_blank",
+  "appui.assistant_response_present",
+  "appui.no_unsupported_method",
+]
+replay = "e2e/ux/replays/websocket-happy-path.replay"
+
+[[scenario]]
+id = "approval-denial"
+title = "Approval denial flow"
+description = "Tool call requires approval; user denies; subsequent agent loop respects the denial and surfaces a typed denial event in the transcript."
+tier = "local"
+transport = "stdio"
+provider = "fixture"
+terminal = "100x30"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-approval-denial"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["approval/request", "approval/deny"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+  "approval-events.jsonl",
+]
+acceptance = [
+  "appui.approval_denied_event_present",
+  "appui.no_tool_call_after_denial",
+]
+
+[[scenario]]
+id = "task-subagent-tree"
+title = "Task / subagent tree visibility"
+description = "Spawn a subagent task; the TUI shows the supervisor/child tree, the artifact index lists child outputs, and the AppUI ledger has parent/child wiring."
+tier = "local"
+transport = "stdio"
+provider = "fixture"
+terminal = "120x40"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-task-subagent-tree"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["task/spawn", "task/observe"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+  "task-ledger.jsonl",
+  "artifact-index.json",
+]
+acceptance = [
+  "appui.child_parent_wiring_consistent",
+  "tui.task_tree_rendered",
+]
+
+[[scenario]]
+id = "restart-reconnect"
+title = "Restart + reconnect"
+description = "Backend restarts mid-session; the TUI reconnects, prior session state is preserved, no duplicate prompts are issued."
+tier = "release"
+transport = "ws"
+provider = "fixture"
+terminal = "100x30"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-restart-reconnect"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["session/resume", "transport/reconnect"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+  "reconnect-events.jsonl",
+]
+acceptance = [
+  "appui.no_duplicate_prompt_after_reconnect",
+  "appui.session_state_preserved",
+]
+
+[[scenario]]
+id = "narrow-layout"
+title = "Narrow terminal layout"
+description = "Run the happy-path scenario in a narrow terminal (60x20). Layout must reflow, not truncate-and-hide control lines."
+tier = "release"
+transport = "stdio"
+provider = "fixture"
+terminal = "narrow"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-narrow-layout"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["chat/send_prompt"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+]
+acceptance = [
+  "tui.no_truncated_control_lines",
+  "tui.first_frame_not_blank",
+]
+
+[[scenario]]
+id = "dropped-completion-backpressure"
+title = "Dropped completion under backpressure"
+description = "Provider stalls mid-stream; backpressure handling MUST surface a typed warning, MUST NOT silently drop tokens, and the next prompt MUST still succeed."
+tier = "release"
+transport = "ws"
+provider = "fixture"
+terminal = "100x30"
+tui_binary = "octos-tui"
+tmux_command = "ux-tui-dropped-completion"
+required_tools = ["tmux", "octos", "octos-tui"]
+required_capabilities = ["chat/send_prompt", "chat/stream"]
+expected_artifacts = [
+  "scenario.json",
+  "summary.json",
+  "appui-transcript.jsonl",
+  "server.log",
+  "tui-capture.txt",
+  "runtime-policy-stamp.json",
+  "validation.json",
+  "stream-events.jsonl",
+]
+acceptance = [
+  "appui.backpressure_warning_present",
+  "appui.no_silent_token_drop",
+  "appui.next_prompt_succeeds",
+]
