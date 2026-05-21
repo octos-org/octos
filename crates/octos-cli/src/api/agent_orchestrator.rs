@@ -2174,6 +2174,12 @@ struct DueLoopFire {
     loop_id: String,
     prompt: String,
     scheduled_for_ms: i64,
+    /// #1135: carries the `MaintenancePromptSource` resolved at fire
+    /// time for maintenance loops, so the queued continuation metadata
+    /// reports the same `project` / `user` / `built_in` provenance as
+    /// the `fire_now` path. `None` for non-maintenance modes — those
+    /// fall back to the legacy `"record"` label.
+    prompt_source: Option<MaintenancePromptSource>,
 }
 
 fn enqueue_due_loop_continuations(
@@ -2248,10 +2254,15 @@ fn enqueue_due_loop_continuations(
         // edit to `.octos/loop.md` between fires actually takes
         // effect on the next scheduled tick. fixed_interval and
         // self_paced keep the persisted prompt.
-        let fire_prompt = if loop_record.mode == "maintenance" {
-            resolve_maintenance_prompt_at_fire_time().prompt
+        // #1135: capture the resolved `MaintenancePromptSource` here
+        // and forward it through `DueLoopFire` so the queued
+        // continuation metadata reports `project` / `user` /
+        // `built_in` instead of the legacy `"record"` placeholder.
+        let (fire_prompt, fire_prompt_source) = if loop_record.mode == "maintenance" {
+            let resolution = resolve_maintenance_prompt_at_fire_time();
+            (resolution.prompt, Some(resolution.source))
         } else {
-            loop_record.prompt.clone()
+            (loop_record.prompt.clone(), None)
         };
         due.push(DueLoopFire {
             session_id: loop_record.session_id.clone(),
@@ -2259,6 +2270,7 @@ fn enqueue_due_loop_continuations(
             loop_id: loop_record.loop_id.clone(),
             prompt: fire_prompt,
             scheduled_for_ms: next_run_at_ms,
+            prompt_source: fire_prompt_source,
         });
         loop_record.last_run_at_ms = Some(now);
         // #1128 codex P1 follow-up: only `fixed_interval` mode
@@ -2287,6 +2299,13 @@ fn enqueue_due_loop_continuations(
 
     let mut queued = 0;
     for fire in due {
+        // #1135: align the scheduled-due metadata with `fire_now` —
+        // maintenance loops report the resolved provenance, every
+        // other mode falls back to the legacy `"record"` label.
+        let prompt_source_label = fire
+            .prompt_source
+            .map(maintenance_prompt_source_label)
+            .unwrap_or("record");
         let continuation = MasterContinuationRequest::new(
             "coding-autonomy",
             fire.session_id.to_string(),
@@ -2296,7 +2315,7 @@ fn enqueue_due_loop_continuations(
         )
         .with_loop_id(fire.loop_id)
         .with_metadata("prompt", fire.prompt)
-        .with_metadata("prompt_source", "record")
+        .with_metadata("prompt_source", prompt_source_label)
         .with_metadata("scheduled_for_ms", fire.scheduled_for_ms.to_string());
         if enqueue_and_persist_continuation(state, continuation)
             .queued()
@@ -4416,6 +4435,24 @@ pub(crate) fn parse_self_paced_next_delay(text: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1135 codex P2: serialize all cwd-mutating tests in this module
+    /// (currently `maintenance_loop_resolves_prompt_at_fire_time_from_project_doc`
+    /// and `scheduled_maintenance_fire_emits_resolved_prompt_source`).
+    /// Rust runs tests in parallel by default; both tests `chdir` to
+    /// their own tempdir and write `.octos/loop.md` there. Without a
+    /// shared lock the two tests can overlap, with one resolving the
+    /// OTHER's project doc and producing nondeterministic content
+    /// failures. The lock is poisoning-safe — we recover from a poisoned
+    /// lock so an earlier panic doesn't permanently disable the suite.
+    static CWD_MUTATING_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn cwd_mutating_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CWD_MUTATING_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct NativeMockProvider {
         content: Result<String, String>,
@@ -7017,6 +7054,8 @@ mod tests {
     #[test]
     fn maintenance_loop_resolves_prompt_at_fire_time_from_project_doc() {
         use std::env;
+        // #1135 codex P2: serialize cwd-mutating tests in this module.
+        let _cwd_guard = cwd_mutating_test_guard();
         let temp = tempfile::TempDir::new().expect("temp dir");
         let cwd_before = env::current_dir().expect("cwd");
         env::set_current_dir(temp.path()).expect("chdir tmp");
@@ -7072,6 +7111,84 @@ mod tests {
             .cloned()
             .expect("prompt_source metadata");
         assert_eq!(source, "project");
+    }
+
+    /// #1135 acceptance: the scheduled-due path must also report the
+    /// resolved `prompt_source` (`project` / `user` / `built_in`) and
+    /// not the legacy `"record"` placeholder. The continuation prompt
+    /// must match the file content, proving the resolution actually
+    /// ran for the scheduled tick, not just for `fire_now`.
+    #[test]
+    fn scheduled_maintenance_fire_emits_resolved_prompt_source() {
+        use std::env;
+        // #1135 codex P2: serialize cwd-mutating tests in this module.
+        let _cwd_guard = cwd_mutating_test_guard();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let cwd_before = env::current_dir().expect("cwd");
+        env::set_current_dir(temp.path()).expect("chdir tmp");
+        let octos_dir = temp.path().join(".octos");
+        std::fs::create_dir_all(&octos_dir).expect("mkdir .octos");
+        std::fs::write(
+            octos_dir.join("loop.md"),
+            "scheduled project maintenance steps\n",
+        )
+        .expect("write loop.md");
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "sched-loop-maint");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: None,
+                command: None,
+                interval_seconds: None,
+                mode: Some("maintenance".into()),
+            })
+            .expect("create maintenance loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Force the scheduled-due path: stamp a past `next_run_at_ms`
+        // and tick the scheduler. `fire_now` is NOT involved here.
+        {
+            let mut state = orchestrator.state();
+            let loop_record = state.loops.get_mut(&loop_id).expect("loop record");
+            loop_record.next_run_at_ms = Some(now_ms() - 1);
+        }
+        let ticked = orchestrator.tick_due_loops_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+        );
+        assert_eq!(ticked, 1, "scheduled maintenance loop should enqueue");
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        env::set_current_dir(&cwd_before).expect("restore cwd");
+        assert_eq!(drained.len(), 1);
+        let prompt_meta = drained[0]
+            .metadata
+            .get("prompt")
+            .cloned()
+            .expect("prompt metadata");
+        assert_eq!(
+            prompt_meta.trim(),
+            "scheduled project maintenance steps",
+            "scheduled maintenance prompt must be resolved from .octos/loop.md (#1135)"
+        );
+        let source = drained[0]
+            .metadata
+            .get("prompt_source")
+            .cloned()
+            .expect("prompt_source metadata");
+        assert_eq!(
+            source, "project",
+            "scheduled fire must carry the resolved MaintenancePromptSource label (#1135)"
+        );
     }
 
     #[test]
