@@ -941,7 +941,16 @@ impl InProcessAgentOrchestrator {
         max_items: usize,
     ) -> Vec<QueuedMasterContinuation> {
         let mut state = self.state();
-        enqueue_due_loop_continuations(&mut state, session_id, profile_id, runtime_state, now_ms());
+        let now = now_ms();
+        enqueue_due_loop_continuations(&mut state, session_id, profile_id, runtime_state, now);
+        // #1129 codex P1 follow-up: active goals whose
+        // `last_continued_at_ms + GOAL_MIN_CONTINUATION_INTERVAL_MS`
+        // is past must also be re-queued here. Previously the only
+        // goal enqueue happened immediately after `record_goal_turn`
+        // (which had just stamped `last_continued_at_ms = now`,
+        // tripping the min-delay gate), so an active goal only ran
+        // its initial continuation and never recurred.
+        enqueue_due_goal_continuations(&mut state, session_id, profile_id, runtime_state, now);
         state.continuations.drain_ready_for_session(
             runtime_state,
             max_items,
@@ -961,6 +970,7 @@ impl InProcessAgentOrchestrator {
 
         let state = self.state();
         let now = now_ms();
+        let now_system = SystemTime::now();
         let mut targets = Vec::new();
         for loop_record in state.loops.values() {
             // #1128 codex P1 follow-up: `due_loop_targets` previously
@@ -990,6 +1000,32 @@ impl InProcessAgentOrchestrator {
                 targets.push(target);
                 if targets.len() >= max_items {
                     break;
+                }
+            }
+        }
+        // #1129 codex P1 follow-up: include sessions whose active goal
+        // is past the min-delay so the AppUI / session-actor scheduler
+        // visits them too. The drain path
+        // (`drain_ready_continuations_for_session`) is where the
+        // actual goal-continuation enqueue happens; this scan only
+        // tells the scheduler WHICH sessions need a visit. Without
+        // this, sessions with a goal but no loop never tick again
+        // after `set_goal`'s initial enqueue.
+        if targets.len() < max_items {
+            let idle_state = GoalRuntimeIdleState::idle();
+            for (session_id, goal) in &state.goals {
+                if profile_filter.is_some_and(|profile_id| goal.profile_id != profile_id) {
+                    continue;
+                }
+                if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
+                    continue;
+                }
+                let target = (session_id.clone(), goal.profile_id.clone());
+                if !targets.contains(&target) {
+                    targets.push(target);
+                    if targets.len() >= max_items {
+                        break;
+                    }
                 }
             }
         }
@@ -2464,6 +2500,44 @@ fn enqueue_and_persist_continuation(
     outcome
 }
 
+/// #1129 codex P1 follow-up to #979 / M15-C2 — scan the session's
+/// active goal (if any) and enqueue a continuation when the policy
+/// gate now allows it. Mirrors `enqueue_due_loop_continuations` for
+/// the goal-recurrence path. Without this scan, the only goal-enqueue
+/// happens inside `maybe_enqueue_goal_after_turn` immediately after
+/// `record_goal_turn` stamped `last_continued_at_ms = now`, which the
+/// 30s min-delay always denies — so active goals only ever fired
+/// their initial continuation and silently stopped.
+fn enqueue_due_goal_continuations(
+    state: &mut AutonomyRuntimeState,
+    session_id: &SessionKey,
+    profile_id: &str,
+    runtime_state: MasterContinuationRuntimeState,
+    now: i64,
+) -> usize {
+    if !runtime_state.is_idle_eligible() {
+        return 0;
+    }
+    let Some(goal) = state.goals.get(session_id).cloned() else {
+        return 0;
+    };
+    if goal.profile_id != profile_id {
+        return 0;
+    }
+    // Re-use the canonical policy gate. `idle_state` is "idle" here
+    // because the AppUI / session-actor tick path only calls into
+    // this drain when no other turn is active.
+    let idle_state = GoalRuntimeIdleState::idle();
+    let now_system = system_time_from_ms(now).unwrap_or_else(SystemTime::now);
+    if !goal_policy_allows_fire(&goal, idle_state, now_system, now) {
+        return 0;
+    }
+    match enqueue_goal_continuation_with_idle(state, session_id, profile_id, &goal, idle_state) {
+        Some(MasterContinuationEnqueueOutcome::Queued(_)) => 1,
+        _ => 0,
+    }
+}
+
 fn enqueue_goal_continuation(
     state: &mut AutonomyRuntimeState,
     session_id: &SessionKey,
@@ -2639,13 +2713,28 @@ fn record_goal_turn_internal(
 /// flip the goal to `complete`. Returns `true` if any sentinel matched
 /// so the caller can stop re-queueing.
 fn detect_goal_complete_sentinel(content: &str) -> bool {
-    let lower = content.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    // #1129 codex P2 follow-up: only match when the sentinel appears
+    // at the END of the assistant reply, not anywhere in the body.
+    // The prior `contains` check meant any assistant message that
+    // merely mentioned `goal_complete` / `<goal:complete>` in prose,
+    // code samples, or instructions silently completed the goal and
+    // stopped recurrence. Anchor to the trimmed last line / trailing
+    // token so the sentinel must be a deliberate end-of-reply
+    // declaration, not an incidental mention.
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
         return false;
     }
+    let lower = trimmed.to_ascii_lowercase();
+    let last_line = lower
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
     GOAL_COMPLETE_SENTINELS
         .iter()
-        .any(|sentinel| lower.contains(sentinel))
+        .any(|sentinel| last_line == *sentinel || last_line.ends_with(sentinel))
 }
 
 fn enqueue_agent_terminal_continuations(
@@ -5490,6 +5579,109 @@ mod tests {
             GoalRuntimeIdleState::idle(),
         ));
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 1);
+    }
+
+    /// #1129 codex P1 acceptance: after a goal turn, the
+    /// `drain_ready_continuations_for_session` tick path MUST pick up
+    /// the goal and re-queue once the 30s min-delay window has elapsed.
+    /// The prior shape never enqueued a delayed continuation, so a
+    /// goal that recorded a turn could only run again if the operator
+    /// re-called `set_goal`. We simulate the elapsed delay by forcing
+    /// `last_continued_at_ms` to the past and assert the next drain
+    /// observes a queued GoalContinue.
+    #[test]
+    fn drain_path_picks_up_active_goal_after_min_delay() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-recurrence");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "keep going".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Consume the initial continuation queued by `set_goal`.
+        let initial = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            initial.len(),
+            1,
+            "set_goal must queue exactly one initial continuation"
+        );
+
+        // Record a turn (this stamps `last_continued_at_ms = now`).
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 0, 1);
+
+        // Right after the turn, the drain path is still gated by the
+        // 30s min-delay — no new continuation should be queued.
+        let drained_immediately = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert!(
+            drained_immediately.is_empty(),
+            "min-delay gate must block immediate recurrence (got {drained_immediately:?})",
+        );
+
+        // Simulate the min-delay window having passed.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - GOAL_MIN_CONTINUATION_INTERVAL_MS - 1;
+        }
+
+        // Now the drain path MUST observe a queued GoalContinue.
+        let drained_after_delay = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            drained_after_delay.len(),
+            1,
+            "after min-delay elapses, active goal must re-queue (got {drained_after_delay:?})",
+        );
+        assert_eq!(
+            drained_after_delay[0].reason,
+            MasterContinuationReason::GoalContinue,
+            "drained continuation must be a GoalContinue",
+        );
+    }
+
+    /// #1129 codex P2 acceptance: `detect_goal_complete_sentinel` must
+    /// only match when the sentinel appears at the END of the reply,
+    /// not anywhere in the body. Otherwise an assistant message that
+    /// merely mentions `goal_complete` in prose silently completes the
+    /// goal and stops recurrence.
+    #[test]
+    fn detect_goal_complete_sentinel_requires_trailing_position() {
+        // Trailing sentinels match — happy path preserved.
+        assert!(detect_goal_complete_sentinel(
+            "All steps done.\ngoal_complete"
+        ));
+        assert!(detect_goal_complete_sentinel("<goal:complete>"));
+        assert!(detect_goal_complete_sentinel(
+            "Summary…\n\n<goal:complete>\n"
+        ));
+
+        // Sentinel in the body but with other content after must NOT match.
+        assert!(!detect_goal_complete_sentinel(
+            "I noticed the sentinel is goal_complete, but I'll keep working on step 2."
+        ));
+        assert!(!detect_goal_complete_sentinel(
+            "If you say <goal:complete>, recurrence stops. For now, advancing step 3."
+        ));
+        // Empty/whitespace inputs still produce no match.
+        assert!(!detect_goal_complete_sentinel(""));
+        assert!(!detect_goal_complete_sentinel("   \n\n"));
     }
 
     /// Bullet 1 / 2: min-delay gate — a fire that happened less than
