@@ -1747,6 +1747,11 @@ if [ -n "$CADDY_DOMAIN" ]; then
     # Determine serve port (match what octos serve uses)
     CADDY_UPSTREAM="localhost:${PORT}"
 
+    # Regex-escape the configured domain so dots match literally
+    # (each '.' becomes '\\.' in the emitted Caddyfile, which CEL parses
+    # to '\.' and RE2 then treats as a literal dot). Closes #1124.
+    CADDY_DOMAIN_RE="${CADDY_DOMAIN//./\\\\.}"
+
     # Write Caddyfile
     CADDYFILE_PATH="$DATA_DIR/Caddyfile"
     cat > "$CADDYFILE_PATH" << CADDYEOF
@@ -1757,13 +1762,16 @@ if [ -n "$CADDY_DOMAIN" ]; then
 }
 
 :9999 {
-    # On-demand TLS gate. Only the configured apex/subdomains may
-    # trigger ACME issuance — any other SNI returns 403 so Caddy
-    # refuses to ask Let's Encrypt for a cert. This is the security
+    # On-demand TLS gate. Only the configured apex or exactly one
+    # label before it (matching the *.${CADDY_DOMAIN} route below)
+    # may trigger ACME issuance — any other SNI returns 403 so Caddy
+    # refuses to ask Let's Encrypt for a cert. Deeper names like
+    # a.b.${CADDY_DOMAIN} are NOT routed and must not consume the
+    # configured domain's ACME rate limit. This is the security
     # boundary that prevents arbitrary DNS pointed at this server
     # from burning ACME rate limits. See codex P1 follow-up to
-    # #380 / #1070.
-    @octos_tls expression \`{query.domain} == "${CADDY_DOMAIN}" || {query.domain}.endsWith(".${CADDY_DOMAIN}")\`
+    # #380 / #1070, and #1124 for the apex+single-label tightening.
+    @octos_tls expression \`{query.domain}.matches("^([^.]+\\\\.)?${CADDY_DOMAIN_RE}\$")\`
     respond @octos_tls 200
     respond /check 403
 }
