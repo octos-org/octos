@@ -4208,6 +4208,92 @@ struct RawAgentArtifactReadParams {
     profile_id: Option<String>,
 }
 
+/// Param shape for the `task/artifact/list` alias. Accepts either
+/// `agent_id` (legacy `agent/artifact/*` shape) or `task_id` (the
+/// UPCR-2026-019 / M13 spec-conforming shape). Spec-conforming clients
+/// reach the artifact surface via `task/list`, which exposes `task_id`,
+/// so the alias must accept that synonym. Codex P1 follow-up to #1094.
+#[derive(Debug, Deserialize)]
+struct RawTaskAgentParams {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+impl RawTaskAgentParams {
+    fn resolve_agent_id(&self, method: &str) -> Result<String, RpcError> {
+        // Prefer the legacy `agent_id` when both are set so existing clients
+        // keep their semantics; accept `task_id` as a synonym otherwise.
+        // Codex P1 re-review on #1121: the `task_id` path MUST require an
+        // explicit `session_id` so the session/parent-child ownership
+        // check still runs. Without it, `ensure_agent_control_scope`
+        // silently downgrades to profile-only matching, and a
+        // same-profile connection that knows another task's UUID could
+        // read its artifacts. The legacy `agent_id` shape keeps the
+        // optional-session behavior for backwards compat.
+        match (self.agent_id.as_deref(), self.task_id.as_deref()) {
+            (Some(agent_id), _) => Ok(agent_id.to_owned()),
+            (None, Some(task_id)) => {
+                if self.session_id.is_none() {
+                    return Err(RpcError::invalid_params(format!(
+                        "{method} params: `task_id` requires `session_id` so artifact access can be scoped to the session that owns the task"
+                    )));
+                }
+                Ok(task_id.to_owned())
+            }
+            (None, None) => Err(RpcError::invalid_params(format!(
+                "{method} params: missing field `agent_id` or `task_id`"
+            ))),
+        }
+    }
+}
+
+/// Param shape for the `task/artifact/read` alias. Mirrors
+/// `RawAgentArtifactReadParams` but accepts either `agent_id` or
+/// `task_id` like `RawTaskAgentParams`. Codex P1 follow-up to #1094.
+#[derive(Debug, Deserialize)]
+struct RawTaskArtifactReadParams {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    artifact_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+impl RawTaskArtifactReadParams {
+    fn resolve_agent_id(&self, method: &str) -> Result<String, RpcError> {
+        // Codex P1 re-review on #1121: see `RawTaskAgentParams::resolve_agent_id`
+        // — the `task_id` path requires `session_id` so the
+        // session/parent-child ownership check still runs.
+        match (self.agent_id.as_deref(), self.task_id.as_deref()) {
+            (Some(agent_id), _) => Ok(agent_id.to_owned()),
+            (None, Some(task_id)) => {
+                if self.session_id.is_none() {
+                    return Err(RpcError::invalid_params(format!(
+                        "{method} params: `task_id` requires `session_id` so artifact access can be scoped to the session that owns the task"
+                    )));
+                }
+                Ok(task_id.to_owned())
+            }
+            (None, None) => Err(RpcError::invalid_params(format!(
+                "{method} params: missing field `agent_id` or `task_id`"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawGoalSetParams {
     session_id: SessionKey,
@@ -4854,14 +4940,29 @@ fn permission_selection_allowed(
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
     };
 
-    let request_wants_tenant_or_cloud = matches!(
-        requested_runtime_mode
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("tenant") | Some("cloud")
-    );
+    // Only treat the request as solo-relaxed when it explicitly says so
+    // (or omits the override). The UPCR-2026-018 runtime_mode override
+    // contract is "an explicit value may only tighten, never relax", so
+    // the relax path triggers only on `None`, empty, or exactly `solo`.
+    // Codex P1 #1086 first extended this to reject `local`/`tenant`/`cloud`
+    // explicit non-solo values. Codex P2 re-review on #1121 then flagged
+    // that any UNRECOGNIZED override (e.g. `multi_tenant`, whitespace-
+    // wrapped, future spec values) was falling through to the relaxed
+    // branch — we now fail closed by inverting the predicate: the gate
+    // relaxes ONLY for explicit solo / omitted, and tightens for
+    // everything else.
+    // Codex P2 re-review #3 on #1121: a blank-string or whitespace-only
+    // override is an explicit malformed value, not "omitted". Treat it
+    // as non-solo so the gate tightens. Only `None` (truly absent) and
+    // a normalized `solo` keep the relaxed path on a Local server.
+    let normalized_override = requested_runtime_mode.map(|raw| raw.trim().to_ascii_lowercase());
+    let request_relaxes_to_solo = match normalized_override.as_deref() {
+        None => true,
+        Some("solo") => true,
+        _ => false,
+    };
     let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
-    let effective_local = server_is_local && !request_wants_tenant_or_cloud;
+    let effective_local = server_is_local && request_relaxes_to_solo;
 
     effective_local
         || (selection.mode != Mode::DangerFullAccess
@@ -6004,7 +6105,7 @@ fn raw_autonomy_rpc_with_orchestrator(
                 limit: params.limit,
             })
         }
-        methods::AGENT_ARTIFACT_LIST | methods::TASK_ARTIFACT_LIST => {
+        methods::AGENT_ARTIFACT_LIST => {
             let params: RawAgentParams = parse_raw_params(request)?;
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
@@ -6017,7 +6118,23 @@ fn raw_autonomy_rpc_with_orchestrator(
                 profile_id,
             })
         }
-        methods::AGENT_ARTIFACT_READ | methods::TASK_ARTIFACT_READ => {
+        methods::TASK_ARTIFACT_LIST => {
+            // Spec-conforming clients (UPCR-2026-019 / M13) pass `task_id`;
+            // legacy callers may still pass `agent_id`. Accept either.
+            let params: RawTaskAgentParams = parse_raw_params(request)?;
+            let agent_id = params.resolve_agent_id(method)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.list_agent_artifacts(AgentRequest {
+                agent_id,
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::AGENT_ARTIFACT_READ => {
             let params: RawAgentArtifactReadParams = parse_raw_params(request)?;
             let profile_id = resolve_autonomy_profile_id(
                 params.session_id.as_ref(),
@@ -6026,6 +6143,24 @@ fn raw_autonomy_rpc_with_orchestrator(
             )?;
             orchestrator.read_agent_artifact(AgentArtifactReadRequest {
                 agent_id: params.agent_id,
+                artifact_id: params.artifact_id,
+                path: params.path,
+                session_id: params.session_id,
+                profile_id,
+            })
+        }
+        methods::TASK_ARTIFACT_READ => {
+            // Spec-conforming clients (UPCR-2026-019 / M13) pass `task_id`;
+            // legacy callers may still pass `agent_id`. Accept either.
+            let params: RawTaskArtifactReadParams = parse_raw_params(request)?;
+            let agent_id = params.resolve_agent_id(method)?;
+            let profile_id = resolve_autonomy_profile_id(
+                params.session_id.as_ref(),
+                params.profile_id.as_deref(),
+                connection_profile_id,
+            )?;
+            orchestrator.read_agent_artifact(AgentArtifactReadRequest {
+                agent_id,
                 artifact_id: params.artifact_id,
                 path: params.path,
                 session_id: params.session_id,
@@ -16344,6 +16479,176 @@ mod tests {
         );
     }
 
+    /// Codex P1 follow-up to #1086: when a Local server receives an
+    /// explicit `runtime_mode: "local"` override, that value must NOT be
+    /// treated as solo-relaxed. `local` is the multi-profile-but-local
+    /// deployment mode, not the single-tenant solo loopback, so the gate
+    /// must tighten just like `tenant`/`cloud` and reject DangerFullAccess.
+    #[test]
+    fn permission_profile_set_local_override_tightens_gate_on_local_server() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+        let session_id = SessionKey("local:permission-profile-local-override".into());
+
+        let local_override_denied = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("local".into()),
+            },
+        )
+        .expect_err("runtime_mode=local must tighten the gate, not relax it");
+        assert_eq!(
+            local_override_denied.code,
+            rpc_error_codes::PERMISSION_DENIED
+        );
+        assert_eq!(
+            local_override_denied
+                .data
+                .as_ref()
+                .and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
+
+        // `cloud` override must also tighten on a Local server.
+        let cloud_override_denied = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("cloud".into()),
+            },
+        )
+        .expect_err("runtime_mode=cloud must tighten the gate");
+        assert_eq!(
+            cloud_override_denied.code,
+            rpc_error_codes::PERMISSION_DENIED
+        );
+
+        // Sanity: no override + Local server still allows DangerFullAccess
+        // — only explicit non-solo overrides should tighten.
+        let allowed = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: session_id.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect("Local server + no override should allow DangerFullAccess");
+        assert_eq!(allowed.session_id, session_id);
+
+        // Explicit `runtime_mode: "solo"` keeps the relaxed gate too.
+        let solo_session = SessionKey("local:permission-profile-solo-override".into());
+        let solo_allowed = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: solo_session.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("solo".into()),
+            },
+        )
+        .expect("runtime_mode=solo should keep the local gate relaxed");
+        assert_eq!(solo_allowed.session_id, solo_session);
+    }
+
+    /// #1121 codex P2 re-review fail-closed acceptance: unrecognized
+    /// `runtime_mode` overrides (typos, whitespace, future values, the
+    /// pre-fix synonym `multi_tenant`) must NOT relax the gate on a
+    /// Local server. Only an explicit `solo` (or absent override) keeps
+    /// the relaxed path.
+    #[test]
+    fn unrecognized_runtime_mode_override_fails_closed_on_local_server() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+        let session_id = SessionKey("local:unrecognized-runtime-mode".into());
+
+        for stray_override in [
+            "multi_tenant",
+            " tenant ",
+            "TENANT",
+            "tenant\n",
+            "unknown",
+            "loCal-foo",
+            // Codex P2 re-review #3 on #1121: blank/whitespace-only
+            // overrides are an explicit malformed value, not "omitted",
+            // and MUST tighten the gate.
+            "",
+            "   ",
+            "\t",
+            "\n",
+        ] {
+            let denied = permission_profile_set_result(
+                &local,
+                PermissionProfileSetParams {
+                    session_id: session_id.clone(),
+                    update: PermissionProfileUpdate {
+                        mode: Some(Mode::DangerFullAccess),
+                        network: Some(Network::Allow),
+                        approval_policy: Some("never".into()),
+                    },
+                    runtime_mode: Some(stray_override.into()),
+                },
+            )
+            .expect_err(
+                "unrecognized runtime_mode override must fail closed instead of relaxing local",
+            );
+            assert_eq!(
+                denied.code,
+                rpc_error_codes::PERMISSION_DENIED,
+                "stray override {stray_override:?} must produce PERMISSION_DENIED",
+            );
+            assert_eq!(
+                denied.data.as_ref().and_then(|data| data.get("kind")),
+                Some(&json!("permission_profile_disallowed")),
+                "stray override {stray_override:?} must report permission_profile_disallowed",
+            );
+        }
+
+        // Sanity: explicit `solo` (trimmed/normalized) still relaxes on
+        // Local — only unrecognized values fail closed.
+        let solo_session = SessionKey("local:unrecognized-runtime-mode-solo-ok".into());
+        let solo_allowed = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: solo_session.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("  SOLO  ".into()),
+            },
+        )
+        .expect("normalized solo override must still relax on Local");
+        assert_eq!(solo_allowed.session_id, solo_session);
+    }
+
     #[test]
     fn capabilities_advertise_local_solo_profile_create_only_when_supported() {
         let dir = tempfile::tempdir().unwrap();
@@ -20196,6 +20501,160 @@ mod tests {
             .map(|(_, _, expected_call)| (*expected_call).to_owned())
             .collect::<Vec<_>>();
         assert_eq!(calls, expected);
+    }
+
+    /// Codex P1 follow-up to #1094: `task/artifact/list` and
+    /// `task/artifact/read` are the UPCR-2026-019 / M13 canonical names.
+    /// Spec-conforming clients reach them via `task/list`, which exposes
+    /// `task_id`, so these aliases MUST accept `task_id` (not just the
+    /// legacy `agent_id`) and resolve it to the backing agent. The legacy
+    /// `agent_id` shape stays working too.
+    #[test]
+    fn task_artifact_alias_accepts_task_id_and_agent_id() {
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let session_id = SessionKey::new("api", "task-artifact-alias");
+        let orchestrator = RecordingOrchestrator::default();
+
+        // task/artifact/list with `task_id` only (spec-conforming shape).
+        let list_with_task_id = RpcRequest::new(
+            "req-list-task",
+            methods::TASK_ARTIFACT_LIST,
+            json!({ "task_id": "task-spec", "session_id": session_id.clone() }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&list_with_task_id, features, None, &orchestrator)
+                .expect("task/artifact/list with task_id should succeed");
+        assert_eq!(result["called"], json!("list_agent_artifacts:task-spec"));
+
+        // task/artifact/read with `task_id` + `artifact_id` only.
+        let read_with_task_id = RpcRequest::new(
+            "req-read-task",
+            methods::TASK_ARTIFACT_READ,
+            json!({
+                "task_id": "task-spec-2",
+                "artifact_id": "artifact-1",
+                "session_id": session_id.clone(),
+            }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&read_with_task_id, features, None, &orchestrator)
+                .expect("task/artifact/read with task_id should succeed");
+        assert_eq!(result["called"], json!("read_agent_artifact:task-spec-2"));
+
+        // Legacy `agent_id` shape on the same aliases keeps working.
+        let list_with_agent_id = RpcRequest::new(
+            "req-list-agent",
+            methods::TASK_ARTIFACT_LIST,
+            json!({ "agent_id": "agent-legacy", "session_id": session_id.clone() }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&list_with_agent_id, features, None, &orchestrator)
+                .expect("task/artifact/list with agent_id should still succeed");
+        assert_eq!(result["called"], json!("list_agent_artifacts:agent-legacy"));
+
+        let read_with_agent_id = RpcRequest::new(
+            "req-read-agent",
+            methods::TASK_ARTIFACT_READ,
+            json!({
+                "agent_id": "agent-legacy-2",
+                "artifact_id": "artifact-2",
+                "session_id": session_id.clone(),
+            }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&read_with_agent_id, features, None, &orchestrator)
+                .expect("task/artifact/read with agent_id should still succeed");
+        assert_eq!(
+            result["called"],
+            json!("read_agent_artifact:agent-legacy-2")
+        );
+
+        // Both `agent_id` and `task_id` set: prefer `agent_id` so legacy
+        // semantics win for compatibility.
+        let list_with_both = RpcRequest::new(
+            "req-list-both",
+            methods::TASK_ARTIFACT_LIST,
+            json!({
+                "agent_id": "agent-wins",
+                "task_id": "task-loses",
+                "session_id": session_id.clone(),
+            }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&list_with_both, features, None, &orchestrator)
+                .expect("task/artifact/list with both ids should prefer agent_id");
+        assert_eq!(result["called"], json!("list_agent_artifacts:agent-wins"));
+
+        // Missing both -> invalid_params (not a crash, not silent default).
+        let missing_both = RpcRequest::new(
+            "req-missing",
+            methods::TASK_ARTIFACT_LIST,
+            json!({ "session_id": session_id }),
+        );
+        let err = raw_autonomy_rpc_with_orchestrator(&missing_both, features, None, &orchestrator)
+            .expect_err("task/artifact/list without ids should fail");
+        assert_eq!(err.code, rpc_error_codes::INVALID_PARAMS);
+    }
+
+    /// #1121 codex P1 re-review #3 acceptance: the `task_id` shape on
+    /// `task/artifact/list` / `task/artifact/read` MUST require an
+    /// explicit `session_id`. Otherwise a same-profile connection that
+    /// knows another task's UUID would bypass the session/parent-child
+    /// ownership check and reach its artifacts. The legacy `agent_id`
+    /// shape still allows optional session_id for backwards compat.
+    #[test]
+    fn task_artifact_alias_task_id_requires_session_id() {
+        let features = ConnectionUiFeatures::stdio_defaults();
+        let orchestrator = RecordingOrchestrator::default();
+
+        // task_id without session_id -> invalid_params.
+        let list_no_session = RpcRequest::new(
+            "req-list-task-no-session",
+            methods::TASK_ARTIFACT_LIST,
+            json!({ "task_id": "task-without-session" }),
+        );
+        let err =
+            raw_autonomy_rpc_with_orchestrator(&list_no_session, features, None, &orchestrator)
+                .expect_err("task_id without session_id must be rejected");
+        assert_eq!(err.code, rpc_error_codes::INVALID_PARAMS);
+
+        let read_no_session = RpcRequest::new(
+            "req-read-task-no-session",
+            methods::TASK_ARTIFACT_READ,
+            json!({ "task_id": "task-without-session", "artifact_id": "art-1" }),
+        );
+        let err =
+            raw_autonomy_rpc_with_orchestrator(&read_no_session, features, None, &orchestrator)
+                .expect_err("task_id without session_id must be rejected on read");
+        assert_eq!(err.code, rpc_error_codes::INVALID_PARAMS);
+
+        // Sanity: legacy `agent_id` without session_id still works
+        // (backwards-compat path, scoped by orchestrator-internal checks
+        // that pre-date this alias).
+        let session_id = SessionKey::new("api", "task-artifact-alias-bc");
+        let agent_no_session = RpcRequest::new(
+            "req-list-agent-no-session",
+            methods::TASK_ARTIFACT_LIST,
+            json!({ "agent_id": "legacy-agent" }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&agent_no_session, features, None, &orchestrator)
+                .expect("legacy agent_id path keeps optional session_id semantics");
+        assert_eq!(result["called"], json!("list_agent_artifacts:legacy-agent"));
+
+        // And task_id WITH session_id still resolves normally.
+        let list_with_session = RpcRequest::new(
+            "req-list-task-with-session",
+            methods::TASK_ARTIFACT_LIST,
+            json!({ "task_id": "task-with-session", "session_id": session_id }),
+        );
+        let result =
+            raw_autonomy_rpc_with_orchestrator(&list_with_session, features, None, &orchestrator)
+                .expect("task_id + session_id should succeed");
+        assert_eq!(
+            result["called"],
+            json!("list_agent_artifacts:task-with-session")
+        );
     }
 
     #[test]

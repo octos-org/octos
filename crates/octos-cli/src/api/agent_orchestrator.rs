@@ -1533,7 +1533,40 @@ fn get_agent<'a>(
     state: &'a AutonomyRuntimeState,
     request: &AgentRequest,
 ) -> Result<&'a AutonomyAgentRecord, RpcError> {
-    let Some(agent) = state.agents.get(&request.agent_id) else {
+    // Codex P1 follow-up to #1121: spec-conforming M13 clients call
+    // `task/artifact/*` with `task_id` (the `TaskListEntry.id`), not
+    // `agent_id`. Task-backed records (native specialists, mirrored
+    // background tasks) carry the task id under `task_id` and the
+    // agent id can differ (`native-…` prefixes, sanitisations, etc.).
+    // First try direct agent_id lookup (legacy + agent-only records),
+    // then fall back to scanning by `task_id` so the alias actually
+    // resolves to the right agent record.
+    //
+    // Codex P1 re-review #4 on #1121: this fallback is shared by all
+    // agent-keyed endpoints — `agent/artifact/*`, `agent/status/read`,
+    // `agent/output/read`, and the legacy `agent_id` branch of
+    // `task/artifact/*`. Without the session_id gate, a same-profile
+    // caller could put a known task UUID in `agent_id` (bypassing the
+    // params-layer `task_id`-requires-`session_id` check) and the
+    // fallback would resolve it, with `ensure_agent_control_scope`
+    // collapsing to profile-only when `session_id` is `None`. Require
+    // `session_id` for the task-id fallback path so the session/
+    // parent-child ownership check is always exercised on task-keyed
+    // lookups. Legacy direct `agent_id` lookups remain unaffected.
+    let direct = state.agents.get(&request.agent_id);
+    let agent = if let Some(found) = direct {
+        found
+    } else if request.session_id.is_some() {
+        match state.agents.values().find(|candidate| {
+            candidate
+                .task_id
+                .as_ref()
+                .is_some_and(|task| task.to_string() == request.agent_id)
+        }) {
+            Some(found) => found,
+            None => return Err(agent_not_found_error(request)),
+        }
+    } else {
         return Err(agent_not_found_error(request));
     };
     ensure_agent_control_scope(agent, request.session_id.as_ref(), &request.profile_id)?;
@@ -3648,6 +3681,85 @@ mod tests {
             })
             .expect("parent must read child artifact via base_key");
         assert_eq!(read["artifact"]["id"], json!("report"));
+    }
+
+    /// #1121 codex P1 follow-up: task-backed records (where `task_id`
+    /// differs from `agent_id` — e.g. native specialists with
+    /// `native-*` agent ids carrying a separate task UUID) must still
+    /// resolve through `get_agent` when a spec-conforming M13 client
+    /// passes `task_id` from a `TaskListEntry.id`. Pins the lookup so
+    /// task/artifact/list/read aliases reach the right agent record.
+    #[test]
+    fn get_agent_resolves_request_id_against_task_id_fallback() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let task_id = TaskId::new();
+        let mut agent = sample_agent("native-specialist-7", MAIN_PROFILE_ID);
+        agent.task_id = Some(task_id.clone());
+        let session_id = agent.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+
+        // Direct agent_id still works.
+        let by_agent = orchestrator
+            .list_agent_artifacts(AgentRequest {
+                agent_id: "native-specialist-7".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: MAIN_PROFILE_ID.into(),
+            })
+            .expect("agent_id lookup must work");
+        assert_eq!(by_agent["agent_id"], json!("native-specialist-7"));
+
+        // Task_id lookup also resolves to the same agent.
+        let by_task = orchestrator
+            .list_agent_artifacts(AgentRequest {
+                agent_id: task_id.to_string(),
+                session_id: Some(session_id),
+                profile_id: MAIN_PROFILE_ID.into(),
+            })
+            .expect("task_id lookup must fall back through task_id field");
+        assert_eq!(by_task["agent_id"], json!("native-specialist-7"));
+    }
+
+    /// #1121 codex P1 re-review #4 acceptance: the task_id fallback in
+    /// `get_agent` MUST NOT fire when the caller omits `session_id`.
+    /// Otherwise a same-profile attacker could put a known task UUID
+    /// directly into `agent_id` (bypassing the params-layer
+    /// `task_id`-requires-`session_id` check), the direct map lookup
+    /// would miss, the fallback would resolve it, and
+    /// `ensure_agent_control_scope` would collapse to profile-only
+    /// matching — leaking artifacts across sessions.
+    #[test]
+    fn task_id_fallback_requires_session_id_to_prevent_same_profile_bypass() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let task_id = TaskId::new();
+        let mut agent = sample_agent("native-specialist-8", MAIN_PROFILE_ID);
+        agent.task_id = Some(task_id.clone());
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+
+        // Pass the task UUID through `agent_id` WITHOUT `session_id` —
+        // the legacy direct lookup misses, and the fallback must
+        // refuse to resolve so `agent_not_found` is returned instead
+        // of a profile-only scope match.
+        let err = orchestrator
+            .list_agent_artifacts(AgentRequest {
+                agent_id: task_id.to_string(),
+                session_id: None,
+                profile_id: MAIN_PROFILE_ID.into(),
+            })
+            .expect_err("task_id-in-agent_id without session_id must be rejected");
+        // The error data carries `kind` for the autonomy error envelope.
+        let envelope_kind = err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        assert_eq!(envelope_kind.as_deref(), Some(kinds::AGENT_NOT_FOUND));
     }
 
     /// #967 / M13-C secret-redaction acceptance: artifact `content`
