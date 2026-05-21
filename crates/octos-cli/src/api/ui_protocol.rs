@@ -14756,12 +14756,18 @@ async fn run_standalone_turn(
                 &reply,
             );
         }
-        // #1140 codex P2 re-review #3: clear the in-flight marker so
-        // subsequent scheduler ticks can re-dispatch the goal once
-        // the min-delay elapses. Independent of whether
-        // `record_goal_turn` succeeded — the dispatched turn is done
-        // either way.
-        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        // #1140 codex P2 re-review #5: do NOT call
+        // `clear_goal_dispatch_in_flight` explicitly here. The RAII
+        // `GoalDispatchInFlightGuard` in the AppUI spawn closure
+        // clears the marker on Drop AFTER `run_standalone_turn`
+        // returns, which is the single canonical clear-point.
+        // Calling `clear_goal_dispatch_in_flight` here AND letting
+        // the guard fire on Drop opens a tiny race: between the
+        // explicit clear and the closure's actual return, a new
+        // AppUI tick can mark the session in-flight (mark/clear is
+        // not generation-scoped), and then the old guard's Drop
+        // wipes the NEW marker. Single-source-of-truth via the
+        // guard avoids that.
     }
 
     // FIX-06: a turn that ends — for any reason — must drop its
