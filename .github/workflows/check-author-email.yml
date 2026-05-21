@@ -1,0 +1,46 @@
+name: check-author-email
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  reject-blocked-emails:
+    name: reject blocked author/committer emails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: scan commits for blocked emails
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLOCKED='yue\.chen@futurewei\.com|ychen@futurewei\.com|ymote@futurewei\.com|@futurewei\.com'
+
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+            BASE="origin/${GITHUB_BASE_REF}"
+            HEAD="${GITHUB_SHA}"
+            git fetch origin "${GITHUB_BASE_REF}" --depth=1 || true
+            RANGE="${BASE}...${HEAD}"
+          else
+            BEFORE="${GITHUB_EVENT_BEFORE:-}"
+            if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+              RANGE="HEAD~100..HEAD"
+            else
+              RANGE="${BEFORE}..${GITHUB_SHA}"
+            fi
+          fi
+
+          echo "Scanning range: ${RANGE}"
+          OFFENDERS=$(git log "${RANGE}" --format='%H|%ae|%ce|%s' | awk -F'|' -v re="${BLOCKED}" '$2 ~ re || $3 ~ re')
+          if [ -n "${OFFENDERS}" ]; then
+            echo ""
+            echo "FAIL: the following commits carry blocked author/committer emails:"
+            echo "${OFFENDERS}"
+            echo ""
+            echo "Fix: rebase + amend each offending commit with an approved git identity."
+            exit 1
+          fi
+          echo "OK: no blocked emails in commit range."
