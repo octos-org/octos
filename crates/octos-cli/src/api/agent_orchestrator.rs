@@ -1017,6 +1017,21 @@ impl InProcessAgentOrchestrator {
                 if profile_filter.is_some_and(|profile_id| goal.profile_id != profile_id) {
                     continue;
                 }
+                // #1140 codex P2 re-review #3: skip sessions whose
+                // AppUI tick path has already dispatched a goal
+                // continuation that hasn't reached post-accounting
+                // yet. The `last_continued_at_ms` stamp alone is not
+                // enough — for goal turns that run longer than
+                // `GOAL_MIN_CONTINUATION_INTERVAL_MS` (30s), the
+                // stamp expires before `record_goal_turn` re-stamps
+                // it, opening a race where the scheduler tick can
+                // re-dispatch in the await gap. The in-flight set is
+                // cleared by `clear_goal_dispatch_in_flight` from the
+                // post-accountant, so a session leaves the set
+                // exactly when it's safe to re-dispatch.
+                if state.in_flight_goal_sessions.contains(session_id) {
+                    continue;
+                }
                 if !goal_policy_allows_fire(goal, idle_state, now_system, now) {
                     continue;
                 }
@@ -1096,6 +1111,85 @@ impl InProcessAgentOrchestrator {
     /// hard cap fires correctly, and the derived continuation budget
     /// (`token_budget / 2500`) bounds total fires until token-side
     /// accounting catches up.
+    ///
+    /// #1140 codex P2 follow-up — dispatch-time stamp that ONLY
+    /// touches `last_continued_at_ms` (and `updated_at_ms`), with NO
+    /// counter increments. Used by the AppUI tick path before a goal
+    /// turn starts so `due_loop_targets` doesn't keep seeing the
+    /// same goal as due every 2s while the turn is in flight. The
+    /// post-turn `record_goal_turn` then handles the full counter
+    /// + token accounting once `run_standalone_turn` returns.
+    ///
+    /// Returns true if the timestamp was updated, false if the goal
+    /// is not found or the profile didn't match.
+    pub(crate) fn record_goal_dispatch_timestamp_only(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        let now = now_ms();
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            return false;
+        };
+        if goal.profile_id != profile_id {
+            return false;
+        }
+        goal.last_continued_at_ms = now;
+        goal.updated_at_ms = now;
+        let snapshot = goal.clone();
+        persist_goal_state(&state, session_id, &snapshot, false);
+        true
+    }
+
+    /// #1140 codex P2 re-review #3 — mark a session as having an
+    /// in-flight goal dispatch. `due_loop_targets`'s goal sweep skips
+    /// in-flight sessions so a long-running goal turn (> 30s) can't
+    /// be re-dispatched in the await gap between turn-terminal
+    /// emission and `record_goal_turn`. Idempotent.
+    pub(crate) fn mark_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        self.state()
+            .in_flight_goal_sessions
+            .insert(session_id.clone());
+    }
+
+    /// #1140 codex P2 re-review #3 — clear the in-flight marker.
+    /// Called by the post-turn accountant after `record_goal_turn`
+    /// (and on error/interrupt paths) so subsequent scheduler ticks
+    /// can re-dispatch the goal once the min-delay elapses.
+    pub(crate) fn clear_goal_dispatch_in_flight(&self, session_id: &SessionKey) {
+        self.state().in_flight_goal_sessions.remove(session_id);
+    }
+
+    /// #1140 codex P1 re-review #4 — RAII drop-guard for the
+    /// in-flight marker. Use this from the AppUI tick path so the
+    /// marker is cleared on ANY exit path (cancellation,
+    /// early-terminal-error, panic), not just the happy
+    /// post-accounting path. The guard captures a 'static reference
+    /// to the orchestrator singleton, so it's safe to move across
+    /// await points / into spawned tasks.
+    pub(crate) fn goal_dispatch_in_flight_guard(
+        &'static self,
+        session_id: SessionKey,
+    ) -> GoalDispatchInFlightGuard {
+        self.mark_goal_dispatch_in_flight(&session_id);
+        GoalDispatchInFlightGuard {
+            orchestrator: self,
+            session_id,
+            disarmed: false,
+        }
+    }
+
+    /// #1133 — the AppUI tick path no longer calls this helper.
+    /// `run_standalone_turn` now folds real `tokens_consumed +
+    /// elapsed` into `record_goal_turn` AFTER the agent task returns,
+    /// which is the single accountant that bumps every counter
+    /// (`continuations_used`, `rate_window_count`, `tokens_used`,
+    /// `last_continued_at_ms`). The helper is preserved for any
+    /// future caller that genuinely only needs a timestamp bump (e.g.
+    /// a session actor whose tokens aren't known immediately) — the
+    /// `#[allow(dead_code)]` reflects "kept by design", not "stale".
+    #[allow(dead_code)]
     pub(crate) fn record_goal_dispatch_only(
         &self,
         session_id: &SessionKey,
@@ -1238,6 +1332,23 @@ impl InProcessAgentOrchestrator {
             .goals
             .get(session_id)
             .map(|goal| goal.status.clone())
+    }
+
+    /// #1133 — accessor used by the AppUI goal-turn acceptance tests to
+    /// pin that `record_goal_turn` actually bumped `tokens_used` /
+    /// `continuations_used` after a turn completed.
+    #[cfg(test)]
+    pub(crate) fn goal_counters_for_test(
+        &self,
+        session_id: &SessionKey,
+    ) -> Option<(u64, u32, u32)> {
+        self.state().goals.get(session_id).map(|goal| {
+            (
+                goal.tokens_used,
+                goal.continuations_used,
+                goal.rate_window_count,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -2085,6 +2196,44 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 }
 
+/// #1140 codex P1 re-review #4 — RAII drop-guard returned by
+/// `InProcessAgentOrchestrator::goal_dispatch_in_flight_guard`. On
+/// `Drop` it clears the in-flight marker for the captured session
+/// id, so the marker is removed even when the AppUI turn is
+/// aborted, panics, or returns through an early-terminal path
+/// before the post-accounting block runs.
+///
+/// Call `disarm()` from the post-accounting block (after the
+/// orchestrator already cleared the marker explicitly) so the
+/// drop-time clear becomes a no-op. The guard is `must_use` to
+/// discourage accidental immediate drop at the dispatch site.
+#[must_use = "GoalDispatchInFlightGuard clears the in-flight marker on drop; hold it for the duration of the goal turn"]
+pub(crate) struct GoalDispatchInFlightGuard {
+    orchestrator: &'static InProcessAgentOrchestrator,
+    session_id: SessionKey,
+    disarmed: bool,
+}
+
+impl GoalDispatchInFlightGuard {
+    /// Mark the guard as disarmed so its `Drop` does NOT clear the
+    /// in-flight marker. Use this when the post-accounting block has
+    /// already called `clear_goal_dispatch_in_flight` explicitly,
+    /// to avoid a redundant clear.
+    #[allow(dead_code)]
+    pub(crate) fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for GoalDispatchInFlightGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.orchestrator
+                .clear_goal_dispatch_in_flight(&self.session_id);
+        }
+    }
+}
+
 pub(crate) fn default_agent_orchestrator() -> &'static InProcessAgentOrchestrator {
     static ORCHESTRATOR: OnceLock<InProcessAgentOrchestrator> = OnceLock::new();
     ORCHESTRATOR.get_or_init(InProcessAgentOrchestrator::default)
@@ -2117,6 +2266,18 @@ struct AutonomyRuntimeState {
     /// "armed" state (the worker already owns the source of truth via
     /// the agent status transition).
     cancellations: HashMap<String, Arc<tokio::sync::Notify>>,
+    /// #1140 codex P2 re-review #3 — sessions whose AppUI tick path
+    /// has dispatched a goal continuation and not yet finished
+    /// post-turn accounting. `due_loop_targets`'s goal sweep skips
+    /// these so a long-running goal turn (model + tool work > 30s
+    /// `GOAL_MIN_CONTINUATION_INTERVAL_MS`) can't be re-dispatched
+    /// in the await gap between turn-terminal emission and
+    /// `record_goal_turn`. Entries are added by
+    /// `mark_goal_dispatch_in_flight` and cleared by
+    /// `clear_goal_dispatch_in_flight`. Independent of (and
+    /// complementary to) the `last_continued_at_ms` timestamp, which
+    /// remains the authoritative min-delay gate for all other callers.
+    in_flight_goal_sessions: std::collections::HashSet<SessionKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -2633,6 +2794,18 @@ fn enqueue_due_goal_continuations(
     now: i64,
 ) -> usize {
     if !runtime_state.is_idle_eligible() {
+        return 0;
+    }
+    // #1140 codex P2 re-review #4: also gate the goal-enqueue path
+    // on `in_flight_goal_sessions`. `due_loop_targets` already skips
+    // in-flight sessions for its goal sweep, but
+    // `drain_ready_continuations_for_session` (which calls this
+    // function) is also invoked when a session is selected by an
+    // active loop target — in that path the goal enqueue would
+    // otherwise queue a stale `GoalContinue` despite the in-flight
+    // turn. The two guards together ensure the in-flight marker is
+    // the authoritative gate on every enqueue path.
+    if state.in_flight_goal_sessions.contains(session_id) {
         return 0;
     }
     let Some(goal) = state.goals.get(session_id).cloned() else {
@@ -7559,6 +7732,220 @@ mod tests {
         assert!(
             (110_000..=130_000).contains(&delta_ms),
             "next_run_at_ms should be roughly 120s in the future (got {delta_ms} ms)",
+        );
+    }
+
+    /// #1133 acceptance 1 — when the AppUI goal-turn path finishes a
+    /// real LLM turn, it must call `record_goal_turn` with the actual
+    /// tokens consumed AND the elapsed seconds, NOT the dispatch-only
+    /// helper. This pins that `tokens_used` is bumped (was permanently
+    /// stuck at 0 in the pre-#1133 shape, hiding `budget_limited`
+    /// transitions from the AppUI goal soak).
+    #[test]
+    fn appui_goal_path_record_goal_turn_with_real_tokens_bumps_counters() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-appui-tokens");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "real tokens please".into(),
+                status: Some("active".into()),
+                token_budget: Some(50_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial set_goal continuation; #1133 acceptance is
+        // about the POST-turn accountant, not the dispatch-time queue.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Pre-condition: counters all start at zero.
+        let (tokens_before, continuations_before, window_before) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(tokens_before, 0);
+        assert_eq!(continuations_before, 0);
+        assert_eq!(window_before, 0);
+
+        // Post-turn AppUI behavior: record a turn that actually consumed
+        // tokens (this is what `run_standalone_turn` does once goal
+        // context + token accounting are wired through).
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 1234, 7);
+
+        let (tokens_after, continuations_after, window_after) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal still exists");
+        assert_eq!(
+            tokens_after, 1234,
+            "record_goal_turn must fold tokens_consumed into goal.tokens_used"
+        );
+        assert_eq!(
+            continuations_after, 1,
+            "record_goal_turn must bump continuations_used by exactly one"
+        );
+        assert_eq!(
+            window_after, 1,
+            "record_goal_turn must bump the sliding rate-window counter",
+        );
+    }
+
+    /// #1133 acceptance 2 — when the AppUI goal turn produces a reply
+    /// ending in `<goal:complete>`, the post-turn
+    /// `maybe_complete_goal_from_model` call flips the goal to
+    /// `complete`. Without this wiring, the sentinel-detection path
+    /// was unreachable from `run_standalone_turn` (only the
+    /// `SessionActor` chat path called it).
+    #[test]
+    fn appui_goal_path_completes_goal_when_reply_ends_with_sentinel() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-appui-sentinel");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "finish via sentinel".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Mid-body sentinel must NOT flip the goal.
+        assert!(!orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "I am about to write <goal:complete> shortly, but step 2 first.",
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("active"),
+        );
+
+        // Trailing sentinel (the canonical AppUI shape) flips it.
+        assert!(orchestrator.maybe_complete_goal_from_model(
+            &session_id,
+            "tenant-a",
+            "All requested checks finished.\n\n<goal:complete>",
+        ));
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("complete"),
+        );
+    }
+
+    /// #1133 acceptance 3 — the AppUI tick path must NOT call
+    /// `record_goal_dispatch_only` for a `GoalContinue` dispatch
+    /// (option (b) in #1133). The post-turn `record_goal_turn` is the
+    /// single accountant that bumps `continuations_used` AND
+    /// `rate_window_count`. Otherwise the AppUI path would double-count
+    /// every fire and exhaust the per-hour cap after ~6 turns instead
+    /// of the documented 12.
+    #[test]
+    fn appui_goal_dispatch_path_does_not_double_count_continuations() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-appui-dispatch");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "one fire counts as one".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Simulate the NEW (#1133 option b) AppUI dispatch path: do NOT
+        // call `record_goal_dispatch_only` at dispatch time. Only call
+        // `record_goal_turn` once the turn returns with real tokens.
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 500, 3);
+
+        let (_, continuations_after, window_after) = orchestrator
+            .goal_counters_for_test(&session_id)
+            .expect("goal exists");
+        assert_eq!(
+            continuations_after, 1,
+            "AppUI option (b) must produce exactly ONE continuations_used increment per turn"
+        );
+        assert_eq!(
+            window_after, 1,
+            "AppUI option (b) must produce exactly ONE rate_window_count increment per turn"
+        );
+    }
+
+    /// #1140 codex P2 re-review #3 acceptance: a goal session that
+    /// has been marked in-flight MUST be excluded from
+    /// `due_loop_targets`'s goal sweep, EVEN IF the
+    /// `last_continued_at_ms` timestamp has gone stale (>30s past).
+    /// This is the race-free guard for long-running goal turns —
+    /// without it, a scheduler tick landing in the await gap between
+    /// turn-terminal emission and post-accounting could re-dispatch.
+    #[test]
+    fn in_flight_goal_session_is_excluded_from_due_loop_targets() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-in-flight");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "long-running goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain the initial continuation so the session is "between turns".
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        // Force `last_continued_at_ms` to a value > 30s in the past
+        // so the timestamp gate would normally PERMIT a re-dispatch.
+        // The in-flight marker is the ONLY thing that should block it.
+        if let Some(goal) = orchestrator.state().goals.get_mut(&session_id) {
+            goal.last_continued_at_ms = now_ms() - (GOAL_MIN_CONTINUATION_INTERVAL_MS * 2);
+        }
+        // Sanity: without the in-flight marker, the goal IS due.
+        let due_before = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            due_before.iter().any(|(s, _)| s == &session_id),
+            "without in-flight marker, stale-timestamp goal must be due (got {due_before:?})",
+        );
+
+        // Mark in-flight. Now the same `due_loop_targets` call MUST
+        // exclude this session.
+        orchestrator.mark_goal_dispatch_in_flight(&session_id);
+        let due_during = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            !due_during.iter().any(|(s, _)| s == &session_id),
+            "in-flight goal session must be excluded from due_loop_targets (got {due_during:?})",
+        );
+
+        // Clearing in-flight restores the session to the due list.
+        orchestrator.clear_goal_dispatch_in_flight(&session_id);
+        let due_after = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            due_after.iter().any(|(s, _)| s == &session_id),
+            "after clearing in-flight, goal must be due again (got {due_after:?})",
         );
     }
 }
