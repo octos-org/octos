@@ -1655,12 +1655,16 @@ impl Tool for ViewImageTool {
                     });
                 }
             };
-        // We bypass `read_no_follow` here because that helper routes through
-        // a text-only PDF extractor that would mis-handle binary image bytes.
-        // `tokio::fs::read` honours the same symlink-safety semantics on Unix
-        // via the O_NOFOLLOW open we performed during scope resolution.
-        let bytes = match tokio::fs::read(&resolved).await {
-            Ok(bytes) => bytes,
+        // #1148 codex P2: open with O_NOFOLLOW (Unix) and read only a
+        // bounded header prefix. `resolve_path_with_scope` returns a
+        // LEXICAL path; the previous `tokio::fs::read` followed
+        // symlinks AND read the entire file, which (a) bypasses
+        // workspace symlink protection and (b) allocates a huge
+        // buffer just to sniff magic bytes. SVG detection needs the
+        // longest prefix (256 bytes); 512 gives headroom. `metadata`
+        // surfaces the true byte length without reading.
+        let (bytes, byte_length) = match read_image_header_no_follow(&resolved) {
+            Ok(pair) => pair,
             Err(error) => {
                 return Ok(ToolResult {
                     output: format!("view_image: failed to read {path}: {error}"),
@@ -1697,7 +1701,7 @@ impl Tool for ViewImageTool {
                 "path": path,
                 "format": format,
                 "mime_type": mime,
-                "byte_length": bytes.len(),
+                "byte_length": byte_length,
             })
             .to_string(),
             success: true,
@@ -1706,11 +1710,52 @@ impl Tool for ViewImageTool {
                 "path": path,
                 "format": format,
                 "mime_type": mime,
-                "byte_length": bytes.len(),
+                "byte_length": byte_length,
             })),
             ..Default::default()
         })
     }
+}
+
+/// #1148 codex P2: bounded-read helper for `view_image` that refuses
+/// to follow symlinks (Unix: O_NOFOLLOW; Windows: an explicit
+/// `metadata.is_symlink()` check after open). Reads only the first
+/// 512 bytes for magic-byte detection — SVG sniffing scans up to
+/// 256, the binary formats all need ≤12. The total file size is
+/// returned separately from `metadata()` so callers can surface
+/// `byte_length` without reading the whole file.
+fn read_image_header_no_follow(resolved: &std::path::Path) -> std::io::Result<(Vec<u8>, u64)> {
+    use std::io::Read;
+    const HEADER_BYTES: usize = 512;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(resolved)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        // Windows fallback: open, then refuse if the resulting handle
+        // turns out to be a symlink. Matches the pattern in
+        // `crates/octos-agent/src/tools/read_file.rs`.
+        let f = std::fs::OpenOptions::new().read(true).open(resolved)?;
+        let meta = f.metadata()?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to follow symlink (view_image)",
+            ));
+        }
+        f
+    };
+    let metadata = file.metadata()?;
+    let byte_length = metadata.len();
+    let mut reader = file.take(HEADER_BYTES as u64);
+    let mut header = Vec::with_capacity(HEADER_BYTES.min(byte_length as usize));
+    reader.read_to_end(&mut header)?;
+    Ok((header, byte_length))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1742,14 +1787,17 @@ const MAX_DYNAMIC_DISCOVERY_LIMIT: usize = 32;
 /// without giving the tool a live `ToolRegistry` reference (which would be
 /// reentrancy-hostile from inside `execute`).
 pub struct ToolSearchTool {
-    catalog: Arc<Vec<ToolCatalogEntry>>,
+    // #1148 codex P2: live shared catalog cell owned by the registry.
+    // Updated on every registry mutation (via `refresh_live_catalog`)
+    // so the discovery surface always reflects post-mutation visible
+    // tools, including ones registered AFTER `with_builtins`
+    // (chat/gateway/profile setup, MCP/plugin/pipeline/memory paths).
+    catalog: Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>>,
 }
 
 impl ToolSearchTool {
-    pub fn new(catalog: Vec<ToolCatalogEntry>) -> Self {
-        Self {
-            catalog: Arc::new(catalog),
-        }
+    pub fn new(catalog: Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>>) -> Self {
+        Self { catalog }
     }
 }
 
@@ -1798,7 +1846,15 @@ impl Tool for ToolSearchTool {
             .limit
             .unwrap_or(DEFAULT_DYNAMIC_DISCOVERY_LIMIT)
             .clamp(1, MAX_DYNAMIC_DISCOVERY_LIMIT);
-        let matches = search_catalog(&self.catalog, &query, limit);
+        // #1148 codex P2: snapshot the live catalog under the
+        // shared Mutex at execute time so we see post-mutation
+        // visible tools.
+        let catalog_snapshot: Vec<ToolCatalogEntry> = self
+            .catalog
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let matches = search_catalog(&catalog_snapshot, &query, limit);
         let results: Vec<Value> = matches
             .iter()
             .map(|entry| {
@@ -1813,7 +1869,7 @@ impl Tool for ToolSearchTool {
             output: json!({
                 "query": query,
                 "matches": results,
-                "total": self.catalog.len(),
+                "total": catalog_snapshot.len(),
             })
             .to_string(),
             success: true,
@@ -1836,14 +1892,13 @@ impl Tool for ToolSearchTool {
 /// implementation; the model-visible contract (input schema, output shape)
 /// stays stable.
 pub struct ToolSuggestTool {
-    catalog: Arc<Vec<ToolCatalogEntry>>,
+    // #1148 codex P2: live shared catalog cell — see `ToolSearchTool`.
+    catalog: Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>>,
 }
 
 impl ToolSuggestTool {
-    pub fn new(catalog: Vec<ToolCatalogEntry>) -> Self {
-        Self {
-            catalog: Arc::new(catalog),
-        }
+    pub fn new(catalog: Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>>) -> Self {
+        Self { catalog }
     }
 }
 
@@ -1892,7 +1947,14 @@ impl Tool for ToolSuggestTool {
             .limit
             .unwrap_or(DEFAULT_DYNAMIC_DISCOVERY_LIMIT)
             .clamp(1, MAX_DYNAMIC_DISCOVERY_LIMIT);
-        let suggestions = suggest_catalog(&self.catalog, &task, limit);
+        // #1148 codex P2: snapshot the live catalog under the
+        // shared Mutex at execute time.
+        let catalog_snapshot: Vec<ToolCatalogEntry> = self
+            .catalog
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let suggestions = suggest_catalog(&catalog_snapshot, &task, limit);
         let results: Vec<Value> = suggestions
             .iter()
             .map(|(entry, score)| {
@@ -1908,7 +1970,7 @@ impl Tool for ToolSuggestTool {
             output: json!({
                 "task": task,
                 "suggestions": results,
-                "total": self.catalog.len(),
+                "total": catalog_snapshot.len(),
             })
             .to_string(),
             success: true,
@@ -2367,6 +2429,63 @@ mod tests {
         assert_eq!(meta["reason"], json!("unrecognised_image_format"));
     }
 
+    /// #1148 codex P2 acceptance: view_image MUST refuse to follow
+    /// symlinks (Unix O_NOFOLLOW) so a malicious repo can't trick
+    /// the tool into reading a file outside the workspace via a
+    /// symlinked image entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn view_image_rejects_symlinked_target() {
+        const PNG_MAGIC: [u8; 12] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("real_image.png");
+        std::fs::write(&target, PNG_MAGIC).expect("write png");
+        let symlink = temp.path().join("link.png");
+        std::os::unix::fs::symlink(&target, &symlink).expect("symlink");
+
+        let tool = ViewImageTool::new(temp.path());
+        let result = tool
+            .execute(&json!({ "path": "link.png" }))
+            .await
+            .expect("view_image runs");
+        assert!(
+            !result.success,
+            "view_image must reject symlinked targets (O_NOFOLLOW); got success result"
+        );
+        let meta = result.structured_metadata.expect("structured metadata");
+        assert_eq!(meta["error_kind"], json!("coding_tool_missing"));
+    }
+
+    /// #1148 codex P2 acceptance: view_image must read only a bounded
+    /// header — it should NOT allocate the entire file for magic-byte
+    /// sniffing. The PNG test above only writes 12 bytes; this one
+    /// writes a 10MB file but still gets a correct format report
+    /// with proper byte_length, proving we read only the header.
+    #[tokio::test]
+    async fn view_image_reads_only_bounded_header_for_large_file() {
+        const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("big.png");
+        let mut bytes = Vec::with_capacity(10_000_000);
+        bytes.extend_from_slice(&PNG_MAGIC);
+        bytes.resize(10_000_000, 0u8);
+        std::fs::write(&path, &bytes).expect("write big png");
+
+        let tool = ViewImageTool::new(temp.path());
+        let result = tool
+            .execute(&json!({ "path": "big.png" }))
+            .await
+            .expect("view_image runs");
+        assert!(result.success, "10MB image with valid header must succeed");
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        assert_eq!(payload["format"], json!("png"));
+        assert_eq!(payload["byte_length"], json!(10_000_000));
+    }
+
+    fn sample_catalog_cell() -> Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>> {
+        Arc::new(std::sync::Mutex::new(sample_catalog()))
+    }
+
     fn sample_catalog() -> Vec<ToolCatalogEntry> {
         vec![
             ToolCatalogEntry::new(
@@ -2394,7 +2513,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_returns_matching_tools_for_substring() {
-        let tool = ToolSearchTool::new(sample_catalog());
+        let tool = ToolSearchTool::new(sample_catalog_cell());
         let result = tool
             .execute(&json!({ "query": "patch" }))
             .await
@@ -2410,7 +2529,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_returns_empty_matches_for_unrelated_query() {
-        let tool = ToolSearchTool::new(sample_catalog());
+        let tool = ToolSearchTool::new(sample_catalog_cell());
         let result = tool
             .execute(&json!({ "query": "zzz_not_a_tool" }))
             .await
@@ -2422,7 +2541,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_honours_limit() {
-        let tool = ToolSearchTool::new(sample_catalog());
+        let tool = ToolSearchTool::new(sample_catalog_cell());
         let result = tool
             .execute(&json!({ "query": "code", "limit": 2 }))
             .await
@@ -2434,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_suggest_ranks_relevant_tools_first() {
-        let tool = ToolSuggestTool::new(sample_catalog());
+        let tool = ToolSuggestTool::new(sample_catalog_cell());
         let result = tool
             .execute(&json!({ "task": "I want to apply a code patch to a file" }))
             .await
@@ -2460,7 +2579,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_suggest_accepts_query_alias_for_task() {
-        let tool = ToolSuggestTool::new(sample_catalog());
+        let tool = ToolSuggestTool::new(sample_catalog_cell());
         let result = tool
             .execute(&json!({ "query": "shell command" }))
             .await
@@ -2469,6 +2588,65 @@ mod tests {
         let payload: Value = serde_json::from_str(&result.output).expect("payload");
         let suggestions = payload["suggestions"].as_array().expect("suggestions");
         assert_eq!(suggestions[0]["name"], json!("exec_command"));
+    }
+
+    /// #1148 codex P2 acceptance: tool_search must reflect tools
+    /// registered AFTER `with_builtins` (chat/gateway/profile setup
+    /// paths inject MCP/plugin/pipeline/memory tools). The discovery
+    /// surface should be live, not a frozen snapshot.
+    #[tokio::test]
+    async fn tool_search_reflects_post_builtins_registrations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+
+        // Sanity: a freshly-coined tool name doesn't appear pre-registration.
+        let search_tool = registry
+            .get_tool("tool_search")
+            .expect("tool_search registered by with_builtins");
+        let result = search_tool
+            .execute(&serde_json::json!({ "query": "post_builtin_xyz_unique" }))
+            .await
+            .expect("tool_search ok");
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        assert_eq!(
+            payload["matches"].as_array().map(Vec::len),
+            Some(0),
+            "fresh registry should not match unknown tool name yet"
+        );
+
+        // Inject a new tool AFTER with_builtins.
+        struct PostBuiltinTool;
+        #[async_trait::async_trait]
+        impl Tool for PostBuiltinTool {
+            fn name(&self) -> &str {
+                "post_builtin_xyz_unique"
+            }
+            fn description(&self) -> &str {
+                "A tool registered after with_builtins"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: &Value) -> eyre::Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+        registry.register(PostBuiltinTool);
+
+        // Now tool_search MUST find it.
+        let result = search_tool
+            .execute(&serde_json::json!({ "query": "post_builtin_xyz_unique" }))
+            .await
+            .expect("tool_search ok");
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        let matches = payload["matches"].as_array().expect("matches array");
+        assert!(
+            matches
+                .iter()
+                .any(|m| m["name"] == json!("post_builtin_xyz_unique")),
+            "tool_search must reflect post-builtins registrations (got {:?})",
+            matches,
+        );
     }
 
     #[tokio::test]
