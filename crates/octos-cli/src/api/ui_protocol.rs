@@ -14675,6 +14675,16 @@ async fn run_standalone_turn(
                 // Defer the send until below the persist block.
                 let captured_final_reply = response.content.clone();
                 let mut cursor = None;
+                // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
+                // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
+                // error). Track whether the assistant row carrying
+                // `response.content` actually persisted. If not, the
+                // captured reply must NOT be released to the post-turn
+                // reschedule block — that would let it call
+                // `apply_self_paced_response` from a reply that never
+                // hit session history, which is the exact failure mode
+                // this fix is meant to prevent.
+                let mut final_assistant_persisted = false;
                 {
                     let mut sessions = sessions.lock().await;
                     let final_assistant = final_assistant_message(
@@ -14691,6 +14701,14 @@ async fn run_standalone_turn(
                             skipped_internal_user = true;
                             continue;
                         }
+                        // Detect the exact row that carries
+                        // `response.content` BEFORE pre-stamp /
+                        // persist, so we can flip
+                        // `final_assistant_persisted` only on its
+                        // Ok branch.
+                        let is_final_assistant_carrier = message.role == MessageRole::Assistant
+                            && message.content == response.content
+                            && !response.content.is_empty();
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();
@@ -14709,12 +14727,22 @@ async fn run_standalone_turn(
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
                             });
+                            if is_final_assistant_carrier {
+                                final_assistant_persisted = true;
+                            }
                         }
                     }
                 }
-                // Persistence committed — now safe to release the
-                // captured reply to the post-turn reschedule block.
-                let _ = final_reply_tx.send(Some(captured_final_reply));
+                // Release the captured reply ONLY when the assistant
+                // row that holds `response.content` is in session
+                // history. On persist failure, send `None` so the
+                // post-turn block falls back to the history scan and
+                // matches the pre-#1134 aborted-turn behaviour.
+                if final_assistant_persisted {
+                    let _ = final_reply_tx.send(Some(captured_final_reply));
+                } else {
+                    let _ = final_reply_tx.send(None);
+                }
                 let done = json!({
                     "type": "done",
                     "content": response.content,
