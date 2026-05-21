@@ -2643,6 +2643,20 @@ fn pending_continuation_is_schedulable(
             let Some(goal) = state.goals.get(&session_key) else {
                 return false;
             };
+            // #1145 codex P2 re-review #2: enforce goal-id identity
+            // BEFORE the legacy wrap-up exemption. When the user
+            // cleared the old goal and created a different one for
+            // the same `SessionKey`, the stale legacy wrap-up still
+            // carries the old `goal_id`. Without this check, the
+            // wrap-up exemption below would bypass the identity
+            // guard and wake the session against the new goal,
+            // letting the stale wrap-up render against an
+            // unrelated objective.
+            if let Some(item_goal_id) = item.goal_id.as_ref() {
+                if item_goal_id.as_str() != goal.goal_id {
+                    return false;
+                }
+            }
             // #1145 codex P2 re-review: pre-#1131 wrap-up turns were
             // queued as `GoalContinue` + `wrap_up_prompt` metadata,
             // and the prompt renderer promotes that shape at render
@@ -2651,23 +2665,10 @@ fn pending_continuation_is_schedulable(
             // `budget_limited`, so the active-only gate would
             // strand legacy persisted wrap-ups indefinitely.
             // Detect the legacy shape and let it through — the goal
-            // record just has to exist.
+            // record's id already matched above.
             if item.metadata.contains_key("wrap_up_prompt") || item.metadata.contains_key("wrap_up")
             {
                 return true;
-            }
-            // #1145 codex P2 re-review: when a user cleared the
-            // old goal and created a new one for the same
-            // `SessionKey`, the queued item still carries the old
-            // `goal_id` while `state.goals` now holds the new goal.
-            // Without a goal-id identity check the stale item would
-            // mark the session schedulable and could drain BEFORE
-            // the new goal's first continuation (the stale item is
-            // the older heap entry).
-            if let Some(item_goal_id) = item.goal_id.as_ref() {
-                if item_goal_id.as_str() != goal.goal_id {
-                    return false;
-                }
             }
             matches!(goal.status.as_str(), "active")
         }
