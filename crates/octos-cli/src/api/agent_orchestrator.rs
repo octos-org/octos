@@ -523,6 +523,16 @@ impl InProcessAgentOrchestrator {
             );
         }
 
+        // #1127 codex P2 follow-up to #991 / M15-B: arm the
+        // cancellation handle BEFORE we publish the agent as `running`
+        // and emit the AGENT_UPDATED event. A client that sees the
+        // running event and immediately calls `interrupt_agent` /
+        // `close_agent` must hit a registered token. With the prior
+        // ordering (register after publish + after worker construction)
+        // the notification was lost and the worker ran to completion
+        // even though the agent's terminal status had been stamped.
+        let cancel_token = self.register_agent_cancellation(&agent_id);
+
         let initial_agent = self.upsert_agent(AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: parent_agent_id.clone(),
@@ -570,17 +580,11 @@ impl InProcessAgentOrchestrator {
         }
         worker.wire_activate_tools();
 
-        // #991 / M15-B — register a cancellation handle keyed by
-        // `agent_id` before we begin work. When `interrupt_agent` /
-        // `close_agent` are invoked from another task they will signal
-        // this `Notify`, and the `tokio::select!` below will short-
-        // circuit `process_message` with an `interrupted` status
-        // instead of letting the model finish. The status we record
-        // here is provisional; if cancellation wins, the
-        // `interrupt_agent` caller will have already stamped a
-        // terminal status — we surface that via
-        // `agent_status_is_terminal` below.
-        let cancel_token = self.register_agent_cancellation(&agent_id);
+        // #991 / M15-B — `cancel_token` was registered above (see the
+        // P2 follow-up comment) before the agent was published. The
+        // `tokio::select!` below short-circuits `process_message` with
+        // an `interrupted` status when a notify lands, instead of
+        // letting the model finish.
         let run = worker.process_message(&task, &[], Vec::new());
         tokio::pin!(run);
         let cancel_wait = cancel_token.notified();
@@ -728,13 +732,19 @@ impl InProcessAgentOrchestrator {
     /// #991 / M15-B — signal cancellation for the running agent task
     /// (if any) and drop the handle. Returns whether a handle was
     /// found. Used by `interrupt_agent` / `close_agent` to wake the
-    /// worker before the in-memory status mutation, so the worker can
-    /// observe both the cancellation and the terminal status without
-    /// racing the status reader.
+    /// worker after the in-memory terminal status has been stamped.
+    ///
+    /// #1127 codex P2 follow-up: use `notify_one()` instead of
+    /// `notify_waiters()` so a notification that lands BEFORE the
+    /// worker has had a chance to `.notified().await` is queued as
+    /// a permit and consumed by the next await. With
+    /// `notify_waiters()`, a fast interrupt that arrived in the
+    /// window between agent publish (the `running` event) and the
+    /// worker's first `notified()` await was silently lost.
     pub(crate) fn signal_agent_cancellation(&self, agent_id: &str) -> bool {
         let token = self.state().cancellations.remove(agent_id);
         if let Some(token) = token {
-            token.notify_waiters();
+            token.notify_one();
             true
         } else {
             false
@@ -1153,22 +1163,30 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 
     fn interrupt_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
-        // #991 / M15-B — signal a *real* cancellation to the running
-        // worker (if registered) BEFORE we flip in-memory status. The
-        // helper takes the state lock briefly to swap the handle out
-        // and then drops the lock before notifying waiters, which is
-        // important: notified workers are likely to call back into the
-        // orchestrator to mark the terminal status themselves.
-        self.signal_agent_cancellation(&request.agent_id);
-        update_agent_terminal_status(self, request, "interrupted", true, false)
+        // #1127 codex P1 follow-up to #991 / M15-B: validate AND stamp
+        // the terminal state BEFORE we wake the worker. The prior shape
+        // signaled first, which (a) let any same-profile caller wake +
+        // remove another session's cancellation token even when the
+        // RPC would later return forbidden, and (b) on multithreaded
+        // runtimes let an authorized interrupt wake the worker before
+        // the status flip became visible — so workers raced through
+        // their wrap-up code and reported `failed` instead of
+        // `interrupted`/`closed`. `update_agent_terminal_status` does
+        // the scope check + stamp under the same state lock, so we
+        // only signal after a successful stamp.
+        let agent_id = request.agent_id.clone();
+        let result = update_agent_terminal_status(self, request, "interrupted", true, false)?;
+        self.signal_agent_cancellation(&agent_id);
+        Ok(result)
     }
 
     fn close_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
-        // #991 / M15-B — same shape as `interrupt_agent`: signal first
-        // so the running worker can shut down its child process / MCP
-        // transport before we record the terminal in-memory state.
-        self.signal_agent_cancellation(&request.agent_id);
-        update_agent_terminal_status(self, request, "closed", false, true)
+        // #1127 codex P1 follow-up to #991 / M15-B: validate + stamp,
+        // then signal — see `interrupt_agent` for the rationale.
+        let agent_id = request.agent_id.clone();
+        let result = update_agent_terminal_status(self, request, "closed", false, true)?;
+        self.signal_agent_cancellation(&agent_id);
+        Ok(result)
     }
 
     /// #991 / M15-B — in-process `spawn_agent` registers a *pending*
@@ -5368,5 +5386,56 @@ mod tests {
             outcome.status, "interrupted",
             "real cancellation must surface as `interrupted`"
         );
+    }
+
+    /// #1127 codex P1 acceptance: a cross-profile interrupt MUST NOT
+    /// signal the worker's cancellation token. The scope check has to
+    /// fire BEFORE the notify, otherwise an attacker who knows
+    /// another tenant's `agent_id` could wake / remove that worker's
+    /// token even though the RPC eventually returns
+    /// `permission_denied`. Pins the validate-then-stamp-then-signal
+    /// order.
+    #[test]
+    fn cross_profile_interrupt_does_not_signal_cancellation_token() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let agent = sample_agent("victim-agent", "tenant-a");
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent.clone());
+
+        // Pre-register a cancellation handle to detect the race.
+        let token = orchestrator.register_agent_cancellation(&agent.agent_id);
+
+        // Attacker on `tenant-b` tries to interrupt tenant-a's agent.
+        let err = orchestrator
+            .interrupt_agent(AgentRequest {
+                agent_id: agent.agent_id.clone(),
+                session_id: Some(agent.session_id.clone()),
+                profile_id: "tenant-b".into(),
+            })
+            .expect_err("cross-profile interrupt must be denied");
+        assert_eq!(err.code, rpc_error_codes::PERMISSION_DENIED);
+
+        // The cancellation token MUST still be registered AND MUST NOT
+        // have been notified — verify both invariants. We do a
+        // try_recv-style check by spawning a quick notified() future
+        // and asserting it doesn't resolve immediately.
+        assert!(
+            orchestrator
+                .state()
+                .cancellations
+                .contains_key(&agent.agent_id),
+            "denied interrupt must NOT have removed the cancellation token"
+        );
+        // `notify_one` would leave a permit on the token. Detect it.
+        let notified_fut = std::pin::pin!(token.notified());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match notified_fut.poll(&mut cx) {
+            std::task::Poll::Ready(()) => {
+                panic!("denied interrupt left a cancellation permit on the victim's token")
+            }
+            std::task::Poll::Pending => {}
+        }
     }
 }
