@@ -18,9 +18,9 @@ use super::{
     ApplyPatchTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool, ConfigureToolTool,
     DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool, ListDirTool, ReadFileTool,
     RequestUserInputTool, ResumeAgentTool, SendInputTool, ShellTool, SpawnAgentTool, Tool,
-    ToolConfigStore, ToolLifecycle, ToolResult, UpdatePlanTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ToolCatalogEntry, ToolConfigStore, ToolLifecycle, ToolResult, ToolSearchTool, ToolSuggestTool,
+    UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool,
+    WorkspaceLogTool, WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -1123,7 +1123,38 @@ impl ToolRegistry {
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
+        // #972 / M14-B P1: `view_image`, `tool_search`, `tool_suggest`.
+        //
+        // `view_image` inherits the workspace filesystem scope so it can only
+        // read images inside the active project.
+        registry.register(
+            ViewImageTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        // Build a catalog snapshot for the dynamic-discovery tools AFTER every
+        // other builtin has registered so the search/suggest surface mirrors
+        // the actual coding tool contract for the active profile.
+        let catalog = registry.catalog_snapshot();
+        registry.register(ToolSearchTool::new(catalog.clone()));
+        registry.register(ToolSuggestTool::new(catalog));
         registry
+    }
+
+    /// Snapshot of every currently-registered tool as a [`ToolCatalogEntry`]
+    /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
+    /// against the effective coding tool contract.
+    pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
+        self.tools
+            .values()
+            .map(|tool| {
+                ToolCatalogEntry::new(
+                    tool.name(),
+                    tool.description(),
+                    tool.tags().iter().map(|t| (*t).to_string()).collect(),
+                )
+            })
+            .collect()
     }
 
     /// Tool names that are bound to a working directory (cwd / base_dir).
@@ -1143,6 +1174,10 @@ impl ToolRegistry {
         "workspace_log",
         "workspace_show",
         "workspace_diff",
+        // #972 / M14-B P1: `view_image` reads files from the workspace and
+        // must follow `rebind_cwd` so a session targeting a new project root
+        // does not leak previously bound paths.
+        "view_image",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -1164,8 +1199,12 @@ impl ToolRegistry {
         permissions: EffectivePermissions,
     ) -> Self {
         let cwd = cwd.as_ref();
-        // Clone everything except cwd-bound tools
-        let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
+        // Clone everything except cwd-bound tools and the dynamic-discovery
+        // tools, which hold a snapshot of the *previous* catalog and would
+        // otherwise advertise stale tool descriptions after a rebind.
+        let mut exclude: Vec<&str> = Self::CWD_BOUND_TOOLS.to_vec();
+        exclude.extend_from_slice(&["tool_search", "tool_suggest"]);
+        let mut registry = self.snapshot_excluding(&exclude);
         registry.workspace_root = Some(cwd.to_path_buf());
         let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
         // Re-register cwd-bound tools with the new workspace
@@ -1215,6 +1254,17 @@ impl ToolRegistry {
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
+        // #972 / M14-B P1: re-register cwd-bound `view_image` and refresh the
+        // dynamic-discovery catalog so `tool_search` / `tool_suggest` reflect
+        // the rebound workspace's tool surface.
+        registry.register(
+            ViewImageTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        let catalog = registry.catalog_snapshot();
+        registry.register(ToolSearchTool::new(catalog.clone()));
+        registry.register(ToolSuggestTool::new(catalog));
         registry
     }
 
