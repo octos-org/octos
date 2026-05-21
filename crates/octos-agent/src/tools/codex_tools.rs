@@ -1663,7 +1663,13 @@ impl Tool for ViewImageTool {
         // buffer just to sniff magic bytes. SVG detection needs the
         // longest prefix (256 bytes); 512 gives headroom. `metadata`
         // surfaces the true byte length without reading.
-        let (bytes, byte_length) = match read_image_header_no_follow(&resolved) {
+        //
+        // #1151: pass the workspace root so the helper can walk
+        // ancestors and reject any parent symlink — `O_NOFOLLOW`
+        // only catches a symlink AT the final path component, so a
+        // symlinked PARENT directory (`workspace/link -> /outside`)
+        // would otherwise let `view_image` read outside the workspace.
+        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, &self.base_dir) {
             Ok(pair) => pair,
             Err(error) => {
                 return Ok(ToolResult {
@@ -1718,15 +1724,45 @@ impl Tool for ViewImageTool {
 }
 
 /// #1148 codex P2: bounded-read helper for `view_image` that refuses
-/// to follow symlinks (Unix: O_NOFOLLOW; Windows: an explicit
-/// `metadata.is_symlink()` check after open). Reads only the first
-/// 512 bytes for magic-byte detection — SVG sniffing scans up to
-/// 256, the binary formats all need ≤12. The total file size is
-/// returned separately from `metadata()` so callers can surface
-/// `byte_length` without reading the whole file.
-fn read_image_header_no_follow(resolved: &std::path::Path) -> std::io::Result<(Vec<u8>, u64)> {
+/// to follow symlinks. Reads only the first 512 bytes for magic-byte
+/// detection — SVG sniffing scans up to 256, the binary formats all
+/// need ≤12. The total file size is returned separately from
+/// `metadata()` so callers can surface `byte_length` without reading
+/// the whole file.
+///
+/// #1151: the original implementation had two symlink gaps:
+///
+///   1. **Unix:** `O_NOFOLLOW` only refuses a symlink at the FINAL
+///      path component. `resolve_path_with_scope` is lexical, so a
+///      symlinked PARENT directory (`workspace/link -> /outside/`)
+///      would pass scope resolution and the open would follow the
+///      parent symlink — `view_image` could read outside the
+///      workspace.
+///   2. **Windows:** `OpenOptions::open` already followed any
+///      symlink/reparse point by the time the post-open
+///      `file.metadata().is_symlink()` check ran. The check was
+///      silently a no-op.
+///
+/// Both gaps are closed by walking ancestors from `resolved` up to
+/// the configured `workspace_root` and calling `symlink_metadata` on
+/// each — refusing if any ancestor (including the leaf) is a
+/// symlink/reparse point. The walk stops at the workspace root
+/// (inclusive) so we never traverse system roots. The Unix
+/// `O_NOFOLLOW` flag is retained as defense in depth for the leaf.
+fn read_image_header_no_follow(
+    resolved: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> std::io::Result<(Vec<u8>, u64)> {
     use std::io::Read;
     const HEADER_BYTES: usize = 512;
+
+    // Pre-open ancestor walk: refuse any symlink/reparse-point in the
+    // path between the workspace root and the leaf (inclusive). This
+    // closes the Unix parent-symlink gap AND the Windows post-open
+    // gap in one shot. The leaf check also acts as the Windows
+    // symlink rejection (Unix still has O_NOFOLLOW below).
+    reject_symlink_ancestors(resolved, workspace_root)?;
+
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1736,26 +1772,65 @@ fn read_image_header_no_follow(resolved: &std::path::Path) -> std::io::Result<(V
             .open(resolved)?
     };
     #[cfg(not(unix))]
-    let file = {
-        // Windows fallback: open, then refuse if the resulting handle
-        // turns out to be a symlink. Matches the pattern in
-        // `crates/octos-agent/src/tools/read_file.rs`.
-        let f = std::fs::OpenOptions::new().read(true).open(resolved)?;
-        let meta = f.metadata()?;
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "refusing to follow symlink (view_image)",
-            ));
-        }
-        f
-    };
+    let file = std::fs::OpenOptions::new().read(true).open(resolved)?;
+
     let metadata = file.metadata()?;
     let byte_length = metadata.len();
     let mut reader = file.take(HEADER_BYTES as u64);
     let mut header = Vec::with_capacity(HEADER_BYTES.min(byte_length as usize));
     reader.read_to_end(&mut header)?;
     Ok((header, byte_length))
+}
+
+/// Walk every ancestor of `resolved` (including `resolved` itself)
+/// and refuse if any one is a symlink or Windows reparse point.
+/// Stops at `workspace_root` (inclusive) so we never recurse into
+/// system roots. Returns `Ok(())` when none of the inspected entries
+/// are symlinks; returns `PermissionDenied` with a descriptive
+/// message when any are.
+///
+/// Safety properties:
+///
+/// * Uses `symlink_metadata`, which does NOT follow the link, so a
+///   symlinked ancestor is correctly classified.
+/// * Terminates at the workspace root even if `resolved` does not
+///   actually live under it (in which case the walk runs out of
+///   ancestors and returns `Ok(())` — containment was already
+///   checked by `resolve_path_with_scope`).
+/// * Hard-bounded by `Path::ancestors`, which is finite.
+fn reject_symlink_ancestors(
+    resolved: &std::path::Path,
+    workspace_root: &std::path::Path,
+) -> std::io::Result<()> {
+    for ancestor in resolved.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to follow symlink ancestor: {}",
+                            ancestor.display()
+                        ),
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // The leaf may not exist yet — keep walking up so a
+                // symlinked PARENT still gets caught. The actual
+                // open below will surface NotFound for the leaf.
+            }
+            Err(err) => return Err(err),
+        }
+        // Stop walking once we hit (and have inspected) the
+        // configured workspace root. Going further would inspect
+        // system directories that the caller has no jurisdiction
+        // over.
+        if ancestor == workspace_root {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2451,6 +2526,90 @@ mod tests {
         assert!(
             !result.success,
             "view_image must reject symlinked targets (O_NOFOLLOW); got success result"
+        );
+        let meta = result.structured_metadata.expect("structured metadata");
+        assert_eq!(meta["error_kind"], json!("coding_tool_missing"));
+    }
+
+    /// #1151 acceptance: view_image MUST refuse to traverse a
+    /// SYMLINKED PARENT DIRECTORY. The Unix `O_NOFOLLOW` flag only
+    /// catches a symlink at the final path component, so without an
+    /// ancestor walk a malicious workspace could ship
+    /// `workspace/link -> /outside/` and `view_image link/real.png`
+    /// would read `/outside/real.png` (outside the workspace).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn view_image_rejects_parent_symlink_directory() {
+        const PNG_MAGIC: [u8; 12] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Two sibling directories under the same tempdir: the
+        // workspace, and an `outside` directory that contains the
+        // real image. The workspace itself contains a symlink
+        // `imgs -> outside`. Lexically `workspace/imgs/real.png`
+        // looks workspace-relative.
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&workspace).expect("mk workspace");
+        std::fs::create_dir(&outside).expect("mk outside");
+        std::fs::write(outside.join("real.png"), PNG_MAGIC).expect("write png");
+        std::os::unix::fs::symlink(&outside, workspace.join("imgs"))
+            .expect("symlink parent directory");
+
+        let tool = ViewImageTool::new(&workspace);
+        let result = tool
+            .execute(&json!({ "path": "imgs/real.png" }))
+            .await
+            .expect("view_image runs");
+        assert!(
+            !result.success,
+            "view_image must refuse a SYMLINKED PARENT directory; got success result: {}",
+            result.output
+        );
+        let meta = result.structured_metadata.expect("structured metadata");
+        assert_eq!(meta["codex_tool"], json!("view_image"));
+        assert_eq!(meta["error_kind"], json!("coding_tool_missing"));
+    }
+
+    /// #1151 acceptance: Windows must perform the symlink rejection
+    /// BEFORE the open call. Prior to the fix the helper opened the
+    /// file first and then called `file.metadata().is_symlink()` —
+    /// but `OpenOptions::open` had already followed the symlink, so
+    /// the check was silently a no-op. The pre-open `symlink_metadata`
+    /// ancestor walk catches the leaf reliably.
+    ///
+    /// NB: Windows symlink creation requires Developer Mode or admin
+    /// privileges. The test silently passes when neither is available
+    /// — there is nothing the test can do about an unprivileged CI
+    /// runner. The Unix counterpart above gives functional coverage;
+    /// this test guards against the platform-specific regression
+    /// only when the host can actually create a symlink.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn view_image_rejects_leaf_symlink_pre_open_on_windows() {
+        const PNG_MAGIC: [u8; 12] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("real_image.png");
+        std::fs::write(&target, PNG_MAGIC).expect("write png");
+        let symlink = temp.path().join("link.png");
+        if std::os::windows::fs::symlink_file(&target, &symlink).is_err() {
+            // Unprivileged runner — symlinks unavailable. Skip
+            // rather than fail; the Unix test exercises the same
+            // ancestor-walk code path.
+            eprintln!(
+                "skipping view_image_rejects_leaf_symlink_pre_open_on_windows: symlink_file failed (Developer Mode or admin required)"
+            );
+            return;
+        }
+
+        let tool = ViewImageTool::new(temp.path());
+        let result = tool
+            .execute(&json!({ "path": "link.png" }))
+            .await
+            .expect("view_image runs");
+        assert!(
+            !result.success,
+            "view_image must reject a leaf symlink PRE-OPEN on Windows; got success result: {}",
+            result.output
         );
         let meta = result.structured_metadata.expect("structured metadata");
         assert_eq!(meta["error_kind"], json!("coding_tool_missing"));
