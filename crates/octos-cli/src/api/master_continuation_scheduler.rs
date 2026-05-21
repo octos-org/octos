@@ -598,6 +598,15 @@ impl MasterContinuationScheduler {
             .map(|item| (item.session_id.as_str(), item.profile_id.as_str()))
     }
 
+    /// #1145 codex P1 follow-up — iterate over every pending
+    /// continuation so callers can filter by reason/goal_id/loop_id
+    /// before deciding to schedule a tick. The orchestrator uses this
+    /// to skip stale `GoalContinue`/`LoopFire` items whose owning
+    /// goal/loop has since been paused, cleared, or deleted.
+    pub(crate) fn pending_items(&self) -> impl Iterator<Item = &QueuedMasterContinuation> + '_ {
+        self.pending_by_key.values()
+    }
+
     fn discard_stale_heap_entries(&mut self) {
         while self
             .heap
