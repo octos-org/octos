@@ -1097,6 +1097,36 @@ impl InProcessAgentOrchestrator {
     /// (`token_budget / 2500`) bounds total fires until token-side
     /// accounting catches up.
     ///
+    /// #1140 codex P2 follow-up — dispatch-time stamp that ONLY
+    /// touches `last_continued_at_ms` (and `updated_at_ms`), with NO
+    /// counter increments. Used by the AppUI tick path before a goal
+    /// turn starts so `due_loop_targets` doesn't keep seeing the
+    /// same goal as due every 2s while the turn is in flight. The
+    /// post-turn `record_goal_turn` then handles the full counter
+    /// + token accounting once `run_standalone_turn` returns.
+    ///
+    /// Returns true if the timestamp was updated, false if the goal
+    /// is not found or the profile didn't match.
+    pub(crate) fn record_goal_dispatch_timestamp_only(
+        &self,
+        session_id: &SessionKey,
+        profile_id: &str,
+    ) -> bool {
+        let now = now_ms();
+        let mut state = self.state();
+        let Some(goal) = state.goals.get_mut(session_id) else {
+            return false;
+        };
+        if goal.profile_id != profile_id {
+            return false;
+        }
+        goal.last_continued_at_ms = now;
+        goal.updated_at_ms = now;
+        let snapshot = goal.clone();
+        persist_goal_state(&state, session_id, &snapshot, false);
+        true
+    }
+
     /// #1133 — the AppUI tick path no longer calls this helper.
     /// `run_standalone_turn` now folds real `tokens_consumed +
     /// elapsed` into `record_goal_turn` AFTER the agent task returns,

@@ -8471,23 +8471,24 @@ async fn maybe_spawn_appui_master_continuation_runner(
             "draining queued master continuation into AppUI turn runtime"
         );
         default_agent_orchestrator().mark_continuation_started(&continuation);
-        // #1133 — the AppUI tick path used to call
-        // `record_goal_dispatch_only` here so the next scheduler tick
-        // (~every 2s) would not re-dispatch the same goal while THIS
-        // turn was still running. That stub bumped `continuations_used`
-        // + `rate_window_count` BEFORE the turn even spent any tokens,
-        // which double-counted every fire once #1133 wired the full
-        // post-turn `record_goal_turn` accountant. Option (b) in #1133
-        // is the resolution: skip dispatch-only entirely on the AppUI
-        // path and let the post-turn call below handle ALL accounting
-        // (including `last_continued_at_ms`). The 2s rescan loop is
-        // prevented by `run_standalone_turn` calling `record_goal_turn`
-        // BEFORE the next scheduler tick observes the session as idle
-        // — the goal's `last_continued_at_ms` is stamped while the
-        // post-accountant runs, which is the same wall-clock window
-        // the rescan loop scans. The `record_goal_dispatch_only` helper
-        // stays available for callers that genuinely only need a
-        // timestamp bump.
+        // #1140 codex P2 follow-up: stamp the goal's
+        // `last_continued_at_ms` AT DISPATCH so the scheduler tick
+        // (which can fire every ~2s) doesn't re-select this goal
+        // while the turn is still in flight. We use the new
+        // `record_goal_dispatch_timestamp_only` helper which ONLY
+        // touches the timestamp — counter increments are reserved
+        // for the post-turn `record_goal_turn` call below (which
+        // runs with real token usage). Without this stamp, a tick
+        // landing after the prior terminal frame but before the
+        // post-turn accountant ran could observe the session as
+        // idle and dispatch ANOTHER continuation, bypassing the
+        // 30s min-delay.
+        if let Some(ref ctx) = goal_context_for_appui {
+            default_agent_orchestrator().record_goal_dispatch_timestamp_only(
+                &SessionKey(continuation.session_id.as_str().to_owned()),
+                &ctx.profile_id,
+            );
+        }
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,
