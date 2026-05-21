@@ -163,7 +163,16 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
                 role: string_field(event, &["role"]),
                 summary: string_field(event, &["summary"]),
                 artifact_count: u32_field(event, &["artifact_count"]),
-                runtime_policy_stamp: event.get("runtime_policy_stamp").cloned(),
+                // Codex P2 follow-up: a `null` runtime_policy_stamp from
+                // the progress producer must be treated as ABSENT (None),
+                // not Some(Value::Null). Otherwise serde emits
+                // `"runtime_policy_stamp": null` on `task/updated` and
+                // clients that cache the stamp see it wiped on every
+                // update tick.
+                runtime_policy_stamp: event
+                    .get("runtime_policy_stamp")
+                    .cloned()
+                    .filter(|v| !v.is_null()),
             },
         )]);
     }
