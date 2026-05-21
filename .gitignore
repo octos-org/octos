@@ -129,3 +129,4 @@ scripts/deploy.sh
 !e2e/fixtures/compat-test-skill/manifest.json
 !e2e/fixtures/compat-test-skill/main
 tsconfig.tsbuildinfo
+e2e/test-results-matrix/
