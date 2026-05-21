@@ -25,6 +25,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // CLI parsing.
@@ -537,7 +538,7 @@ function getByPath(obj, dottedPath) {
   return cursor;
 }
 
-class StdioClient {
+export class StdioClient {
   constructor({ octosBin, dataDir, workspace, repoRoot, stderrLog, transcriptLog, timeoutMs }) {
     this.timeoutMs = timeoutMs;
     this.transcriptLog = transcriptLog;
@@ -566,14 +567,50 @@ class StdioClient {
     });
     this.rl = readline.createInterface({ input: this.child.stdout });
     this.rl.on('line', (line) => this._onLine(line));
+    // Codex P2 follow-up: when the spawned `octos serve` crashes,
+    // panics, or the wrong binary is at OCTOS_BIN, the child can
+    // exit with pending RPCs still in flight. Track exit so we can
+    // reject pending requests instead of waiting for them to time
+    // out (or worse, propagating an unhandled EPIPE on stdin —
+    // which would terminate Node and leave no scenario.json or
+    // summary.json artifact behind).
+    this.exitInfo = null;
     this.exited = new Promise((resolve) => {
-      this.child.once('exit', (code, signal) => resolve({ code, signal }));
+      this.child.once('exit', (code, signal) => {
+        this.exitInfo = { code, signal };
+        this._failPending(new Error(
+          `octos serve exited unexpectedly (code=${code}, signal=${signal})`,
+        ));
+        resolve(this.exitInfo);
+      });
+    });
+    // Defensive: stdin EPIPE arrives as an `error` event. Without a
+    // handler this terminates Node. With one we just record it; the
+    // child-exit handler above does the actual cleanup.
+    this.child.stdin.on('error', (err) => {
+      appendJsonl(this.transcriptLog, {
+        direction: 'stdin_error',
+        code: err.code,
+        message: err.message,
+      });
     });
     this.spawned = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('octos serve --stdio spawn timeout')), 10_000);
       this.child.once('spawn', () => { clearTimeout(timer); resolve(); });
       this.child.once('error', reject);
     });
+  }
+
+  _failPending(err) {
+    const pending = this.pending;
+    this.pending = new Map();
+    for (const [, request] of pending) {
+      try { request.resolve({ jsonrpc: '2.0', id: null, error: {
+        code: -32000,
+        message: err.message,
+        data: { kind: 'backend_exited' },
+      } }); } catch { /* ignore */ }
+    }
   }
 
   _onLine(line) {
@@ -600,7 +637,29 @@ class StdioClient {
     const id = `m22-matrix-${++this.nextSeq}-${crypto.randomBytes(3).toString('hex')}`;
     const frame = { jsonrpc: '2.0', id, method, params };
     appendJsonl(this.transcriptLog, { direction: 'client_to_server', frame });
-    this.child.stdin.write(`${JSON.stringify(frame)}\n`);
+    // Codex P2 follow-up: if the backend already exited, don't write
+    // to a dead stdin — emit a typed `backend_exited` error instead
+    // so the scenario records a failed step and the run summary is
+    // still written.
+    if (this.exitInfo) {
+      return Promise.resolve({ jsonrpc: '2.0', id, error: {
+        code: -32000,
+        message: `octos serve has exited (code=${this.exitInfo.code}, signal=${this.exitInfo.signal})`,
+        data: { kind: 'backend_exited' },
+      } });
+    }
+    try {
+      this.child.stdin.write(`${JSON.stringify(frame)}\n`);
+    } catch (err) {
+      // EPIPE between the exit-event firing and us reaching this
+      // line: synthesize the same typed error so the scenario doesn't
+      // hang waiting for a response that will never come.
+      return Promise.resolve({ jsonrpc: '2.0', id, error: {
+        code: -32000,
+        message: `stdin write failed (${err.code || err.message})`,
+        data: { kind: 'backend_exited' },
+      } });
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -881,7 +940,14 @@ async function main() {
   if (!summary.ok) process.exitCode = 1;
 }
 
-main().catch((err) => {
-  console.error(err?.stack || String(err));
-  process.exit(1);
-});
+// Codex P2 follow-up: only run `main()` when this file is invoked
+// as a CLI script. Importing it from a regression test (to exercise
+// StdioClient against a fake backend) must not kick off the full
+// runner pipeline.
+const __thisFile = fileURLToPath(import.meta.url);
+if (process.argv[1] && path.resolve(process.argv[1]) === __thisFile) {
+  main().catch((err) => {
+    console.error(err?.stack || String(err));
+    process.exit(1);
+  });
+}
