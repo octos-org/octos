@@ -658,7 +658,8 @@ pub mod code_structure;
 
 pub use codex_tools::{
     ApplyPatchTool, CloseAgentTool, ExecCommandTool, RequestUserInputTool, ResumeAgentTool,
-    SendInputTool, SpawnAgentTool, UpdatePlanTool, WaitAgentTool, WriteStdinTool,
+    SendInputTool, SpawnAgentTool, ToolCatalogEntry, ToolSearchTool, ToolSuggestTool,
+    UpdatePlanTool, ViewImageTool, WaitAgentTool, WriteStdinTool,
 };
 pub use deep_search::DeepSearchTool;
 pub use delegate::{

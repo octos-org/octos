@@ -37,14 +37,18 @@ pub(crate) const CODING_EXEC_SESSION_CAPABILITY_V1: &str = "coding.exec_session.
 pub(crate) const CODING_PLAN_TOOL_CAPABILITY_V1: &str = "coding.plan_tool.v1";
 pub(crate) const CODING_USER_INPUT_TOOL_CAPABILITY_V1: &str = "coding.user_input_tool.v1";
 pub(crate) const CODING_SUBAGENT_ALIASES_CAPABILITY_V1: &str = "coding.subagent_aliases.v1";
-// Optional capabilities declared by UPCR-2026-020 §3 that have no canonical
-// P0 tool yet. The constants exist so the protocol vocabulary is single-
-// sourced; an actual server advertises them only when the underlying
-// feature is wired (see UPCR §5 "Capability-gated fields must be omitted
-// when the corresponding capability is not negotiated").
-#[allow(dead_code)]
+// Optional capabilities declared by UPCR-2026-020 §3.
+//
+// `image_view` and `dynamic_tool_search` are wired in by #972 / M14-B P1 and
+// are advertised whenever the server's `with_builtins` registers
+// `view_image`, `tool_search`, and `tool_suggest` (see
+// `ui_protocol::derived_capabilities`).
+//
+// `image_generation` has no native or skill backend bound to it yet, so the
+// constant exists for vocabulary parity but the capability is not
+// advertised. See UPCR §5: capability-gated fields must be omitted when the
+// corresponding capability is not negotiated.
 pub(crate) const CODING_IMAGE_VIEW_CAPABILITY_V1: &str = "coding.image_view.v1";
-#[allow(dead_code)]
 pub(crate) const CODING_DYNAMIC_TOOL_SEARCH_CAPABILITY_V1: &str = "coding.dynamic_tool_search.v1";
 #[allow(dead_code)]
 pub(crate) const CODING_IMAGE_GENERATION_CAPABILITY_V1: &str = "coding.image_generation.v1";
@@ -106,6 +110,12 @@ pub(crate) const OCTOS_KNOWN_MODEL_VISIBLE_TOOLS: &[&str] = &[
     "workspace_log",
     "workspace_show",
     "workspace_diff",
+    // #972 / M14-B P1 — Codex-compatible image inspection and dynamic
+    // tool discovery. These resolve through the same profile runtime as
+    // the P0 set and respect the active filesystem scope.
+    "view_image",
+    "tool_search",
+    "tool_suggest",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,10 +482,39 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
     OctosToolSpec {
         name: "manage_skills",
         category: "discovery",
-        aliases: &["tool_search", "tool_suggest"],
+        aliases: &[],
         policy: "allowed",
         detail: Some(
-            "Skill management exists, but Codex dynamic tool discovery aliases are not parity yet.",
+            "Skill management. Codex dynamic tool discovery aliases live on dedicated tool_search / tool_suggest entries.",
+        ),
+    },
+    // #972 / M14-B P1: canonical Codex dynamic tool discovery surface.
+    OctosToolSpec {
+        name: "tool_search",
+        category: "discovery",
+        aliases: &[],
+        policy: "allowed",
+        detail: Some(
+            "Canonical Codex tool_search entry. Returns ranked matches from the active coding tool contract.",
+        ),
+    },
+    OctosToolSpec {
+        name: "tool_suggest",
+        category: "discovery",
+        aliases: &[],
+        policy: "allowed",
+        detail: Some(
+            "Canonical Codex tool_suggest entry. Recommends tools for a free-form task description.",
+        ),
+    },
+    // #972 / M14-B P1: canonical Codex image-view surface.
+    OctosToolSpec {
+        name: "view_image",
+        category: "read",
+        aliases: &[],
+        policy: "allowed",
+        detail: Some(
+            "Canonical Codex view_image entry. Returns format / MIME / byte length for a workspace image.",
         ),
     },
     OctosToolSpec {
@@ -1017,6 +1056,57 @@ mod tests {
              so the M14 coding tool contract can resolve them as active or deferred. \
              Missing: {missing:?}. Registered tool names: {names:?}"
         );
+    }
+
+    /// #972 / M14-B P1 — sibling guard for the optional Codex parity surface.
+    /// Once these tools land, the OCTOS_KNOWN_MODEL_VISIBLE_TOOLS / OctosToolSpec
+    /// arrays and the `with_builtins` registration must all stay in lockstep
+    /// so the contract's tools array surfaces them as `available` whenever
+    /// the live registry registers them.
+    #[test]
+    fn p1_canonical_tools_are_registered_by_session_builtins() {
+        use octos_agent::ToolRegistry;
+        use octos_agent::sandbox::NoSandbox;
+
+        let cwd = std::path::Path::new("/tmp");
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
+        let names: std::collections::HashSet<String> = registry.tool_names().into_iter().collect();
+
+        for required in &["view_image", "tool_search", "tool_suggest"] {
+            assert!(
+                names.contains(*required),
+                "P1 canonical tool {required} must be registered by \
+                 ToolRegistry::with_builtins_and_sandbox so the M14 coding \
+                 tool contract can advertise it. Registered tool names: {names:?}"
+            );
+        }
+    }
+
+    /// #972 / M14-B P1 — the contract's `tools` array (driven by
+    /// OCTOS_TOOL_SPECS) must surface every P1 tool when the runtime
+    /// reports it as available. Otherwise the AppUI inspection flow can't
+    /// see the new entries even though the live registry has them.
+    #[test]
+    fn p1_canonical_tools_appear_in_contract_tools_array() {
+        let available = &["view_image", "tool_search", "tool_suggest"];
+        let context = ToolStatusListContext {
+            available_model_tools: available,
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let tools = payload["tools"].as_array().expect("tools array");
+
+        for name in available {
+            let found = tools
+                .iter()
+                .find(|tool| tool["name"] == json!(name))
+                .unwrap_or_else(|| panic!("P1 tool {name} must appear in contract tools array"));
+            assert_eq!(
+                found["status"],
+                json!(TOOL_STATUS_AVAILABLE),
+                "P1 tool {name} should be `available` when registered"
+            );
+        }
     }
 
     #[test]

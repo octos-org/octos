@@ -1196,6 +1196,20 @@ impl ConnectionUiFeatures {
             &mut capabilities.supported_features,
             super::coding_tool_contract::CODING_TOOL_CONTRACT_FEATURE_V1,
         );
+        // #972 / M14-B P1: advertise the optional Codex-parity capabilities
+        // now that the underlying tools (`view_image`, `tool_search`,
+        // `tool_suggest`) are wired through the profile runtime. UPCR-2026-020
+        // §3 lets capability-gated fields ride alongside the canonical
+        // contract; we omit `image_generation` because no native or skill
+        // backend is bound to it.
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            super::coding_tool_contract::CODING_IMAGE_VIEW_CAPABILITY_V1,
+        );
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            super::coding_tool_contract::CODING_DYNAMIC_TOOL_SEARCH_CAPABILITY_V1,
+        );
         if self.context_lifecycle_available() {
             push_capability_feature(
                 &mut capabilities.supported_features,

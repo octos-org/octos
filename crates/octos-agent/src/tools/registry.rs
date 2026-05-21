@@ -18,9 +18,9 @@ use super::{
     ApplyPatchTool, BrowserTool, CheckWorkspaceContractTool, CloseAgentTool, ConfigureToolTool,
     DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool, ListDirTool, ReadFileTool,
     RequestUserInputTool, ResumeAgentTool, SendInputTool, ShellTool, SpawnAgentTool, Tool,
-    ToolConfigStore, ToolLifecycle, ToolResult, UpdatePlanTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ToolCatalogEntry, ToolConfigStore, ToolLifecycle, ToolResult, ToolSearchTool, ToolSuggestTool,
+    UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool,
+    WorkspaceLogTool, WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -105,6 +105,13 @@ pub struct ToolRegistry {
     supervisor: Arc<TaskSupervisor>,
     /// Set to true when any spawn_only tool is actually invoked in this agent run.
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
+    /// #1148 codex P2: shared live catalog cell used by `tool_search` /
+    /// `tool_suggest`. Updated on every mutation (`register`,
+    /// `register_arc`, `apply_policy`, `mark_spawn_only`, etc.) so
+    /// the discovery surface always reflects the live registry's
+    /// visible tools. The Mutex is fine here — refreshes are cheap
+    /// (clones a small Vec) and only happen on registry mutations.
+    live_catalog: Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>>,
     /// Session key for tagging background tasks (set per-session).
     session_key: Option<String>,
     /// Precomputed output directory hint for spawn_only tool messaging.
@@ -134,6 +141,7 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: None,
         }
@@ -735,7 +743,7 @@ impl ToolRegistry {
         };
         drop(parent);
 
-        Self {
+        let mut snapshot = Self {
             tools,
             workspace_root: self.workspace_root.clone(),
             provider_policy: self.provider_policy.clone(),
@@ -749,9 +757,26 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
+        };
+        // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
+        // Arcs still point to the PARENT's catalog cell. Re-register
+        // fresh instances bound to the snapshot's own cell so search
+        // reflects the snapshot's (possibly filtered) tool surface,
+        // not the parent's. The `register` call below also fires
+        // `refresh_live_catalog` via `invalidate_cache`.
+        if snapshot.tools.contains_key("tool_search") {
+            let cell = snapshot.live_catalog_handle();
+            snapshot.register(ToolSearchTool::new(cell));
         }
+        if snapshot.tools.contains_key("tool_suggest") {
+            let cell = snapshot.live_catalog_handle();
+            snapshot.register(ToolSuggestTool::new(cell));
+        }
+        snapshot.refresh_live_catalog();
+        snapshot
     }
 
     // -- Deferred tool activation -------------------------------------------
@@ -952,11 +977,20 @@ impl ToolRegistry {
             .cached_specs
             .get_mut()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // #1148 codex P2: refresh the live catalog cell so the
+        // `tool_search` / `tool_suggest` discovery surface sees this
+        // mutation. Every existing mutation site already calls
+        // `invalidate_cache`, so threading the refresh through here
+        // covers all of them in one shot.
+        self.refresh_live_catalog();
     }
 
     /// Clear the cached specs through &self (for interior-mutability callers).
     fn invalidate_cache_shared(&self) {
         *self.cached_specs.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // #1148 codex P2: refresh the live catalog cell. See the
+        // `&mut self` variant above.
+        self.refresh_live_catalog();
     }
 
     /// Execute a tool by name.
@@ -1123,7 +1157,65 @@ impl ToolRegistry {
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
+        // #972 / M14-B P1: `view_image`, `tool_search`, `tool_suggest`.
+        //
+        // `view_image` inherits the workspace filesystem scope so it can only
+        // read images inside the active project.
+        registry.register(
+            ViewImageTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        // #1148 codex P2: pass the LIVE shared catalog cell instead
+        // of a frozen Vec snapshot. The registry refreshes the cell
+        // on every mutation via `refresh_live_catalog` (called from
+        // `invalidate_cache` / `invalidate_cache_shared`), so the
+        // discovery surface reflects post-builtin registrations
+        // (chat/gateway/profile setup, MCP/plugin/pipeline/memory).
+        let catalog_cell = registry.live_catalog_handle();
+        registry.register(ToolSearchTool::new(catalog_cell.clone()));
+        registry.register(ToolSuggestTool::new(catalog_cell));
+        // Final refresh so the catalog reflects the just-registered
+        // search/suggest tools too (cosmetic — they show up in their
+        // own search results).
+        registry.refresh_live_catalog();
         registry
+    }
+
+    /// Snapshot of every currently-registered tool as a [`ToolCatalogEntry`]
+    /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
+    /// against the effective coding tool contract.
+    pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
+        self.tools
+            .values()
+            .map(|tool| {
+                ToolCatalogEntry::new(
+                    tool.name(),
+                    tool.description(),
+                    tool.tags().iter().map(|t| (*t).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// #1148 codex P2 — return the shared live-catalog cell so
+    /// `ToolSearchTool` / `ToolSuggestTool` see post-mutation tool
+    /// state. Cloning the `Arc` is cheap; readers acquire the inner
+    /// Mutex briefly at execute time.
+    pub fn live_catalog_handle(&self) -> Arc<std::sync::Mutex<Vec<ToolCatalogEntry>>> {
+        self.live_catalog.clone()
+    }
+
+    /// #1148 codex P2 — rebuild the live catalog from the current
+    /// visible tool set. Called from every mutation site
+    /// (`register`, `register_arc`, `unregister`, `apply_policy`,
+    /// `mark_spawn_only`, ...). Idempotent + cheap; the inner Vec
+    /// is replaced wholesale to avoid stale entries.
+    pub(crate) fn refresh_live_catalog(&self) {
+        let snapshot = self.catalog_snapshot();
+        if let Ok(mut guard) = self.live_catalog.lock() {
+            *guard = snapshot;
+        }
     }
 
     /// Tool names that are bound to a working directory (cwd / base_dir).
@@ -1143,6 +1235,10 @@ impl ToolRegistry {
         "workspace_log",
         "workspace_show",
         "workspace_diff",
+        // #972 / M14-B P1: `view_image` reads files from the workspace and
+        // must follow `rebind_cwd` so a session targeting a new project root
+        // does not leak previously bound paths.
+        "view_image",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -1164,8 +1260,12 @@ impl ToolRegistry {
         permissions: EffectivePermissions,
     ) -> Self {
         let cwd = cwd.as_ref();
-        // Clone everything except cwd-bound tools
-        let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
+        // Clone everything except cwd-bound tools and the dynamic-discovery
+        // tools, which hold a snapshot of the *previous* catalog and would
+        // otherwise advertise stale tool descriptions after a rebind.
+        let mut exclude: Vec<&str> = Self::CWD_BOUND_TOOLS.to_vec();
+        exclude.extend_from_slice(&["tool_search", "tool_suggest"]);
+        let mut registry = self.snapshot_excluding(&exclude);
         registry.workspace_root = Some(cwd.to_path_buf());
         let sandbox: Arc<dyn Sandbox> = Arc::from(sandbox);
         // Re-register cwd-bound tools with the new workspace
@@ -1215,6 +1315,19 @@ impl ToolRegistry {
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
+        // #972 / M14-B P1: re-register cwd-bound `view_image` and refresh the
+        // dynamic-discovery catalog so `tool_search` / `tool_suggest` reflect
+        // the rebound workspace's tool surface.
+        registry.register(
+            ViewImageTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_file_access(permissions.file_access),
+        );
+        // #1148 codex P2: live shared catalog cell — see `with_builtins`.
+        let catalog_cell = registry.live_catalog_handle();
+        registry.register(ToolSearchTool::new(catalog_cell.clone()));
+        registry.register(ToolSuggestTool::new(catalog_cell));
+        registry.refresh_live_catalog();
         registry
     }
 
