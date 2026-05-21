@@ -14690,6 +14690,20 @@ async fn run_standalone_turn(
     // remains zero, which is the correct conservative behaviour: an
     // interrupted turn should not exhaust the goal's token budget.
     if let Some(goal_ctx) = goal_context.as_ref() {
+        // #1140 codex P2 re-review #2: the turn-start dispatch stamp
+        // can go stale on long goal turns (model + tool work > 30s
+        // exceeds GOAL_MIN_CONTINUATION_INTERVAL_MS). Refresh the
+        // timestamp IMMEDIATELY before the post-turn accountant runs
+        // so a scheduler tick landing in the gap between turn-terminal
+        // emission and `record_goal_turn` can't observe the goal as
+        // due. The refresh is a no-op if the goal was already
+        // transitioned (paused/complete), so it's safe to call
+        // unconditionally for goal_context turns. Note that
+        // `record_goal_turn` below also stamps `last_continued_at_ms
+        // = now`, but the await on `sessions_for_reschedule.lock()`
+        // is the exact yield point we need to guard.
+        default_agent_orchestrator()
+            .record_goal_dispatch_timestamp_only(&session_id, &goal_ctx.profile_id);
         let pre = pre_assistant_count_for_post_turn.unwrap_or(0);
         let assistant_reply: Option<String> = {
             let mut guard = sessions_for_reschedule.lock().await;
