@@ -147,6 +147,24 @@ function normalizeScenario(row, idx, seenIds) {
       `scenario "${row.id}" has invalid provider "${row.provider}"`,
     );
   }
+  // Codex P2 follow-up: optional scalar fields (replay, notes) default
+  // to null when absent. But if the TOML sets them to a non-string (e.g.
+  // `replay = []` or `notes = 42`), the value still slips through and
+  // ends up in the --json projection — breaking the README contract
+  // that says these are string-or-null. Validate type when present.
+  for (const optField of ["replay", "notes"]) {
+    if (
+      Object.prototype.hasOwnProperty.call(row, optField) &&
+      row[optField] !== null &&
+      row[optField] !== undefined
+    ) {
+      if (typeof row[optField] !== "string" || row[optField].length === 0) {
+        throw new ManifestSchemaError(
+          `scenario "${row.id}" field "${optField}" must be a non-empty string when set (or omitted)`,
+        );
+      }
+    }
+  }
   for (const arrField of [
     "required_tools",
     "required_capabilities",
