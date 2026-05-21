@@ -54,6 +54,11 @@ image = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
 base64 = { workspace = true }
+# #1057: `onboarding/workspace_probe` parses `workspace_policy.toml` to
+# surface presence + parse errors during TUI onboarding. The probe re-uses
+# `octos_agent::workspace_policy::WorkspacePolicy` as the canonical schema
+# and only needs the `toml` deserializer entry point here.
+toml = { workspace = true }
 keyring = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
