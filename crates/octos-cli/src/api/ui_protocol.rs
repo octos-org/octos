@@ -8483,18 +8483,28 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // post-turn accountant ran could observe the session as
         // idle and dispatch ANOTHER continuation, bypassing the
         // 30s min-delay.
-        if let Some(ref ctx) = goal_context_for_appui {
+        let _in_flight_guard = if let Some(ref ctx) = goal_context_for_appui {
             let session_key = SessionKey(continuation.session_id.as_str().to_owned());
             default_agent_orchestrator()
                 .record_goal_dispatch_timestamp_only(&session_key, &ctx.profile_id);
             // #1140 codex P2 re-review #3: mark the goal session as
-            // in-flight so `due_loop_targets`'s goal sweep skips it
-            // until the post-turn accountant clears it. This is the
-            // authoritative race-free gate — the timestamp alone is
-            // not enough for goal turns that exceed the 30s
-            // min-delay (the stamp expires mid-turn).
-            default_agent_orchestrator().mark_goal_dispatch_in_flight(&session_key);
-        }
+            // in-flight so `due_loop_targets`'s goal sweep + the
+            // `enqueue_due_goal_continuations` enqueue path both
+            // skip it until the post-turn accountant clears it. The
+            // timestamp alone isn't enough for goal turns that
+            // exceed the 30s min-delay.
+            //
+            // #1140 codex P1 re-review #4: use the RAII drop-guard
+            // shape so the marker is cleared even if the spawned
+            // turn task is aborted (e.g. `abort_connection_turns`
+            // on connection close) or returns through an early
+            // terminal path. The post-accounting block still calls
+            // `clear_goal_dispatch_in_flight` explicitly; the
+            // Drop becomes a no-op in that case (idempotent).
+            Some(default_agent_orchestrator().goal_dispatch_in_flight_guard(session_key))
+        } else {
+            None
+        };
         run_standalone_turn(
             ws_for_turn,
             state_for_turn,

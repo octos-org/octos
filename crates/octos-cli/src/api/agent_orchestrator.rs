@@ -1161,6 +1161,25 @@ impl InProcessAgentOrchestrator {
         self.state().in_flight_goal_sessions.remove(session_id);
     }
 
+    /// #1140 codex P1 re-review #4 — RAII drop-guard for the
+    /// in-flight marker. Use this from the AppUI tick path so the
+    /// marker is cleared on ANY exit path (cancellation,
+    /// early-terminal-error, panic), not just the happy
+    /// post-accounting path. The guard captures a 'static reference
+    /// to the orchestrator singleton, so it's safe to move across
+    /// await points / into spawned tasks.
+    pub(crate) fn goal_dispatch_in_flight_guard(
+        &'static self,
+        session_id: SessionKey,
+    ) -> GoalDispatchInFlightGuard {
+        self.mark_goal_dispatch_in_flight(&session_id);
+        GoalDispatchInFlightGuard {
+            orchestrator: self,
+            session_id,
+            disarmed: false,
+        }
+    }
+
     /// #1133 — the AppUI tick path no longer calls this helper.
     /// `run_standalone_turn` now folds real `tokens_consumed +
     /// elapsed` into `record_goal_turn` AFTER the agent task returns,
@@ -2150,6 +2169,44 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 }
 
+/// #1140 codex P1 re-review #4 — RAII drop-guard returned by
+/// `InProcessAgentOrchestrator::goal_dispatch_in_flight_guard`. On
+/// `Drop` it clears the in-flight marker for the captured session
+/// id, so the marker is removed even when the AppUI turn is
+/// aborted, panics, or returns through an early-terminal path
+/// before the post-accounting block runs.
+///
+/// Call `disarm()` from the post-accounting block (after the
+/// orchestrator already cleared the marker explicitly) so the
+/// drop-time clear becomes a no-op. The guard is `must_use` to
+/// discourage accidental immediate drop at the dispatch site.
+#[must_use = "GoalDispatchInFlightGuard clears the in-flight marker on drop; hold it for the duration of the goal turn"]
+pub(crate) struct GoalDispatchInFlightGuard {
+    orchestrator: &'static InProcessAgentOrchestrator,
+    session_id: SessionKey,
+    disarmed: bool,
+}
+
+impl GoalDispatchInFlightGuard {
+    /// Mark the guard as disarmed so its `Drop` does NOT clear the
+    /// in-flight marker. Use this when the post-accounting block has
+    /// already called `clear_goal_dispatch_in_flight` explicitly,
+    /// to avoid a redundant clear.
+    #[allow(dead_code)]
+    pub(crate) fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for GoalDispatchInFlightGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.orchestrator
+                .clear_goal_dispatch_in_flight(&self.session_id);
+        }
+    }
+}
+
 pub(crate) fn default_agent_orchestrator() -> &'static InProcessAgentOrchestrator {
     static ORCHESTRATOR: OnceLock<InProcessAgentOrchestrator> = OnceLock::new();
     ORCHESTRATOR.get_or_init(InProcessAgentOrchestrator::default)
@@ -2668,6 +2725,18 @@ fn enqueue_due_goal_continuations(
     now: i64,
 ) -> usize {
     if !runtime_state.is_idle_eligible() {
+        return 0;
+    }
+    // #1140 codex P2 re-review #4: also gate the goal-enqueue path
+    // on `in_flight_goal_sessions`. `due_loop_targets` already skips
+    // in-flight sessions for its goal sweep, but
+    // `drain_ready_continuations_for_session` (which calls this
+    // function) is also invoked when a session is selected by an
+    // active loop target — in that path the goal enqueue would
+    // otherwise queue a stale `GoalContinue` despite the in-flight
+    // turn. The two guards together ensure the in-flight marker is
+    // the authoritative gate on every enqueue path.
+    if state.in_flight_goal_sessions.contains(session_id) {
         return 0;
     }
     let Some(goal) = state.goals.get(session_id).cloned() else {
