@@ -11521,6 +11521,14 @@ async fn run_m9_fixture_turn(
                             runtime_detail: Some(
                                 "persisted deterministic task snapshot".to_owned(),
                             ),
+                            // #1123 / M13-B — synthetic fixture path has no
+                            // BackgroundTask projection; leave all five fields
+                            // unset so the wire shape stays bare.
+                            source: None,
+                            role: None,
+                            summary: None,
+                            artifact_count: None,
+                            runtime_policy_stamp: None,
                         }),
                     );
                     let _ = send_notification_durable(
@@ -11543,6 +11551,11 @@ async fn run_m9_fixture_turn(
                             state: UiTaskRuntimeState::Completed,
                             tool_call_id: None,
                             runtime_detail: Some("fixture complete".to_owned()),
+                            source: None,
+                            role: None,
+                            summary: None,
+                            artifact_count: None,
+                            runtime_policy_stamp: None,
                         }),
                     );
                     if m9_fixture_delay_or_interrupt(
@@ -12493,6 +12506,11 @@ async fn run_native_code_review_turn(
             state: UiTaskRuntimeState::Running,
             tool_call_id: None,
             runtime_detail: Some("launching model-backed native specialists".to_owned()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     let _ = send_notification_durable(
@@ -12637,6 +12655,11 @@ async fn run_native_code_review_turn(
                         state: UiTaskRuntimeState::Cancelled,
                         tool_call_id: None,
                         runtime_detail: Some("interrupted by client".to_owned()),
+                        source: None,
+                        role: None,
+                        summary: None,
+                        artifact_count: None,
+                        runtime_policy_stamp: None,
                     }),
                 );
                 try_emit_terminal(
@@ -12743,6 +12766,11 @@ async fn run_native_code_review_turn(
             runtime_detail: Some(format!(
                 "{completed}/{expected_results} specialists completed"
             )),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     try_emit_terminal(
@@ -13219,6 +13247,11 @@ async fn run_m15_live_subagent_fixture_turn(
             state: UiTaskRuntimeState::Running,
             tool_call_id: None,
             runtime_detail: Some("octos serve launching CLI subagents".to_owned()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     let _ = send_notification_durable(
@@ -13348,6 +13381,11 @@ async fn run_m15_live_subagent_fixture_turn(
                         state: UiTaskRuntimeState::Cancelled,
                         tool_call_id: None,
                         runtime_detail: Some("interrupted by client".to_owned()),
+                        source: None,
+                        role: None,
+                        summary: None,
+                        artifact_count: None,
+                        runtime_policy_stamp: None,
                     }),
                 );
                 return M9FixtureOutcome::Interrupted;
@@ -13437,6 +13475,11 @@ async fn run_m15_live_subagent_fixture_turn(
             state: UiTaskRuntimeState::Completed,
             tool_call_id: None,
             runtime_detail: Some(format!("{completed} live CLI subagents completed")),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     append_appui_evidence_jsonl(

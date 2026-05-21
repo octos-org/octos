@@ -4222,6 +4222,38 @@ pub struct TaskUpdatedEvent {
     pub state: TaskRuntimeState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_detail: Option<String>,
+    // ── #1123 / M13-B projection fields ─────────────────────────────
+    // #1113 wired these fields onto the `BackgroundTask` snapshot and
+    // `task/list` projection, but the live `task/updated` notification
+    // dropped them — clients subscribed to events saw a stale shape
+    // while clients calling `task/list` saw the new shape. Mirroring
+    // them here closes the gap. All five use
+    // `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+    // legacy daemons and synthetic emitters that cannot resolve the
+    // values still round-trip.
+    /// Origin of the underlying task: `"model"`, `"supervisor"`, or
+    /// `"user"`. Mirrors `BackgroundTask::source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Role label assigned at spawn (`"reviewer"`, `"implementer"`,
+    /// `"test_worker"`, `"explorer"`). Mirrors `BackgroundTask::role`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Bounded summary capsule mirroring `ChildResultSummary.summary`
+    /// for terminal children. Mirrors `BackgroundTask::summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Number of artifacts emitted so far so UX can badge tasks without
+    /// resolving `task/artifact/list`. Mirrors
+    /// `BackgroundTask::artifact_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_count: Option<u32>,
+    /// Effective runtime policy stamp captured at spawn. Stored as raw
+    /// JSON so the wire shape does not depend on the AppUI
+    /// `UiAutonomyRuntimePolicyStamp` schema. Mirrors
+    /// `BackgroundTask::runtime_policy_stamp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_policy_stamp: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5791,6 +5823,11 @@ mod tests {
             title: "spawn_only_runner".into(),
             state: TaskRuntimeState::Cancelled,
             runtime_detail: Some("user cancelled".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         })
         .into_rpc_notification()
         .expect("serialize task/updated cancelled");
@@ -7714,6 +7751,11 @@ mod tests {
             title: "spawn_only_runner".into(),
             state: TaskRuntimeState::Cancelled,
             runtime_detail: Some("user cancelled".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         });
         let rpc = event
             .clone()
@@ -7722,6 +7764,85 @@ mod tests {
         let decoded =
             UiNotification::from_rpc_notification(rpc).expect("deserialize task/updated cancelled");
         assert_eq!(decoded, event);
+    }
+
+    /// #1123 codex P2 follow-up to #1113: pin that the new M13-B
+    /// projection fields (source / role / summary / artifact_count /
+    /// runtime_policy_stamp) round-trip through serde on
+    /// `TaskUpdatedEvent` AND that absent fields stay absent on the
+    /// wire (no `null` leakage that would clobber a prior value cached
+    /// by a stale subscriber).
+    #[test]
+    fn task_updated_event_round_trips_m13b_projection_fields() {
+        // Populated path: every projection field set, all five must
+        // appear on the wire and decode back unchanged.
+        let event = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(0xBEEF)),
+            tool_call_id: Some("call-r".into()),
+            title: "review".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            source: Some("model".into()),
+            role: Some("reviewer".into()),
+            summary: Some("found 1 issue".into()),
+            artifact_count: Some(2),
+            runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+        };
+        let value = serde_json::to_value(&event).expect("serialize task/updated");
+        assert_eq!(value.get("source"), Some(&json!("model")));
+        assert_eq!(value.get("role"), Some(&json!("reviewer")));
+        assert_eq!(value.get("summary"), Some(&json!("found 1 issue")));
+        assert_eq!(value.get("artifact_count"), Some(&json!(2)));
+        assert_eq!(
+            value.get("runtime_policy_stamp"),
+            Some(&json!({ "approval_policy": "on-request" })),
+        );
+        let parsed: TaskUpdatedEvent =
+            serde_json::from_value(value).expect("deserialize task/updated");
+        assert_eq!(parsed, event);
+
+        // Absent path: no field set, no field on the wire. A legacy
+        // payload that pre-dates the fields still parses thanks to
+        // `#[serde(default)]`.
+        let bare = TaskUpdatedEvent {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(0xBEE0)),
+            tool_call_id: None,
+            title: "review".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
+        };
+        let bare_value = serde_json::to_value(&bare).expect("serialize bare task/updated");
+        assert!(bare_value.get("source").is_none(), "absent source omits");
+        assert!(bare_value.get("role").is_none(), "absent role omits");
+        assert!(bare_value.get("summary").is_none(), "absent summary omits");
+        assert!(
+            bare_value.get("artifact_count").is_none(),
+            "absent artifact_count omits",
+        );
+        assert!(
+            bare_value.get("runtime_policy_stamp").is_none(),
+            "absent runtime_policy_stamp omits",
+        );
+        let legacy_json = json!({
+            "session_id": "local:demo",
+            "task_id": TaskId(Uuid::from_u128(0xBEE0)),
+            "title": "review",
+            "state": "running",
+        });
+        let parsed_legacy: TaskUpdatedEvent =
+            serde_json::from_value(legacy_json).expect("deserialize legacy bare");
+        assert_eq!(parsed_legacy.source, None);
+        assert_eq!(parsed_legacy.role, None);
+        assert_eq!(parsed_legacy.summary, None);
+        assert_eq!(parsed_legacy.artifact_count, None);
+        assert_eq!(parsed_legacy.runtime_policy_stamp, None);
     }
 
     // ===== UPCR-2026-009 / -010 / -011 / -012 golden tests (PR G) =====
@@ -8112,6 +8233,11 @@ mod tests {
             title: "podcast_generate".into(),
             state: TaskRuntimeState::Completed,
             runtime_detail: Some("rendered output.mp3".into()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         };
         let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
         assert_eq!(
@@ -8132,6 +8258,11 @@ mod tests {
             title: "legacy".into(),
             state: TaskRuntimeState::Running,
             runtime_detail: None,
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         };
         let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");
         assert!(

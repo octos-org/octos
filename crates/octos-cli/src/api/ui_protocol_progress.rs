@@ -159,6 +159,11 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
                 title: string_field(event, &["title"]).unwrap_or_else(|| "Task".into()),
                 state: UiTaskRuntimeState::Running,
                 runtime_detail: Some("task started".into()),
+                source: string_field(event, &["source"]),
+                role: string_field(event, &["role"]),
+                summary: string_field(event, &["summary"]),
+                artifact_count: u32_field(event, &["artifact_count"]),
+                runtime_policy_stamp: event.get("runtime_policy_stamp").cloned(),
             },
         )]);
     }
@@ -218,6 +223,18 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
         title,
         state,
         runtime_detail: string_field(event, &["runtime_detail", "message", "status_message"]),
+        // #1123 codex P2 follow-up to #1113: thread the M13-B
+        // projection fields from the underlying progress JSON
+        // (produced by `background_task_to_progress_json`) onto the
+        // `task/updated` notification. Unset values stay `None`, which
+        // skip_serializing_if drops from the wire shape — so legacy
+        // emitters that don't supply the fields produce a bare
+        // payload identical to the pre-M13-B shape.
+        source: string_field(event, &["source"]),
+        role: string_field(event, &["role"]),
+        summary: string_field(event, &["summary"]),
+        artifact_count: u32_field(event, &["artifact_count"]),
+        runtime_policy_stamp: event.get("runtime_policy_stamp").cloned(),
     })])
 }
 
