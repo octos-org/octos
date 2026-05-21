@@ -951,12 +951,40 @@ impl InProcessAgentOrchestrator {
         // tripping the min-delay gate), so an active goal only ran
         // its initial continuation and never recurred.
         enqueue_due_goal_continuations(&mut state, session_id, profile_id, runtime_state, now);
-        state.continuations.drain_ready_for_session(
+        let drained = state.continuations.drain_ready_for_session(
             runtime_state,
             max_items,
             &session_id.to_string(),
             profile_id,
-        )
+        );
+        // #1150 codex P2 follow-up to #1145: `pending_continuation_is_schedulable`
+        // gates which sessions `due_loop_targets` surfaces, but the
+        // scheduler's drain pops by `(session_key, profile)` without
+        // re-applying the predicate. So a session correctly woken by
+        // a fresh active continuation could drain an older stale
+        // wrap-up first if both share the same `(session, profile)`
+        // (lower sequence pops first under FIFO tie-break). Re-apply
+        // the predicate here at the drain site and DROP unschedulable
+        // items — do NOT re-enqueue. This matches `due_loop_targets`'s
+        // silent-skip semantics for stale wrap-ups whose owning
+        // entity has been paused/cleared/replaced.
+        let mut kept = Vec::with_capacity(drained.len());
+        for item in drained {
+            if pending_continuation_is_schedulable(&state, &item) {
+                kept.push(item);
+            } else {
+                tracing::debug!(
+                    session_key = %session_id.0,
+                    profile_id = %profile_id,
+                    reason = ?item.reason,
+                    continuation_id = ?item.id,
+                    goal_id = ?item.goal_id,
+                    loop_id = ?item.loop_id,
+                    "dropping stale continuation at drain site (#1150)"
+                );
+            }
+        }
+        kept
     }
 
     pub(crate) fn due_loop_targets(
@@ -6381,6 +6409,145 @@ mod tests {
                 .iter()
                 .any(|(_, profile_id)| profile_id == "tenant-b"),
             "profile_filter must exclude other tenants' pending wrap-ups, got {targets_a:?}",
+        );
+    }
+
+    /// #1150 codex P2 follow-up to #1145: `pending_continuation_is_schedulable`
+    /// gates which sessions `due_loop_targets` surfaces, but the drain
+    /// path (`drain_ready_continuations_for_session` →
+    /// `MasterContinuationScheduler::drain_ready_for_session`) pops by
+    /// `(session_key, profile)` without re-applying the predicate. So
+    /// if the same session's queue holds both a fresh schedulable
+    /// continuation AND an older stale wrap-up whose owning goal has
+    /// been replaced, the stale wrap-up (lower sequence → higher heap
+    /// priority by FIFO tie-break) would drain first. This regression
+    /// test pins drain-site filtering: only the fresh continuation is
+    /// returned, and the stale wrap-up is dropped from the queue
+    /// rather than silently re-queued for the next tick.
+    #[test]
+    fn drain_ready_continuations_filters_stale_at_drain_site_per_1150() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "drain-filter-stale");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "fresh active goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain whatever the `set_goal` lifecycle queued so we control
+        // the queue contents below precisely.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Hand-enqueue a stale legacy wrap-up (`GoalContinue` +
+        // `wrap_up_prompt` metadata) carrying an OLD `goal_id` — the
+        // pre-#1131 persisted shape. This is the item that must be
+        // filtered out at drain time: the current `goal.goal_id`
+        // differs from `item.goal_id`, so
+        // `pending_continuation_is_schedulable` returns false.
+        let current_goal_id = orchestrator
+            .state()
+            .goals
+            .get(&session_id)
+            .expect("goal exists")
+            .goal_id
+            .clone();
+        let stale_goal_id = format!("{current_goal_id}-superseded");
+        assert_ne!(stale_goal_id, current_goal_id);
+        {
+            let mut state = orchestrator.state();
+            let stale = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(stale_goal_id.clone())
+            .with_metadata(
+                "wrap_up_prompt",
+                "STALE: summarize a goal that no longer owns this session",
+            );
+            let outcome = enqueue_and_persist_continuation(&mut state, stale);
+            assert!(
+                outcome.queued().is_some(),
+                "stale wrap-up must enqueue (fresh continuation not yet present)"
+            );
+        }
+
+        // Now hand-enqueue a FRESH `GoalContinue` carrying the CURRENT
+        // goal_id. This is what `enqueue_due_goal_continuations` would
+        // emit if the min-delay had cleared, and is the item the
+        // session was woken for. It must drain; the stale wrap-up
+        // queued before it must not.
+        {
+            let mut state = orchestrator.state();
+            let fresh = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(current_goal_id.clone())
+            .with_metadata("objective", "fresh active goal".to_owned())
+            .with_metadata("status", "active".to_owned());
+            let outcome = enqueue_and_persist_continuation(&mut state, fresh);
+            assert!(
+                outcome.queued().is_some(),
+                "fresh continuation must enqueue under a distinct dedupe key"
+            );
+        }
+
+        // Sanity: both are queued before the drain.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            2,
+            "pre-drain queue must hold both stale wrap-up and fresh continuation",
+        );
+
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Only the fresh continuation may be returned. The stale
+        // wrap-up — pointing at a superseded goal_id — must be
+        // dropped, NOT silently surfaced to the caller.
+        assert_eq!(
+            drained.len(),
+            1,
+            "drain must return only the fresh continuation, got {drained:?}",
+        );
+        let returned = &drained[0];
+        assert_eq!(returned.reason, MasterContinuationReason::GoalContinue);
+        assert_eq!(
+            returned.goal_id.as_ref().map(|id| id.as_str()),
+            Some(current_goal_id.as_str()),
+            "drain must return the fresh goal_id continuation, not the stale one",
+        );
+        assert!(
+            !returned.metadata.contains_key("wrap_up_prompt"),
+            "drain must not surface the stale wrap-up shape",
+        );
+
+        // And the stale item must be DROPPED from the queue entirely,
+        // not held back for the next tick — matching the silent-skip
+        // semantics of `due_loop_targets` / pending-sweep filtering.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "stale wrap-up must be dropped from the queue, not re-enqueued for next tick",
         );
     }
 
