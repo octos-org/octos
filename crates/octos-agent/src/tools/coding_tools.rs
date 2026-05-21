@@ -2798,6 +2798,162 @@ impl Tool for ToolSuggestTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #1149 / M14-B P2 tool: `image_generation`.
+//
+// Codex's optional image-generation surface. Octos doesn't ship a native
+// image-generation backend yet (no MoFA media skill is bundled and the
+// `octos-llm` providers — Anthropic / Gemini / OpenRouter — don't expose
+// an image-generation endpoint; OpenAI does via DALL-E but isn't wired
+// through `LlmProvider` either). Rather than leave the canonical Codex
+// name unregistered (which would surface to the model as "tool not
+// found"), we register a stub that returns a typed
+// `coding_tool_unsupported` envelope. This keeps the wire-level contract
+// complete: model-visible name advertised, structured error returned,
+// follow-up work tracked in #1149 for a real backend (OpenAI image API
+// or a bundled skill).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ImageGenerationInput {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    n: Option<u32>,
+}
+
+/// Codex-compatible `image_generation` tool.
+///
+/// Stub: always returns a structured `coding_tool_unsupported` envelope. The
+/// canonical Codex input shape (`prompt`, optional `size`, optional `n`) is
+/// accepted and validated so a future backend-bound implementation can
+/// upgrade in place without breaking the model-visible schema. See #1149
+/// for the follow-up wiring (OpenAI image API or bundled skill).
+pub struct ImageGenerationTool {
+    backend_bound: bool,
+}
+
+impl Default for ImageGenerationTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ImageGenerationTool {
+    /// Construct the stub variant. Always returns `coding_tool_unsupported`
+    /// because no native or skill backend is bound. The constructor is kept
+    /// `pub` so the `with_builtins` path and tests both reach it through one
+    /// entrypoint; a future #1149 follow-up will add `with_backend(...)` here
+    /// and flip `backend_bound`.
+    pub fn new() -> Self {
+        Self {
+            backend_bound: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ImageGenerationTool {
+    fn name(&self) -> &str {
+        "image_generation"
+    }
+
+    fn description(&self) -> &str {
+        "Generate an image from a text prompt. STUB: no native or skill backend is bound yet (#1149 follow-up); calls return a typed `coding_tool_unsupported` error envelope."
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["media", "code"]
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Free-form text prompt describing the image to generate"
+                },
+                "size": {
+                    "type": "string",
+                    "description": "Optional output size hint (e.g. `1024x1024`). Provider-specific; reserved for the backend-bound variant."
+                },
+                "n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4,
+                    "description": "Optional number of images to generate (1-4). Reserved for the backend-bound variant."
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        let input: ImageGenerationInput =
+            serde_json::from_value(args.clone()).wrap_err("invalid image_generation input")?;
+        let prompt = input
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        if prompt.is_none() {
+            return Ok(ToolResult {
+                output: "image_generation requires a non-empty `prompt`".to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "image_generation",
+                    "error_kind": "coding_tool_denied",
+                    "reason": "missing_prompt",
+                })),
+                ..Default::default()
+            });
+        }
+        // `backend_bound` is reserved for the #1149 follow-up. Until a real
+        // backend is wired, every call returns the typed unsupported
+        // envelope; we keep the field on the struct so the future upgrade
+        // is a behaviour change, not an API break.
+        if self.backend_bound {
+            // Unreachable until #1149 follow-up; the stub constructor
+            // always sets `backend_bound = false`.
+            return Ok(ToolResult {
+                output: "image_generation: backend bound but no implementation available"
+                    .to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "image_generation",
+                    "error_kind": "coding_tool_missing",
+                })),
+                ..Default::default()
+            });
+        }
+        let prompt = prompt.unwrap_or("");
+        Ok(ToolResult {
+            output: json!({
+                "error": "image_generation has no native or skill backend bound on this profile",
+                "follow_up": "https://github.com/octos-org/octos/issues/1149",
+                "prompt": prompt,
+            })
+            .to_string(),
+            success: false,
+            structured_metadata: Some(json!({
+                "codex_tool": "image_generation",
+                "error_kind": "coding_tool_unsupported",
+                "reason": "no_backend_bound",
+                "follow_up_issue": "https://github.com/octos-org/octos/issues/1149",
+                "accepted_input": {
+                    "prompt": prompt,
+                    "size": input.size,
+                    "n": input.n,
+                },
+            })),
+            ..Default::default()
+        })
+    }
+}
+
 /// Tokenise a query into lowercase words, dropping anything shorter than two
 /// characters. Used by both `tool_search` (fallback when no exact substring
 /// match exists) and `tool_suggest`.
@@ -4079,5 +4235,104 @@ mod tests {
             "child process must be killed on timeout — sentinel file at {} should NOT exist",
             sentinel.display(),
         );
+    }
+
+    // #1149 / M14-B P2 tests — `image_generation` stub.
+    // -----------------------------------------------------------------------
+
+    /// The stub MUST surface `image_generation` as model-visible so
+    /// the canonical Codex tool surface is wire-complete.
+    #[tokio::test]
+    async fn builtins_expose_image_generation_tool_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let names: std::collections::HashSet<_> =
+            registry.specs().into_iter().map(|spec| spec.name).collect();
+        assert!(
+            names.contains("image_generation"),
+            "image_generation must be model-visible: {names:?}"
+        );
+    }
+
+    /// Happy stub path: a valid prompt returns a structured
+    /// `coding_tool_unsupported` envelope (no backend bound). The
+    /// model must NOT receive a generic "tool not found" — instead it
+    /// gets a typed error it can react to (UPCR-2026-020 §8).
+    #[tokio::test]
+    async fn image_generation_returns_typed_unsupported_envelope() {
+        let tool = ImageGenerationTool::new();
+        let result = tool
+            .execute(&json!({
+                "prompt": "a snowy cabin at dusk, watercolour",
+                "size": "1024x1024",
+                "n": 1
+            }))
+            .await
+            .expect("image_generation runs");
+        assert!(
+            !result.success,
+            "stub must not claim success while no backend is bound"
+        );
+        let meta = result.structured_metadata.expect("structured metadata");
+        assert_eq!(meta["codex_tool"], json!("image_generation"));
+        assert_eq!(meta["error_kind"], json!("coding_tool_unsupported"));
+        assert_eq!(meta["reason"], json!("no_backend_bound"));
+        // The accepted input is echoed so AppUI clients can render
+        // "tool was called with X" UX while waiting for the follow-up.
+        assert_eq!(
+            meta["accepted_input"]["prompt"],
+            json!("a snowy cabin at dusk, watercolour")
+        );
+        assert_eq!(meta["accepted_input"]["size"], json!("1024x1024"));
+        assert_eq!(meta["accepted_input"]["n"], json!(1));
+    }
+
+    /// Error path: a missing / blank prompt returns
+    /// `coding_tool_denied` (input validation), not
+    /// `coding_tool_unsupported` (backend missing). Distinguishing
+    /// these is important so AppUI clients render the right UX.
+    #[tokio::test]
+    async fn image_generation_rejects_missing_prompt() {
+        let tool = ImageGenerationTool::new();
+        let result = tool
+            .execute(&json!({}))
+            .await
+            .expect("image_generation runs");
+        assert!(!result.success);
+        let meta = result.structured_metadata.expect("structured metadata");
+        assert_eq!(meta["error_kind"], json!("coding_tool_denied"));
+        assert_eq!(meta["reason"], json!("missing_prompt"));
+    }
+
+    /// The stub's spec / schema must accept the canonical Codex
+    /// input shape (`prompt` required, `size` + `n` optional) so a
+    /// future backend swap-in is wire-compatible.
+    #[test]
+    fn image_generation_schema_pins_canonical_input_shape() {
+        let tool = ImageGenerationTool::new();
+        assert_eq!(tool.name(), "image_generation");
+        let schema = tool.input_schema();
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["required"], json!(["prompt"]));
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(props.contains_key("prompt"));
+        assert!(props.contains_key("size"));
+        assert!(props.contains_key("n"));
+    }
+
+    /// Blank-string prompt still triggers the missing-prompt
+    /// validation path (trimmed). Pinned so a future refactor of
+    /// the trim/empty filter doesn't quietly drop the check.
+    #[tokio::test]
+    async fn image_generation_rejects_whitespace_only_prompt() {
+        let tool = ImageGenerationTool::new();
+        let result = tool
+            .execute(&json!({ "prompt": "   \n\t  " }))
+            .await
+            .expect("image_generation runs");
+        assert!(!result.success);
+        let meta = result.structured_metadata.expect("structured metadata");
+        assert_eq!(meta["error_kind"], json!("coding_tool_denied"));
+        assert_eq!(meta["reason"], json!("missing_prompt"));
     }
 }
