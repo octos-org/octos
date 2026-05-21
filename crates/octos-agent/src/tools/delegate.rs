@@ -634,9 +634,19 @@ impl Tool for DelegateTool {
             worker = worker.with_system_prompt(prompt.clone());
         }
         if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
+            // #1126 codex P1: pass `None` so the factory derives a
+            // unique child session key per delegated worker (e.g.
+            // `parent#spawn-<worker>` in the session_actor factory).
+            // Previously this forwarded `self.session_key.clone()`
+            // (the PARENT key), which the factory honours verbatim —
+            // every delegated child then persisted its forked context
+            // back onto the parent's `context_ledgers/<session>.json`,
+            // letting resume/audit observe a child's truncated fork
+            // in place of the parent transcript. Mirrors the SpawnTool
+            // path which already passes `None` (see spawn.rs).
             if let Some(manager) = factory(ChildPromptContextRequest {
                 parent_session_key: self.session_key.clone(),
-                child_session_key: self.session_key.clone(),
+                child_session_key: None,
                 task_id: Some(child_task_id.clone()),
                 worker_id: worker_id_for_context,
                 task_label: label.clone(),
