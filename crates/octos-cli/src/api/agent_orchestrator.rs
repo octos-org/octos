@@ -1869,6 +1869,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
             expires_at_ms: now + LOOP_MAX_AGE_DAYS * 24 * 60 * 60 * 1_000,
             created_at_ms: now,
             updated_at_ms: now,
+            // #1130 — fresh loop has zero fires consumed.
+            fires_used: 0,
         };
         state
             .loops
@@ -2029,7 +2031,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                         .and_then(|delay_ms| now.checked_add(delay_ms))
                 });
                 loop_record.updated_at_ms = now;
-                let loop_json = autonomy_loop_json(loop_record);
+                // Persist the schedule-side timestamp updates regardless
+                // of enqueue outcome (we still attempted a fire).
                 persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
 
                 let continuation = MasterContinuationRequest::new(
@@ -2042,10 +2045,31 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 .with_loop_id(loop_id.clone())
                 .with_metadata("prompt", resolved_prompt)
                 .with_metadata("prompt_source", prompt_source_label);
-                let fire = master_continuation_enqueue_json(enqueue_and_persist_continuation(
-                    &mut state,
-                    continuation,
-                ));
+                let outcome = enqueue_and_persist_continuation(&mut state, continuation);
+                // #1138 codex P2 follow-up to #1130: only count the
+                // fire toward the persisted `fires_used` budget when a
+                // NEW continuation was actually queued. `Duplicate`
+                // outcomes mean the prior continuation is still
+                // pending — a retry/spam should NOT burn the safety
+                // budget, otherwise users can exhaust a loop early by
+                // repeatedly clicking `fire_now` while a fire is in
+                // flight. `saturating_add` defends against a corrupt
+                // snapshot restore.
+                let newly_queued = matches!(outcome, MasterContinuationEnqueueOutcome::Queued(_));
+                if newly_queued {
+                    let loop_record = state
+                        .loops
+                        .get_mut(&loop_id)
+                        .expect("loop record still present");
+                    loop_record.fires_used = loop_record.fires_used.saturating_add(1);
+                    persist_loop_state_with_store(supervisor_store.as_ref(), loop_record);
+                }
+                let loop_json = state
+                    .loops
+                    .get(&loop_id)
+                    .map(autonomy_loop_json)
+                    .unwrap_or(Value::Null);
+                let fire = master_continuation_enqueue_json(outcome);
 
                 Ok(json!({
                     "session_id": session_id,
@@ -2163,6 +2187,14 @@ struct AutonomyLoopRecord {
     expires_at_ms: i64,
     created_at_ms: i64,
     updated_at_ms: i64,
+    /// #1130 — number of fires this loop has consumed against
+    /// `LOOP_DEFAULT_MAX_FIRES`. Persisted to the supervisor store so the
+    /// runtime budget gate is enforced across daemon restarts and across
+    /// repeated `fire_now` invocations (`loop_runtime_view` was previously
+    /// rebuilding the runtime with a zeroed `fires_used` counter, so the
+    /// max-fires safety cap never tripped). Defaults to 0 for legacy
+    /// snapshots that pre-date this field.
+    fires_used: u32,
 }
 
 struct ParsedLoopCreate {
@@ -2309,6 +2341,7 @@ fn enqueue_due_loop_continuations(
             .prompt_source
             .map(maintenance_prompt_source_label)
             .unwrap_or("record");
+        let loop_id_for_increment = fire.loop_id.clone();
         let continuation = MasterContinuationRequest::new(
             "coding-autonomy",
             fire.session_id.to_string(),
@@ -2320,10 +2353,24 @@ fn enqueue_due_loop_continuations(
         .with_metadata("prompt", fire.prompt)
         .with_metadata("prompt_source", prompt_source_label)
         .with_metadata("scheduled_for_ms", fire.scheduled_for_ms.to_string());
-        if enqueue_and_persist_continuation(state, continuation)
-            .queued()
-            .is_some()
-        {
+        let outcome = enqueue_and_persist_continuation(state, continuation);
+        // #1138 codex P2 follow-up to #1130: only count the scheduled
+        // fire toward the persisted `fires_used` budget when a NEW
+        // continuation was actually queued. `Duplicate` outcomes (the
+        // prior continuation is still pending) must not burn the
+        // safety budget, otherwise a sticky pending fire could
+        // exhaust the loop's MAX_FIRES with no real LLM executions.
+        if outcome.queued().is_some() {
+            let snapshot = state
+                .loops
+                .get_mut(&loop_id_for_increment)
+                .map(|loop_record| {
+                    loop_record.fires_used = loop_record.fires_used.saturating_add(1);
+                    loop_record.clone()
+                });
+            if let Some(snapshot) = snapshot {
+                persist_loop_state(state, &snapshot);
+            }
             queued += 1;
         }
     }
@@ -3273,6 +3320,14 @@ fn restore_loop_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             .unwrap_or(group.created_at_ms.try_into().unwrap_or(i64::MAX)),
         updated_at_ms: supervisor_metadata_i64(&group.metadata, "updated_at_ms")
             .unwrap_or(group.updated_at_ms.try_into().unwrap_or(i64::MAX)),
+        // #1130 — replay the persisted `fires_used` counter so the
+        // `LoopRuntime` budget gate sees the real consumed-fires value
+        // (not a fresh zero) after a daemon restart. Legacy snapshots
+        // that pre-date #1130 lack this key — `unwrap_or(0)` keeps them
+        // working without forcing a manual migration.
+        fires_used: supervisor_metadata_u64(&group.metadata, "fires_used")
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
     };
     state.next_loop_seq = state
         .next_loop_seq
@@ -3567,6 +3622,14 @@ fn persist_loop_state_with_store(
     group
         .metadata
         .insert("updated_at_ms".into(), json!(loop_record.updated_at_ms));
+    // #1130 — persist the cumulative fires counter alongside the other
+    // runtime accountants (`next_run_at_ms`, `last_run_at_ms`, …). Without
+    // this every restart resets `fires_used` to zero and the
+    // `LOOP_DEFAULT_MAX_FIRES` safety cap silently becomes unenforceable
+    // for any loop that out-lives the daemon process.
+    group
+        .metadata
+        .insert("fires_used".into(), json!(loop_record.fires_used as u64));
     let event_id = format!(
         "autonomy_loop_state:{}:{}",
         group.group_id,
@@ -4360,7 +4423,14 @@ fn loop_runtime_view(record: &AutonomyLoopRecord) -> LoopRuntime {
         "maintenance" => LoopRuntimePolicy::maintenance(LOOP_DEFAULT_MAX_FIRES),
         _ => LoopRuntimePolicy::self_paced(LOOP_DEFAULT_MAX_FIRES),
     };
-    let mut runtime = LoopRuntime::new(record.loop_id.clone(), invocation, policy);
+    // #1130 — seed the runtime with the persisted `fires_used` counter.
+    // Previously `LoopRuntime::new` zeroed this field on every decision
+    // call, so the `LOOP_DEFAULT_MAX_FIRES` safety cap could never trip
+    // for a loop that survived past a single decision (every `fire_now`,
+    // every scheduled tick, every restart). The wire-through makes
+    // `decide_fire` budget-aware across the entire loop lifetime.
+    let mut runtime = LoopRuntime::new(record.loop_id.clone(), invocation, policy)
+        .with_fires_used(record.fires_used);
     match record.status.as_str() {
         "paused" => runtime.pause(),
         "deleted" => runtime.delete(),
@@ -6944,6 +7014,89 @@ mod tests {
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
             1
         );
+    }
+
+    /// #1130 — pin the persisted-`fires_used` enforcement.
+    ///
+    /// Before #1130, `loop_runtime_view` rebuilt a fresh `LoopRuntime`
+    /// on every decision call and `fires_used` never round-tripped
+    /// through the loop record, so the runtime's `LOOP_DEFAULT_MAX_FIRES`
+    /// budget gate could never trip — any loop that burned through the
+    /// budget kept firing forever. This test directly stages a loop at
+    /// `LOOP_DEFAULT_MAX_FIRES - 1` consumed fires, fires it once (must
+    /// succeed, bumps the counter to exactly the cap), then attempts a
+    /// second fire which the runtime must deny with
+    /// `LoopFireDecision::Exhausted` → `LOOP_POLICY_DENIED` on the wire.
+    #[test]
+    fn loop_fires_used_persists_and_caps_at_max() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "loop-fires-cap");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("periodic check".into()),
+                command: None,
+                interval_seconds: Some(60),
+                mode: Some("fixed_interval".into()),
+            })
+            .expect("create loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Stage the loop one fire shy of the cap. The next fire must
+        // succeed (consumes the last unit of budget); the one after must
+        // be rejected with the runtime's exhausted-budget denial.
+        {
+            let mut state = orchestrator.state();
+            let loop_record = state
+                .loops
+                .get_mut(&loop_id)
+                .expect("loop record present after create");
+            loop_record.fires_used = LOOP_DEFAULT_MAX_FIRES - 1;
+        }
+
+        let fired = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id: loop_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect("final fire under the cap must succeed");
+        assert_eq!(fired["status"], json!("queued"));
+        // After firing, the persisted counter must sit at exactly the
+        // cap — `loop_runtime_view` will read this back on the next
+        // decision call.
+        assert_eq!(
+            orchestrator
+                .state()
+                .loops
+                .get(&loop_id)
+                .expect("loop record post-fire")
+                .fires_used,
+            LOOP_DEFAULT_MAX_FIRES,
+            "fires_used must be incremented and persisted on successful fire",
+        );
+
+        // The follow-up fire crosses the cap. `decide_fire` must return
+        // `LoopFireDecision::Exhausted` → wire-level
+        // `kinds::LOOP_POLICY_DENIED` with the runtime's
+        // `exhausted budget` reason carried in the data payload.
+        let denied = orchestrator
+            .control_loop(LoopControlRequest {
+                loop_id,
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                kind: LoopControlKind::FireNow,
+            })
+            .expect_err("fires_used at cap must deny further fires");
+        let data = denied.data.expect("error data");
+        assert_eq!(data["kind"], json!(kinds::LOOP_POLICY_DENIED));
+        let runtime_reason = data
+            .get("runtime_reason")
+            .and_then(Value::as_str)
+            .expect("loop runtime denial must carry runtime_reason");
+        assert_eq!(runtime_reason, "exhausted budget");
     }
 
     #[test]

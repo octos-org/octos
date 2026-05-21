@@ -788,6 +788,22 @@ impl LoopRuntime {
         }
     }
 
+    /// #1130 — seed the runtime view with a previously persisted
+    /// `fires_used` counter. `loop_runtime_view` (the
+    /// `AutonomyLoopRecord` → `LoopRuntime` adapter in
+    /// `agent_orchestrator.rs`) was rebuilding a fresh runtime on every
+    /// decision call, so `decide_fire` always saw `fires_used == 0` and
+    /// the `LOOP_DEFAULT_MAX_FIRES` budget never tripped — any loop that
+    /// out-lived its budget through repeated `fire_now` calls or a
+    /// long-running fixed schedule kept firing forever. This setter is
+    /// the production wire-through: callers pass the
+    /// `AutonomyLoopRecord.fires_used` they read from the supervisor
+    /// store, and the runtime's budget gate then sees the real count.
+    pub fn with_fires_used(mut self, fires: u32) -> Self {
+        self.fires_used = fires;
+        self
+    }
+
     pub fn decide(&self, now: SystemTime) -> LoopPolicyDecision {
         match self.state {
             LoopRuntimeState::Deleted => return LoopPolicyDecision::Denied(DenyReason::Deleted),
