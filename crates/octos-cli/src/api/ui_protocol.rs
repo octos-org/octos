@@ -14655,16 +14655,25 @@ async fn run_standalone_turn(
 
         match result {
             Ok(response) => {
-                // #1134 — emit the final EndTurn payload BEFORE persisting
-                // anything to the session manager. The post-turn
-                // self-paced reschedule block awaits this oneshot and
-                // uses it directly instead of `history.last()`, so
-                // background assistant rows (spawn_only / send_file
-                // companion writes) that land below the LLM reply
-                // cannot mask the model's `<<loop-next-in: ...>>`
-                // hint. We clone the string so the in-spawn `done`
-                // event below can still emit `response.content`.
-                let _ = final_reply_tx.send(Some(response.content.clone()));
+                // #1134 — capture the LLM reply for the post-turn
+                // self-paced reschedule block. The receiver of this
+                // oneshot uses the captured content instead of
+                // `history.last()`, so background assistant rows
+                // (spawn_only / send_file companion writes) that
+                // land below the LLM reply cannot mask the model's
+                // `<<loop-next-in: ...>>` hint. We CLONE the string
+                // so the in-spawn `done` event below can still emit
+                // `response.content`.
+                //
+                // #1158 codex P2 follow-up: send the captured reply
+                // ONLY AFTER persistence has committed. If the spawn
+                // task is interrupted (or panics) between
+                // `process_message` returning and persistence
+                // completing, an early send would let the post-turn
+                // block call `apply_self_paced_response` from a
+                // reply that never made it into session history.
+                // Defer the send until below the persist block.
+                let captured_final_reply = response.content.clone();
                 let mut cursor = None;
                 {
                     let mut sessions = sessions.lock().await;
@@ -14703,6 +14712,9 @@ async fn run_standalone_turn(
                         }
                     }
                 }
+                // Persistence committed — now safe to release the
+                // captured reply to the post-turn reschedule block.
+                let _ = final_reply_tx.send(Some(captured_final_reply));
                 let done = json!({
                     "type": "done",
                     "content": response.content,
