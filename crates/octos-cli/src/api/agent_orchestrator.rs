@@ -1029,6 +1029,31 @@ impl InProcessAgentOrchestrator {
                 }
             }
         }
+        // #1141 — sweep the master continuation queue itself so any
+        // session with a pending continuation (e.g. the wrap-up turn
+        // enqueued by `record_goal_turn` when token_budget is
+        // exhausted) gets a scheduler visit even if its owning goal
+        // is no longer `active` (e.g. `budget_limited`) and it has no
+        // active loop. Without this sweep the wrap-up remains queued
+        // indefinitely for goal-only AppUI sessions because the
+        // loop+goal scans above gate on active status.
+        if targets.len() < max_items {
+            for (session_id_str, profile_id_str) in state.continuations.pending_sessions() {
+                if profile_filter.is_some_and(|profile_id| profile_id_str != profile_id) {
+                    continue;
+                }
+                let target = (
+                    SessionKey(session_id_str.to_owned()),
+                    profile_id_str.to_owned(),
+                );
+                if !targets.contains(&target) {
+                    targets.push(target);
+                    if targets.len() >= max_items {
+                        break;
+                    }
+                }
+            }
+        }
         targets
     }
 
@@ -5912,6 +5937,117 @@ mod tests {
         // emit a duplicate wrap-up.
         orchestrator.record_goal_turn(&session_id, "tenant-a", 100, 1);
         assert_eq!(orchestrator.pending_continuation_count_for_test(), 0);
+    }
+
+    /// #1141 — when an AppUI goal turn exhausts `token_budget`,
+    /// `record_goal_turn` transitions the goal to `budget_limited` and
+    /// enqueues a one-shot wrap-up continuation. For a goal-only AppUI
+    /// session (no loop) the only way the scheduler can drain that
+    /// wrap-up is for `due_loop_targets` to surface the session — but
+    /// the active-goal scan gates on `status == "active"`, which
+    /// `budget_limited` is not. The Option B fix sweeps the master
+    /// continuation queue itself so any session with a pending
+    /// continuation still gets a scheduler visit.
+    #[test]
+    fn due_loop_targets_includes_pending_wrap_up_for_budget_limited_goal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "goal-budget-wrapup");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "exhaust then expect wrap-up scheduling".into(),
+                status: Some("active".into()),
+                token_budget: Some(1_000),
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain whatever the `set_goal` lifecycle queued so the only
+        // pending continuation after exhaustion below is the wrap-up.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Force tokens_used near the budget and record a turn that
+        // exhausts it — this transitions the goal to `budget_limited`
+        // AND enqueues the wrap-up continuation.
+        orchestrator.force_goal_tokens_used_for_test(&session_id, 900);
+        orchestrator.record_goal_turn(&session_id, "tenant-a", 200, 5);
+        assert_eq!(
+            orchestrator.goal_status_for_test(&session_id).as_deref(),
+            Some("budget_limited"),
+            "post-exhaustion goal must be `budget_limited`, not `active`",
+        );
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_test(),
+            1,
+            "exhausting the budget must enqueue exactly one wrap-up continuation",
+        );
+
+        // Pre-fix this returned an empty vec: the goal-status gate
+        // excludes `budget_limited` and there is no loop for this
+        // session, so the wrap-up would have sat pending indefinitely.
+        let targets = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(
+            targets.contains(&(session_id.clone(), "tenant-a".to_owned())),
+            "due_loop_targets must surface a session with a pending wrap-up \
+             continuation even when its goal is `budget_limited`, got {targets:?}",
+        );
+
+        // And the drain path for that session must actually return the
+        // wrap-up — i.e. the scheduler visit translates into useful
+        // work (not a no-op pickup).
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].reason, MasterContinuationReason::GoalWrapUp);
+    }
+
+    /// #1141 — `due_loop_targets` must respect `profile_filter` when
+    /// sweeping the master continuation queue: a pending continuation
+    /// for profile B must not surface under a query scoped to
+    /// profile A.
+    #[test]
+    fn due_loop_targets_pending_sweep_respects_profile_filter() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_a = SessionKey::with_profile("tenant-a", "api", "goal-a");
+        let session_b = SessionKey::with_profile("tenant-b", "api", "goal-b");
+        for (session, tenant) in [(&session_a, "tenant-a"), (&session_b, "tenant-b")] {
+            orchestrator
+                .set_goal(GoalSetRequest {
+                    session_id: session.clone(),
+                    profile_id: tenant.into(),
+                    objective: "wrap-up profile gating".into(),
+                    status: Some("active".into()),
+                    token_budget: Some(1_000),
+                    transition_actor: None,
+                })
+                .expect("set active goal");
+            let _ = orchestrator.drain_ready_continuations_for_session(
+                session,
+                tenant,
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX,
+            );
+            orchestrator.force_goal_tokens_used_for_test(session, 900);
+            orchestrator.record_goal_turn(session, tenant, 200, 5);
+        }
+
+        let targets_a = orchestrator.due_loop_targets(Some("tenant-a"), 8);
+        assert!(targets_a.contains(&(session_a.clone(), "tenant-a".to_owned())));
+        assert!(
+            !targets_a
+                .iter()
+                .any(|(_, profile_id)| profile_id == "tenant-b"),
+            "profile_filter must exclude other tenants' pending wrap-ups, got {targets_a:?}",
+        );
     }
 
     /// #1131 — when the budget-exhaustion wrap-up turn is dispatched,
