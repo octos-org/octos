@@ -14733,16 +14733,31 @@ async fn run_standalone_turn(
                         }
                     }
                 }
-                // Release the captured reply ONLY when the assistant
-                // row that holds `response.content` is in session
-                // history. On persist failure, send `None` so the
-                // post-turn block falls back to the history scan and
-                // matches the pre-#1134 aborted-turn behaviour.
-                if final_assistant_persisted {
-                    let _ = final_reply_tx.send(Some(captured_final_reply));
+                // #1158 codex P2 rev3 follow-up: distinguish two
+                // shapes of "empty captured reply":
+                //
+                //   * `response.content.is_empty()` — the model
+                //     explicitly EndTurn'd with no text. The picker
+                //     contract treats `Some("")` as an authoritative
+                //     blank signal and suppresses the history
+                //     fallback. We must NOT downgrade to `None`
+                //     here, otherwise an earlier non-empty assistant
+                //     row that landed in history would be picked up
+                //     as the loop's "last reply" and reschedule from
+                //     stale content.
+                //
+                //   * `response.content` non-empty BUT the
+                //     assistant-row persist failed — the captured
+                //     reply was never committed to history, so we
+                //     send `None` and let the post-turn block fall
+                //     back to the history scan (matches pre-#1134
+                //     aborted-turn behaviour).
+                let final_send = if response.content.is_empty() || final_assistant_persisted {
+                    Some(captured_final_reply)
                 } else {
-                    let _ = final_reply_tx.send(None);
-                }
+                    None
+                };
+                let _ = final_reply_tx.send(final_send);
                 let done = json!({
                     "type": "done",
                     "content": response.content,
