@@ -13705,6 +13705,54 @@ struct GoalContinuationContext {
     profile_id: String,
 }
 
+/// #1134 — pick the LAST non-empty assistant row after `pre` from a
+/// pre-fetched session history slice.
+///
+/// Walks from the back and skips empty-content rows (assistant
+/// tool-call stubs persisted before the model's final text reply).
+/// Pulled out as a free function so the acceptance test can simulate
+/// the spawn_only / send_file ordering directly without standing up
+/// `run_standalone_turn`.
+fn appui_history_last_non_empty_assistant_after(history: &[Message], pre: usize) -> Option<String> {
+    history
+        .iter()
+        .filter(|message| matches!(message.role, MessageRole::Assistant))
+        .enumerate()
+        .filter(|(idx, _)| *idx >= pre)
+        .filter(|(_, message)| !message.content.is_empty())
+        .last()
+        .map(|(_, message)| message.content.clone())
+}
+
+/// #1134 — pick the assistant text that should be fed to
+/// `apply_self_paced_response`.
+///
+/// Prefers `captured_response_content` (the agent_task's EndTurn
+/// payload — the source of truth for `<<loop-next-in: ...>>`). Empty
+/// content is treated as "no reply" so a blank EndTurn does not
+/// stamp a default-delay reschedule and matches the non-empty filter
+/// the session-history fallback applies.
+///
+/// Falls back to `history_fallback` (typically
+/// [`appui_history_last_non_empty_assistant_after`]) only when the
+/// captured content is `None` — i.e. the oneshot didn't fire
+/// (interrupt / agent error / panic). The pre-#1134 shape used
+/// `history_fallback` unconditionally, which is wrong when a
+/// spawn_only / send_file path persists a background assistant row
+/// AFTER the model's final reply: `.last()` selects the background
+/// row and the LLM's reschedule hint never reaches the loop
+/// scheduler.
+fn appui_loop_assistant_reply_for_self_paced(
+    captured_response_content: Option<&str>,
+    history_fallback: Option<String>,
+) -> Option<String> {
+    match captured_response_content {
+        Some(content) if !content.is_empty() => Some(content.to_owned()),
+        Some(_) => None,
+        None => history_fallback,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -14615,6 +14663,19 @@ async fn run_standalone_turn(
     // clone alive in this outer scope for the post-turn self-paced
     // reschedule read below.
     let sessions_for_reschedule = sessions.clone();
+    // #1134 — capture the turn's final `response.content` (the agent's
+    // actual EndTurn payload) directly out of `agent_task` so the
+    // post-turn self-paced reschedule block can parse the
+    // `<<loop-next-in: ...>>` hint from the LLM reply without scanning
+    // the session history. The session-history walk picks the LAST
+    // assistant-row, which is wrong when a spawn_only / send_file path
+    // persists a background assistant message AFTER the model's final
+    // reply: `.last()` selects the background row (often with no
+    // hint) and `apply_self_paced_response` falls back to the default
+    // delay. A oneshot is the right shape because the spawn emits at
+    // most one final response and we only need it once in the post-turn
+    // block.
+    let (final_reply_tx, final_reply_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         let result = octos_llm::with_router_context(
@@ -14637,7 +14698,36 @@ async fn run_standalone_turn(
 
         match result {
             Ok(response) => {
+                // #1134 — capture the LLM reply for the post-turn
+                // self-paced reschedule block. The receiver of this
+                // oneshot uses the captured content instead of
+                // `history.last()`, so background assistant rows
+                // (spawn_only / send_file companion writes) that
+                // land below the LLM reply cannot mask the model's
+                // `<<loop-next-in: ...>>` hint. We CLONE the string
+                // so the in-spawn `done` event below can still emit
+                // `response.content`.
+                //
+                // #1158 codex P2 follow-up: send the captured reply
+                // ONLY AFTER persistence has committed. If the spawn
+                // task is interrupted (or panics) between
+                // `process_message` returning and persistence
+                // completing, an early send would let the post-turn
+                // block call `apply_self_paced_response` from a
+                // reply that never made it into session history.
+                // Defer the send until below the persist block.
+                let captured_final_reply = response.content.clone();
                 let mut cursor = None;
+                // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
+                // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
+                // error). Track whether the assistant row carrying
+                // `response.content` actually persisted. If not, the
+                // captured reply must NOT be released to the post-turn
+                // reschedule block — that would let it call
+                // `apply_self_paced_response` from a reply that never
+                // hit session history, which is the exact failure mode
+                // this fix is meant to prevent.
+                let mut final_assistant_persisted = false;
                 {
                     let mut sessions = sessions.lock().await;
                     let final_assistant = final_assistant_message(
@@ -14654,6 +14744,14 @@ async fn run_standalone_turn(
                             skipped_internal_user = true;
                             continue;
                         }
+                        // Detect the exact row that carries
+                        // `response.content` BEFORE pre-stamp /
+                        // persist, so we can flip
+                        // `final_assistant_persisted` only on its
+                        // Ok branch.
+                        let is_final_assistant_carrier = message.role == MessageRole::Assistant
+                            && message.content == response.content
+                            && !response.content.is_empty();
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();
@@ -14672,9 +14770,37 @@ async fn run_standalone_turn(
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
                             });
+                            if is_final_assistant_carrier {
+                                final_assistant_persisted = true;
+                            }
                         }
                     }
                 }
+                // #1158 codex P2 rev3 follow-up: distinguish two
+                // shapes of "empty captured reply":
+                //
+                //   * `response.content.is_empty()` — the model
+                //     explicitly EndTurn'd with no text. The picker
+                //     contract treats `Some("")` as an authoritative
+                //     blank signal and suppresses the history
+                //     fallback. We must NOT downgrade to `None`
+                //     here, otherwise an earlier non-empty assistant
+                //     row that landed in history would be picked up
+                //     as the loop's "last reply" and reschedule from
+                //     stale content.
+                //
+                //   * `response.content` non-empty BUT the
+                //     assistant-row persist failed — the captured
+                //     reply was never committed to history, so we
+                //     send `None` and let the post-turn block fall
+                //     back to the history scan (matches pre-#1134
+                //     aborted-turn behaviour).
+                let final_send = if response.content.is_empty() || final_assistant_persisted {
+                    Some(captured_final_reply)
+                } else {
+                    None
+                };
+                let _ = final_reply_tx.send(final_send);
                 let done = json!({
                     "type": "done",
                     "content": response.content,
@@ -14686,6 +14812,11 @@ async fn run_standalone_turn(
                 let _ = progress_tx_for_result.send(done.to_string()).await;
             }
             Err(error) => {
+                // #1134 — signal the post-turn block that no LLM reply
+                // is available on the error path. The receiver falls
+                // back to the session-history scan, matching the
+                // pre-#1134 behaviour.
+                let _ = final_reply_tx.send(None);
                 let error = json!({
                     "type": "error",
                     "message": error.to_string(),
@@ -14941,36 +15072,58 @@ async fn run_standalone_turn(
         });
     }
 
+    // #1134 — await the agent_task's oneshot for the turn's final
+    // `response.content`. The receiver resolves to:
+    //   * `Ok(Some(content))` — the agent reached EndTurn and sent the
+    //     model's actual reply BEFORE persisting any background
+    //     assistant rows. The self-paced reschedule below parses
+    //     `<<loop-next-in: ...>>` directly off this string.
+    //   * `Ok(None)`  — the agent task returned an error.
+    //   * `Err(_)`    — the sender dropped (interrupt path or task
+    //     panic). The session-history fallback below is the correct
+    //     conservative behaviour.
+    //
+    // `agent_task.await` has already returned above, so the sender
+    // half is guaranteed to be either delivered or dropped — this
+    // `await` will not block.
+    let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
+
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
     // AFTER the model reply has been persisted to the per-session
     // session manager. This is the AppUI parity for what
     // `SessionActor::drain_master_continuations` does for the chat
-    // path. Reading from `sessions` (= `session_runtime.sessions`)
-    // ensures we observe the assistant message that `run_standalone_turn`
-    // just persisted, NOT a stale `state.sessions` view that never
-    // gets written to in production.
+    // path.
+    //
+    // #1134 — prefer the captured `response.content` from the
+    // agent_task spawn. The session-history scan it replaces picks
+    // `.last()` of all non-empty assistant rows after `pre`; when a
+    // spawn_only / send_file path persists a background row AFTER
+    // the model's final reply, `.last()` selects the background row
+    // and `apply_self_paced_response` falls back to the default
+    // delay. The captured content is the actual EndTurn payload, so
+    // the `<<loop-next-in: ...>>` hint always wins. Fall back to the
+    // session-history scan ONLY if the oneshot didn't fire (interrupt
+    // / agent error path).
     if let (Some(loop_id), Some(pre)) = (
         loop_id_for_self_paced.as_ref(),
         pre_assistant_count_for_post_turn,
     ) {
-        let assistant_reply: Option<String> = {
+        // Only walk the session history when the oneshot didn't fire
+        // — the common path (agent reached EndTurn) reads
+        // `final_response_content` directly and avoids the lock
+        // altogether.
+        let history_fallback: Option<String> = if final_response_content.is_some() {
+            None
+        } else {
             let mut guard = sessions_for_reschedule.lock().await;
             let session = guard.get_or_create(&session_id).await;
             let history = session.get_history(usize::MAX);
-            // Walk from the back: pick the LAST assistant message
-            // emitted after the pre-count with non-empty content. For
-            // tool-using loop turns, `process_inbound` persists
-            // assistant tool-call stubs before the final text reply
-            // — those have empty content and must be skipped.
-            history
-                .iter()
-                .filter(|message| matches!(message.role, MessageRole::Assistant))
-                .enumerate()
-                .filter(|(idx, _)| *idx >= pre)
-                .filter(|(_, message)| !message.content.is_empty())
-                .last()
-                .map(|(_, message)| message.content.clone())
+            appui_history_last_non_empty_assistant_after(history, pre)
         };
+        let assistant_reply = appui_loop_assistant_reply_for_self_paced(
+            final_response_content.as_deref(),
+            history_fallback,
+        );
         if let Some(reply) = assistant_reply {
             let profile_for_reschedule = session_id
                 .profile_id()
@@ -16791,6 +16944,148 @@ mod tests {
             crate::context_manager::context_ledger_path(dir.path(), &session_id.to_string())
                 .exists(),
             "AppUI prompt-context preparation should persist the canonical context ledger"
+        );
+    }
+
+    /// #1134 acceptance — when an AppUI loop turn uses a spawn_only /
+    /// send_file path that persists a background assistant message
+    /// AFTER the model's final reply, the pre-#1134 shape walks the
+    /// session history with `.last()` and selects the background row
+    /// — which contains no `<<loop-next-in: ...>>` hint — so
+    /// `apply_self_paced_response` falls back to the default delay.
+    ///
+    /// The fix routes the agent task's `response.content` out through
+    /// a oneshot so the post-turn block parses the hint directly off
+    /// the LLM's EndTurn payload. This test pins the contract:
+    /// feeding the helper a captured `<<loop-next-in: 60s>>` reply
+    /// AND a session-history fallback that would (incorrectly) yield
+    /// a background row must pick the captured reply, and
+    /// `apply_self_paced_response` must reschedule at ~60s — NOT the
+    /// `SELF_PACED_DEFAULT_DELAY_SECONDS` fallback.
+    #[test]
+    fn appui_loop_uses_response_content_not_session_history_for_self_paced() {
+        // Build a private orchestrator so the test does not touch the
+        // process-wide `default_agent_orchestrator()` static; running
+        // in parallel with the appui_*_loop_*_drains tests that DO
+        // share the static would otherwise contaminate their loop
+        // counts.
+        use crate::api::agent_orchestrator::InProcessAgentOrchestrator;
+
+        // `SELF_PACED_DEFAULT_DELAY_SECONDS` is module-private
+        // (`agent_orchestrator.rs` line 49: `const ... = 60 * 15`).
+        // Mirror the constant here so the test pins the EXACT value
+        // the production fallback would stamp — if the production
+        // default changes, this test goes red as a tripwire,
+        // forcing a follow-up review.
+        const SELF_PACED_DEFAULT_DELAY_SECONDS_MIRROR: u64 = 60 * 15;
+
+        // Simulated turn timeline (exactly the bug scenario): the
+        // model emitted a self-paced hint, then a spawn_only /
+        // send_file companion row was persisted afterwards. The
+        // history fallback's `.last()` would pick the background
+        // row, which has no hint.
+        let model_reply = "status report <<loop-next-in: 60s>>";
+        let background_row = "[background] sent file: report.pdf";
+        let history = vec![
+            test_message(MessageRole::User, "loop fire prompt"),
+            test_message(MessageRole::Assistant, model_reply),
+            // The bug: a background assistant row lands AFTER the
+            // model's EndTurn reply.
+            test_message(MessageRole::Assistant, background_row),
+        ];
+        let pre_assistant_count = 0;
+
+        // Pre-#1134 behaviour: history fallback alone picks the
+        // background row.
+        let fallback_only =
+            appui_history_last_non_empty_assistant_after(&history, pre_assistant_count);
+        assert_eq!(
+            fallback_only.as_deref(),
+            Some(background_row),
+            "fallback alone reproduces the bug — picks the background row, not the model reply"
+        );
+
+        // Post-#1134 behaviour: the captured `response.content` wins
+        // even though the fallback would (incorrectly) yield the
+        // background row.
+        let assistant_reply = appui_loop_assistant_reply_for_self_paced(
+            Some(model_reply),
+            // Compute the fallback the same way the production
+            // post-turn block does — this is the value `.last()`
+            // would have returned.
+            appui_history_last_non_empty_assistant_after(&history, pre_assistant_count),
+        );
+        assert_eq!(
+            assistant_reply.as_deref(),
+            Some(model_reply),
+            "captured response.content must win over the session-history fallback"
+        );
+
+        // End-to-end: feed the picked reply into the orchestrator's
+        // self-paced reschedule and confirm the next_run_at_ms lands
+        // ~60s out (NOT the default delay).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id =
+            SessionKey::with_profile("tenant-a", "api", "appui-loop-self-paced-response");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("self-paced loop".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self_paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        let applied = orchestrator
+            .apply_self_paced_response(
+                &loop_id,
+                "tenant-a",
+                assistant_reply.as_deref().expect("picked assistant reply"),
+            )
+            .expect("apply self-paced response");
+        assert_eq!(
+            applied,
+            Some(Duration::from_secs(60)),
+            "captured response.content must yield the 60s hint, not the default delay"
+        );
+        assert_ne!(
+            applied,
+            Some(Duration::from_secs(SELF_PACED_DEFAULT_DELAY_SECONDS_MIRROR)),
+            "captured response.content must NOT fall back to SELF_PACED_DEFAULT_DELAY_SECONDS"
+        );
+
+        // Negative control: had we taken the background row instead
+        // (the pre-#1134 shape), the parsed delay would be `None`
+        // and apply_self_paced_response would stamp the default.
+        let bug_path = orchestrator
+            .apply_self_paced_response(&loop_id, "tenant-a", background_row)
+            .expect("apply self-paced response (bug path)");
+        assert_eq!(
+            bug_path, None,
+            "the pre-#1134 history-fallback path returns None (no hint), stamping the default delay"
+        );
+    }
+
+    /// #1134 — when the oneshot didn't fire (interrupt / agent error
+    /// path), the post-turn block must fall back to the session
+    /// history scan. This pins that contract on the picker helper.
+    #[test]
+    fn appui_loop_self_paced_picker_falls_back_to_history_when_capture_missing() {
+        let history_pick = Some("status report <<loop-next-in: 60s>>".to_owned());
+        let assistant_reply = appui_loop_assistant_reply_for_self_paced(None, history_pick.clone());
+        assert_eq!(assistant_reply, history_pick);
+
+        // Empty captured content is treated as "no reply" (matches
+        // the non-empty filter the history walk applies). We do NOT
+        // fall back to history in that case — the agent explicitly
+        // delivered a blank EndTurn payload.
+        let blank_capture = appui_loop_assistant_reply_for_self_paced(Some(""), history_pick);
+        assert_eq!(
+            blank_capture, None,
+            "empty captured content must not stamp a default-delay reschedule via history fallback"
         );
     }
 
