@@ -973,17 +973,19 @@ impl InProcessAgentOrchestrator {
             if pending_continuation_is_schedulable(&state, &item) {
                 kept.push(item);
             } else {
-                // #1159 codex P2 follow-up: persist the discard before
-                // forgetting it. Otherwise on restart, `configure_supervisor_store`
-                // replays the ledger and re-queues any continuation
-                // that lacks a terminal event — so a "dropped" stale
-                // wrap-up resurrects after every restart. Mirror the
-                // existing `mark_continuation_completed` shape: record
-                // a ContinuationCompleted with a `result` tag that
-                // names *why* the entry was discarded, so an operator
-                // reading the ledger can tell stale-drop from genuine
-                // completion.
-                if let Some(store) = state.supervisor_store.as_ref() {
+                // #1159 codex P2 follow-up: only TOMBSTONE drops whose
+                // owning entity is genuinely gone (goal cleared and
+                // replaced, loop deleted), where the same dedupe_key
+                // cannot recur. For the *paused* subset (loop status
+                // != active, goal status != active but goal_id still
+                // matches), leave the supervisor ledger untouched —
+                // resuming the entity is expected to re-queue the
+                // same dedupe_key, and a Completed tombstone would
+                // make `upsert_continuation` silently drop the new
+                // Queued event because Completed outranks Queued.
+                if stale_drop_should_tombstone(&state, &item)
+                    && let Some(store) = state.supervisor_store.as_ref()
+                {
                     let _ = store.record_continuation_completed(
                         item.group_id.as_str(),
                         item.dedupe_key.as_str(),
@@ -2945,6 +2947,66 @@ fn pending_continuation_is_schedulable(
         // ChildCompleted, ScatterJoinComplete, External — no owning
         // goal/loop record to inspect, pass through.
         _ => true,
+    }
+}
+
+/// #1159 codex P2 follow-up to #1150 — decide whether a drain-time
+/// "stale drop" should write a `ContinuationCompleted` ledger event.
+///
+/// We tombstone ONLY when the owning entity is gone in a way that
+/// guarantees the same dedupe_key cannot recur — goal cleared and
+/// replaced (different goal_id) or loop deleted. Without that
+/// guarantee, tombstoning would defeat a legitimate re-queue: the
+/// supervisor store ranks `Completed > Queued` in `upsert_continuation`,
+/// so a fresh Queued event arriving after a Completed tombstone for
+/// the same `(group, continuation_id)` key is silently ignored.
+///
+/// The "paused" subset of unschedulability (loop status != "active",
+/// goal status != "active" but goal_id still matches) intentionally
+/// returns false here: when the user resumes the entity, the periodic
+/// `enqueue_due_*_continuations` sweep is expected to re-queue with
+/// the same stable dedupe_key, and any Completed tombstone written
+/// during the pause would prevent the new Queued event from sticking
+/// in the ledger.
+fn stale_drop_should_tombstone(
+    state: &AutonomyRuntimeState,
+    item: &QueuedMasterContinuation,
+) -> bool {
+    match &item.reason {
+        MasterContinuationReason::LoopFire => {
+            let Some(loop_id) = item.loop_id.as_ref() else {
+                return false;
+            };
+            // Tombstone iff the loop record is genuinely gone. A
+            // paused loop has the record present with a non-"active"
+            // status; resuming it re-enqueues the same dedupe_key.
+            !state.loops.contains_key(loop_id.as_str())
+        }
+        MasterContinuationReason::GoalContinue | MasterContinuationReason::GoalWrapUp => {
+            let session_key = SessionKey(item.session_id.as_str().to_owned());
+            let Some(goal) = state.goals.get(&session_key) else {
+                // Goal was cleared. dedupe_key includes goal_id; a
+                // future goal under the same session will have a
+                // distinct goal_id and thus a distinct dedupe_key.
+                return true;
+            };
+            if let Some(item_goal_id) = item.goal_id.as_ref() {
+                if item_goal_id.as_str() != goal.goal_id {
+                    // Different goal took the session's slot — same
+                    // session_key but new goal_id, so dedupe_key
+                    // can't recur. Safe to tombstone.
+                    return true;
+                }
+            }
+            // Same goal_id is still present (e.g. paused,
+            // budget_limited). Resuming it can re-queue the same
+            // dedupe_key; don't tombstone.
+            false
+        }
+        // ChildCompleted, ScatterJoinComplete, External — no entity
+        // identity attached. Leave the ledger entry alone; the
+        // in-memory drop is sufficient.
+        _ => false,
     }
 }
 
@@ -6666,6 +6728,128 @@ mod tests {
             restarted.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
             0,
             "restart must not resurrect a stale wrap-up that was dropped at drain time",
+        );
+    }
+
+    /// #1159 codex P2 follow-up: when a continuation is dropped at
+    /// drain time because its goal is merely *paused* (not gone), we
+    /// must NOT tombstone the ledger entry. The supervisor store
+    /// ranks `Completed > Queued` in `upsert_continuation`, so a
+    /// fresh Queued event arriving after the goal resumes would be
+    /// silently ignored — losing a legitimate continuation.
+    #[test]
+    fn drain_time_drop_does_not_tombstone_paused_entries_per_1159() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store_dir = dir.path().join("supervisor");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator
+            .configure_supervisor_store(&store_dir)
+            .expect("configure store");
+        let session_id = SessionKey::with_profile("tenant-a", "api", "drain-drop-paused");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "will be paused".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set goal");
+        // Drain & complete the initial set_goal continuation so it
+        // doesn't pollute later assertions.
+        let initial = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        for item in &initial {
+            orchestrator.mark_continuation_started(item);
+            orchestrator.mark_continuation_completed(item, Some("processed".into()));
+        }
+
+        let goal_id = orchestrator
+            .state()
+            .goals
+            .get(&session_id)
+            .expect("goal exists")
+            .goal_id
+            .clone();
+        // Hand-enqueue a GoalContinue against the SAME goal_id (so
+        // it's not "superseded"), then pause the goal so the
+        // predicate marks the entry unschedulable. Same goal_id is
+        // the case that must NOT be tombstoned: resuming the goal
+        // can re-queue the same stable dedupe_key.
+        {
+            let mut state = orchestrator.state();
+            let request = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(goal_id.clone());
+            enqueue_and_persist_continuation(&mut state, request);
+            // Pause the goal — same goal_id stays in state.goals.
+            state
+                .goals
+                .get_mut(&session_id)
+                .expect("goal")
+                .status = "paused".to_owned();
+        }
+
+        // Drain — the predicate marks this unschedulable (goal
+        // paused), so the new fix drops it from in-memory queue
+        // but must NOT write a ContinuationCompleted to the store.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        // Resume the goal and re-enqueue. The simulated "operator
+        // un-paused" must succeed; the store must not have
+        // tombstoned the dedupe_key.
+        {
+            let mut state = orchestrator.state();
+            state
+                .goals
+                .get_mut(&session_id)
+                .expect("goal")
+                .status = "active".to_owned();
+            let request = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(goal_id.clone());
+            let outcome = enqueue_and_persist_continuation(&mut state, request);
+            assert!(
+                matches!(
+                    outcome,
+                    MasterContinuationEnqueueOutcome::Queued(_)
+                        | MasterContinuationEnqueueOutcome::Duplicate { .. }
+                ),
+                "post-resume re-enqueue must succeed (queued or deduplicated against the in-memory entry), got {outcome:?}",
+            );
+        }
+
+        // Restart and confirm the resumed continuation is still
+        // there. Pre-fix, the Completed tombstone written during
+        // the paused drain blocks the new Queued event from
+        // sticking, so the restart sees 0 pending.
+        let restarted = InProcessAgentOrchestrator::default();
+        restarted
+            .configure_supervisor_store(&store_dir)
+            .expect("replay store");
+        assert!(
+            restarted.pending_continuation_count_for_session_for_test(&session_id, "tenant-a") >= 1,
+            "paused-then-resumed continuation must survive restart (pre-fix this asserts 0)",
         );
     }
 
