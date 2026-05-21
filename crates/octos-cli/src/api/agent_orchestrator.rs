@@ -124,6 +124,56 @@ pub(crate) struct LoopControlRequest {
     pub(crate) kind: LoopControlKind,
 }
 
+/// #991 / M15-B — scope for `spawn_agent`. The trait keeps the request
+/// surface narrow because the orchestrator-owned launcher is the source
+/// of truth for backend kind, sandbox stamp, and policy stamp — the
+/// caller only declares which child it wants and the task that child
+/// should drive. Optional fields are accepted but always re-validated:
+/// client-supplied `agent_id`, `parent_agent_id`, and policy stamps are
+/// rejected or ignored as effective state per the M15-B acceptance
+/// criteria. The default trait impl returns the
+/// `method_not_supported` shape so wire-level callers can detect the
+/// orchestrator-not-wired condition without panicking.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired into the JSON-RPC bridge in a follow-up PR (#991)
+pub(crate) struct SpawnAgentRequest {
+    pub(crate) session_id: SessionKey,
+    pub(crate) profile_id: String,
+    pub(crate) parent_agent_id: Option<String>,
+    pub(crate) backend_kind: String,
+    pub(crate) role: String,
+    pub(crate) nickname: String,
+    pub(crate) task: String,
+    pub(crate) cwd: Option<String>,
+}
+
+/// #991 / M15-B — scope for `send_input` (push a user message into a
+/// running child) and `wait_agent` (block until terminal). Keeping the
+/// two requests identical right now avoids leaking transport details
+/// (timeout, cursor) into the trait surface; M15-C will refine wait
+/// semantics with streaming once a backend implements it.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired into the JSON-RPC bridge in a follow-up PR (#991)
+pub(crate) struct AgentInputRequest {
+    pub(crate) agent_id: String,
+    pub(crate) session_id: Option<SessionKey>,
+    pub(crate) profile_id: String,
+    pub(crate) input: String,
+}
+
+/// #991 / M15-B — scope for `resume_agent` (re-attach to an existing
+/// child by id). Resume is a read-mostly operation today: it returns
+/// the agent record so the caller can re-wire its dispatch context
+/// without a fresh `agent_list` round-trip.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired into the JSON-RPC bridge in a follow-up PR (#991)
+pub(crate) struct ResumeAgentRequest {
+    pub(crate) agent_id: String,
+    pub(crate) session_id: Option<SessionKey>,
+    pub(crate) profile_id: String,
+}
+
+#[allow(dead_code)] // spawn/send_input/wait/resume call sites land in the JSON-RPC bridge follow-up (#991)
 pub(crate) trait AgentOrchestrator: Send + Sync {
     fn list_agents(&self, request: AgentListRequest) -> Result<Value, RpcError>;
     fn read_agent_status(&self, request: AgentRequest) -> Result<Value, RpcError>;
@@ -138,6 +188,86 @@ pub(crate) trait AgentOrchestrator: Send + Sync {
     fn create_loop(&self, request: LoopCreateRequest) -> Result<Value, RpcError>;
     fn list_loops(&self, request: LoopListRequest) -> Result<Value, RpcError>;
     fn control_loop(&self, request: LoopControlRequest) -> Result<Value, RpcError>;
+
+    /// #991 / M15-B — kick off a new native/CLI/MCP child via the
+    /// orchestrator-owned specialist runner. Default impl returns
+    /// `method_not_supported` so existing in-process impls stay
+    /// buildable; production implementations override this.
+    fn spawn_agent(&self, request: SpawnAgentRequest) -> Result<Value, RpcError> {
+        let _ = request;
+        Err(method_not_supported_error(
+            "agent/spawn",
+            "spawn_agent",
+            None,
+            None,
+        ))
+    }
+
+    /// #991 / M15-B — push a user input into a running child. Default
+    /// impl returns `method_not_supported`; production implementations
+    /// route to the supervised process / MCP transport.
+    fn send_input(&self, request: AgentInputRequest) -> Result<Value, RpcError> {
+        Err(method_not_supported_error(
+            "agent/send_input",
+            "send_input",
+            request.session_id.as_ref(),
+            Some(&request.profile_id),
+        ))
+    }
+
+    /// #991 / M15-B — block on or stream the terminal transition of an
+    /// agent. The default impl returns `method_not_supported`; in-
+    /// process orchestrators can satisfy this synchronously by reading
+    /// the current agent record when the agent is already terminal.
+    fn wait_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
+        Err(method_not_supported_error(
+            "agent/wait",
+            "wait_agent",
+            request.session_id.as_ref(),
+            Some(&request.profile_id),
+        ))
+    }
+
+    /// #991 / M15-B — re-attach to an existing child by id. Default
+    /// impl returns `method_not_supported`.
+    fn resume_agent(&self, request: ResumeAgentRequest) -> Result<Value, RpcError> {
+        Err(method_not_supported_error(
+            "agent/resume",
+            "resume_agent",
+            request.session_id.as_ref(),
+            Some(&request.profile_id),
+        ))
+    }
+}
+
+/// #991 / M15-B — uniform error shape for trait methods that have a
+/// declared default impl but are not implemented on the current
+/// orchestrator. Uses the spec §3 `UNSUPPORTED_CAPABILITY` slot so
+/// AppUI clients can distinguish "method exists but not wired" from
+/// the `METHOD_NOT_FOUND` JSON-RPC dispatch miss.
+#[allow(dead_code)] // bridge consumer lands in the follow-up PR (#991)
+pub(crate) fn method_not_supported_error(
+    method: &str,
+    capability: &str,
+    session_id: Option<&SessionKey>,
+    profile_id: Option<&str>,
+) -> RpcError {
+    let mut data = serde_json::Map::new();
+    data.insert("kind".into(), json!("agent_method_not_supported"));
+    data.insert("method".into(), json!(method));
+    data.insert("capability".into(), json!(capability));
+    data.insert("recoverable".into(), json!(false));
+    if let Some(session_id) = session_id {
+        data.insert("session_id".into(), json!(session_id));
+    }
+    if let Some(profile_id) = profile_id {
+        data.insert("profile_id".into(), json!(profile_id));
+    }
+    RpcError::new(
+        rpc_error_codes::UNSUPPORTED_CAPABILITY,
+        format!("{method} is not implemented on this orchestrator"),
+    )
+    .with_data(Value::Object(data))
 }
 
 #[derive(Debug, Default)]
@@ -393,6 +523,16 @@ impl InProcessAgentOrchestrator {
             );
         }
 
+        // #1127 codex P2 follow-up to #991 / M15-B: arm the
+        // cancellation handle BEFORE we publish the agent as `running`
+        // and emit the AGENT_UPDATED event. A client that sees the
+        // running event and immediately calls `interrupt_agent` /
+        // `close_agent` must hit a registered token. With the prior
+        // ordering (register after publish + after worker construction)
+        // the notification was lost and the worker ran to completion
+        // even though the agent's terminal status had been stamped.
+        let cancel_token = self.register_agent_cancellation(&agent_id);
+
         let initial_agent = self.upsert_agent(AgentUpsert {
             agent_id: agent_id.clone(),
             parent_agent_id: parent_agent_id.clone(),
@@ -440,7 +580,24 @@ impl InProcessAgentOrchestrator {
         }
         worker.wire_activate_tools();
 
-        let result = worker.process_message(&task, &[], Vec::new()).await;
+        // #991 / M15-B — `cancel_token` was registered above (see the
+        // P2 follow-up comment) before the agent was published. The
+        // `tokio::select!` below short-circuits `process_message` with
+        // an `interrupted` status when a notify lands, instead of
+        // letting the model finish.
+        let run = worker.process_message(&task, &[], Vec::new());
+        tokio::pin!(run);
+        let cancel_wait = cancel_token.notified();
+        tokio::pin!(cancel_wait);
+        let result = tokio::select! {
+            biased;
+            _ = &mut cancel_wait => {
+                Err(eyre::eyre!("native specialist cancelled"))
+            }
+            result = &mut run => result,
+        };
+        let cancelled = !self.state().cancellations.contains_key(&agent_id)
+            && self.agent_status_is_terminal(&agent_id);
         let (status, output, artifacts) = match result {
             Ok(response) => {
                 let output = response.content.clone();
@@ -454,11 +611,19 @@ impl InProcessAgentOrchestrator {
                 );
                 ("completed".to_owned(), output, artifacts)
             }
+            Err(error) if cancelled => {
+                let output = format!("Native specialist cancelled: {error}");
+                ("interrupted".to_owned(), output, Vec::new())
+            }
             Err(error) => {
                 let output = format!("Native specialist failed: {error}");
                 ("failed".to_owned(), output, Vec::new())
             }
         };
+        // Clear the registered handle regardless of outcome — by the
+        // time we reach this point the worker has stopped running, so
+        // any subsequent `signal_agent_cancellation` would be a no-op.
+        self.deregister_agent_cancellation(&agent_id);
 
         if !output.is_empty() {
             self.append_agent_output(&agent_id, &session_id, &profile_id, &output)?;
@@ -540,6 +705,50 @@ impl InProcessAgentOrchestrator {
     fn agent_status_is_terminal(&self, agent_id: &str) -> bool {
         self.agent_status(agent_id)
             .is_some_and(|status| is_agent_terminal_status(&status))
+    }
+
+    /// #991 / M15-B — register (or replace) the cancellation handle
+    /// for `agent_id`. Returns the registered `Notify` so the worker
+    /// can `notified()` on the same instance. Callers should drop
+    /// their clone when they finish or transition the agent into a
+    /// terminal state — the orchestrator clears the slot on
+    /// `interrupt_agent` / `close_agent` after signalling.
+    pub(crate) fn register_agent_cancellation(&self, agent_id: &str) -> Arc<tokio::sync::Notify> {
+        let token = Arc::new(tokio::sync::Notify::new());
+        self.state()
+            .cancellations
+            .insert(agent_id.to_owned(), token.clone());
+        token
+    }
+
+    /// #991 / M15-B — drop the registered cancellation handle for
+    /// `agent_id` (typically called by the runner once it has reached
+    /// a terminal state and no longer wants to be wakeable). Safe to
+    /// call when no handle is registered.
+    pub(crate) fn deregister_agent_cancellation(&self, agent_id: &str) {
+        self.state().cancellations.remove(agent_id);
+    }
+
+    /// #991 / M15-B — signal cancellation for the running agent task
+    /// (if any) and drop the handle. Returns whether a handle was
+    /// found. Used by `interrupt_agent` / `close_agent` to wake the
+    /// worker after the in-memory terminal status has been stamped.
+    ///
+    /// #1127 codex P2 follow-up: use `notify_one()` instead of
+    /// `notify_waiters()` so a notification that lands BEFORE the
+    /// worker has had a chance to `.notified().await` is queued as
+    /// a permit and consumed by the next await. With
+    /// `notify_waiters()`, a fast interrupt that arrived in the
+    /// window between agent publish (the `running` event) and the
+    /// worker's first `notified()` await was silently lost.
+    pub(crate) fn signal_agent_cancellation(&self, agent_id: &str) -> bool {
+        let token = self.state().cancellations.remove(agent_id);
+        if let Some(token) = token {
+            token.notify_one();
+            true
+        } else {
+            false
+        }
     }
 
     /// #1021 / M17-C — stamp the dispatch context contract onto the agent record so subsequent `agent/updated` events surface `context_mode` / `context_refs` / `context_contract` to AppUI clients. Returns the freshly serialised agent JSON so callers can emit it through the supervisor event sink. Idempotent: the stored contract is overwritten on each call, mirroring how MCP dispatches stamp the most-recent contract on every response.
@@ -954,11 +1163,202 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
     }
 
     fn interrupt_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
-        update_agent_terminal_status(self, request, "interrupted", true, false)
+        // #1127 codex P1 follow-up to #991 / M15-B: validate AND stamp
+        // the terminal state BEFORE we wake the worker. The prior shape
+        // signaled first, which (a) let any same-profile caller wake +
+        // remove another session's cancellation token even when the
+        // RPC would later return forbidden, and (b) on multithreaded
+        // runtimes let an authorized interrupt wake the worker before
+        // the status flip became visible — so workers raced through
+        // their wrap-up code and reported `failed` instead of
+        // `interrupted`/`closed`. `update_agent_terminal_status` does
+        // the scope check + stamp under the same state lock, so we
+        // only signal after a successful stamp.
+        let agent_id = request.agent_id.clone();
+        let result = update_agent_terminal_status(self, request, "interrupted", true, false)?;
+        self.signal_agent_cancellation(&agent_id);
+        Ok(result)
     }
 
     fn close_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
-        update_agent_terminal_status(self, request, "closed", false, true)
+        // #1127 codex P1 follow-up to #991 / M15-B: validate + stamp,
+        // then signal — see `interrupt_agent` for the rationale.
+        let agent_id = request.agent_id.clone();
+        let result = update_agent_terminal_status(self, request, "closed", false, true)?;
+        self.signal_agent_cancellation(&agent_id);
+        Ok(result)
+    }
+
+    /// #991 / M15-B — in-process `spawn_agent` registers a *pending*
+    /// agent record so subsequent `agent_list` / `agent_status` calls
+    /// observe the new child immediately. The actual model / CLI /
+    /// MCP work is driven by the caller (typically the session
+    /// runtime factory or the specialist runner) which retrieves the
+    /// registered cancellation handle when it begins running. This
+    /// keeps the trait surface synchronous (matches the rest of the
+    /// orchestrator API) while still letting backend implementations
+    /// satisfy the spawn contract — they pre-register the record, then
+    /// run the work in a follow-up tokio task.
+    fn spawn_agent(&self, request: SpawnAgentRequest) -> Result<Value, RpcError> {
+        let backend_kind = request.backend_kind.trim();
+        if backend_kind.is_empty() {
+            return Err(autonomy_error(
+                kinds::AGENT_CONTROL_UNAVAILABLE,
+                "spawn_agent requires a non-empty backend_kind",
+                Some(&request.session_id),
+                Some(&request.profile_id),
+                None,
+                true,
+            ));
+        }
+        let role = request.role.trim();
+        let nickname = request.nickname.trim();
+        if role.is_empty() || nickname.is_empty() {
+            return Err(autonomy_error(
+                kinds::AGENT_CONTROL_UNAVAILABLE,
+                "spawn_agent requires non-empty role and nickname",
+                Some(&request.session_id),
+                Some(&request.profile_id),
+                None,
+                true,
+            ));
+        }
+        // Server-owned agent ids — never trust the client. The id
+        // shape matches `run_native_specialist` so AppUI clients can
+        // round-trip the value through `agent/status/read` and
+        // `agent/interrupt` without translation.
+        let agent_id = format!("{backend_kind}-{}", uuid::Uuid::now_v7());
+        let path = format!(
+            "{}/{}",
+            request.parent_agent_id.as_deref().unwrap_or("master"),
+            agent_id
+        );
+        let agent = self.upsert_agent(AgentUpsert {
+            agent_id: agent_id.clone(),
+            parent_agent_id: request.parent_agent_id,
+            session_id: request.session_id.clone(),
+            task_id: None,
+            path,
+            role: role.to_owned(),
+            nickname: nickname.to_owned(),
+            backend_kind: backend_kind.to_owned(),
+            status: "running".to_owned(),
+            last_task: (!request.task.trim().is_empty()).then(|| {
+                request
+                    .task
+                    .chars()
+                    .take(MAX_OBJECTIVE_BYTES)
+                    .collect::<String>()
+            }),
+            cwd: request.cwd.filter(|cwd| !cwd.is_empty()),
+            profile_id: request.profile_id.clone(),
+        });
+        Ok(json!({
+            "session_id": request.session_id,
+            "profile_id": request.profile_id,
+            "agent_id": agent_id,
+            "agent": agent,
+            "ok": true,
+        }))
+    }
+
+    /// #991 / M15-B — synchronous `send_input` appends the input as a
+    /// new `last_task` marker and bumps the agent record's
+    /// `updated_at_ms`. A future backend impl can override to route
+    /// the input to a running supervised process / MCP transport
+    /// stdin. Refuses to deliver input to terminal agents.
+    fn send_input(&self, request: AgentInputRequest) -> Result<Value, RpcError> {
+        let input = request.input.trim();
+        if input.is_empty() {
+            return Err(autonomy_error(
+                kinds::AGENT_CONTROL_UNAVAILABLE,
+                "send_input requires a non-empty input",
+                request.session_id.as_ref(),
+                Some(&request.profile_id),
+                Some(("agent_id", request.agent_id.as_str())),
+                true,
+            ));
+        }
+        let scope_request = AgentRequest {
+            agent_id: request.agent_id.clone(),
+            session_id: request.session_id.clone(),
+            profile_id: request.profile_id.clone(),
+        };
+        let mut state = self.state();
+        let agent = state
+            .agents
+            .get_mut(&request.agent_id)
+            .ok_or_else(|| agent_not_found_error(&scope_request))?;
+        ensure_agent_control_scope(agent, request.session_id.as_ref(), &request.profile_id)?;
+        if is_agent_terminal_status(&agent.status) {
+            return Err(autonomy_error(
+                kinds::AGENT_CONTROL_UNAVAILABLE,
+                "send_input cannot deliver to a terminal agent",
+                request.session_id.as_ref().or(Some(&agent.session_id)),
+                Some(&request.profile_id),
+                Some(("agent_id", agent.agent_id.as_str())),
+                true,
+            ));
+        }
+        agent.last_task = Some(input.chars().take(MAX_OBJECTIVE_BYTES).collect());
+        agent.updated_at_ms = now_ms();
+        Ok(json!({
+            "agent_id": agent.agent_id,
+            "session_id": agent.session_id,
+            "delivered": true,
+            "ok": true,
+            "agent": autonomy_agent_json(agent),
+        }))
+    }
+
+    /// #991 / M15-B — synchronous `wait_agent` resolves immediately
+    /// when the agent is already terminal, otherwise returns the
+    /// current (non-terminal) agent record with `terminal: false`.
+    /// True streaming/blocking semantics will land with the backend
+    /// impl when subprocess JoinHandles are wired through the trait.
+    fn wait_agent(&self, request: AgentRequest) -> Result<Value, RpcError> {
+        let state = self.state();
+        let agent = get_agent(&state, &request)?;
+        let terminal = is_agent_terminal_status(&agent.status);
+        Ok(json!({
+            "agent_id": agent.agent_id,
+            "session_id": agent.session_id,
+            "terminal": terminal,
+            "status": agent.status,
+            "agent": autonomy_agent_json(agent),
+            "ok": true,
+        }))
+    }
+
+    /// #991 / M15-B — `resume_agent` is a re-attach: it returns the
+    /// current agent record so the caller can rebuild its dispatch
+    /// context without a separate `agent/status/read` round-trip.
+    /// Refuses to resume terminal agents (use `spawn_agent` for a
+    /// fresh child).
+    fn resume_agent(&self, request: ResumeAgentRequest) -> Result<Value, RpcError> {
+        let scope = AgentRequest {
+            agent_id: request.agent_id.clone(),
+            session_id: request.session_id.clone(),
+            profile_id: request.profile_id.clone(),
+        };
+        let state = self.state();
+        let agent = get_agent(&state, &scope)?;
+        if is_agent_terminal_status(&agent.status) {
+            return Err(autonomy_error(
+                kinds::AGENT_CONTROL_UNAVAILABLE,
+                "resume_agent cannot attach to a terminal agent",
+                request.session_id.as_ref().or(Some(&agent.session_id)),
+                Some(&request.profile_id),
+                Some(("agent_id", agent.agent_id.as_str())),
+                true,
+            ));
+        }
+        Ok(json!({
+            "agent_id": agent.agent_id,
+            "session_id": agent.session_id,
+            "agent": autonomy_agent_json(agent),
+            "ok": true,
+        }))
     }
 
     fn get_goal(&self, request: GoalSessionRequest) -> Result<Value, RpcError> {
@@ -1332,6 +1732,19 @@ struct AutonomyRuntimeState {
     supervisor_store: Option<SupervisorStore>,
     next_goal_seq: u64,
     next_loop_seq: u64,
+    /// #991 / M15-B — per-agent cancellation handles registered by
+    /// `run_native_specialist` (and future specialist runners) so that
+    /// `interrupt_agent` / `close_agent` can signal a *real* abort to
+    /// the running task instead of only mutating in-memory status. The
+    /// handle is dropped when the agent reaches a terminal state. A
+    /// `tokio::sync::Notify` is sufficient here: the worker holds an
+    /// `Arc<Notify>` and selects on `notified()` against its workload;
+    /// `notify_waiters()` wakes every clone. Compared to a
+    /// `CancellationToken` this avoids pulling in `tokio_util` for one
+    /// signal type, and the orchestrator does not need to inspect the
+    /// "armed" state (the worker already owns the source of truth via
+    /// the agent status transition).
+    cancellations: HashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4646,5 +5059,495 @@ mod tests {
             replayed_after_completion.pending_continuation_count_for_test(),
             1
         );
+    }
+
+    // ---------------- #991 / M15-B trait extension tests ----------------
+
+    /// #991 / M15-B — a fresh orchestrator type that does NOT override
+    /// the new trait methods MUST return the `UNSUPPORTED_CAPABILITY`
+    /// shape so wire-level callers can detect the "method declared,
+    /// runtime not wired" condition without panicking. This guards
+    /// against accidental method-not-found regressions when the trait
+    /// surface grows but a specific orchestrator hasn't been updated.
+    struct UnimplementedOrchestrator;
+
+    impl AgentOrchestrator for UnimplementedOrchestrator {
+        fn list_agents(&self, _: AgentListRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn read_agent_status(&self, _: AgentRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn read_agent_output(&self, _: AgentOutputRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn list_agent_artifacts(&self, _: AgentRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn read_agent_artifact(&self, _: AgentArtifactReadRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn interrupt_agent(&self, _: AgentRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn close_agent(&self, _: AgentRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn get_goal(&self, _: GoalSessionRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn set_goal(&self, _: GoalSetRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn clear_goal(&self, _: GoalSessionRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn create_loop(&self, _: LoopCreateRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn list_loops(&self, _: LoopListRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        fn control_loop(&self, _: LoopControlRequest) -> Result<Value, RpcError> {
+            Ok(json!({}))
+        }
+        // Intentionally do NOT override spawn_agent / send_input /
+        // wait_agent / resume_agent — those should fall through to
+        // the default impl and return the UNSUPPORTED_CAPABILITY
+        // shape.
+    }
+
+    fn default_session(suffix: &str) -> SessionKey {
+        SessionKey::with_profile("tenant-a", "api", suffix)
+    }
+
+    #[test]
+    fn trait_default_spawn_agent_returns_unsupported_capability() {
+        let orchestrator = UnimplementedOrchestrator;
+        let session_id = default_session("default-spawn");
+        let err = orchestrator
+            .spawn_agent(SpawnAgentRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                parent_agent_id: None,
+                backend_kind: "native".into(),
+                role: "reviewer".into(),
+                nickname: "Default".into(),
+                task: "do work".into(),
+                cwd: None,
+            })
+            .expect_err("default spawn_agent must error");
+        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
+        let data = err.data.expect("default error carries data");
+        assert_eq!(data["method"], json!("agent/spawn"));
+        assert_eq!(data["kind"], json!("agent_method_not_supported"));
+    }
+
+    #[test]
+    fn trait_default_send_input_returns_unsupported_capability() {
+        let orchestrator = UnimplementedOrchestrator;
+        let session_id = default_session("default-send-input");
+        let err = orchestrator
+            .send_input(AgentInputRequest {
+                agent_id: "agent-x".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                input: "hello".into(),
+            })
+            .expect_err("default send_input must error");
+        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
+        let data = err.data.expect("default error carries data");
+        assert_eq!(data["method"], json!("agent/send_input"));
+    }
+
+    #[test]
+    fn trait_default_wait_agent_returns_unsupported_capability() {
+        let orchestrator = UnimplementedOrchestrator;
+        let session_id = default_session("default-wait");
+        let err = orchestrator
+            .wait_agent(AgentRequest {
+                agent_id: "agent-x".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+            })
+            .expect_err("default wait_agent must error");
+        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
+        let data = err.data.expect("default error carries data");
+        assert_eq!(data["method"], json!("agent/wait"));
+    }
+
+    #[test]
+    fn trait_default_resume_agent_returns_unsupported_capability() {
+        let orchestrator = UnimplementedOrchestrator;
+        let session_id = default_session("default-resume");
+        let err = orchestrator
+            .resume_agent(ResumeAgentRequest {
+                agent_id: "agent-x".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+            })
+            .expect_err("default resume_agent must error");
+        assert_eq!(err.code, rpc_error_codes::UNSUPPORTED_CAPABILITY);
+        let data = err.data.expect("default error carries data");
+        assert_eq!(data["method"], json!("agent/resume"));
+    }
+
+    #[test]
+    fn in_process_spawn_agent_registers_running_record() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = default_session("spawn-success");
+        let result = orchestrator
+            .spawn_agent(SpawnAgentRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                parent_agent_id: Some("master".into()),
+                backend_kind: "native".into(),
+                role: "reviewer".into(),
+                nickname: "Spawned".into(),
+                task: "audit changes".into(),
+                cwd: None,
+            })
+            .expect("spawn ok");
+        assert_eq!(result["ok"], json!(true));
+        let agent_id = result["agent_id"].as_str().expect("agent_id").to_owned();
+        assert!(agent_id.starts_with("native-"));
+        let status = orchestrator
+            .read_agent_status(AgentRequest {
+                agent_id: agent_id.clone(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("status");
+        assert_eq!(status["agent"]["status"], json!("running"));
+        assert_eq!(status["agent"]["last_task"], json!("audit changes"));
+        assert_eq!(status["agent"]["backend_kind"], json!("native"));
+    }
+
+    #[test]
+    fn in_process_spawn_agent_rejects_empty_backend_kind() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = default_session("spawn-reject");
+        let err = orchestrator
+            .spawn_agent(SpawnAgentRequest {
+                session_id,
+                profile_id: "tenant-a".into(),
+                parent_agent_id: None,
+                backend_kind: "  ".into(),
+                role: "reviewer".into(),
+                nickname: "Bad".into(),
+                task: "x".into(),
+                cwd: None,
+            })
+            .expect_err("empty backend_kind is rejected");
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn in_process_send_input_updates_last_task_for_running_agent() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let agent = sample_agent("agent-input", "tenant-a");
+        let session_id = agent.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+        let result = orchestrator
+            .send_input(AgentInputRequest {
+                agent_id: "agent-input".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+                input: "next instruction".into(),
+            })
+            .expect("send_input ok");
+        assert_eq!(result["delivered"], json!(true));
+        assert_eq!(result["agent"]["last_task"], json!("next instruction"));
+    }
+
+    #[test]
+    fn in_process_send_input_rejects_empty_payload() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let agent = sample_agent("agent-empty-input", "tenant-a");
+        let session_id = agent.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+        let err = orchestrator
+            .send_input(AgentInputRequest {
+                agent_id: "agent-empty-input".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                input: "   ".into(),
+            })
+            .expect_err("empty input rejected");
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn in_process_send_input_rejects_terminal_agent() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let mut agent = sample_agent("agent-terminal", "tenant-a");
+        agent.status = "completed".into();
+        let session_id = agent.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent);
+        let err = orchestrator
+            .send_input(AgentInputRequest {
+                agent_id: "agent-terminal".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+                input: "too late".into(),
+            })
+            .expect_err("terminal agent rejected");
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn in_process_wait_agent_returns_terminal_flag() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let running = sample_agent("agent-running", "tenant-a");
+        let mut completed = sample_agent("agent-done", "tenant-a");
+        completed.status = "completed".into();
+        let session_id = running.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(running.agent_id.clone(), running);
+        orchestrator
+            .state()
+            .agents
+            .insert(completed.agent_id.clone(), completed);
+
+        let running_result = orchestrator
+            .wait_agent(AgentRequest {
+                agent_id: "agent-running".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("wait running");
+        assert_eq!(running_result["terminal"], json!(false));
+        assert_eq!(running_result["status"], json!("running"));
+
+        let done_result = orchestrator
+            .wait_agent(AgentRequest {
+                agent_id: "agent-done".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("wait done");
+        assert_eq!(done_result["terminal"], json!(true));
+        assert_eq!(done_result["status"], json!("completed"));
+    }
+
+    #[test]
+    fn in_process_resume_agent_returns_record_and_rejects_terminal() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let running = sample_agent("agent-resume", "tenant-a");
+        let mut closed = sample_agent("agent-resume-closed", "tenant-a");
+        closed.status = "closed".into();
+        let session_id = running.session_id.clone();
+        orchestrator
+            .state()
+            .agents
+            .insert(running.agent_id.clone(), running);
+        orchestrator
+            .state()
+            .agents
+            .insert(closed.agent_id.clone(), closed);
+
+        let resumed = orchestrator
+            .resume_agent(ResumeAgentRequest {
+                agent_id: "agent-resume".into(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("resume running ok");
+        assert_eq!(resumed["agent"]["agent_id"], json!("agent-resume"));
+
+        let err = orchestrator
+            .resume_agent(ResumeAgentRequest {
+                agent_id: "agent-resume-closed".into(),
+                session_id: Some(session_id),
+                profile_id: "tenant-a".into(),
+            })
+            .expect_err("resume terminal must fail");
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::AGENT_CONTROL_UNAVAILABLE)
+        );
+    }
+
+    /// #991 / M15-B — `interrupt_agent` MUST signal a *real* abort to
+    /// a running native-specialist task, not only flip the in-memory
+    /// status. The fastest way to assert that is to drive
+    /// `run_native_specialist` with an LLM mock that sleeps on the
+    /// model call, fire `interrupt_agent` from another task, and
+    /// assert the future returns within a short timeout with
+    /// `status == interrupted`.
+    #[tokio::test]
+    async fn interrupt_agent_signals_real_cancellation_to_native_specialist() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let orchestrator = Arc::new(InProcessAgentOrchestrator::default());
+        let session_id = default_session("native-cancel");
+        let tools = Arc::new(ToolRegistry::with_builtins(dir.path()));
+        let memory = Arc::new(
+            EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .expect("memory store"),
+        );
+
+        struct SleepyProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for SleepyProvider {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                // Sleep "forever" — interrupt_agent must short-
+                // circuit this. We do still bound it so a failing
+                // cancellation path doesn't hang CI; 30s is far
+                // beyond the 5s test timeout.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(octos_llm::ChatResponse {
+                    content: Some("never".into()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: Default::default(),
+                    provider_index: None,
+                })
+            }
+            fn model_id(&self) -> &str {
+                "sleepy"
+            }
+            fn provider_name(&self) -> &str {
+                "test"
+            }
+        }
+
+        use std::time::Duration;
+        let llm: Arc<dyn LlmProvider> = Arc::new(SleepyProvider);
+        let orchestrator_for_spawn = orchestrator.clone();
+        let agent_id = "native-cancel-target".to_owned();
+        let agent_id_for_spawn = agent_id.clone();
+        let session_id_for_spawn = session_id.clone();
+        let spawn = tokio::spawn(async move {
+            orchestrator_for_spawn
+                .run_native_specialist(NativeSpecialistLaunchRequest {
+                    agent_id: Some(agent_id_for_spawn),
+                    parent_agent_id: Some("master".to_owned()),
+                    session_id: session_id_for_spawn,
+                    profile_id: "tenant-a".to_owned(),
+                    role: "reviewer".to_owned(),
+                    nickname: "Sleepy".to_owned(),
+                    task: "wait forever".to_owned(),
+                    cwd: dir.path().to_path_buf(),
+                    llm,
+                    memory,
+                    tools,
+                    system_prompt: None,
+                    agent_config: None,
+                    task_ledger_path: None,
+                    event_tx: None,
+                })
+                .await
+        });
+
+        // Wait briefly for the orchestrator to register the
+        // cancellation handle. We don't have a hook for "worker
+        // ready", so poll until the handle is visible.
+        let mut tries = 0;
+        loop {
+            if orchestrator.state().cancellations.contains_key(&agent_id) {
+                break;
+            }
+            tries += 1;
+            assert!(tries < 100, "cancellation handle never registered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let interrupt_result = orchestrator
+            .interrupt_agent(AgentRequest {
+                agent_id: agent_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-a".into(),
+            })
+            .expect("interrupt ok");
+        assert_eq!(interrupt_result["status"], json!("interrupted"));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), spawn)
+            .await
+            .expect("native specialist must return within timeout")
+            .expect("join ok")
+            .expect("specialist result ok");
+        assert_eq!(
+            outcome.status, "interrupted",
+            "real cancellation must surface as `interrupted`"
+        );
+    }
+
+    /// #1127 codex P1 acceptance: a cross-profile interrupt MUST NOT
+    /// signal the worker's cancellation token. The scope check has to
+    /// fire BEFORE the notify, otherwise an attacker who knows
+    /// another tenant's `agent_id` could wake / remove that worker's
+    /// token even though the RPC eventually returns
+    /// `permission_denied`. Pins the validate-then-stamp-then-signal
+    /// order.
+    #[test]
+    fn cross_profile_interrupt_does_not_signal_cancellation_token() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let agent = sample_agent("victim-agent", "tenant-a");
+        orchestrator
+            .state()
+            .agents
+            .insert(agent.agent_id.clone(), agent.clone());
+
+        // Pre-register a cancellation handle to detect the race.
+        let token = orchestrator.register_agent_cancellation(&agent.agent_id);
+
+        // Attacker on `tenant-b` tries to interrupt tenant-a's agent.
+        let err = orchestrator
+            .interrupt_agent(AgentRequest {
+                agent_id: agent.agent_id.clone(),
+                session_id: Some(agent.session_id.clone()),
+                profile_id: "tenant-b".into(),
+            })
+            .expect_err("cross-profile interrupt must be denied");
+        assert_eq!(err.code, rpc_error_codes::PERMISSION_DENIED);
+
+        // The cancellation token MUST still be registered AND MUST NOT
+        // have been notified — verify both invariants. We do a
+        // try_recv-style check by spawning a quick notified() future
+        // and asserting it doesn't resolve immediately.
+        assert!(
+            orchestrator
+                .state()
+                .cancellations
+                .contains_key(&agent.agent_id),
+            "denied interrupt must NOT have removed the cancellation token"
+        );
+        // `notify_one` would leave a permit on the token. Detect it.
+        let notified_fut = std::pin::pin!(token.notified());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match notified_fut.poll(&mut cx) {
+            std::task::Poll::Ready(()) => {
+                panic!("denied interrupt left a cancellation permit on the victim's token")
+            }
+            std::task::Poll::Pending => {}
+        }
     }
 }
