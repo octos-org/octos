@@ -112,8 +112,11 @@ npm --prefix e2e run ux:scenario:list -- --tier fast
 npm --prefix e2e run ux:scenario:list -- --tier local
 npm --prefix e2e run ux:scenario:list -- --tier release
 
-# Machine-readable output for CI.
-npm --prefix e2e run ux:scenario:list -- --tier release --json
+# Machine-readable output for CI. Use --silent so npm's lifecycle
+# banner ("> ux:scenario:list", "> node …") doesn't pollute stdout
+# before the JSON document. Alternatively, invoke node directly:
+#   node e2e/scripts/ux-scenario-list.mjs --tier release --json
+npm --silent --prefix e2e run ux:scenario:list -- --tier release --json
 
 # Point at a different manifest (for testing).
 npm --prefix e2e run ux:scenario:list -- --manifest /tmp/alt.toml

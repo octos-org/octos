@@ -91,11 +91,35 @@ export function loadManifest({ path }) {
   };
 }
 
+// Codex P2 follow-up: scalar fields that downstream code (CLI,
+// runner, table renderer, JSON consumers) assume are non-empty
+// strings. The earlier check only verified presence (i.e. that the
+// TOML key existed at all), so a value like `42` or `[]` or `""`
+// would slip through and later crash with a confusing error.
+const REQUIRED_NON_EMPTY_STRING_FIELDS = [
+  "title",
+  "description",
+  "terminal",
+  "tui_binary",
+  "tmux_command",
+];
+
 function normalizeScenario(row, idx, seenIds) {
   for (const field of REQUIRED_SCENARIO_FIELDS) {
     if (!Object.prototype.hasOwnProperty.call(row, field)) {
       throw new ManifestSchemaError(
         `scenario #${idx + 1} is missing required field "${field}"`,
+      );
+    }
+  }
+  for (const field of REQUIRED_NON_EMPTY_STRING_FIELDS) {
+    if (
+      !Object.prototype.hasOwnProperty.call(row, field) ||
+      typeof row[field] !== "string" ||
+      row[field].length === 0
+    ) {
+      throw new ManifestSchemaError(
+        `scenario #${idx + 1} has invalid "${field}": must be a non-empty string`,
       );
     }
   }

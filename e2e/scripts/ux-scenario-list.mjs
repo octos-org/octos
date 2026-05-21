@@ -176,6 +176,13 @@ function main() {
   const sorted = [...filtered].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const rows = sorted.map((s) => {
     const { status, reasons } = classifyRunnability(s, env);
+    // Codex P2 follow-up: emit the FULL normalized scenario record in
+    // each row so JSON consumers (CI, the future runner in #1064-#1067)
+    // can decide which TUI binary / tmux command / replay payload /
+    // notes to use without reparsing the TOML. Previously the JSON
+    // output was just the table-column projection (id/tier/transport/
+    // provider/terminal/title), missing description/tuiBinary/
+    // tmuxCommand/replay/notes/quarantine.
     return {
       id: s.id,
       tier: s.tier,
@@ -183,12 +190,18 @@ function main() {
       provider: s.provider,
       terminal: s.terminal,
       title: s.title,
+      description: s.description,
+      tuiBinary: s.tuiBinary,
+      tmuxCommand: s.tmuxCommand,
       status,
       reasons,
       requiredTools: s.requiredTools,
       requiredCapabilities: s.requiredCapabilities,
       acceptance: s.acceptance,
       expectedArtifacts: s.expectedArtifacts,
+      replay: s.replay,
+      notes: s.notes,
+      quarantine: s.quarantine,
     };
   });
   const summary = summarize(rows);
