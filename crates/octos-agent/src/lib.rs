@@ -128,7 +128,8 @@ pub use provider_tools::{ProviderToolsets, ToolAdjustment};
 pub use recorder::{BlackBoxRecorder, RecordEntry};
 pub use role_template::{
     APPROVAL_ASK, APPROVAL_NEVER, ModelPreference, ROLE_EXPLORER, ROLE_IMPLEMENTER, ROLE_REVIEWER,
-    ROLE_TEST_WORKER, RoleTemplate, SANDBOX_AUTO, SANDBOX_NONE, UnknownModelPreference,
+    ROLE_TEST_WORKER, RoleTemplate, RoleTemplateSummary, SANDBOX_AUTO, SANDBOX_NONE,
+    UnknownModelPreference,
 };
 pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
