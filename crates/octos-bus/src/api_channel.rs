@@ -234,8 +234,47 @@ struct ChatRequest {
     /// carries it through `add_message_with_seq`, letting the user-message
     /// `session_result` event correlate the optimistic web bubble back to
     /// the server-assigned seq.
+    ///
+    /// M9 #674/#675 phase 1b: `client_message_id` is retained as the wire
+    /// alias for one release per the alias-deprecation plan tied to #679.
+    /// New clients should send `thread_id` instead; ingress prefers
+    /// `thread_id` when both are present (see #675 phase 1b).
     #[serde(default)]
     client_message_id: Option<String>,
+    /// Canonical per-turn thread identity (M9 #674/#675 phase 1b).
+    ///
+    /// New clients should populate this field directly. When both
+    /// `thread_id` and `client_message_id` are present on a request,
+    /// `thread_id` wins; `client_message_id` remains the wire alias for
+    /// one release per the alias-deprecation window (#679).
+    ///
+    /// Downstream propagation (`originating_thread_id` on the spawn /
+    /// session-actor path) is untouched in this PR — that rename lands
+    /// in the parallel PR-1a (`Origin.thread_id`).
+    #[serde(default)]
+    thread_id: Option<String>,
+}
+
+impl ChatRequest {
+    /// Effective thread id for this request: prefer the canonical
+    /// `thread_id`, fall back to the legacy `client_message_id` alias.
+    ///
+    /// Empty strings are normalized to `None` so a sentinel-empty value
+    /// behaves the same as "absent" — matches the long-standing
+    /// `client_message_id` treatment so downstream emission doesn't
+    /// produce a session_result with an empty-string correlation id.
+    fn effective_thread_id(&self) -> Option<String> {
+        self.thread_id
+            .as_ref()
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .or_else(|| {
+                self.client_message_id
+                    .as_ref()
+                    .filter(|value| !value.is_empty())
+                    .cloned()
+            })
+    }
 }
 
 /// API channel that runs an HTTP server for web client access.
@@ -1543,10 +1582,6 @@ async fn handle_chat(
         }
     }
 
-    let session_id = req
-        .session_id
-        .unwrap_or_else(|| format!("web-{}", uuid::Uuid::now_v7()));
-
     // M8.10 follow-up (#636): pull the request's `client_message_id`
     // up here so it can tag both the synthetic warm-up SSE events AND
     // seed the sticky map BEFORE the session actor's reporter starts
@@ -1556,10 +1591,17 @@ async fn handle_chat(
     // `send_raw_sse` calls of the turn could race with the actor's
     // first thread_id-tagged emission, leaving early `replace` events
     // un-routed. Seeding here closes that window.
-    let request_thread_id: Option<String> = req
-        .client_message_id
-        .clone()
-        .filter(|value| !value.is_empty());
+    //
+    // M9 #675 phase 1b: prefer the canonical `thread_id`, fall back to
+    // the legacy `client_message_id` alias. `effective_thread_id` also
+    // strips sentinel-empty strings the same way the previous code did.
+    // Resolved BEFORE `session_id`'s `unwrap_or_else` partially moves
+    // out of `req` so the helper still has full access to the request.
+    let request_thread_id: Option<String> = req.effective_thread_id();
+
+    let session_id = req
+        .session_id
+        .unwrap_or_else(|| format!("web-{}", uuid::Uuid::now_v7()));
 
     // Create per-request SSE channel. If a previous request is still streaming
     // AND alive, reuse it. Otherwise, replace the stale sender.
@@ -1605,6 +1647,13 @@ async fn handle_chat(
         // overflow agent's `reply_to` which becomes
         // `_session_result.response_to_client_message_id` — the field the
         // web reducer correlates against the optimistic streaming bubble.
+        //
+        // M9 #675 phase 1b: the same effective thread id (prefer
+        // `thread_id`, fall back to `client_message_id`) seeds both the
+        // metadata bag and `InboundMessage.message_id`. The wire-shape
+        // field name in metadata stays `client_message_id` for one
+        // release per the alias-deprecation plan tied to #679 — the
+        // downstream rename to `Origin.thread_id` is owned by PR-1a.
         let inbound = InboundMessage {
             channel: "api".into(),
             sender_id: "web".into(),
@@ -1623,11 +1672,7 @@ async fn handle_chat(
                 if let Some(topic) = req.topic.filter(|value| !value.is_empty()) {
                     metadata.insert("topic".to_string(), serde_json::Value::String(topic));
                 }
-                if let Some(cmid) = req
-                    .client_message_id
-                    .clone()
-                    .filter(|value| !value.is_empty())
-                {
+                if let Some(cmid) = request_thread_id.clone() {
                     metadata.insert(
                         "client_message_id".to_string(),
                         serde_json::Value::String(cmid),
@@ -1635,10 +1680,7 @@ async fn handle_chat(
                 }
                 serde_json::Value::Object(metadata)
             },
-            message_id: req
-                .client_message_id
-                .clone()
-                .filter(|value| !value.is_empty()),
+            message_id: request_thread_id.clone(),
         };
 
         if let Err(e) = state.inbound_tx.send(inbound).await {
@@ -2931,6 +2973,287 @@ mod tests {
             inbound.message_id.is_none(),
             "empty client_message_id must not populate inbound.message_id, got {:?}",
             inbound.message_id,
+        );
+    }
+
+    /// M9 #674/#675 phase 1b: a request carrying the canonical
+    /// `thread_id` field (no legacy `client_message_id`) must be
+    /// accepted and propagate the value as the InboundMessage
+    /// `message_id` and the metadata bag's `client_message_id` key
+    /// (wire alias for one release per the #679 deprecation window).
+    /// The sticky thread_id map must be seeded too — same observable
+    /// contract as `chat_request_seeds_thread_id_for_first_event_and_sticky_map`
+    /// but driven from the canonical field.
+    #[tokio::test]
+    async fn chat_request_accepts_canonical_thread_id_field() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let last_thread_id = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+                last_thread_id: last_thread_id.clone(),
+            });
+
+        // Canonical field only — no legacy `client_message_id` on the wire.
+        let body = serde_json::json!({
+            "message": "hello via canonical thread_id",
+            "session_id": "web-675b-canonical",
+            "thread_id": "thread-canonical-xyz",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("inbound channel timed out")
+                .expect("inbound channel closed without a message");
+
+        assert_eq!(
+            inbound.message_id.as_deref(),
+            Some("thread-canonical-xyz"),
+            "canonical `thread_id` field must populate InboundMessage.message_id (M9 #675 phase 1b)",
+        );
+        assert_eq!(
+            inbound
+                .metadata
+                .get("client_message_id")
+                .and_then(|v| v.as_str()),
+            Some("thread-canonical-xyz"),
+            "metadata `client_message_id` (wire alias) must carry the canonical thread_id for one release per #679",
+        );
+
+        let map = last_thread_id.lock().await;
+        assert_eq!(
+            map.get("web-675b-canonical").map(String::as_str),
+            Some("thread-canonical-xyz"),
+            "sticky map must be seeded from the canonical thread_id, got {map:?}",
+        );
+    }
+
+    /// M9 #675 phase 1b: legacy `client_message_id` clients must keep
+    /// working unchanged when `thread_id` is absent from the request.
+    /// Regression guard for the alias-deprecation window before #679
+    /// drops the legacy field entirely.
+    #[tokio::test]
+    async fn chat_request_falls_back_to_legacy_client_message_id_when_thread_id_absent() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let last_thread_id = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+                last_thread_id: last_thread_id.clone(),
+            });
+
+        // Legacy wire shape only — no canonical `thread_id`.
+        let body = serde_json::json!({
+            "message": "hello via legacy alias",
+            "session_id": "web-675b-legacy",
+            "client_message_id": "legacy-cmid-abc",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("inbound channel timed out")
+                .expect("inbound channel closed without a message");
+
+        assert_eq!(
+            inbound.message_id.as_deref(),
+            Some("legacy-cmid-abc"),
+            "legacy `client_message_id` must still populate InboundMessage.message_id when canonical thread_id is absent",
+        );
+        assert_eq!(
+            inbound
+                .metadata
+                .get("client_message_id")
+                .and_then(|v| v.as_str()),
+            Some("legacy-cmid-abc"),
+            "metadata `client_message_id` must carry the legacy value unchanged",
+        );
+
+        let map = last_thread_id.lock().await;
+        assert_eq!(
+            map.get("web-675b-legacy").map(String::as_str),
+            Some("legacy-cmid-abc"),
+            "sticky map must be seeded from the legacy alias when thread_id is absent, got {map:?}",
+        );
+    }
+
+    /// M9 #675 phase 1b: when BOTH `thread_id` and the legacy
+    /// `client_message_id` are present on the request, the canonical
+    /// `thread_id` wins. Locks down the alias-deprecation precedence
+    /// rule so clients migrating field-by-field cannot accidentally
+    /// regress to the legacy value.
+    #[tokio::test]
+    async fn chat_request_thread_id_wins_over_legacy_client_message_id() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let last_thread_id = Arc::new(Mutex::new(HashMap::new()));
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+                last_thread_id: last_thread_id.clone(),
+            });
+
+        let body = serde_json::json!({
+            "message": "both fields present",
+            "session_id": "web-675b-both",
+            "thread_id": "canonical-wins",
+            "client_message_id": "legacy-loses",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("inbound channel timed out")
+                .expect("inbound channel closed without a message");
+
+        assert_eq!(
+            inbound.message_id.as_deref(),
+            Some("canonical-wins"),
+            "canonical `thread_id` must outrank legacy `client_message_id` on the InboundMessage",
+        );
+        assert_eq!(
+            inbound
+                .metadata
+                .get("client_message_id")
+                .and_then(|v| v.as_str()),
+            Some("canonical-wins"),
+            "metadata `client_message_id` (wire alias) must carry the canonical thread_id value, not the legacy field's",
+        );
+
+        let map = last_thread_id.lock().await;
+        assert_eq!(
+            map.get("web-675b-both").map(String::as_str),
+            Some("canonical-wins"),
+            "sticky map must reflect canonical thread_id precedence, got {map:?}",
+        );
+    }
+
+    /// M9 #675 phase 1b: an empty canonical `thread_id` is treated
+    /// the same as "absent" — matches the long-standing
+    /// `client_message_id` treatment, and lets the fallback path
+    /// recover the legacy value when present.
+    #[tokio::test]
+    async fn chat_request_empty_thread_id_falls_back_to_legacy_client_message_id() {
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/chat", post(handle_chat))
+            .with_state(ApiState {
+                inbound_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                watchers: Arc::new(Mutex::new(HashMap::new())),
+                auth_token: None,
+                profile_id: Some(TEST_PROFILE_ID.to_string()),
+                sessions: test_sessions(),
+                task_query: None,
+                task_cancel: None,
+                task_relaunch: None,
+                on_session_deleted: None,
+                metrics_renderer: None,
+                last_thread_id: Arc::new(Mutex::new(HashMap::new())),
+            });
+
+        let body = serde_json::json!({
+            "message": "empty canonical, legacy populated",
+            "session_id": "web-675b-empty-canonical",
+            "thread_id": "",
+            "client_message_id": "legacy-recovers",
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_millis(500), inbound_rx.recv())
+                .await
+                .expect("inbound channel timed out")
+                .expect("inbound channel closed without a message");
+
+        assert_eq!(
+            inbound.message_id.as_deref(),
+            Some("legacy-recovers"),
+            "empty canonical `thread_id` must fall through to the legacy `client_message_id` (matches the empty-cmid normalization rule)",
         );
     }
 

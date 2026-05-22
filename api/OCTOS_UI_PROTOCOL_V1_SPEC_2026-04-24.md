@@ -334,6 +334,39 @@ collapses to the per-thread `seq`. Specifically:
   `appendCompletionBubble` / `message/persisted` consumers continue to
   work until `M9-γ-3` removes them.
 
+### 5.2 `ChatRequest.thread_id` canonicalization (M9 #674 / #675 phase 1b)
+
+On the request side, `POST /chat` (and the equivalent WS `turn/start`
+ingress) accepts a canonical `thread_id` field on the request body:
+
+```json
+{
+  "message": "<user prompt>",
+  "session_id": "web-...",
+  "thread_id": "<per-turn cluster identity>",
+  ...
+}
+```
+
+- `thread_id` is the **canonical per-turn identity** for the inbound
+  side, mirroring `Envelope.thread_id` on the egress side. New clients
+  SHOULD populate this field directly.
+- The legacy `client_message_id` field on the request body is retained
+  as a **wire alias** for one release per the alias-deprecation window
+  tracked by M9 #679. The server ingress accepts either name.
+- **Precedence** — when both `thread_id` and `client_message_id` are
+  present, the canonical `thread_id` wins. Empty / sentinel-empty
+  values on either field are treated as absent.
+- Removal — the `client_message_id` alias is scheduled for removal in
+  the same release that closes M9 #679, after one full release of
+  dual-acceptance overlap. Clients SHOULD migrate to `thread_id`
+  before that window closes.
+- The downstream propagation chain (the inbound's `metadata`
+  `client_message_id` key and `InboundMessage.message_id`) retains its
+  legacy field names in this PR; the rename to
+  `Origin.thread_id` lands separately in the parallel PR-1a of the same
+  epic.
+
 ## 6. Envelope Model
 
 Client commands are JSON-RPC requests.
