@@ -86,12 +86,16 @@ if [ -n "$merge_base" ] && [ -n "$head_sha" ] && [ "$merge_base" = "$head_sha" ]
 fi
 
 if [ -z "$merge_base" ] || [ "$base_equals_head" -eq 1 ]; then
-  # Probe the working tree for any protocol/spec changes via `git status`.
-  # If something is staged or untracked we can still run; otherwise reject.
+  # Probe the working tree for any uncommitted *trigger* changes only.
+  # A stray untracked UPCR / template / spec edit must NOT mask a committed
+  # protocol change here — that bypass was codex review #7. We're trying to
+  # answer "is there real protocol work in the working tree that justifies
+  # running in uncommitted-only mode?", and only protocol-code and spec-doc
+  # files (the trigger set) can answer yes.
   uncommitted_probe="$(
     git status --porcelain --untracked-files=all -- \
       "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}" "$SPEC_GLOB" \
-      "$UPCR_GLOB" "$UPCR_TEMPLATE" 2>/dev/null || true
+      2>/dev/null || true
   )"
   if [ -z "$uncommitted_probe" ]; then
     if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
@@ -106,8 +110,13 @@ override; either none resolved or the resolved ref points to HEAD itself
 state because that lets committed protocol changes slip through CI.
 
 Fix: fetch a real base (e.g. `git fetch --no-tags origin main`), or set
-UPCR_BASE_REF=<sha-or-ref> that is an ancestor of HEAD (e.g. HEAD~1 or the
-previous main SHA), or set UPCR_ALLOW_NO_DOC=1 only for a documented
+UPCR_BASE_REF=<sha-or-ref> that points to the actual target branch this
+PR/branch is built against (e.g. the merge-base SHA against origin/main,
+or the commit of the target branch tip). Do NOT use `HEAD~1` for branches
+that contain multiple commits — the gate would diff only the last commit
+and report no protocol-visible edits even when an earlier commit on the
+branch touched protocol Rust. Use `HEAD~1` only as a single-commit-only
+case. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a documented
 reviewer override.
 EOF
     exit 2

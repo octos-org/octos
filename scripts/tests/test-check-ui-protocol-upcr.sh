@@ -24,6 +24,9 @@
 #      UPCR) -> exit non-zero (codex #5 — deleted UPCR is not coverage).
 #  14. Resolved base ref equals HEAD (single-branch CI) -> exit non-zero
 #      (codex #6 — closes HEAD..HEAD silent-empty-diff bypass).
+#  15. Missing base ref + committed protocol change + untracked UPCR
+#      template (no uncommitted protocol/spec trigger) -> exit non-zero
+#      (codex #7 — coverage docs must not unblock the missing-base probe).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -434,6 +437,35 @@ scenario_base_equals_head_fails() {
 }
 
 scenario_base_equals_head_fails
+
+# Scenario 15: shallow checkout with no base ref AND a committed protocol
+# change AND a stray untracked UPCR-template. The recovery probe must look
+# only at trigger files (protocol code + spec), not coverage docs, or a
+# stale UPCR/template would mask the committed protocol bypass. Codex
+# review #7.
+scenario_missing_base_with_untracked_template_fails() {
+  local dir
+  dir="$(make_repo 0)"
+  (
+    cd "$dir"
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    git add -A
+    git commit --quiet -m "feat: extend"
+    # Drop a stray untracked UPCR template into the working tree.
+    printf '# template stub\n' \
+      > docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
+    pass "stray untracked template does not unblock missing-base probe"
+  else
+    fail "stray template bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_missing_base_with_untracked_template_fails
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"
