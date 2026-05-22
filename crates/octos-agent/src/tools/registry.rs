@@ -412,9 +412,17 @@ impl ToolRegistry {
         let tool: Arc<dyn Tool> = Arc::new(tool);
         self.tools.insert(name.clone(), tool.clone());
         if name == "spawn" {
+            let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
+            self.tools
+                .insert("spawn_agent".to_string(), spawn_agent.clone());
+            // #1172: the `delegate` alias wraps spawn_agent + wait_agent.
+            // Re-bind it whenever spawn_agent moves so the Codex alias
+            // sees the live delegate, not the no-op default.
             self.tools.insert(
-                "spawn_agent".to_string(),
-                Arc::new(SpawnAgentTool::with_delegate(tool)),
+                "delegate".to_string(),
+                Arc::new(super::coding_tools::DelegateAliasTool::with_spawn_agent(
+                    spawn_agent,
+                )),
             );
         }
         self.invalidate_cache();
@@ -425,9 +433,14 @@ impl ToolRegistry {
         let name = tool.name().to_string();
         self.tools.insert(name.clone(), tool.clone());
         if name == "spawn" {
+            let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
+            self.tools
+                .insert("spawn_agent".to_string(), spawn_agent.clone());
             self.tools.insert(
-                "spawn_agent".to_string(),
-                Arc::new(SpawnAgentTool::with_delegate(tool)),
+                "delegate".to_string(),
+                Arc::new(super::coding_tools::DelegateAliasTool::with_spawn_agent(
+                    spawn_agent,
+                )),
             );
         }
         self.invalidate_cache();
@@ -1166,7 +1179,16 @@ impl ToolRegistry {
                 .with_approval_policy(permissions.approval_policy),
         );
         registry.register(
-            ExecCommandTool::new(cwd, sandbox)
+            ExecCommandTool::new(cwd, sandbox.clone())
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        // #1172: Codex-compatible `bash` alias. Shares command policy /
+        // approval policy / sandbox with `shell` and `exec_command`, so a
+        // deny in one path denies in all three.
+        registry.register(
+            super::coding_tools::BashTool::new(cwd, sandbox)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
                 .with_approval_policy(permissions.approval_policy),
@@ -1175,6 +1197,12 @@ impl ToolRegistry {
         registry.register(UpdatePlanTool);
         registry.register(RequestUserInputTool);
         registry.register(SpawnAgentTool::new());
+        // #1172: Codex-compatible `delegate` one-call wrapper. The default
+        // instance has no spawn_agent bound — `register("spawn")` swaps
+        // both `spawn_agent` and `delegate` in lockstep, so when the
+        // session runtime wires a native spawn delegate this alias picks
+        // up the live one.
+        registry.register(super::coding_tools::DelegateAliasTool::new());
         registry.register(SendInputTool);
         registry.register(ResumeAgentTool);
         registry.register(WaitAgentTool);
@@ -1282,6 +1310,10 @@ impl ToolRegistry {
     pub const CWD_BOUND_TOOLS: &'static [&'static str] = &[
         "shell",
         "exec_command",
+        // #1172: `bash` alias holds a workspace base_dir for workdir
+        // resolution and must follow `rebind_cwd` so a re-scoped session
+        // doesn't keep running commands under the old project root.
+        "bash",
         "read_file",
         "write_file",
         "apply_patch",
@@ -1335,7 +1367,14 @@ impl ToolRegistry {
                 .with_approval_policy(permissions.approval_policy),
         );
         registry.register(
-            ExecCommandTool::new(cwd, sandbox)
+            ExecCommandTool::new(cwd, sandbox.clone())
+                .with_filesystem_scope(permissions.filesystem_scope)
+                .with_policy(permissions.shell_command_policy())
+                .with_approval_policy(permissions.approval_policy),
+        );
+        // #1172: re-register the `bash` alias against the new cwd.
+        registry.register(
+            super::coding_tools::BashTool::new(cwd, sandbox)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
                 .with_approval_policy(permissions.approval_policy),

@@ -52,6 +52,13 @@ pub(crate) const CODING_IMAGE_VIEW_CAPABILITY_V1: &str = "coding.image_view.v1";
 pub(crate) const CODING_DYNAMIC_TOOL_SEARCH_CAPABILITY_V1: &str = "coding.dynamic_tool_search.v1";
 #[allow(dead_code)]
 pub(crate) const CODING_IMAGE_GENERATION_CAPABILITY_V1: &str = "coding.image_generation.v1";
+// #1172 — Codex naming-parity aliases. The underlying capability already
+// rides on `shell` / `exec_command`, `spawn_agent` + `wait_agent`, and the
+// (compile-time) browser tool, so these flags exist to advertise the
+// Codex-compatible spellings to clients negotiating tool surface area.
+pub(crate) const CODING_BASH_CAPABILITY_V1: &str = "coding.bash.v1";
+pub(crate) const CODING_DELEGATE_CAPABILITY_V1: &str = "coding.delegate.v1";
+pub(crate) const CODING_BROWSER_CAPABILITY_V1: &str = "coding.browser.v1";
 
 // UPCR-2026-020 §8 typed error kinds. Used in structured RpcError `data.kind`
 // fields when the corresponding failure mode is hit. Declared centrally so
@@ -116,6 +123,12 @@ pub(crate) const OCTOS_KNOWN_MODEL_VISIBLE_TOOLS: &[&str] = &[
     "view_image",
     "tool_search",
     "tool_suggest",
+    // #1172 — Codex naming-parity aliases. `bash` shares the runtime with
+    // `shell` / `exec_command`; `delegate` chains `spawn_agent` +
+    // `wait_agent` so the Codex-compatible one-call lifecycle is visible
+    // alongside the canonical primitives.
+    "bash",
+    "delegate",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +562,26 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
         policy: "allowed",
         detail: None,
     },
+    // #1172 — Codex naming-parity aliases. Surface them in the tool
+    // contract so `tool/status/list` advertises the new spellings.
+    OctosToolSpec {
+        name: "bash",
+        category: "runtime",
+        aliases: &["shell", "exec_command"],
+        policy: "approval_gated",
+        detail: Some(
+            "Codex-compatible one-shot shell alias. Shares the command policy / approval policy / sandbox with shell and exec_command.",
+        ),
+    },
+    OctosToolSpec {
+        name: "delegate",
+        category: "agent",
+        aliases: &["spawn_agent", "wait_agent"],
+        policy: "allowed",
+        detail: Some(
+            "Codex-compatible one-call wrapper: spawn_agent + wait_agent + result extraction. Role resolves through the M14-C role template registry.",
+        ),
+    },
 ];
 
 pub(crate) fn tool_status_list_payload(context: ToolStatusListContext<'_>) -> Value {
@@ -903,6 +936,10 @@ mod tests {
             CODING_IMAGE_GENERATION_CAPABILITY_V1,
             "coding.image_generation.v1"
         );
+        // #1172 — Codex naming-parity capability flags.
+        assert_eq!(CODING_BASH_CAPABILITY_V1, "coding.bash.v1");
+        assert_eq!(CODING_DELEGATE_CAPABILITY_V1, "coding.delegate.v1");
+        assert_eq!(CODING_BROWSER_CAPABILITY_V1, "coding.browser.v1");
 
         // Typed error kinds (UPCR §8).
         assert_eq!(
@@ -1115,6 +1152,55 @@ mod tests {
                 "P1 canonical tool {required} must be registered by \
                  ToolRegistry::with_builtins_and_sandbox so the M14 coding \
                  tool contract can advertise it. Registered tool names: {names:?}"
+            );
+        }
+    }
+
+    /// #1172 — Codex naming-parity aliases (`bash`, `delegate`) must
+    /// be registered by `with_builtins` so a Codex-trained model hits
+    /// them on first call. Browser stays under the same registration
+    /// table; if it ever moves behind a feature flag, this guard fires.
+    #[test]
+    fn codex_naming_aliases_are_registered_by_session_builtins() {
+        use octos_agent::ToolRegistry;
+        use octos_agent::sandbox::NoSandbox;
+
+        let cwd = std::path::Path::new("/tmp");
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
+        let names: std::collections::HashSet<String> = registry.tool_names().into_iter().collect();
+
+        for required in &["bash", "delegate", "browser"] {
+            assert!(
+                names.contains(*required),
+                "{required} must be registered by \
+                 ToolRegistry::with_builtins_and_sandbox so the Codex \
+                 naming-parity contract can advertise it. Registered: {names:?}"
+            );
+        }
+    }
+
+    /// #1172 — `bash`, `delegate`, `browser` must appear in the
+    /// contract's `tools` array when the runtime reports them as
+    /// available. Without these entries the AppUI inspection flow
+    /// can't render the new aliases.
+    #[test]
+    fn codex_naming_aliases_appear_in_contract_tools_array() {
+        let available = &["bash", "delegate", "browser"];
+        let context = ToolStatusListContext {
+            available_model_tools: available,
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let tools = payload["tools"].as_array().expect("tools array");
+        for name in available {
+            let entry = tools
+                .iter()
+                .find(|tool| tool["name"] == json!(name))
+                .unwrap_or_else(|| panic!("alias {name} must appear in contract tools array"));
+            assert_eq!(
+                entry["status"],
+                json!(TOOL_STATUS_AVAILABLE),
+                "alias {name} must report `available` when registered",
             );
         }
     }

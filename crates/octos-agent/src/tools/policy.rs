@@ -165,8 +165,12 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     },
     ToolGroupInfo {
         name: "group:runtime",
+        // #1172: include the Codex-compatible `bash` alias so a policy
+        // denying / deferring `group:runtime` covers every shell entry
+        // point. Otherwise a profile that disabled runtime execution
+        // would still be reachable via `bash(cmd=…)`.
         description: "Shell command execution",
-        tools: &["shell", "exec_command", "write_stdin"],
+        tools: &["shell", "exec_command", "write_stdin", "bash"],
     },
     ToolGroupInfo {
         name: "group:web",
@@ -180,6 +184,13 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
     },
     ToolGroupInfo {
         name: "group:sessions",
+        // #1172: include the Codex-compatible `delegate` one-call
+        // wrapper so a policy denying / deferring `group:sessions`
+        // covers every subagent entry point. The wrapper keeps an
+        // Arc<dyn Tool> for the bound `spawn_agent`, so a policy that
+        // removes `spawn` / `spawn_agent` from the visible registry
+        // would still leave `delegate` capable of spawning a child
+        // without this entry.
         description: "Spawn background subagents for parallel tasks",
         tools: &[
             "spawn",
@@ -188,6 +199,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
             "resume_agent",
             "wait_agent",
             "close_agent",
+            "delegate",
         ],
     },
     ToolGroupInfo {

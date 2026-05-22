@@ -1497,6 +1497,671 @@ simple_codex_tool!(
 );
 
 // ---------------------------------------------------------------------------
+// #1172 — Codex naming-parity aliases: `bash`, `delegate`.
+//
+// Codex CLI exposes these model-visible names alongside the canonical
+// Octos surface (`shell` / `exec_command`, `spawn_agent` + `wait_agent`).
+// A Codex-trained model emitting `bash(cmd=…)` or `delegate(role=…)`
+// without these aliases hits "tool not found" first and recovers via
+// `tool_search` on the retry. Registering the aliases removes that
+// first-call round trip without changing the underlying capability set.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
+const MAX_BASH_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Debug, Deserialize)]
+struct BashInput {
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    workdir: Option<String>,
+}
+
+/// Codex-compatible `bash` alias.
+///
+/// One-shot, non-PTY shell entrypoint. Mirrors Codex CLI 0.131.0's
+/// `bash(cmd, timeout_ms?)` shape so a Codex-trained model lands on the
+/// alias directly instead of probing `tool_search` first. Shares the
+/// command policy + approval policy + sandbox with `exec_command` /
+/// `shell` so a deny in one path denies in all three; the bash schema
+/// is intentionally minimal (`cmd` + optional `timeout_ms`) to keep the
+/// surface area visible to the model small.
+pub struct BashTool {
+    base_dir: PathBuf,
+    filesystem_scope: FilesystemScope,
+    policy: Arc<dyn CommandPolicy>,
+    approval_policy: ApprovalPolicy,
+    sandbox: Arc<dyn Sandbox>,
+}
+
+impl BashTool {
+    pub fn new(base_dir: impl Into<PathBuf>, sandbox: Arc<dyn Sandbox>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
+            policy: Arc::new(crate::policy::SafePolicy::default()),
+            approval_policy: ApprovalPolicy::Ask,
+            sandbox,
+        }
+    }
+
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
+    }
+
+    pub fn with_policy(mut self, policy: Arc<dyn CommandPolicy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn with_approval_policy(mut self, approval_policy: ApprovalPolicy) -> Self {
+        self.approval_policy = approval_policy;
+        self
+    }
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "Run a one-shot shell command and return stdout/stderr. Non-PTY, non-interactive. Codex-compatible alias of exec_command / shell with a stripped-down schema (`cmd`, optional `timeout_ms`)."
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["runtime", "code"]
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        // Same rationale as ShellTool / ExecCommandTool: filesystem-
+        // mutating shell invocations cannot race other tool calls.
+        ConcurrencyClass::Exclusive
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "The shell command to execute"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": MAX_BASH_TIMEOUT_SECS * 1000,
+                    "description": "Optional timeout in milliseconds (default 120000)"
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional working directory relative to the workspace"
+                }
+            },
+            "required": ["cmd"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        let input: BashInput =
+            serde_json::from_value(args.clone()).wrap_err("invalid bash tool input")?;
+        let Some(command) = input.cmd.clone().or_else(|| input.command.clone()) else {
+            return Ok(ToolResult {
+                output: "bash requires `cmd`".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let cwd = match resolve_optional_workdir(
+            &self.base_dir,
+            input.workdir.as_deref(),
+            self.filesystem_scope,
+        ) {
+            Ok(cwd) => cwd,
+            Err(output) => {
+                return Ok(ToolResult {
+                    output,
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
+        if let Some(result) = request_command_approval(
+            self.name(),
+            &command,
+            &cwd,
+            &self.policy,
+            self.approval_policy,
+        )
+        .await
+        {
+            return Ok(result);
+        }
+
+        let timeout_secs = input
+            .timeout_ms
+            .map(|ms| ms.div_ceil(1000))
+            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
+            .clamp(1, MAX_BASH_TIMEOUT_SECS);
+
+        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // codex review (#1172) P2 (follow-up): put the child in its own
+        // process group BEFORE spawn so the negative-PID kill below
+        // reaches every grandchild it forked. Without this, a command
+        // like `bash(cmd="(sleep 60; touch late) & wait", timeout_ms=1000)`
+        // would leave the backgrounded `sleep` alive in the original
+        // process group and the timeout cleanup would only kill the
+        // wrapper shell. `process_group(0)` is the Unix-only knob; on
+        // Windows job objects would be the analogue but `taskkill /F /T`
+        // already walks the process tree.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return Ok(ToolResult {
+                    output: format!("Failed to execute command: {error}"),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+        // codex review (#1172) P2: `tokio::process::Child` does NOT
+        // kill the underlying process on drop, so a `timeout()` that
+        // expires would leave the shell running and able to mutate
+        // the workspace later. Save the PID before `wait_with_output`
+        // takes ownership of the child, then on timeout send
+        // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
+        // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
+        let child_pid = child.id();
+        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let mut text = String::new();
+                text.push_str(&String::from_utf8_lossy(&output.stdout));
+                if !output.stderr.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str("\n--- stderr ---\n");
+                    }
+                    text.push_str(&String::from_utf8_lossy(&output.stderr));
+                }
+                if text.is_empty() {
+                    text.push_str("(no output)");
+                }
+                let exit_code = output.status.code().unwrap_or(-1);
+                text.push_str(&format!("\n\nExit code: {exit_code}"));
+                Ok(ToolResult {
+                    output: truncate_output(text, MAX_CAPTURE_BYTES),
+                    success: output.status.success(),
+                    structured_metadata: Some(json!({
+                        "codex_tool": "bash",
+                        "octos_tool": "exec_command",
+                        "exit_code": exit_code,
+                    })),
+                    ..Default::default()
+                })
+            }
+            Ok(Err(error)) => Ok(ToolResult {
+                output: format!("Failed to execute command: {error}"),
+                success: false,
+                ..Default::default()
+            }),
+            Err(_) => {
+                kill_timed_out_child(child_pid).await;
+                Ok(ToolResult {
+                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
+/// Best-effort kill of a child whose `wait_with_output()` was dropped
+/// when a `tokio::time::timeout` expired. Mirrors `ShellTool`'s
+/// kill-on-timeout: SIGTERM the process group/tree, brief grace period,
+/// then SIGKILL if any process remains. On Windows uses `taskkill /F /T`.
+/// Errors are swallowed because the call is best-effort cleanup —
+/// the timeout result has already been returned to the caller.
+async fn kill_timed_out_child(child_pid: Option<u32>) {
+    let Some(pid) = child_pid else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        let descendants = collect_descendant_pids(pid);
+        signal_process_group(pid, "-15");
+        signal_pids(&descendants, "-15");
+        signal_process(pid, "-15");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut remaining = descendants;
+        remaining.extend(collect_descendant_pids(pid));
+        remaining.sort_unstable();
+        remaining.dedup();
+
+        if process_group_exists(pid)
+            || process_exists(pid)
+            || remaining
+                .iter()
+                .any(|descendant| process_exists(*descendant))
+        {
+            signal_process_group(pid, "-9");
+            signal_pids(&remaining, "-9");
+            signal_process(pid, "-9");
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command as StdCommand;
+        let _ = StdCommand::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: &str) -> bool {
+    use std::process::Command as StdCommand;
+
+    let group = format!("-{pid}");
+    StdCommand::new("kill")
+        .args([signal, "--", &group])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: &str) -> bool {
+    use std::process::Command as StdCommand;
+
+    StdCommand::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn signal_pids(pids: &[u32], signal: &str) {
+    for pid in pids {
+        signal_process(*pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    signal_process_group(pid, "-0")
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    signal_process(pid, "-0")
+}
+
+#[cfg(unix)]
+fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    use std::process::Command as StdCommand;
+
+    let output = match StdCommand::new("ps").args(["-eo", "pid=,ppid="]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        children_by_parent.entry(ppid).or_default().push(pid);
+    }
+
+    let mut descendants = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = children_by_parent
+        .get(&root_pid)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        descendants.push(pid);
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    descendants
+}
+
+#[derive(Debug, Deserialize)]
+struct DelegateInput {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+const DEFAULT_DELEGATE_TIMEOUT_MS: u64 = 300_000;
+const MAX_DELEGATE_TIMEOUT_MS: u64 = 3_600_000;
+
+/// Codex-compatible `delegate` one-call wrapper.
+///
+/// Chains `spawn_agent` (start a supervised subagent) → `wait_agent`
+/// (block until terminal) → extract result. Codex CLI exposes this as
+/// a convenience for clients that don't want to manage the
+/// spawn/wait/close lifecycle by hand.
+///
+/// `role` is resolved through the M14-C `RoleTemplate` registry when
+/// the name matches one of the four canonical roles (`reviewer`,
+/// `implementer`, `test_worker`, `explorer`); unknown role names are
+/// rejected at the tool boundary so a typo (`"review"` vs `"reviewer"`)
+/// surfaces immediately instead of silently smuggling an unbounded
+/// prompt through.
+///
+/// Wiring note (#971 partial): the role template's `prompt_prefix` and
+/// `allowed_tools` budget are folded into the spawn arguments here, but
+/// concrete sandbox / approval policy enforcement still flows through
+/// the underlying `spawn_agent` delegate. When #971 fully lands, this
+/// tool will pick up policy gating "for free" through the upgraded
+/// spawn_agent contract.
+pub struct DelegateAliasTool {
+    spawn_agent: Option<Arc<dyn Tool>>,
+}
+
+impl Default for DelegateAliasTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DelegateAliasTool {
+    pub fn new() -> Self {
+        Self { spawn_agent: None }
+    }
+
+    pub fn with_spawn_agent(spawn_agent: Arc<dyn Tool>) -> Self {
+        Self {
+            spawn_agent: Some(spawn_agent),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DelegateAliasTool {
+    fn name(&self) -> &str {
+        "delegate"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn a supervised Codex-compatible subagent, wait for it to finish, and return the result + artifacts. One-call wrapper around `spawn_agent` + `wait_agent`. `role` resolves through the M14-C role template registry (reviewer / implementer / test_worker / explorer)."
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["gateway", "code"]
+    }
+
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "description": "Subagent role: reviewer, implementer, test_worker, or explorer"
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Task description for the subagent"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": MAX_DELEGATE_TIMEOUT_MS,
+                    "description": "How long to wait for the child to terminate (default 300000)"
+                }
+            },
+            "required": ["role", "task"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let input: DelegateInput =
+            serde_json::from_value(args.clone()).wrap_err("invalid delegate input")?;
+        let Some(role) = input
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "delegate requires `role`".to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "delegate",
+                    "error_kind": "coding_tool_denied",
+                    "reason": "missing_role",
+                })),
+                ..Default::default()
+            });
+        };
+        let Some(task) = input
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "delegate requires `task`".to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "delegate",
+                    "error_kind": "coding_tool_denied",
+                    "reason": "missing_task",
+                })),
+                ..Default::default()
+            });
+        };
+        // Resolve role through the typed registry. Unknown role names
+        // are rejected at the boundary so drift (`"review"` vs
+        // `"reviewer"`) doesn't silently smuggle an undeclared prompt
+        // prefix through.
+        let template = match crate::role_template::RoleTemplate::for_name(role) {
+            Some(template) => template,
+            None => {
+                let canonical: Vec<&str> = crate::role_template::RoleTemplate::all()
+                    .iter()
+                    .map(|tpl| tpl.name)
+                    .collect();
+                return Ok(ToolResult {
+                    output: format!(
+                        "delegate: unknown role {role:?}; canonical roles: {canonical:?}"
+                    ),
+                    success: false,
+                    structured_metadata: Some(json!({
+                        "codex_tool": "delegate",
+                        "error_kind": "coding_tool_denied",
+                        "reason": "unknown_role",
+                        "role": role,
+                        "canonical_roles": canonical,
+                    })),
+                    ..Default::default()
+                });
+            }
+        };
+
+        let Some(spawn_agent) = self.spawn_agent.as_ref() else {
+            return Ok(ToolResult {
+                output: "delegate requires the session runtime to register a spawn_agent delegate"
+                    .to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "delegate",
+                    "error_kind": "coding_tool_missing",
+                    "reason": "spawn_agent_unbound",
+                })),
+                ..Default::default()
+            });
+        };
+
+        let Some(supervisor) = ctx.task_supervisor.as_ref().cloned() else {
+            return Ok(ToolResult {
+                output: "delegate requires a task supervisor in ToolContext".to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "delegate",
+                    "error_kind": "coding_tool_missing",
+                    "reason": "supervisor_unbound",
+                })),
+                ..Default::default()
+            });
+        };
+
+        // Build the effective spawn payload: fold the role's prompt
+        // prefix into the task and pass the role + allowed_tools budget
+        // through so the supervisor / orchestrator can advertise them.
+        let task_prompt = if template.prompt_prefix.is_empty() {
+            task.to_string()
+        } else {
+            format!("{}\n\n{}", template.prompt_prefix, task)
+        };
+        let spawn_args = json!({
+            "task": task_prompt,
+            "label": format!("delegate-{}", template.name),
+            "mode": "background",
+            "role": template.name,
+            "allowed_tools": template.allowed_tools,
+        });
+
+        let before: HashSet<String> = supervisor
+            .get_all_tasks()
+            .into_iter()
+            .map(|task| task.id)
+            .collect();
+        let spawn_result = spawn_agent.execute_with_context(ctx, &spawn_args).await?;
+        if !spawn_result.success {
+            return Ok(ToolResult {
+                output: format!("delegate: spawn_agent failed: {}", spawn_result.output),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "delegate",
+                    "error_kind": "coding_tool_missing",
+                    "reason": "spawn_agent_failed",
+                    "role": template.name,
+                })),
+                ..Default::default()
+            });
+        };
+        let Some(task_record) = newest_spawned_task(&supervisor, &before) else {
+            return Ok(ToolResult {
+                output: "delegate: spawn_agent did not register a new task with the supervisor"
+                    .to_string(),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "delegate",
+                    "error_kind": "coding_tool_missing",
+                    "reason": "spawn_agent_no_task",
+                    "role": template.name,
+                })),
+                ..Default::default()
+            });
+        };
+        let agent_id = task_record.id;
+
+        // Block until the child reaches a terminal lifecycle state or
+        // the caller-specified timeout fires. Mirrors `wait_agent_body`
+        // so the contract stays identical.
+        let timeout_ms = input
+            .timeout_ms
+            .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_MS)
+            .min(MAX_DELEGATE_TIMEOUT_MS);
+        let started = Instant::now();
+        let final_task = loop {
+            let snapshot = supervisor.get_task(&agent_id);
+            let is_terminal = snapshot
+                .as_ref()
+                .is_some_and(|task| task.status.is_terminal());
+            if is_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        let (status_str, result_text, artifacts, error_text, terminal, child_session_key) =
+            match final_task {
+                Some(task) => (
+                    task.status.as_str().to_string(),
+                    task.summary.clone().unwrap_or_default(),
+                    task.output_files.clone(),
+                    task.error.clone(),
+                    task.status.is_terminal(),
+                    task.child_session_key.clone(),
+                ),
+                None => (
+                    "unknown".to_string(),
+                    String::new(),
+                    Vec::new(),
+                    Some(format!("agent {agent_id} not found in supervisor")),
+                    true,
+                    None,
+                ),
+            };
+        let timed_out = !terminal && status_str != "unknown";
+        let success = terminal && status_str == TaskStatus::Completed.as_str();
+        let payload = json!({
+            "agent_id": agent_id,
+            "role": template.name,
+            "status": status_str,
+            "result": result_text,
+            "artifacts": artifacts,
+            "error": error_text,
+            "terminal": terminal,
+            "timed_out": timed_out,
+            "child_session_key": child_session_key,
+        });
+        Ok(ToolResult {
+            output: payload.to_string(),
+            success,
+            structured_metadata: Some(json!({
+                "codex_tool": "delegate",
+                "role": template.name,
+                "agent_id": agent_id,
+                "artifacts": artifacts,
+                "terminal": terminal,
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #972 / M14-B P1 tools: `view_image`, `tool_search`, `tool_suggest`.
 //
 // These complete the Codex-compatible coding tool surface declared by
@@ -1833,22 +2498,6 @@ fn read_image_header_no_follow(
     Ok((header, byte_length))
 }
 
-/// Walk every ancestor of `resolved` (including `resolved` itself)
-/// and refuse if any one is a symlink or Windows reparse point.
-/// Stops at `workspace_root` (inclusive) so we never recurse into
-/// system roots. Returns `Ok(())` when none of the inspected entries
-/// are symlinks; returns `PermissionDenied` with a descriptive
-/// message when any are.
-///
-/// Safety properties:
-///
-/// * Uses `symlink_metadata`, which does NOT follow the link, so a
-///   symlinked ancestor is correctly classified.
-/// * Terminates at the workspace root even if `resolved` does not
-///   actually live under it (in which case the walk runs out of
-///   ancestors and returns `Ok(())` — containment was already
-///   checked by `resolve_path_with_scope`).
-/// * Hard-bounded by `Path::ancestors`, which is finite.
 /// Leaf-only symlink check for host-scope reads. Equivalent to the
 /// final iteration of `reject_symlink_ancestors` but without walking
 /// upward — host scope intentionally accepts paths outside the
@@ -1872,6 +2521,22 @@ fn reject_leaf_symlink(resolved: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Walk every ancestor of `resolved` (including `resolved` itself)
+/// and refuse if any one is a symlink or Windows reparse point.
+/// Stops at `workspace_root` (inclusive) so we never recurse into
+/// system roots. Returns `Ok(())` when none of the inspected entries
+/// are symlinks; returns `PermissionDenied` with a descriptive
+/// message when any are.
+///
+/// Safety properties:
+///
+/// * Uses `symlink_metadata`, which does NOT follow the link, so a
+///   symlinked ancestor is correctly classified.
+/// * Terminates at the workspace root even if `resolved` does not
+///   actually live under it (in which case the walk runs out of
+///   ancestors and returns `Ok(())` — containment was already
+///   checked by `resolve_path_with_scope`).
+/// * Hard-bounded by `Path::ancestors`, which is finite.
 fn reject_symlink_ancestors(
     resolved: &std::path::Path,
     workspace_root: &std::path::Path,
@@ -3017,5 +3682,402 @@ mod tests {
         for name in &["view_image", "tool_search", "tool_suggest"] {
             assert!(names.contains(*name), "{name} must be model-visible");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1172 — Codex naming-parity alias tests (`bash`, `delegate`).
+    // -----------------------------------------------------------------------
+
+    /// #1172 acceptance: `with_builtins` must surface the new aliases
+    /// alongside the canonical primitives so a Codex-trained model
+    /// hitting `bash(cmd=…)` or `delegate(role=…, task=…)` lands on
+    /// the registered tool directly.
+    #[tokio::test]
+    async fn builtins_expose_codex_naming_aliases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let names: std::collections::HashSet<_> =
+            registry.specs().into_iter().map(|spec| spec.name).collect();
+        for name in &["bash", "delegate"] {
+            assert!(names.contains(*name), "{name} must be model-visible");
+        }
+    }
+
+    /// #1172 acceptance: `tool_search("bash")` must surface the new
+    /// alias on first call. Without the alias the canonical `shell`
+    /// would dominate even though a Codex-trained model is emitting
+    /// `bash(...)`.
+    #[tokio::test]
+    async fn tool_search_returns_bash_alias() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let search = registry
+            .get_tool("tool_search")
+            .expect("tool_search registered");
+        let result = search
+            .execute(&json!({ "query": "bash" }))
+            .await
+            .expect("tool_search ok");
+        assert!(result.success);
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        let matches = payload["matches"].as_array().expect("matches");
+        let names: Vec<&str> = matches.iter().filter_map(|m| m["name"].as_str()).collect();
+        assert!(
+            names.contains(&"bash"),
+            "tool_search must surface bash alias; got {names:?}"
+        );
+    }
+
+    /// #1172 happy path: `bash` runs a simple command to completion
+    /// and returns the captured stdout.
+    #[tokio::test]
+    async fn bash_runs_simple_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let result = registry
+            .execute("bash", &json!({ "cmd": "printf hello-bash" }))
+            .await
+            .expect("bash runs");
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("hello-bash"),
+            "bash output must contain captured stdout; got: {}",
+            result.output
+        );
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("bash must emit structured metadata");
+        assert_eq!(meta["codex_tool"], json!("bash"));
+    }
+
+    /// #1172 denial path: dangerous commands are rejected by the
+    /// shared `SafePolicy`, the same gate `shell` and `exec_command`
+    /// use. The error path returns `success=false` with a denial
+    /// message — no command is spawned.
+    #[tokio::test]
+    async fn bash_denies_dangerous_command_via_safe_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let result = registry
+            .execute("bash", &json!({ "cmd": "rm -rf /" }))
+            .await
+            .expect("bash runs");
+        assert!(
+            !result.success,
+            "bash must reject `rm -rf /` via SafePolicy; got: {}",
+            result.output
+        );
+        assert!(
+            result.output.to_lowercase().contains("denied")
+                || result.output.to_lowercase().contains("approval"),
+            "bash denial message must be readable; got: {}",
+            result.output
+        );
+    }
+
+    /// #1172 denial path: missing `cmd` is rejected at the boundary
+    /// without spawning anything.
+    #[tokio::test]
+    async fn bash_rejects_missing_cmd() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let result = registry
+            .execute("bash", &json!({}))
+            .await
+            .expect("bash runs");
+        assert!(!result.success);
+        assert!(
+            result.output.contains("cmd"),
+            "missing-cmd error must mention `cmd`; got: {}",
+            result.output
+        );
+    }
+
+    /// #1172 happy path: `delegate(role, task)` spawns a child task
+    /// through the registered spawn delegate, waits for it to reach a
+    /// terminal state, and surfaces the artifacts list. We background
+    /// a completer that flips the supervisor's task to `Completed` so
+    /// the wait loop exits with a terminal payload instead of a
+    /// timeout.
+    #[tokio::test]
+    async fn delegate_spawns_waits_and_returns_artifacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        // Spawn a background completer that polls the supervisor and
+        // flips the first new task to Completed so the wait loop
+        // terminates instead of timing out. Uses an unbounded sleep
+        // budget but the outer 5s `timeout_ms` is the hard cap.
+        let supervisor_for_completer = supervisor.clone();
+        let completer = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Some(task) = supervisor_for_completer
+                    .get_all_tasks()
+                    .into_iter()
+                    .find(|task| task.tool_name == "spawn" || task.tool_name == "spawn_agent")
+                {
+                    supervisor_for_completer
+                        .mark_completed(&task.id, vec!["delegate-output.txt".to_string()]);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "delegate",
+                &json!({
+                    "role": "reviewer",
+                    "task": "review the diff for unsafe regressions",
+                    "timeout_ms": 5_000,
+                }),
+            )
+            .await
+            .expect("delegate runs");
+        let _ = completer.await;
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        assert_eq!(payload["role"], json!("reviewer"));
+        assert!(payload["agent_id"].is_string(), "{payload}");
+        assert!(
+            payload["terminal"].as_bool().unwrap_or(false),
+            "delegate must report terminal=true once the child completes: {payload}"
+        );
+        assert_eq!(payload["status"], json!("completed"));
+        assert!(
+            payload["artifacts"].is_array(),
+            "artifacts must be an array even when empty"
+        );
+        let meta = result
+            .structured_metadata
+            .expect("delegate must emit structured metadata");
+        assert_eq!(meta["codex_tool"], json!("delegate"));
+        assert_eq!(meta["role"], json!("reviewer"));
+    }
+
+    /// #1172 denial path: unknown role names must be rejected at the
+    /// tool boundary so a typo (`"review"` vs `"reviewer"`) surfaces
+    /// immediately instead of silently smuggling an unbounded prompt.
+    #[tokio::test]
+    async fn delegate_rejects_unknown_role() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let result = registry
+            .execute(
+                "delegate",
+                &json!({ "role": "review", "task": "do a review" }),
+            )
+            .await
+            .expect("delegate runs");
+        assert!(
+            !result.success,
+            "delegate must reject `review` (canonical is `reviewer`); got: {}",
+            result.output
+        );
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("delegate must emit denial metadata");
+        assert_eq!(meta["error_kind"], json!("coding_tool_denied"));
+        assert_eq!(meta["reason"], json!("unknown_role"));
+        assert_eq!(meta["role"], json!("review"));
+    }
+
+    /// #1172 denial path: missing `task` is rejected without
+    /// spawning anything.
+    #[tokio::test]
+    async fn delegate_rejects_missing_task() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let result = registry
+            .execute("delegate", &json!({ "role": "reviewer" }))
+            .await
+            .expect("delegate runs");
+        assert!(!result.success);
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("delegate must emit denial metadata");
+        assert_eq!(meta["reason"], json!("missing_task"));
+    }
+
+    /// #1172 boundary: without a registered native spawn delegate the
+    /// alias must fail clearly rather than silently no-op so a broken
+    /// session runtime is visible at the tool boundary.
+    #[tokio::test]
+    async fn delegate_fails_when_spawn_agent_unbound() {
+        let tool = DelegateAliasTool::new();
+        let result = tool
+            .execute(&json!({ "role": "reviewer", "task": "inspect" }))
+            .await
+            .expect("delegate runs");
+        assert!(!result.success);
+        let meta = result.structured_metadata.expect("metadata");
+        assert_eq!(meta["error_kind"], json!("coding_tool_missing"));
+    }
+
+    /// #1172 codex review P1: `bash` must be covered by the
+    /// `group:runtime` tool policy group so a profile denying runtime
+    /// commands cannot be bypassed via the Codex naming alias.
+    /// `delegate` likewise must be covered by `group:sessions` so a
+    /// policy denying subagent spawn cannot be bypassed via the
+    /// one-call wrapper.
+    #[test]
+    fn codex_naming_aliases_are_covered_by_policy_groups() {
+        use crate::tools::policy::tool_group_info;
+        let runtime = tool_group_info("group:runtime").expect("group:runtime registered");
+        assert!(
+            runtime.tools.contains(&"bash"),
+            "group:runtime must include `bash` so the alias respects \
+             runtime-denying policies: {tools:?}",
+            tools = runtime.tools,
+        );
+        let sessions = tool_group_info("group:sessions").expect("group:sessions registered");
+        assert!(
+            sessions.tools.contains(&"delegate"),
+            "group:sessions must include `delegate` so the alias respects \
+             session-denying policies: {tools:?}",
+            tools = sessions.tools,
+        );
+    }
+
+    /// #1172 codex review P1 acceptance: when a tool policy denies
+    /// `group:runtime`, the `bash` alias must be filtered out of the
+    /// registry alongside `shell` / `exec_command` / `write_stdin`.
+    /// Without the group-coverage fix, `bash` would remain visible and
+    /// the policy could be bypassed.
+    #[test]
+    fn bash_is_filtered_when_policy_denies_runtime_group() {
+        use crate::tools::policy::ToolPolicy;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["group:runtime".into()],
+            require_tags: vec![],
+        };
+        registry.apply_policy(&policy);
+        assert!(
+            registry.get_tool("bash").is_none(),
+            "bash must be filtered when policy denies group:runtime"
+        );
+        // Sibling tools in the same group must also be gone.
+        assert!(registry.get_tool("shell").is_none());
+        assert!(registry.get_tool("exec_command").is_none());
+    }
+
+    /// #1172 codex review P1 acceptance: when a policy denies
+    /// `group:sessions`, the `delegate` alias must be filtered out of
+    /// the registry alongside `spawn_agent` / `wait_agent` / etc.
+    /// Without the group-coverage fix, `delegate` would survive the
+    /// filter and keep an Arc to spawn_agent, so the policy could be
+    /// bypassed.
+    #[test]
+    fn delegate_is_filtered_when_policy_denies_sessions_group() {
+        use crate::tools::policy::ToolPolicy;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["group:sessions".into()],
+            require_tags: vec![],
+        };
+        registry.apply_policy(&policy);
+        assert!(
+            registry.get_tool("delegate").is_none(),
+            "delegate must be filtered when policy denies group:sessions"
+        );
+        assert!(registry.get_tool("spawn_agent").is_none());
+        assert!(registry.get_tool("wait_agent").is_none());
+    }
+
+    /// #1172 codex review P2 acceptance (follow-up): a `bash` command
+    /// that backgrounds a grandchild and `wait`s on it must still have
+    /// the grandchild killed when the bash timeout fires. Without
+    /// `process_group(0)` before spawn, the negative-PID kill targets
+    /// a process group that the child was never put in, so the
+    /// backgrounded `sleep` survives the timeout and the workspace
+    /// mutation happens after the tool reports failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_kills_grandchildren_via_process_group_on_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("grandchild-late.txt");
+        let sentinel_path = sentinel.to_string_lossy().into_owned();
+        // Backgrounded grandchild that touches the sentinel after a sleep
+        // longer than the timeout. The `wait` keeps the outer bash alive
+        // so the timeout path is forced to walk the process group.
+        let cmd = format!("(sleep 3; touch {sentinel_path}) & wait");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let started = std::time::Instant::now();
+        let result = registry
+            .execute("bash", &json!({ "cmd": cmd, "timeout_ms": 1_000 }))
+            .await
+            .expect("bash runs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "bash must return within the timeout window (got {:?})",
+            started.elapsed()
+        );
+        assert!(!result.success, "{}", result.output);
+        // Wait past when the orphaned grandchild's `touch` would fire.
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "grandchild process must be killed via the bash process group on \
+             timeout — sentinel at {} should NOT exist (negative-PID kill \
+             didn't reach the grandchild)",
+            sentinel.display(),
+        );
+    }
+
+    /// #1172 codex review P2 acceptance: when a `bash` command exceeds
+    /// `timeout_ms`, the child process must be killed instead of left
+    /// alive in the background. We start a child that touches a sentinel
+    /// file after a sleep that's longer than the timeout. If the kill
+    /// fires correctly the sentinel never appears; if the child is
+    /// orphaned it will appear after the timeout returns to the caller.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_kills_child_process_on_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("late-write.txt");
+        let sentinel_path = sentinel.to_string_lossy().into_owned();
+        // sleep 3 seconds then touch the sentinel; bash timeout fires
+        // at ~1s so the touch must NOT execute if the kill works.
+        let cmd = format!("sleep 3; touch {sentinel_path}");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let started = std::time::Instant::now();
+        let result = registry
+            .execute("bash", &json!({ "cmd": cmd, "timeout_ms": 1_000 }))
+            .await
+            .expect("bash runs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "bash must return within the timeout window (got {:?})",
+            started.elapsed()
+        );
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("timed out"),
+            "bash must report timeout in the output; got: {}",
+            result.output,
+        );
+        // Wait past when the orphaned `touch` would have fired had the
+        // kill failed (3s sleep + 1s slack).
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "child process must be killed on timeout — sentinel file at {} should NOT exist",
+            sentinel.display(),
+        );
     }
 }
