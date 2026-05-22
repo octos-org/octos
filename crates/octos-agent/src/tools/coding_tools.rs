@@ -1665,6 +1665,14 @@ impl Tool for BashTool {
                 });
             }
         };
+        // codex review (#1172) P2: `tokio::process::Child` does NOT
+        // kill the underlying process on drop, so a `timeout()` that
+        // expires would leave the shell running and able to mutate
+        // the workspace later. Save the PID before `wait_with_output`
+        // takes ownership of the child, then on timeout send
+        // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
+        // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
+        let child_pid = child.id();
         match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
             Ok(Ok(output)) => {
                 let mut text = String::new();
@@ -1696,12 +1704,62 @@ impl Tool for BashTool {
                 success: false,
                 ..Default::default()
             }),
-            Err(_) => Ok(ToolResult {
-                output: format!("Command timed out after {timeout_secs} seconds"),
-                success: false,
-                ..Default::default()
-            }),
+            Err(_) => {
+                kill_timed_out_child(child_pid).await;
+                Ok(ToolResult {
+                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    success: false,
+                    ..Default::default()
+                })
+            }
         }
+    }
+}
+
+/// Best-effort kill of a child whose `wait_with_output()` was dropped
+/// when a `tokio::time::timeout` expired. Mirrors `ShellTool`'s
+/// kill-on-timeout: SIGTERM the process group, brief grace period,
+/// then SIGKILL if still alive. On Windows uses `taskkill /F /T`.
+/// Errors are swallowed because the call is best-effort cleanup —
+/// the timeout result has already been returned to the caller.
+async fn kill_timed_out_child(child_pid: Option<u32>) {
+    let Some(pid) = child_pid else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::process::Command as StdCommand;
+
+        // SIGTERM to the process group and the PID itself.
+        let _ = StdCommand::new("kill")
+            .args(["-15", &format!("-{pid}")])
+            .status();
+        let _ = StdCommand::new("kill")
+            .args(["-15", &pid.to_string()])
+            .status();
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let still_alive = StdCommand::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+
+        if still_alive {
+            let _ = StdCommand::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .status();
+            let _ = StdCommand::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command as StdCommand;
+        let _ = StdCommand::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .status();
     }
 }
 
@@ -3775,5 +3833,122 @@ mod tests {
         assert!(!result.success);
         let meta = result.structured_metadata.expect("metadata");
         assert_eq!(meta["error_kind"], json!("coding_tool_missing"));
+    }
+
+    /// #1172 codex review P1: `bash` must be covered by the
+    /// `group:runtime` tool policy group so a profile denying runtime
+    /// commands cannot be bypassed via the Codex naming alias.
+    /// `delegate` likewise must be covered by `group:sessions` so a
+    /// policy denying subagent spawn cannot be bypassed via the
+    /// one-call wrapper.
+    #[test]
+    fn codex_naming_aliases_are_covered_by_policy_groups() {
+        use crate::tools::policy::tool_group_info;
+        let runtime = tool_group_info("group:runtime").expect("group:runtime registered");
+        assert!(
+            runtime.tools.contains(&"bash"),
+            "group:runtime must include `bash` so the alias respects \
+             runtime-denying policies: {tools:?}",
+            tools = runtime.tools,
+        );
+        let sessions = tool_group_info("group:sessions").expect("group:sessions registered");
+        assert!(
+            sessions.tools.contains(&"delegate"),
+            "group:sessions must include `delegate` so the alias respects \
+             session-denying policies: {tools:?}",
+            tools = sessions.tools,
+        );
+    }
+
+    /// #1172 codex review P1 acceptance: when a tool policy denies
+    /// `group:runtime`, the `bash` alias must be filtered out of the
+    /// registry alongside `shell` / `exec_command` / `write_stdin`.
+    /// Without the group-coverage fix, `bash` would remain visible and
+    /// the policy could be bypassed.
+    #[test]
+    fn bash_is_filtered_when_policy_denies_runtime_group() {
+        use crate::tools::policy::ToolPolicy;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["group:runtime".into()],
+            require_tags: vec![],
+        };
+        registry.apply_policy(&policy);
+        assert!(
+            registry.get_tool("bash").is_none(),
+            "bash must be filtered when policy denies group:runtime"
+        );
+        // Sibling tools in the same group must also be gone.
+        assert!(registry.get_tool("shell").is_none());
+        assert!(registry.get_tool("exec_command").is_none());
+    }
+
+    /// #1172 codex review P1 acceptance: when a policy denies
+    /// `group:sessions`, the `delegate` alias must be filtered out of
+    /// the registry alongside `spawn_agent` / `wait_agent` / etc.
+    /// Without the group-coverage fix, `delegate` would survive the
+    /// filter and keep an Arc to spawn_agent, so the policy could be
+    /// bypassed.
+    #[test]
+    fn delegate_is_filtered_when_policy_denies_sessions_group() {
+        use crate::tools::policy::ToolPolicy;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        let policy = ToolPolicy {
+            allow: vec![],
+            deny: vec!["group:sessions".into()],
+            require_tags: vec![],
+        };
+        registry.apply_policy(&policy);
+        assert!(
+            registry.get_tool("delegate").is_none(),
+            "delegate must be filtered when policy denies group:sessions"
+        );
+        assert!(registry.get_tool("spawn_agent").is_none());
+        assert!(registry.get_tool("wait_agent").is_none());
+    }
+
+    /// #1172 codex review P2 acceptance: when a `bash` command exceeds
+    /// `timeout_ms`, the child process must be killed instead of left
+    /// alive in the background. We start a child that touches a sentinel
+    /// file after a sleep that's longer than the timeout. If the kill
+    /// fires correctly the sentinel never appears; if the child is
+    /// orphaned it will appear after the timeout returns to the caller.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_kills_child_process_on_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("late-write.txt");
+        let sentinel_path = sentinel.to_string_lossy().into_owned();
+        // sleep 3 seconds then touch the sentinel; bash timeout fires
+        // at ~1s so the touch must NOT execute if the kill works.
+        let cmd = format!("sleep 3; touch {sentinel_path}");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let started = std::time::Instant::now();
+        let result = registry
+            .execute("bash", &json!({ "cmd": cmd, "timeout_ms": 1_000 }))
+            .await
+            .expect("bash runs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "bash must return within the timeout window (got {:?})",
+            started.elapsed()
+        );
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("timed out"),
+            "bash must report timeout in the output; got: {}",
+            result.output,
+        );
+        // Wait past when the orphaned `touch` would have fired had the
+        // kill failed (3s sleep + 1s slack).
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "child process must be killed on timeout — sentinel file at {} should NOT exist",
+            sentinel.display(),
+        );
     }
 }
