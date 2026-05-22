@@ -22,6 +22,8 @@
 #      deletions are protocol-visible too).
 #  13. Code change + deletion of an existing UPCR (no add/modify of any
 #      UPCR) -> exit non-zero (codex #5 — deleted UPCR is not coverage).
+#  14. Resolved base ref equals HEAD (single-branch CI) -> exit non-zero
+#      (codex #6 — closes HEAD..HEAD silent-empty-diff bypass).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -337,7 +339,7 @@ scenario_no_base_ref_fails() {
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -ne 0 ] && grep -q "could not resolve a base ref" <<<"$out"; then
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
     pass "missing base ref fails loud (no silent CI bypass)"
   else
     fail "missing base ref: status=$status output=$out"
@@ -404,6 +406,34 @@ scenario_deleted_upcr_is_not_coverage() {
 }
 
 scenario_deleted_upcr_is_not_coverage
+
+# Scenario 14: resolved base ref equals HEAD (e.g. single-branch CI checkout
+# where origin/main and the feature branch are the same commit). HEAD..HEAD
+# is empty by construction; the script must refuse to run instead of silently
+# reporting "no protocol-visible edits detected". Codex review #6.
+scenario_base_equals_head_fails() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    # Commit a protocol change directly onto feature, then point
+    # origin/main at HEAD so merge-base(origin/main, HEAD) == HEAD.
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    git add -A
+    git commit --quiet -m "feat: extend"
+    git update-ref refs/remotes/origin/main HEAD
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
+    pass "merge_base == HEAD fails loud (no empty-diff bypass)"
+  else
+    fail "merge_base == HEAD: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_base_equals_head_fails
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"

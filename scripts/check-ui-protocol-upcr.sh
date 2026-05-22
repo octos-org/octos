@@ -63,33 +63,64 @@ resolve_status=0
 base_ref="$(resolve_base_ref)" || resolve_status=$?
 
 merge_base=""
+head_sha=""
 if [ "$resolve_status" -eq 0 ] && [ -n "$base_ref" ]; then
   merge_base="$(git merge-base "$base_ref" HEAD 2>/dev/null || true)"
+  head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
 fi
 
-# If we cannot establish a merge-base for the committed range, fail loud.
-# This used to silently skip the committed-range check, which was a CI
-# bypass on shallow / single-branch checkouts (#717 codex review #1).
-# The fallback for environments that legitimately have no base ref is
-# `UPCR_ALLOW_NO_DOC=1` (already documented as the reviewer override).
-if [ -z "$merge_base" ]; then
-  if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
-    printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
-    exit 0
-  fi
-  cat >&2 <<'EOF'
-ui-protocol-upcr: could not resolve a base ref for the diff (tried origin/main,
-main, origin/master, master). The gate refuses to run with only uncommitted
+# Treat merge_base == HEAD as "no committed work to inspect": HEAD..HEAD is
+# empty, so the committed-range scan would silently miss any actual diffs.
+# This is the bypass codex review #6 flagged. We distinguish two sub-cases:
+#
+#   * Uncommitted protocol changes exist in the working tree -> legitimate
+#     pre-commit case (feature branch freshly created off main); proceed
+#     with uncommitted-only checking.
+#   * No uncommitted protocol changes either -> the gate cannot tell
+#     whether the repo lacks a real base ref (shallow CI) or whether the
+#     branch is genuinely identical to main. Fail loud so a stale base
+#     ref doesn't silently bypass committed-but-not-yet-pushed work.
+base_equals_head=0
+if [ -n "$merge_base" ] && [ -n "$head_sha" ] && [ "$merge_base" = "$head_sha" ]; then
+  base_equals_head=1
+fi
+
+if [ -z "$merge_base" ] || [ "$base_equals_head" -eq 1 ]; then
+  # Probe the working tree for any protocol/spec changes via `git status`.
+  # If something is staged or untracked we can still run; otherwise reject.
+  uncommitted_probe="$(
+    git status --porcelain --untracked-files=all -- \
+      "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}" "$SPEC_GLOB" \
+      "$UPCR_GLOB" "$UPCR_TEMPLATE" 2>/dev/null || true
+  )"
+  if [ -z "$uncommitted_probe" ]; then
+    if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
+      printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
+      exit 0
+    fi
+    cat >&2 <<'EOF'
+ui-protocol-upcr: could not resolve a usable base ref for the diff. The gate
+tried origin/main, main, origin/master, master, and any UPCR_BASE_REF
+override; either none resolved or the resolved ref points to HEAD itself
+(which would diff HEAD..HEAD = empty). Refusing to run with only stale
 state because that lets committed protocol changes slip through CI.
 
-Fix: fetch origin/main (e.g. `git fetch --no-tags origin main`), or set
-UPCR_BASE_REF=<sha-or-ref>, or set UPCR_ALLOW_NO_DOC=1 only for a documented
+Fix: fetch a real base (e.g. `git fetch --no-tags origin main`), or set
+UPCR_BASE_REF=<sha-or-ref> that is an ancestor of HEAD (e.g. HEAD~1 or the
+previous main SHA), or set UPCR_ALLOW_NO_DOC=1 only for a documented
 reviewer override.
 EOF
-  exit 2
+    exit 2
+  fi
+  # Uncommitted protocol/UPCR changes exist; proceed in uncommitted-only mode.
+  merge_base=""
 fi
 
-range="$merge_base..HEAD"
+if [ -n "$merge_base" ]; then
+  range="$merge_base..HEAD"
+else
+  range=""
+fi
 
 # Emit destination paths from `git diff --name-status` in the committed
 # range. The second argument selects between two filters:
@@ -273,7 +304,7 @@ fi
 cat >&2 <<EOF
 ui-protocol-upcr: protocol-visible edits require a UPCR document.
 
-Detected code-level protocol changes (range: $range):
+Detected code-level protocol changes (range: ${range:-uncommitted-only}):
 EOF
 while IFS= read -r _change; do
   [ -z "$_change" ] && continue
