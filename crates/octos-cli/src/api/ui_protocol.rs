@@ -2338,6 +2338,103 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Interval between successive status-word rotations on the in-flight
+/// thinking bubble. Mirrors the gateway `StatusIndicator::run_status_loop`
+/// (`tick % 8 == 0`) so the cadence feels identical across surfaces.
+const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// CJK code-point check shared with `status_indicator::has_cjk` — kept
+/// inline here to avoid pulling the channel-aware status_indicator
+/// module into the WS turn path.
+fn prompt_has_cjk(prompt: &str) -> bool {
+    prompt.chars().any(|c| {
+        matches!(
+            c,
+            '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}'
+        )
+    })
+}
+
+/// Spawn a per-turn tokio task that rotates a creative status word
+/// every [`STATUS_WORD_INTERVAL`] through the progress channel for the
+/// SPA `ThinkingIndicator`. Mirrors the gateway StatusIndicator
+/// (`✦ Pondering...`, `✦ 正在炼丹...`) but for the WS surface — the
+/// frame goes through the existing `progress_tx` pipeline which the
+/// mapper at `ui_protocol_progress::map_status_word` lifts onto
+/// `progress/updated{kind:"status_word"}`.
+///
+/// The task exits when EITHER the cancel flag flips (the per-turn
+/// handler signals it via [`StatusWordRotatorGuard`] on its way out)
+/// OR the progress channel's receiver drops (function scope unwinds
+/// and the consumer is gone). Backpressure failures (`try_send` ==
+/// `Full`) just skip that rotation — a missed word is harmless.
+fn spawn_status_word_rotator(
+    progress_tx: tokio::sync::mpsc::Sender<String>,
+    prompt: &str,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use crate::persona_service::{DEFAULT_STATUS_WORDS, DEFAULT_STATUS_WORDS_ZH};
+
+    let is_cjk = prompt_has_cjk(prompt);
+    let pool: Vec<&'static str> = if is_cjk {
+        DEFAULT_STATUS_WORDS_ZH.to_vec()
+    } else {
+        DEFAULT_STATUS_WORDS.to_vec()
+    };
+    if pool.is_empty() {
+        return;
+    }
+
+    // Slow per-turn offset so back-to-back turns don't always start on
+    // the same word. Using `SystemTime` here is fine — the offset has
+    // no correctness role, only aesthetic spread.
+    let start_idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0)
+        % pool.len();
+
+    tokio::spawn(async move {
+        let mut idx = start_idx;
+        loop {
+            tokio::time::sleep(STATUS_WORD_INTERVAL).await;
+            if cancel.load(std::sync::atomic::Ordering::Acquire) || progress_tx.is_closed() {
+                return;
+            }
+            let word = pool[idx % pool.len()];
+            idx = idx.wrapping_add(1);
+            let payload = serde_json::json!({
+                "type": "status_word",
+                "label": word,
+            });
+            let Ok(json) = serde_json::to_string(&payload) else {
+                continue;
+            };
+            // Backpressure failure → drop this rotation. The next
+            // tick will pick a fresh word. The SPA caches the last
+            // rendered word so a missed frame just delays the next
+            // visible swap by 8s.
+            let _ = progress_tx.try_send(json);
+        }
+    });
+}
+
+/// RAII guard that flips the rotator's cancellation flag on drop so
+/// the spawned task exits cleanly when `run_standalone_turn` returns
+/// (including on early-return / panic / interrupt paths).
+struct StatusWordRotatorGuard {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for StatusWordRotatorGuard {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct BoundedChannelReporter {
     tx: tokio::sync::mpsc::Sender<String>,
     /// Mirrors WS-layer drops: when the progress channel is full the agent
@@ -14693,6 +14790,20 @@ async fn run_standalone_turn(
             turn_id.clone(),
         ),
     );
+    // Rotator: emits `progress/updated{kind:"status_word"}` every 8s
+    // for the SPA ThinkingIndicator to swap a creative word in the
+    // in-flight bubble. The drop guard ensures the spawned task
+    // exits when this function unwinds (success, error, or interrupt).
+    let status_word_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_status_word_rotator(
+        progress_tx.clone(),
+        &prompt,
+        Arc::clone(&status_word_cancel),
+    );
+    let _status_word_guard = StatusWordRotatorGuard {
+        cancel: Arc::clone(&status_word_cancel),
+    };
+
     let progress_tx_for_result = progress_tx.clone();
     let progress_tx_for_tasks = progress_tx.clone();
     let task_progress_dropped = progress_dropped.clone();
