@@ -671,28 +671,21 @@ session. Make hooks robust and fast. Target < 1 second.
 
 ---
 
-## Part 7: Progress Events (forthcoming)
+## Part 7: Progress Events
 
-The `OCTOS_EVENT_SINK` transport and the `octos.harness.event.v1` structured
-progress schema are defined in
-[OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md](./OCTOS_HARNESS_M4_WORKSTREAMS_2026-04-21.md)
-under M4.1A. They are **not** yet implemented as of this guide's
-publication.
+The runtime exposes a local structured progress sink to long-running child
+workflows through `OCTOS_EVENT_SINK`. The value is a transport URI; M4.1A
+requires local `file://...` JSONL sinks and the runtime also accepts bare file
+paths for older helpers.
 
-Until M4.1A lands:
-
-- emit human-readable progress to **stderr**. It is captured as diagnostic
-  output.
-- do **not** try to bridge into parent task status from your tool; that
-  bridge does not exist yet.
-- when M4.1A ships, this section will point to the emitter helpers and
-  the structured event shape.
-
-The structured event shape (to be honored once available) is:
+Missing `OCTOS_EVENT_SINK` is a no-op for emitters. Stderr remains diagnostic
+text only; durable parent-visible progress must be emitted as structured
+`octos.harness.event.v1` records:
 
 ```json
 {
   "schema": "octos.harness.event.v1",
+  "schema_version": 1,
   "kind": "progress",
   "session_id": "...",
   "task_id": "...",
@@ -702,6 +695,12 @@ The structured event shape (to be honored once available) is:
   "progress": 0.6
 }
 ```
+
+The runtime validates field sizes, `progress` range `0.0..=1.0`, schema
+version, and the sink-owned `session_id`/`task_id`. Accepted progress updates
+fold into the task supervisor's durable `runtime_detail`, emit a parent-visible
+`task_status` / `task/updated` update, and replay through the same task status
+state used by `/api/sessions/:id/tasks`.
 
 ---
 

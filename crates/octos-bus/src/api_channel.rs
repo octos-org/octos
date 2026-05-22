@@ -4861,6 +4861,19 @@ mod tests {
                         "tool_name": "podcast_generate",
                         "status": "running",
                         "started_at": "2026-04-16T00:00:00Z",
+                        "runtime_detail": {
+                            "schema": "octos.harness.event.v1",
+                            "schema_version": 1,
+                            "kind": "progress",
+                            "session_id": "api:test-chat",
+                            "task_id": "task-1",
+                            "workflow_kind": "deep_research",
+                            "current_phase": "fetching_sources",
+                            "progress_message": "Fetching source 3/12",
+                            "progress": 0.42
+                        },
+                        "workflow_kind": "deep_research",
+                        "current_phase": "fetching_sources",
                         "error": null
                     }
                 ])
@@ -4880,6 +4893,13 @@ mod tests {
         assert_eq!(parsed["topic"], "site astro");
         assert_eq!(parsed["task"]["id"], "task-1");
         assert_eq!(parsed["task"]["tool_name"], "podcast_generate");
+        assert_eq!(parsed["task"]["workflow_kind"], "deep_research");
+        assert_eq!(parsed["task"]["current_phase"], "fetching_sources");
+        assert_eq!(
+            parsed["task"]["runtime_detail"]["progress_message"],
+            "Fetching source 3/12"
+        );
+        assert_eq!(parsed["task"]["runtime_detail"]["progress"], 0.42);
     }
 
     #[tokio::test]

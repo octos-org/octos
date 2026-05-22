@@ -8902,6 +8902,10 @@ mod tests {
         assert_eq!(tasks[0]["workflow_kind"], "deep_research");
         assert_eq!(tasks[0]["current_phase"], "fetch");
         assert_eq!(tasks[0]["runtime_detail"]["session_id"], "api:session");
+        assert_eq!(
+            tasks[0]["runtime_detail"]["schema_version"],
+            serde_json::json!(octos_agent::abi_schema::HARNESS_PROGRESS_EVENT_SCHEMA_VERSION)
+        );
         assert_eq!(tasks[0]["runtime_detail"]["task_id"], task_id);
         assert_eq!(
             tasks[0]["runtime_detail"]["progress_message"],

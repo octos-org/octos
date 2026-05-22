@@ -41,6 +41,13 @@ pub const HOOK_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 /// envelope at `octos.agent.progress.event.v1`.
 pub const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 
+/// Current schema version for the typed
+/// [`HarnessEventPayload::Progress`](crate::harness_events::HarnessEventPayload::Progress)
+/// event emitted by long-running child workflows through
+/// `octos.harness.event.v1`. This is the parent-visible progress ABI
+/// that folds into durable task status snapshots.
+pub const HARNESS_PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
+
 /// Current schema version for `TaskResult`.
 pub const TASK_RESULT_SCHEMA_VERSION: u32 = 1;
 

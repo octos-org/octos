@@ -1,8 +1,8 @@
 //! Structured harness event ABI and local sink transport.
 //!
-//! Child tools/workflows write newline-delimited JSON events to a local path
-//! exposed through `OCTOS_EVENT_SINK`. The runtime consumes those events and
-//! folds them into durable task snapshots.
+//! Child tools/workflows write newline-delimited JSON events to the local
+//! transport URI exposed through `OCTOS_EVENT_SINK`. The runtime consumes those
+//! events and folds them into durable task snapshots.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -19,8 +19,8 @@ use tracing::warn;
 
 use crate::abi_schema::{
     COST_ATTRIBUTION_SCHEMA_VERSION, HARNESS_ERROR_SCHEMA_VERSION,
-    SUB_AGENT_DISPATCH_SCHEMA_VERSION, SWARM_DISPATCH_SCHEMA_VERSION,
-    SWARM_REVIEW_DECISION_SCHEMA_VERSION,
+    HARNESS_PROGRESS_EVENT_SCHEMA_VERSION, SUB_AGENT_DISPATCH_SCHEMA_VERSION,
+    SWARM_DISPATCH_SCHEMA_VERSION, SWARM_REVIEW_DECISION_SCHEMA_VERSION,
 };
 use crate::harness_errors::HarnessErrorEvent;
 use crate::task_supervisor::TaskSupervisor;
@@ -54,6 +54,10 @@ fn default_swarm_dispatch_schema_version() -> u32 {
 
 fn default_cost_attribution_schema_version() -> u32 {
     COST_ATTRIBUTION_SCHEMA_VERSION
+}
+
+fn default_harness_progress_event_schema_version() -> u32 {
+    HARNESS_PROGRESS_EVENT_SCHEMA_VERSION
 }
 
 fn default_swarm_review_decision_schema_version() -> u32 {
@@ -338,6 +342,8 @@ pub enum HarnessEventPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessProgressEvent {
+    #[serde(default = "default_harness_progress_event_schema_version")]
+    pub schema_version: u32,
     pub session_id: String,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -721,6 +727,7 @@ impl HarnessEvent {
             schema: HARNESS_EVENT_SCHEMA_V1.to_string(),
             payload: HarnessEventPayload::Progress {
                 data: HarnessProgressEvent {
+                    schema_version: HARNESS_PROGRESS_EVENT_SCHEMA_VERSION,
                     session_id: session_id.into(),
                     task_id: task_id.into(),
                     workflow: workflow.map(Into::into),
@@ -952,6 +959,12 @@ impl HarnessEvent {
 
         match &self.payload {
             HarnessEventPayload::Progress { data } => {
+                if data.schema_version > HARNESS_PROGRESS_EVENT_SCHEMA_VERSION {
+                    return Err(HarnessEventError(format!(
+                        "unsupported harness progress schema_version {} (max supported: {})",
+                        data.schema_version, HARNESS_PROGRESS_EVENT_SCHEMA_VERSION
+                    )));
+                }
                 validate_common_ids(&data.session_id, &data.task_id)?;
                 validate_optional_name("workflow", data.workflow.as_deref(), MAX_WORKFLOW_BYTES)?;
                 validate_phase(&data.phase)?;
@@ -1145,6 +1158,7 @@ impl HarnessEvent {
                 let message = data.message.as_deref();
                 serde_json::json!({
                     "schema": self.schema,
+                    "schema_version": data.schema_version,
                     "kind": "progress",
                     "session_id": data.session_id,
                     "task_id": data.task_id,
@@ -1621,6 +1635,11 @@ impl HarnessEventSink {
     pub fn path(&self) -> &Path {
         self.sink_file.path()
     }
+
+    /// Return the transport URI child processes should receive in OCTOS_EVENT_SINK.
+    pub fn uri(&self) -> String {
+        format!("file://{}", self.path().display())
+    }
 }
 
 impl Drop for HarnessEventSink {
@@ -1807,6 +1826,42 @@ mod tests {
         let parsed = HarnessEvent::from_json_line(&raw.to_string()).unwrap();
         let detail = parsed.runtime_detail_value(None, None);
         assert_eq!(detail["progress"], 0.25);
+    }
+
+    #[test]
+    fn progress_event_defaults_and_rejects_future_schema_version() {
+        let legacy = serde_json::json!({
+            "schema": "octos.harness.event.v1",
+            "kind": "progress",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "workflow": "deep_research",
+            "phase": "fetch",
+            "message": "Fetching",
+            "progress": 0.4
+        });
+
+        let parsed = HarnessEvent::from_json_line(&legacy.to_string()).unwrap();
+        match &parsed.payload {
+            HarnessEventPayload::Progress { data } => {
+                assert_eq!(data.schema_version, HARNESS_PROGRESS_EVENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected Progress, got {other:?}"),
+        }
+        assert_eq!(
+            parsed.runtime_detail_value(None, None)["schema_version"],
+            serde_json::json!(HARNESS_PROGRESS_EVENT_SCHEMA_VERSION)
+        );
+
+        let future = serde_json::json!({
+            "schema": "octos.harness.event.v1",
+            "schema_version": HARNESS_PROGRESS_EVENT_SCHEMA_VERSION + 1,
+            "kind": "progress",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "phase": "fetch"
+        });
+        assert!(HarnessEvent::from_json_line(&future.to_string()).is_err());
     }
 
     #[test]
@@ -2079,6 +2134,57 @@ mod tests {
             .get_task(&other_task_id)
             .expect("other task missing");
         assert!(other.runtime_detail.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sink_uri_is_file_transport_and_preserves_context_lookup() {
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_id = supervisor.register("custom_report", "call-1", Some("api:session"));
+        supervisor.mark_running(&task_id);
+
+        let sink = HarnessEventSink::new(supervisor.clone(), task_id.clone(), "api:session")
+            .expect("create sink");
+        let uri = sink.uri();
+        assert!(
+            uri.starts_with("file://"),
+            "sink URI must be file transport: {uri}"
+        );
+
+        let context = lookup_event_sink_context(&uri).expect("sink context registered for URI");
+        assert_eq!(context.session_id, "api:session");
+        assert_eq!(context.task_id, task_id);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.set_on_change(move |task| {
+            let _ = tx.send(task.clone());
+        });
+
+        let event = HarnessEvent::progress(
+            "api:session",
+            context.task_id.clone(),
+            Some("custom_report"),
+            "rendering",
+            Some("Rendering section 2/5"),
+            Some(0.4),
+        );
+        write_event_to_sink(&uri, &event).unwrap();
+
+        let updated = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let task = rx.recv().await.expect("task update");
+                if task.runtime_detail.is_some() {
+                    break task;
+                }
+            }
+        })
+        .await
+        .expect("URI sink should update task");
+
+        let detail: Value =
+            serde_json::from_str(updated.runtime_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["workflow_kind"], "custom_report");
+        assert_eq!(detail["current_phase"], "rendering");
+        assert_eq!(detail["progress_message"], "Rendering section 2/5");
     }
 
     /// M8.6: `SessionSanitized` round-trips through JSON and reports the
