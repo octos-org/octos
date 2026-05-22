@@ -1,0 +1,19 @@
+{
+  "schema": "octos.ux.summary.v1",
+  "status": "passed",
+  "mode": "self-test",
+  "scenario_id": "ux-artifact-self-test",
+  "transport": "stdio",
+  "artifacts": {
+    "scenario.json": "scenario.json",
+    "summary.json": "summary.json",
+    "launch-command.txt": "launch-command.txt",
+    "terminal-size.json": "terminal-size.json",
+    "input-replay.log": "input-replay.log",
+    "appui-transcript.jsonl": "appui-transcript.jsonl",
+    "server.log": "server.log",
+    "tui-capture.txt": "tui-capture.txt",
+    "runtime-policy-stamp.json": "runtime-policy-stamp.json",
+    "validation.json": "validation.json"
+  }
+}

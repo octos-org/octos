@@ -26,6 +26,7 @@ node_modules/
 # Playwright/tmux test artifacts
 e2e/test-results/
 e2e/test-results-tmux/
+e2e/test-results-ux/
 
 # Dashboard build output.
 #

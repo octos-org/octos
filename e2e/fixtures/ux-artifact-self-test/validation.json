@@ -1,0 +1,124 @@
+{
+  "schema": "octos.ux.validation.v1",
+  "status": "passed",
+  "checks": [
+    {
+      "id": "artifact_abi",
+      "status": "passed",
+      "detail": "required octos.ux.artifacts.v1 artifacts are present and schema-shaped; validation.json uses octos.ux.validation.v1",
+      "evidence": [
+        "scenario.json",
+        "summary.json",
+        "launch-command.txt",
+        "terminal-size.json",
+        "input-replay.log",
+        "appui-transcript.jsonl",
+        "server.log",
+        "tui-capture.txt",
+        "runtime-policy-stamp.json",
+        "validation.json"
+      ]
+    },
+    {
+      "id": "appui_transcript_parseable",
+      "status": "passed",
+      "detail": "parsed 5 JSONL entries; methods=client_hello, session/open, turn/completed; responses=2",
+      "evidence": [
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "real_tmux_evidence",
+      "status": "passed",
+      "detail": "real tmux evidence is not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json"
+      ]
+    },
+    {
+      "id": "appui_transcript_semantic",
+      "status": "passed",
+      "detail": "semantic transcript checks are not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json",
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "rendered_screen_no_known_bug_patterns",
+      "status": "passed",
+      "detail": "tui-capture*.txt and server.log do not match known tmux UX bug patterns",
+      "evidence": [
+        "tui-capture.txt",
+        "server.log"
+      ]
+    },
+    {
+      "id": "screen_geometry_consistent",
+      "status": "passed",
+      "detail": "screen geometry checks are not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json",
+        "terminal-size.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "permission_selection_visible_contract",
+      "status": "passed",
+      "detail": "permission-selection visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
+      "id": "provider_missing_visible_contract",
+      "status": "passed",
+      "detail": "provider-missing visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
+      "id": "approval_denial_visible_contract",
+      "status": "passed",
+      "detail": "approval-denial visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
+      "id": "task_subagent_tree_visible_contract",
+      "status": "passed",
+      "detail": "task-subagent-tree visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
+      "id": "restart_reconnect_visible_contract",
+      "status": "passed",
+      "detail": "restart-reconnect visible contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
+      "id": "dropped_completion_backpressure_contract",
+      "status": "passed",
+      "detail": "dropped-completion/backpressure contract is not required for this scenario",
+      "evidence": [
+        "scenario.json"
+      ]
+    },
+    {
+      "id": "lower_soak_summary_semantic",
+      "status": "passed",
+      "detail": "no lower soak summary artifact is present for this scenario",
+      "evidence": [
+        "soak-summary.json"
+      ]
+    }
+  ],
+  "failures": []
+}

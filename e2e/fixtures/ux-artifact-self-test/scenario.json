@@ -1,0 +1,19 @@
+{
+  "schema": "octos.ux.scenario.v1",
+  "id": "ux-artifact-self-test",
+  "name": "UX artifact validator self-test",
+  "artifact_abi": "octos.ux.artifacts.v1",
+  "transport": "stdio",
+  "required_artifacts": [
+    "scenario.json",
+    "summary.json",
+    "launch-command.txt",
+    "terminal-size.json",
+    "input-replay.log",
+    "appui-transcript.jsonl",
+    "server.log",
+    "tui-capture.txt",
+    "runtime-policy-stamp.json",
+    "validation.json"
+  ]
+}

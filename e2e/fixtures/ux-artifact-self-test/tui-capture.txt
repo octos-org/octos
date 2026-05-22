@@ -1,0 +1,10 @@
+Octos TUI
+
+Messages
+User: validate self-test artifact bundle
+Assistant: Self-test turn completed.
+
+Composer
+>
+
+state Ready

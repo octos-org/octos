@@ -47,6 +47,9 @@ required_capabilities = ["onboarding/workspace_probe", "runtime/policy_stamp"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
@@ -77,17 +80,23 @@ required_capabilities = ["onboarding/workspace_probe"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
+  "tui-capture-provider-missing.txt",
 ]
 acceptance = [
   "appui.provider_missing_banner_present",
   "appui.no_panic",
   "tui.first_frame_not_blank",
+  "provider_missing_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner with no profile LLM to open /provider and preserve the recoverable provider setup capture."
 
 [[scenario]]
 id = "permission-selection"
@@ -104,17 +113,24 @@ required_capabilities = ["runtime/policy_stamp", "permission/profile_select"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
+  "tui-capture-permissions-open.txt",
+  "tui-capture-permissions-applied.txt",
 ]
 acceptance = [
   "runtime.policy_stamp_present",
   "runtime.policy_stamp_matches_selection",
   "appui.no_otp_calls",
+  "permission_selection_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner to open /permissions, apply a workspace-write never-ask policy, and preserve permission captures."
 
 [[scenario]]
 id = "stdio-happy-path"
@@ -131,6 +147,9 @@ required_capabilities = ["chat/send_prompt", "chat/receive_response"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
@@ -159,6 +178,9 @@ required_capabilities = ["chat/send_prompt", "chat/receive_response"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
@@ -187,17 +209,24 @@ required_capabilities = ["approval/request", "approval/deny"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
   "approval-events.jsonl",
+  "tui-capture-approval-request.txt",
+  "tui-capture-approval-denied.txt",
 ]
 acceptance = [
   "appui.approval_denied_event_present",
   "appui.no_tool_call_after_denial",
+  "approval_denial_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner with OCTOS_M9_PROTOCOL_FIXTURES=1 to trigger a real AppUI approval request and drive denial through the TUI."
 
 [[scenario]]
 id = "task-subagent-tree"
@@ -214,6 +243,9 @@ required_capabilities = ["task/spawn", "task/observe"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
@@ -221,11 +253,18 @@ expected_artifacts = [
   "validation.json",
   "task-ledger.jsonl",
   "artifact-index.json",
+  "tui-capture-task-subagent-tree-running.txt",
+  "tui-capture-task-subagent-tree-final.txt",
+  "tui-capture-task-subagent-tree-summary.txt",
+  "m15-evidence/appui-transcript.jsonl",
+  "m15-evidence/agent-artifacts/code-review-report.md",
 ]
 acceptance = [
   "appui.child_parent_wiring_consistent",
   "tui.task_tree_rendered",
+  "task_subagent_tree_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner with OCTOS_M15_LIVE_SUBAGENT_FIXTURE=1 to trigger the real M15 live subagent fixture and preserve task/subagent captures."
 
 [[scenario]]
 id = "restart-reconnect"
@@ -238,21 +277,33 @@ terminal = "100x30"
 tui_binary = "octos-tui"
 tmux_command = "ux-tui-restart-reconnect"
 required_tools = ["tmux", "octos", "octos-tui"]
-required_capabilities = ["session/resume", "transport/reconnect"]
+required_capabilities = ["session/resume", "session/snapshot", "session/hydrate", "protocol/replay_lossy", "transport/reconnect"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
   "reconnect-events.jsonl",
+  "tui-capture-pre-restart.txt",
+  "tui-capture-post-reconnect.txt",
+  "pre-restart-snapshot.json",
+  "post-reconnect-snapshot.json",
+  "websocket-transcript.jsonl",
+  "server-before-restart.log",
+  "server-pane-after-restart.txt",
 ]
 acceptance = [
   "appui.no_duplicate_prompt_after_reconnect",
   "appui.session_state_preserved",
+  "restart_reconnect_visible_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner over WebSocket, restarts the real backend tmux server under the live TUI, then captures TUI reconnect state plus session/hydrate pre/post snapshots."
 
 [[scenario]]
 id = "narrow-layout"
@@ -269,6 +320,9 @@ required_capabilities = ["chat/send_prompt"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
@@ -291,19 +345,29 @@ terminal = "100x30"
 tui_binary = "octos-tui"
 tmux_command = "ux-tui-dropped-completion"
 required_tools = ["tmux", "octos", "octos-tui"]
-required_capabilities = ["chat/send_prompt", "chat/stream"]
+required_capabilities = ["chat/send_prompt", "chat/stream", "turn/completed", "protocol/replay_lossy", "session/snapshot"]
 expected_artifacts = [
   "scenario.json",
   "summary.json",
+  "launch-command.txt",
+  "terminal-size.json",
+  "input-replay.log",
   "appui-transcript.jsonl",
   "server.log",
   "tui-capture.txt",
   "runtime-policy-stamp.json",
   "validation.json",
   "stream-events.jsonl",
+  "notification-log.jsonl",
+  "backpressure-report.json",
+  "websocket-transcript.jsonl",
+  "tui-capture-replay-lossy.txt",
+  "tui-capture-backpressure-final.txt",
 ]
 acceptance = [
   "appui.backpressure_warning_present",
   "appui.no_silent_token_drop",
   "appui.next_prompt_succeeds",
+  "dropped_completion_backpressure_contract",
 ]
+notes = "Uses the current octos-tui onboarding runner plus a WebSocket sidecar probe to cover fixture-backed protocol/replay_lossy recovery. This does not yet force a true dropped turn/completed writer-channel failure."

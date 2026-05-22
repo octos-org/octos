@@ -1,0 +1,5 @@
+{"ts":"2026-05-18T00:00:00.000Z","direction":"client_to_server","frame":{"jsonrpc":"2.0","id":"self-1","method":"client_hello","params":{"client":"ux-artifact-self-test"}}}
+{"ts":"2026-05-18T00:00:00.010Z","direction":"server_to_client","frame":{"jsonrpc":"2.0","id":"self-1","result":{"server":"octos","capabilities":["runtime.policy_stamp.v1"]}}}
+{"ts":"2026-05-18T00:00:00.020Z","direction":"client_to_server","frame":{"jsonrpc":"2.0","id":"self-2","method":"session/open","params":{"session_id":"ux-artifact-self-test","profile_id":"local"}}}
+{"ts":"2026-05-18T00:00:00.030Z","direction":"server_to_client","frame":{"jsonrpc":"2.0","id":"self-2","result":{"opened":{"session_id":"ux-artifact-self-test"},"runtime_policy_stamp":{"profile_id":"local","sandbox_mode":"danger-full-access","approval_policy":"never"}}}}
+{"ts":"2026-05-18T00:00:00.040Z","direction":"server_to_client","frame":{"jsonrpc":"2.0","method":"turn/completed","params":{"session_id":"ux-artifact-self-test","turn_id":"turn-self-test","status":"completed"}}}
