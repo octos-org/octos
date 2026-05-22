@@ -2551,8 +2551,8 @@ mod tests {
         let png = outside.path().join("host.png");
         std::fs::write(&png, PNG_MAGIC).expect("write png");
 
-        let tool = ViewImageTool::new(workspace.path())
-            .with_filesystem_scope(FilesystemScope::Host);
+        let tool =
+            ViewImageTool::new(workspace.path()).with_filesystem_scope(FilesystemScope::Host);
 
         // Absolute path: host scope must accept it even though it lives
         // outside `workspace.path()`.
@@ -2586,8 +2586,8 @@ mod tests {
         let link = outside.path().join("link.png");
         std::os::unix::fs::symlink(&target, &link).expect("create symlink");
 
-        let tool = ViewImageTool::new(workspace.path())
-            .with_filesystem_scope(FilesystemScope::Host);
+        let tool =
+            ViewImageTool::new(workspace.path()).with_filesystem_scope(FilesystemScope::Host);
 
         let result = tool
             .execute(&json!({ "path": link.to_string_lossy() }))

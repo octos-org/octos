@@ -22,10 +22,19 @@ pub(super) enum BudgetStop {
     /// pipeline rejection cascaded into ~20 rounds of manual `web_fetch`
     /// until the loop hit `max_iterations` and persisted only "Reached
     /// max iterations." as the assistant reply.
-    MaxIterations { limit: u32 },
-    MaxTokens { used: u32, limit: u32 },
-    ActivityTimeout { limit: Duration },
-    IdleProgressTimeout { limit: Duration },
+    MaxIterations {
+        limit: u32,
+    },
+    MaxTokens {
+        used: u32,
+        limit: u32,
+    },
+    ActivityTimeout {
+        limit: Duration,
+    },
+    IdleProgressTimeout {
+        limit: Duration,
+    },
 }
 
 impl BudgetStop {

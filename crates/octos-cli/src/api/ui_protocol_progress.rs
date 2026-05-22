@@ -753,10 +753,7 @@ mod tests {
         );
 
         let status = mapping.status.expect("status_word status");
-        assert_eq!(
-            status.event.metadata.kind,
-            progress_kinds::STATUS_WORD
-        );
+        assert_eq!(status.event.metadata.kind, progress_kinds::STATUS_WORD);
         assert_eq!(status.event.metadata.label.as_deref(), Some("Pondering"));
         assert_eq!(mapping.warning, None);
     }
