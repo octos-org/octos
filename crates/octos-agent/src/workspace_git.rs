@@ -1049,7 +1049,10 @@ mod tests {
     /// mirrors the spawn completion path so a regression in either the
     /// wiring or the validator itself surfaces here. Sync wrapper so the
     /// existing `#[test]` callers don't have to switch to `#[tokio::test]`.
-    fn run_slides_project_root_validators_sync(workspace_root: &Path) {
+    fn run_slides_project_root_validators_sync(
+        workspace_root: &Path,
+        files_to_send: &[PathBuf],
+    ) {
         let registry = Arc::new(ToolRegistry::new());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1060,7 +1063,7 @@ mod tests {
                 &registry,
                 workspace_root,
                 Some(WorkspaceProjectKind::Slides),
-                &[],
+                files_to_send,
             )
             .await;
         });
@@ -1243,7 +1246,7 @@ mod tests {
         // `ledger.append(...)`, masking the gap that codex flagged: the
         // validator was declared at the project policy but never RUN at the
         // project root in production. Now we exercise the real helper.
-        run_slides_project_root_validators_sync(temp.path());
+        run_slides_project_root_validators_sync(temp.path(), &[slides_root.join("output/deck.pptx")]);
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
@@ -1294,14 +1297,17 @@ mod tests {
 
         let report = snapshot_workspace_turn(temp.path(), "apply user request").unwrap();
 
-        assert_eq!(report.validation_failures.len(), 1);
-        assert_eq!(
-            report.validation_failures[0].phase,
-            WorkspaceValidationPhase::Completion
-        );
-        assert_eq!(
-            report.validation_failures[0].check,
-            "file_exists:output/**/slide-*.png"
+        // Post-#997 round-3: `read_workspace_policy` auto-migrates
+        // legacy slides policies on read. The custom on_completion
+        // `file_exists:output/...` checks above match the legacy
+        // marker and get replaced with empty + SpawnOnlyFiles
+        // MagicBytes (which doesn't run via the snapshot path).
+        // The test still proves `snapshot_workspace_turn` reads the
+        // (now migrated) policy without panicking.
+        assert!(
+            report.validation_failures.is_empty(),
+            "migrated slides policy declares no project-scope file_exists; got {:?}",
+            report.validation_failures
         );
     }
 
@@ -1328,7 +1334,7 @@ mod tests {
         // project policy but never RUN at the project root in production.
         // The helper writes a real `Pass` to the same ledger path the real
         // harness writes after `run_task` succeeds.
-        run_slides_project_root_validators_sync(temp.path());
+        run_slides_project_root_validators_sync(temp.path(), &[slides_root.join("output/deck.pptx")]);
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
