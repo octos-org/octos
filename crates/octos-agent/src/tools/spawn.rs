@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::mcp_agent::{
-    DispatchContextContract, DispatchRequest, DispatchResponse, McpAgentBackendConfig,
-    SharedBackend, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse,
+    McpAgentBackendConfig, SharedBackend, build_backend_from_config, build_dispatch_event_payload,
+    dispatch_with_metrics,
 };
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::file_state_cache::FileStateCache;
@@ -476,6 +477,13 @@ pub struct SpawnTool {
     /// starts, so child prompts are compacted and normalized by the same
     /// durable context path as top-level turns.
     child_prompt_context_manager_factory: Option<ChildPromptContextManagerFactory>,
+    /// #714: pre-dispatch policy gate for the `agent_mcp` spawn branch.
+    /// Without one, `dispatch_with_metrics` is reached unconditionally —
+    /// the same bypass the swarm side closed via
+    /// `octos_swarm::SwarmBuilder::with_dispatch_policy` in #710 / #713.
+    /// `None` keeps the pre-fix behaviour for callers that opted out
+    /// (e.g. legacy tests not exercising the gate).
+    dispatch_policy: Option<crate::dispatch_policy::DispatchPolicy>,
 }
 
 impl SpawnTool {
@@ -514,6 +522,7 @@ impl SpawnTool {
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
+            dispatch_policy: None,
         }
     }
 
@@ -555,6 +564,7 @@ impl SpawnTool {
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
+            dispatch_policy: None,
         }
     }
 
@@ -673,6 +683,19 @@ impl SpawnTool {
         Ok(self.with_mcp_agent_backend(backend, tool_name))
     }
 
+    /// #714: wire a pre-dispatch policy gate for the `agent_mcp` spawn
+    /// branch. Mirrors
+    /// [`octos_swarm::SwarmBuilder::with_dispatch_policy`] so both
+    /// dispatch surfaces fail closed on the same shape of gates
+    /// ([`ToolPolicy`], env denylist / allowlist, approval,
+    /// `require_sandboxed`). Without one, the agent_mcp branch reaches
+    /// [`crate::tools::mcp_agent::dispatch_with_metrics`] directly —
+    /// the bypass #714 closes.
+    pub fn with_dispatch_policy(mut self, policy: crate::dispatch_policy::DispatchPolicy) -> Self {
+        self.dispatch_policy = Some(policy);
+        self
+    }
+
     /// Attach a cost / provenance accountant (M7.4). Every successful
     /// MCP sub-agent dispatch routed through this tool records an
     /// attribution on the accountant's ledger. If the accountant carries
@@ -760,6 +783,63 @@ impl SpawnTool {
             .mcp_agent_tool_name
             .clone()
             .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
+
+        // #714: the public `dispatch_to_mcp_agent` helper is a thin
+        // wrapper around `dispatch_with_metrics`. Apply the same policy
+        // gate the main `execute` agent_mcp branch uses so a configured
+        // policy cannot be bypassed by routing through this helper. The
+        // gate inspects the dispatch payload (tool_name + task) before
+        // any backend round-trip, so denials never touch the network
+        // and never increment the dispatch metric. On denial we
+        // synthesise a `RemoteError` response carrying the gate reason
+        // so the existing harness-event + dispatch-event pipeline
+        // surfaces the failure with the same shape as a backend error.
+        if let Some(policy) = self.dispatch_policy.as_ref() {
+            if let Err(denial) = crate::dispatch_policy::enforce_dispatch_gates(
+                policy,
+                backend.as_ref(),
+                crate::dispatch_policy::DispatchTarget {
+                    dispatch_id: task_id,
+                    tool_name: &tool_name,
+                    task: &task,
+                },
+            )
+            .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    outcome = %denial.last_dispatch_outcome,
+                    reason = %denial.reason,
+                    "rejecting direct MCP dispatch by DispatchPolicy gate"
+                );
+                let denied_response = DispatchResponse {
+                    outcome: DispatchOutcome::RemoteError,
+                    output: String::new(),
+                    files_to_send: Vec::new(),
+                    error: Some(format!(
+                        "dispatch rejected by policy ({}): {}",
+                        denial.last_dispatch_outcome, denial.reason
+                    )),
+                    context_contract: None,
+                };
+                let payload = build_dispatch_event_payload(
+                    session_id,
+                    task_id,
+                    workflow,
+                    phase,
+                    backend.as_ref(),
+                    &denied_response,
+                );
+                let event = HarnessEvent {
+                    schema: crate::harness_events::HARNESS_EVENT_SCHEMA_V1.to_string(),
+                    payload,
+                };
+                event.validate().map_err(|error| {
+                    eyre::eyre!("policy-denied dispatch event failed validation: {error}")
+                })?;
+                return Ok((denied_response, event));
+            }
+        }
 
         let request = DispatchRequest::new(tool_name, task).with_context_contract(
             // #1021 / M17-C — populate backend_kind/agent_id/risk so the
@@ -1916,6 +1996,48 @@ impl Tool for SpawnTool {
                 "workflow": workflow.clone(),
                 "additional_instructions": input.additional_instructions,
             });
+
+            // #714: pre-dispatch policy gate. Runs **before** any
+            // budget reservation or backend dispatch so a denial
+            // short-circuits the whole pipeline (no reservation taken,
+            // no backend touched) — the same ordering the swarm
+            // dispatcher uses in `octos_swarm::dispatch_with_budget`.
+            // Without a configured policy this is a noop and the
+            // existing path is unchanged. With one, the gate enforces
+            // `tool_policy`, env denylist / allowlist, `require_approval`,
+            // and `require_sandboxed` so the agent_mcp branch can no
+            // longer bypass the constraints the operator wired into
+            // `octos serve`.
+            if let Some(policy) = self.dispatch_policy.as_ref() {
+                if let Err(denial) = crate::dispatch_policy::enforce_dispatch_gates(
+                    policy,
+                    backend.as_ref(),
+                    crate::dispatch_policy::DispatchTarget {
+                        dispatch_id: &task_id_for_event,
+                        tool_name: &tool_name,
+                        task: &dispatch_payload,
+                    },
+                )
+                .await
+                {
+                    warn!(
+                        task_id = %task_id_for_event,
+                        outcome = %denial.last_dispatch_outcome,
+                        reason = %denial.reason,
+                        "rejecting MCP sub-agent dispatch by DispatchPolicy gate"
+                    );
+                    let message = format!(
+                        "Status: FAILED\nDispatch rejected by policy ({outcome}): {reason}",
+                        outcome = denial.last_dispatch_outcome,
+                        reason = denial.reason,
+                    );
+                    return Ok(ToolResult {
+                        output: message,
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
 
             // Pre-dispatch budget reservation (F-003). Absent a
             // configured accountant the reservation short-circuits to
@@ -3399,6 +3521,7 @@ mod tests {
             parent_subagent_output_router: None,
             parent_subagent_summary_generator: None,
             child_prompt_context_manager_factory: None,
+            dispatch_policy: None,
         };
 
         assert_eq!(tool.worker_count.load(Ordering::SeqCst), 0);

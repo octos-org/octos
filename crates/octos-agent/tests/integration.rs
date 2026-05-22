@@ -177,7 +177,25 @@ async fn test_agent_max_iterations() {
         .process_message("loop forever", &[], vec![])
         .await
         .unwrap();
-    assert_eq!(resp.content, "Reached max iterations.");
+    // Regression: the bare "Reached max iterations." stub was replaced
+    // with an actionable message that names the iteration count and
+    // hints at `run_pipeline` as the canonical multi-step research path.
+    // See `crates/octos-agent/src/agent/budget.rs::BudgetStop::message`.
+    assert!(
+        resp.content.contains('3'),
+        "expected the configured iteration cap '3' in: {}",
+        resp.content
+    );
+    assert!(
+        resp.content.to_lowercase().contains("iteration"),
+        "expected 'iteration' in: {}",
+        resp.content
+    );
+    assert!(
+        resp.content.contains("run_pipeline"),
+        "expected a hint about 'run_pipeline' in: {}",
+        resp.content
+    );
 }
 
 #[tokio::test]

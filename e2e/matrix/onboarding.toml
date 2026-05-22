@@ -1,0 +1,297 @@
+# M22-H Onboarding Operational Matrix
+#
+# Scenario manifest for the TUI Solo Onboarding pack. Each scenario maps a
+# user-visible onboarding flow onto a deterministic JSON-RPC interaction with
+# `octos serve --stdio`.
+#
+# Schema (per `[[scenarios]]` table):
+#
+#   name        (string)    Stable identifier; used as the per-scenario
+#                           artifact subdirectory name.
+#   tier        (string)    "fast" | "local" | "release".
+#                             - fast    -> no real provider key, no live tmux,
+#                                          <30 s wall-clock budget. PR gate.
+#                             - local   -> requires a local provider key, may
+#                                          touch the real filesystem and tmux.
+#                             - release -> required pre-merge live lane;
+#                                          cannot be skipped on the release
+#                                          tier without an explicit override.
+#   transport   (string)    "stdio" only in this PR. WS/tmux transports land
+#                           when validators + tier-local arrive.
+#   description (string)    Single-line human-readable summary.
+#   skip_reason (string)    Optional. When set, scenario is reported as
+#                           "skipped" with this reason. Required when a
+#                           release-tier scenario is intentionally inert.
+#
+# Per-step keys (each entry in `steps`):
+#
+#   id     (string)   Stable per-scenario id. Validators index by this.
+#   rpc    (string)   AppUI JSON-RPC method name.
+#   params (table)    Params blob. Placeholders:
+#                       "${workspace}"  -> scenario workspace directory
+#                       "${workspace}/<sub>" allowed.
+#                       "${missing_path}" -> a path that DOES NOT exist
+#                       "${root_escape_path}" -> a path that resolves under
+#                                                a banned OS root (e.g.
+#                                                /etc/octos-not-a-real-...).
+#                       "${session_id}" -> per-scenario session id
+#                       "${profile_id}" -> per-scenario profile id
+#                       "${email}"      -> per-scenario seeded email
+#   expect (table)    Optional. Per-step shape expectations the runner can
+#                     enforce without a full validator. Recognized keys:
+#                       ok            (bool)   whether the RPC must succeed.
+#                                              Defaults to true.
+#                       result_has    (array)  list of dotted-path keys that
+#                                              must exist in the result.
+#                       error_kind    (string) when ok=false, the typed
+#                                              data.kind we expect.
+#
+# `validators` is reserved for the follow-up PR. Each scenario currently
+# advertises the validator name it WILL be wired to so we can grep for the
+# implementation gap. The runner ignores unknown validators today.
+#
+# `artifacts` is the standard bundle the runner writes per scenario:
+#   - rpc-transcript.jsonl     full stdio JSON-RPC trace
+#   - server-stderr.log        captured stderr from `octos serve --stdio`
+#   - result.json              {ok, steps, expectations} summary
+#   - data/                    per-scenario --data-dir (profiles, etc.)
+#   - workspace/               per-scenario --cwd workspace tree
+
+[pack]
+name = "onboarding"
+contract = "UPCR-2026-018"
+issue = "1056"
+
+# ---------------------------------------------------------------------------
+# tier-fast scenarios — deterministic, no provider key, no live tmux.
+# ---------------------------------------------------------------------------
+
+[[scenarios]]
+name = "first-run-capabilities"
+tier = "fast"
+transport = "stdio"
+description = "First-run client sees onboarding capability flags before any profile state exists."
+validators = ["onboarding_capability_flags"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "client_hello"
+rpc = "client_hello"
+params = { client = "m22-matrix-fast", client_version = "0.1.0" }
+# Codex P1 follow-up: server_hello does NOT return `server_version`;
+# its real shape is { type, transport, client_transport, client,
+# capabilities }. Assert the canonical shape so the gate actually
+# validates the handshake instead of failing on a non-existent key.
+expect = { result_has = ["type", "capabilities"] }
+
+[[scenarios.steps]]
+id = "capabilities"
+rpc = "config/capabilities/list"
+params = {}
+expect = { result_has = [
+    "capabilities.supported_methods",
+] }
+
+
+[[scenarios]]
+name = "profile-local-create-idempotent"
+tier = "fast"
+transport = "stdio"
+description = "profile/local/create creates a local solo profile and is idempotent under the same metadata."
+validators = ["profile_local_create_no_otp", "profile_id_consistency"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "create_first"
+rpc = "profile/local/create"
+params = { name = "Matrix Fast Owner", username = "${profile_id}", email = "${email}" }
+expect = { result_has = ["profile_id", "created"] }
+
+[[scenarios.steps]]
+id = "create_again"
+rpc = "profile/local/create"
+params = { name = "Matrix Fast Owner", username = "${profile_id}", email = "${email}" }
+expect = { result_has = ["profile_id", "created"] }
+
+
+[[scenarios]]
+name = "profile-local-create-collision"
+tier = "fast"
+transport = "stdio"
+description = "profile/local/create rejects username collision with different owner metadata."
+validators = ["profile_local_collision_typed_error"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "create_owner_a"
+rpc = "profile/local/create"
+params = { name = "Owner A", username = "${profile_id}", email = "${email}" }
+expect = { result_has = ["profile_id"] }
+
+[[scenarios.steps]]
+id = "create_owner_b_collides"
+rpc = "profile/local/create"
+params = { name = "Owner B", username = "${profile_id}", email = "owner-b@example.test" }
+expect = { ok = false, error_kind = "profile_local_collision" }
+
+
+[[scenarios]]
+name = "workspace-probe-existing"
+tier = "fast"
+transport = "stdio"
+description = "onboarding/workspace_probe canonicalizes an existing writable directory."
+validators = ["workspace_probe_existing_writable"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "probe_existing"
+rpc = "onboarding/workspace_probe"
+params = { path = "${workspace}" }
+expect = { result_has = [
+    "requested_path",
+    "expanded_path",
+    "canonical_path",
+    "exists",
+    "is_directory",
+    "writable",
+    "workspace_policy",
+    "root_escape",
+    "runtime_mode",
+] }
+
+
+[[scenarios]]
+name = "workspace-probe-missing"
+tier = "fast"
+transport = "stdio"
+description = "onboarding/workspace_probe reports a missing path with null canonical and exists=false."
+validators = ["workspace_probe_missing_path"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "probe_missing"
+rpc = "onboarding/workspace_probe"
+params = { path = "${missing_path}" }
+expect = { result_has = [
+    "requested_path",
+    "exists",
+    "is_directory",
+    "root_escape",
+] }
+
+
+[[scenarios]]
+name = "workspace-probe-root-escape"
+tier = "fast"
+transport = "stdio"
+description = "onboarding/workspace_probe surfaces root_escape=true under a banned system root."
+validators = ["workspace_probe_root_escape_typed"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "probe_etc"
+rpc = "onboarding/workspace_probe"
+params = { path = "${root_escape_path}" }
+expect = { result_has = ["root_escape", "banned_root"] }
+
+
+[[scenarios]]
+name = "permission-profile-set-then-stamp"
+tier = "local"
+transport = "stdio"
+description = "permission/profile/set applies a local-solo selection and runtime_policy_stamp reflects it."
+# Codex P1 follow-up note: this scenario relies on session/open
+# succeeding, which requires a configured provider. Demoted from
+# `fast` to `local` until profile/llm/upsert is wired as a
+# precondition step. See follow-up issue tracking the wire-up.
+skip_reason = "tier-fast can't reach session/open without provider setup; promote back to fast after #1056 follow-up adds the prereq steps."
+validators = ["permission_profile_stamp_consistent", "runtime_policy_stamp_present"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "create_profile"
+rpc = "profile/local/create"
+params = { name = "Matrix Fast Owner", username = "${profile_id}", email = "${email}" }
+
+[[scenarios.steps]]
+id = "open_session"
+rpc = "session/open"
+params = { session_id = "${session_id}", profile_id = "${profile_id}", cwd = "${workspace}" }
+
+[[scenarios.steps]]
+id = "list_permission_profiles"
+rpc = "permission/profile/list"
+params = { session_id = "${session_id}" }
+expect = { result_has = ["session_id", "profiles"] }
+
+[[scenarios.steps]]
+id = "set_permission_profile"
+rpc = "permission/profile/set"
+params = { session_id = "${session_id}", update = { mode = "workspace-write", approval_policy = "on-request" } }
+expect = { result_has = ["session_id", "current"] }
+
+[[scenarios.steps]]
+id = "status_after_set"
+rpc = "session/status/read"
+params = { session_id = "${session_id}", profile_id = "${profile_id}" }
+expect = { result_has = ["runtime_policy_stamp"] }
+
+
+[[scenarios]]
+name = "resume-after-partial-setup"
+tier = "fast"
+transport = "stdio"
+description = "After profile create + workspace probe but before session/open, capabilities and a second probe still succeed (resume entry)."
+validators = ["resume_partial_setup_safe"]
+artifacts = ["rpc-transcript.jsonl", "server-stderr.log", "result.json"]
+
+[[scenarios.steps]]
+id = "create_profile"
+rpc = "profile/local/create"
+params = { name = "Matrix Fast Owner", username = "${profile_id}", email = "${email}" }
+
+[[scenarios.steps]]
+id = "first_probe"
+rpc = "onboarding/workspace_probe"
+params = { path = "${workspace}" }
+
+[[scenarios.steps]]
+id = "resume_capabilities"
+rpc = "config/capabilities/list"
+params = {}
+expect = { result_has = ["capabilities.supported_methods"] }
+
+[[scenarios.steps]]
+id = "resume_probe"
+rpc = "onboarding/workspace_probe"
+params = { path = "${workspace}" }
+expect = { result_has = ["requested_path", "exists"] }
+
+
+# ---------------------------------------------------------------------------
+# tier-local / tier-release placeholders.
+#
+# These declare the *intent* so the next PR can grep for them, but they are
+# currently skipped with explicit reasons. The runner respects `skip_reason`
+# on every tier (no enforcement yet on release tier — release-gate
+# enforcement lands with the validators PR).
+# ---------------------------------------------------------------------------
+
+[[scenarios]]
+name = "first-run-local-tmux"
+tier = "local"
+transport = "stdio"
+description = "Drive octos-tui through first-run wizard under live tmux (placeholder)."
+validators = ["tui_first_run_capture"]
+artifacts = ["tui-capture.txt", "rpc-transcript.jsonl"]
+skip_reason = "tier-local scenarios land with PR #2 (validators) and PR #3 (tier-local)."
+
+
+[[scenarios]]
+name = "release-gate-no-otp"
+tier = "release"
+transport = "stdio"
+description = "Release gate: full onboarding flow must avoid auth/send_code and auth/verify (placeholder)."
+validators = ["no_otp_emitted", "no_secret_leak_in_transcripts"]
+artifacts = ["rpc-transcript.jsonl", "redaction-report.json"]
+skip_reason = "tier-release gate enforced once validators ship (PR #2)."

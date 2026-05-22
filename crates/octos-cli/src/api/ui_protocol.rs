@@ -4865,6 +4865,7 @@ fn configured_provider_json(
 
 fn permission_profile_supported_selections(
     state: &AppState,
+    session_id: &SessionKey,
 ) -> Vec<octos_core::ui_protocol::PermissionProfileSelection> {
     use octos_core::ui_protocol::{
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
@@ -4881,7 +4882,16 @@ fn permission_profile_supported_selections(
             network: Network::Deny,
         },
     ];
-    if state.deployment_mode == crate::config::DeploymentMode::Local {
+    // #1162 codex P2 — keep list output consistent with the
+    // session-scope gate added to `permission_profile_set`. On a Local
+    // server we only advertise `danger_full_access` for sessions whose
+    // structural profile_id is NOT tenant/cloud-scoped; tenant-scoped
+    // sessions get `permission_profile_disallowed` from `set`, so the
+    // list must omit the dead option rather than render it as a
+    // selectable profile.
+    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    let session_is_non_solo_scoped = session_id_encodes_non_solo_scope(session_id);
+    if server_is_local && !session_is_non_solo_scoped {
         profiles.push(Selection {
             mode: Mode::DangerFullAccess,
             network: Network::Allow,
@@ -4981,8 +4991,138 @@ fn permission_profile_disallowed_error(
     }))
 }
 
+/// #1162 — Returns `true` when the supplied session key carries a
+/// non-solo tenant/cloud scope marker in a STRUCTURAL position of the
+/// base key. The M12-G soak negative probe creates sessions like
+/// `tenant-a:api:m12-negative#…` and `coding:tenant:m12-negative#…`
+/// and asserts that the gate rejects `danger_full_access` even when
+/// the client omits the `runtime_mode` override (UPCR-2026-018 /
+/// #1086). This helper layers the session-shape signal on top of the
+/// override gate so a non-conforming or older client cannot slip
+/// dangerous mode past the policy boundary.
+///
+/// Two structural positions of the base key are checked. Parsing
+/// does NOT rely on `SessionKey::profile_id()` because that helper's
+/// recognition list is narrower than the gateway's set of supported
+/// channels (codex P1 round 3 #1167 caught the gap for `line`,
+/// `wechat`, etc.) — we always interpret the FIRST segment as the
+/// candidate `profile_id` and disambiguate against the registered
+/// channel list locally.
+///
+/// 1. First segment when it is NOT a registered channel — treat as a
+///    candidate `profile_id` and match `tenant` / `cloud` exactly
+///    (case-insensitive, trimmed) or anything starting with
+///    `tenant-` / `cloud-`. This catches the `with_profile` /
+///    `with_profile_topic` shape (`tenant-a:api:…`,
+///    `tenant--child:api:…`, `cloud--root:api:…`, `tenant-a:line:…`).
+/// 2. Second-of-three segment when it equals exactly `tenant` or
+///    `cloud` AND the 1st segment is NOT a registered channel —
+///    catches the M12-G soak shape `{profile}:tenant:{chat}` /
+///    `{profile}:cloud:{chat}` (`coding:tenant:m12-negative`,
+///    `m12solo:cloud:m12-negative`). The match is EXACT (no
+///    `starts_with`) so chat-id text like `_main:api:tenant-demo` is
+///    not affected (2nd slot there is `api`, a registered channel,
+///    so the structural form there is `profile=_main`, `channel=api`,
+///    `chat=tenant-demo`). The 1st-segment guard also prevents the
+///    false positive on legacy `{channel}:{chat_id_with_colons}`
+///    sessions like `local:tenant:123` where the chat-id text itself
+///    contains `tenant:`.
+///
+/// Codex review history on #1167:
+/// - P2 round 1: restrict the scan to STRUCTURAL slots (chat-id text
+///   is arbitrary; `local:cloud-migration` is legitimate).
+/// - P1 round 2: also catch the soak's `{profile}:tenant:{chat}` shape
+///   where `tenant`/`cloud` sits in the channel slot.
+/// - P2 round 2: the channel-slot check must NOT fire when the 1st
+///   segment is a registered channel — that's a legacy
+///   `{channel}:{chat_id_with_colons}` session, not a tenant scope.
+/// - P1 round 3: don't rely on `SessionKey::profile_id()` — it returns
+///   `None` for profiled sessions on channels that aren't in the core
+///   recognition list (`line`, `wechat`, …), so the gate must parse
+///   the first segment with the full registered-channel set locally.
+fn session_id_encodes_non_solo_scope(session_id: &SessionKey) -> bool {
+    fn token_marks_non_solo(raw: &str) -> bool {
+        let token = raw.trim().to_ascii_lowercase();
+        token == "tenant"
+            || token == "cloud"
+            || token.starts_with("tenant-")
+            || token.starts_with("cloud-")
+    }
+
+    let mut parts = session_id.base_key().splitn(3, ':');
+    let first = parts.next();
+    let second = parts.next();
+    let third = parts.next();
+
+    // (1) Candidate profile_id slot: 1st segment when it is NOT a
+    // registered channel name. This is structural — chat-id text
+    // cannot occupy this slot because a 2-segment base key with a
+    // registered-channel 1st segment is a legacy
+    // `{channel}:{chat_id}` shape (and we don't read the 1st segment
+    // as profile_id in that case).
+    if let Some(first) = first {
+        if !is_registered_channel_name(first) && token_marks_non_solo(first) {
+            return true;
+        }
+
+        // (2) Channel-slot scope marker: 2nd segment when it equals
+        // exactly `tenant`/`cloud` AND the 1st segment is NOT a
+        // registered channel. The 1st-segment guard prevents the
+        // false positive on `local:tenant:123` where `tenant:123` is
+        // chat-id text.
+        if !is_registered_channel_name(first) {
+            if let (Some(second), Some(_third)) = (second, third) {
+                let channel_slot = second.trim().to_ascii_lowercase();
+                if channel_slot == "tenant" || channel_slot == "cloud" {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Registered gateway-channel name set used by
+/// `session_id_encodes_non_solo_scope` to distinguish a legacy
+/// `{channel}:{chat_id_with_colons}` session from a tenant-scoped
+/// `{profile}:tenant:{chat}` session. This is a SUPERSET of
+/// `octos_core::types::is_channel_name` — core's list omits
+/// feature-gated channels (`line`, `wechat`, `mock`) that the
+/// gateway / bus crates emit in `BusMessage.channel`. Codex round 4
+/// review (#1167) caught the gap: a legacy
+/// `SessionKey::new("line", "tenant:123")` whose chat-id text starts
+/// with `tenant:` would be misclassified as tenant-scoped without
+/// recognising `line` here. Keep in sync when new gateway channels
+/// are added.
+fn is_registered_channel_name(value: &str) -> bool {
+    matches!(
+        value,
+        "api"
+            | "cli"
+            | "discord"
+            | "email"
+            | "feishu"
+            | "line"
+            | "local"
+            | "matrix"
+            | "mock"
+            | "qq-bot"
+            | "slack"
+            | "system"
+            | "telegram"
+            | "test"
+            | "twilio"
+            | "wechat"
+            | "wecom"
+            | "wecom-bot"
+            | "whatsapp"
+    )
+}
+
 fn permission_selection_allowed(
     state: &AppState,
+    session_id: &SessionKey,
     selection: octos_core::ui_protocol::PermissionProfileSelection,
     approval_policy: Option<octos_agent::ApprovalPolicy>,
     requested_runtime_mode: Option<&str>,
@@ -5013,7 +5153,14 @@ fn permission_selection_allowed(
         _ => false,
     };
     let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
-    let effective_local = server_is_local && request_relaxes_to_solo;
+    // #1162: defense-in-depth. A session whose key encodes a non-solo
+    // tenant scope (e.g. `coding:tenant:m12-negative`) MUST tighten the
+    // gate even when the client omitted the `runtime_mode` override.
+    // The M12-G soak negative probe relies on this signal so a
+    // non-conforming client cannot slip dangerous mode past the policy
+    // boundary by simply leaving the override out.
+    let session_is_non_solo_scoped = session_id_encodes_non_solo_scope(session_id);
+    let effective_local = server_is_local && request_relaxes_to_solo && !session_is_non_solo_scoped;
 
     effective_local
         || (selection.mode != Mode::DangerFullAccess
@@ -5063,10 +5210,11 @@ fn permission_profile_list_result(
 ) -> octos_core::ui_protocol::PermissionProfileListResult {
     let store = session_permission_profiles();
     let current = store.get(&params.session_id);
+    let profiles = permission_profile_supported_selections(state, &params.session_id);
     octos_core::ui_protocol::PermissionProfileListResult {
         session_id: params.session_id,
         current,
-        profiles: permission_profile_supported_selections(state),
+        profiles,
     }
 }
 
@@ -5083,6 +5231,7 @@ fn permission_profile_set_result(
     let requested = params.update.apply_to(previous);
     if !permission_selection_allowed(
         state,
+        &params.session_id,
         requested,
         approval_policy,
         params.runtime_mode.as_deref(),
@@ -11521,6 +11670,14 @@ async fn run_m9_fixture_turn(
                             runtime_detail: Some(
                                 "persisted deterministic task snapshot".to_owned(),
                             ),
+                            // #1123 / M13-B — synthetic fixture path has no
+                            // BackgroundTask projection; leave all five fields
+                            // unset so the wire shape stays bare.
+                            source: None,
+                            role: None,
+                            summary: None,
+                            artifact_count: None,
+                            runtime_policy_stamp: None,
                         }),
                     );
                     let _ = send_notification_durable(
@@ -11543,6 +11700,11 @@ async fn run_m9_fixture_turn(
                             state: UiTaskRuntimeState::Completed,
                             tool_call_id: None,
                             runtime_detail: Some("fixture complete".to_owned()),
+                            source: None,
+                            role: None,
+                            summary: None,
+                            artifact_count: None,
+                            runtime_policy_stamp: None,
                         }),
                     );
                     if m9_fixture_delay_or_interrupt(
@@ -12493,6 +12655,11 @@ async fn run_native_code_review_turn(
             state: UiTaskRuntimeState::Running,
             tool_call_id: None,
             runtime_detail: Some("launching model-backed native specialists".to_owned()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     let _ = send_notification_durable(
@@ -12637,6 +12804,11 @@ async fn run_native_code_review_turn(
                         state: UiTaskRuntimeState::Cancelled,
                         tool_call_id: None,
                         runtime_detail: Some("interrupted by client".to_owned()),
+                        source: None,
+                        role: None,
+                        summary: None,
+                        artifact_count: None,
+                        runtime_policy_stamp: None,
                     }),
                 );
                 try_emit_terminal(
@@ -12743,6 +12915,11 @@ async fn run_native_code_review_turn(
             runtime_detail: Some(format!(
                 "{completed}/{expected_results} specialists completed"
             )),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     try_emit_terminal(
@@ -13219,6 +13396,11 @@ async fn run_m15_live_subagent_fixture_turn(
             state: UiTaskRuntimeState::Running,
             tool_call_id: None,
             runtime_detail: Some("octos serve launching CLI subagents".to_owned()),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     let _ = send_notification_durable(
@@ -13348,6 +13530,11 @@ async fn run_m15_live_subagent_fixture_turn(
                         state: UiTaskRuntimeState::Cancelled,
                         tool_call_id: None,
                         runtime_detail: Some("interrupted by client".to_owned()),
+                        source: None,
+                        role: None,
+                        summary: None,
+                        artifact_count: None,
+                        runtime_policy_stamp: None,
                     }),
                 );
                 return M9FixtureOutcome::Interrupted;
@@ -13437,6 +13624,11 @@ async fn run_m15_live_subagent_fixture_turn(
             state: UiTaskRuntimeState::Completed,
             tool_call_id: None,
             runtime_detail: Some(format!("{completed} live CLI subagents completed")),
+            source: None,
+            role: None,
+            summary: None,
+            artifact_count: None,
+            runtime_policy_stamp: None,
         }),
     );
     append_appui_evidence_jsonl(
@@ -13660,6 +13852,54 @@ async fn seed_m9_task_output_fixture(
 #[derive(Debug, Clone)]
 struct GoalContinuationContext {
     profile_id: String,
+}
+
+/// #1134 — pick the LAST non-empty assistant row after `pre` from a
+/// pre-fetched session history slice.
+///
+/// Walks from the back and skips empty-content rows (assistant
+/// tool-call stubs persisted before the model's final text reply).
+/// Pulled out as a free function so the acceptance test can simulate
+/// the spawn_only / send_file ordering directly without standing up
+/// `run_standalone_turn`.
+fn appui_history_last_non_empty_assistant_after(history: &[Message], pre: usize) -> Option<String> {
+    history
+        .iter()
+        .filter(|message| matches!(message.role, MessageRole::Assistant))
+        .enumerate()
+        .filter(|(idx, _)| *idx >= pre)
+        .filter(|(_, message)| !message.content.is_empty())
+        .last()
+        .map(|(_, message)| message.content.clone())
+}
+
+/// #1134 — pick the assistant text that should be fed to
+/// `apply_self_paced_response`.
+///
+/// Prefers `captured_response_content` (the agent_task's EndTurn
+/// payload — the source of truth for `<<loop-next-in: ...>>`). Empty
+/// content is treated as "no reply" so a blank EndTurn does not
+/// stamp a default-delay reschedule and matches the non-empty filter
+/// the session-history fallback applies.
+///
+/// Falls back to `history_fallback` (typically
+/// [`appui_history_last_non_empty_assistant_after`]) only when the
+/// captured content is `None` — i.e. the oneshot didn't fire
+/// (interrupt / agent error / panic). The pre-#1134 shape used
+/// `history_fallback` unconditionally, which is wrong when a
+/// spawn_only / send_file path persists a background assistant row
+/// AFTER the model's final reply: `.last()` selects the background
+/// row and the LLM's reschedule hint never reaches the loop
+/// scheduler.
+fn appui_loop_assistant_reply_for_self_paced(
+    captured_response_content: Option<&str>,
+    history_fallback: Option<String>,
+) -> Option<String> {
+    match captured_response_content {
+        Some(content) if !content.is_empty() => Some(content.to_owned()),
+        Some(_) => None,
+        None => history_fallback,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14572,6 +14812,19 @@ async fn run_standalone_turn(
     // clone alive in this outer scope for the post-turn self-paced
     // reschedule read below.
     let sessions_for_reschedule = sessions.clone();
+    // #1134 — capture the turn's final `response.content` (the agent's
+    // actual EndTurn payload) directly out of `agent_task` so the
+    // post-turn self-paced reschedule block can parse the
+    // `<<loop-next-in: ...>>` hint from the LLM reply without scanning
+    // the session history. The session-history walk picks the LAST
+    // assistant-row, which is wrong when a spawn_only / send_file path
+    // persists a background assistant message AFTER the model's final
+    // reply: `.last()` selects the background row (often with no
+    // hint) and `apply_self_paced_response` falls back to the default
+    // delay. A oneshot is the right shape because the spawn emits at
+    // most one final response and we only need it once in the post-turn
+    // block.
+    let (final_reply_tx, final_reply_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         let result = octos_llm::with_router_context(
@@ -14594,7 +14847,36 @@ async fn run_standalone_turn(
 
         match result {
             Ok(response) => {
+                // #1134 — capture the LLM reply for the post-turn
+                // self-paced reschedule block. The receiver of this
+                // oneshot uses the captured content instead of
+                // `history.last()`, so background assistant rows
+                // (spawn_only / send_file companion writes) that
+                // land below the LLM reply cannot mask the model's
+                // `<<loop-next-in: ...>>` hint. We CLONE the string
+                // so the in-spawn `done` event below can still emit
+                // `response.content`.
+                //
+                // #1158 codex P2 follow-up: send the captured reply
+                // ONLY AFTER persistence has committed. If the spawn
+                // task is interrupted (or panics) between
+                // `process_message` returning and persistence
+                // completing, an early send would let the post-turn
+                // block call `apply_self_paced_response` from a
+                // reply that never made it into session history.
+                // Defer the send until below the persist block.
+                let captured_final_reply = response.content.clone();
                 let mut cursor = None;
+                // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
+                // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
+                // error). Track whether the assistant row carrying
+                // `response.content` actually persisted. If not, the
+                // captured reply must NOT be released to the post-turn
+                // reschedule block — that would let it call
+                // `apply_self_paced_response` from a reply that never
+                // hit session history, which is the exact failure mode
+                // this fix is meant to prevent.
+                let mut final_assistant_persisted = false;
                 {
                     let mut sessions = sessions.lock().await;
                     let final_assistant = final_assistant_message(
@@ -14611,6 +14893,14 @@ async fn run_standalone_turn(
                             skipped_internal_user = true;
                             continue;
                         }
+                        // Detect the exact row that carries
+                        // `response.content` BEFORE pre-stamp /
+                        // persist, so we can flip
+                        // `final_assistant_persisted` only on its
+                        // Ok branch.
+                        let is_final_assistant_carrier = message.role == MessageRole::Assistant
+                            && message.content == response.content
+                            && !response.content.is_empty();
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();
@@ -14629,9 +14919,37 @@ async fn run_standalone_turn(
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
                             });
+                            if is_final_assistant_carrier {
+                                final_assistant_persisted = true;
+                            }
                         }
                     }
                 }
+                // #1158 codex P2 rev3 follow-up: distinguish two
+                // shapes of "empty captured reply":
+                //
+                //   * `response.content.is_empty()` — the model
+                //     explicitly EndTurn'd with no text. The picker
+                //     contract treats `Some("")` as an authoritative
+                //     blank signal and suppresses the history
+                //     fallback. We must NOT downgrade to `None`
+                //     here, otherwise an earlier non-empty assistant
+                //     row that landed in history would be picked up
+                //     as the loop's "last reply" and reschedule from
+                //     stale content.
+                //
+                //   * `response.content` non-empty BUT the
+                //     assistant-row persist failed — the captured
+                //     reply was never committed to history, so we
+                //     send `None` and let the post-turn block fall
+                //     back to the history scan (matches pre-#1134
+                //     aborted-turn behaviour).
+                let final_send = if response.content.is_empty() || final_assistant_persisted {
+                    Some(captured_final_reply)
+                } else {
+                    None
+                };
+                let _ = final_reply_tx.send(final_send);
                 let done = json!({
                     "type": "done",
                     "content": response.content,
@@ -14643,6 +14961,11 @@ async fn run_standalone_turn(
                 let _ = progress_tx_for_result.send(done.to_string()).await;
             }
             Err(error) => {
+                // #1134 — signal the post-turn block that no LLM reply
+                // is available on the error path. The receiver falls
+                // back to the session-history scan, matching the
+                // pre-#1134 behaviour.
+                let _ = final_reply_tx.send(None);
                 let error = json!({
                     "type": "error",
                     "message": error.to_string(),
@@ -14898,36 +15221,58 @@ async fn run_standalone_turn(
         });
     }
 
+    // #1134 — await the agent_task's oneshot for the turn's final
+    // `response.content`. The receiver resolves to:
+    //   * `Ok(Some(content))` — the agent reached EndTurn and sent the
+    //     model's actual reply BEFORE persisting any background
+    //     assistant rows. The self-paced reschedule below parses
+    //     `<<loop-next-in: ...>>` directly off this string.
+    //   * `Ok(None)`  — the agent task returned an error.
+    //   * `Err(_)`    — the sender dropped (interrupt path or task
+    //     panic). The session-history fallback below is the correct
+    //     conservative behaviour.
+    //
+    // `agent_task.await` has already returned above, so the sender
+    // half is guaranteed to be either delivered or dropped — this
+    // `await` will not block.
+    let final_response_content: Option<String> = final_reply_rx.await.ok().flatten();
+
     // #1128 codex P1 re-review #2 — apply self-paced rescheduling
     // AFTER the model reply has been persisted to the per-session
     // session manager. This is the AppUI parity for what
     // `SessionActor::drain_master_continuations` does for the chat
-    // path. Reading from `sessions` (= `session_runtime.sessions`)
-    // ensures we observe the assistant message that `run_standalone_turn`
-    // just persisted, NOT a stale `state.sessions` view that never
-    // gets written to in production.
+    // path.
+    //
+    // #1134 — prefer the captured `response.content` from the
+    // agent_task spawn. The session-history scan it replaces picks
+    // `.last()` of all non-empty assistant rows after `pre`; when a
+    // spawn_only / send_file path persists a background row AFTER
+    // the model's final reply, `.last()` selects the background row
+    // and `apply_self_paced_response` falls back to the default
+    // delay. The captured content is the actual EndTurn payload, so
+    // the `<<loop-next-in: ...>>` hint always wins. Fall back to the
+    // session-history scan ONLY if the oneshot didn't fire (interrupt
+    // / agent error path).
     if let (Some(loop_id), Some(pre)) = (
         loop_id_for_self_paced.as_ref(),
         pre_assistant_count_for_post_turn,
     ) {
-        let assistant_reply: Option<String> = {
+        // Only walk the session history when the oneshot didn't fire
+        // — the common path (agent reached EndTurn) reads
+        // `final_response_content` directly and avoids the lock
+        // altogether.
+        let history_fallback: Option<String> = if final_response_content.is_some() {
+            None
+        } else {
             let mut guard = sessions_for_reschedule.lock().await;
             let session = guard.get_or_create(&session_id).await;
             let history = session.get_history(usize::MAX);
-            // Walk from the back: pick the LAST assistant message
-            // emitted after the pre-count with non-empty content. For
-            // tool-using loop turns, `process_inbound` persists
-            // assistant tool-call stubs before the final text reply
-            // — those have empty content and must be skipped.
-            history
-                .iter()
-                .filter(|message| matches!(message.role, MessageRole::Assistant))
-                .enumerate()
-                .filter(|(idx, _)| *idx >= pre)
-                .filter(|(_, message)| !message.content.is_empty())
-                .last()
-                .map(|(_, message)| message.content.clone())
+            appui_history_last_non_empty_assistant_after(history, pre)
         };
+        let assistant_reply = appui_loop_assistant_reply_for_self_paced(
+            final_response_content.as_deref(),
+            history_fallback,
+        );
         if let Some(reply) = assistant_reply {
             let profile_for_reschedule = session_id
                 .profile_id()
@@ -16751,6 +17096,148 @@ mod tests {
         );
     }
 
+    /// #1134 acceptance — when an AppUI loop turn uses a spawn_only /
+    /// send_file path that persists a background assistant message
+    /// AFTER the model's final reply, the pre-#1134 shape walks the
+    /// session history with `.last()` and selects the background row
+    /// — which contains no `<<loop-next-in: ...>>` hint — so
+    /// `apply_self_paced_response` falls back to the default delay.
+    ///
+    /// The fix routes the agent task's `response.content` out through
+    /// a oneshot so the post-turn block parses the hint directly off
+    /// the LLM's EndTurn payload. This test pins the contract:
+    /// feeding the helper a captured `<<loop-next-in: 60s>>` reply
+    /// AND a session-history fallback that would (incorrectly) yield
+    /// a background row must pick the captured reply, and
+    /// `apply_self_paced_response` must reschedule at ~60s — NOT the
+    /// `SELF_PACED_DEFAULT_DELAY_SECONDS` fallback.
+    #[test]
+    fn appui_loop_uses_response_content_not_session_history_for_self_paced() {
+        // Build a private orchestrator so the test does not touch the
+        // process-wide `default_agent_orchestrator()` static; running
+        // in parallel with the appui_*_loop_*_drains tests that DO
+        // share the static would otherwise contaminate their loop
+        // counts.
+        use crate::api::agent_orchestrator::InProcessAgentOrchestrator;
+
+        // `SELF_PACED_DEFAULT_DELAY_SECONDS` is module-private
+        // (`agent_orchestrator.rs` line 49: `const ... = 60 * 15`).
+        // Mirror the constant here so the test pins the EXACT value
+        // the production fallback would stamp — if the production
+        // default changes, this test goes red as a tripwire,
+        // forcing a follow-up review.
+        const SELF_PACED_DEFAULT_DELAY_SECONDS_MIRROR: u64 = 60 * 15;
+
+        // Simulated turn timeline (exactly the bug scenario): the
+        // model emitted a self-paced hint, then a spawn_only /
+        // send_file companion row was persisted afterwards. The
+        // history fallback's `.last()` would pick the background
+        // row, which has no hint.
+        let model_reply = "status report <<loop-next-in: 60s>>";
+        let background_row = "[background] sent file: report.pdf";
+        let history = vec![
+            test_message(MessageRole::User, "loop fire prompt"),
+            test_message(MessageRole::Assistant, model_reply),
+            // The bug: a background assistant row lands AFTER the
+            // model's EndTurn reply.
+            test_message(MessageRole::Assistant, background_row),
+        ];
+        let pre_assistant_count = 0;
+
+        // Pre-#1134 behaviour: history fallback alone picks the
+        // background row.
+        let fallback_only =
+            appui_history_last_non_empty_assistant_after(&history, pre_assistant_count);
+        assert_eq!(
+            fallback_only.as_deref(),
+            Some(background_row),
+            "fallback alone reproduces the bug — picks the background row, not the model reply"
+        );
+
+        // Post-#1134 behaviour: the captured `response.content` wins
+        // even though the fallback would (incorrectly) yield the
+        // background row.
+        let assistant_reply = appui_loop_assistant_reply_for_self_paced(
+            Some(model_reply),
+            // Compute the fallback the same way the production
+            // post-turn block does — this is the value `.last()`
+            // would have returned.
+            appui_history_last_non_empty_assistant_after(&history, pre_assistant_count),
+        );
+        assert_eq!(
+            assistant_reply.as_deref(),
+            Some(model_reply),
+            "captured response.content must win over the session-history fallback"
+        );
+
+        // End-to-end: feed the picked reply into the orchestrator's
+        // self-paced reschedule and confirm the next_run_at_ms lands
+        // ~60s out (NOT the default delay).
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id =
+            SessionKey::with_profile("tenant-a", "api", "appui-loop-self-paced-response");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                prompt: Some("self-paced loop".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self_paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        let applied = orchestrator
+            .apply_self_paced_response(
+                &loop_id,
+                "tenant-a",
+                assistant_reply.as_deref().expect("picked assistant reply"),
+            )
+            .expect("apply self-paced response");
+        assert_eq!(
+            applied,
+            Some(Duration::from_secs(60)),
+            "captured response.content must yield the 60s hint, not the default delay"
+        );
+        assert_ne!(
+            applied,
+            Some(Duration::from_secs(SELF_PACED_DEFAULT_DELAY_SECONDS_MIRROR)),
+            "captured response.content must NOT fall back to SELF_PACED_DEFAULT_DELAY_SECONDS"
+        );
+
+        // Negative control: had we taken the background row instead
+        // (the pre-#1134 shape), the parsed delay would be `None`
+        // and apply_self_paced_response would stamp the default.
+        let bug_path = orchestrator
+            .apply_self_paced_response(&loop_id, "tenant-a", background_row)
+            .expect("apply self-paced response (bug path)");
+        assert_eq!(
+            bug_path, None,
+            "the pre-#1134 history-fallback path returns None (no hint), stamping the default delay"
+        );
+    }
+
+    /// #1134 — when the oneshot didn't fire (interrupt / agent error
+    /// path), the post-turn block must fall back to the session
+    /// history scan. This pins that contract on the picker helper.
+    #[test]
+    fn appui_loop_self_paced_picker_falls_back_to_history_when_capture_missing() {
+        let history_pick = Some("status report <<loop-next-in: 60s>>".to_owned());
+        let assistant_reply = appui_loop_assistant_reply_for_self_paced(None, history_pick.clone());
+        assert_eq!(assistant_reply, history_pick);
+
+        // Empty captured content is treated as "no reply" (matches
+        // the non-empty filter the history walk applies). We do NOT
+        // fall back to history in that case — the agent explicitly
+        // delivered a blank EndTurn payload.
+        let blank_capture = appui_loop_assistant_reply_for_self_paced(Some(""), history_pick);
+        assert_eq!(
+            blank_capture, None,
+            "empty captured content must not stamp a default-delay reschedule via history fallback"
+        );
+    }
+
     #[test]
     fn profile_local_create_creates_user_and_profile_without_otp() {
         let dir = tempfile::tempdir().unwrap();
@@ -17449,6 +17936,306 @@ ignore = []
         )
         .expect("normalized solo override must still relax on Local");
         assert_eq!(solo_allowed.session_id, solo_session);
+    }
+
+    /// #1162 — M12-G regression. A session whose base key carries a
+    /// tenant/cloud scope marker in a structural slot (the
+    /// `with_profile` first slot OR the M12-G soak's `{profile}:tenant:`
+    /// channel-slot literal) on a Local server must reject
+    /// `danger_full_access` even when the client omits the
+    /// `runtime_mode` override. The explicit override (UPCR-2026-018 /
+    /// #1086) is the PRIMARY signal but a buggy / older / non-conforming
+    /// client may omit it; this defense-in-depth gate prevents a
+    /// tenant-scoped session from slipping dangerous mode past the
+    /// policy boundary by leaving the override out.
+    ///
+    /// Codex P1/P2 (#1167) review: chat-id text is arbitrary so the
+    /// gate must NOT key off colon-delimited chat-id segments. The
+    /// channel-slot check is EXACT (`== "tenant"` / `== "cloud"`) to
+    /// avoid false positives on legitimate chat-id text like
+    /// `_main:api:tenant-demo` (2nd slot there is `api`, not `tenant`).
+    #[test]
+    fn danger_full_access_rejected_for_non_cloud_tenant_per_1162() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+
+        for (label, session_id) in [
+            // profile_id-slot markers (`with_profile` shape).
+            (
+                "profile=tenant-a",
+                SessionKey::with_profile("tenant-a", "api", "m12-negative"),
+            ),
+            (
+                "profile=tenant--child",
+                SessionKey::with_profile("tenant--child", "api", "m12-negative"),
+            ),
+            (
+                "profile=cloud--root",
+                SessionKey::with_profile("cloud--root", "api", "m12-negative"),
+            ),
+            (
+                "profile=TENANT-A (case-insensitive)",
+                SessionKey::with_profile("TENANT-A", "api", "m12-negative"),
+            ),
+            (
+                "profile=tenant-a + topic suffix",
+                SessionKey::with_profile_topic("tenant-a", "api", "m12-negative", "research"),
+            ),
+            // M12-G soak shape: `{profile}:tenant:{chat}` /
+            // `{profile}:cloud:{chat}` — `tenant`/`cloud` sits in the
+            // channel slot. `SessionKey::profile_id()` returns `None`
+            // because neither is a registered channel name, so the
+            // helper has to detect the channel-slot literal directly.
+            (
+                "channel-slot=tenant (soak shape)",
+                SessionKey("coding:tenant:m12-negative".into()),
+            ),
+            (
+                "channel-slot=cloud (soak shape)",
+                SessionKey("m12solo:cloud:m12-negative".into()),
+            ),
+            (
+                "channel-slot=tenant + topic suffix",
+                SessionKey("coding:tenant:m12-negative#1747".into()),
+            ),
+            (
+                "channel-slot=TENANT (case-insensitive)",
+                SessionKey("coding:TENANT:m12-negative".into()),
+            ),
+            // Codex P1 round 3 (#1167) — profiled tenant sessions on
+            // channels that core's `is_channel_name` doesn't include
+            // (`line`, `wechat`, …). The gate must reject these too,
+            // so it can't rely solely on `SessionKey::profile_id()`
+            // (which returns `None` when the 2nd segment isn't in
+            // the recognition list).
+            (
+                "profile=tenant-a + channel=line",
+                SessionKey("tenant-a:line:room-1".into()),
+            ),
+            (
+                "profile=cloud--root + channel=wechat",
+                SessionKey("cloud--root:wechat:group-42".into()),
+            ),
+            (
+                "profile=tenant + channel=line",
+                SessionKey("tenant:line:room-1".into()),
+            ),
+        ] {
+            let denied = match permission_profile_set_result(
+                &local,
+                PermissionProfileSetParams {
+                    session_id: session_id.clone(),
+                    update: PermissionProfileUpdate {
+                        mode: Some(Mode::DangerFullAccess),
+                        network: Some(Network::Allow),
+                        approval_policy: Some("never".into()),
+                    },
+                    runtime_mode: None,
+                },
+            ) {
+                Err(err) => err,
+                Ok(ok) => panic!(
+                    "{label} ({session_id}): expected PERMISSION_DENIED but accepted: {ok:?}",
+                ),
+            };
+            assert_eq!(
+                denied.code,
+                rpc_error_codes::PERMISSION_DENIED,
+                "{label} ({session_id}) must return PERMISSION_DENIED",
+            );
+            assert_eq!(
+                denied.data.as_ref().and_then(|data| data.get("kind")),
+                Some(&json!("permission_profile_disallowed")),
+                "{label} ({session_id}) must report permission_profile_disallowed",
+            );
+        }
+    }
+
+    /// #1162 codex P2 review (#1167) — `permission/profile/list` MUST
+    /// honor the same session-scope gate as `permission/profile/set`,
+    /// or clients see `danger_full_access` advertised as a selectable
+    /// option that `set` then rejects. Tenant-scoped sessions omit it
+    /// from the list on a Local server; solo-scoped sessions keep it.
+    #[test]
+    fn danger_full_access_omitted_from_list_for_tenant_scoped_session_per_1162() {
+        use octos_core::ui_protocol::{PermissionProfileListParams, PermissionProfileMode as Mode};
+
+        let local = AppState::empty_for_tests();
+
+        let tenant_session = SessionKey::with_profile("tenant-a", "api", "m12-negative");
+        let tenant_listing = permission_profile_list_result(
+            &local,
+            PermissionProfileListParams {
+                session_id: tenant_session,
+            },
+        );
+        assert!(
+            !tenant_listing
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "tenant-scoped session must NOT advertise danger_full_access",
+        );
+
+        let solo_session = SessionKey("local:m12-positive".into());
+        let solo_listing = permission_profile_list_result(
+            &local,
+            PermissionProfileListParams {
+                session_id: solo_session,
+            },
+        );
+        assert!(
+            solo_listing
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "solo-scoped session on Local must keep advertising danger_full_access",
+        );
+    }
+
+    /// #1162 codex P2 review (#1167) — chat-id text must NOT trigger
+    /// the tenant gate. `SessionKey` treats chat IDs as arbitrary, so
+    /// a Local session whose chat-id text happens to contain `cloud-`
+    /// or `tenant-` (e.g. `local:cloud-migration`, `_main:api:tenant-demo`)
+    /// must keep the existing relaxed path.
+    ///
+    /// Codex P2 round 2 (#1167) additionally pins the legacy
+    /// `{channel}:{chat_id_with_colons}` case where `chat_id` itself
+    /// contains `tenant:` / `cloud:` (e.g. `local:tenant:123`,
+    /// `telegram:cloud:42`). The channel-slot check must guard against
+    /// this by requiring the 1st segment to NOT be a registered
+    /// channel before treating the 2nd segment as structural.
+    #[test]
+    fn danger_full_access_chat_id_text_does_not_trigger_tenant_gate_per_1162() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+
+        for raw_session_id in [
+            // chat-id contains `cloud-migration` / `tenant-demo` — must NOT
+            // be conflated with a tenant-scoped profile.
+            "local:cloud-migration",
+            "local:tenant-demo",
+            "_main:api:cloud-migration",
+            "_main:api:tenant-demo",
+            // Codex P2 round 2 — legacy `{channel}:{chat_id_with_colons}`
+            // session where the chat-id text itself contains `tenant:`/
+            // `cloud:`. `SessionKey::new("local", "tenant:123")` produces
+            // base key `local:tenant:123`; channel `local` is registered
+            // so this is a chat-id-with-colons case, NOT a tenant scope.
+            "local:tenant:123",
+            "local:cloud:456",
+            "telegram:tenant:789",
+            "matrix:cloud:!room:abc",
+            // Codex P2 round 4 — feature-gated channels (`line`,
+            // `wechat`, `mock`) must also be recognised so legacy
+            // `{channel}:{chat_id_with_colons}` on those gateways
+            // doesn't trip the tenant gate.
+            "line:tenant:123",
+            "wechat:cloud:456",
+            "mock:tenant:abc",
+        ] {
+            let session_id = SessionKey(raw_session_id.into());
+            permission_profile_set_result(
+                &local,
+                PermissionProfileSetParams {
+                    session_id: session_id.clone(),
+                    update: PermissionProfileUpdate {
+                        mode: Some(Mode::DangerFullAccess),
+                        network: Some(Network::Allow),
+                        approval_policy: Some("never".into()),
+                    },
+                    runtime_mode: None,
+                },
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{raw_session_id}: chat-id text containing tenant/cloud-like \
+                     substrings must NOT trigger the tenant gate — got: {err:?}",
+                )
+            });
+            // Sanity: list still advertises DangerFullAccess for this
+            // session because the chat-id text is not a structural
+            // tenant signal.
+            let listing = permission_profile_list_result(
+                &local,
+                octos_core::ui_protocol::PermissionProfileListParams {
+                    session_id: session_id.clone(),
+                },
+            );
+            assert!(
+                listing
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.mode == Mode::DangerFullAccess),
+                "{raw_session_id}: chat-id text must NOT remove danger from list",
+            );
+        }
+    }
+
+    /// Sanity counterpart to #1162 — a tenant-scoped session must STILL
+    /// reject when the runtime_mode override also says tenant (so we
+    /// don't drift the existing #1086 contract) and a solo-scoped
+    /// session keeps the existing relaxed path. The cloud-tenant
+    /// "accepted" sanity case for #1162 is the existing
+    /// `permission_profile_handlers_are_server_owned_and_reject_danger_outside_local`
+    /// test (no override + Local server → accepts danger_full_access).
+    #[test]
+    fn danger_full_access_session_scope_gate_does_not_drift_existing_behavior_per_1162() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+
+        // Solo-scoped session_id on Local + no override → existing relaxed
+        // path keeps allowing danger_full_access. The new gate must not
+        // tighten this case.
+        let solo_session = SessionKey("m12solo:local:m12-positive#1747".into());
+        let allowed = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: solo_session.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect("solo-scoped session_id on Local must keep allowing danger");
+        assert_eq!(allowed.session_id, solo_session);
+
+        // Tenant-scoped session_id + explicit `runtime_mode: "tenant"` → still
+        // rejected (no regression on #1086).
+        let tenant_session = SessionKey("coding:tenant:m12-negative#1747".into());
+        let denied = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: tenant_session,
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("tenant".into()),
+            },
+        )
+        .expect_err("tenant-scoped session + tenant override must still reject");
+        assert_eq!(denied.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            denied.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
     }
 
     #[test]

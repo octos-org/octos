@@ -456,6 +456,164 @@ fn verify_signature(timestamp: &str, nonce: &str, encrypt_key: &str, body: &str)
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Shared state for the webhook HTTP handler.
+#[derive(Clone)]
+struct WebhookState {
+    encrypt_key: Option<String>,
+    verification_token: Option<String>,
+    inbound_tx: mpsc::Sender<serde_json::Value>,
+}
+
+/// Webhook entry point — validates signature (fail-closed when a secret is
+/// configured), decrypts the payload, and forwards the parsed event onto the
+/// internal channel.
+///
+/// Security: when `encrypt_key` is set, ALL THREE Lark signature headers
+/// (`X-Lark-Signature`, `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`)
+/// MUST be present AND the computed HMAC MUST match. Any missing header or
+/// signature mismatch returns 401 Unauthorized. See #862.
+async fn handle_webhook(
+    axum::extract::State(state): axum::extract::State<WebhookState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Try to parse the body as JSON
+    let body_json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Feishu webhook: invalid JSON body: {e}");
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "invalid json"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Plaintext url_verification challenge — answer before requiring the
+    // event-signature headers, since Lark's setup probe may arrive without
+    // them. Encrypted url_verification (with `encrypt` field) is handled
+    // after signature verification + decryption below. See codex review on
+    // PR #1163.
+    let is_plaintext_url_verification = body_json.get("encrypt").is_none()
+        && body_json.get("type").and_then(|v| v.as_str()) == Some("url_verification");
+
+    // Signature verification: fail-closed when encrypt_key is set (#862).
+    // Skipped for plaintext url_verification (handled above).
+    //
+    // NB: nested `if let` instead of `if let ... && condition` let-chain
+    // — workspace MSRV is 1.85.0 and let-chains stabilized in Rust 1.88.
+    if let Some(ref ek) = state.encrypt_key {
+        if !is_plaintext_url_verification {
+            let timestamp = headers
+                .get("X-Lark-Request-Timestamp")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let nonce = headers
+                .get("X-Lark-Request-Nonce")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let expected_sig = headers
+                .get("X-Lark-Signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            if timestamp.is_empty() || nonce.is_empty() || expected_sig.is_empty() {
+                warn!(
+                    has_timestamp = !timestamp.is_empty(),
+                    has_nonce = !nonce.is_empty(),
+                    has_signature = !expected_sig.is_empty(),
+                    "Feishu webhook: missing required signature header(s); rejecting"
+                );
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"error": "missing signature headers"})),
+                )
+                    .into_response();
+            }
+
+            let computed = verify_signature(timestamp, nonce, ek, &body);
+            if computed != expected_sig {
+                warn!("Feishu webhook: signature mismatch");
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"error": "signature mismatch"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Decrypt if encrypted
+    let event_json = if let Some(encrypt_str) = body_json.get("encrypt").and_then(|v| v.as_str()) {
+        if let Some(ref ek) = state.encrypt_key {
+            match decrypt_lark_event(ek, encrypt_str) {
+                Ok(decrypted) => match serde_json::from_str(&decrypted) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Feishu webhook: failed to parse decrypted event: {e}");
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({"error": "decrypt parse error"})),
+                        )
+                            .into_response();
+                    }
+                },
+                Err(e) => {
+                    warn!("Feishu webhook: decryption failed: {e}");
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": "decryption failed"})),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            warn!("Feishu webhook: received encrypted event but no encrypt_key configured");
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "no encrypt key configured"})),
+            )
+                .into_response();
+        }
+    } else {
+        body_json
+    };
+
+    // Handle url_verification challenge
+    if event_json.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
+        let challenge = event_json
+            .get("challenge")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        info!("Feishu webhook: url_verification challenge received");
+        return axum::Json(serde_json::json!({"challenge": challenge})).into_response();
+    }
+
+    // Verification token check (for non-encrypted plaintext events)
+    if let Some(ref vt) = state.verification_token {
+        let event_token = event_json
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !event_token.is_empty() && event_token != vt {
+            warn!("Feishu webhook: verification token mismatch");
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": "token mismatch"})),
+            )
+                .into_response();
+        }
+    }
+
+    // Forward event to the channel for processing
+    let _ = state.inbound_tx.send(event_json).await;
+
+    "ok".into_response()
+}
+
 pub struct FeishuChannel {
     app_id: String,
     app_secret: String,
@@ -1275,131 +1433,15 @@ impl FeishuChannel {
 
     /// Run webhook HTTP server mode.
     async fn start_webhook(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
-        use axum::{
-            Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post,
-        };
+        use axum::{Router, routing::post};
 
-        #[derive(Clone)]
-        struct WebhookState {
-            encrypt_key: Option<String>,
-            verification_token: Option<String>,
-            inbound_tx: mpsc::Sender<serde_json::Value>,
-        }
-
-        async fn handle_webhook(
-            State(state): State<WebhookState>,
-            headers: HeaderMap,
-            body: String,
-        ) -> impl IntoResponse {
-            // Try to parse the body as JSON
-            let body_json: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Feishu webhook: invalid JSON body: {e}");
-                    return (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        axum::Json(serde_json::json!({"error": "invalid json"})),
-                    )
-                        .into_response();
-                }
-            };
-
-            // Signature verification if encrypt_key is set
-            if let Some(ref ek) = state.encrypt_key {
-                let timestamp = headers
-                    .get("X-Lark-Request-Timestamp")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let nonce = headers
-                    .get("X-Lark-Request-Nonce")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let expected_sig = headers
-                    .get("X-Lark-Signature")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-
-                if !timestamp.is_empty() && !nonce.is_empty() && !expected_sig.is_empty() {
-                    let computed = verify_signature(timestamp, nonce, ek, &body);
-                    if computed != expected_sig {
-                        warn!("Feishu webhook: signature mismatch");
-                        return (
-                            axum::http::StatusCode::FORBIDDEN,
-                            axum::Json(serde_json::json!({"error": "signature mismatch"})),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-
-            // Decrypt if encrypted
-            let event_json = if let Some(encrypt_str) =
-                body_json.get("encrypt").and_then(|v| v.as_str())
-            {
-                if let Some(ref ek) = state.encrypt_key {
-                    match decrypt_lark_event(ek, encrypt_str) {
-                        Ok(decrypted) => match serde_json::from_str(&decrypted) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!("Feishu webhook: failed to parse decrypted event: {e}");
-                                return (
-                                    axum::http::StatusCode::BAD_REQUEST,
-                                    axum::Json(serde_json::json!({"error": "decrypt parse error"})),
-                                )
-                                    .into_response();
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Feishu webhook: decryption failed: {e}");
-                            return (
-                                axum::http::StatusCode::BAD_REQUEST,
-                                axum::Json(serde_json::json!({"error": "decryption failed"})),
-                            )
-                                .into_response();
-                        }
-                    }
-                } else {
-                    warn!("Feishu webhook: received encrypted event but no encrypt_key configured");
-                    return (
-                        axum::http::StatusCode::BAD_REQUEST,
-                        axum::Json(serde_json::json!({"error": "no encrypt key configured"})),
-                    )
-                        .into_response();
-                }
-            } else {
-                body_json
-            };
-
-            // Handle url_verification challenge
-            if event_json.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
-                let challenge = event_json
-                    .get("challenge")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                info!("Feishu webhook: url_verification challenge received");
-                return axum::Json(serde_json::json!({"challenge": challenge})).into_response();
-            }
-
-            // Verification token check (for non-encrypted plaintext events)
-            if let Some(ref vt) = state.verification_token {
-                let event_token = event_json
-                    .get("token")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !event_token.is_empty() && event_token != vt {
-                    warn!("Feishu webhook: verification token mismatch");
-                    return (
-                        axum::http::StatusCode::FORBIDDEN,
-                        axum::Json(serde_json::json!({"error": "token mismatch"})),
-                    )
-                        .into_response();
-                }
-            }
-
-            // Forward event to the channel for processing
-            let _ = state.inbound_tx.send(event_json).await;
-
-            "ok".into_response()
+        // Warn at startup if no signing secret is configured — webhook will
+        // accept any payload from any source in this mode. See #862.
+        if self.encrypt_key.is_none() {
+            warn!(
+                "Feishu webhook: no encrypt_key configured — signature verification is DISABLED. \
+                 Configure encrypt_key in production to authenticate inbound webhook events."
+            );
         }
 
         // Internal channel for passing parsed events
@@ -1809,5 +1851,211 @@ mod tests {
         .with_webhook_port(8080);
         assert_eq!(ch.mode, "webhook");
         assert_eq!(ch.webhook_port, 8080);
+    }
+
+    // ---- Fail-closed signature verification regression tests (#862) ----
+    //
+    // Pre-fix, missing any of the three Lark signature headers silently
+    // skipped verification when an encrypt_key was configured. These tests
+    // pin the fail-closed contract: with a secret, ANY missing header
+    // returns 401 Unauthorized.
+
+    fn webhook_state_with_secret(
+        secret: Option<&str>,
+    ) -> (WebhookState, mpsc::Receiver<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
+        let state = WebhookState {
+            encrypt_key: secret.map(|s| s.to_string()),
+            verification_token: None,
+            inbound_tx: tx,
+        };
+        (state, rx)
+    }
+
+    /// Build a HeaderMap from `(name, value)` pairs. A `None` value omits
+    /// the header entirely — used to simulate the bypass attempt.
+    fn build_headers(pairs: &[(&str, Option<&str>)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            if let Some(v) = value {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+        }
+        h
+    }
+
+    async fn call_handle_webhook(
+        state: WebhookState,
+        headers: axum::http::HeaderMap,
+        body: &str,
+    ) -> axum::http::StatusCode {
+        let response = handle_webhook(axum::extract::State(state), headers, body.to_string()).await;
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_secret_but_missing_signature_header_is_rejected() {
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some("1700000000")),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            // X-Lark-Signature deliberately omitted
+        ]);
+        let body = r#"{"type":"event_callback"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "missing X-Lark-Signature must fail-closed when secret is set (#862)"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_secret_but_missing_timestamp_header_is_rejected() {
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[
+            // X-Lark-Request-Timestamp deliberately omitted
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some("deadbeef")),
+        ]);
+        let body = r#"{"type":"event_callback"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "missing X-Lark-Request-Timestamp must fail-closed when secret is set (#862)"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_secret_but_missing_nonce_header_is_rejected() {
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some("1700000000")),
+            // X-Lark-Request-Nonce deliberately omitted
+            ("X-Lark-Signature", Some("deadbeef")),
+        ]);
+        let body = r#"{"type":"event_callback"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "missing X-Lark-Request-Nonce must fail-closed when secret is set (#862)"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_secret_and_all_headers_missing_is_rejected() {
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        // No signature headers at all — the original bypass vector.
+        let headers = build_headers(&[]);
+        let body = r#"{"type":"event_callback"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "no signature headers at all must fail-closed when secret is set (#862)"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_secret_and_valid_signature_succeeds() {
+        let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
+        let body = r#"{"type":"event_callback","event":{}}"#;
+        let timestamp = "1700000000";
+        let nonce = "nonce-abc";
+        let sig = verify_signature(timestamp, nonce, "mykey", body);
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some(timestamp)),
+            ("X-Lark-Request-Nonce", Some(nonce)),
+            ("X-Lark-Signature", Some(&sig)),
+        ]);
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "valid signature must pass verification"
+        );
+        // Event should be forwarded onto the channel.
+        assert!(rx.try_recv().is_ok(), "event should be forwarded");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_without_secret_retains_open_behavior() {
+        // No encrypt_key configured — operator opted out of signing.
+        // Missing-header requests must still be accepted (open behavior).
+        let (state, mut rx) = webhook_state_with_secret(None);
+        let headers = build_headers(&[]);
+        let body = r#"{"type":"event_callback","event":{}}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "without a configured secret, unsigned webhooks remain accepted"
+        );
+        assert!(rx.try_recv().is_ok(), "event should be forwarded");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_url_verification_passes_without_headers_when_secret_set() {
+        // Lark's initial URL verification probe may arrive without signature
+        // headers even when an encrypt_key is configured. The handler must
+        // answer the challenge instead of rejecting it (codex finding on PR
+        // #1163). This only applies to plaintext url_verification — the
+        // encrypted variant still goes through the signature gate.
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[]);
+        let body = r#"{"type":"url_verification","challenge":"abc123"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "plaintext url_verification must be answered even without signature headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_non_url_verification_without_encrypt_field_still_requires_signature() {
+        // Belt-and-suspenders: a plaintext payload that is NOT
+        // url_verification must still be rejected when signature headers
+        // are missing and a secret is configured.
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[]);
+        let body = r#"{"type":"event_callback","event":{}}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "plaintext event_callback must still be rejected when signature headers are missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_secret_and_bad_signature_is_rejected() {
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some("1700000000")),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some("not-the-right-signature")),
+        ]);
+        let body = r#"{"type":"event_callback"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "mismatched signature must be rejected"
+        );
     }
 }

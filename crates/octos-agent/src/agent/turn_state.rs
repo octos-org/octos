@@ -21,7 +21,7 @@ impl From<&BudgetStop> for LoopBudgetStopKind {
     fn from(value: &BudgetStop) -> Self {
         match value {
             BudgetStop::Shutdown => Self::Shutdown,
-            BudgetStop::MaxIterations => Self::MaxIterations,
+            BudgetStop::MaxIterations { .. } => Self::MaxIterations,
             BudgetStop::MaxTokens { .. } => Self::MaxTokens,
             BudgetStop::ActivityTimeout { .. } => Self::ActivityTimeout,
             BudgetStop::IdleProgressTimeout { .. } => Self::IdleProgressTimeout,

@@ -159,6 +159,20 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
                 title: string_field(event, &["title"]).unwrap_or_else(|| "Task".into()),
                 state: UiTaskRuntimeState::Running,
                 runtime_detail: Some("task started".into()),
+                source: string_field(event, &["source"]),
+                role: string_field(event, &["role"]),
+                summary: string_field(event, &["summary"]),
+                artifact_count: u32_field(event, &["artifact_count"]),
+                // Codex P2 follow-up: a `null` runtime_policy_stamp from
+                // the progress producer must be treated as ABSENT (None),
+                // not Some(Value::Null). Otherwise serde emits
+                // `"runtime_policy_stamp": null` on `task/updated` and
+                // clients that cache the stamp see it wiped on every
+                // update tick.
+                runtime_policy_stamp: event
+                    .get("runtime_policy_stamp")
+                    .cloned()
+                    .filter(|v| !v.is_null()),
             },
         )]);
     }
@@ -218,6 +232,26 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
         title,
         state,
         runtime_detail: string_field(event, &["runtime_detail", "message", "status_message"]),
+        // #1123 codex P2 follow-up to #1113: thread the M13-B
+        // projection fields from the underlying progress JSON
+        // (produced by `background_task_to_progress_json`) onto the
+        // `task/updated` notification. Unset values stay `None`, which
+        // skip_serializing_if drops from the wire shape — so legacy
+        // emitters that don't supply the fields produce a bare
+        // payload identical to the pre-M13-B shape.
+        source: string_field(event, &["source"]),
+        role: string_field(event, &["role"]),
+        summary: string_field(event, &["summary"]),
+        artifact_count: u32_field(event, &["artifact_count"]),
+        // Codex P2 rev2 follow-up: same null-to-absent filtering as
+        // map_task_started above — a `null` stamp from the producer must
+        // not pass through, otherwise serde emits
+        // `"runtime_policy_stamp": null` on the regular `task/updated`
+        // tick and any client that caches the stamp sees it wiped.
+        runtime_policy_stamp: event
+            .get("runtime_policy_stamp")
+            .cloned()
+            .filter(|v| !v.is_null()),
     })])
 }
 
@@ -853,6 +887,35 @@ mod tests {
         assert_eq!(updated.title, "search");
         assert_eq!(updated.state, UiTaskRuntimeState::Running);
         assert_eq!(updated.runtime_detail.as_deref(), Some("checking outputs"));
+    }
+
+    /// Codex P2 rev2 follow-up on #1156: a `null` runtime_policy_stamp
+    /// emitted by the producer on a `task_updated` event must NOT
+    /// pass through as `Some(Value::Null)`. Otherwise serde emits
+    /// `"runtime_policy_stamp": null` on the wire and clients that
+    /// cache the stamp see it wiped on every update tick (the same
+    /// bug the `task_started` filter already prevents).
+    #[test]
+    fn ui_protocol_progress_treats_null_stamp_as_absent_on_task_updated() {
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "task_updated",
+                "task_id": "01900000-0000-7000-8000-0000000000aa",
+                "title": "search",
+                "state": "verifying",
+                "runtime_policy_stamp": null,
+            }),
+        );
+
+        let [UiNotification::TaskUpdated(updated)] = mapping.notifications.as_slice() else {
+            panic!("expected task updated notification");
+        };
+        assert!(
+            updated.runtime_policy_stamp.is_none(),
+            "null stamp must be filtered to None, got {:?}",
+            updated.runtime_policy_stamp,
+        );
     }
 
     #[test]
