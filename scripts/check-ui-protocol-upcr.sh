@@ -69,60 +69,94 @@ if [ "$resolve_status" -eq 0 ] && [ -n "$base_ref" ]; then
   head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
 fi
 
-# Treat merge_base == HEAD as "no committed work to inspect": HEAD..HEAD is
-# empty, so the committed-range scan would silently miss any actual diffs.
-# This is the bypass codex review #6 flagged. We distinguish two sub-cases:
+# Case analysis for the diff range:
 #
-#   * Uncommitted protocol changes exist in the working tree -> legitimate
-#     pre-commit case (feature branch freshly created off main); proceed
-#     with uncommitted-only checking.
-#   * No uncommitted protocol changes either -> the gate cannot tell
-#     whether the repo lacks a real base ref (shallow CI) or whether the
-#     branch is genuinely identical to main. Fail loud so a stale base
-#     ref doesn't silently bypass committed-but-not-yet-pushed work.
+#   * resolve_base_ref failed entirely (no origin/main, no main, no
+#     UPCR_BASE_REF) -> we cannot reason about committed work at all.
+#     Fail loud unless UPCR_ALLOW_NO_DOC=1 (closes codex #1).
+#
+#   * merge_base resolves but equals HEAD -> normal for a freshly-created
+#     feature branch where the only relevant work is staged or unstaged.
+#     Fall through in uncommitted-only mode and set `strict_uncommitted=1`,
+#     which disables the spec-only self-coverage fallback. Without that
+#     guard, a stray dirty spec edit could mask a committed protocol-code
+#     change that lives in HEAD itself (closes codex #6/#8/#10).
+#
+#   * merge_base != HEAD -> normal committed-range scan.
 base_equals_head=0
 if [ -n "$merge_base" ] && [ -n "$head_sha" ] && [ "$merge_base" = "$head_sha" ]; then
   base_equals_head=1
 fi
 
-if [ -z "$merge_base" ] || [ "$base_equals_head" -eq 1 ]; then
-  # Probe the working tree for any uncommitted *trigger* changes only.
-  # A stray untracked UPCR / template / spec edit must NOT mask a committed
-  # protocol change here — that bypass was codex review #7. We're trying to
-  # answer "is there real protocol work in the working tree that justifies
-  # running in uncommitted-only mode?", and only protocol-code and spec-doc
-  # files (the trigger set) can answer yes.
-  uncommitted_probe="$(
+strict_uncommitted=0
+# Treat both (a) no base ref resolvable and (b) base ref resolved but
+# `git merge-base` returned empty as the same failure: we cannot diff
+# committed work against the target branch. Case (b) hits on shallow PR
+# checkouts that fetched origin/main as a separate depth-1 tip with no
+# shared ancestor, or when UPCR_BASE_REF points at an unrelated history.
+# Without this guard the script silently falls into uncommitted-only mode
+# and lets committed protocol changes bypass the gate (codex review #11).
+if [ "$resolve_status" -ne 0 ] || [ -z "$base_ref" ] \
+    || { [ -n "$base_ref" ] && [ -z "$merge_base" ]; }; then
+  if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
+    printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
+    exit 0
+  fi
+  cat >&2 <<'EOF'
+ui-protocol-upcr: could not resolve a usable merge-base for the diff. The gate
+tried origin/main, main, origin/master, master, and any UPCR_BASE_REF
+override; either no base ref resolved, or `git merge-base` found no common
+ancestor between the base ref and HEAD (typical in shallow PR checkouts that
+fetched the base as a depth-1 tip without shared history). Refusing to run
+because that lets committed protocol changes slip through CI.
+
+Fix: fetch a real base with full history (e.g. `git fetch --no-tags --unshallow
+origin main`, or `git fetch --depth=N origin main` deep enough to reach the
+merge-base), or set UPCR_BASE_REF=<sha-or-ref> to a commit that is actually an
+ancestor of HEAD. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a documented
+reviewer override.
+EOF
+  exit 2
+fi
+
+if [ "$base_equals_head" -eq 1 ]; then
+  # Pre-commit / freshly-created-branch flow: we'll run in uncommitted-only
+  # mode IFF there's actual uncommitted trigger work to inspect. If the
+  # working tree is clean and merge_base == HEAD, we cannot tell whether
+  # the branch is genuinely identical to main (no work, nothing to gate)
+  # or whether a stale base ref is hiding committed protocol edits. Fall
+  # back to a probe of uncommitted trigger paths; if the probe is empty,
+  # fail loud. This is the careful split between codex #6 (close the
+  # silent-empty-diff bypass when there's no uncommitted work either) and
+  # codex #10 (don't reject legitimate pre-commit staged-trigger work).
+  pre_commit_probe="$(
     git status --porcelain --untracked-files=all -- \
       "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}" "$SPEC_GLOB" \
       2>/dev/null || true
   )"
-  if [ -z "$uncommitted_probe" ]; then
+  if [ -z "$pre_commit_probe" ]; then
     if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
-      printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
+      printf 'ui-protocol-upcr: base ref resolves to HEAD; allowed by reviewer override\n'
       exit 0
     fi
     cat >&2 <<'EOF'
-ui-protocol-upcr: could not resolve a usable base ref for the diff. The gate
-tried origin/main, main, origin/master, master, and any UPCR_BASE_REF
-override; either none resolved or the resolved ref points to HEAD itself
-(which would diff HEAD..HEAD = empty). Refusing to run with only stale
-state because that lets committed protocol changes slip through CI.
+ui-protocol-upcr: the resolved base ref points to HEAD and the working tree
+has no uncommitted protocol/spec edits. The committed-range diff (HEAD..HEAD)
+is empty by construction, which can hide committed protocol changes on a
+stale single-branch CI checkout. Refusing to run.
 
 Fix: fetch a real base (e.g. `git fetch --no-tags origin main`), or set
 UPCR_BASE_REF=<sha-or-ref> that points to the actual target branch this
-PR/branch is built against (e.g. the merge-base SHA against origin/main,
-or the commit of the target branch tip). Do NOT use `HEAD~1` for branches
-that contain multiple commits — the gate would diff only the last commit
-and report no protocol-visible edits even when an earlier commit on the
-branch touched protocol Rust. Use `HEAD~1` only as a single-commit-only
-case. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a documented
-reviewer override.
+PR/branch is built against. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a
+documented reviewer override.
 EOF
     exit 2
   fi
-  # Uncommitted protocol/UPCR changes exist; proceed in uncommitted-only mode.
+  # Uncommitted trigger work exists; proceed in strict uncommitted-only mode.
+  # `strict_uncommitted` disables the spec-only self-coverage fallback so
+  # a stray dirty spec can't mask a committed protocol change in HEAD.
   merge_base=""
+  strict_uncommitted=1
 fi
 
 if [ -n "$merge_base" ]; then
@@ -250,14 +284,67 @@ uncommitted_names() {
   done <<<"$entries"
 }
 
+# Emit paths that are currently slated for deletion in the working tree
+# (staged or unstaged) for the given path-specs. Used in coverage mode to
+# subtract paths that the user is removing from the branch's coverage set
+# — closes codex review #9 / #717 where committing a UPCR and then staging
+# its deletion would still report UPCR coverage.
+uncommitted_deletions() {
+  local entries
+  entries="$(git status --porcelain --untracked-files=all -- "$@" 2>/dev/null || true)"
+  if [ -z "$entries" ]; then
+    return 0
+  fi
+  local line status_code path
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    status_code="${line:0:2}"
+    path="${line:3}"
+    if [[ "$status_code" == R* ]]; then
+      path="${path##* -> }"
+    fi
+    case "$status_code" in
+      "D "|" D"|"DD"|"AD"|"MD")
+        printf '%s\n' "$path"
+        ;;
+    esac
+  done <<<"$entries"
+}
+
 collect_names() {
   local range="$1"
   local mode="$2"
   shift 2
-  {
-    diff_range_names "$range" "$mode" "$@"
-    uncommitted_names "$mode" "$@"
-  } | awk 'NF && !seen[$0]++'
+  local merged
+  merged="$(
+    {
+      diff_range_names "$range" "$mode" "$@"
+      uncommitted_names "$mode" "$@"
+    } | awk 'NF && !seen[$0]++'
+  )"
+  if [ "$mode" != "coverage" ] || [ -z "$merged" ]; then
+    printf '%s\n' "$merged"
+    return 0
+  fi
+  # In coverage mode, subtract any path that is currently being deleted in
+  # the working tree even if it appears in the committed AMR range. A
+  # branch that committed a UPCR and then staged its deletion no longer
+  # has that UPCR as coverage at the tip of the branch.
+  local pending_deletes
+  pending_deletes="$(uncommitted_deletions "$@")"
+  if [ -z "$pending_deletes" ]; then
+    printf '%s\n' "$merged"
+    return 0
+  fi
+  awk -v deletes="$pending_deletes" '
+    BEGIN {
+      n = split(deletes, arr, "\n")
+      for (i = 1; i <= n; i++) {
+        if (arr[i] != "") del[arr[i]] = 1
+      }
+    }
+    NF && !(($0) in del)
+  ' <<<"$merged"
 }
 
 # Split changes into code-level (Rust source) and spec-doc buckets so the
@@ -295,9 +382,12 @@ if [ -n "$upcr_real" ]; then
 fi
 
 # No UPCR doc. A spec-only edit can self-cover, but only if the spec change
-# is an add/modify; a deletion-only spec change is just a protocol-visible
-# removal and still needs an explicit UPCR.
-if [ -z "$code_changes" ] && [ -n "$spec_changes" ]; then
+# is an add/modify AND we have a real committed-range diff. In strict
+# uncommitted-only mode (merge_base == HEAD) the spec-only shortcut is
+# disabled, because a stray dirty spec edit could otherwise mask a
+# committed protocol-code change that lives in HEAD itself (codex #8/#10).
+if [ "$strict_uncommitted" -eq 0 ] \
+    && [ -z "$code_changes" ] && [ -n "$spec_changes" ]; then
   spec_coverage="$(collect_names "$range" coverage "$SPEC_GLOB")"
   if [ -n "$spec_coverage" ]; then
     printf 'ui-protocol-upcr: spec-only edit, treated as self-coverage\n'

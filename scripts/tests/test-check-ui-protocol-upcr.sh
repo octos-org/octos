@@ -27,6 +27,17 @@
 #  15. Missing base ref + committed protocol change + untracked UPCR
 #      template (no uncommitted protocol/spec trigger) -> exit non-zero
 #      (codex #7 — coverage docs must not unblock the missing-base probe).
+#  16. base_equals_head + dirty uncommitted spec edit -> exit non-zero
+#      (codex #8 — dirty triggers must not bypass the missing-base check).
+#  17. Committed UPCR coverage + staged deletion of that same UPCR ->
+#      exit non-zero (codex #9 — pending-delete UPCRs are not coverage).
+#  18. feature == main (no baseline commit) + staged Rust trigger +
+#      staged UPCR -> exit 0 (codex #10 — pre-commit on freshly-created
+#      branch must NOT be rejected by the merge_base==HEAD guard).
+#  19. Base ref resolves but `git merge-base` returns empty (disconnected
+#      histories, e.g. shallow CI fetch of origin/main as a depth-1 tip)
+#      -> exit non-zero (codex #11 — closes the empty-merge-base silent
+#      uncommitted-only bypass).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -82,6 +93,12 @@ make_repo() {
       # Pretend main is also our upstream so resolve_base_ref picks it up.
       git update-ref refs/remotes/origin/main HEAD
       git checkout --quiet -b feature
+      # Add an unrelated commit on feature so merge_base(origin/main, HEAD)
+      # is the baseline commit, not HEAD itself. Otherwise HEAD..HEAD is
+      # empty and the gate refuses to run.
+      printf 'note\n' > FEATURE_BASELINE.md
+      git add FEATURE_BASELINE.md
+      git commit --quiet -m "chore: feature baseline"
     else
       # Move HEAD off main so the script can't find a base ref via
       # main/origin/main and there is nowhere to merge-base against.
@@ -342,7 +359,7 @@ scenario_no_base_ref_fails() {
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable merge-base" <<<"$out"; then
     pass "missing base ref fails loud (no silent CI bypass)"
   else
     fail "missing base ref: status=$status output=$out"
@@ -428,8 +445,8 @@ scenario_base_equals_head_fails() {
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
-    pass "merge_base == HEAD fails loud (no empty-diff bypass)"
+  if [ "$status" -ne 0 ] && grep -q "points to HEAD" <<<"$out"; then
+    pass "merge_base == HEAD with clean tree fails loud (no empty-diff bypass)"
   else
     fail "merge_base == HEAD: status=$status output=$out"
   fi
@@ -457,7 +474,7 @@ scenario_missing_base_with_untracked_template_fails() {
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable merge-base" <<<"$out"; then
     pass "stray untracked template does not unblock missing-base probe"
   else
     fail "stray template bypass: status=$status output=$out"
@@ -466,6 +483,161 @@ scenario_missing_base_with_untracked_template_fails() {
 }
 
 scenario_missing_base_with_untracked_template_fails
+
+# Scenario 16: base_equals_head + uncommitted spec edit must still fail
+# loud. Codex review #8 — a dirty trigger file must not promote the gate
+# into uncommitted-only mode and bypass committed-but-undetectable changes.
+scenario_base_equals_head_dirty_spec_fails() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    # Commit a protocol Rust change with no UPCR, then point origin/main
+    # at HEAD so merge_base == HEAD.
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    git add -A
+    git commit --quiet -m "feat: extend"
+    git update-ref refs/remotes/origin/main HEAD
+    # Add an uncommitted spec edit on top of that.
+    printf '# spec tweak\n' >> api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  # With dirty spec, we enter strict uncommitted-only mode. The spec-only
+  # self-coverage shortcut is disabled in that mode, so the gate falls
+  # through to "require a UPCR document" — closing the bypass.
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out"; then
+    pass "dirty spec does not unblock base_equals_head check"
+  else
+    fail "dirty spec bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_base_equals_head_dirty_spec_fails
+
+# Scenario 17: a committed UPCR that is then staged for deletion is not
+# coverage. Codex review #9 — collect_names in coverage mode must subtract
+# uncommitted deletions even if the committed AMR range still lists them.
+scenario_staged_upcr_deletion_invalidates_coverage() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# UPCR-2026-099 added\n' \
+      > docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_TEST.md
+    git add -A
+    git commit --quiet -m "feat: protocol + new upcr"
+    # Now stage the deletion of the UPCR that was just added.
+    git rm --quiet docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_TEST.md
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out"; then
+    pass "staged UPCR deletion invalidates committed coverage"
+  else
+    fail "staged UPCR deletion bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_staged_upcr_deletion_invalidates_coverage
+
+# Scenario 18: freshly-created feature branch where feature == main (no
+# baseline commit) with staged protocol code change AND staged UPCR.
+# This is the legitimate pre-commit case codex #10 worried about. The
+# gate must NOT reject with "base ref resolves to HEAD" when real
+# uncommitted trigger work justifies an uncommitted-only run.
+scenario_freshly_created_branch_pre_commit_ok() {
+  local dir
+  dir="$(mktemp -d /tmp/upcr-gate-test.XXXXXX)"
+  (
+    cd "$dir"
+    git init --quiet --initial-branch=main
+    git config user.email "test@example.com"
+    git config user.name "test"
+    git config commit.gpgsign false
+
+    mkdir -p scripts crates/octos-core/src crates/octos-cli/src/api api docs
+    cp "$TARGET" scripts/check-ui-protocol-upcr.sh
+    chmod +x scripts/check-ui-protocol-upcr.sh
+
+    printf '// baseline\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# spec baseline\n' > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+
+    git add -A
+    git commit --quiet -m "baseline"
+    git update-ref refs/remotes/origin/main HEAD
+    # Branch off main WITHOUT a baseline commit on feature; merge_base == HEAD.
+    git checkout --quiet -b feature
+
+    # Stage a protocol change + the UPCR pre-commit (untracked or staged is
+    # both fine — uncommitted_names covers both).
+    printf '// extend\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# UPCR-2026-099 Pre-commit\n' \
+      > docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_PRE.md
+    git add crates/octos-core/src/ui_protocol.rs
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -eq 0 ] && grep -q "UPCR coverage" <<<"$out"; then
+    pass "feature == main pre-commit with staged trigger + UPCR is accepted"
+  else
+    fail "freshly created branch rejected: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_freshly_created_branch_pre_commit_ok
+
+# Scenario 19: base ref resolves to a real commit but `git merge-base` finds
+# no common ancestor. Simulated by creating origin/main as an orphan branch
+# whose history is disjoint from HEAD's history. Without the empty-merge-base
+# guard the gate would silently fall into uncommitted-only mode and miss
+# committed protocol changes. Codex review #11.
+scenario_empty_merge_base_fails() {
+  local dir
+  dir="$(mktemp -d /tmp/upcr-gate-test.XXXXXX)"
+  (
+    cd "$dir"
+    git init --quiet --initial-branch=feature
+    git config user.email "test@example.com"
+    git config user.name "test"
+    git config commit.gpgsign false
+
+    mkdir -p scripts crates/octos-core/src crates/octos-cli/src/api api docs
+    cp "$TARGET" scripts/check-ui-protocol-upcr.sh
+    chmod +x scripts/check-ui-protocol-upcr.sh
+
+    # feature branch with a committed protocol change but no UPCR.
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# spec baseline\n' > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+    git add -A
+    git commit --quiet -m "feat: protocol change"
+
+    # Create an orphan commit and point origin/main at it; merge-base
+    # (origin/main, feature) is empty (no common ancestor).
+    git checkout --quiet --orphan orphan-base
+    git rm -rf --quiet .
+    mkdir -p docs
+    printf '# orphan\n' > docs/.keep
+    git add -A
+    git commit --quiet -m "orphan base"
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout --quiet feature
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable merge-base" <<<"$out"; then
+    pass "empty merge-base fails loud (no disconnected-history bypass)"
+  else
+    fail "empty merge-base: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_empty_merge_base_fails
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"
