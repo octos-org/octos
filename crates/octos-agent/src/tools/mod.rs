@@ -666,8 +666,9 @@ pub mod code_structure;
 
 pub use coding_tools::{
     ApplyPatchTool, BashTool, CloseAgentTool, DelegateAliasTool, ExecCommandTool,
-    RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool, ToolCatalogEntry,
-    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WriteStdinTool,
+    ImageGenerationTool, RequestUserInputTool, ResumeAgentTool, SendInputTool, SpawnAgentTool,
+    ToolCatalogEntry, ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool,
+    WaitAgentTool, WriteStdinTool,
 };
 pub use deep_search::DeepSearchTool;
 pub use delegate::{

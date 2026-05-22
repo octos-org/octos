@@ -72,6 +72,15 @@ pub(crate) const ERROR_KIND_CODING_TOOL_DENIED: &str = "coding_tool_denied";
 pub(crate) const ERROR_KIND_CODING_TOOL_MISSING: &str = "coding_tool_missing";
 #[allow(dead_code)]
 pub(crate) const ERROR_KIND_EXEC_SESSION_UNKNOWN: &str = "exec_session_unknown";
+/// #1149 — typed error kind returned by `image_generation` when the tool
+/// is registered but no native or skill backend is bound for the active
+/// profile. Distinguishes "the contract advertises this name, but no
+/// implementation is available right now" from `coding_tool_missing`
+/// (path/resource not found) and `coding_tool_denied` (policy refusal),
+/// so AppUI clients can surface the right next step (install a skill,
+/// switch provider) instead of generic "tool error".
+#[allow(dead_code)]
+pub(crate) const ERROR_KIND_CODING_TOOL_UNSUPPORTED: &str = "coding_tool_unsupported";
 
 pub(crate) const CODING_P0_REQUIRED_TOOL_NAMES: &[&str] = &[
     "apply_patch",
@@ -129,6 +138,14 @@ pub(crate) const OCTOS_KNOWN_MODEL_VISIBLE_TOOLS: &[&str] = &[
     // alongside the canonical primitives.
     "bash",
     "delegate",
+    // #1149 / M14-B P2 — Codex-compatible `image_generation` entry. The
+    // tool is registered so the wire-level contract is complete and the
+    // model gets a typed `coding_tool_unsupported` response instead of a
+    // generic "tool not found", but no native or skill backend is bound
+    // yet. See `crates/octos-agent/src/tools/coding_tools.rs`
+    // (`ImageGenerationTool`) and #1149 for the follow-up to wire a
+    // real backend (OpenAI image API or a bundled skill).
+    "image_generation",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,6 +549,25 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
         policy: "allowed",
         detail: Some(
             "Canonical Codex view_image entry. Returns format / MIME / byte length for a workspace image.",
+        ),
+    },
+    // #1149 / M14-B P2: canonical Codex image-generation surface.
+    //
+    // Registered as a model-visible stub so the wire-level contract is
+    // complete; the tool currently returns `coding_tool_unsupported` for
+    // every call because no native or skill backend is bound yet. The
+    // `coding.image_generation.v1` capability is intentionally NOT
+    // advertised in `ui_protocol::advertised_capabilities` so clients
+    // don't render it as usable (UPCR-2026-020 §5: capability-gated
+    // fields are omitted when the implementation isn't bound). Follow-up
+    // to wire a real backend tracked in #1149.
+    OctosToolSpec {
+        name: "image_generation",
+        category: "media",
+        aliases: &[],
+        policy: "allowed",
+        detail: Some(
+            "Canonical Codex image_generation entry. Stub: no native or skill backend bound yet; calls return a typed coding_tool_unsupported response (#1149 follow-up).",
         ),
     },
     OctosToolSpec {
@@ -949,6 +985,14 @@ mod tests {
         assert_eq!(ERROR_KIND_CODING_TOOL_DENIED, "coding_tool_denied");
         assert_eq!(ERROR_KIND_CODING_TOOL_MISSING, "coding_tool_missing");
         assert_eq!(ERROR_KIND_EXEC_SESSION_UNKNOWN, "exec_session_unknown");
+        // #1149 — typed error kind for the registered-but-unimplemented
+        // `image_generation` stub. Pinned so a future spec rename
+        // (`coding_tool_unsupported` -> `tool_unsupported`, etc.) becomes a
+        // compile-time diff.
+        assert_eq!(
+            ERROR_KIND_CODING_TOOL_UNSUPPORTED,
+            "coding_tool_unsupported"
+        );
     }
 
     fn required_tool<'a>(contract: &'a Value, name: &str) -> &'a Value {
@@ -1192,6 +1236,7 @@ mod tests {
         };
         let payload = tool_status_list_payload(context);
         let tools = payload["tools"].as_array().expect("tools array");
+
         for name in available {
             let entry = tools
                 .iter()
@@ -1203,6 +1248,47 @@ mod tests {
                 "alias {name} must report `available` when registered",
             );
         }
+    }
+
+    /// #1149 / M14-B P2 — `image_generation` must be registered by
+    /// `ToolRegistry::with_builtins_and_sandbox` as a stub so the
+    /// canonical Codex tool surface is wire-complete. Real backend
+    /// wiring (OpenAI image API / bundled skill) is tracked in #1149.
+    #[test]
+    fn p2_image_generation_is_registered_by_session_builtins() {
+        use octos_agent::ToolRegistry;
+        use octos_agent::sandbox::NoSandbox;
+
+        let cwd = std::path::Path::new("/tmp");
+        let registry = ToolRegistry::with_builtins_and_sandbox(cwd, Box::new(NoSandbox));
+        let names: std::collections::HashSet<String> = registry.tool_names().into_iter().collect();
+
+        assert!(
+            names.contains("image_generation"),
+            "P2 canonical tool image_generation must be registered by \
+             ToolRegistry::with_builtins_and_sandbox so the M14 coding \
+             tool contract can advertise it. Registered tool names: {names:?}"
+        );
+    }
+
+    /// #1149 / M14-B P2 — when the runtime reports `image_generation` as
+    /// available, the contract's `tools` array must surface it through the
+    /// OCTOS_TOOL_SPECS entry (status `available`, category `media`).
+    #[test]
+    fn p2_image_generation_appears_in_contract_tools_array() {
+        let available = &["image_generation"];
+        let context = ToolStatusListContext {
+            available_model_tools: available,
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let tools = payload["tools"].as_array().expect("tools array");
+        let entry = tools
+            .iter()
+            .find(|tool| tool["name"] == json!("image_generation"))
+            .expect("image_generation must appear in contract tools array");
+        assert_eq!(entry["status"], json!(TOOL_STATUS_AVAILABLE));
+        assert_eq!(entry["category"], json!("media"));
     }
 
     /// #972 / M14-B P1 — the contract's `tools` array (driven by
