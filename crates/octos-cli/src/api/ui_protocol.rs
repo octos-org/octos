@@ -12366,19 +12366,19 @@ fn default_native_code_review_specs() -> Vec<NativeCodeReviewSpec> {
         NativeCodeReviewSpec::new(
             "reviewer-api",
             "Ada Lovelace",
-            "api_contract_review",
+            octos_agent::ROLE_REVIEWER,
             "AppUI/API contract compatibility, wire protocol correctness, and client-visible state.",
         ),
         NativeCodeReviewSpec::new(
             "reviewer-tests",
             "Hypatia",
-            "test_and_soak_review",
+            octos_agent::ROLE_REVIEWER,
             "unit, integration, tmux UX soak, and missing evidence for regressions.",
         ),
         NativeCodeReviewSpec::new(
             "reviewer-policy",
             "Socrates",
-            "policy_and_safety_review",
+            octos_agent::ROLE_REVIEWER,
             "sandbox, permissions, profile/runtime policy, MCP/tool exposure, and approval boundaries.",
         ),
     ]
@@ -12632,6 +12632,9 @@ async fn run_native_code_review_turn(
     let task_id = TaskId::new();
     let target = review_target_summary(params.target.as_ref());
     let objective = review_objective(&params, &target);
+    let review_runtime_policy_stamp =
+        octos_agent::RoleTemplate::for_name(octos_agent::ROLE_REVIEWER)
+            .map(|template| template.runtime_policy_stamp("supervisor", "native_review", None));
     let workspace_root = session_runtime.workspace_root.clone();
     let llm_provider = session_runtime.profile.llm.clone();
     let memory_store = session_runtime.profile.memory.clone();
@@ -12655,11 +12658,11 @@ async fn run_native_code_review_turn(
             state: UiTaskRuntimeState::Running,
             tool_call_id: None,
             runtime_detail: Some("launching model-backed native specialists".to_owned()),
-            source: None,
-            role: None,
-            summary: None,
-            artifact_count: None,
-            runtime_policy_stamp: None,
+            source: Some("supervisor".to_owned()),
+            role: Some(octos_agent::ROLE_REVIEWER.to_owned()),
+            summary: Some("Launching native code review specialists".to_owned()),
+            artifact_count: Some(0),
+            runtime_policy_stamp: review_runtime_policy_stamp.clone(),
         }),
     );
     let _ = send_notification_durable(
@@ -12804,11 +12807,11 @@ async fn run_native_code_review_turn(
                         state: UiTaskRuntimeState::Cancelled,
                         tool_call_id: None,
                         runtime_detail: Some("interrupted by client".to_owned()),
-                        source: None,
-                        role: None,
-                        summary: None,
-                        artifact_count: None,
-                        runtime_policy_stamp: None,
+                        source: Some("supervisor".to_owned()),
+                        role: Some(octos_agent::ROLE_REVIEWER.to_owned()),
+                        summary: Some("Code review interrupted".to_owned()),
+                        artifact_count: Some(0),
+                        runtime_policy_stamp: review_runtime_policy_stamp.clone(),
                     }),
                 );
                 try_emit_terminal(
@@ -12915,11 +12918,13 @@ async fn run_native_code_review_turn(
             runtime_detail: Some(format!(
                 "{completed}/{expected_results} specialists completed"
             )),
-            source: None,
-            role: None,
-            summary: None,
-            artifact_count: None,
-            runtime_policy_stamp: None,
+            source: Some("supervisor".to_owned()),
+            role: Some(octos_agent::ROLE_REVIEWER.to_owned()),
+            summary: Some(format!(
+                "Scatter-join complete: {completed}/{expected_results} specialists completed"
+            )),
+            artifact_count: Some(0),
+            runtime_policy_stamp: review_runtime_policy_stamp,
         }),
     );
     try_emit_terminal(
@@ -27832,6 +27837,18 @@ ignore = []
             unchanged.matches("M16_CODE_REVIEW_FINAL_LINE").count(),
             1,
             "marker must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn default_native_review_specs_use_backend_reviewer_template() {
+        let specs = default_native_code_review_specs();
+        assert_eq!(specs.len(), 3);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.role == octos_agent::ROLE_REVIEWER),
+            "built-in review/start specialists must resolve through the M14-C reviewer role template"
         );
     }
 

@@ -970,6 +970,7 @@ fn normalize_spawn_agent_args(args: &Value) -> Value {
             "backend",
             "agent_mcp_tool_name",
             "agent_definition_id",
+            "role",
         ] {
             if let Some(value) = input.get(key) {
                 out.insert(key.to_string(), value.clone());
@@ -1010,6 +1011,18 @@ fn normalize_spawn_agent_args(args: &Value) -> Value {
             out.insert(
                 "label".to_string(),
                 Value::String(format!("codex-{agent_type}")),
+            );
+        }
+    }
+    if !out.contains_key("role") {
+        if let Some(role_template) = args
+            .get("agent_type")
+            .and_then(Value::as_str)
+            .and_then(crate::role_template::RoleTemplate::for_codex_agent_type)
+        {
+            out.insert(
+                "role".to_string(),
+                Value::String(role_template.name.to_string()),
             );
         }
     }
@@ -1129,6 +1142,7 @@ impl Tool for SpawnAgentTool {
                 "reasoning_effort": {"type": "string"},
                 "task": {"type": "string"},
                 "label": {"type": "string"},
+                "role": {"type": "string"},
                 "mode": {"type": "string", "enum": ["background", "sync"]},
                 "allowed_tools": {"type": "array", "items": {"type": "string"}}
             }
@@ -2419,12 +2433,72 @@ mod tests {
         let input = task.tool_input.expect("tool input");
         assert_eq!(input["task"], "inspect parity");
         assert_eq!(input["label"], "codex-worker");
+        assert_eq!(input["role"], crate::ROLE_IMPLEMENTER);
         assert!(
             input["additional_instructions"]
                 .as_str()
                 .unwrap()
                 .contains("reasoning_effort: high")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_agent_aliases_operate_on_supervisor_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let supervisor = registry.supervisor();
+        let agent_id = supervisor.register_with_input(
+            "spawn",
+            "call-alias",
+            Some("api:alias-test"),
+            Some(json!({ "task": "initial" })),
+        );
+        supervisor.mark_running(&agent_id);
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:alias-test".to_owned()),
+            ..ToolContext::zero()
+        };
+
+        let sent = registry
+            .execute_with_context(
+                &ctx,
+                "send_input",
+                &json!({
+                    "agent_id": agent_id.clone(),
+                    "message": "continue with reviewer notes"
+                }),
+            )
+            .await
+            .expect("send_input");
+        assert!(sent.success, "{}", sent.output);
+        let updated = supervisor.get_task(&agent_id).expect("task");
+        let tool_input = updated.tool_input.expect("tool input");
+        assert_eq!(
+            tool_input["last_codex_send_input"]["request"]["message"],
+            "continue with reviewer notes"
+        );
+
+        let waited = registry
+            .execute_with_context(
+                &ctx,
+                "wait_agent",
+                &json!({ "agent_id": agent_id.clone(), "timeout_ms": 0 }),
+            )
+            .await
+            .expect("wait_agent");
+        assert!(waited.success, "{}", waited.output);
+        let waited_payload: Value = serde_json::from_str(&waited.output).expect("wait json");
+        assert_eq!(waited_payload["agents"][0]["agent_id"], agent_id);
+        assert_eq!(waited_payload["agents"][0]["status"], "running");
+
+        let closed = registry
+            .execute_with_context(&ctx, "close_agent", &json!({ "target": agent_id.clone() }))
+            .await
+            .expect("close_agent");
+        assert!(closed.success, "{}", closed.output);
+        let closed_task = supervisor.get_task(&agent_id).expect("task");
+        assert_eq!(closed_task.status, crate::TaskStatus::Cancelled);
     }
 
     #[tokio::test]

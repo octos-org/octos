@@ -20,14 +20,16 @@
 //! test/lint/build suite and reports failures. `explorer` — read-only
 //! codebase analyst that gathers context for an upstream planner.
 //!
-//! Scope cap (per #971 partial PR plan): this PR ships the type shape,
-//! the lookup, and guard tests pinning the canonical names + tool-group
-//! membership. Wiring callers (spawn paths in `task_supervisor`,
-//! `agent_orchestrator`, `specialist_runner`, ...) to actually CONSULT
-//! the registry instead of hard-coding role strings is follow-on work.
+//! M14-C runtime wiring: `spawn` / `spawn_agent` consult this registry
+//! when a child declares `role`, native review specialists stamp the
+//! resolved runtime template onto their `TaskSupervisor` task records,
+//! and AppUI receives the resulting role/source/artifact/runtime-policy
+//! projection through `task/list` and `task/updated`.
 
 use std::fmt;
 use std::str::FromStr;
+
+use serde_json::{Value, json};
 
 /// Canonical name for the repository / code reviewer role.
 pub const ROLE_REVIEWER: &str = "reviewer";
@@ -194,6 +196,75 @@ impl RoleTemplate {
     pub fn permits(&self, entry: &str) -> bool {
         self.allowed_tools.contains(&entry)
     }
+
+    /// Return the template tool budget in the owned shape expected by
+    /// `SpawnTool::Input.allowed_tools`.
+    pub fn allowed_tools_vec(&self) -> Vec<String> {
+        self.allowed_tools
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect()
+    }
+
+    /// Infer a canonical role from Codex-style `agent_type` values.
+    ///
+    /// Codex prompts commonly ask for generic `worker`, `reviewer`,
+    /// `tester`, or `explorer` agents. This helper keeps that vocabulary
+    /// model-visible while resolving the actual role through the backend
+    /// registry.
+    pub fn for_codex_agent_type(agent_type: &str) -> Option<&'static RoleTemplate> {
+        let normalized = agent_type.trim().to_ascii_lowercase();
+        let role = match normalized.as_str() {
+            "review"
+            | "reviewer"
+            | "code_reviewer"
+            | "code-reviewer"
+            | "repo_reviewer"
+            | "repository_reviewer" => ROLE_REVIEWER,
+            "worker"
+            | "implementer"
+            | "implementation_worker"
+            | "implementation-worker"
+            | "coder"
+            | "developer" => ROLE_IMPLEMENTER,
+            "test"
+            | "tester"
+            | "test_worker"
+            | "test-worker"
+            | "verification_worker"
+            | "verifier" => ROLE_TEST_WORKER,
+            "explore" | "explorer" | "analyst" | "codebase_analyst" | "read_only" | "read-only" => {
+                ROLE_EXPLORER
+            }
+            other => other,
+        };
+        Self::for_name(role)
+    }
+
+    /// Backend-owned runtime stamp for task/list and task/updated
+    /// projection. The stamp is intentionally descriptive rather than a
+    /// command surface: it records which server template resolved the
+    /// child role, tool budget, sandbox, approval, and model preference.
+    pub fn runtime_policy_stamp(
+        &self,
+        source: &str,
+        backend: &str,
+        requested_model: Option<&str>,
+    ) -> Value {
+        json!({
+            "template_id": "m14-c.subagent_runtime.v1",
+            "role": self.name,
+            "role_name": self.display_name,
+            "source": source,
+            "backend": backend,
+            "sandbox": self.default_sandbox_mode,
+            "approval_policy": self.default_approval_policy,
+            "tool_policy_id": format!("role:{}", self.name),
+            "allowed_tools": self.allowed_tools,
+            "model_preference": self.model_preference.as_str(),
+            "requested_model": requested_model,
+        })
+    }
 }
 
 /// All registered role templates. Keep this list aligned with the
@@ -315,6 +386,7 @@ const ROLE_TEMPLATES: &[RoleTemplate] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Guard: the four canonical role names M14-C promises must remain
     /// the EXACT spelling the wire schema, `TaskListEntry.role` doc
@@ -630,5 +702,54 @@ mod tests {
         assert_eq!(ModelPreference::parse("nope"), None);
         assert_eq!(ModelPreference::parse(""), None);
         assert!("nope".parse::<ModelPreference>().is_err());
+    }
+
+    #[test]
+    fn codex_agent_type_aliases_resolve_to_backend_roles() {
+        assert_eq!(
+            RoleTemplate::for_codex_agent_type("review").map(|template| template.name),
+            Some(ROLE_REVIEWER)
+        );
+        assert_eq!(
+            RoleTemplate::for_codex_agent_type("worker").map(|template| template.name),
+            Some(ROLE_IMPLEMENTER)
+        );
+        assert_eq!(
+            RoleTemplate::for_codex_agent_type("tester").map(|template| template.name),
+            Some(ROLE_TEST_WORKER)
+        );
+        assert_eq!(
+            RoleTemplate::for_codex_agent_type("read-only").map(|template| template.name),
+            Some(ROLE_EXPLORER)
+        );
+        assert!(RoleTemplate::for_codex_agent_type("planner").is_none());
+    }
+
+    #[test]
+    fn runtime_policy_stamp_is_template_shaped() {
+        let tpl = RoleTemplate::for_name(ROLE_REVIEWER).expect("reviewer");
+        let stamp = tpl.runtime_policy_stamp("model", "builtin", Some("fast-coding"));
+
+        assert_eq!(stamp["template_id"], "m14-c.subagent_runtime.v1");
+        assert_eq!(stamp["role"], ROLE_REVIEWER);
+        assert_eq!(stamp["role_name"], "Reviewer");
+        assert_eq!(stamp["source"], "model");
+        assert_eq!(stamp["backend"], "builtin");
+        assert_eq!(stamp["sandbox"], SANDBOX_NONE);
+        assert_eq!(stamp["approval_policy"], APPROVAL_NEVER);
+        assert_eq!(stamp["tool_policy_id"], "role:reviewer");
+        assert_eq!(stamp["model_preference"], "coding");
+        assert_eq!(stamp["requested_model"], "fast-coding");
+        assert_eq!(
+            stamp["allowed_tools"],
+            json!([
+                "read_file",
+                "group:search",
+                "web_search",
+                "web_fetch",
+                "recall_memory",
+                "synthesize_research"
+            ])
+        );
     }
 }

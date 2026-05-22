@@ -260,7 +260,7 @@ const REQUIRED_CODING_TOOLS: &[RequiredToolSpec] = &[
         aliases: &["spawn"],
         policy: "allowed",
         partial_alias_detail: Some(
-            "Octos spawn exists, but Codex-compatible agent alias lifecycle is not model-visible yet.",
+            "Octos spawn exists; spawn_agent is the Codex-compatible model-visible alias when the session runtime binds a supervisor-backed delegate.",
         ),
     },
     RequiredToolSpec {
@@ -456,14 +456,18 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
         category: "agent",
         aliases: &["spawn_agent"],
         policy: "allowed",
-        detail: Some("Octos subagent launcher; Codex agent lifecycle aliases are not parity yet."),
+        detail: Some(
+            "Octos subagent launcher; spawn_agent is the Codex-compatible supervisor alias.",
+        ),
     },
     OctosToolSpec {
         name: "read_task_output",
         category: "agent",
         aliases: &["wait_agent"],
         policy: "allowed",
-        detail: Some("Background task output reader; not Codex wait_agent parity."),
+        detail: Some(
+            "Background task output reader; wait_agent inspects the same TaskSupervisor state.",
+        ),
     },
     OctosToolSpec {
         name: "activate_tools",
@@ -715,7 +719,11 @@ fn required_tool_status_entry(
     }
 
     if let Some(alias) = first_present(spec.aliases, available_model_tools) {
-        entry.insert("status".into(), json!(TOOL_STATUS_UNIMPLEMENTED));
+        let status = match spec.name {
+            "spawn_agent" | "wait_agent" => TOOL_STATUS_ALIASED,
+            _ => TOOL_STATUS_UNIMPLEMENTED,
+        };
+        entry.insert("status".into(), json!(status));
         entry.insert("backend_tool".into(), json!(alias));
         if let Some(detail) = spec.partial_alias_detail {
             entry.insert("detail".into(), json!(detail));
@@ -1025,6 +1033,35 @@ mod tests {
         // missing — verify by leaving write_stdin out of every set.
         let write_stdin = required_tool(contract, "write_stdin");
         assert_eq!(write_stdin["status"], json!(TOOL_STATUS_MISSING));
+    }
+
+    #[test]
+    fn subagent_backend_aliases_are_reported_as_policy_equivalent_aliases() {
+        let context = ToolStatusListContext {
+            available_model_tools: &[
+                "apply_patch",
+                "exec_command",
+                "write_stdin",
+                "update_plan",
+                "request_user_input",
+                "spawn",
+                "read_task_output",
+                "send_input",
+                "resume_agent",
+                "close_agent",
+            ],
+            ..ToolStatusListContext::default_for_session("coding:test")
+        };
+        let payload = tool_status_list_payload(context);
+        let contract = &payload["coding_tool_contract"];
+
+        let spawn_agent = required_tool(contract, "spawn_agent");
+        assert_eq!(spawn_agent["status"], json!(TOOL_STATUS_ALIASED));
+        assert_eq!(spawn_agent["backend_tool"], json!("spawn"));
+
+        let wait_agent = required_tool(contract, "wait_agent");
+        assert_eq!(wait_agent["status"], json!(TOOL_STATUS_ALIASED));
+        assert_eq!(wait_agent["backend_tool"], json!("read_task_output"));
     }
 
     /// #972 — guard against accidental removal of any P0 canonical tool

@@ -22,7 +22,7 @@ use super::supervisor_store::{
 };
 use chrono::Utc;
 use octos_agent::tools::mcp_agent::DispatchContextContract;
-use octos_agent::{Agent, AgentConfig, ToolRegistry};
+use octos_agent::{Agent, AgentConfig, RoleTemplate, ToolRegistry};
 use octos_core::ui_protocol::{
     OutputCursor, RpcError, autonomy_error_kinds as kinds, methods, rpc_error_codes,
 };
@@ -394,7 +394,10 @@ pub(crate) fn upsert_background_task_agent(
         session_id: session_id.clone(),
         task_id,
         path: format!("master/{agent_id}"),
-        role: "background_task".to_owned(),
+        role: task
+            .role
+            .clone()
+            .unwrap_or_else(|| "background_task".to_owned()),
         nickname: background_task_nickname(task),
         backend_kind: background_task_backend_kind(task),
         status,
@@ -544,6 +547,32 @@ impl InProcessAgentOrchestrator {
             .ok()
             .filter(|_| !raw_task_id.is_empty());
         if !raw_task_id.is_empty() {
+            let template = RoleTemplate::for_name(&role);
+            let runtime_policy_stamp = template
+                .map(|template| {
+                    template.runtime_policy_stamp(
+                        "supervisor",
+                        NATIVE_SPECIALIST_BACKEND_KIND,
+                        None,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    json!({
+                        "template_id": "m14-c.subagent_runtime.v1",
+                        "role": role.clone(),
+                        "source": "supervisor",
+                        "backend": NATIVE_SPECIALIST_BACKEND_KIND,
+                        "tool_policy_id": "coding-v1",
+                    })
+                });
+            supervisor.set_m13b_projection(
+                &raw_task_id,
+                Some("supervisor".to_owned()),
+                Some(role.clone()),
+                Some(task.chars().take(160).collect()),
+                Some(0),
+                Some(runtime_policy_stamp),
+            );
             supervisor.mark_running(&raw_task_id);
             supervisor.mark_runtime_state(
                 &raw_task_id,
@@ -700,8 +729,24 @@ impl InProcessAgentOrchestrator {
                             .filter_map(|artifact| artifact.path.clone())
                             .collect(),
                     );
+                    supervisor.set_m13b_projection(
+                        &raw_task_id,
+                        None,
+                        None,
+                        Some(output.chars().take(1200).collect()),
+                        Some(artifacts.len() as u32),
+                        None,
+                    );
                 } else {
                     supervisor.mark_failed(&raw_task_id, output.clone());
+                    supervisor.set_m13b_projection(
+                        &raw_task_id,
+                        None,
+                        None,
+                        Some(output.chars().take(1200).collect()),
+                        Some(0),
+                        None,
+                    );
                 }
             }
             let agent = self.set_agent_status(
@@ -5162,6 +5207,23 @@ mod tests {
             .expect("supervised task");
         assert_eq!(task.status, octos_agent::TaskStatus::Completed);
         assert_eq!(task.runtime_state, octos_agent::TaskRuntimeState::Completed);
+        assert_eq!(task.source.as_deref(), Some("supervisor"));
+        assert_eq!(task.role.as_deref(), Some(octos_agent::ROLE_REVIEWER));
+        assert_eq!(task.artifact_count, Some(1));
+        assert_eq!(
+            task.runtime_policy_stamp
+                .as_ref()
+                .and_then(|stamp| stamp.get("template_id"))
+                .and_then(Value::as_str),
+            Some("m14-c.subagent_runtime.v1")
+        );
+        assert_eq!(
+            task.runtime_policy_stamp
+                .as_ref()
+                .and_then(|stamp| stamp.get("tool_policy_id"))
+                .and_then(Value::as_str),
+            Some("role:reviewer")
+        );
     }
 
     #[tokio::test]
