@@ -24,6 +24,11 @@ fixture_dir="$out_dir/fixtures"
 cli_fixture="$fixture_dir/review-cli-specialist.mjs"
 mcp_fixture="$fixture_dir/review-mcp-specialist.mjs"
 provider_key_source="${OCTOS_M16_NATIVE_PROVIDER_KEY_SOURCE:-$repo_root/e2e/test-results-m15-native-review-start-stdio/20260516T191424Z/data/profiles/m15-native.json}"
+live_provider_config_path="$data_dir/profiles/$profile_id.json"
+secret_cleanup_report="$out_dir/m16-secret-cleanup.json"
+cleanup_secrets_done=0
+cleanup_stop_done=0
+tmux_session_started=0
 
 usage() {
   cat <<'USAGE'
@@ -252,7 +257,7 @@ deepseek_key_from_source() {
 
 write_profile_config() {
   mkdir -p "$data_dir/profiles"
-  node - "$data_dir/profiles/$profile_id.json" "$profile_id" <<'NODE'
+  node - "$live_provider_config_path" "$profile_id" <<'NODE'
 const fs = require('fs');
 const [file, profileId] = process.argv.slice(2);
 const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -316,50 +321,43 @@ fs.writeFileSync(file, `${JSON.stringify(profile, null, 2)}\n`);
 NODE
 }
 
-scrub_secrets() {
-  # Walks every artifact / runtime tree the soak writes and redacts
-  # provider keys in place. Writes a `secret-scan-report.txt` next to
-  # the soak evidence with per-file redaction counts (no secret values
-  # are printed). #1024 — the prior implementation matched only a
-  # narrow `sk-[A-Za-z0-9]{20,}` pattern and emitted no report, so
-  # provider-specific shapes (`sk-ant-*`, `sk-proj-*`, gemini bearer
-  # tokens, JWT-shaped Anthropic OAuth) could slip through unscanned.
-  node - "$out_dir" "$data_dir" "$runtime_root" <<'NODE'
+cleanup_runtime_secrets() {
+  if [[ "${cleanup_secrets_done:-0}" == "1" ]]; then
+    return 0
+  fi
+  cleanup_secrets_done=1
+  local removed_provider_config=0
+  if [[ -f "$live_provider_config_path" ]]; then
+    rm -f "$live_provider_config_path" || true
+    removed_provider_config=1
+  fi
+  unset DEEPSEEK_API_KEY
+  node - "$out_dir" "$runtime_root" "$data_dir" "$secret_cleanup_report" "$live_provider_config_path" "$removed_provider_config" <<'NODE'
 const fs = require('fs');
 const path = require('path');
-const roots = process.argv.slice(2);
-
+const [outDir, runtimeRoot, dataDir, reportPath, providerConfigPath, removedProviderConfigRaw] = process.argv.slice(2);
+const roots = [outDir, runtimeRoot, dataDir].filter(Boolean);
 const patterns = [
-  // OpenAI / DeepSeek / generic OpenAI-compatible
-  /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9._\-]{20,}/g,
-  // Anthropic OAuth bearer tokens (sk-ant-oat01-...)
-  /sk-ant-oat01-[A-Za-z0-9._\-]{20,}/g,
-  // Google Gemini AIza... keys
-  /AIza[0-9A-Za-z_\-]{30,}/g,
-  // Twilio account/auth pairs
-  /AC[0-9a-f]{32}/g,
-  // Generic Bearer secrets in headers/log lines
-  /Bearer [A-Za-z0-9._\-]{32,}/g,
+  { name: 'openai_compatible', re: /sk-(?:proj-|ant-|svcacct-|admin-|or-v1-)?[A-Za-z0-9._\-]{20,}/g },
+  { name: 'anthropic_oauth', re: /sk-ant-oat01-[A-Za-z0-9._\-]{20,}/g },
+  { name: 'google_ai', re: /AIza[0-9A-Za-z_\-]{30,}/g },
+  { name: 'twilio', re: /AC[0-9a-f]{32}/g },
+  { name: 'bearer', re: /Bearer [A-Za-z0-9._\-]{32,}/g },
 ];
-
-const scanExtensions = /\.(json|jsonl|log|txt|md|env|sh|mjs|yaml|yml|toml|conf|ini)$/i;
+const textSuffixes = new Set([
+  '.json', '.jsonl', '.log', '.txt', '.md', '.env', '.sh', '.mjs', '.js',
+  '.toml', '.yaml', '.yml', '.conf', '.ini',
+]);
 const skipDirs = new Set(['.git', 'node_modules', 'target', '__pycache__']);
+const scannedRoots = [];
+const scannedFiles = [];
+const redactedFiles = [];
+const seenFiles = new Set();
+let redactionsTotal = 0;
 
-const report = [];
-let totalRedactions = 0;
-let filesScanned = 0;
-
-function redact(text) {
-  let next = text;
-  let count = 0;
-  for (const pattern of patterns) {
-    pattern.lastIndex = 0;
-    next = next.replace(pattern, (match) => {
-      count += 1;
-      return '<redacted>';
-    });
-  }
-  return { next, count };
+function isTextFile(filePath) {
+  return textSuffixes.has(path.extname(filePath).toLowerCase())
+    || ['launch-command.txt', 'launch.sh'].includes(path.basename(filePath));
 }
 
 function walk(p) {
@@ -372,59 +370,105 @@ function walk(p) {
     }
     return;
   }
-  if (!scanExtensions.test(p)) return;
-  filesScanned += 1;
+  if (!isTextFile(p)) return;
+  const resolved = path.resolve(p);
+  if (seenFiles.has(resolved) || resolved === path.resolve(reportPath)) return;
+  seenFiles.add(resolved);
   let text;
   try {
     text = fs.readFileSync(p, 'utf8');
   } catch {
     return;
   }
-  const { next, count } = redact(text);
-  if (count > 0) {
+  let next = text;
+  let redactions = 0;
+  for (const pattern of patterns) {
+    pattern.re.lastIndex = 0;
+    next = next.replace(pattern.re, () => {
+      redactions += 1;
+      redactionsTotal += 1;
+      return `<redacted:${pattern.name}>`;
+    });
+  }
+  scannedFiles.push(p);
+  if (next !== text) {
     fs.writeFileSync(p, next);
-    report.push({ path: p, count });
-    totalRedactions += count;
+    redactedFiles.push({ path: p, redactions });
   }
 }
 
-for (const root of roots) walk(root);
-
-// Emit the report under the FIRST root (out_dir). Pass arg-0 (out_dir)
-// is the canonical evidence directory.
-const evidenceRoot = roots[0];
-if (evidenceRoot && fs.existsSync(evidenceRoot)) {
-  const lines = [
-    `# M16 tmux soak secret-scan report`,
-    `roots: ${roots.join(', ')}`,
-    `files_scanned: ${filesScanned}`,
-    `total_redactions: ${totalRedactions}`,
-    '',
-    ...report.map((entry) => `${entry.count}\t${entry.path}`),
-  ];
-  try {
-    fs.writeFileSync(path.join(evidenceRoot, 'secret-scan-report.txt'), `${lines.join('\n')}\n`);
-  } catch {
-    // Don't crash the trap on report write failure.
-  }
+for (const root of roots) {
+  if (!fs.existsSync(root)) continue;
+  scannedRoots.push(root);
+  walk(root);
 }
 
-// Non-zero exit on detected redactions would block the soak validator
-// from running; surface the count via the report only.
+const report = {
+  schema: 'octos.m16.secret_cleanup.v1',
+  scanned_roots: scannedRoots,
+  scanned_files: scannedFiles,
+  scanned_file_count: scannedFiles.length,
+  redacted_files: redactedFiles,
+  redacted_file_count: redactedFiles.length,
+  redactions_total: redactionsTotal,
+  removed_live_provider_config: Boolean(Number(removedProviderConfigRaw || '0')),
+  live_provider_config_path: providerConfigPath,
+};
+fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+
+const legacyLines = [
+  '# M16 tmux soak secret-scan report',
+  `roots: ${roots.join(', ')}`,
+  `files_scanned: ${scannedFiles.length}`,
+  `total_redactions: ${redactionsTotal}`,
+  '',
+  ...redactedFiles.map((entry) => `${entry.redactions}\t${entry.path}`),
+];
+try {
+  fs.writeFileSync(path.join(outDir, 'secret-scan-report.txt'), `${legacyLines.join('\n')}\n`);
+} catch {
+  // Best-effort compatibility report; the JSON report is canonical.
+}
 NODE
 }
 
+stop_tui_session() {
+  if [[ "${cleanup_stop_done:-0}" == "1" ]]; then
+    return 0
+  fi
+  cleanup_stop_done=1
+  if [[ "${tmux_session_started:-0}" == "1" && "${OCTOS_M16_UX_KEEP_SESSION:-0}" != "1" && -x "$tui_runner" ]]; then
+    "$tui_runner" stop || true
+  fi
+}
+
+cleanup_on_exit() {
+  local status="${1:-$?}"
+  stop_tui_session
+  cleanup_runtime_secrets || true
+  return "$status"
+}
+
+cleanup_on_signal() {
+  local status="$1"
+  trap - EXIT
+  cleanup_on_exit "$status"
+  exit "$status"
+}
+
 run_soak() {
-  command -v tmux >/dev/null 2>&1 || die "tmux is required"
-  [[ -x "$tui_runner" ]] || die "octos-tui tmux runner not found or not executable: $tui_runner"
-  ensure_binaries
   mkdir -p "$out_dir" "$runtime_root" "$data_dir" "$workdir"
-  # Register the secret scrub BEFORE any provider config / key is
-  # written so a startup failure between mkdir and the actual write
-  # still emits a clean evidence tree. Catching INT/TERM as well
-  # closes the gap #1024 flagged where Ctrl-C during the bootstrap
-  # left the unscanned provider config behind.
-  trap scrub_secrets EXIT INT TERM
+  # Register cleanup before writing live provider config, so startup failures
+  # and signals still remove/redact runtime evidence before validation.
+  trap 'cleanup_on_exit $?' EXIT
+  trap 'cleanup_on_signal 130' INT
+  trap 'cleanup_on_signal 143' TERM
+  if [[ "${OCTOS_M16_UX_INJECT_FAIL_AFTER_PROFILE_WRITE:-0}" != "1" ]]; then
+    command -v tmux >/dev/null 2>&1 || die "tmux is required"
+    [[ -x "$tui_runner" ]] || die "octos-tui tmux runner not found or not executable: $tui_runner"
+    ensure_binaries
+  fi
   write_review_workspace_fixture
   write_review_fixtures
   write_replay
@@ -436,6 +480,10 @@ run_soak() {
   [[ -n "$provider_key" && "$provider_key" != "<redacted>" ]] || die "missing provider key; set OCTOS_M16_NATIVE_API_KEY, OCTOS_M15_NATIVE_API_KEY, DEEPSEEK_API_KEY, or OCTOS_M16_NATIVE_PROVIDER_KEY_SOURCE"
   write_profile_config
   export DEEPSEEK_API_KEY="$provider_key"
+  if [[ "${OCTOS_M16_UX_INJECT_FAIL_AFTER_PROFILE_WRITE:-0}" == "1" ]]; then
+    echo "Injected failure after provider config write" >&2
+    return 97
+  fi
 
   local backend_command
   backend_command="env OCTOS_REVIEW_CLI_SPECIALIST_ARGV_JSON=$(shell_quote "[\"$cli_fixture\"]") OCTOS_REVIEW_MCP_TIMEOUT_SECS=30 $(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir") --cwd $(shell_quote "$workdir") --swarm-backend stdio --swarm-backend-cmd $(shell_quote "$mcp_fixture")"
@@ -458,15 +506,13 @@ run_soak() {
   export OCTOS_TUI_M15_UX_ROWS="${OCTOS_M16_UX_ROWS:-40}"
 
   "$tui_runner" start
+  tmux_session_started=1
   local status=0
   "$tui_runner" drive || status=$?
   "$tui_runner" capture || true
+  stop_tui_session
+  cleanup_runtime_secrets
   python3 "$script_dir/validate-m16-tmux-orchestration.py" --out-dir "$out_dir" || status=$?
-  if [[ "${OCTOS_M16_UX_KEEP_SESSION:-0}" != "1" ]]; then
-    "$tui_runner" stop || true
-  fi
-  scrub_secrets
-  trap - EXIT
 
   echo "M16 UX soak artifacts: $out_dir"
   return "$status"
@@ -475,54 +521,64 @@ run_soak() {
 self_test() {
   bash -n "$0"
   python3 -m py_compile "$script_dir/validate-m16-tmux-orchestration.py"
-  # #1024: exercise scrub_secrets against a synthetic tree so the
-  # broadened pattern set + report emission stay regression-tested.
-  local fixture_root
-  fixture_root="$(mktemp -d -t m16-scrub-test-XXXXXX)"
-  trap 'rm -rf "$fixture_root"' RETURN
-  local old_out_dir="${out_dir:-}"
-  local old_data_dir="${data_dir:-}"
-  local old_runtime_root="${runtime_root:-}"
-  out_dir="$fixture_root/out"
-  data_dir="$fixture_root/data"
-  runtime_root="$fixture_root/runtime"
-  mkdir -p "$out_dir" "$data_dir" "$runtime_root"
-  cat > "$data_dir/profile.json" <<JSON
-{ "api_key": "sk-test-${RANDOM}1234567890ABCDEFG1234567890" }
-JSON
-  cat > "$runtime_root/log.txt" <<TXT
+  local tmp_root
+  tmp_root="$(mktemp -d -t m16-cleanup-test-XXXXXX)"
+  trap 'rm -rf "$tmp_root"' RETURN
+  mkdir -p "$tmp_root/out" "$tmp_root/runtime/preexisting"
+  cat > "$tmp_root/out/seed.env" <<TXT
+OPENAI_API_KEY=sk-test-1234567890ABCDEFG1234567890
+ANTHROPIC_OAUTH_JWT=sk-ant-oat01-jwthdr.octosjwtpayloadABCDEFGH.octosjwtsignatureIJKLMNOP
+TXT
+  cat > "$tmp_root/runtime/preexisting/log.txt" <<TXT
 auth: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD
 google: AIzaSyA-1234567890abcdefghijklmnopqrstuv
 TXT
-  cat > "$out_dir/anthropic.env" <<TXT
-ANTHROPIC_API_KEY=sk-ant-oat01-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
-# codex P1+P3 follow-up to #1089: dotted JWT-shaped OAuth tokens must
-# be scrubbed in full, not just up to the first \`.\` separator. The
-# first JWT segment below is intentionally short so the old (no-\`.\`)
-# regex cannot match the prefix-with-segment as a 20+ char run either;
-# without dot-aware redaction the entire token survives. The residual
-# grep then matches distinctive payload and signature markers so any
-# regression that drops \`.\` from the char class fails this self-test.
-ANTHROPIC_OAUTH_JWT=sk-ant-oat01-jwthdr.octosjwtpayloadABCDEFGH.octosjwtsignatureIJKLMNOP
-TXT
-  scrub_secrets
-  if grep -RIEq -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij|octosjwtpayload|octosjwtsignature' "$fixture_root"; then
-    echo "scrub_secrets self-test FAIL: residual secrets in $fixture_root" >&2
-    grep -RIEn -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij|octosjwtpayload|octosjwtsignature' "$fixture_root" || true
-    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+  local output_file="$tmp_root/injected-failure.out"
+  set +e
+  OCTOS_M16_UX_OUT_DIR="$tmp_root/out" \
+    OCTOS_M16_UX_RUNTIME_ROOT="$tmp_root/runtime" \
+    OCTOS_M16_UX_DATA_DIR="$tmp_root/runtime/data" \
+    OCTOS_M16_UX_WORKDIR="$tmp_root/runtime/workspace" \
+    OCTOS_M16_UX_INJECT_FAIL_AFTER_PROFILE_WRITE=1 \
+    OCTOS_M16_NATIVE_API_KEY="sk-testm16cleanup000000000000" \
+    OCTOS_M16_BUILD=0 \
+    "$0" run >"$output_file" 2>&1
+  local status=$?
+  set -e
+  [[ "$status" == "97" ]] || die "self-test expected injected failure status 97, got $status"
+  [[ ! -f "$tmp_root/runtime/data/profiles/coding.json" ]] || die "self-test provider config was not removed"
+  if grep -RIEq -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij|octosjwtpayload|octosjwtsignature' "$tmp_root/out" "$tmp_root/runtime"; then
+    echo "secret cleanup self-test FAIL: residual secrets in $tmp_root" >&2
+    grep -RIEn -- 'sk-test|sk-ant-oat01|AIzaSy|Bearer abcdefghij|octosjwtpayload|octosjwtsignature' "$tmp_root/out" "$tmp_root/runtime" || true
     return 1
   fi
-  if [[ ! -s "$out_dir/secret-scan-report.txt" ]]; then
-    echo "scrub_secrets self-test FAIL: secret-scan-report.txt missing or empty" >&2
-    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
+  node - "$tmp_root/out/m16-secret-cleanup.json" <<'NODE'
+const fs = require('fs');
+const reportPath = process.argv[2];
+if (!fs.existsSync(reportPath)) {
+  throw new Error(`missing cleanup report: ${reportPath}`);
+}
+const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+if (report.schema !== 'octos.m16.secret_cleanup.v1') {
+  throw new Error(`unexpected cleanup schema: ${report.schema}`);
+}
+if (!report.removed_live_provider_config) {
+  throw new Error('cleanup report did not record provider config removal');
+}
+if (!report.scanned_roots.some((root) => root.endsWith('/out'))) {
+  throw new Error('cleanup report did not scan evidence output tree');
+}
+if (!report.scanned_roots.some((root) => root.endsWith('/runtime'))) {
+  throw new Error('cleanup report did not scan runtime tree');
+}
+if (report.redactions_total < 4 || report.redacted_file_count < 2) {
+  throw new Error(`cleanup report did not record expected redactions: ${JSON.stringify(report)}`);
+}
+NODE
+  if [[ ! -s "$tmp_root/out/secret-scan-report.txt" ]]; then
+    echo "secret cleanup self-test FAIL: legacy secret-scan-report.txt missing" >&2
     return 1
   fi
-  if ! grep -q '^total_redactions: [1-9]' "$out_dir/secret-scan-report.txt"; then
-    echo "scrub_secrets self-test FAIL: report did not record redactions" >&2
-    out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
-    return 1
-  fi
-  out_dir="$old_out_dir"; data_dir="$old_data_dir"; runtime_root="$old_runtime_root"
   echo "Self-test passed"
 }
 

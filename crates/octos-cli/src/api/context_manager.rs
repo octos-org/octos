@@ -6,8 +6,8 @@
 //! and fork-sanitizer contracts that SessionActor can wire into the production
 //! turn loop in later M16 workstreams.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use octos_core::{Message, MessageRole, ToolCall};
@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 const CONTEXT_MANAGER_SCHEMA: &str = "octos.context-manager.v1";
 const DEFAULT_TOOL_OUTPUT_POLICY_ID: &str = "tool-output-v1";
+const TOOL_OUTPUT_UI_PREVIEW_MAX_BYTES: usize = 512;
 const SYNTHETIC_MISSING_TOOL_OUTPUT: &str =
     "[tool output missing: aborted before result was recorded]";
 
@@ -217,11 +218,20 @@ pub(crate) struct ToolOutputEnvelope {
     pub(crate) tool_name: String,
     pub(crate) raw_sha256: String,
     pub(crate) raw_artifact_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ui_preview: Option<ToolOutputPreviewLink>,
     pub(crate) original_bytes: usize,
     pub(crate) model_visible_content: String,
     pub(crate) model_visible_bytes: usize,
     pub(crate) truncation_reason: Option<ToolOutputTruncationReason>,
     pub(crate) policy_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ToolOutputPreviewLink {
+    pub(crate) preview_ref: String,
+    pub(crate) content: String,
+    pub(crate) bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +386,7 @@ pub(crate) struct ContextManager {
     last_compaction_id: Option<ContextCompactionId>,
     recovery_state: ContextRecoveryState,
     tool_output_policy: ToolOutputPolicy,
+    tool_output_artifacts: HashMap<String, Vec<u8>>,
     compactions: Vec<ContextCompactionRecord>,
 }
 
@@ -399,6 +410,7 @@ pub(crate) fn persist_context_manager_snapshot(
     session_id: &str,
     manager: &ContextManager,
 ) -> Result<PathBuf, String> {
+    persist_tool_output_artifacts(data_dir, manager)?;
     let path = context_ledger_path(data_dir, session_id);
     let parent = path
         .parent()
@@ -434,6 +446,65 @@ pub(crate) fn persist_context_manager_snapshot(
         ));
     }
     Ok(path)
+}
+
+fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<PathBuf, String> {
+    let root = data_dir.join("context_ledgers");
+    let mut path = root.clone();
+    for component in Path::new(artifact_ref).components() {
+        match component {
+            Component::Normal(part) => path.push(part),
+            _ => {
+                return Err(format!(
+                    "invalid context artifact reference contains non-normal component: {artifact_ref}"
+                ));
+            }
+        }
+    }
+    Ok(path)
+}
+
+fn persist_tool_output_artifacts(data_dir: &Path, manager: &ContextManager) -> Result<(), String> {
+    for (artifact_ref, bytes) in &manager.tool_output_artifacts {
+        let path = context_ledger_artifact_path(data_dir, artifact_ref)?;
+        atomic_write_bytes(&path, bytes)?;
+    }
+    Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("context artifact path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create context artifact directory {} failed: {err}",
+            parent.display()
+        )
+    })?;
+    let tmp_name = format!(
+        "{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("tool-output.txt"),
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let tmp_path = parent.join(tmp_name);
+    std::fs::write(&tmp_path, bytes).map_err(|err| {
+        format!(
+            "write context artifact {} failed: {err}",
+            tmp_path.display()
+        )
+    })?;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "install context artifact {} failed: {err}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn load_context_manager_snapshot(
@@ -519,6 +590,7 @@ impl ContextManager {
             last_compaction_id: None,
             recovery_state: ContextRecoveryState::Exact,
             tool_output_policy: ToolOutputPolicy::default(),
+            tool_output_artifacts: HashMap::new(),
             compactions: Vec::new(),
         }
     }
@@ -577,6 +649,7 @@ impl ContextManager {
             last_compaction_id: None,
             recovery_state: ContextRecoveryState::Rebuilt,
             tool_output_policy: ToolOutputPolicy::default(),
+            tool_output_artifacts: HashMap::new(),
             compactions: Vec::new(),
         }
     }
@@ -677,6 +750,7 @@ impl ContextManager {
             last_compaction_id: snapshot.state.last_compaction_id,
             recovery_state: snapshot.state.recovery_state,
             tool_output_policy: ToolOutputPolicy::default(),
+            tool_output_artifacts: HashMap::new(),
             compactions: snapshot.compactions,
         }
     }
@@ -921,9 +995,19 @@ impl ContextManager {
             self.tool_output_policy.model_visible_max_bytes,
             ToolOutputTruncationReason::MaxBytes,
         );
-        let raw_artifact_ref = (original_bytes
-            > self.tool_output_policy.inline_raw_threshold_bytes)
+        let raw_artifact_ref = (truncation_reason.is_some()
+            || original_bytes > self.tool_output_policy.inline_raw_threshold_bytes)
             .then(|| format!("tool-output/{raw_sha256}.txt"));
+        if let Some(artifact_ref) = raw_artifact_ref.as_ref() {
+            self.tool_output_artifacts
+                .insert(artifact_ref.clone(), raw_output.as_bytes().to_vec());
+        }
+        let ui_preview_content = tool_output_preview(&model_visible_content);
+        let ui_preview = Some(ToolOutputPreviewLink {
+            preview_ref: format!("appui/tool-output-preview/{tool_call_id}"),
+            bytes: ui_preview_content.len(),
+            content: ui_preview_content,
+        });
         self.record_item_with_source_ref(
             TranscriptItemKind::ToolOutput {
                 envelope: ToolOutputEnvelope {
@@ -931,6 +1015,7 @@ impl ContextManager {
                     tool_name: tool_name.into(),
                     raw_sha256,
                     raw_artifact_ref,
+                    ui_preview,
                     original_bytes,
                     model_visible_bytes: model_visible_content.len(),
                     model_visible_content,
@@ -1321,6 +1406,11 @@ impl ContextManager {
         }
 
         if let Some(max_tokens) = policy.max_prompt_token_estimate {
+            truncate_tool_outputs_for_context_pressure(
+                &mut entries,
+                max_tokens,
+                &mut truncated_item_ids,
+            );
             trim_prompt_entries_preserving_invariants(
                 &mut entries,
                 max_tokens,
@@ -1544,6 +1634,34 @@ fn trim_prompt_entries_preserving_invariants(
     }
 }
 
+fn truncate_tool_outputs_for_context_pressure(
+    entries: &mut [PromptMessageEntry],
+    max_tokens: usize,
+    truncated_item_ids: &mut Vec<TranscriptItemId>,
+) {
+    if estimate_entries_tokens(entries) <= max_tokens {
+        return;
+    }
+    let max_tool_bytes = (max_tokens.saturating_mul(4) / 2).max(1);
+    for entry in entries.iter_mut() {
+        if entry.message.role != MessageRole::Tool || entry.message.content.len() <= max_tool_bytes
+        {
+            continue;
+        }
+        let (content, reason) = truncate_utf8(
+            &entry.message.content,
+            max_tool_bytes,
+            ToolOutputTruncationReason::ContextWindowPressure,
+        );
+        if reason.is_some() {
+            entry.message.content = content;
+            for item_id in &entry.source_item_ids {
+                push_unique_item_id(truncated_item_ids, item_id.clone());
+            }
+        }
+    }
+}
+
 fn first_removable_prompt_group(entries: &[PromptMessageEntry]) -> Option<(usize, usize)> {
     let start = entries
         .iter()
@@ -1674,6 +1792,15 @@ fn truncate_utf8(
     let mut truncated = value[..end].to_owned();
     truncated.push_str("\n[truncated]");
     (truncated, Some(reason))
+}
+
+fn tool_output_preview(value: &str) -> String {
+    truncate_utf8(
+        value,
+        TOOL_OUTPUT_UI_PREVIEW_MAX_BYTES,
+        ToolOutputTruncationReason::MaxBytes,
+    )
+    .0
 }
 
 fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
@@ -1917,6 +2044,10 @@ mod tests {
                 .unwrap()
                 .starts_with("tool-output/sha256:")
         );
+        let preview = envelope.ui_preview.as_ref().expect("ui preview link");
+        assert_eq!(preview.preview_ref, "appui/tool-output-preview/call-1");
+        assert_eq!(preview.content, envelope.model_visible_content);
+        assert_eq!(preview.bytes, preview.content.len());
         assert!(envelope.raw_sha256.starts_with("sha256:"));
     }
 
@@ -2381,6 +2512,94 @@ mod tests {
     }
 
     #[test]
+    fn durable_context_ledger_persists_tool_output_sidecar_and_preview_link() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = "coding:local:tui#tool-output";
+        let policy = ToolOutputPolicy {
+            policy_id: "test-policy".into(),
+            inline_raw_threshold_bytes: 8,
+            model_visible_max_bytes: 10,
+        };
+        let mut manager = ContextManager::new(session_id, None).with_tool_output_policy(policy);
+        manager.record_message(&assistant_tool_call("call-1"));
+        manager.record_tool_output("call-1", "shell", "0123456789abcdef");
+
+        let envelope = match &manager.items()[1].kind {
+            TranscriptItemKind::ToolOutput { envelope } => envelope,
+            other => panic!("expected tool output, got {other:?}"),
+        };
+        let artifact_ref = envelope
+            .raw_artifact_ref
+            .as_deref()
+            .expect("large output should have sidecar ref");
+        let preview_ref = envelope
+            .ui_preview
+            .as_ref()
+            .expect("ui preview link")
+            .preview_ref
+            .clone();
+
+        let snapshot_path = persist_context_manager_snapshot(temp.path(), session_id, &manager)
+            .expect("persist context manager");
+        let artifact_path =
+            context_ledger_artifact_path(temp.path(), artifact_ref).expect("artifact path");
+
+        assert!(snapshot_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&artifact_path).expect("read sidecar"),
+            "0123456789abcdef"
+        );
+        assert_eq!(preview_ref, "appui/tool-output-preview/call-1");
+
+        let loaded = load_context_manager_snapshot(temp.path(), session_id)
+            .expect("load snapshot")
+            .expect("snapshot exists");
+        let frame = loaded.for_prompt(&PromptBuildPolicy::default());
+        let tool_message = frame
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("tool message");
+        assert_eq!(tool_message.content, "0123456789\n[truncated]");
+        assert_eq!(
+            frame.report.truncated_item_ids.len(),
+            1,
+            "replay should preserve the same model-visible truncation evidence"
+        );
+    }
+
+    #[test]
+    fn prompt_context_pressure_truncates_tool_output_before_dropping_groups() {
+        let policy = ToolOutputPolicy {
+            policy_id: "test-policy".into(),
+            inline_raw_threshold_bytes: 1024,
+            model_visible_max_bytes: 1024,
+        };
+        let mut manager = ContextManager::new("s", None).with_tool_output_policy(policy);
+        manager.record_message(&Message::system("system"));
+        manager.record_message(&Message::user("recent user"));
+        manager.record_message(&assistant_tool_call("call-pressure"));
+        let tool_item_id = manager.record_tool_output("call-pressure", "shell", &"x".repeat(200));
+
+        let frame = manager.for_prompt(&PromptBuildPolicy {
+            max_prompt_token_estimate: Some(40),
+            ..PromptBuildPolicy::default()
+        });
+
+        let tool_message = frame
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("tool output should remain");
+        assert!(tool_message.content.ends_with("[truncated]"));
+        assert!(tool_message.content.len() < 200);
+        assert!(
+            frame.report.truncated_item_ids.contains(&tool_item_id),
+            "context-pressure truncation should report the affected tool output item"
+        );
+    }
+
+    #[test]
     fn fork_child_history_drops_parent_reasoning_tool_calls_outputs_and_context_injections() {
         let mut manager = ContextManager::new("s", None);
         manager.record_message(&Message::system("system"));
@@ -2445,6 +2664,7 @@ mod tests {
                     tool_name: String::new(),
                     raw_sha256: String::new(),
                     raw_artifact_ref: None,
+                    ui_preview: None,
                     original_bytes: 0,
                     model_visible_content: String::new(),
                     model_visible_bytes: 0,
