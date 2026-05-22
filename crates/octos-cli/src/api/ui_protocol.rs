@@ -1210,6 +1210,24 @@ impl ConnectionUiFeatures {
             &mut capabilities.supported_features,
             super::coding_tool_contract::CODING_DYNAMIC_TOOL_SEARCH_CAPABILITY_V1,
         );
+        // #1172 — Codex naming-parity aliases. The underlying capabilities
+        // ride on `shell` / `exec_command` (for `bash`), `spawn_agent` +
+        // `wait_agent` (for `delegate`), and the compile-time browser tool
+        // (for `browser`). Advertising them lets a Codex-trained client
+        // skip the `tool not found` -> `tool_search` round trip on first
+        // call.
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            super::coding_tool_contract::CODING_BASH_CAPABILITY_V1,
+        );
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            super::coding_tool_contract::CODING_DELEGATE_CAPABILITY_V1,
+        );
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            super::coding_tool_contract::CODING_BROWSER_CAPABILITY_V1,
+        );
         if self.context_lifecycle_available() {
             push_capability_feature(
                 &mut capabilities.supported_features,
@@ -17811,6 +17829,27 @@ ignore = []
             !tenant_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1),
             "tenant deployment must NOT advertise the workspace probe feature",
         );
+    }
+
+    /// #1172 — Codex naming-parity capability flags must be advertised
+    /// alongside the existing image-view / dynamic-tool-search flags so
+    /// a Codex-trained client negotiating capabilities can skip the
+    /// `tool not found` -> `tool_search` retry on first call.
+    #[test]
+    fn codex_naming_aliases_advertise_capability_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_profile_state(dir.path());
+        let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+        for feature in &[
+            super::super::coding_tool_contract::CODING_BASH_CAPABILITY_V1,
+            super::super::coding_tool_contract::CODING_DELEGATE_CAPABILITY_V1,
+            super::super::coding_tool_contract::CODING_BROWSER_CAPABILITY_V1,
+        ] {
+            assert!(
+                capabilities.supports_feature(feature),
+                "advertised_capabilities must include {feature} for Codex naming parity",
+            );
+        }
     }
 
     #[test]
