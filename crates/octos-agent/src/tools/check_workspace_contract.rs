@@ -196,11 +196,7 @@ mod tests {
         // the exact path `inspect_workspace_contract` reads.
         write_pptx_bytes(repo_root.join("output/deck.pptx"));
         write_file(repo_root.join("output/imgs/slide-01.png"), "png");
-        run_slides_project_root_validators(
-            tmp.path(),
-            &[repo_root.join("output/deck.pptx")],
-        )
-        .await;
+        run_slides_project_root_validators(tmp.path(), &[repo_root.join("output/deck.pptx")]).await;
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool
@@ -239,11 +235,8 @@ mod tests {
         // spawn loop exercises in production.
         write_pptx_bytes(ready_root.join("output/deck.pptx"));
         write_file(ready_root.join("output/imgs/slide-01.png"), "png");
-        run_slides_project_root_validators(
-            tmp.path(),
-            &[ready_root.join("output/deck.pptx")],
-        )
-        .await;
+        run_slides_project_root_validators(tmp.path(), &[ready_root.join("output/deck.pptx")])
+            .await;
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool

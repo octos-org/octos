@@ -4651,18 +4651,13 @@ printf '{"output":"voice saved","success":true}\n'
     /// production. Pre-round-2 the fixture manually `ledger.append(...)`ed a
     /// fake Pass; codex flagged that as masking the gap (the validator was
     /// declared but never RUN at the project root in production).
-    async fn run_managed_slides_workspace_validators(
-        tmp_root: &std::path::Path,
-        slug: &str,
-    ) {
+    async fn run_managed_slides_workspace_validators(tmp_root: &std::path::Path, slug: &str) {
         use crate::workspace_git::WorkspaceProjectKind;
         let registry = std::sync::Arc::new(crate::ToolRegistry::new());
         // Mirror production: the spawn loop hands the plugin's
         // `files_to_send` list through. The fixture stages the deck at
         // the legacy in-project path so the filter accepts it.
-        let files_to_send = vec![
-            tmp_root.join("slides").join(slug).join("output/deck.pptx"),
-        ];
+        let files_to_send = vec![tmp_root.join("slides").join(slug).join("output/deck.pptx")];
         let _ = crate::workspace_contract::run_project_root_validators(
             &registry,
             tmp_root,

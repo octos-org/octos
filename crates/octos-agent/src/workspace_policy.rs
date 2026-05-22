@@ -3066,10 +3066,12 @@ ignore = []
     }
 
     /// Migration: a slides project whose persisted policy was written
-    /// before #997 round-3 (still carries `file_exists:output/deck.pptx`
-    /// + a Glob-source MagicBytes validator) should be auto-upgraded on
+    /// before #997 round-3 should be auto-upgraded on
     /// `read_workspace_policy`, and the upgrade should rewrite the file
     /// on disk so subsequent reads are cheap.
+    ///
+    /// The legacy shape still carries `file_exists:output/deck.pptx`
+    /// plus a Glob-source MagicBytes validator.
     #[test]
     fn read_workspace_policy_auto_migrates_legacy_slides_policy() {
         let tmp = tempfile::tempdir().unwrap();

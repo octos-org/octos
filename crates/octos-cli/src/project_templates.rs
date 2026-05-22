@@ -98,7 +98,7 @@ module.exports = [];
         &project_dir,
         &slides_delivery::workspace_policy_for_slug(Some(&slug)),
     )
-        .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+    .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
 
     initialize_and_commit(
         &project_dir,

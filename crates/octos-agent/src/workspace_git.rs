@@ -812,20 +812,19 @@ fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
     // of `<kind>/<slug>/`) but allowlist the search scope to
     // `<session>/skill-output/` so this can't be abused to read
     // arbitrary files elsewhere in the workspace.
-    let (base_root, allow_root): (PathBuf, Option<PathBuf>) =
-        if Path::new(pattern).is_absolute() {
-            (PathBuf::from("/"), None)
-        } else if pattern.starts_with("skill-output/") || pattern.starts_with("skill-output\\") {
-            match repo_root.parent().and_then(|p| p.parent()) {
-                Some(session_root) => (
-                    session_root.to_path_buf(),
-                    Some(session_root.join("skill-output")),
-                ),
-                None => (repo_root.to_path_buf(), None),
-            }
-        } else {
-            (repo_root.to_path_buf(), None)
-        };
+    let (base_root, allow_root): (PathBuf, Option<PathBuf>) = if Path::new(pattern).is_absolute() {
+        (PathBuf::from("/"), None)
+    } else if pattern.starts_with("skill-output/") || pattern.starts_with("skill-output\\") {
+        match repo_root.parent().and_then(|p| p.parent()) {
+            Some(session_root) => (
+                session_root.to_path_buf(),
+                Some(session_root.join("skill-output")),
+            ),
+            None => (repo_root.to_path_buf(), None),
+        }
+    } else {
+        (repo_root.to_path_buf(), None)
+    };
 
     let full_pattern = if Path::new(pattern).is_absolute() {
         PathBuf::from(pattern)
@@ -1049,10 +1048,7 @@ mod tests {
     /// mirrors the spawn completion path so a regression in either the
     /// wiring or the validator itself surfaces here. Sync wrapper so the
     /// existing `#[test]` callers don't have to switch to `#[tokio::test]`.
-    fn run_slides_project_root_validators_sync(
-        workspace_root: &Path,
-        files_to_send: &[PathBuf],
-    ) {
+    fn run_slides_project_root_validators_sync(workspace_root: &Path, files_to_send: &[PathBuf]) {
         let registry = Arc::new(ToolRegistry::new());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1246,7 +1242,10 @@ mod tests {
         // `ledger.append(...)`, masking the gap that codex flagged: the
         // validator was declared at the project policy but never RUN at the
         // project root in production. Now we exercise the real helper.
-        run_slides_project_root_validators_sync(temp.path(), &[slides_root.join("output/deck.pptx")]);
+        run_slides_project_root_validators_sync(
+            temp.path(),
+            &[slides_root.join("output/deck.pptx")],
+        );
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
@@ -1334,7 +1333,10 @@ mod tests {
         // project policy but never RUN at the project root in production.
         // The helper writes a real `Pass` to the same ledger path the real
         // harness writes after `run_task` succeeds.
-        run_slides_project_root_validators_sync(temp.path(), &[slides_root.join("output/deck.pptx")]);
+        run_slides_project_root_validators_sync(
+            temp.path(),
+            &[slides_root.join("output/deck.pptx")],
+        );
         initialize_and_commit(
             &slides_root,
             WorkspaceProjectKind::Slides,
