@@ -92,21 +92,36 @@ fi
 range="$merge_base..HEAD"
 
 # Emit destination paths from `git diff --name-status` in the committed
-# range. `--diff-filter=AMR` keeps Added / Modified / Renamed entries; for
-# renames the trailing column is the destination, which is what we want
+# range. The second argument selects between two filters:
+#
+#   * trigger  -> AMRD: Added / Modified / Renamed / Deleted. Removal of a
+#                 protocol file is itself a protocol-visible event and must
+#                 be gated (codex review #4 / #717).
+#   * coverage -> AMR  only: a *deleted* UPCR or spec file is NOT valid
+#                 coverage for a protocol-code change (codex review #5).
+#
+# For renames the trailing column is the destination, which is what we want
 # (we care about the file that lives in the working tree at HEAD, not the
 # pre-rename path). Whitespace-only changes are filtered by re-running
 # `git diff -w --stat` on each candidate and dropping those with empty stat.
 diff_range_names() {
   local range="$1"
-  shift
+  local mode="$2"
+  shift 2
   if [ -z "$range" ]; then
     return 0
   fi
+  local filter
+  case "$mode" in
+    trigger)  filter="AMRD" ;;
+    coverage) filter="AMR"  ;;
+    *)
+      echo "diff_range_names: unknown mode '$mode'" >&2
+      return 2
+      ;;
+  esac
   local raw
-  # AMRD: Added, Modified, Renamed, Deleted. Deletions of protocol files are
-  # also protocol-visible events (codex review #4 / #717) and must be gated.
-  raw="$(git diff --name-status --diff-filter=AMRD "$range" -- "$@" 2>/dev/null || true)"
+  raw="$(git diff --name-status --diff-filter="$filter" "$range" -- "$@" 2>/dev/null || true)"
   if [ -z "$raw" ]; then
     return 0
   fi
@@ -144,7 +159,18 @@ diff_range_names() {
 }
 
 # Uncommitted change names (staged + unstaged + untracked) for matching paths.
+#
+# $1 = mode: "trigger" includes deletions, "coverage" excludes them.
 uncommitted_names() {
+  local mode="$1"
+  shift
+  case "$mode" in
+    trigger|coverage) ;;
+    *)
+      echo "uncommitted_names: unknown mode '$mode'" >&2
+      return 2
+      ;;
+  esac
   local entries
   entries="$(git status --porcelain --untracked-files=all -- "$@" 2>/dev/null || true)"
   if [ -z "$entries" ]; then
@@ -160,9 +186,15 @@ uncommitted_names() {
       path="${path##* -> }"
     fi
     case "$status_code" in
-      "??"|"A "|"AM"|" A"|R*|"D "|" D"|"DD"|"AD"|"MD")
-        # Adds, renames, and deletions are all protocol-visible events.
+      "??"|"A "|"AM"|" A"|R*)
+        # Adds and renames count for both modes.
         printf '%s\n' "$path"
+        ;;
+      "D "|" D"|"DD"|"AD"|"MD")
+        # Deletions count for trigger only — a deleted UPCR is not coverage.
+        if [ "$mode" = "trigger" ]; then
+          printf '%s\n' "$path"
+        fi
         ;;
       *)
         # Tracked modification — drop if whitespace-only.
@@ -180,25 +212,30 @@ uncommitted_names() {
 
 collect_names() {
   local range="$1"
-  shift
+  local mode="$2"
+  shift 2
   {
-    diff_range_names "$range" "$@"
-    uncommitted_names "$@"
+    diff_range_names "$range" "$mode" "$@"
+    uncommitted_names "$mode" "$@"
   } | awk 'NF && !seen[$0]++'
 }
 
 # Split changes into code-level (Rust source) and spec-doc buckets so the
 # coverage rules can treat them differently. Codex review #3 (#717): an
 # unrelated spec edit must not satisfy the gate for a code-level diff.
-code_changes="$(collect_names "$range" "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}")"
-spec_changes="$(collect_names "$range" "$SPEC_GLOB")"
+# Trigger mode includes deletions so removing a protocol file is gated.
+code_changes="$(collect_names "$range" trigger "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}")"
+spec_changes="$(collect_names "$range" trigger "$SPEC_GLOB")"
 
 if [ -z "$code_changes" ] && [ -z "$spec_changes" ]; then
   printf 'ui-protocol-upcr: no protocol-visible edits detected\n'
   exit 0
 fi
 
-upcr_changes="$(collect_names "$range" "$UPCR_GLOB" "$UPCR_TEMPLATE")"
+# Coverage mode for UPCR docs: only added or modified entries count. A
+# deletion of an old UPCR is NOT coverage for a fresh protocol change
+# (codex review #5 / #717).
+upcr_changes="$(collect_names "$range" coverage "$UPCR_GLOB" "$UPCR_TEMPLATE")"
 
 # Verify the matched UPCR file looks like a real UPCR-YYYY-NNN doc.
 upcr_real=""
@@ -217,10 +254,15 @@ if [ -n "$upcr_real" ]; then
   exit 0
 fi
 
-# No UPCR doc. Spec-only changes are self-coverage; otherwise fail.
+# No UPCR doc. A spec-only edit can self-cover, but only if the spec change
+# is an add/modify; a deletion-only spec change is just a protocol-visible
+# removal and still needs an explicit UPCR.
 if [ -z "$code_changes" ] && [ -n "$spec_changes" ]; then
-  printf 'ui-protocol-upcr: spec-only edit, treated as self-coverage\n'
-  exit 0
+  spec_coverage="$(collect_names "$range" coverage "$SPEC_GLOB")"
+  if [ -n "$spec_coverage" ]; then
+    printf 'ui-protocol-upcr: spec-only edit, treated as self-coverage\n'
+    exit 0
+  fi
 fi
 
 if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
