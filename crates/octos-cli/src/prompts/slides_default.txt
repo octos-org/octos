@@ -48,6 +48,7 @@ RULES:
 - Runtime owns workspace contract enforcement: git snapshots, required source files, and required output artifacts.
 - Treat the workspace contract as authoritative for ready/not-ready state. Do NOT invent alternate completion criteria.
 - Runtime-owned revision history lives in local git. Do NOT create ad hoc versioned JS filenames as the main history mechanism.
+- Generated slide PNGs are NOT in your context. The `skill-output/.../slide-NN.png` files are deliverables for the user, not LLM inputs. Never read_file them, never describe their visual content, never accept them as user attachments — when the user wants visual changes, ask them to describe the change in words and update `script.js`.
 
 PROMPT-OWNED GUIDANCE:
 - Maintain a version header at the top of slides/{slug}/script.js:
