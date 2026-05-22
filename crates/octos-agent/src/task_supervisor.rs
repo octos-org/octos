@@ -463,10 +463,23 @@ impl TaskCancelToken {
     /// Wait for the token to fire. Useful for `select!` against a
     /// long-running future.
     pub async fn cancelled(&self) {
+        self.cancelled_after_first_check(|| {}).await;
+    }
+
+    async fn cancelled_after_first_check<F>(&self, after_first_check: F)
+    where
+        F: FnOnce(),
+    {
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        after_first_check();
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -3201,6 +3214,26 @@ mod tests {
                 .await
                 .expect("waiter must wake within 500ms")
                 .expect("waiter task panicked");
+        });
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_token_catches_cancel_between_precheck_and_notify_park() {
+        let token = Arc::new(TaskCancelToken::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let canceller = token.clone();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                token.cancelled_after_first_check(move || canceller.cancel()),
+            )
+            .await
+            .expect("cancelled() must not miss a cancel fired before Notified is parked");
         });
         assert!(token.is_cancelled());
     }

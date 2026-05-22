@@ -1537,8 +1537,18 @@ impl GatewayRuntime {
 
         // Main loop: dispatch inbound messages to concurrent tasks
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let shutdown_notified = shutdown_notify.notified();
+            tokio::pin!(shutdown_notified);
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
             let mut inbound = tokio::select! {
-                _ = shutdown_notify.notified() => {
+                biased;
+                _ = &mut shutdown_notified => {
                     if self.shutdown.load(Ordering::Acquire) {
                         break;
                     }
