@@ -1729,8 +1729,8 @@ impl Tool for BashTool {
 
 /// Best-effort kill of a child whose `wait_with_output()` was dropped
 /// when a `tokio::time::timeout` expired. Mirrors `ShellTool`'s
-/// kill-on-timeout: SIGTERM the process group, brief grace period,
-/// then SIGKILL if still alive. On Windows uses `taskkill /F /T`.
+/// kill-on-timeout: SIGTERM the process group/tree, brief grace period,
+/// then SIGKILL if any process remains. On Windows uses `taskkill /F /T`.
 /// Errors are swallowed because the call is best-effort cleanup —
 /// the timeout result has already been returned to the caller.
 async fn kill_timed_out_child(child_pid: Option<u32>) {
@@ -1739,30 +1739,27 @@ async fn kill_timed_out_child(child_pid: Option<u32>) {
     };
     #[cfg(unix)]
     {
-        use std::process::Command as StdCommand;
-
-        // SIGTERM to the process group and the PID itself.
-        let _ = StdCommand::new("kill")
-            .args(["-15", &format!("-{pid}")])
-            .status();
-        let _ = StdCommand::new("kill")
-            .args(["-15", &pid.to_string()])
-            .status();
+        let descendants = collect_descendant_pids(pid);
+        signal_process_group(pid, "-15");
+        signal_pids(&descendants, "-15");
+        signal_process(pid, "-15");
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let still_alive = StdCommand::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|s| s.success());
+        let mut remaining = descendants;
+        remaining.extend(collect_descendant_pids(pid));
+        remaining.sort_unstable();
+        remaining.dedup();
 
-        if still_alive {
-            let _ = StdCommand::new("kill")
-                .args(["-9", &format!("-{pid}")])
-                .status();
-            let _ = StdCommand::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+        if process_group_exists(pid)
+            || process_exists(pid)
+            || remaining
+                .iter()
+                .any(|descendant| process_exists(*descendant))
+        {
+            signal_process_group(pid, "-9");
+            signal_pids(&remaining, "-9");
+            signal_process(pid, "-9");
         }
     }
     #[cfg(windows)]
@@ -1772,6 +1769,87 @@ async fn kill_timed_out_child(child_pid: Option<u32>) {
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .status();
     }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: &str) -> bool {
+    use std::process::Command as StdCommand;
+
+    let group = format!("-{pid}");
+    StdCommand::new("kill")
+        .args([signal, "--", &group])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: &str) -> bool {
+    use std::process::Command as StdCommand;
+
+    StdCommand::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn signal_pids(pids: &[u32], signal: &str) {
+    for pid in pids {
+        signal_process(*pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    signal_process_group(pid, "-0")
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    signal_process(pid, "-0")
+}
+
+#[cfg(unix)]
+fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
+    use std::process::Command as StdCommand;
+
+    let output = match StdCommand::new("ps").args(["-eo", "pid=,ppid="]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        children_by_parent.entry(ppid).or_default().push(pid);
+    }
+
+    let mut descendants = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = children_by_parent
+        .get(&root_pid)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        descendants.push(pid);
+        if let Some(children) = children_by_parent.get(&pid) {
+            stack.extend(children.iter().copied());
+        }
+    }
+    descendants
 }
 
 #[derive(Debug, Deserialize)]
