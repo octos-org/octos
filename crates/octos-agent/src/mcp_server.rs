@@ -32,6 +32,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use eyre::Result;
@@ -273,34 +274,20 @@ impl McpServer {
         let token = Arc::new(token);
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let accept_shutdown = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = accept_shutdown.notified() => break,
-                    accept = listener.accept() => {
-                        match accept {
-                            Ok((stream, peer)) => {
-                                let server = server.clone();
-                                let token = token.clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = handle_http_connection(server, token, stream, peer).await {
-                                        warn!(error = %err, "mcp-serve http connection error");
-                                    }
-                                });
-                            }
-                            Err(err) => {
-                                warn!(error = %err, "mcp-serve accept failed");
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let accept_shutdown_requested = shutdown_requested.clone();
+        let handle = tokio::spawn(run_http_accept_loop(
+            listener,
+            server,
+            token,
+            accept_shutdown,
+            accept_shutdown_requested,
+        ));
 
         Ok(McpServerHandle {
             addr,
             shutdown,
+            shutdown_requested,
             handle,
         })
     }
@@ -321,6 +308,7 @@ impl McpServer {
 pub struct McpServerHandle {
     addr: SocketAddr,
     shutdown: Arc<tokio::sync::Notify>,
+    shutdown_requested: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
 
@@ -330,8 +318,50 @@ impl McpServerHandle {
     }
 
     pub async fn shutdown(self) {
+        self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
         let _ = self.handle.await;
+    }
+}
+
+async fn run_http_accept_loop(
+    listener: TcpListener,
+    server: Arc<McpServer>,
+    token: Arc<String>,
+    accept_shutdown: Arc<tokio::sync::Notify>,
+    accept_shutdown_requested: Arc<AtomicBool>,
+) {
+    loop {
+        if accept_shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
+        let shutdown_notified = accept_shutdown.notified();
+        tokio::pin!(shutdown_notified);
+        if accept_shutdown_requested.load(Ordering::Acquire) {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut shutdown_notified => break,
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, peer)) => {
+                        let server = server.clone();
+                        let token = token.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_http_connection(server, token, stream, peer).await {
+                                warn!(error = %err, "mcp-serve http connection error");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "mcp-serve accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -956,5 +986,47 @@ mod tests {
         assert_eq!(outcome, "unknown");
         assert!(contract.is_none());
         assert!(error.is_none());
+    }
+
+    struct NoopDispatch;
+
+    #[async_trait::async_trait]
+    impl McpSessionDispatch for NoopDispatch {
+        async fn run_session(
+            &self,
+            _contract: &str,
+            _input: &Value,
+            _observer: &dyn SessionLifecycleObserver,
+        ) -> Result<McpSessionOutcome, McpServerError> {
+            Ok(McpSessionOutcome {
+                final_state: TaskLifecycleState::Ready,
+                artifact_path: None,
+                artifact_content: None,
+                validator_results: Vec::new(),
+                cost: json!({}),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn http_accept_loop_exits_when_shutdown_was_fired_before_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = Arc::new(McpServer::new(
+            Arc::new(NoopDispatch),
+            Arc::new(TaskSupervisor::new()),
+        ));
+        let token = Arc::new("test-token".to_string());
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown_requested = Arc::new(AtomicBool::new(true));
+
+        shutdown.notify_waiters();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            run_http_accept_loop(listener, server, token, shutdown, shutdown_requested),
+        )
+        .await
+        .expect("accept loop must exit when shutdown fired before it polls");
     }
 }
