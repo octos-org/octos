@@ -951,12 +951,6 @@ impl InProcessAgentOrchestrator {
         // tripping the min-delay gate), so an active goal only ran
         // its initial continuation and never recurred.
         enqueue_due_goal_continuations(&mut state, session_id, profile_id, runtime_state, now);
-        let drained = state.continuations.drain_ready_for_session(
-            runtime_state,
-            max_items,
-            &session_id.to_string(),
-            profile_id,
-        );
         // #1150 codex P2 follow-up to #1145: `pending_continuation_is_schedulable`
         // gates which sessions `due_loop_targets` surfaces, but the
         // scheduler's drain pops by `(session_key, profile)` without
@@ -968,40 +962,67 @@ impl InProcessAgentOrchestrator {
         // items — do NOT re-enqueue. This matches `due_loop_targets`'s
         // silent-skip semantics for stale wrap-ups whose owning
         // entity has been paused/cleared/replaced.
-        let mut kept = Vec::with_capacity(drained.len());
-        for item in drained {
-            if pending_continuation_is_schedulable(&state, &item) {
-                kept.push(item);
-            } else {
-                // #1159 codex P2 follow-up: only TOMBSTONE drops whose
-                // owning entity is genuinely gone (goal cleared and
-                // replaced, loop deleted), where the same dedupe_key
-                // cannot recur. For the *paused* subset (loop status
-                // != active, goal status != active but goal_id still
-                // matches), leave the supervisor ledger untouched —
-                // resuming the entity is expected to re-queue the
-                // same dedupe_key, and a Completed tombstone would
-                // make `upsert_continuation` silently drop the new
-                // Queued event because Completed outranks Queued.
-                if stale_drop_should_tombstone(&state, &item)
-                    && let Some(store) = state.supervisor_store.as_ref()
-                {
-                    let _ = store.record_continuation_completed(
-                        item.group_id.as_str(),
-                        item.dedupe_key.as_str(),
-                        now_ms_u64(),
-                        Some("discarded:stale_at_drain (#1150)".into()),
+        //
+        // #1160 codex P3 follow-up to #1150/#1159: dropped stale items
+        // already consumed a slot of the scheduler's `max_items`
+        // budget, so a caller with `max_items=1` (production AppUI
+        // tick loop) that finds a stale item at heap head returns an
+        // empty vec — the fresh continuation queued behind it waits a
+        // full tick (~30s) before draining. Refill from the scheduler
+        // until `kept.len() == max_items` or the queue is empty for
+        // this `(session, profile)`. The scheduler removes each popped
+        // item from `pending_by_key` and pushes back any non-matching
+        // heap entries, so repeated calls cannot revisit a previously
+        // drained item.
+        // Cap the initial allocation: callers (notably tests and
+        // sweep paths) sometimes pass `usize::MAX` to mean
+        // "everything", which would overflow `Vec::with_capacity`.
+        let mut kept: Vec<QueuedMasterContinuation> = Vec::with_capacity(max_items.min(32));
+        while kept.len() < max_items {
+            let remaining = max_items - kept.len();
+            let drained = state.continuations.drain_ready_for_session(
+                runtime_state,
+                remaining,
+                &session_id.to_string(),
+                profile_id,
+            );
+            if drained.is_empty() {
+                break;
+            }
+            for item in drained {
+                if pending_continuation_is_schedulable(&state, &item) {
+                    kept.push(item);
+                } else {
+                    // #1159 codex P2 follow-up: only TOMBSTONE drops whose
+                    // owning entity is genuinely gone (goal cleared and
+                    // replaced, loop deleted), where the same dedupe_key
+                    // cannot recur. For the *paused* subset (loop status
+                    // != active, goal status != active but goal_id still
+                    // matches), leave the supervisor ledger untouched —
+                    // resuming the entity is expected to re-queue the
+                    // same dedupe_key, and a Completed tombstone would
+                    // make `upsert_continuation` silently drop the new
+                    // Queued event because Completed outranks Queued.
+                    if stale_drop_should_tombstone(&state, &item)
+                        && let Some(store) = state.supervisor_store.as_ref()
+                    {
+                        let _ = store.record_continuation_completed(
+                            item.group_id.as_str(),
+                            item.dedupe_key.as_str(),
+                            now_ms_u64(),
+                            Some("discarded:stale_at_drain (#1150)".into()),
+                        );
+                    }
+                    tracing::debug!(
+                        session_key = %session_id.0,
+                        profile_id = %profile_id,
+                        reason = ?item.reason,
+                        continuation_id = ?item.id,
+                        goal_id = ?item.goal_id,
+                        loop_id = ?item.loop_id,
+                        "dropping stale continuation at drain site (#1150)"
                     );
                 }
-                tracing::debug!(
-                    session_key = %session_id.0,
-                    profile_id = %profile_id,
-                    reason = ?item.reason,
-                    continuation_id = ?item.id,
-                    goal_id = ?item.goal_id,
-                    loop_id = ?item.loop_id,
-                    "dropping stale continuation at drain site (#1150)"
-                );
             }
         }
         kept
@@ -6637,6 +6658,138 @@ mod tests {
             orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
             0,
             "stale wrap-up must be dropped from the queue, not re-enqueued for next tick",
+        );
+    }
+
+    /// #1160 codex P3 follow-up to #1150/#1159: the drain path pops up
+    /// to `max_items` from the scheduler and THEN filters via
+    /// `pending_continuation_is_schedulable`. Items dropped by that
+    /// predicate have already consumed a scheduler slot, so a caller
+    /// with `max_items=1` (production AppUI tick loop) that finds a
+    /// stale wrap-up at the head of the heap returns ZERO items even
+    /// though a fresh schedulable continuation is queued right behind
+    /// it — the fresh item waits a full AppUI tick (~30s) before the
+    /// next drain sees it. This regression test pins the refill
+    /// behaviour: when a stale item is dropped, the drain must keep
+    /// pulling from the scheduler until either `max_items` schedulable
+    /// items are collected or the queue is empty for this session.
+    #[test]
+    fn drain_with_max_items_one_finds_fresh_when_stale_drains_first_per_1160() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id = SessionKey::with_profile("tenant-a", "api", "drain-refill-max-items");
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-a".into(),
+                objective: "fresh active goal".into(),
+                status: Some("active".into()),
+                token_budget: None,
+                transition_actor: None,
+            })
+            .expect("set active goal");
+        // Drain whatever the `set_goal` lifecycle queued so we control
+        // the queue contents below precisely.
+        let _ = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+
+        let current_goal_id = orchestrator
+            .state()
+            .goals
+            .get(&session_id)
+            .expect("goal exists")
+            .goal_id
+            .clone();
+        let stale_goal_id = format!("{current_goal_id}-superseded");
+        assert_ne!(stale_goal_id, current_goal_id);
+
+        // Hand-enqueue a stale wrap-up FIRST so it gets the lower
+        // sequence and therefore higher heap priority under FIFO
+        // tie-break — exactly the case that surfaces stale items at
+        // slot 0 of a `max_items=1` drain.
+        {
+            let mut state = orchestrator.state();
+            let stale = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(stale_goal_id.clone())
+            .with_metadata(
+                "wrap_up_prompt",
+                "STALE: summarize a goal that no longer owns this session",
+            );
+            let outcome = enqueue_and_persist_continuation(&mut state, stale);
+            assert!(
+                outcome.queued().is_some(),
+                "stale wrap-up must enqueue (fresh continuation not yet present)"
+            );
+        }
+        // Now hand-enqueue the FRESH continuation behind the stale one.
+        {
+            let mut state = orchestrator.state();
+            let fresh = MasterContinuationRequest::new(
+                "coding-autonomy-goal",
+                session_id.to_string(),
+                "tenant-a".to_owned(),
+                MasterContinuationReason::GoalContinue,
+                SystemTime::now(),
+            )
+            .with_goal_id(current_goal_id.clone())
+            .with_metadata("objective", "fresh active goal".to_owned())
+            .with_metadata("status", "active".to_owned());
+            let outcome = enqueue_and_persist_continuation(&mut state, fresh);
+            assert!(
+                outcome.queued().is_some(),
+                "fresh continuation must enqueue under a distinct dedupe key"
+            );
+        }
+
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            2,
+            "pre-drain queue must hold both stale wrap-up and fresh continuation",
+        );
+
+        // Production AppUI tick path passes max_items=1. The pre-#1160
+        // code would pop the stale item, filter it out, and return an
+        // empty vec — leaving the fresh item queued for the next tick.
+        let drained = orchestrator.drain_ready_continuations_for_session(
+            &session_id,
+            "tenant-a",
+            MasterContinuationRuntimeState::idle(),
+            1,
+        );
+
+        assert_eq!(
+            drained.len(),
+            1,
+            "drain with max_items=1 must refill past stale items and surface the fresh continuation, got {drained:?}",
+        );
+        let returned = &drained[0];
+        assert_eq!(returned.reason, MasterContinuationReason::GoalContinue);
+        assert_eq!(
+            returned.goal_id.as_ref().map(|id| id.as_str()),
+            Some(current_goal_id.as_str()),
+            "drain must return the fresh goal_id continuation, not the stale one",
+        );
+        assert!(
+            !returned.metadata.contains_key("wrap_up_prompt"),
+            "drain must not surface the stale wrap-up shape",
+        );
+
+        // After the single-slot drain, the fresh continuation has been
+        // taken AND the stale wrap-up has been dropped. Nothing should
+        // remain queued for this session.
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&session_id, "tenant-a"),
+            0,
+            "fresh continuation must not still be queued after a max_items=1 drain that surfaced it",
         );
     }
 
