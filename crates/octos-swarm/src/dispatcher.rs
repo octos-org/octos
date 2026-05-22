@@ -210,6 +210,14 @@ impl Swarm {
         self.backend.clone()
     }
 
+    /// Return the configured pre-dispatch policy gate.
+    ///
+    /// Direct AppUI specialist runners use this when they intentionally
+    /// reuse the swarm backend without going through [`Self::dispatch`].
+    pub fn dispatch_policy(&self) -> Arc<DispatchPolicy> {
+        self.dispatch_policy.clone()
+    }
+
     /// Dispatch a batch of contracts against the configured backend.
     ///
     /// # Invariants

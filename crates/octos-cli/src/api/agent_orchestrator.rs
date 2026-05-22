@@ -361,6 +361,7 @@ pub(crate) struct NativeSpecialistLaunchRequest {
     pub(crate) agent_config: Option<AgentConfig>,
     pub(crate) task_ledger_path: Option<PathBuf>,
     pub(crate) event_tx: Option<NativeSpecialistEventSender>,
+    pub(crate) dispatch_policy: Option<Arc<octos_agent::DispatchPolicy>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -524,6 +525,7 @@ impl InProcessAgentOrchestrator {
             agent_config,
             task_ledger_path,
             event_tx,
+            dispatch_policy,
         } = request;
 
         let agent_id = agent_id.unwrap_or_else(|| format!("native-{}", uuid::Uuid::now_v7()));
@@ -532,6 +534,39 @@ impl InProcessAgentOrchestrator {
             parent_agent_id.as_deref().unwrap_or("master"),
             agent_id
         );
+        if let Some(policy) = dispatch_policy.as_ref() {
+            let backend = octos_agent::DispatchBackendMetadata::sandboxed(
+                NATIVE_SPECIALIST_BACKEND_KIND,
+                cwd.to_string_lossy().into_owned(),
+            );
+            let task_payload = json!({
+                "task": task.as_str(),
+                "cwd": cwd.to_string_lossy().into_owned(),
+            });
+            if let Err(denial) = octos_agent::enforce_dispatch_gates_for_backend(
+                policy.as_ref(),
+                &backend,
+                octos_agent::DispatchTarget {
+                    dispatch_id: &agent_id,
+                    tool_name: NATIVE_SPECIALIST_BACKEND_KIND,
+                    task: &task_payload,
+                },
+            )
+            .await
+            {
+                return Err(autonomy_error(
+                    kinds::AGENT_CONTROL_FORBIDDEN,
+                    format!(
+                        "dispatch rejected by policy ({}): {}",
+                        denial.last_dispatch_outcome, denial.reason
+                    ),
+                    Some(&session_id),
+                    Some(&profile_id),
+                    Some(("agent_id", agent_id.as_str())),
+                    true,
+                ));
+            }
+        }
         let supervisor = tools.supervisor();
         let raw_task_id = supervisor.register_with_lineage(
             "native_agent",
@@ -5090,6 +5125,7 @@ mod tests {
                 agent_config: None,
                 task_ledger_path: None,
                 event_tx: Some(tx),
+                dispatch_policy: None,
             })
             .await
             .expect("native specialist run");
@@ -5165,6 +5201,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_specialist_dispatch_policy_accepts_sandbox_requirement() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let tools = Arc::new(ToolRegistry::with_builtins_and_sandbox(
+            dir.path(),
+            octos_agent::create_sandbox(&octos_agent::SandboxConfig::default()),
+        ));
+        let memory = Arc::new(
+            EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .expect("memory store"),
+        );
+        let llm: Arc<dyn LlmProvider> = Arc::new(NativeMockProvider {
+            content: Ok("native specialist respected sandbox policy".to_owned()),
+        });
+        let policy = Arc::new(octos_agent::DispatchPolicy {
+            require_sandboxed: true,
+            ..Default::default()
+        });
+
+        let result = orchestrator
+            .run_native_specialist(NativeSpecialistLaunchRequest {
+                agent_id: Some("native-policy-sandbox".to_owned()),
+                parent_agent_id: Some("master".to_owned()),
+                session_id: SessionKey::with_profile("tenant-a", "api", "native-policy"),
+                profile_id: "tenant-a".to_owned(),
+                role: "reviewer".to_owned(),
+                nickname: "Native Policy".to_owned(),
+                task: "review sandbox policy".to_owned(),
+                cwd: dir.path().to_path_buf(),
+                llm,
+                memory,
+                tools,
+                system_prompt: Some("You are a focused reviewer.".to_owned()),
+                agent_config: None,
+                task_ledger_path: None,
+                event_tx: None,
+                dispatch_policy: Some(policy),
+            })
+            .await
+            .expect("native specialist should satisfy sandbox dispatch policy");
+
+        assert_eq!(result.status, "completed");
+    }
+
+    #[tokio::test]
     async fn native_specialist_failure_marks_agent_and_task_failed() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let orchestrator = InProcessAgentOrchestrator::default();
@@ -5196,6 +5278,7 @@ mod tests {
                 agent_config: None,
                 task_ledger_path: None,
                 event_tx: None,
+                dispatch_policy: None,
             })
             .await
             .expect("native specialist run");
@@ -8438,6 +8521,7 @@ mod tests {
                     agent_config: None,
                     task_ledger_path: None,
                     event_tx: None,
+                    dispatch_policy: None,
                 })
                 .await
         });

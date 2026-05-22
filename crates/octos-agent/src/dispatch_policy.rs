@@ -57,6 +57,61 @@ use crate::{
     PolicyDecision, ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester, ToolPolicy,
 };
 
+/// Backend facts needed by the dispatch policy gate.
+///
+/// The gate only needs display labels for diagnostics and whether the
+/// caller can prove the dispatch will run under a sandbox. Keeping this
+/// metadata independent from [`McpAgentBackend`] lets direct CLI or
+/// native-specialist launchers reuse the same gate instead of open-coding
+/// parallel checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchBackendMetadata {
+    backend_label: String,
+    endpoint_label: String,
+    sandboxed: bool,
+}
+
+impl DispatchBackendMetadata {
+    pub fn new(
+        backend_label: impl Into<String>,
+        endpoint_label: impl Into<String>,
+        sandboxed: bool,
+    ) -> Self {
+        Self {
+            backend_label: backend_label.into(),
+            endpoint_label: endpoint_label.into(),
+            sandboxed,
+        }
+    }
+
+    pub fn unsandboxed(
+        backend_label: impl Into<String>,
+        endpoint_label: impl Into<String>,
+    ) -> Self {
+        Self::new(backend_label, endpoint_label, false)
+    }
+
+    pub fn sandboxed(backend_label: impl Into<String>, endpoint_label: impl Into<String>) -> Self {
+        Self::new(backend_label, endpoint_label, true)
+    }
+
+    pub fn from_mcp_backend(backend: &dyn McpAgentBackend) -> Self {
+        Self::unsandboxed(backend.backend_label(), backend.endpoint_label())
+    }
+
+    pub fn backend_label(&self) -> &str {
+        &self.backend_label
+    }
+
+    pub fn endpoint_label(&self) -> &str {
+        &self.endpoint_label
+    }
+
+    pub fn is_sandboxed(&self) -> bool {
+        self.sandboxed
+    }
+}
+
 /// Configuration for the dispatch policy gate.
 ///
 /// Every field is independently optional so callers can opt into just the
@@ -239,11 +294,22 @@ pub async fn enforce_dispatch_gates(
     backend: &dyn McpAgentBackend,
     target: DispatchTarget<'_>,
 ) -> Result<(), GateDenial> {
+    let metadata = DispatchBackendMetadata::from_mcp_backend(backend);
+    enforce_dispatch_gates_for_backend(policy, &metadata, target).await
+}
+
+/// Same policy gate as [`enforce_dispatch_gates`], but parameterized by
+/// backend metadata so non-MCP launchers do not bypass the central path.
+pub async fn enforce_dispatch_gates_for_backend(
+    policy: &DispatchPolicy,
+    backend: &DispatchBackendMetadata,
+    target: DispatchTarget<'_>,
+) -> Result<(), GateDenial> {
     if policy.is_noop() {
         return Ok(());
     }
 
-    if policy.require_sandboxed && !backend_is_sandboxed(backend) {
+    if policy.require_sandboxed && !backend.is_sandboxed() {
         return Err(GateDenial {
             last_dispatch_outcome: "sandbox_required",
             reason: format!(
@@ -347,16 +413,6 @@ pub async fn enforce_dispatch_gates(
     }
 
     Ok(())
-}
-
-fn backend_is_sandboxed(_backend: &dyn McpAgentBackend) -> bool {
-    // No `McpAgentBackend` implementation reports as sandboxed today.
-    // The trait does not expose an `is_sandboxed()` method, so callers
-    // that demand sandboxing must wire a backend that wraps the dispatch
-    // call site in their own isolation surface (Bubblewrap subprocess,
-    // Docker container, etc.). When the trait grows an `is_sandboxed()`
-    // method, this helper becomes the single switch-point.
-    false
 }
 
 fn first_forbidden_env_key(
