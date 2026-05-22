@@ -623,7 +623,7 @@ pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_regi
 pub mod ssrf;
 
 // Built-in tools
-pub mod codex_tools;
+pub mod coding_tools;
 pub mod deep_search;
 pub mod delegate;
 pub mod diff_edit;
@@ -663,7 +663,7 @@ pub mod git;
 #[cfg(feature = "ast")]
 pub mod code_structure;
 
-pub use codex_tools::{
+pub use coding_tools::{
     ApplyPatchTool, CloseAgentTool, ExecCommandTool, RequestUserInputTool, ResumeAgentTool,
     SendInputTool, SpawnAgentTool, ToolCatalogEntry, ToolSearchTool, ToolSuggestTool,
     UpdatePlanTool, ViewImageTool, WaitAgentTool, WriteStdinTool,
