@@ -20,6 +20,8 @@
 #  11. No base ref resolvable -> exit non-zero (codex #1 — closes CI bypass).
 #  12. Protocol file deletion (no UPCR) -> exit non-zero (codex #4 —
 #      deletions are protocol-visible too).
+#  13. Code change + deletion of an existing UPCR (no add/modify of any
+#      UPCR) -> exit non-zero (codex #5 — deleted UPCR is not coverage).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -64,6 +66,8 @@ make_repo() {
     printf '// baseline\n' > crates/octos-cli/src/api/ui_protocol.rs
     printf 'pub fn old() {}\n' > crates/octos-cli/src/api/ui_protocol_alpha.rs
     printf '# spec baseline\n' > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+    printf '# UPCR-2026-001 seed baseline\n' \
+      > docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_SEED.md
     printf '# placeholder\n' > docs/.keep
 
     git add -A
@@ -376,6 +380,30 @@ scenario_renamed_protocol_file
 scenario_unrelated_spec_does_not_cover_code
 scenario_no_base_ref_fails
 scenario_deleted_protocol_file
+
+# Scenario 13: deleting an existing UPCR while editing protocol code must
+# NOT satisfy coverage. Closes the bypass codex caught in review #5.
+scenario_deleted_upcr_is_not_coverage() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    printf '// extend\n' > crates/octos-core/src/ui_protocol.rs
+    git rm --quiet docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_001_SEED.md
+    git add -A
+    git commit --quiet -m "feat: extend + drop old upcr"
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out"; then
+    pass "deleted UPCR does not satisfy coverage"
+  else
+    fail "deleted UPCR coverage bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_deleted_upcr_is_not_coverage
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"
