@@ -1,0 +1,97 @@
+M17 Live Proof Soak Runbook
+
+Issue: #1023
+
+This runbook collects the current live-proof support for M17-E. It does not
+claim closure by itself; closure requires a passing m17-live-proof-validation.json
+from a live run with provider credentials and external services available.
+
+Harness Map
+
+Requirement: DeepSeek-backed code-review swarm
+Current script/evidence: e2e/scripts/m15-native-review-start-stdio-soak.mjs
+Notes: Runs review/start against octos serve --stdio, configures DeepSeek, and validates 3 native + CLI + MCP specialists.
+
+Requirement: Native child agents
+Current script/evidence: m15-native-review-start-stdio-soak.mjs summary queriedAgents
+Notes: Proves native specialists complete, but does not by itself prove direct spawn_agent coverage.
+
+Requirement: TUI tmux captures
+Current script/evidence: e2e/scripts/m16-live-tui-tmux-soak.sh
+Notes: Requires tmux and octos-tui; output includes terminal captures and m16-ux-soak-validation.json.
+
+Requirement: AppUI transcript
+Current script/evidence: client-observed-appui-transcript.jsonl or appui-transcript.jsonl
+Notes: The M17 validator requires the transcript from both the stdio and tmux paths when supplied.
+
+Requirement: Server log
+Current script/evidence: server-stderr.log and server.log
+Notes: server.log is required for the tmux proof; stdio scripts also keep stderr.
+
+Requirement: Loop/goal budget coverage
+Current script/evidence: m15-loop-runtime-stdio-soak.mjs, m15-goal-runtime-stdio-soak.mjs
+Notes: Goal budget is explicit budget_limited; organic token exhaustion is still documented as a production gap in the summary.
+
+Requirement: Budget stop/grace proof
+Current script/evidence: --budget-grace-dir passed to validate-m17-live-proof.py
+Notes: Closure requires captured LoopRetryState/budget-grace log evidence. Existing loop/goal soaks alone may not satisfy this.
+
+Requirement: Direct spawn proof
+Current script/evidence: --spawn-dir passed to validate-m17-live-proof.py
+Notes: Closure requires direct spawn_agent evidence for at least three native children. Review/start specialists alone do not satisfy this gap.
+
+Requirement: Child context ledgers
+Current script/evidence: child-context-ledger.jsonl or context-ledger.jsonl
+Notes: M17 validator requires at least three child records, with explicit unmanaged markers for non-managed paths.
+
+Requirement: Artifact index
+Current script/evidence: artifact-index.json from component evidence and m17-live-proof-artifact-index.json
+Notes: The M17 validator emits a consolidated index in the validation directory.
+
+Requirement: Validation report
+Current script/evidence: m17-live-proof-validation.json
+Notes: close_issue_1023: true only when every required check passes.
+
+Requirement: Secret hygiene
+Current script/evidence: component redaction plus M17 scan
+Notes: Raw provider-key-shaped values fail validation; values are never printed.
+
+Run
+
+From the octos repo:
+
+  DEEPSEEK_API_KEY=sk-... npm --prefix e2e run soak:m17:live-proof
+
+Useful overrides:
+
+  OCTOS_M17_SKIP_TUI=1 \
+  OCTOS_M17_SPAWN_DIR=/path/to/direct-spawn-evidence \
+  OCTOS_M17_BUDGET_GRACE_DIR=/path/to/budget-grace-evidence \
+  bash e2e/scripts/m17-live-proof-soak.sh run
+
+To validate already-captured evidence without running live services:
+
+  python3 e2e/scripts/validate-m17-live-proof.py \
+    --out-dir e2e/test-results-m17-live-proof/manual-validation \
+    --m15-native-dir e2e/test-results-m15-native-review-start-stdio/<run> \
+    --m16-tmux-dir e2e/test-results-m16-tmux-ux/<run> \
+    --loop-dir e2e/test-results-m15-loop-runtime-stdio/<run> \
+    --goal-dir e2e/test-results-m15-goal-runtime-stdio/<run> \
+    --spawn-dir <direct-spawn-evidence> \
+    --budget-grace-dir <budget-grace-evidence>
+
+Local Checks
+
+  npm --prefix e2e run soak:m17:live-proof:self-test
+
+The self-test creates synthetic evidence, verifies the validator catches a fake
+raw key, then verifies a clean synthetic fixture passes. It does not call live
+LLM providers.
+
+Closure Rule
+
+#1023 can be closed after live execution only when:
+
+- m17-live-proof-validation.json has status: passed and close_issue_1023: true.
+- The report was generated from a live DeepSeek-backed run, not synthetic or fixture-only evidence.
+- Direct spawn_agent, child-context ledger, and budget-grace checks pass.

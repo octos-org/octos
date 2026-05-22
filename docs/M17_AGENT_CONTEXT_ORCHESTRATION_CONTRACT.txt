@@ -81,7 +81,10 @@ Acceptance:
 
 Issue: #1023
 
-Re-run budget, spawn, and DeepSeek live code-review swarm soaks.
+Re-run budget, spawn, and DeepSeek live code-review swarm soaks. The current
+operator runbook is `docs/M17_LIVE_PROOF_SOAK_RUNBOOK.txt`; the strict closure
+validator is `e2e/scripts/validate-m17-live-proof.py` and the orchestrator is
+`e2e/scripts/m17-live-proof-soak.sh`.
 
 Acceptance:
 
