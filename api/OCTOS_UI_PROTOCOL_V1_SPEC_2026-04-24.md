@@ -336,8 +336,8 @@ collapses to the per-thread `seq`. Specifically:
 
 ### 5.2 `ChatRequest.thread_id` canonicalization (M9 #674 / #675 phase 1b)
 
-On the request side, `POST /chat` (and the equivalent WS `turn/start`
-ingress) accepts a canonical `thread_id` field on the request body:
+On the HTTP request side, `POST /chat` accepts a canonical `thread_id`
+field on the request body:
 
 ```json
 {
@@ -357,6 +357,10 @@ ingress) accepts a canonical `thread_id` field on the request body:
 - **Precedence** — when both `thread_id` and `client_message_id` are
   present, the canonical `thread_id` wins. Empty / sentinel-empty
   values on either field are treated as absent.
+- **WS surface** — the equivalent WS `turn/start` ingress
+  (`TurnStartParams` in `octos-core::ui_protocol`) does NOT carry
+  `thread_id` in this PR; it derives the thread from `turn_id`. WS
+  parity will land in a follow-up PR sequenced with M9 #677/#678.
 - Removal — the `client_message_id` alias is scheduled for removal in
   the same release that closes M9 #679, after one full release of
   dual-acceptance overlap. Clients SHOULD migrate to `thread_id`
