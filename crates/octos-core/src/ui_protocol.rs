@@ -1432,6 +1432,10 @@ pub enum InputItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionOpenParams {
     pub session_id: SessionKey,
+    /// Optional sub-topic suffix to open. When present, the server scopes
+    /// replay and live fan-out to the matching topic bucket for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2650,6 +2654,8 @@ impl MessagePersistedSource {
 pub struct MessagePersistedEvent {
     pub session_id: SessionKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
@@ -2720,6 +2726,8 @@ pub struct MessagePersistedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnSpawnCompleteEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3884,6 +3892,8 @@ pub struct TurnStartedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageDeltaEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub text: String,
 }
@@ -4060,6 +4070,8 @@ pub struct ApprovalRenderHints {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequestedEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub approval_id: ApprovalId,
     pub turn_id: TurnId,
     pub tool_name: String,
@@ -4086,6 +4098,7 @@ impl ApprovalRequestedEvent {
     ) -> Self {
         Self {
             session_id,
+            topic: None,
             approval_id,
             turn_id,
             tool_name: tool_name.into(),
@@ -4207,6 +4220,8 @@ pub enum TaskRuntimeState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskUpdatedEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub task_id: TaskId,
     /// Originating tool call id. Carrying it on the wire alongside
     /// `task_id` lets the client flip the in-flight chip from spinner
@@ -4259,6 +4274,8 @@ pub struct TaskUpdatedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOutputDeltaEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub task_id: TaskId,
     pub cursor: OutputCursor,
     pub text: String,
@@ -4570,6 +4587,8 @@ pub struct WarningEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnCompletedEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<UiCursor>,
@@ -4602,6 +4621,8 @@ pub struct TurnSessionResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnErrorEvent {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub turn_id: TurnId,
     pub code: String,
     pub message: String,
@@ -4782,6 +4803,17 @@ pub enum UiNotification {
     ContextNormalizationReported(ContextNormalizationReportedEvent),
 }
 
+fn set_topic_if_absent(slot: &mut Option<String>, topic: &str) {
+    if slot
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        *slot = Some(topic.to_owned());
+    }
+}
+
 impl UiNotification {
     pub fn method(&self) -> &'static str {
         match self {
@@ -4822,7 +4854,96 @@ impl UiNotification {
         }
     }
 
-    pub fn into_rpc_notification(self) -> Result<RpcNotification<Value>, serde_json::Error> {
+    pub fn session_id(&self) -> &SessionKey {
+        match self {
+            Self::SessionOpened(event) => &event.session_id,
+            Self::TurnStarted(event) => &event.session_id,
+            Self::MessageDelta(event) => &event.session_id,
+            Self::ToolStarted(event) => &event.session_id,
+            Self::ToolProgress(event) => &event.session_id,
+            Self::ToolCompleted(event) => &event.session_id,
+            Self::ApprovalRequested(event) => &event.session_id,
+            Self::ApprovalAutoResolved(event) => &event.session_id,
+            Self::ApprovalDecided(event) => &event.session_id,
+            Self::ApprovalCancelled(event) => &event.session_id,
+            Self::TaskUpdated(event) => &event.session_id,
+            Self::TaskOutputDelta(event) => &event.session_id,
+            Self::ProgressUpdated(event) => &event.session_id,
+            Self::Warning(event) => &event.session_id,
+            Self::TurnCompleted(event) => &event.session_id,
+            Self::TurnError(event) => &event.session_id,
+            Self::ReplayLossy(event) => &event.session_id,
+            Self::MessagePersisted(event) => &event.session_id,
+            Self::TurnSpawnComplete(event) => &event.session_id,
+            Self::FileAttached(event) => &event.session_id,
+            Self::SessionEventBridged(event) => &event.session_id,
+            Self::RouterStatus(event) => &event.session_id,
+            Self::RouterFailover(event) => &event.session_id,
+            Self::QueueState(event) => &event.session_id,
+            Self::AgentUpdated(event) => &event.session_id,
+            Self::AgentOutputDelta(event) => &event.session_id,
+            Self::AgentArtifactUpdated(event) => &event.session_id,
+            Self::SessionGoalUpdated(event) => &event.session_id,
+            Self::SessionGoalCleared(event) => &event.session_id,
+            Self::LoopUpdated(event) => &event.session_id,
+            Self::LoopFired(event) => &event.session_id,
+            Self::LoopCompleted(event) => &event.session_id,
+            Self::ContextCompactionCompleted(event) => &event.session_id,
+            Self::ContextNormalizationReported(event) => &event.session_id,
+        }
+    }
+
+    pub fn topic(&self) -> Option<&str> {
+        match self {
+            Self::TurnStarted(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::MessageDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::ApprovalRequested(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TaskUpdated(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::TaskOutputDelta(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TurnCompleted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TurnError(event) => event.topic.as_deref().or_else(|| event.session_id.topic()),
+            Self::MessagePersisted(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::TurnSpawnComplete(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            Self::SessionEventBridged(event) => {
+                event.topic.as_deref().or_else(|| event.session_id.topic())
+            }
+            _ => self.session_id().topic(),
+        }
+    }
+
+    pub fn stamp_topic_from_session(&mut self) {
+        let Some(topic) = self.session_id().topic().map(ToOwned::to_owned) else {
+            return;
+        };
+        match self {
+            Self::TurnStarted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::MessageDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::ApprovalRequested(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TaskUpdated(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TaskOutputDelta(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnCompleted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnError(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::MessagePersisted(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::TurnSpawnComplete(event) => set_topic_if_absent(&mut event.topic, &topic),
+            Self::SessionEventBridged(event) => set_topic_if_absent(&mut event.topic, &topic),
+            _ => {}
+        }
+    }
+
+    pub fn into_rpc_notification(mut self) -> Result<RpcNotification<Value>, serde_json::Error> {
+        self.stamp_topic_from_session();
         let method = self.method();
         let params = match self {
             Self::SessionOpened(params) => serde_json::to_value(params),
@@ -5021,15 +5142,17 @@ mod tests {
     }
 
     #[test]
-    fn session_open_params_cwd_is_additive_and_round_trips() {
+    fn session_open_params_topic_and_cwd_are_additive_and_round_trip() {
         let params = SessionOpenParams {
             session_id: SessionKey("local:demo".into()),
+            topic: Some("research".into()),
             profile_id: Some("coding".into()),
             cwd: Some("/repo".into()),
             after: None,
         };
 
         let wire = serde_json::to_value(&params).expect("serialize session/open params");
+        assert_eq!(wire["topic"], json!("research"));
         assert_eq!(wire["cwd"], json!("/repo"));
 
         let decoded: SessionOpenParams =
@@ -5042,6 +5165,7 @@ mod tests {
         });
         let decoded_legacy: SessionOpenParams =
             serde_json::from_value(legacy).expect("legacy session/open params");
+        assert!(decoded_legacy.topic.is_none());
         assert!(decoded_legacy.cwd.is_none());
     }
 
@@ -5818,6 +5942,7 @@ mod tests {
         // of this module.
         let task_cancelled = UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: task_id.clone(),
             tool_call_id: None,
             title: "spawn_only_runner".into(),
@@ -6887,6 +7012,7 @@ mod tests {
     fn ui_notification_builds_and_parses_json_rpc_notification() {
         let event = UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             turn_id: TurnId(Uuid::from_u128(2)),
             text: "partial".into(),
         });
@@ -7178,6 +7304,7 @@ mod tests {
         };
         let completed = UiNotification::TurnCompleted(TurnCompletedEvent {
             session_id,
+            topic: None,
             turn_id: TurnId(Uuid::from_u128(9)),
             cursor: Some(completed_cursor),
             tokens_in: None,
@@ -7746,6 +7873,7 @@ mod tests {
     fn task_updated_event_round_trips_with_cancelled_state() {
         let event = UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: TaskId(Uuid::from_u128(7)),
             tool_call_id: None,
             title: "spawn_only_runner".into(),
@@ -7778,6 +7906,7 @@ mod tests {
         // appear on the wire and decode back unchanged.
         let event = TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: TaskId(Uuid::from_u128(0xBEEF)),
             tool_call_id: Some("call-r".into()),
             title: "review".into(),
@@ -7807,6 +7936,7 @@ mod tests {
         // `#[serde(default)]`.
         let bare = TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: TaskId(Uuid::from_u128(0xBEE0)),
             tool_call_id: None,
             title: "review".into(),
@@ -8054,6 +8184,7 @@ mod tests {
     fn golden_message_persisted_event_serde() {
         let event = MessagePersistedEvent {
             session_id: sample_session_id(),
+            topic: None,
             turn_id: Some(sample_turn_id()),
             thread_id: Some("thread-1".into()),
             seq: 18,
@@ -8101,6 +8232,7 @@ mod tests {
         ] {
             let e = MessagePersistedEvent {
                 session_id: sample_session_id(),
+                topic: None,
                 turn_id: None,
                 thread_id: None,
                 seq: 1,
@@ -8136,6 +8268,7 @@ mod tests {
     fn golden_turn_spawn_complete_event_serde() {
         let event = TurnSpawnCompleteEvent {
             session_id: sample_session_id(),
+            topic: None,
             turn_id: Some(sample_turn_id()),
             thread_id: Some("thread-1".into()),
             task_id: "task_abc123".into(),
@@ -8175,6 +8308,7 @@ mod tests {
         // optional-fields convention).
         let bare = TurnSpawnCompleteEvent {
             session_id: sample_session_id(),
+            topic: None,
             turn_id: None,
             thread_id: None,
             task_id: "task_zzz".into(),
@@ -8228,6 +8362,7 @@ mod tests {
         // `TaskUpdatedEvent` with `tool_call_id` set.
         let task_event = TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: TaskId(Uuid::from_u128(0xDEADBEEF)),
             tool_call_id: Some("call_podcast_generate_42".into()),
             title: "podcast_generate".into(),
@@ -8253,6 +8388,7 @@ mod tests {
         // (legacy daemons / synthetic paths).
         let task_legacy = TaskUpdatedEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             task_id: TaskId(Uuid::from_u128(1)),
             tool_call_id: None,
             title: "legacy".into(),
@@ -8284,6 +8420,7 @@ mod tests {
         // `TurnSpawnCompleteEvent` with `tool_call_id` set.
         let spawn_event = TurnSpawnCompleteEvent {
             session_id: SessionKey("local:demo".into()),
+            topic: None,
             turn_id: None,
             thread_id: None,
             task_id: "task_podcast_42".into(),

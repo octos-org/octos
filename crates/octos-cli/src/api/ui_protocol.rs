@@ -1354,6 +1354,7 @@ impl TaskOutputDeltaTracker {
 
         Some(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id,
             cursor,
             text,
@@ -2232,6 +2233,7 @@ fn install_message_commit_observer(ledger: Arc<UiProtocolLedger>) {
             }
             let event = MessagePersistedEvent {
                 session_id: session_key.clone(),
+                topic: None,
                 // The `Message` struct does not yet carry a typed
                 // turn_id (PR-F in the structural plan adds it). Emit
                 // `None` for now per UPCR-2026-012 ("absent on legacy
@@ -7043,8 +7045,11 @@ async fn handle_session_open(
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
     id: String,
-    params: SessionOpenParams,
+    mut params: SessionOpenParams,
 ) -> bool {
+    normalize_session_open_params_topic(&mut params);
+    let topic_scope = params.topic.clone();
+
     // Subscribe to the live ledger broadcast BEFORE the replay query so any
     // event that lands while we're still computing replay/opened sits in the
     // broadcast buffer and gets emitted by the forwarder once we hand it off
@@ -7155,11 +7160,42 @@ async fn handle_session_open(
         baseline_seq,
         ws.connection_id,
         features,
+        topic_scope,
         live_rx,
         live_forwarders.clone(),
     )
     .await;
     true
+}
+
+fn normalize_session_open_params_topic(params: &mut SessionOpenParams) {
+    let topic = normalized_topic(params.topic.as_deref())
+        .or_else(|| params.session_id.topic().map(ToOwned::to_owned));
+    params.topic = topic.clone();
+    if let Some(topic) = topic.as_deref() {
+        params.session_id = session_key_with_optional_topic(&params.session_id, Some(topic));
+    }
+}
+
+fn normalized_topic(topic: Option<&str>) -> Option<String> {
+    topic
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn ledger_event_matches_topic_scope(
+    event: &UiProtocolLedgerEvent,
+    topic_scope: Option<&str>,
+) -> bool {
+    let event_topic = event
+        .topic()
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty());
+    match topic_scope.map(str::trim).filter(|topic| !topic.is_empty()) {
+        Some(topic) => event_topic == Some(topic),
+        None => event_topic.is_none(),
+    }
 }
 
 fn stdio_session_open_candidate_profile(
@@ -7186,6 +7222,7 @@ async fn spawn_live_forwarder(
     baseline_seq: u64,
     self_connection_id: ConnectionId,
     features: ConnectionUiFeatures,
+    topic_scope: Option<String>,
     mut rx: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
     forwarders: SharedLiveForwarders,
 ) {
@@ -7205,6 +7242,9 @@ async fn spawn_live_forwarder(
                     // only way to keep delivery exactly-once. Other
                     // connections still receive the event via fan-out.
                     if event.from_connection == Some(self_connection_id) {
+                        continue;
+                    }
+                    if !ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()) {
                         continue;
                     }
                     if !live_event_passes_capability_filter(&event.event, features) {
@@ -7328,8 +7368,10 @@ async fn open_session_result(
     connection_id: ConnectionId,
     connection_profile_id: Option<&str>,
     features: ConnectionUiFeatures,
-    params: SessionOpenParams,
+    mut params: SessionOpenParams,
 ) -> Result<SessionOpenOutcome, RpcError> {
+    normalize_session_open_params_topic(&mut params);
+    let topic_scope = params.topic.clone();
     let active_profile_id = validate_session_scope(
         &params.session_id,
         params.profile_id.as_deref(),
@@ -7427,8 +7469,9 @@ async fn open_session_result(
     if let Some(root) = effective_workspace_root.as_ref() {
         session_workspaces().set(params.session_id.clone(), root.clone());
     }
-    let (replay, replay_baseline_seq) =
+    let (mut replay, replay_baseline_seq) =
         ledger.replay_after_with_head(&params.session_id, params.after.as_ref())?;
+    replay.retain(|event| ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref()));
     let replayed_approval_ids = replay
         .iter()
         .filter_map(|event| match &event.event {
@@ -7441,6 +7484,12 @@ async fn open_session_result(
     let pending_approvals = approvals
         .pending_for_session(&params.session_id)
         .into_iter()
+        .filter(|approval| {
+            let event = UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(
+                approval.clone(),
+            ));
+            ledger_event_matches_topic_scope(&event, topic_scope.as_deref())
+        })
         .filter(|approval| !replayed_approval_ids.contains(&approval.approval_id))
         .collect::<Vec<_>>();
 
@@ -11479,6 +11528,7 @@ async fn run_m9_fixture_turn(
                 &ledger,
                 UiNotification::MessageDelta(MessageDeltaEvent {
                     session_id: session_id.clone(),
+                    topic: None,
                     turn_id: turn_id.clone(),
                     text: "OK".to_owned(),
                 }),
@@ -11506,6 +11556,7 @@ async fn run_m9_fixture_turn(
                     &ledger,
                     UiNotification::MessageDelta(MessageDeltaEvent {
                         session_id: session_id.clone(),
+                        topic: None,
                         turn_id: turn_id.clone(),
                         text: "OK\n".to_owned(),
                     }),
@@ -11625,6 +11676,7 @@ async fn run_m9_fixture_turn(
                             &ledger,
                             UiNotification::MessageDelta(MessageDeltaEvent {
                                 session_id: session_id.clone(),
+                                topic: None,
                                 turn_id: turn_id.clone(),
                                 text: text.to_owned(),
                             }),
@@ -11663,6 +11715,7 @@ async fn run_m9_fixture_turn(
                         &ledger,
                         UiNotification::TaskUpdated(TaskUpdatedEvent {
                             session_id: session_id.clone(),
+                            topic: None,
                             task_id: task_id.clone(),
                             title: "M9 task output fixture".to_owned(),
                             state: UiTaskRuntimeState::Running,
@@ -11685,6 +11738,7 @@ async fn run_m9_fixture_turn(
                         &ledger,
                         UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
                             session_id: session_id.clone(),
+                            topic: None,
                             task_id: task_id.clone(),
                             cursor: OutputCursor { offset: 0 },
                             text: "fixture output line one\nfixture output line two\n".to_owned(),
@@ -11695,6 +11749,7 @@ async fn run_m9_fixture_turn(
                         &ledger,
                         UiNotification::TaskUpdated(TaskUpdatedEvent {
                             session_id: session_id.clone(),
+                            topic: None,
                             task_id,
                             title: "M9 task output fixture".to_owned(),
                             state: UiTaskRuntimeState::Completed,
@@ -12650,6 +12705,7 @@ async fn run_native_code_review_turn(
         &ledger,
         UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             title: "Native code review specialist swarm".to_owned(),
             state: UiTaskRuntimeState::Running,
@@ -12667,6 +12723,7 @@ async fn run_native_code_review_turn(
         &ledger,
         UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             cursor: OutputCursor { offset: 0 },
             text: format!(
@@ -12799,6 +12856,7 @@ async fn run_native_code_review_turn(
                     &ledger,
                     UiNotification::TaskUpdated(TaskUpdatedEvent {
                         session_id: session_id.clone(),
+                        topic: None,
                         task_id: task_id.clone(),
                         title: "Native code review specialist swarm".to_owned(),
                         state: UiTaskRuntimeState::Cancelled,
@@ -12842,6 +12900,7 @@ async fn run_native_code_review_turn(
                             &ledger,
                             UiNotification::MessageDelta(MessageDeltaEvent {
                                 session_id: session_id.clone(),
+                                topic: None,
                                 turn_id: turn_id.clone(),
                                 text,
                             }),
@@ -12883,6 +12942,7 @@ async fn run_native_code_review_turn(
         &ledger,
         UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: final_summary.clone(),
         }),
@@ -12892,6 +12952,7 @@ async fn run_native_code_review_turn(
         &ledger,
         UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             cursor: OutputCursor {
                 offset: final_summary.len() as u64,
@@ -12908,6 +12969,7 @@ async fn run_native_code_review_turn(
         &ledger,
         UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id,
             title: "Native code review specialist swarm".to_owned(),
             state: UiTaskRuntimeState::Completed,
@@ -13391,6 +13453,7 @@ async fn run_m15_live_subagent_fixture_turn(
         ledger,
         UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             title: "Live code review subagent swarm".to_owned(),
             state: UiTaskRuntimeState::Running,
@@ -13408,6 +13471,7 @@ async fn run_m15_live_subagent_fixture_turn(
         ledger,
         UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             cursor: OutputCursor { offset: 0 },
             text: "Launching Ada Lovelace (reviewer-api), Hypatia (reviewer-tests), and Socrates (reviewer-security) through octos serve --stdio.\n".to_owned(),
@@ -13525,6 +13589,7 @@ async fn run_m15_live_subagent_fixture_turn(
                     ledger,
                     UiNotification::TaskUpdated(TaskUpdatedEvent {
                         session_id: session_id.clone(),
+                        topic: None,
                         task_id,
                         title: "Live code review subagent swarm".to_owned(),
                         state: UiTaskRuntimeState::Cancelled,
@@ -13598,6 +13663,7 @@ async fn run_m15_live_subagent_fixture_turn(
         ledger,
         UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: summary.clone(),
         }),
@@ -13607,6 +13673,7 @@ async fn run_m15_live_subagent_fixture_turn(
         ledger,
         UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             cursor: OutputCursor {
                 offset: summary.len() as u64,
@@ -13619,6 +13686,7 @@ async fn run_m15_live_subagent_fixture_turn(
         ledger,
         UiNotification::TaskUpdated(TaskUpdatedEvent {
             session_id: session_id.clone(),
+            topic: None,
             task_id: task_id.clone(),
             title: "Live code review subagent swarm".to_owned(),
             state: UiTaskRuntimeState::Completed,
@@ -14381,6 +14449,7 @@ async fn run_standalone_turn(
                     {
                         let event = TurnSpawnCompleteEvent {
                             session_id: session_id.clone(),
+                            topic: None,
                             turn_id: Some(turn_id.clone()),
                             thread_id: Some(thread_id.clone()),
                             task_id: task_id_value,
@@ -15027,6 +15096,7 @@ async fn run_standalone_turn(
                                 &ledger,
                                 UiNotification::MessageDelta(MessageDeltaEvent {
                                     session_id: session_id.clone(),
+                                    topic: None,
                                     turn_id: turn_id.clone(),
                                     text: content.to_string(),
                                 }),
@@ -15447,6 +15517,7 @@ async fn try_emit_terminal(
                 ledger,
                 UiNotification::TurnCompleted(TurnCompletedEvent {
                     session_id: session_id.clone(),
+                    topic: None,
                     turn_id: turn_id.clone(),
                     cursor: None,
                     // UPCR-2026-014 (M9-α-9) addendum fields; the WS
@@ -15821,6 +15892,7 @@ async fn abort_connection_turns(
             {
                 let _ = ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
                     session_id: session_id.clone(),
+                    topic: None,
                     turn_id: turn_id.clone(),
                     code: "connection_closed".to_owned(),
                     message: "connection closed before turn completed".to_owned(),
@@ -15974,6 +16046,7 @@ fn send_turn_error(
         ledger,
         UiNotification::TurnError(TurnErrorEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             code: code.into(),
             message: message.into(),
@@ -17002,6 +17075,7 @@ mod tests {
     fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
         let params = SessionOpenParams {
             session_id: SessionKey("coding:local:test".into()),
+            topic: None,
             profile_id: None,
             cwd: None,
             after: None,
@@ -17013,6 +17087,7 @@ mod tests {
 
         let params = SessionOpenParams {
             session_id: SessionKey("local:test".into()),
+            topic: None,
             profile_id: Some("explicit".into()),
             cwd: None,
             after: None,
@@ -17024,6 +17099,7 @@ mod tests {
 
         let params = SessionOpenParams {
             session_id: SessionKey("local:test".into()),
+            topic: None,
             profile_id: None,
             cwd: None,
             after: None,
@@ -18472,6 +18548,7 @@ ignore = []
 
         let missing_params = SessionOpenParams {
             session_id: SessionKey("local:missing-binding".into()),
+            topic: None,
             profile_id: Some("missing".into()),
             cwd: None,
             after: None,
@@ -18523,6 +18600,7 @@ ignore = []
 
         let grace_params = SessionOpenParams {
             session_id: SessionKey("local:grace-binding".into()),
+            topic: None,
             profile_id: Some("grace".into()),
             cwd: None,
             after: None,
@@ -18688,6 +18766,7 @@ ignore = []
                 features,
                 SessionOpenParams {
                     session_id: session_id.clone(),
+                    topic: None,
                     profile_id: None,
                     cwd: None,
                     after: None,
@@ -19163,6 +19242,7 @@ ignore = []
         let workspace = tempfile::tempdir().unwrap();
         let params = SessionOpenParams {
             session_id: SessionKey::with_profile_topic("ada", "local", "tui", "coding"),
+            topic: None,
             profile_id: Some("ada".into()),
             cwd: Some(workspace.path().to_string_lossy().into_owned()),
             after: None,
@@ -19341,6 +19421,7 @@ ignore = []
         let completed = UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(
             TurnCompletedEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: TurnId::new(),
                 cursor: Some(cursor.clone()),
                 tokens_in: None,
@@ -19353,6 +19434,7 @@ ignore = []
         let persisted = UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(
             MessagePersistedEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: None,
                 thread_id: None,
                 seq: 1,
@@ -19371,6 +19453,7 @@ ignore = []
         let spawn = UiProtocolLedgerEvent::Notification(UiNotification::TurnSpawnComplete(
             TurnSpawnCompleteEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: None,
                 thread_id: None,
                 task_id: "task-1".into(),
@@ -19391,6 +19474,7 @@ ignore = []
         let delta =
             UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
                 session_id: session_id.clone(),
+                topic: None,
                 turn_id: TurnId::new(),
                 text: "x".into(),
             }));
@@ -21127,11 +21211,13 @@ ignore = []
         let turn_id = TurnId::new();
         let first = ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: "one".into(),
         }));
         ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id,
             text: "two".into(),
         }));
@@ -21145,6 +21231,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: Some(first.cursor),
@@ -21165,6 +21252,97 @@ ignore = []
     }
 
     #[tokio::test]
+    async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = state_with_sessions(temp.path());
+        let ledger = UiProtocolLedger::new(16);
+        let approvals = PendingApprovalStore::default();
+        let base_session = SessionKey("local:topic-replay".into());
+        let alpha_session = session_key_with_optional_topic(&base_session, Some("alpha"));
+        let beta_session = session_key_with_optional_topic(&base_session, Some("beta"));
+        let root_turn = TurnId::new();
+        let alpha_turn = TurnId::new();
+        let beta_turn = TurnId::new();
+
+        ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: base_session.clone(),
+            topic: None,
+            turn_id: root_turn,
+            text: "root".into(),
+        }));
+        ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: alpha_session.clone(),
+            topic: None,
+            turn_id: alpha_turn,
+            text: "alpha".into(),
+        }));
+        ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: beta_session.clone(),
+            topic: None,
+            turn_id: beta_turn,
+            text: "beta".into(),
+        }));
+
+        let outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            None,
+            ConnectionUiFeatures::default(),
+            SessionOpenParams {
+                session_id: base_session.clone(),
+                topic: Some("alpha".into()),
+                profile_id: None,
+                cwd: None,
+                after: Some(UiCursor {
+                    stream: alpha_session.0.clone(),
+                    seq: 0,
+                }),
+            },
+        )
+        .await
+        .expect("topic-scoped session/open succeeds");
+
+        assert_eq!(outcome.result.opened.session_id, alpha_session);
+        assert_eq!(outcome.replay.len(), 1);
+        assert!(matches!(
+            &outcome.replay[0].event,
+            UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(event))
+                if event.text == "alpha" && event.topic.as_deref() == Some("alpha")
+        ));
+
+        let root_outcome = open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            ConnectionId::next(),
+            None,
+            ConnectionUiFeatures::default(),
+            SessionOpenParams {
+                session_id: base_session.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                after: Some(UiCursor {
+                    stream: base_session.0.clone(),
+                    seq: 0,
+                }),
+            },
+        )
+        .await
+        .expect("root session/open succeeds");
+
+        assert_eq!(root_outcome.result.opened.session_id, base_session);
+        assert_eq!(root_outcome.replay.len(), 1);
+        assert!(matches!(
+            &root_outcome.replay[0].event,
+            UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(event))
+                if event.text == "root" && event.topic.is_none()
+        ));
+    }
+
+    #[tokio::test]
     async fn session_open_rejects_after_cursor_from_other_stream() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = state_with_sessions(temp.path());
@@ -21181,6 +21359,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: Some(UiCursor {
@@ -21219,11 +21398,13 @@ ignore = []
         let turn_id = TurnId::new();
         ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: "one".into(),
         }));
         ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id,
             text: "two".into(),
         }));
@@ -21237,6 +21418,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: Some(UiCursor {
@@ -21291,6 +21473,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: None,
@@ -21324,6 +21507,7 @@ ignore = []
         approvals.request(approval.clone());
         ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: TurnId::new(),
             text: "before".into(),
         }));
@@ -21338,6 +21522,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: Some(UiCursor {
@@ -21401,6 +21586,7 @@ ignore = []
             },
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: None,
@@ -21450,6 +21636,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id,
+                topic: None,
                 profile_id: None,
                 cwd: Some(temp.path().to_string_lossy().to_string()),
                 after: None,
@@ -21486,6 +21673,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: None,
@@ -21556,6 +21744,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id,
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: None,
@@ -22854,6 +23043,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: None,
@@ -22877,6 +23067,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: Some(UiCursor {
@@ -23021,6 +23212,7 @@ ignore = []
     fn notification_serializes_as_json_rpc_method_frame() {
         let frame = UiNotification::TurnError(TurnErrorEvent {
             session_id: SessionKey("local:test".into()),
+            topic: None,
             turn_id: TurnId::new(),
             code: "test".into(),
             message: "failed".into(),
@@ -23816,6 +24008,7 @@ ignore = []
             ledger_for_turn.append_notification(UiNotification::TurnCompleted(
                 TurnCompletedEvent {
                     session_id: session_for_turn,
+                    topic: None,
                     turn_id: turn_for_turn,
                     cursor: None,
                     tokens_in: None,
@@ -24049,6 +24242,7 @@ ignore = []
             &ledger,
             UiNotification::MessageDelta(MessageDeltaEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 text: "hi".into(),
             }),
@@ -24510,6 +24704,7 @@ ignore = []
         // C1" — the cursor space starts at 1.
         let warmup = ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             text: "preamble".into(),
         }));
@@ -24557,6 +24752,7 @@ ignore = []
             ConnectionUiFeatures::default(),
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: None,
                 cwd: None,
                 after: Some(warmup.cursor.clone()),
@@ -25148,6 +25344,7 @@ ignore = []
         ));
         let _ = ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: turn_id.clone(),
             cursor: None,
             tokens_in: None,
@@ -25289,6 +25486,7 @@ ignore = []
         // `MESSAGE_PERSISTED_SOURCE_OVERRIDE` task-local).
         ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             seq: 1,
@@ -25306,6 +25504,7 @@ ignore = []
         }));
         ledger.append_notification(UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             seq: 2,
@@ -25323,6 +25522,7 @@ ignore = []
         }));
         ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             task_id: "task_abc".into(),
@@ -25483,6 +25683,7 @@ ignore = []
         let ledger = event_ledger(&state).await;
         ledger.append_notification(UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: None,
             thread_id: Some("cmid-user-1".into()),
             task_id: "task_x".into(),
@@ -25939,6 +26140,7 @@ ignore = []
     fn message_persisted_for(session: &SessionKey) -> UiNotification {
         UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session.clone(),
+            topic: None,
             turn_id: Some(TurnId::new()),
             thread_id: None,
             seq: 0,
@@ -26046,6 +26248,7 @@ ignore = []
     fn background_message_persisted_for(session: &SessionKey) -> UiNotification {
         UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session.clone(),
+            topic: None,
             turn_id: Some(TurnId::new()),
             thread_id: Some("thread-1".into()),
             seq: 0,
@@ -26069,6 +26272,7 @@ ignore = []
     fn turn_spawn_complete_for(session: &SessionKey) -> UiNotification {
         UiNotification::TurnSpawnComplete(TurnSpawnCompleteEvent {
             session_id: session.clone(),
+            topic: None,
             turn_id: Some(TurnId::new()),
             thread_id: Some("thread-1".into()),
             task_id: "task_abc123".into(),
@@ -26102,6 +26306,102 @@ ignore = []
     }
 
     #[tokio::test]
+    async fn live_forwarder_topic_scope_drops_other_topic_events() {
+        let (ws_alpha, mut rx_alpha) = ws_connection_for_test(16);
+        let (ws_beta, mut rx_beta) = ws_connection_for_test(16);
+        let ledger = Arc::new(UiProtocolLedger::new(16));
+        let session_id = SessionKey("local:topic-live".into());
+        let forwarders_alpha: SharedLiveForwarders =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let forwarders_beta: SharedLiveForwarders =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let alpha_live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_alpha.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws_alpha.connection_id(),
+            ConnectionUiFeatures::default(),
+            Some("alpha".into()),
+            alpha_live_rx,
+            forwarders_alpha.clone(),
+        )
+        .await;
+
+        let beta_live_rx = ledger.subscribe(&session_id);
+        spawn_live_forwarder(
+            ws_beta.clone(),
+            ledger.clone(),
+            session_id.clone(),
+            0,
+            ws_beta.connection_id(),
+            ConnectionUiFeatures::default(),
+            Some("beta".into()),
+            beta_live_rx,
+            forwarders_beta.clone(),
+        )
+        .await;
+
+        ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: Some("alpha".into()),
+            turn_id: TurnId::new(),
+            text: "alpha".into(),
+        }));
+        ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: Some("beta".into()),
+            turn_id: TurnId::new(),
+            text: "beta".into(),
+        }));
+
+        let alpha_frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx_alpha.recv())
+            .await
+            .expect("alpha bridge frame")
+            .expect("alpha ws open");
+        let alpha_json: Value = match &alpha_frame {
+            WsMessage::Text(text) => serde_json::from_str(text).expect("alpha frame json"),
+            other => panic!("unexpected alpha frame: {other:?}"),
+        };
+        assert_eq!(
+            alpha_json.get("method").and_then(Value::as_str),
+            Some(octos_core::ui_protocol::methods::MESSAGE_DELTA),
+        );
+        assert_eq!(alpha_json["params"]["text"], json!("alpha"));
+        assert_eq!(alpha_json["params"]["topic"], json!("alpha"));
+
+        let beta_frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx_beta.recv())
+            .await
+            .expect("beta bridge frame")
+            .expect("beta ws open");
+        let beta_json: Value = match &beta_frame {
+            WsMessage::Text(text) => serde_json::from_str(text).expect("beta frame json"),
+            other => panic!("unexpected beta frame: {other:?}"),
+        };
+        assert_eq!(
+            beta_json.get("method").and_then(Value::as_str),
+            Some(octos_core::ui_protocol::methods::MESSAGE_DELTA),
+        );
+        assert_eq!(beta_json["params"]["text"], json!("beta"));
+        assert_eq!(beta_json["params"]["topic"], json!("beta"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx_alpha.try_recv().is_err(),
+            "alpha topic bridge must not receive beta events",
+        );
+        assert!(
+            rx_beta.try_recv().is_err(),
+            "beta topic bridge must not receive alpha events",
+        );
+
+        abort_live_forwarders(&forwarders_alpha, &ledger).await;
+        abort_live_forwarders(&forwarders_beta, &ledger).await;
+    }
+
+    #[tokio::test]
     async fn live_forwarder_pushes_message_persisted_to_subscribed_ws() {
         let (ws, mut rx) = ws_connection_for_test(16);
         let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -26116,6 +26416,7 @@ ignore = []
             0,
             ws.connection_id(),
             features_with_message_persisted(true),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26159,6 +26460,7 @@ ignore = []
             baseline.cursor.seq,
             ws.connection_id(),
             features_with_message_persisted(true),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26203,6 +26505,7 @@ ignore = []
             0,
             ws.connection_id(),
             features_with_message_persisted(false),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26351,6 +26654,7 @@ ignore = []
             0,
             ws.connection_id(),
             features_for_spawn_complete_test(true, true),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26492,6 +26796,7 @@ ignore = []
             ws.connection_id(),
             // Old client: has message_persisted but NOT spawn_complete.
             features_for_spawn_complete_test(true, false),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26537,6 +26842,7 @@ ignore = []
             0,
             ws_a.connection_id(),
             features_with_message_persisted(true),
+            None,
             rx_a_live,
             forwarders_a.clone(),
         )
@@ -26549,6 +26855,7 @@ ignore = []
             0,
             ws_b.connection_id(),
             features_with_message_persisted(true),
+            None,
             rx_b_live,
             forwarders_b.clone(),
         )
@@ -26658,6 +26965,7 @@ ignore = []
             replay_head,
             ws.connection_id(),
             features_with_message_persisted(true),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26703,6 +27011,7 @@ ignore = []
             0,
             ws.connection_id(),
             features_with_message_persisted(true),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -26743,6 +27052,7 @@ ignore = []
             0,
             ws_other.connection_id(),
             features_with_message_persisted(true),
+            None,
             live_rx_other,
             forwarders_other.clone(),
         )
@@ -26827,6 +27137,7 @@ ignore = []
             0,
             ws.connection_id(),
             features_with_message_persisted(true),
+            None,
             live_rx,
             forwarders.clone(),
         )
@@ -27227,6 +27538,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("m11e-custom-cwd".into()),
                 cwd: Some(supplied_cwd.to_string_lossy().into_owned()),
                 after: None,
@@ -27316,6 +27628,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_a.clone(),
+                topic: None,
                 profile_id: Some("m11e-multi-cwd".into()),
                 cwd: Some(cwd_a.to_string_lossy().into_owned()),
                 after: None,
@@ -27334,6 +27647,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_b.clone(),
+                topic: None,
                 profile_id: Some("m11e-multi-cwd".into()),
                 cwd: Some(cwd_b.to_string_lossy().into_owned()),
                 after: None,
@@ -27481,6 +27795,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("m11e-rebind-attempt".into()),
                 cwd: Some(first_cwd.to_string_lossy().into_owned()),
                 after: None,
@@ -27498,6 +27813,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("m11e-rebind-attempt".into()),
                 // Different cwd — must NOT take effect; cache is sticky.
                 cwd: Some(second_cwd.to_string_lossy().into_owned()),
@@ -27570,6 +27886,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id,
+                topic: None,
                 profile_id: None,
                 cwd: Some(cwd.to_string_lossy().into_owned()),
                 after: None,
@@ -27635,6 +27952,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_a.clone(),
+                topic: None,
                 profile_id: Some("m11e-symlink".into()),
                 cwd: Some(cwd_a.to_string_lossy().into_owned()),
                 after: None,
@@ -27758,6 +28076,7 @@ ignore = []
             features,
             SessionOpenParams {
                 session_id: session_id.clone(),
+                topic: None,
                 profile_id: Some("m11f-tier2-default".into()),
                 cwd: None,
                 after: None,
