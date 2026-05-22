@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::mcp_agent::{
-    DispatchContextContract, DispatchRequest, DispatchResponse, McpAgentBackendConfig,
-    SharedBackend, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
+    DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse,
+    McpAgentBackendConfig, SharedBackend, build_backend_from_config, build_dispatch_event_payload,
+    dispatch_with_metrics,
 };
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::file_state_cache::FileStateCache;
@@ -782,6 +783,63 @@ impl SpawnTool {
             .mcp_agent_tool_name
             .clone()
             .unwrap_or_else(|| DEFAULT_MCP_AGENT_TOOL_NAME.to_string());
+
+        // #714: the public `dispatch_to_mcp_agent` helper is a thin
+        // wrapper around `dispatch_with_metrics`. Apply the same policy
+        // gate the main `execute` agent_mcp branch uses so a configured
+        // policy cannot be bypassed by routing through this helper. The
+        // gate inspects the dispatch payload (tool_name + task) before
+        // any backend round-trip, so denials never touch the network
+        // and never increment the dispatch metric. On denial we
+        // synthesise a `RemoteError` response carrying the gate reason
+        // so the existing harness-event + dispatch-event pipeline
+        // surfaces the failure with the same shape as a backend error.
+        if let Some(policy) = self.dispatch_policy.as_ref() {
+            if let Err(denial) = crate::dispatch_policy::enforce_dispatch_gates(
+                policy,
+                backend.as_ref(),
+                crate::dispatch_policy::DispatchTarget {
+                    dispatch_id: task_id,
+                    tool_name: &tool_name,
+                    task: &task,
+                },
+            )
+            .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    outcome = %denial.last_dispatch_outcome,
+                    reason = %denial.reason,
+                    "rejecting direct MCP dispatch by DispatchPolicy gate"
+                );
+                let denied_response = DispatchResponse {
+                    outcome: DispatchOutcome::RemoteError,
+                    output: String::new(),
+                    files_to_send: Vec::new(),
+                    error: Some(format!(
+                        "dispatch rejected by policy ({}): {}",
+                        denial.last_dispatch_outcome, denial.reason
+                    )),
+                    context_contract: None,
+                };
+                let payload = build_dispatch_event_payload(
+                    session_id,
+                    task_id,
+                    workflow,
+                    phase,
+                    backend.as_ref(),
+                    &denied_response,
+                );
+                let event = HarnessEvent {
+                    schema: crate::harness_events::HARNESS_EVENT_SCHEMA_V1.to_string(),
+                    payload,
+                };
+                event.validate().map_err(|error| {
+                    eyre::eyre!("policy-denied dispatch event failed validation: {error}")
+                })?;
+                return Ok((denied_response, event));
+            }
+        }
 
         let request = DispatchRequest::new(tool_name, task).with_context_contract(
             // #1021 / M17-C — populate backend_kind/agent_id/risk so the

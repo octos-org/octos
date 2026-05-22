@@ -201,3 +201,63 @@ async fn agent_mcp_spawn_respects_dispatch_policy_fanout_cap_per_714() {
         "approver consulted {consults} times; expected 3 (one per spawn)"
     );
 }
+
+/// #714 follow-up (codex review): the public `dispatch_to_mcp_agent`
+/// helper is a thin wrapper around `dispatch_with_metrics`. A
+/// configured [`DispatchPolicy`] must gate this entry point too —
+/// callers that route through the helper cannot be allowed to bypass
+/// the gate the main spawn execute path enforces.
+#[tokio::test]
+async fn dispatch_to_mcp_agent_helper_respects_dispatch_policy_per_714() {
+    let dir = TempDir::new().unwrap();
+    let memory = memory(&dir).await;
+    let (tx, _rx) = tokio::sync::mpsc::channel::<InboundMessage>(8);
+
+    let backend_inner = Arc::new(CountingBackend {
+        served: AtomicU32::new(0),
+    });
+    let backend: SharedBackend = backend_inner.clone();
+
+    // Tool policy that denies the default MCP dispatch tool name. The
+    // gate must reject the helper invocation before the backend is
+    // touched.
+    let policy = DispatchPolicy {
+        tool_policy: Some(octos_agent::ToolPolicy {
+            deny: vec!["run_task".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let llm: Arc<dyn LlmProvider> = Arc::new(NullLlm);
+    let spawn = SpawnTool::new(llm, memory, PathBuf::from(dir.path()), tx)
+        .with_mcp_agent_backend(backend, Some("run_task".to_string()))
+        .with_dispatch_policy(policy);
+
+    let (response, _event) = spawn
+        .dispatch_to_mcp_agent(
+            serde_json::json!({"task": "helper bypass attempt"}),
+            "session-helper",
+            "task-helper",
+            None,
+            None,
+        )
+        .await
+        .expect("helper returns a synthesized response on denial, not an error");
+
+    assert_eq!(
+        response.outcome,
+        DispatchOutcome::RemoteError,
+        "policy-denied helper dispatch must surface RemoteError, not Success"
+    );
+    let error = response.error.expect("denied response carries error");
+    assert!(
+        error.contains("policy") || error.contains("denied"),
+        "error must mention the policy gate; got `{error}`"
+    );
+    assert_eq!(
+        backend_inner.served.load(Ordering::SeqCst),
+        0,
+        "backend must NOT be touched when the policy gate denies the helper dispatch"
+    );
+}
