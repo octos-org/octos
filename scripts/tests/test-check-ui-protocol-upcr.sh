@@ -27,6 +27,10 @@
 #  15. Missing base ref + committed protocol change + untracked UPCR
 #      template (no uncommitted protocol/spec trigger) -> exit non-zero
 #      (codex #7 — coverage docs must not unblock the missing-base probe).
+#  16. base_equals_head + dirty uncommitted spec edit -> exit non-zero
+#      (codex #8 — dirty triggers must not bypass the missing-base check).
+#  17. Committed UPCR coverage + staged deletion of that same UPCR ->
+#      exit non-zero (codex #9 — pending-delete UPCRs are not coverage).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -82,6 +86,12 @@ make_repo() {
       # Pretend main is also our upstream so resolve_base_ref picks it up.
       git update-ref refs/remotes/origin/main HEAD
       git checkout --quiet -b feature
+      # Add an unrelated commit on feature so merge_base(origin/main, HEAD)
+      # is the baseline commit, not HEAD itself. Otherwise HEAD..HEAD is
+      # empty and the gate refuses to run.
+      printf 'note\n' > FEATURE_BASELINE.md
+      git add FEATURE_BASELINE.md
+      git commit --quiet -m "chore: feature baseline"
     else
       # Move HEAD off main so the script can't find a base ref via
       # main/origin/main and there is nowhere to merge-base against.
@@ -466,6 +476,63 @@ scenario_missing_base_with_untracked_template_fails() {
 }
 
 scenario_missing_base_with_untracked_template_fails
+
+# Scenario 16: base_equals_head + uncommitted spec edit must still fail
+# loud. Codex review #8 — a dirty trigger file must not promote the gate
+# into uncommitted-only mode and bypass committed-but-undetectable changes.
+scenario_base_equals_head_dirty_spec_fails() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    # Commit a protocol Rust change with no UPCR, then point origin/main
+    # at HEAD so merge_base == HEAD.
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    git add -A
+    git commit --quiet -m "feat: extend"
+    git update-ref refs/remotes/origin/main HEAD
+    # Add an uncommitted spec edit on top of that.
+    printf '# spec tweak\n' >> api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable base ref" <<<"$out"; then
+    pass "dirty spec does not unblock base_equals_head check"
+  else
+    fail "dirty spec bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_base_equals_head_dirty_spec_fails
+
+# Scenario 17: a committed UPCR that is then staged for deletion is not
+# coverage. Codex review #9 — collect_names in coverage mode must subtract
+# uncommitted deletions even if the committed AMR range still lists them.
+scenario_staged_upcr_deletion_invalidates_coverage() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# UPCR-2026-099 added\n' \
+      > docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_TEST.md
+    git add -A
+    git commit --quiet -m "feat: protocol + new upcr"
+    # Now stage the deletion of the UPCR that was just added.
+    git rm --quiet docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_099_TEST.md
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out"; then
+    pass "staged UPCR deletion invalidates committed coverage"
+  else
+    fail "staged UPCR deletion bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_staged_upcr_deletion_invalidates_coverage
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"
