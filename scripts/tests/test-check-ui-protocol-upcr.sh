@@ -34,6 +34,10 @@
 #  18. feature == main (no baseline commit) + staged Rust trigger +
 #      staged UPCR -> exit 0 (codex #10 — pre-commit on freshly-created
 #      branch must NOT be rejected by the merge_base==HEAD guard).
+#  19. Base ref resolves but `git merge-base` returns empty (disconnected
+#      histories, e.g. shallow CI fetch of origin/main as a depth-1 tip)
+#      -> exit non-zero (codex #11 — closes the empty-merge-base silent
+#      uncommitted-only bypass).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -355,7 +359,7 @@ scenario_no_base_ref_fails() {
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -ne 0 ] && grep -q "could not resolve a base ref" <<<"$out"; then
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable merge-base" <<<"$out"; then
     pass "missing base ref fails loud (no silent CI bypass)"
   else
     fail "missing base ref: status=$status output=$out"
@@ -470,7 +474,7 @@ scenario_missing_base_with_untracked_template_fails() {
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -ne 0 ] && grep -q "could not resolve a base ref" <<<"$out"; then
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable merge-base" <<<"$out"; then
     pass "stray untracked template does not unblock missing-base probe"
   else
     fail "stray template bypass: status=$status output=$out"
@@ -586,6 +590,54 @@ scenario_freshly_created_branch_pre_commit_ok() {
 }
 
 scenario_freshly_created_branch_pre_commit_ok
+
+# Scenario 19: base ref resolves to a real commit but `git merge-base` finds
+# no common ancestor. Simulated by creating origin/main as an orphan branch
+# whose history is disjoint from HEAD's history. Without the empty-merge-base
+# guard the gate would silently fall into uncommitted-only mode and miss
+# committed protocol changes. Codex review #11.
+scenario_empty_merge_base_fails() {
+  local dir
+  dir="$(mktemp -d /tmp/upcr-gate-test.XXXXXX)"
+  (
+    cd "$dir"
+    git init --quiet --initial-branch=feature
+    git config user.email "test@example.com"
+    git config user.name "test"
+    git config commit.gpgsign false
+
+    mkdir -p scripts crates/octos-core/src crates/octos-cli/src/api api docs
+    cp "$TARGET" scripts/check-ui-protocol-upcr.sh
+    chmod +x scripts/check-ui-protocol-upcr.sh
+
+    # feature branch with a committed protocol change but no UPCR.
+    printf '// changed\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# spec baseline\n' > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+    git add -A
+    git commit --quiet -m "feat: protocol change"
+
+    # Create an orphan commit and point origin/main at it; merge-base
+    # (origin/main, feature) is empty (no common ancestor).
+    git checkout --quiet --orphan orphan-base
+    git rm -rf --quiet .
+    mkdir -p docs
+    printf '# orphan\n' > docs/.keep
+    git add -A
+    git commit --quiet -m "orphan base"
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout --quiet feature
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a usable merge-base" <<<"$out"; then
+    pass "empty merge-base fails loud (no disconnected-history bypass)"
+  else
+    fail "empty merge-base: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+scenario_empty_merge_base_fails
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"

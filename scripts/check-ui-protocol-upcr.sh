@@ -89,20 +89,32 @@ if [ -n "$merge_base" ] && [ -n "$head_sha" ] && [ "$merge_base" = "$head_sha" ]
 fi
 
 strict_uncommitted=0
-if [ "$resolve_status" -ne 0 ] || [ -z "$base_ref" ]; then
+# Treat both (a) no base ref resolvable and (b) base ref resolved but
+# `git merge-base` returned empty as the same failure: we cannot diff
+# committed work against the target branch. Case (b) hits on shallow PR
+# checkouts that fetched origin/main as a separate depth-1 tip with no
+# shared ancestor, or when UPCR_BASE_REF points at an unrelated history.
+# Without this guard the script silently falls into uncommitted-only mode
+# and lets committed protocol changes bypass the gate (codex review #11).
+if [ "$resolve_status" -ne 0 ] || [ -z "$base_ref" ] \
+    || { [ -n "$base_ref" ] && [ -z "$merge_base" ]; }; then
   if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
     printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
     exit 0
   fi
   cat >&2 <<'EOF'
-ui-protocol-upcr: could not resolve a base ref for the diff (tried origin/main,
-main, origin/master, master, and any UPCR_BASE_REF override). Refusing to run
+ui-protocol-upcr: could not resolve a usable merge-base for the diff. The gate
+tried origin/main, main, origin/master, master, and any UPCR_BASE_REF
+override; either no base ref resolved, or `git merge-base` found no common
+ancestor between the base ref and HEAD (typical in shallow PR checkouts that
+fetched the base as a depth-1 tip without shared history). Refusing to run
 because that lets committed protocol changes slip through CI.
 
-Fix: fetch a real base (e.g. `git fetch --no-tags origin main`), or set
-UPCR_BASE_REF=<sha-or-ref> that points to the actual target branch this
-PR/branch is built against. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a
-documented reviewer override.
+Fix: fetch a real base with full history (e.g. `git fetch --no-tags --unshallow
+origin main`, or `git fetch --depth=N origin main` deep enough to reach the
+merge-base), or set UPCR_BASE_REF=<sha-or-ref> to a commit that is actually an
+ancestor of HEAD. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a documented
+reviewer override.
 EOF
   exit 2
 fi
