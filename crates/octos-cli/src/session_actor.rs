@@ -448,9 +448,22 @@ fn record_prompt_messages_not_covered_by_context(
     let known_messages = manager.for_prompt(policy).messages;
     let covered = covered_prompt_message_indices(messages, &known_messages);
     for (index, message) in messages.iter().enumerate() {
-        if !covered[index] {
-            manager.record_message(message);
+        if covered[index] {
+            continue;
         }
+        // Mirror of the same exemption in
+        // `api::ui_protocol::record_prompt_messages_not_covered_by_context`:
+        // skip System messages. The agent's runtime System prompt is
+        // re-composed on every turn and prepended fresh to
+        // `messages[0]`; recording it here makes the manager stack one
+        // `SystemInstruction` item per turn, which `for_prompt` then
+        // re-emits and `normalize_system_messages` concatenates into a
+        // multi-copy blob. The runtime System is re-applied at the end
+        // of `prepare_prompt`, so dropping it here does not lose it.
+        if message.role == MessageRole::System {
+            continue;
+        }
+        manager.record_message(message);
     }
 }
 
@@ -495,6 +508,10 @@ fn tool_call_slices_match(
 struct LoopPromptContextScratch {
     manager: ContextManager,
     observed_messages: usize,
+    /// Cached runtime System captured at TurnStart, reused across
+    /// iterations to avoid re-capturing an already-merged `messages[0]`
+    /// (see analogue in `AppUiLoopPromptScratch`).
+    runtime_system: Option<Message>,
 }
 
 struct SessionActorPromptContextBridge {
@@ -568,6 +585,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             *scratch_guard = Some(LoopPromptContextScratch {
                 manager,
                 observed_messages: messages.len(),
+                runtime_system: None,
             });
         }
         let scratch = scratch_guard
@@ -612,6 +630,17 @@ impl PromptContextManager for SessionActorPromptContextBridge {
             publish_context_manager_status(&self.session_key, &scratch.manager);
         }
 
+        // Capture runtime System once per turn at TurnStart, reuse on
+        // every Iteration. See the AppUI analogue in
+        // `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+        // for the duplication concern that motivates the cache.
+        if request.phase == PromptContextPhase::TurnStart {
+            scratch.runtime_system = messages
+                .first()
+                .filter(|m| m.role == MessageRole::System)
+                .cloned();
+        }
+        let runtime_system = scratch.runtime_system.clone();
         let frame = scratch.manager.for_prompt(&policy);
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
@@ -619,6 +648,27 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 .zip(frame.messages.iter())
                 .any(|(left, right)| !prompt_message_matches(left, right));
         *messages = frame.messages;
+        if let Some(system) = runtime_system {
+            // Merge in place when the frame leads with a System (e.g.
+            // compaction summary). `normalize_system_messages` runs
+            // BEFORE this bridge in the agent loop
+            // (`loop_compaction.rs:35`), so multi-System payloads
+            // produced here would reach the provider unmerged.
+            // Anthropic in particular rejects them outright. See the
+            // AppUI analogue in `api::ui_protocol::AppUiPromptContextBridge::prepare_prompt`
+            // for the rationale.
+            match messages.first_mut() {
+                Some(first) if first.role == MessageRole::System => {
+                    let existing = std::mem::take(&mut first.content);
+                    first.content = if existing.is_empty() {
+                        system.content
+                    } else {
+                        format!("{}\n\n{}", system.content, existing)
+                    };
+                }
+                _ => messages.insert(0, system),
+            }
+        }
         scratch.observed_messages = messages.len();
         {
             let mut canonical = self
@@ -2695,6 +2745,39 @@ impl ActorFactory {
             let pipeline_factory = pipeline_factory.clone();
             spawn_tool =
                 spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+        }
+        // Child SendFileTool factory (gateway parity with AppUI). Every
+        // spawned subagent's registry gets a fresh `SendFileTool` wired
+        // to the SAME `proxy_tx` channel as the parent, so spawn_only
+        // `files_to_send` deliveries land via the canonical session
+        // persist path. Pre-fix the gateway child registry was missing
+        // `send_file` (only `with_builtins + plugins + pipeline_factory`),
+        // and any workspace-contract subagent declaring `send_file` in
+        // `allowed_tools` (slides post-completion delivery, etc.) hit
+        // spawn preflight "required tool(s) not available on this host:
+        // send_file" at `spawn.rs:1344` — same regression as on the
+        // AppUI path, surfaced by codex review of PR #1079.
+        {
+            // `channel` / `chat_id` are `&'a str` from `SpawnParams`;
+            // the child factory closure outlives this stack frame, so
+            // own them as `String` before capture.
+            let factory_proxy_tx = proxy_tx.clone();
+            let factory_channel: String = channel.to_string();
+            let factory_chat_id: String = chat_id.to_string();
+            let factory_topic = session_key.topic().map(str::to_string);
+            let factory_base = user_workspace.clone();
+            let factory_extra = self.data_dir.clone();
+            spawn_tool = spawn_tool.with_child_tool_factory(Arc::new(move || {
+                let tool = SendFileTool::with_context(
+                    factory_proxy_tx.clone(),
+                    factory_channel.clone(),
+                    factory_chat_id.clone(),
+                )
+                .with_topic(factory_topic.clone())
+                .with_base_dir(factory_base.clone())
+                .with_extra_allowed_dir(factory_extra.clone());
+                Arc::new(tool) as Arc<dyn octos_agent::tools::Tool>
+            }));
         }
 
         // Wire direct background result injection (bypasses InboundMessage relay)

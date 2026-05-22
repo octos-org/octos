@@ -545,8 +545,17 @@ impl ContextManager {
         thread_id: Option<String>,
         fork: ForkedChildContext,
     ) -> Self {
-        let next_item_seq = fork
+        // Drop any `SystemInstruction` items inherited from a polluted
+        // parent context. They are no longer owned by the manager (see
+        // `record_message_with_source_ref` early-return) and forking
+        // them into the child would re-stack the LLM prompt as soon as
+        // the child's `for_prompt` runs.
+        let items: Vec<_> = fork
             .items
+            .into_iter()
+            .filter(|item| !matches!(item.kind, TranscriptItemKind::SystemInstruction { .. }))
+            .collect();
+        let next_item_seq = items
             .iter()
             .filter_map(|item| {
                 item.id
@@ -563,7 +572,7 @@ impl ContextManager {
             thread_id,
             generation: fork.parent_generation + 1,
             next_item_seq,
-            items: fork.items,
+            items,
             last_checkpoint_id: None,
             last_compaction_id: None,
             recovery_state: ContextRecoveryState::Rebuilt,
@@ -637,8 +646,21 @@ impl ContextManager {
     }
 
     pub(crate) fn from_snapshot(snapshot: ContextSnapshot) -> Self {
-        let next_item_seq = snapshot
+        // Strip `SystemInstruction` items inherited from a polluted
+        // snapshot. Pre-fix daemons (between 28552bb9d landing and the
+        // System-skip fix on `record_message_with_source_ref`) stacked
+        // one SystemInstruction per turn into the manager and
+        // persisted it; reloading those snapshots without filtering
+        // would resurrect the duplicates on the next `for_prompt`.
+        // `SystemInstruction` items are no longer owned by the manager,
+        // so dropping them here is the snapshot-side complement to the
+        // recording-side early-return.
+        let items: Vec<_> = snapshot
             .items
+            .into_iter()
+            .filter(|item| !matches!(item.kind, TranscriptItemKind::SystemInstruction { .. }))
+            .collect();
+        let next_item_seq = items
             .iter()
             .filter_map(|item| item.id.as_str().strip_prefix("ctxitem_"))
             .filter_map(|suffix| suffix.parse::<u64>().ok())
@@ -650,7 +672,7 @@ impl ContextManager {
             thread_id: snapshot.state.thread_id,
             generation: snapshot.state.generation,
             next_item_seq,
-            items: snapshot.items,
+            items,
             last_checkpoint_id: snapshot.state.last_checkpoint_id,
             last_compaction_id: snapshot.state.last_compaction_id,
             recovery_state: snapshot.state.recovery_state,
@@ -770,6 +792,24 @@ impl ContextManager {
         message: &Message,
         source_ref: Option<TranscriptSourceRef>,
     ) -> Vec<TranscriptItemId> {
+        // The agent's runtime System prompt is composed per turn via
+        // `compose_system_prompt()` and placed at `messages[0]` by the
+        // agent loop; it is NOT a piece of session state the
+        // ContextManager should own. Recording it here makes every
+        // entry point (bridge per-turn recording, persisted-message
+        // merge, boot replay via from_session_history, fork) stack a
+        // `SystemInstruction` item across turns / restarts. `for_prompt`
+        // then re-emits them all and `normalize_system_messages`
+        // concatenates them into a 4×-bloated `messages[0]`.
+        //
+        // The legitimate use of SystemInstruction items (compaction
+        // summaries) flows through `compact_context`, not through this
+        // recording API. Skipping System here is therefore safe across
+        // all callers: bridge recording, persisted-message merging,
+        // boot replay, and snapshot reconstruction.
+        if message.role == MessageRole::System {
+            return Vec::new();
+        }
         let mut ids = Vec::new();
         match message.role {
             MessageRole::System => ids.push(self.record_item_with_source_ref(
@@ -1722,8 +1762,13 @@ mod tests {
     #[test]
     fn records_context_state_checkpoint_and_snapshot_hash() {
         let mut manager = ContextManager::new("coding:local:test", Some("thread-1".into()));
-        manager.record_message(&Message::system("You are Octos."));
+        // System messages are intentionally not recorded as
+        // SystemInstruction items — they belong to the agent's runtime
+        // prompt composition. See `record_message_with_source_ref`
+        // early-return. Use User + Assistant to exercise checkpoint /
+        // snapshot machinery.
         manager.record_message(&Message::user("Review this project"));
+        manager.record_message(&Message::assistant("On it."));
         let before_checkpoint = manager.transcript_hash();
 
         let checkpoint = manager.checkpoint("before_sampling");
@@ -2366,8 +2411,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(fork.sanitizer_hash.starts_with("sha256:"));
+        // SystemInstruction items are no longer recorded into the
+        // manager (see `record_message_with_source_ref` early-return)
+        // — the agent re-applies its runtime System at the bridge.
+        // The fork therefore never carries a SystemInstruction either.
         assert!(
-            fork.items
+            !fork
+                .items
                 .iter()
                 .any(|item| matches!(item.kind, TranscriptItemKind::SystemInstruction { .. }))
         );
@@ -2546,7 +2596,11 @@ mod tests {
     fn durable_context_ledger_round_trips_active_compacted_generation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_id = "coding:local:tui#coding";
-        let mut history = vec![Message::system("system")];
+        // System messages are intentionally skipped by
+        // `record_message_with_source_ref` (the agent re-applies its
+        // runtime System at the bridge), so seed history with
+        // user/assistant pairs only.
+        let mut history = vec![];
         for index in 0..6 {
             history.push(Message::user(format!("u{index}")));
             history.push(Message::assistant(format!("a{index}")));
@@ -2569,9 +2623,18 @@ mod tests {
         let snapshot_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read persisted snapshot"))
                 .expect("parse persisted snapshot");
+        // source_index[0] anchors at the source_seq of the first item
+        // retained AFTER compaction (keep_recent_items: 4 above keeps
+        // the last 4 messages of the user/assistant pairs). With
+        // System messages now intentionally skipped at record time
+        // (`record_message_with_source_ref` early-return), 12 items go
+        // in (u0..a5) at source_seqs 0..11; compaction keeps the last
+        // 4 (source_seqs 8..11), so the snapshot's source_index begins
+        // at 8 rather than 0. The atomic materialization invariant
+        // still holds — the source_index is present and consistent.
         assert_eq!(
             snapshot_json["source_index"][0]["source_seq"],
-            serde_json::json!(0),
+            serde_json::json!(8),
             "context snapshot must atomically materialize the normalized source index"
         );
 
@@ -2760,11 +2823,15 @@ mod tests {
             ..PromptBuildPolicy::default()
         });
 
+        // System messages are no longer owned by the manager (see
+        // `record_message_with_source_ref` early-return) — the agent's
+        // runtime System is re-applied at the bridge boundary instead.
+        // Frame.messages therefore should NOT contain a System.
         assert!(
-            frame
+            !frame
                 .messages
                 .iter()
-                .any(|message| message.role == MessageRole::System && message.content == "system")
+                .any(|message| message.role == MessageRole::System)
         );
         assert!(
             !frame
