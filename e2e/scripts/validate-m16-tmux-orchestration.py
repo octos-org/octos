@@ -41,11 +41,12 @@ EVIDENCE_FILES = (
     "appui-transcript.jsonl",
     "input-replay.log",
     "launch-command.txt",
+    "m16-secret-cleanup.json",
     "summary.env",
     "terminal-size.json",
 )
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-SECRET_RE = re.compile(r"sk-[A-Za-z0-9]{20,}")
+SECRET_RE = re.compile(r"(?:sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,})")
 
 
 def utc_now() -> str:
@@ -66,6 +67,16 @@ def read_summary_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key] = value
     return values
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(read_text(path))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def likely_text_file(path: Path) -> bool:
@@ -167,11 +178,24 @@ class Validator:
             for row in self.transcript_rows
             if isinstance(row.get("frame"), dict)
         ]
-        summary = read_summary_env(out_dir / "summary.env")
+        self.summary = read_summary_env(out_dir / "summary.env")
+        self.cleanup_report = load_json(out_dir / "m16-secret-cleanup.json")
         scan_roots = [out_dir]
-        if runtime_root := summary.get("runtime_root"):
+        if runtime_root := self.summary.get("runtime_root"):
             scan_roots.append(Path(runtime_root))
+        self.secret_scan_roots = scan_roots
         self.secret_leaks = secret_leaks_under(scan_roots)
+        self.secret_scan = {
+            "scanned_roots": [str(root) for root in scan_roots if root.exists()],
+            "cleanup_scanned_roots": self.cleanup_report.get("scanned_roots", []),
+            "cleanup_scanned_file_count": self.cleanup_report.get("scanned_file_count", 0),
+            "redacted_file_count": self.cleanup_report.get("redacted_file_count", 0),
+            "redactions_total": self.cleanup_report.get("redactions_total", 0),
+            "removed_live_provider_config": self.cleanup_report.get(
+                "removed_live_provider_config", False
+            ),
+            "leak_paths": self.secret_leaks,
+        }
 
     def add(self, check_id: str, passed: bool, detail: str, evidence: list[str]) -> None:
         self.checks.append(
@@ -218,6 +242,33 @@ class Validator:
             if ok
             else f"backend evidence does not prove octos serve --stdio review/start without leaked secrets; secret leaks={self.secret_leaks or 'none'}",
             ["launch-command.txt", "appui-transcript.jsonl", "summary.env"],
+        )
+
+    def check_secret_cleanup_and_scan(self) -> None:
+        cleanup_roots = [str(root) for root in self.cleanup_report.get("scanned_roots", [])]
+        expected_roots = [str(root) for root in self.secret_scan_roots if root.exists()]
+        missing_roots = [
+            root
+            for root in expected_roots
+            if root not in cleanup_roots and str(Path(root).resolve()) not in cleanup_roots
+        ]
+        report_ok = self.cleanup_report.get("schema") == "octos.m16.secret_cleanup.v1"
+        removed_config = bool(self.cleanup_report.get("removed_live_provider_config"))
+        scanned_files = int(self.cleanup_report.get("scanned_file_count") or 0)
+        no_leaks = not self.secret_leaks
+        ok = report_ok and removed_config and scanned_files > 0 and not missing_roots and no_leaks
+        self.add(
+            "full_tree_secret_cleanup_and_scan",
+            ok,
+            "cleanup removed live provider config and validator scanned evidence/runtime trees without provider-key leaks"
+            if ok
+            else (
+                "secret cleanup/scan incomplete: "
+                f"report_ok={report_ok} removed_config={removed_config} "
+                f"scanned_files={scanned_files} missing_roots={missing_roots or 'none'} "
+                f"leak_paths={self.secret_leaks or 'none'}"
+            ),
+            ["m16-secret-cleanup.json", "summary.env"],
         )
 
     def check_prompt(self) -> None:
@@ -383,6 +434,7 @@ class Validator:
     def run(self) -> dict[str, Any]:
         self.require_files()
         self.check_real_backend()
+        self.check_secret_cleanup_and_scan()
         self.check_prompt()
         self.check_protocol_orchestration()
         self.check_visible_traces()
@@ -396,6 +448,7 @@ class Validator:
             "jsonl_parse_warnings": {
                 "appui_transcript_invalid_lines": self.transcript_invalid,
             },
+            "secret_scan": self.secret_scan,
             "checks": self.checks,
             "failures": failures,
             "evidence": {name: str(self.out_dir / name) for name in (*CAPTURE_FILES, *EVIDENCE_FILES)},
