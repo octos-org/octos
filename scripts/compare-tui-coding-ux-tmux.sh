@@ -488,7 +488,7 @@ tui_capture_has_active_state() {
   # legacy regex missed and caused inline-diff detection to stall).
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- \
-    '>_ Octos TUI[[:space:]]+.*Thinking|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
+    '>_ Octos TUI[[:space:]]+.*(Thinking|Working|Progress|Streaming)|state[[:space:]]+[^[:space:]]+[[:space:]]+(running|blocked|working|progress|streaming|Working|Progress|Streaming)|status[[:space:]]+(Turn started|Tool started|Approval requested|Approval denied|Thinking|Working|Progress|Streaming)|model[[:space:]]+Waiting for model|Approval Requested|live assistant'
 }
 
 tui_capture_has_blocking_approval() {
@@ -511,6 +511,15 @@ tui_session_has_error_state() {
 tui_capture_has_composer() {
   local capture="$1"
   printf '%s\n' "$capture" | grep -E -q -- 'Composer|^[[:space:]│]*›[[:space:]]'
+}
+
+tui_turn_cycle_complete_for_capture() {
+  local capture="$1"
+  local saw_active="$2"
+
+  [ "$saw_active" -eq 1 ] \
+    && tui_capture_has_ready_state "$capture" \
+    && ! tui_capture_has_active_state "$capture"
 }
 
 tui_prompt_prefix() {
@@ -713,13 +722,31 @@ wait_for_tui_turn_cycle() {
     if tui_capture_has_active_state "$capture"; then
       saw_active=1
     fi
-    if tui_capture_has_ready_state "$capture" \
-      && ! tui_capture_has_active_state "$capture"; then
+    if tui_turn_cycle_complete_for_capture "$capture" "$saw_active"; then
       return 0
     fi
     sleep 0.5
   done
   return 1
+}
+
+run_detector_self_test() {
+  local working_capture
+  local progress_capture
+  local idle_capture
+
+  working_capture=$'>_ Octos TUI  Working\nComposer\n'
+  progress_capture=$'status Progress\nComposer\n'
+  idle_capture=$'>_ Octos TUI  idle\nAsk Octos to change code\nComposer\n'
+
+  tui_capture_has_active_state "$working_capture" \
+    || { printf 'detector self-test failed: Working was not active\n' >&2; return 1; }
+  tui_capture_has_active_state "$progress_capture" \
+    || { printf 'detector self-test failed: Progress was not active\n' >&2; return 1; }
+  ! tui_turn_cycle_complete_for_capture "$idle_capture" 0 \
+    || { printf 'detector self-test failed: idle completed before active\n' >&2; return 1; }
+  tui_turn_cycle_complete_for_capture "$idle_capture" 1 \
+    || { printf 'detector self-test failed: idle did not complete after active\n' >&2; return 1; }
 }
 
 wait_for_tui_approval_prompt() {
@@ -1874,6 +1901,11 @@ main() {
     exit 1
   fi
 }
+
+if [ "${OCTOS_TUI_UX_DETECTOR_SELF_TEST:-0}" = "1" ]; then
+  run_detector_self_test
+  exit $?
+fi
 
 # Only run the soak when this script is invoked directly. Sourcing
 # (e.g. from scripts/tests/test-compare-tui-coding-ux-detectors.sh) is
