@@ -1472,7 +1472,21 @@ impl TaskSupervisor {
                 task.runtime_state = TaskRuntimeState::Completed;
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
+                let artifact_count = output_files.len() as u32;
                 task.output_files = output_files;
+                if task.artifact_count.is_some() || artifact_count > 0 {
+                    task.artifact_count = Some(artifact_count);
+                }
+                if task.summary.is_none() {
+                    task.summary = Some(if artifact_count > 0 {
+                        format!(
+                            "{} completed with {} artifact(s)",
+                            task.tool_name, artifact_count
+                        )
+                    } else {
+                        format!("{} completed", task.tool_name)
+                    });
+                }
                 Some(task.clone())
             } else {
                 None
@@ -1518,6 +1532,9 @@ impl TaskSupervisor {
                 task.runtime_state = TaskRuntimeState::Failed;
                 task.updated_at = Utc::now();
                 task.completed_at = Some(Utc::now());
+                if task.summary.is_none() {
+                    task.summary = Some(error.chars().take(1200).collect());
+                }
                 task.error = Some(error);
                 (Some(task.clone()), already_failed)
             } else {
@@ -2031,6 +2048,38 @@ mod tests {
             1,
             "no-op call must NOT fire on_change"
         );
+    }
+
+    #[test]
+    fn terminal_updates_refresh_summary_and_artifact_count() {
+        let supervisor = TaskSupervisor::new();
+        let completed = supervisor.register("spawn", "call-complete", None);
+        supervisor.set_m13b_projection(
+            &completed,
+            Some("model".into()),
+            Some("reviewer".into()),
+            None,
+            Some(0),
+            None,
+        );
+        supervisor.mark_completed(
+            &completed,
+            vec![
+                "/tmp/octos-review/report.md".to_owned(),
+                "/tmp/octos-review/raw.json".to_owned(),
+            ],
+        );
+        let task = supervisor.get_task(&completed).expect("completed task");
+        assert_eq!(task.artifact_count, Some(2));
+        assert_eq!(
+            task.summary.as_deref(),
+            Some("spawn completed with 2 artifact(s)")
+        );
+
+        let failed = supervisor.register("spawn", "call-fail", None);
+        supervisor.mark_failed(&failed, "review worker failed".to_owned());
+        let task = supervisor.get_task(&failed).expect("failed task");
+        assert_eq!(task.summary.as_deref(), Some("review worker failed"));
     }
 
     #[test]

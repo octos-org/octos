@@ -24,6 +24,59 @@ use super::{
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
+fn policy_equivalent_tool_names(name: &str) -> Vec<&str> {
+    match name {
+        "spawn_agent" => vec!["spawn_agent", "spawn"],
+        "wait_agent" => vec!["wait_agent", "read_task_output"],
+        _ => vec![name],
+    }
+}
+
+fn evaluate_provider_policy_equivalent(policy: &ToolPolicy, name: &str) -> policy::PolicyDecision {
+    let names = policy_equivalent_tool_names(name);
+    for entry in &policy.deny {
+        if names
+            .iter()
+            .any(|candidate| policy::entry_matches(entry, candidate))
+        {
+            return policy::PolicyDecision::Deny {
+                reason: policy::GENERIC_DENY_REASON,
+            };
+        }
+    }
+    if policy.allow.is_empty()
+        || policy.allow.iter().any(|entry| {
+            names
+                .iter()
+                .any(|candidate| policy::entry_matches(entry, candidate))
+        })
+    {
+        return policy::PolicyDecision::Allow;
+    }
+    policy::PolicyDecision::Deny {
+        reason: policy::GENERIC_DENY_REASON,
+    }
+}
+
+fn provider_policy_allows_equivalent_with_tags(
+    policy: &ToolPolicy,
+    name: &str,
+    tool_tags: &[&str],
+) -> bool {
+    if !matches!(
+        evaluate_provider_policy_equivalent(policy, name),
+        policy::PolicyDecision::Allow
+    ) {
+        return false;
+    }
+    if policy.require_tags.is_empty() || tool_tags.is_empty() {
+        return true;
+    }
+    tool_tags
+        .iter()
+        .any(|tag| policy.require_tags.iter().any(|required| required == tag))
+}
+
 /// Estimate the serialized JSON size without allocating.
 /// Walks the serde_json::Value tree recursively, counting bytes.
 fn estimate_json_size(value: &serde_json::Value) -> usize {
@@ -458,7 +511,7 @@ impl ToolRegistry {
             return false;
         };
         if let Some(ref policy) = self.provider_policy {
-            if !policy.is_allowed_with_tags(name, tool.tags()) {
+            if !provider_policy_allows_equivalent_with_tags(policy, name, tool.tags()) {
                 return false;
             }
         }
@@ -484,9 +537,9 @@ impl ToolRegistry {
             .values()
             .filter(|t| !deferred.contains(t.name()))
             .filter(|t| {
-                self.provider_policy
-                    .as_ref()
-                    .is_none_or(|p| p.is_allowed_with_tags(t.name(), t.tags()))
+                self.provider_policy.as_ref().is_none_or(|p| {
+                    provider_policy_allows_equivalent_with_tags(p, t.name(), t.tags())
+                })
             })
             .filter(|t| {
                 self.context_filter.as_ref().is_none_or(|tags| {
@@ -529,7 +582,11 @@ impl ToolRegistry {
                         .filter_map(|name| {
                             let tool = self.tools.get(name)?;
                             if let Some(ref policy) = self.provider_policy {
-                                if !policy.is_allowed_with_tags(name, tool.tags()) {
+                                if !provider_policy_allows_equivalent_with_tags(
+                                    policy,
+                                    name,
+                                    tool.tags(),
+                                ) {
                                     return None;
                                 }
                             }
@@ -1018,7 +1075,9 @@ impl ToolRegistry {
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
         if let Some(ref policy) = self.provider_policy {
-            if let policy::PolicyDecision::Deny { reason } = policy.evaluate(name) {
+            if let policy::PolicyDecision::Deny { reason } =
+                evaluate_provider_policy_equivalent(policy, name)
+            {
                 eyre::bail!("tool '{}' denied by provider policy ({})", name, reason);
             }
         }
@@ -2024,6 +2083,49 @@ mod lifecycle_tests {
             !reg.is_tool_visible("shell"),
             "provider-policy-denied tools must not be reported as visible"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_execution_policy_is_equivalent_to_spawn_alias() {
+        let mut reg = make_registry(5, 3);
+        reg.set_provider_policy(ToolPolicy {
+            deny: vec!["spawn".to_owned()],
+            ..Default::default()
+        });
+        assert!(
+            !reg.is_tool_visible("spawn_agent"),
+            "spawn_agent should be hidden when policy denies its backend spawn alias"
+        );
+        let denied = match reg
+            .execute("spawn_agent", &serde_json::json!({ "message": "review" }))
+            .await
+        {
+            Ok(result) => panic!(
+                "spawn deny should deny spawn_agent alias, got: {}",
+                result.output
+            ),
+            Err(error) => error,
+        };
+        assert!(denied.to_string().contains("denied by provider policy"));
+
+        let mut reg = make_registry(5, 3);
+        reg.set_provider_policy(ToolPolicy {
+            allow: vec!["spawn".to_owned()],
+            ..Default::default()
+        });
+        assert!(
+            reg.is_tool_visible("spawn_agent"),
+            "spawn_agent should be visible when policy allows its backend spawn alias"
+        );
+        let allowed = reg
+            .execute("spawn_agent", &serde_json::json!({ "message": "review" }))
+            .await
+            .expect("spawn allow should allow spawn_agent alias to execute");
+        assert!(
+            !allowed.success,
+            "the alias should pass policy, then fail only because the bare builtin registry has no native spawn delegate"
+        );
+        assert!(allowed.output.contains("native spawn delegate"));
     }
 
     #[test]

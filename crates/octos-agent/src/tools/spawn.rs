@@ -23,6 +23,7 @@ use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::file_state_cache::FileStateCache;
 use crate::harness_events::{HarnessEvent, HarnessEventSink, write_event_to_sink};
 use crate::prompt_context::PromptContextManager;
+use crate::role_template::RoleTemplate;
 use crate::subagent_output::SubAgentOutputRouter;
 use crate::subagent_summary::AgentSummaryGenerator;
 use crate::task_supervisor::TaskSupervisor;
@@ -956,6 +957,9 @@ struct Input {
     /// These are added after the parent's worker prompt, never replacing it.
     #[serde(default, alias = "system_prompt")]
     additional_instructions: Option<String>,
+    /// Canonical M14-C backend role template to apply to this child.
+    #[serde(default)]
+    role: Option<String>,
     /// Optional structured workflow metadata from the session runtime.
     #[serde(default)]
     workflow: Option<WorkflowMetadata>,
@@ -1055,6 +1059,37 @@ fn apply_agent_definition(
     }
 
     Ok(())
+}
+
+fn append_role_instructions(existing: Option<String>, role_prefix: &str) -> Option<String> {
+    if role_prefix.trim().is_empty() {
+        return existing;
+    }
+    Some(match existing {
+        Some(existing) if !existing.trim().is_empty() => format!("{role_prefix}\n\n{existing}"),
+        _ => role_prefix.to_owned(),
+    })
+}
+
+fn apply_role_template(input: &mut Input) -> Result<Option<&'static RoleTemplate>> {
+    let Some(role) = input
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+    else {
+        return Ok(None);
+    };
+    let template = RoleTemplate::for_name(role)
+        .ok_or_else(|| eyre::eyre!("spawn: unknown role template '{role}'"))?;
+
+    if input.allowed_tools.is_empty() {
+        input.allowed_tools = template.allowed_tools_vec();
+    }
+    input.additional_instructions =
+        append_role_instructions(input.additional_instructions.take(), template.prompt_prefix);
+    input.role = Some(template.name.to_owned());
+    Ok(Some(template))
 }
 
 fn should_deliver_output_files(files: &[PathBuf]) -> bool {
@@ -1830,6 +1865,11 @@ impl Tool for SpawnTool {
                     "items": { "type": "string" },
                     "description": "Tool names the subagent may use. Empty = all builtins."
                 },
+                "role": {
+                    "type": "string",
+                    "enum": ["reviewer", "implementer", "test_worker", "explorer"],
+                    "description": "Backend-owned M14-C role template. When set, the server resolves tool budget, sandbox, approval, model preference, and prompt prefix from the runtime template."
+                },
                 "context": {
                     "type": "string",
                     "description": "Extra context prepended to the task prompt."
@@ -1939,6 +1979,7 @@ impl Tool for SpawnTool {
         // wins" semantics. Unknown ids are a hard error — silently ignoring
         // them would let a typo erase the manifest's safety envelope.
         apply_agent_definition(&mut input, ctx.agent_definitions.as_ref())?;
+        let role_template = apply_role_template(&mut input)?;
 
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
         let worker_id = AgentId::new(format!("subagent-{worker_num}"));
@@ -1992,6 +2033,7 @@ impl Tool for SpawnTool {
             let dispatch_payload = serde_json::json!({
                 "task": task_desc,
                 "label": label,
+                "role": input.role,
                 "allowed_tools": allowed_tools,
                 "workflow": workflow.clone(),
                 "additional_instructions": input.additional_instructions,
@@ -2625,6 +2667,24 @@ impl Tool for SpawnTool {
                     .and_then(|supervisor| supervisor.get_task(task_id))
                     .and_then(|task| task.child_session_key)
             });
+            if let (Some(supervisor), Some(task_id), Some(template)) = (
+                self.task_supervisor.as_ref(),
+                tracked_task_id.as_ref(),
+                role_template,
+            ) {
+                supervisor.set_m13b_projection(
+                    task_id,
+                    Some("model".to_owned()),
+                    Some(template.name.to_owned()),
+                    Some(label.chars().take(160).collect()),
+                    Some(0),
+                    Some(template.runtime_policy_stamp(
+                        "model",
+                        &input.backend,
+                        input.model.as_deref(),
+                    )),
+                );
+            }
             let llm = sub_llm;
             let memory = self.memory.clone();
             let working_dir = self.working_dir.clone();
@@ -3449,6 +3509,48 @@ impl Tool for SpawnTool {
 mod tests {
     use super::*;
     use crate::{HookConfig, HookEvent};
+
+    #[test]
+    fn role_template_selection_applies_prompt_and_tool_budget() {
+        let mut input: Input = serde_json::from_value(serde_json::json!({
+            "task": "review this diff",
+            "role": crate::ROLE_REVIEWER,
+            "additional_instructions": "Focus on API behavior."
+        }))
+        .expect("input parses");
+
+        let template = apply_role_template(&mut input)
+            .expect("role template resolves")
+            .expect("template");
+
+        assert_eq!(template.name, crate::ROLE_REVIEWER);
+        assert_eq!(
+            input.allowed_tools,
+            template.allowed_tools_vec(),
+            "empty allowed_tools should resolve from the backend-owned role template"
+        );
+        let instructions = input
+            .additional_instructions
+            .as_deref()
+            .expect("instructions");
+        assert!(
+            instructions.starts_with(template.prompt_prefix),
+            "role prompt prefix must be prepended by the runtime factory"
+        );
+        assert!(instructions.contains("Focus on API behavior."));
+    }
+
+    #[test]
+    fn role_template_selection_rejects_unknown_role() {
+        let mut input: Input = serde_json::from_value(serde_json::json!({
+            "task": "do something",
+            "role": "planner"
+        }))
+        .expect("input parses");
+
+        let error = apply_role_template(&mut input).expect_err("unknown role is rejected");
+        assert!(error.to_string().contains("unknown role template"));
+    }
 
     #[cfg(unix)]
     fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
