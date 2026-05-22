@@ -55,6 +55,36 @@ pub fn build() -> WorkflowInstance {
     }
 }
 
+/// Build the slides workspace policy. When `slug` is `Some`, the
+/// artifact globs are baked with the project's slug so they point at
+/// the canonical post-rebind location
+/// (`skill-output/slides/<slug>/output/...`). When `slug` is `None`,
+/// generic patterns are used (suitable for the `for_kind(Slides)`
+/// default and tests that don't know the slug).
+pub fn workspace_policy_for_slug(slug: Option<&str>) -> WorkspacePolicy {
+    let (primary, deck, previews) = match slug {
+        Some(s) => (
+            format!("skill-output/slides/{s}/output/deck.pptx"),
+            format!("skill-output/slides/{s}/output/deck.pptx"),
+            format!("skill-output/slides/{s}/output/**/slide-*.png"),
+        ),
+        None => (
+            "output/deck.pptx".into(),
+            "output/deck.pptx".into(),
+            "output/**/slide-*.png".into(),
+        ),
+    };
+    let mut policy = workspace_policy();
+    policy.artifacts = WorkspaceArtifactsPolicy {
+        entries: BTreeMap::from([
+            ("primary".into(), primary),
+            ("deck".into(), deck),
+            ("previews".into(), previews),
+        ]),
+    };
+    policy
+}
+
 pub fn workspace_policy() -> WorkspacePolicy {
     WorkspacePolicy {
         schema_version: octos_agent::WORKSPACE_POLICY_SCHEMA_VERSION,

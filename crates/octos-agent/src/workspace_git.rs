@@ -805,14 +805,39 @@ fn check_list_passed(checks: &[WorkspaceCheckStatus]) -> bool {
 }
 
 fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
+    // Slides projects declare slug-aware artifact globs like
+    // `skill-output/slides/<slug>/output/deck.pptx` that point at the
+    // canonical Octos plugin output location (outside the project dir).
+    // For those patterns, resolve against the session root (the parent
+    // of `<kind>/<slug>/`) but allowlist the search scope to
+    // `<session>/skill-output/` so this can't be abused to read
+    // arbitrary files elsewhere in the workspace.
+    let (base_root, allow_root): (PathBuf, Option<PathBuf>) =
+        if Path::new(pattern).is_absolute() {
+            (PathBuf::from("/"), None)
+        } else if pattern.starts_with("skill-output/") || pattern.starts_with("skill-output\\") {
+            match repo_root.parent().and_then(|p| p.parent()) {
+                Some(session_root) => (
+                    session_root.to_path_buf(),
+                    Some(session_root.join("skill-output")),
+                ),
+                None => (repo_root.to_path_buf(), None),
+            }
+        } else {
+            (repo_root.to_path_buf(), None)
+        };
+
     let full_pattern = if Path::new(pattern).is_absolute() {
         PathBuf::from(pattern)
     } else {
-        repo_root.join(pattern)
+        base_root.join(pattern)
     };
-    let canonical_root = repo_root
+    let canonical_root = base_root
         .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+        .unwrap_or_else(|_| base_root.clone());
+    let canonical_allow = allow_root
+        .as_ref()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
     let mut matches = Vec::new();
 
     let Ok(entries) = glob(&full_pattern.to_string_lossy()) else {
@@ -827,8 +852,18 @@ fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
         if !canonical.starts_with(&canonical_root) {
             continue;
         }
+        if let Some(allow) = canonical_allow.as_ref() {
+            if !canonical.starts_with(allow) {
+                continue;
+            }
+        }
+        let display_base = if canonical_allow.is_some() {
+            base_root.as_path()
+        } else {
+            repo_root
+        };
         let relative = entry
-            .strip_prefix(repo_root)
+            .strip_prefix(display_base)
             .unwrap_or(&entry)
             .to_string_lossy()
             .replace('\\', "/");
