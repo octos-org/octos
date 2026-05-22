@@ -1654,6 +1654,17 @@ impl Tool for BashTool {
 
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // codex review (#1172) P2 (follow-up): put the child in its own
+        // process group BEFORE spawn so the negative-PID kill below
+        // reaches every grandchild it forked. Without this, a command
+        // like `bash(cmd="(sleep 60; touch late) & wait", timeout_ms=1000)`
+        // would leave the backgrounded `sleep` alive in the original
+        // process group and the timeout cleanup would only kill the
+        // wrapper shell. `process_group(0)` is the Unix-only knob; on
+        // Windows job objects would be the analogue but `taskkill /F /T`
+        // already walks the process tree.
+        #[cfg(unix)]
+        cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
         let child = match cmd.spawn() {
             Ok(child) => child,
@@ -3908,6 +3919,46 @@ mod tests {
         );
         assert!(registry.get_tool("spawn_agent").is_none());
         assert!(registry.get_tool("wait_agent").is_none());
+    }
+
+    /// #1172 codex review P2 acceptance (follow-up): a `bash` command
+    /// that backgrounds a grandchild and `wait`s on it must still have
+    /// the grandchild killed when the bash timeout fires. Without
+    /// `process_group(0)` before spawn, the negative-PID kill targets
+    /// a process group that the child was never put in, so the
+    /// backgrounded `sleep` survives the timeout and the workspace
+    /// mutation happens after the tool reports failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_kills_grandchildren_via_process_group_on_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sentinel = temp.path().join("grandchild-late.txt");
+        let sentinel_path = sentinel.to_string_lossy().into_owned();
+        // Backgrounded grandchild that touches the sentinel after a sleep
+        // longer than the timeout. The `wait` keeps the outer bash alive
+        // so the timeout path is forced to walk the process group.
+        let cmd = format!("(sleep 3; touch {sentinel_path}) & wait");
+        let registry = ToolRegistry::with_builtins(temp.path());
+        let started = std::time::Instant::now();
+        let result = registry
+            .execute("bash", &json!({ "cmd": cmd, "timeout_ms": 1_000 }))
+            .await
+            .expect("bash runs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "bash must return within the timeout window (got {:?})",
+            started.elapsed()
+        );
+        assert!(!result.success, "{}", result.output);
+        // Wait past when the orphaned grandchild's `touch` would fire.
+        tokio::time::sleep(std::time::Duration::from_millis(4_000)).await;
+        assert!(
+            !sentinel.exists(),
+            "grandchild process must be killed via the bash process group on \
+             timeout — sentinel at {} should NOT exist (negative-PID kill \
+             didn't reach the grandchild)",
+            sentinel.display(),
+        );
     }
 
     /// #1172 codex review P2 acceptance: when a `bash` command exceeds
