@@ -12638,6 +12638,10 @@ async fn run_native_code_review_turn(
     let tools = Arc::new(session_runtime.tools.snapshot_excluding(&[]));
     let agent_config = session_runtime.agent.agent_config();
     let system_prompt_base = session_runtime.agent.system_prompt_snapshot();
+    let review_dispatch_policy = Arc::new(octos_agent::DispatchPolicy::from_agent_gates(
+        profile_runtime.tool_policy.clone(),
+        true,
+    ));
     let native_specs = native_code_review_specs(Some(profile_runtime.as_ref()));
     let native_names = native_specs
         .iter()
@@ -12697,6 +12701,7 @@ async fn run_native_code_review_turn(
         let cwd = workspace_root.clone();
         let event_tx = event_tx.clone();
         let agent_config = agent_config.clone();
+        let dispatch_policy = review_dispatch_policy.clone();
         joins.spawn(async move {
             let result = default_agent_orchestrator()
                 .run_native_specialist(NativeSpecialistLaunchRequest {
@@ -12715,6 +12720,7 @@ async fn run_native_code_review_turn(
                     agent_config: Some(agent_config),
                     task_ledger_path: None,
                     event_tx: Some(event_tx),
+                    dispatch_policy: Some(dispatch_policy),
                 })
                 .await;
             match result {
@@ -12756,6 +12762,7 @@ async fn run_native_code_review_turn(
         &objective,
         &target,
         &turn_id,
+        review_dispatch_policy.clone(),
     );
     maybe_spawn_mcp_review_specialist(
         &mut joins,
@@ -13001,6 +13008,7 @@ fn maybe_spawn_cli_review_specialist(
     objective: &str,
     target: &str,
     turn_id: &TurnId,
+    dispatch_policy: Arc<octos_agent::DispatchPolicy>,
 ) {
     let Some(argv) = review_cli_argv() else {
         return;
@@ -13047,6 +13055,7 @@ fn maybe_spawn_cli_review_specialist(
             default_agent_orchestrator(),
             &sink,
             SupervisedCliSpecialist::new(spec, command)
+                .with_dispatch_policy(dispatch_policy)
                 .heartbeat_interval(std::time::Duration::from_secs(2)),
         )
         .await
@@ -13116,12 +13125,14 @@ fn maybe_spawn_mcp_review_specialist(
     });
     let sink = WsSupervisorEventSink { ws: ws.clone() };
     let backend = swarm_state.swarm.backend();
+    let dispatch_policy = swarm_state.swarm.dispatch_policy();
     let timeout = review_mcp_timeout();
     joins.spawn(async move {
         match run_supervised_mcp_specialist(
             default_agent_orchestrator(),
             &sink,
             SupervisedMcpSpecialist::new(spec, backend, tool_name, task)
+                .with_dispatch_policy(dispatch_policy)
                 .timeout(timeout)
                 .heartbeat_interval(std::time::Duration::from_secs(2)),
         )

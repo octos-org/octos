@@ -59,6 +59,7 @@ pub(crate) struct SupervisedCliSpecialist {
     pub(crate) spec: SupervisedSpecialistSpec,
     pub(crate) command: CliAgentCommandConfig,
     pub(crate) heartbeat_interval: Duration,
+    pub(crate) dispatch_policy: Option<Arc<octos_agent::DispatchPolicy>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +70,7 @@ pub(crate) struct SupervisedMcpSpecialist {
     pub(crate) task: Value,
     pub(crate) timeout: Duration,
     pub(crate) heartbeat_interval: Duration,
+    pub(crate) dispatch_policy: Option<Arc<octos_agent::DispatchPolicy>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,11 +88,17 @@ impl SupervisedCliSpecialist {
             spec,
             command,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            dispatch_policy: None,
         }
     }
 
     pub(crate) fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    pub(crate) fn with_dispatch_policy(mut self, policy: Arc<octos_agent::DispatchPolicy>) -> Self {
+        self.dispatch_policy = Some(policy);
         self
     }
 }
@@ -109,6 +117,7 @@ impl SupervisedMcpSpecialist {
             task,
             timeout: DEFAULT_MCP_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            dispatch_policy: None,
         }
     }
 
@@ -119,6 +128,11 @@ impl SupervisedMcpSpecialist {
 
     pub(crate) fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    pub(crate) fn with_dispatch_policy(mut self, policy: Arc<octos_agent::DispatchPolicy>) -> Self {
+        self.dispatch_policy = Some(policy);
         self
     }
 }
@@ -161,6 +175,36 @@ pub(crate) async fn run_supervised_cli_specialist(
         )
         .unwrap_or(initial_agent);
     emit_agent_updated(sink, &request.spec.session_id, agent);
+
+    if let Some(policy) = request.dispatch_policy.as_ref() {
+        let endpoint = request.command.program.to_string_lossy().into_owned();
+        let backend = octos_agent::DispatchBackendMetadata::unsandboxed("cli", endpoint);
+        let task = json!({
+            "task": request.spec.task.as_deref(),
+            "cwd": request.spec.cwd.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            "program": request.command.program.to_string_lossy().into_owned(),
+            "args": request.command.args.clone(),
+            "env": request.command.env.clone(),
+        });
+        if let Err(denial) = octos_agent::enforce_dispatch_gates_for_backend(
+            policy.as_ref(),
+            &backend,
+            octos_agent::DispatchTarget {
+                dispatch_id: &request.spec.agent_id,
+                tool_name: &request.spec.backend_kind,
+                task: &task,
+            },
+        )
+        .await
+        {
+            return finish_failed_spawn(
+                orchestrator,
+                sink,
+                &request.spec,
+                dispatch_policy_denial_message(&denial),
+            );
+        }
+    }
 
     let process = match CliAgentProcess::spawn(request.command) {
         Ok(process) => process,
@@ -218,6 +262,30 @@ pub(crate) async fn run_supervised_mcp_specialist(
         )
         .unwrap_or(initial_agent);
     emit_agent_updated(sink, &request.spec.session_id, agent);
+
+    if let Some(policy) = request.dispatch_policy.as_ref() {
+        let backend =
+            octos_agent::DispatchBackendMetadata::from_mcp_backend(request.backend.as_ref());
+        if let Err(denial) = octos_agent::enforce_dispatch_gates_for_backend(
+            policy.as_ref(),
+            &backend,
+            octos_agent::DispatchTarget {
+                dispatch_id: &request.spec.agent_id,
+                tool_name: &request.tool_name,
+                task: &request.task,
+            },
+        )
+        .await
+        {
+            return finish_failed_spawn(
+                orchestrator,
+                sink,
+                &request.spec,
+                dispatch_policy_denial_message(&denial),
+            );
+        }
+    }
+
     let dispatch = request.backend.dispatch(
         DispatchRequest::new(request.tool_name.clone(), request.task.clone())
             .with_context_contract(context_contract.clone()),
@@ -372,6 +440,13 @@ fn finish_mcp_run(
         artifact_ids: artifacts.into_iter().map(|artifact| artifact.id).collect(),
         ping_count,
     })
+}
+
+fn dispatch_policy_denial_message(denial: &octos_agent::GateDenial) -> String {
+    format!(
+        "dispatch rejected by policy ({}): {}",
+        denial.last_dispatch_outcome, denial.reason
+    )
 }
 
 fn finish_failed_spawn<T>(
@@ -654,6 +729,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -913,5 +989,167 @@ printf 'done\n'
                 .any(|(method, params)| *method == methods::AGENT_OUTPUT_DELTA
                     && params["text"] == json!("mcp done"))
         );
+    }
+    struct DenyRequester;
+
+    #[async_trait]
+    impl octos_agent::ToolApprovalRequester for DenyRequester {
+        async fn request_approval(
+            &self,
+            _request: octos_agent::ToolApprovalRequest,
+        ) -> octos_agent::ToolApprovalDecision {
+            octos_agent::ToolApprovalDecision::Deny
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_specialist_policy_denies_approval_before_process_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let script = write_executable(
+            &dir,
+            "agent-policy-approval",
+            r#"#!/bin/sh
+printf spawned > "$1"
+"#,
+        );
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let sink = RecordingSink::default();
+        let spec = sample_spec(&dir, "cli-policy-approval");
+        let policy = Arc::new(octos_agent::DispatchPolicy {
+            require_approval: true,
+            approval_requester: Some(Arc::new(DenyRequester)),
+            ..Default::default()
+        });
+
+        let error = run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                spec,
+                CliAgentCommandConfig::new(script)
+                    .arg(marker.to_string_lossy())
+                    .cwd(dir.path()),
+            )
+            .with_dispatch_policy(policy),
+        )
+        .await
+        .expect_err("approval denial must fail the dispatch");
+
+        assert!(error.contains("approval_denied"), "got: {error}");
+        assert!(
+            !marker.exists(),
+            "denied CLI dispatch must not spawn child process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_specialist_policy_denies_non_allowlisted_env_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned-env");
+        let script = write_executable(
+            &dir,
+            "agent-policy-env",
+            r#"#!/bin/sh
+printf spawned > "$1"
+"#,
+        );
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let sink = RecordingSink::default();
+        let spec = sample_spec(&dir, "cli-policy-env");
+        let mut allowlist = HashSet::new();
+        allowlist.insert("ALLOWED_ONLY".to_owned());
+        let policy = Arc::new(octos_agent::DispatchPolicy {
+            env_allowlist: Some(allowlist),
+            ..Default::default()
+        });
+
+        let error = run_supervised_cli_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedCliSpecialist::new(
+                spec,
+                CliAgentCommandConfig::new(script)
+                    .arg(marker.to_string_lossy())
+                    .cwd(dir.path())
+                    .env("FORBIDDEN_ENV", "secret"),
+            )
+            .with_dispatch_policy(policy),
+        )
+        .await
+        .expect_err("env allowlist denial must fail the dispatch");
+
+        assert!(error.contains("env_forbidden"), "got: {error}");
+        assert!(
+            !marker.exists(),
+            "env-denied CLI dispatch must not spawn child process"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_specialist_policy_denies_approval_before_backend_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedMcpBackend::default());
+        *backend.artifact.lock().unwrap() = Some(dir.path().join("mcp-report.md"));
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let sink = RecordingSink::default();
+        let mut spec = sample_spec(&dir, "mcp-policy-approval");
+        spec.backend_kind = "mcp_test".to_owned();
+        let policy = Arc::new(octos_agent::DispatchPolicy {
+            require_approval: true,
+            approval_requester: Some(Arc::new(DenyRequester)),
+            ..Default::default()
+        });
+
+        let error = run_supervised_mcp_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedMcpSpecialist::new(
+                spec,
+                backend.clone(),
+                "agent/run",
+                json!({ "prompt": "review" }),
+            )
+            .with_dispatch_policy(policy),
+        )
+        .await
+        .expect_err("approval denial must fail the MCP dispatch");
+
+        assert!(error.contains("approval_denied"), "got: {error}");
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn mcp_specialist_policy_requires_sandbox_before_backend_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(ScriptedMcpBackend::default());
+        *backend.artifact.lock().unwrap() = Some(dir.path().join("mcp-report.md"));
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let sink = RecordingSink::default();
+        let mut spec = sample_spec(&dir, "mcp-policy-sandbox");
+        spec.backend_kind = "mcp_test".to_owned();
+        let policy = Arc::new(octos_agent::DispatchPolicy {
+            require_sandboxed: true,
+            ..Default::default()
+        });
+
+        let error = run_supervised_mcp_specialist(
+            &orchestrator,
+            &sink,
+            SupervisedMcpSpecialist::new(
+                spec,
+                backend.clone(),
+                "agent/run",
+                json!({ "prompt": "review" }),
+            )
+            .with_dispatch_policy(policy),
+        )
+        .await
+        .expect_err("sandbox requirement must fail unsandboxed MCP dispatch");
+
+        assert!(error.contains("sandbox_required"), "got: {error}");
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
 }

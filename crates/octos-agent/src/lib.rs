@@ -87,7 +87,10 @@ pub use cost_ledger::{
     COST_USD_HISTOGRAM, ContractCostRollup, CostAccountant, CostAttributionEvent, CostBudgetPolicy,
     CostLedger, PersistentCostLedger, project_cost_usd,
 };
-pub use dispatch_policy::{DispatchPolicy, DispatchTarget, GateDenial, enforce_dispatch_gates};
+pub use dispatch_policy::{
+    DispatchBackendMetadata, DispatchPolicy, DispatchTarget, GateDenial, enforce_dispatch_gates,
+    enforce_dispatch_gates_for_backend,
+};
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use file_state_cache::{
