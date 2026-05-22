@@ -1788,8 +1788,16 @@ fn read_image_header_no_follow(
     // Skipped entirely for host-scope (workspace_root=None) because
     // the resolved path is outside the workspace and the walk would
     // hit system symlinks (e.g. `/tmp` on macOS).
-    if let Some(root) = workspace_root {
-        reject_symlink_ancestors(resolved, root)?;
+    //
+    // #1153 codex P2 rev2: when we skip the ancestor walk for host
+    // scope, the WINDOWS leaf-symlink guard goes with it. Unix still
+    // has O_NOFOLLOW below, but the `#[cfg(not(unix))]` open has no
+    // replacement. Keep at least a leaf-only `symlink_metadata` check
+    // so a host symlink like `C:\tmp\link.png -> C:\secret\real.png`
+    // doesn't quietly follow on Windows.
+    match workspace_root {
+        Some(root) => reject_symlink_ancestors(resolved, root)?,
+        None => reject_leaf_symlink(resolved)?,
     }
 
     #[cfg(unix)]
@@ -1827,6 +1835,29 @@ fn read_image_header_no_follow(
 ///   ancestors and returns `Ok(())` — containment was already
 ///   checked by `resolve_path_with_scope`).
 /// * Hard-bounded by `Path::ancestors`, which is finite.
+/// Leaf-only symlink check for host-scope reads. Equivalent to the
+/// final iteration of `reject_symlink_ancestors` but without walking
+/// upward — host scope intentionally accepts paths outside the
+/// workspace, so we can't pick an ancestor stop.
+///
+/// On Unix this is belt-and-suspenders with the `O_NOFOLLOW` flag
+/// used in the open below (both reject a symlinked leaf). On Windows
+/// it's the ONLY leaf no-follow guard.
+///
+/// `NotFound` is propagated as `Ok(())` so the subsequent open
+/// surfaces the real error rather than masking it as PermissionDenied.
+fn reject_leaf_symlink(resolved: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(resolved) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to follow symlink leaf: {}", resolved.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 fn reject_symlink_ancestors(
     resolved: &std::path::Path,
     workspace_root: &std::path::Path,
@@ -2537,6 +2568,37 @@ mod tests {
         );
         let payload: Value = serde_json::from_str(&result.output).expect("json payload");
         assert_eq!(payload["format"], json!("png"));
+    }
+
+    /// Codex review #1153 P2 rev2: when host-scope skips the
+    /// ancestor walk, the Windows leaf-symlink guard goes with it
+    /// (Unix still has O_NOFOLLOW, but Windows has no replacement).
+    /// The new `reject_leaf_symlink` must catch a leaf symlink even
+    /// in host scope. This test exercises the Unix path; the same
+    /// guard runs on Windows where it's the ONLY leaf no-follow check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn view_image_host_scope_still_rejects_leaf_symlink_per_1153() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let target = outside.path().join("real.png");
+        std::fs::write(&target, PNG_MAGIC).expect("write real png");
+        let link = outside.path().join("link.png");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let tool = ViewImageTool::new(workspace.path())
+            .with_filesystem_scope(FilesystemScope::Host);
+
+        let result = tool
+            .execute(&json!({ "path": link.to_string_lossy() }))
+            .await
+            .expect("view_image runs");
+
+        assert!(
+            !result.success,
+            "host-scope view_image must still reject a leaf symlink even when ancestor walk is skipped; got: {}",
+            result.output,
+        );
     }
 
     #[tokio::test]
