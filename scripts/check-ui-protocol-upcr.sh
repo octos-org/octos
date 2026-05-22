@@ -108,17 +108,15 @@ diff_range_names() {
   if [ -z "$raw" ]; then
     return 0
   fi
-  local line code src dst name
+  local line code name
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     code="$(printf '%s' "$line" | awk '{print $1}')"
     case "$code" in
       R*)
-        # Format: "R100<TAB>old/path<TAB>new/path"
-        src="$(printf '%s' "$line" | awk '{print $2}')"
-        dst="$(printf '%s' "$line" | awk '{print $3}')"
-        # If the new path is one of the protocol paths, count it.
-        name="$dst"
+        # Format: "R<score><TAB>old/path<TAB>new/path" — destination is what
+        # lives in the working tree, so that's what consumers see.
+        name="$(printf '%s' "$line" | awk '{print $3}')"
         ;;
       *)
         name="$(printf '%s' "$line" | awk '{print $2}')"
@@ -231,7 +229,10 @@ ui-protocol-upcr: protocol-visible edits require a UPCR document.
 
 Detected code-level protocol changes (range: $range):
 EOF
-printf '  %s\n' $code_changes >&2
+while IFS= read -r _change; do
+  [ -z "$_change" ] && continue
+  printf '  %s\n' "$_change" >&2
+done <<<"$code_changes"
 if [ -n "$spec_changes" ]; then
   cat >&2 <<EOF
 
