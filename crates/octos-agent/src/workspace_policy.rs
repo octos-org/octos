@@ -747,26 +747,25 @@ impl WorkspacePolicy {
                         "file_exists:changelog.md".into(),
                     ],
                     on_source_change: Vec::new(),
-                    on_completion: vec![
-                        "file_exists:output/deck.pptx".into(),
-                        "file_exists:output/**/slide-*.png".into(),
-                    ],
-                    // octos #997: gate the slides project on the PPTX magic-bytes
-                    // signature so an HTML "success" deck (the mofa_slides
-                    // failure mode where the skill writes an error page in
-                    // place of the .pptx) trips the project-scope contract.
-                    //
-                    // The bare `MagicBytes` validator lives in `for_session()`
-                    // as `mofa_slides_contract` (workspace_policy.rs:863-874),
-                    // but the session-scope spawn_tasks table is not consulted
-                    // by `inspect_workspace_contract` — which only reads
-                    // `validation.validators` against the slides-kind policy.
-                    // Mirror the spawn-task contract here so the
-                    // project-scope gate actually exercises the check. See
-                    // option (a) of the issue write-up; the deeper fix
-                    // (option (b): teach `inspect_workspace_contract` to read
-                    // `spawn_tasks` too) is the right architectural cleanup
-                    // and is tracked as a follow-up.
+                    // Path-based `file_exists` checks were removed: the
+                    // deck lands under `<workspace>/skill-output/slides/<slug>/`
+                    // via the host's plugin work-dir rebind (outside the
+                    // project dir), so the previous `file_exists:output/...`
+                    // could never match in production. The MagicBytes
+                    // validator below now consumes the plugin's
+                    // `files_to_send` list via the SpawnOnlyFiles source
+                    // — the same path set the session-scope
+                    // `mofa_slides_contract` uses.
+                    on_completion: Vec::new(),
+                    // octos #997: gate the slides project on the PPTX
+                    // magic-bytes signature so an HTML "success" deck
+                    // trips the contract. Uses `SpawnOnlyFiles` source
+                    // — the spawn loop wires `files_to_send` through to
+                    // `run_project_root_validators`, which filters to
+                    // files belonging to this project
+                    // (`<session>/skill-output/slides/<slug>/` or the
+                    // legacy `<session>/slides/<slug>/`) before passing
+                    // them to the validator runner.
                     validators: vec![Validator {
                         id: "slides.mofa_slides.pptx_magic_bytes".into(),
                         required: true,
@@ -774,10 +773,10 @@ impl WorkspacePolicy {
                         timeout_ms: None,
                         phase: ValidatorPhaseKind::Completion,
                         spec: ValidatorSpec::MagicBytes {
-                            glob: "**/*.pptx".into(),
+                            glob: String::new(),
                             format: MagicByteKind::Pptx,
-                            source: ValidatorFileSource::Glob,
-                            extension: None,
+                            source: ValidatorFileSource::SpawnOnlyFiles,
+                            extension: Some("pptx".into()),
                         },
                     }],
                 },
@@ -1626,13 +1625,20 @@ mod tests {
                 "file_exists:changelog.md",
             ]
         );
+        // `on_completion` no longer declares project-relative
+        // `file_exists` checks — the deck lands under
+        // `<workspace>/skill-output/...` via the host's plugin
+        // work-dir rebind, outside the project dir. Artifact gating
+        // moved to the SpawnOnlyFiles MagicBytes validator below.
+        assert!(policy.validation.on_completion.is_empty());
+        assert_eq!(policy.validation.validators.len(), 1);
         assert_eq!(
-            policy.validation.on_completion,
-            vec![
-                "file_exists:output/deck.pptx",
-                "file_exists:output/**/slide-*.png",
-            ]
+            policy.validation.validators[0].id,
+            "slides.mofa_slides.pptx_magic_bytes"
         );
+        // Artifact descriptors retained as the default for_kind(Slides)
+        // policy (slug-aware paths land in the per-project persisted
+        // policy via `slides_delivery::workspace_policy_for_slug`).
         assert_eq!(
             policy.artifacts.entries.get("primary").map(String::as_str),
             Some("output/deck.pptx")
