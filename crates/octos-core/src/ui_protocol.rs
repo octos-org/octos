@@ -192,9 +192,8 @@ pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1: &str =
 /// #965 / UPCR-2026-019 — spec-canonical feature name for the
 /// supervised-task artifact surface (`task/artifact/list`, `task/artifact/read`,
 /// `agent/artifact/list`, `agent/artifact/read`, `agent/artifact/updated`).
-/// Advertised alongside [`UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1`] so
-/// clients that look for the M13-A name find it; method gating stays on the
-/// existing consolidated flag.
+/// The canonical `task/artifact/*` methods are gated on this flag; legacy
+/// `agent/artifact/*` aliases remain gated on agent control.
 pub const UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1: &str = "harness.task_artifacts.v1";
 
 /// Server-known feature registry. Used by
@@ -239,6 +238,9 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         methods::TASK_LIST | methods::TASK_CANCEL | methods::TASK_RESTART_FROM_NODE => {
             Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1)
         }
+        methods::TASK_ARTIFACT_LIST | methods::TASK_ARTIFACT_READ => {
+            Some(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1)
+        }
         methods::SESSION_HYDRATE => Some(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
         methods::THREAD_GRAPH_GET => Some(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
         methods::TURN_STATE_GET => Some(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
@@ -260,8 +262,6 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::AGENT_OUTPUT_READ
         | methods::AGENT_ARTIFACT_LIST
         | methods::AGENT_ARTIFACT_READ
-        | methods::TASK_ARTIFACT_LIST
-        | methods::TASK_ARTIFACT_READ
         | methods::AGENT_INTERRUPT
         | methods::AGENT_CLOSE => Some(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
         methods::SESSION_GOAL_GET | methods::SESSION_GOAL_SET | methods::SESSION_GOAL_CLEAR => {
@@ -1239,6 +1239,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
             UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
@@ -1452,6 +1453,8 @@ pub enum UiResultKind {
     TaskCancel,
     TaskRestartFromNode,
     TaskOutputRead,
+    TaskArtifactList,
+    TaskArtifactRead,
     SessionHydrate,
     ThreadGraphGet,
     TurnStateGet,
@@ -1473,6 +1476,8 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::TASK_CANCEL => Some(UiResultKind::TaskCancel),
         methods::TASK_RESTART_FROM_NODE => Some(UiResultKind::TaskRestartFromNode),
         methods::TASK_OUTPUT_READ => Some(UiResultKind::TaskOutputRead),
+        methods::TASK_ARTIFACT_LIST => Some(UiResultKind::TaskArtifactList),
+        methods::TASK_ARTIFACT_READ => Some(UiResultKind::TaskArtifactRead),
         methods::SESSION_HYDRATE => Some(UiResultKind::SessionHydrate),
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
@@ -1843,6 +1848,34 @@ pub struct TaskOutputReadParams {
     pub limit_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactListParams {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactReadParams {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<OutputCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskListParams {
     pub session_id: SessionKey,
@@ -1877,6 +1910,47 @@ pub struct TaskListResult {
     pub topic: Option<String>,
     #[serde(default)]
     pub tasks: Vec<TaskListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactRecord {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactListResult {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<TaskArtifactRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactReadResult {
+    pub session_id: SessionKey,
+    pub task_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub artifact: TaskArtifactRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<OutputCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<OutputCursor>,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3068,6 +3142,8 @@ pub enum UiCommand {
     TaskCancel(TaskCancelParams),
     TaskRestartFromNode(TaskRestartFromNodeParams),
     TaskOutputRead(TaskOutputReadParams),
+    TaskArtifactList(TaskArtifactListParams),
+    TaskArtifactRead(TaskArtifactReadParams),
     SessionHydrate(SessionHydrateParams),
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
@@ -3106,6 +3182,8 @@ impl UiCommand {
             Self::TaskCancel(_) => methods::TASK_CANCEL,
             Self::TaskRestartFromNode(_) => methods::TASK_RESTART_FROM_NODE,
             Self::TaskOutputRead(_) => methods::TASK_OUTPUT_READ,
+            Self::TaskArtifactList(_) => methods::TASK_ARTIFACT_LIST,
+            Self::TaskArtifactRead(_) => methods::TASK_ARTIFACT_READ,
             Self::SessionHydrate(_) => methods::SESSION_HYDRATE,
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
@@ -3146,6 +3224,8 @@ impl UiCommand {
             Self::TaskCancel(params) => serde_json::to_value(params),
             Self::TaskRestartFromNode(params) => serde_json::to_value(params),
             Self::TaskOutputRead(params) => serde_json::to_value(params),
+            Self::TaskArtifactList(params) => serde_json::to_value(params),
+            Self::TaskArtifactRead(params) => serde_json::to_value(params),
             Self::SessionHydrate(params) => serde_json::to_value(params),
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
@@ -3206,6 +3286,12 @@ impl UiCommand {
                 Ok(Self::TaskRestartFromNode(decode_params(method, params)?))
             }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_params(method, params)?)),
+            methods::TASK_ARTIFACT_LIST => {
+                Ok(Self::TaskArtifactList(decode_params(method, params)?))
+            }
+            methods::TASK_ARTIFACT_READ => {
+                Ok(Self::TaskArtifactRead(decode_params(method, params)?))
+            }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_params(method, params)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
@@ -3533,6 +3619,8 @@ pub enum UiRpcResult {
     TaskCancel(TaskCancelResult),
     TaskRestartFromNode(TaskRestartFromNodeResult),
     TaskOutputRead(TaskOutputReadResult),
+    TaskArtifactList(TaskArtifactListResult),
+    TaskArtifactRead(TaskArtifactReadResult),
     SessionHydrate(SessionHydrateResult),
     ThreadGraphGet(ThreadGraphGetResult),
     TurnStateGet(TurnStateGetResult),
@@ -3555,6 +3643,8 @@ impl UiRpcResult {
             Self::TaskCancel(_) => UiResultKind::TaskCancel,
             Self::TaskRestartFromNode(_) => UiResultKind::TaskRestartFromNode,
             Self::TaskOutputRead(_) => UiResultKind::TaskOutputRead,
+            Self::TaskArtifactList(_) => UiResultKind::TaskArtifactList,
+            Self::TaskArtifactRead(_) => UiResultKind::TaskArtifactRead,
             Self::SessionHydrate(_) => UiResultKind::SessionHydrate,
             Self::ThreadGraphGet(_) => UiResultKind::ThreadGraphGet,
             Self::TurnStateGet(_) => UiResultKind::TurnStateGet,
@@ -3577,6 +3667,8 @@ impl UiRpcResult {
             Self::TaskCancel(_) => Some(methods::TASK_CANCEL),
             Self::TaskRestartFromNode(_) => Some(methods::TASK_RESTART_FROM_NODE),
             Self::TaskOutputRead(_) => Some(methods::TASK_OUTPUT_READ),
+            Self::TaskArtifactList(_) => Some(methods::TASK_ARTIFACT_LIST),
+            Self::TaskArtifactRead(_) => Some(methods::TASK_ARTIFACT_READ),
             Self::SessionHydrate(_) => Some(methods::SESSION_HYDRATE),
             Self::ThreadGraphGet(_) => Some(methods::THREAD_GRAPH_GET),
             Self::TurnStateGet(_) => Some(methods::TURN_STATE_GET),
@@ -3599,6 +3691,8 @@ impl UiRpcResult {
             Self::TaskCancel(result) => serde_json::to_value(result),
             Self::TaskRestartFromNode(result) => serde_json::to_value(result),
             Self::TaskOutputRead(result) => serde_json::to_value(result),
+            Self::TaskArtifactList(result) => serde_json::to_value(result),
+            Self::TaskArtifactRead(result) => serde_json::to_value(result),
             Self::SessionHydrate(result) => serde_json::to_value(result),
             Self::ThreadGraphGet(result) => serde_json::to_value(result),
             Self::TurnStateGet(result) => serde_json::to_value(result),
@@ -3648,6 +3742,12 @@ impl UiRpcResult {
                 Ok(Self::TaskRestartFromNode(decode_result(method, result)?))
             }
             methods::TASK_OUTPUT_READ => Ok(Self::TaskOutputRead(decode_result(method, result)?)),
+            methods::TASK_ARTIFACT_LIST => {
+                Ok(Self::TaskArtifactList(decode_result(method, result)?))
+            }
+            methods::TASK_ARTIFACT_READ => {
+                Ok(Self::TaskArtifactRead(decode_result(method, result)?))
+            }
             methods::SESSION_HYDRATE => Ok(Self::SessionHydrate(decode_result(method, result)?)),
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_result(method, result)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_result(method, result)?)),
@@ -5169,9 +5269,12 @@ mod tests {
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(capabilities.supports_method(methods::TASK_LIST));
         assert!(capabilities.supports_method(methods::TASK_CANCEL));
         assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
         assert!(capabilities.unsupported.is_empty());
 
         let json = serde_json::to_string(&capabilities).expect("serialize capabilities");
@@ -5203,6 +5306,7 @@ mod tests {
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(!decoded.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
     }
 
     #[test]
@@ -5214,6 +5318,9 @@ mod tests {
         assert!(capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
         assert!(capabilities.supports_method(methods::TASK_OUTPUT_READ));
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(capabilities.unsupported.is_empty());
     }
 
@@ -5401,6 +5508,8 @@ mod tests {
         assert!(!capabilities.supports_method(methods::TASK_LIST));
         assert!(!capabilities.supports_method(methods::TASK_CANCEL));
         assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
     }
 
     #[test]
@@ -5419,12 +5528,15 @@ mod tests {
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1));
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         // Task-control methods are gated by harness.task_control.v1 — they
         // must not appear in the advertised method set when the gating
         // feature is not negotiated.
         assert!(!capabilities.supports_method(methods::TASK_LIST));
         assert!(!capabilities.supports_method(methods::TASK_CANCEL));
         assert!(!capabilities.supports_method(methods::TASK_RESTART_FROM_NODE));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
         // Unconditional methods stay present.
         assert!(capabilities.supports_method(methods::SESSION_OPEN));
         assert!(capabilities.supports_method(methods::TURN_START));
@@ -5449,14 +5561,10 @@ mod tests {
 
     #[test]
     fn negotiated_capabilities_hide_task_and_agent_artifact_methods_without_feature() {
-        // #965 — UPCR-2026-019 capability gating: `task/artifact/list`
-        // and `task/artifact/read` (plus the legacy `agent/artifact/*`
-        // aliases that route through the same handlers) must not appear
-        // in `supported_methods` unless the negotiated capability set
-        // includes `coding.agent_control.v1`. Without the gate the
-        // server would advertise an RPC that immediately returns
-        // `agent_control_unavailable` for every caller.
+        // #965/#1084 — task artifact methods have their own harness feature
+        // gate, while legacy agent artifact aliases stay under agent control.
         let capabilities = UiProtocolCapabilities::for_negotiated_features(Vec::<String>::new());
+        assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
         assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
         assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
         assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
@@ -5465,24 +5573,28 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_capabilities_advertise_task_and_agent_artifact_methods_when_feature_requested() {
-        // #965 — counterpart to the gate-off test above. When the
-        // client requests `coding.agent_control.v1` (paired with the
-        // `coding.autonomy.v1` base, since `agent_control` is an
-        // autonomy-optional add-on), both the canonical `task/artifact/*`
-        // names and the legacy `agent/artifact/*` aliases appear in
-        // the negotiated method set so the dispatcher
-        // (`task/artifact/* | agent/artifact/* => handler`) is reachable
-        // by name in either direction.
+    fn negotiated_capabilities_advertise_task_artifact_methods_when_feature_requested() {
+        let capabilities = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+        ]);
+        assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+    }
+
+    #[test]
+    fn negotiated_capabilities_advertise_agent_artifact_methods_when_agent_control_requested() {
         let capabilities = UiProtocolCapabilities::for_negotiated_features([
             UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
             UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
         ]);
         assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1));
-        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
-        assert!(capabilities.supports_method(methods::TASK_ARTIFACT_READ));
         assert!(capabilities.supports_method(methods::AGENT_ARTIFACT_LIST));
         assert!(capabilities.supports_method(methods::AGENT_ARTIFACT_READ));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_LIST));
+        assert!(!capabilities.supports_method(methods::TASK_ARTIFACT_READ));
     }
 
     #[test]
@@ -5500,6 +5612,10 @@ mod tests {
         assert_eq!(
             UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
             "harness.task_control.v1"
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            "harness.task_artifacts.v1"
         );
         assert_eq!(
             UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
@@ -6574,6 +6690,45 @@ mod tests {
             UiCommand::from_rpc_request(restart_wire).expect("decode task/restart_from_node"),
             restart
         );
+
+        let artifact_list = UiCommand::TaskArtifactList(TaskArtifactListParams {
+            session_id: SessionKey("local:demo".into()),
+            task_id: task_id.clone(),
+            profile_id: Some("coding".into()),
+            agent_id: None,
+        });
+        assert_eq!(artifact_list.method(), methods::TASK_ARTIFACT_LIST);
+        let artifact_list_wire = artifact_list
+            .clone()
+            .into_rpc_request("task-artifact-list")
+            .expect("serialize task/artifact/list");
+        assert_eq!(artifact_list_wire.params["task_id"], json!(task_id));
+        assert_eq!(
+            UiCommand::from_rpc_request(artifact_list_wire).expect("decode task/artifact/list"),
+            artifact_list
+        );
+
+        let artifact_read = UiCommand::TaskArtifactRead(TaskArtifactReadParams {
+            session_id: SessionKey("local:demo".into()),
+            task_id: TaskId(Uuid::from_u128(45)),
+            artifact_id: Some("summary".into()),
+            path: None,
+            cursor: None,
+            limit_bytes: Some(1024),
+            profile_id: None,
+            agent_id: Some("agent-1".into()),
+        });
+        assert_eq!(artifact_read.method(), methods::TASK_ARTIFACT_READ);
+        let artifact_read_wire = artifact_read
+            .clone()
+            .into_rpc_request("task-artifact-read")
+            .expect("serialize task/artifact/read");
+        assert_eq!(artifact_read_wire.params["artifact_id"], json!("summary"));
+        assert_eq!(artifact_read_wire.params["agent_id"], json!("agent-1"));
+        assert_eq!(
+            UiCommand::from_rpc_request(artifact_read_wire).expect("decode task/artifact/read"),
+            artifact_read
+        );
     }
 
     #[test]
@@ -6686,6 +6841,14 @@ mod tests {
             first_server_result_kind_for_method(methods::TASK_RESTART_FROM_NODE),
             Some(UiResultKind::TaskRestartFromNode)
         );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_ARTIFACT_LIST),
+            Some(UiResultKind::TaskArtifactList)
+        );
+        assert_eq!(
+            first_server_result_kind_for_method(methods::TASK_ARTIFACT_READ),
+            Some(UiResultKind::TaskArtifactRead)
+        );
 
         let preview_id = PreviewId::new();
         let diff_result = UiRpcResult::DiffPreviewGet(DiffPreviewGetResult {
@@ -6775,6 +6938,70 @@ mod tests {
             UiRpcResult::from_method_and_result(methods::TASK_LIST, value)
                 .expect("decode task/list result"),
             task_list
+        );
+
+        let task_artifact_list = UiRpcResult::TaskArtifactList(TaskArtifactListResult {
+            session_id: SessionKey("local:demo".into()),
+            task_id: list_task_id.clone(),
+            agent_id: Some("agent-1".into()),
+            artifacts: vec![TaskArtifactRecord {
+                id: "summary".into(),
+                title: "Summary".into(),
+                kind: "markdown".into(),
+                status: "ready".into(),
+                path: None,
+                content: None,
+                extra: BTreeMap::new(),
+            }],
+        });
+        assert_eq!(task_artifact_list.kind(), UiResultKind::TaskArtifactList);
+        assert_eq!(
+            task_artifact_list.method(),
+            Some(methods::TASK_ARTIFACT_LIST)
+        );
+        let value = task_artifact_list
+            .clone()
+            .into_result_value()
+            .expect("serialize task/artifact/list result");
+        assert_eq!(value["artifacts"][0]["id"], json!("summary"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_ARTIFACT_LIST, value)
+                .expect("decode task/artifact/list result"),
+            task_artifact_list
+        );
+
+        let task_artifact_read = UiRpcResult::TaskArtifactRead(TaskArtifactReadResult {
+            session_id: SessionKey("local:demo".into()),
+            task_id: list_task_id.clone(),
+            agent_id: Some("agent-1".into()),
+            artifact: TaskArtifactRecord {
+                id: "summary".into(),
+                title: "Summary".into(),
+                kind: "markdown".into(),
+                status: "ready".into(),
+                path: None,
+                content: None,
+                extra: BTreeMap::new(),
+            },
+            content: Some("done".into()),
+            cursor: Some(OutputCursor { offset: 0 }),
+            next_cursor: Some(OutputCursor { offset: 4 }),
+            has_more: false,
+        });
+        assert_eq!(task_artifact_read.kind(), UiResultKind::TaskArtifactRead);
+        assert_eq!(
+            task_artifact_read.method(),
+            Some(methods::TASK_ARTIFACT_READ)
+        );
+        let value = task_artifact_read
+            .clone()
+            .into_result_value()
+            .expect("serialize task/artifact/read result");
+        assert_eq!(value["content"], json!("done"));
+        assert_eq!(
+            UiRpcResult::from_method_and_result(methods::TASK_ARTIFACT_READ, value)
+                .expect("decode task/artifact/read result"),
+            task_artifact_read
         );
 
         let cancel_result = UiRpcResult::TaskCancel(TaskCancelResult {
