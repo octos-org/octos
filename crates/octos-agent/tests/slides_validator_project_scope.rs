@@ -50,17 +50,27 @@ fn slides_kind_policy_wires_mofa_slides_pptx_magic_bytes_validator() {
         "PPTX MagicBytes validator must run at the Completion phase"
     );
 
-    // Sanity: the glob must target `.pptx` files. The validator is glob-
-    // based, not template-interpolated, so a recursive PPTX pattern is what
-    // we want.
-    let glob = match &pptx_validator.spec {
-        ValidatorSpec::MagicBytes { glob, .. } => glob.clone(),
+    // Post-#997 round-3: validator consumes the plugin's `files_to_send`
+    // via `SpawnOnlyFiles` source and filters to `.pptx` files via the
+    // `extension` field. The glob string itself is empty (the plugin
+    // file list is the authoritative source, not a disk scan).
+    match &pptx_validator.spec {
+        ValidatorSpec::MagicBytes {
+            source, extension, ..
+        } => {
+            assert_eq!(
+                *source,
+                octos_agent::workspace_policy::ValidatorFileSource::SpawnOnlyFiles,
+                "slides MagicBytes must consume files_to_send (post #997 round-3)"
+            );
+            assert_eq!(
+                extension.as_deref(),
+                Some("pptx"),
+                "slides MagicBytes must filter to .pptx outputs"
+            );
+        }
         _ => unreachable!("matched MagicBytes above"),
-    };
-    assert!(
-        glob.ends_with(".pptx"),
-        "MagicBytes glob should target .pptx files, got {glob:?}"
-    );
+    }
 }
 
 #[tokio::test]
@@ -73,7 +83,7 @@ async fn html_pptx_fails_slides_kind_project_scope_validator_gate() {
 
     use octos_agent::ToolRegistry;
     use octos_agent::validators::ValidatorPhase;
-    use octos_agent::workspace_contract::run_declared_validators;
+    use octos_agent::workspace_contract::run_declared_validators_with_output;
 
     let dir = tempfile::tempdir().unwrap();
     let workspace_root = dir.path();
@@ -85,18 +95,23 @@ async fn html_pptx_fails_slides_kind_project_scope_validator_gate() {
     // (`PK\x03\x04`) that a real .pptx carries, so MagicBytes(Pptx) must
     // reject this file.
     let html_error_page = b"<!DOCTYPE html><html><body>500 internal error</body></html>";
-    std::fs::write(output_dir.join("deck.pptx"), html_error_page).unwrap();
+    let deck_path = output_dir.join("deck.pptx");
+    std::fs::write(&deck_path, html_error_page).unwrap();
 
     let policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
     let registry = Arc::new(ToolRegistry::new());
 
-    let result = run_declared_validators(
+    // Post-#997 round-3: validator uses `SpawnOnlyFiles` source, so the
+    // file list must be supplied alongside the validator invocation.
+    let result = run_declared_validators_with_output(
         &registry,
         workspace_root,
         &policy.validation.validators,
         "slides/demo",
         ValidatorPhase::Completion,
         None,
+        None,
+        Some(vec![deck_path.clone()]),
     )
     .await;
 
@@ -119,7 +134,7 @@ async fn valid_pptx_passes_slides_kind_project_scope_validator_gate() {
 
     use octos_agent::ToolRegistry;
     use octos_agent::validators::ValidatorPhase;
-    use octos_agent::workspace_contract::run_declared_validators;
+    use octos_agent::workspace_contract::run_declared_validators_with_output;
 
     let dir = tempfile::tempdir().unwrap();
     let workspace_root = dir.path();
@@ -131,18 +146,23 @@ async fn valid_pptx_passes_slides_kind_project_scope_validator_gate() {
     // archive is not required for this check.
     let mut pptx_bytes = vec![0x50, 0x4B, 0x03, 0x04];
     pptx_bytes.extend_from_slice(&[0u8; 64]);
-    std::fs::write(output_dir.join("deck.pptx"), pptx_bytes).unwrap();
+    let deck_path = output_dir.join("deck.pptx");
+    std::fs::write(&deck_path, pptx_bytes).unwrap();
 
     let policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
     let registry = Arc::new(ToolRegistry::new());
 
-    let outcomes = run_declared_validators(
+    // Post-#997 round-3: validator uses `SpawnOnlyFiles` source, so the
+    // file list must be supplied alongside the validator invocation.
+    let outcomes = run_declared_validators_with_output(
         &registry,
         workspace_root,
         &policy.validation.validators,
         "slides/demo",
         ValidatorPhase::Completion,
         None,
+        None,
+        Some(vec![deck_path.clone()]),
     )
     .await
     .expect("genuine PPTX must pass the slides project-scope validator gate");
@@ -245,9 +265,17 @@ async fn project_root_validators_write_to_project_ledger_without_manual_seeding(
     // calls after a successful `run_task` for slides workflows. No manual
     // ledger seeding.
     let registry = Arc::new(ToolRegistry::new());
-    let report =
-        run_project_root_validators(&registry, session_root, Some(WorkspaceProjectKind::Slides))
-            .await;
+    // Mirror what the spawn loop does on success: pass the plugin's
+    // `files_to_send` so the project-scope `MagicBytes(SpawnOnlyFiles)`
+    // validator can check the actual emitted deck path.
+    let files_to_send = vec![output_dir.join("deck.pptx")];
+    let report = run_project_root_validators(
+        &registry,
+        session_root,
+        Some(WorkspaceProjectKind::Slides),
+        &files_to_send,
+    )
+    .await;
 
     // The slides project should have been picked up + run.
     assert_eq!(

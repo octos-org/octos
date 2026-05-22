@@ -63,9 +63,20 @@ fn should_load_workspace_policy_v1_slides_fixture() {
             .any(|line| line == "file_exists:script.js"),
         "expected slides turn-end validation to include script.js",
     );
+    // Post-#997 round-3: `read_workspace_policy` auto-migrates legacy
+    // slides policies to slug-aware skill-output artifact paths. The
+    // fixture is a pre-migration v1 snapshot; the read should yield
+    // the migrated form. The slug is the parent dir's name (here the
+    // tempdir's random tail).
+    let primary = policy.artifacts.entries.get("primary").expect("primary");
+    let slug = temp
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("tempdir must have a name");
     assert_eq!(
-        policy.artifacts.entries.get("primary").map(String::as_str),
-        Some("output/deck.pptx")
+        primary.as_str(),
+        format!("skill-output/slides/{slug}/output/deck.pptx").as_str()
     );
 }
 

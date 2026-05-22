@@ -658,6 +658,7 @@ impl Agent {
                                                 &bg_tools,
                                                 workspace_root,
                                                 None,
+                                                &r.files_to_send,
                                             )
                                             .await;
                                     }

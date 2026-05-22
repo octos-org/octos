@@ -31,19 +31,22 @@ const SESSION_PROMPTS_DIR: &str = "session_prompts";
 /// ```text
 /// slides/<slug>/
 ///   history/       — optional manual exports (git is the primary history)
-///   output/        — generated PPTX files
 ///   assets/        — images, logos, branding
 ///   memory.md      — project-level memory
 ///   changelog.md   — edit history
 ///   script.js      — slide generation script template
 /// ```
+///
+/// `output/` is NOT scaffolded — generated decks land under
+/// `<workspace>/skill-output/slides/<slug>/output/` via the host's
+/// plugin work-dir rebind (the canonical Octos plugin output path).
+/// The previous empty `<project>/output/` was a ghost folder the
+/// project-scope validator never found anything in.
 pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
     let slug = slugify(project_name);
     let project_dir = data_dir.join("slides").join(&slug);
     std::fs::create_dir_all(project_dir.join("history"))
         .map_err(|e| format!("create slides history dir failed: {e}"))?;
-    std::fs::create_dir_all(project_dir.join("output"))
-        .map_err(|e| format!("create slides output dir failed: {e}"))?;
     std::fs::create_dir_all(project_dir.join("assets"))
         .map_err(|e| format!("create slides assets dir failed: {e}"))?;
 
@@ -91,8 +94,11 @@ module.exports = [];
             .map_err(|e| format!("write slides script.js failed: {e}"))?;
     }
 
-    write_workspace_policy(&project_dir, &slides_delivery::workspace_policy())
-        .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
+    write_workspace_policy(
+        &project_dir,
+        &slides_delivery::workspace_policy_for_slug(Some(&slug)),
+    )
+    .map_err(|e| format!("write slides workspace policy failed: {e}"))?;
 
     initialize_and_commit(
         &project_dir,
@@ -1013,7 +1019,10 @@ mod tests {
         let project_dir = scaffold_slides_project(tmp.path(), "test-deck").unwrap();
 
         assert!(project_dir.join("history").is_dir());
-        assert!(project_dir.join("output").is_dir());
+        // `output/` is no longer scaffolded — decks land under
+        // `<workspace>/skill-output/slides/<slug>/output/` via the
+        // host's plugin work-dir rebind.
+        assert!(!project_dir.join("output").exists());
         assert!(project_dir.join("assets").is_dir());
         assert!(project_dir.join("memory.md").is_file());
         assert!(project_dir.join("changelog.md").is_file());

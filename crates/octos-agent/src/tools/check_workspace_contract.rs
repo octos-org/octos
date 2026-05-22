@@ -147,12 +147,16 @@ mod tests {
     /// `run_project_root_validators` mirrors the spawn completion path so a
     /// regression in either the wiring or the validator itself surfaces
     /// here.
-    async fn run_slides_project_root_validators(workspace_root: &std::path::Path) {
+    async fn run_slides_project_root_validators(
+        workspace_root: &std::path::Path,
+        files_to_send: &[std::path::PathBuf],
+    ) {
         let registry = Arc::new(ToolRegistry::new());
         let _ = crate::workspace_contract::run_project_root_validators(
             &registry,
             workspace_root,
             Some(WorkspaceProjectKind::Slides),
+            files_to_send,
         )
         .await;
     }
@@ -192,7 +196,7 @@ mod tests {
         // the exact path `inspect_workspace_contract` reads.
         write_pptx_bytes(repo_root.join("output/deck.pptx"));
         write_file(repo_root.join("output/imgs/slide-01.png"), "png");
-        run_slides_project_root_validators(tmp.path()).await;
+        run_slides_project_root_validators(tmp.path(), &[repo_root.join("output/deck.pptx")]).await;
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool
@@ -231,7 +235,8 @@ mod tests {
         // spawn loop exercises in production.
         write_pptx_bytes(ready_root.join("output/deck.pptx"));
         write_file(ready_root.join("output/imgs/slide-01.png"), "png");
-        run_slides_project_root_validators(tmp.path()).await;
+        run_slides_project_root_validators(tmp.path(), &[ready_root.join("output/deck.pptx")])
+            .await;
 
         let tool = CheckWorkspaceContractTool::new(tmp.path());
         let result = tool

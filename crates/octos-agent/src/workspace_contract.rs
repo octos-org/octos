@@ -714,6 +714,7 @@ pub async fn run_project_root_validators(
     tools: &ToolRegistry,
     working_dir: &Path,
     expected_kind: Option<WorkspaceProjectKind>,
+    files_to_send: &[PathBuf],
 ) -> ProjectRootValidatorReport {
     let mut report = ProjectRootValidatorReport::default();
     let repos = match list_workspace_repos(working_dir) {
@@ -754,14 +755,26 @@ pub async fn run_project_root_validators(
             continue;
         }
 
+        // Filter `files_to_send` to the files that belong to THIS
+        // project. The host rebinds plugin work_dir to
+        // `<session>/skill-output/`, so a slides project's deck lands
+        // at `<session>/skill-output/slides/<slug>/output/deck.pptx`.
+        // Tests / legacy paths may also stage files directly under
+        // `<session>/<kind>/<slug>/`. The `SpawnOnlyFiles` validator
+        // source consumes this filtered list.
+        let project_files =
+            filter_files_for_project(files_to_send, working_dir, repo.kind, &repo.slug);
+
         report.projects_run = report.projects_run.saturating_add(1);
-        match run_declared_validators(
+        match run_declared_validators_with_output(
             tools,
             &project_root,
             &policy.validation.validators,
             &repo_label,
             ValidatorPhase::Completion,
             None,
+            None,
+            Some(project_files),
         )
         .await
         {
@@ -773,6 +786,34 @@ pub async fn run_project_root_validators(
     }
 
     report
+}
+
+/// Select files from `files_to_send` whose absolute path lives under
+/// either `<session>/skill-output/<kind>/<slug>/` (the canonical
+/// post-rebind plugin output location) or `<session>/<kind>/<slug>/`
+/// (legacy / test fallback where files were staged directly inside the
+/// project dir).
+fn filter_files_for_project(
+    files_to_send: &[PathBuf],
+    session_root: &Path,
+    kind: WorkspaceProjectKind,
+    slug: &str,
+) -> Vec<PathBuf> {
+    let kind_dir = kind.directory_name();
+    let prefix_skill_output = session_root.join("skill-output").join(kind_dir).join(slug);
+    let prefix_in_project = session_root.join(kind_dir).join(slug);
+    files_to_send
+        .iter()
+        .filter(|path| {
+            let absolute = if path.is_absolute() {
+                (*path).clone()
+            } else {
+                session_root.join(path)
+            };
+            absolute.starts_with(&prefix_skill_output) || absolute.starts_with(&prefix_in_project)
+        })
+        .cloned()
+        .collect()
 }
 
 fn build_validator_runner(tools: &ToolRegistry, workspace_root: &Path) -> ValidatorRunner {
