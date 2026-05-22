@@ -69,44 +69,89 @@ if [ "$resolve_status" -eq 0 ] && [ -n "$base_ref" ]; then
   head_sha="$(git rev-parse --verify --quiet HEAD 2>/dev/null || true)"
 fi
 
-# Treat merge_base == HEAD as "no committed work to inspect": HEAD..HEAD is
-# empty, so the committed-range scan would silently miss any actual diffs.
-# Codex review #6/#8 also showed that a dirty trigger file in the working
-# tree must NOT promote the gate into uncommitted-only mode — a committed
-# protocol change with a stray dirty spec edit would otherwise hit the
-# spec-only self-coverage path and bypass the gate. So we always fail
-# loud when the base ref is missing or resolves to HEAD; UPCR_ALLOW_NO_DOC
-# is the documented reviewer escape hatch.
+# Case analysis for the diff range:
+#
+#   * resolve_base_ref failed entirely (no origin/main, no main, no
+#     UPCR_BASE_REF) -> we cannot reason about committed work at all.
+#     Fail loud unless UPCR_ALLOW_NO_DOC=1 (closes codex #1).
+#
+#   * merge_base resolves but equals HEAD -> normal for a freshly-created
+#     feature branch where the only relevant work is staged or unstaged.
+#     Fall through in uncommitted-only mode and set `strict_uncommitted=1`,
+#     which disables the spec-only self-coverage fallback. Without that
+#     guard, a stray dirty spec edit could mask a committed protocol-code
+#     change that lives in HEAD itself (closes codex #6/#8/#10).
+#
+#   * merge_base != HEAD -> normal committed-range scan.
 base_equals_head=0
 if [ -n "$merge_base" ] && [ -n "$head_sha" ] && [ "$merge_base" = "$head_sha" ]; then
   base_equals_head=1
 fi
 
-if [ -z "$merge_base" ] || [ "$base_equals_head" -eq 1 ]; then
+strict_uncommitted=0
+if [ "$resolve_status" -ne 0 ] || [ -z "$base_ref" ]; then
   if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
     printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
     exit 0
   fi
   cat >&2 <<'EOF'
-ui-protocol-upcr: could not resolve a usable base ref for the diff. The gate
-tried origin/main, main, origin/master, master, and any UPCR_BASE_REF
-override; either none resolved or the resolved ref points to HEAD itself
-(which would diff HEAD..HEAD = empty). Refusing to run because that lets
-committed protocol changes slip through CI.
+ui-protocol-upcr: could not resolve a base ref for the diff (tried origin/main,
+main, origin/master, master, and any UPCR_BASE_REF override). Refusing to run
+because that lets committed protocol changes slip through CI.
 
 Fix: fetch a real base (e.g. `git fetch --no-tags origin main`), or set
 UPCR_BASE_REF=<sha-or-ref> that points to the actual target branch this
-PR/branch is built against (e.g. the merge-base SHA against origin/main,
-or the commit of the target branch tip). Do NOT use `HEAD~1` for branches
-that contain multiple commits — the gate would diff only the last commit
-and report no protocol-visible edits even when an earlier commit on the
-branch touched protocol Rust. As a last resort, set UPCR_ALLOW_NO_DOC=1
-for a documented reviewer override.
+PR/branch is built against. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a
+documented reviewer override.
 EOF
   exit 2
 fi
 
-range="$merge_base..HEAD"
+if [ "$base_equals_head" -eq 1 ]; then
+  # Pre-commit / freshly-created-branch flow: we'll run in uncommitted-only
+  # mode IFF there's actual uncommitted trigger work to inspect. If the
+  # working tree is clean and merge_base == HEAD, we cannot tell whether
+  # the branch is genuinely identical to main (no work, nothing to gate)
+  # or whether a stale base ref is hiding committed protocol edits. Fall
+  # back to a probe of uncommitted trigger paths; if the probe is empty,
+  # fail loud. This is the careful split between codex #6 (close the
+  # silent-empty-diff bypass when there's no uncommitted work either) and
+  # codex #10 (don't reject legitimate pre-commit staged-trigger work).
+  pre_commit_probe="$(
+    git status --porcelain --untracked-files=all -- \
+      "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}" "$SPEC_GLOB" \
+      2>/dev/null || true
+  )"
+  if [ -z "$pre_commit_probe" ]; then
+    if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
+      printf 'ui-protocol-upcr: base ref resolves to HEAD; allowed by reviewer override\n'
+      exit 0
+    fi
+    cat >&2 <<'EOF'
+ui-protocol-upcr: the resolved base ref points to HEAD and the working tree
+has no uncommitted protocol/spec edits. The committed-range diff (HEAD..HEAD)
+is empty by construction, which can hide committed protocol changes on a
+stale single-branch CI checkout. Refusing to run.
+
+Fix: fetch a real base (e.g. `git fetch --no-tags origin main`), or set
+UPCR_BASE_REF=<sha-or-ref> that points to the actual target branch this
+PR/branch is built against. As a last resort, set UPCR_ALLOW_NO_DOC=1 for a
+documented reviewer override.
+EOF
+    exit 2
+  fi
+  # Uncommitted trigger work exists; proceed in strict uncommitted-only mode.
+  # `strict_uncommitted` disables the spec-only self-coverage fallback so
+  # a stray dirty spec can't mask a committed protocol change in HEAD.
+  merge_base=""
+  strict_uncommitted=1
+fi
+
+if [ -n "$merge_base" ]; then
+  range="$merge_base..HEAD"
+else
+  range=""
+fi
 
 # Emit destination paths from `git diff --name-status` in the committed
 # range. The second argument selects between two filters:
@@ -325,9 +370,12 @@ if [ -n "$upcr_real" ]; then
 fi
 
 # No UPCR doc. A spec-only edit can self-cover, but only if the spec change
-# is an add/modify; a deletion-only spec change is just a protocol-visible
-# removal and still needs an explicit UPCR.
-if [ -z "$code_changes" ] && [ -n "$spec_changes" ]; then
+# is an add/modify AND we have a real committed-range diff. In strict
+# uncommitted-only mode (merge_base == HEAD) the spec-only shortcut is
+# disabled, because a stray dirty spec edit could otherwise mask a
+# committed protocol-code change that lives in HEAD itself (codex #8/#10).
+if [ "$strict_uncommitted" -eq 0 ] \
+    && [ -z "$code_changes" ] && [ -n "$spec_changes" ]; then
   spec_coverage="$(collect_names "$range" coverage "$SPEC_GLOB")"
   if [ -n "$spec_coverage" ]; then
     printf 'ui-protocol-upcr: spec-only edit, treated as self-coverage\n'
