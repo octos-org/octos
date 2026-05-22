@@ -138,6 +138,7 @@ pub(super) fn emit_turn_completed(
 ) {
     let notification = UiNotification::TurnCompleted(TurnCompletedEvent {
         session_id: session_id.clone(),
+        topic: None,
         turn_id: turn_id.clone(),
         cursor: None,
         // UPCR-2026-014 (M9-α-9) addendum fields; the α-3 helper does
@@ -289,6 +290,7 @@ mod tests {
         // does at `ui_protocol.rs:920-973`.
         let observer_event = UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session_id.clone(),
+            topic: None,
             turn_id: Some(turn_id.clone()),
             thread_id: Some("cmid-alpha-3".into()),
             seq: 42,

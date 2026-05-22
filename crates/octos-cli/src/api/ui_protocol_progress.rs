@@ -154,6 +154,7 @@ fn map_task_started(context: &ProgressMappingContext, event: &Value) -> UiProgre
         return UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(
             TaskUpdatedEvent {
                 session_id: context.session_id.clone(),
+                topic: None,
                 task_id,
                 tool_call_id: string_field(event, &["tool_call_id"]),
                 title: string_field(event, &["title"]).unwrap_or_else(|| "Task".into()),
@@ -227,6 +228,7 @@ fn map_task_updated(context: &ProgressMappingContext, event: &Value) -> UiProgre
 
     UiProgressMapping::notifications(vec![UiNotification::TaskUpdated(TaskUpdatedEvent {
         session_id: context.session_id.clone(),
+        topic: None,
         task_id,
         tool_call_id: string_field(event, &["tool_call_id"]),
         title,
@@ -316,6 +318,7 @@ fn map_token(context: &ProgressMappingContext, event: &Value) -> UiProgressMappi
 
     UiProgressMapping::notifications(vec![UiNotification::MessageDelta(MessageDeltaEvent {
         session_id: context.session_id.clone(),
+        topic: None,
         turn_id: context.turn_id.clone(),
         text,
     })])

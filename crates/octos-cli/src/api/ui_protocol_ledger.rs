@@ -147,6 +147,19 @@ impl UiProtocolLedgerEvent {
         }
     }
 
+    pub(crate) fn topic(&self) -> Option<&str> {
+        match self {
+            Self::Notification(notification) => notification.topic(),
+            Self::Progress(event) => event.session_id.topic(),
+        }
+    }
+
+    fn stamp_topic_from_session(&mut self) {
+        if let Self::Notification(notification) = self {
+            notification.stamp_topic_from_session();
+        }
+    }
+
     fn with_cursor(mut self, cursor: UiCursor) -> Self {
         if let Self::Notification(notification) = &mut self {
             match notification {
@@ -600,9 +613,10 @@ impl UiProtocolLedger {
 
     fn append(
         &self,
-        event: UiProtocolLedgerEvent,
+        mut event: UiProtocolLedgerEvent,
         from_connection: Option<ConnectionId>,
     ) -> LedgeredUiProtocolEvent {
+        event.stamp_topic_from_session();
         let session_id = event.session_id().clone();
         let preload_snapshot = self.snapshot_if_session_absent(&session_id);
         let cursor;
@@ -1603,6 +1617,7 @@ mod tests {
     fn delta(session: &SessionKey, text: &str) -> UiNotification {
         UiNotification::MessageDelta(MessageDeltaEvent {
             session_id: session.clone(),
+            topic: None,
             turn_id: TurnId::new(),
             text: text.into(),
         })
@@ -1649,6 +1664,7 @@ mod tests {
         let completed =
             ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
                 session_id,
+                topic: None,
                 turn_id,
                 cursor: None,
                 tokens_in: None,
@@ -2170,6 +2186,7 @@ mod tests {
         use octos_core::ui_protocol::{MessagePersistedEvent, MessagePersistedSource};
         UiNotification::MessagePersisted(MessagePersistedEvent {
             session_id: session.clone(),
+            topic: None,
             turn_id: Some(TurnId::new()),
             thread_id: None,
             seq: 0,

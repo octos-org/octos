@@ -103,6 +103,7 @@ pub(super) fn emit_turn_completed_full(
 ) {
     let notification = UiNotification::TurnCompleted(TurnCompletedEvent {
         session_id: session_id.clone(),
+        topic: None,
         turn_id: turn_id.clone(),
         cursor: None,
         tokens_in,
