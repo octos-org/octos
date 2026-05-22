@@ -3681,6 +3681,16 @@ pub mod progress_kinds {
     pub const TOKEN_COST_UPDATE: &str = "token_cost_update";
     pub const TOOL_PROGRESS: &str = "tool_progress";
     pub const TOOL_COMPLETED: &str = "tool_completed";
+    /// Creative status-word rotation matching the gateway's
+    /// `StatusIndicator` (`✦ Pondering...`, `✦ Brewing...`, etc.) for
+    /// the web ThinkingIndicator surface. The server emits
+    /// `progress/updated{kind:"status_word", label:"<word>"}` every
+    /// ~8s during an in-flight agent turn; the SPA bridge
+    /// (`ui-protocol-event-router.ts`) lifts these onto a
+    /// `crew:status_word` DOM event the `ThinkingIndicator` listens
+    /// for. CJK-aware: the rotator picks Chinese words for Chinese
+    /// input, English for English.
+    pub const STATUS_WORD: &str = "status_word";
     pub const UNKNOWN: &str = "unknown";
 }
 

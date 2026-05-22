@@ -113,6 +113,7 @@ pub(crate) fn map_progress_json(
         "thinking" => map_simple_status(context, event, progress_kinds::THINKING),
         "response" => map_simple_status(context, event, progress_kinds::RESPONSE),
         "cost_update" => map_cost_update(context, event),
+        "status_word" => map_status_word(context, event),
         "stream_end" => map_simple_status(context, event, progress_kinds::STREAM_END),
         "retry" | "retry_backoff" => map_retry_backoff(context, event),
         "approval_requested" | "approval_request" => map_approval_requested(context, event),
@@ -422,6 +423,25 @@ fn map_cost_update(context: &ProgressMappingContext, event: &Value) -> UiProgres
     UiProgressMapping::status(context, metadata)
 }
 
+/// Map the per-turn status-word rotator's frame
+/// (`{"type":"status_word", "label":"Pondering"}`) onto a
+/// `progress/updated{kind:"status_word"}` notification. The SPA
+/// `ThinkingIndicator` subscribes via the bridge's `crew:status_word`
+/// dispatcher and swaps the word in the in-flight bubble.
+fn map_status_word(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
+    let word = string_field(event, &["label", "word"]).filter(|s| !s.is_empty());
+    let Some(word) = word else {
+        return UiProgressMapping::warning(
+            context,
+            "invalid_progress",
+            "status_word progress event missing string field `label`".to_string(),
+        );
+    };
+    let mut metadata = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+    metadata.label = Some(word);
+    UiProgressMapping::status(context, metadata)
+}
+
 fn map_retry_backoff(context: &ProgressMappingContext, event: &Value) -> UiProgressMapping {
     let mut retry = UiRetryBackoff::new();
     retry.attempt = u32_field(event, &["attempt", "retry_round"]);
@@ -717,6 +737,44 @@ mod tests {
             assert!(mapping.notifications.is_empty());
             assert_eq!(mapping.warning, None);
         }
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_status_word_to_progress_kinds_status_word() {
+        // Lock the wire contract that the per-turn rotator
+        // (`spawn_status_word_rotator`) emits — a flat
+        // `{"type":"status_word","label":"Pondering"}` JSON frame on
+        // the progress channel — onto a
+        // `progress/updated{kind:"status_word", label:"Pondering"}`
+        // notification the SPA bridge guards/parses.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "status_word",
+                "label": "Pondering",
+            }),
+        );
+
+        let status = mapping.status.expect("status_word status");
+        assert_eq!(status.event.metadata.kind, progress_kinds::STATUS_WORD);
+        assert_eq!(status.event.metadata.label.as_deref(), Some("Pondering"));
+        assert_eq!(mapping.warning, None);
+    }
+
+    #[test]
+    fn ui_protocol_progress_maps_status_word_missing_label_to_warning() {
+        // Defensive: a status_word frame with no label is malformed.
+        // Surface it as a `warning` so the SPA can ignore it instead
+        // of swapping the in-flight bubble to an empty caption.
+        let mapping = map_progress_json(
+            &context(),
+            &json!({
+                "type": "status_word",
+            }),
+        );
+        assert!(mapping.status.is_none());
+        let warning = mapping.warning.expect("warning emitted for empty label");
+        assert_eq!(warning.code, "invalid_progress");
     }
 
     #[test]
