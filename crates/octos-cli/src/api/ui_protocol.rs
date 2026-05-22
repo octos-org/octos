@@ -4865,6 +4865,7 @@ fn configured_provider_json(
 
 fn permission_profile_supported_selections(
     state: &AppState,
+    session_id: &SessionKey,
 ) -> Vec<octos_core::ui_protocol::PermissionProfileSelection> {
     use octos_core::ui_protocol::{
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
@@ -4881,7 +4882,16 @@ fn permission_profile_supported_selections(
             network: Network::Deny,
         },
     ];
-    if state.deployment_mode == crate::config::DeploymentMode::Local {
+    // #1162 codex P2 — keep list output consistent with the
+    // session-scope gate added to `permission_profile_set`. On a Local
+    // server we only advertise `danger_full_access` for sessions whose
+    // structural profile_id is NOT tenant/cloud-scoped; tenant-scoped
+    // sessions get `permission_profile_disallowed` from `set`, so the
+    // list must omit the dead option rather than render it as a
+    // selectable profile.
+    let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
+    let session_is_non_solo_scoped = session_id_encodes_non_solo_scope(session_id);
+    if server_is_local && !session_is_non_solo_scoped {
         profiles.push(Selection {
             mode: Mode::DangerFullAccess,
             network: Network::Allow,
@@ -4981,8 +4991,138 @@ fn permission_profile_disallowed_error(
     }))
 }
 
+/// #1162 — Returns `true` when the supplied session key carries a
+/// non-solo tenant/cloud scope marker in a STRUCTURAL position of the
+/// base key. The M12-G soak negative probe creates sessions like
+/// `tenant-a:api:m12-negative#…` and `coding:tenant:m12-negative#…`
+/// and asserts that the gate rejects `danger_full_access` even when
+/// the client omits the `runtime_mode` override (UPCR-2026-018 /
+/// #1086). This helper layers the session-shape signal on top of the
+/// override gate so a non-conforming or older client cannot slip
+/// dangerous mode past the policy boundary.
+///
+/// Two structural positions of the base key are checked. Parsing
+/// does NOT rely on `SessionKey::profile_id()` because that helper's
+/// recognition list is narrower than the gateway's set of supported
+/// channels (codex P1 round 3 #1167 caught the gap for `line`,
+/// `wechat`, etc.) — we always interpret the FIRST segment as the
+/// candidate `profile_id` and disambiguate against the registered
+/// channel list locally.
+///
+/// 1. First segment when it is NOT a registered channel — treat as a
+///    candidate `profile_id` and match `tenant` / `cloud` exactly
+///    (case-insensitive, trimmed) or anything starting with
+///    `tenant-` / `cloud-`. This catches the `with_profile` /
+///    `with_profile_topic` shape (`tenant-a:api:…`,
+///    `tenant--child:api:…`, `cloud--root:api:…`, `tenant-a:line:…`).
+/// 2. Second-of-three segment when it equals exactly `tenant` or
+///    `cloud` AND the 1st segment is NOT a registered channel —
+///    catches the M12-G soak shape `{profile}:tenant:{chat}` /
+///    `{profile}:cloud:{chat}` (`coding:tenant:m12-negative`,
+///    `m12solo:cloud:m12-negative`). The match is EXACT (no
+///    `starts_with`) so chat-id text like `_main:api:tenant-demo` is
+///    not affected (2nd slot there is `api`, a registered channel,
+///    so the structural form there is `profile=_main`, `channel=api`,
+///    `chat=tenant-demo`). The 1st-segment guard also prevents the
+///    false positive on legacy `{channel}:{chat_id_with_colons}`
+///    sessions like `local:tenant:123` where the chat-id text itself
+///    contains `tenant:`.
+///
+/// Codex review history on #1167:
+/// - P2 round 1: restrict the scan to STRUCTURAL slots (chat-id text
+///   is arbitrary; `local:cloud-migration` is legitimate).
+/// - P1 round 2: also catch the soak's `{profile}:tenant:{chat}` shape
+///   where `tenant`/`cloud` sits in the channel slot.
+/// - P2 round 2: the channel-slot check must NOT fire when the 1st
+///   segment is a registered channel — that's a legacy
+///   `{channel}:{chat_id_with_colons}` session, not a tenant scope.
+/// - P1 round 3: don't rely on `SessionKey::profile_id()` — it returns
+///   `None` for profiled sessions on channels that aren't in the core
+///   recognition list (`line`, `wechat`, …), so the gate must parse
+///   the first segment with the full registered-channel set locally.
+fn session_id_encodes_non_solo_scope(session_id: &SessionKey) -> bool {
+    fn token_marks_non_solo(raw: &str) -> bool {
+        let token = raw.trim().to_ascii_lowercase();
+        token == "tenant"
+            || token == "cloud"
+            || token.starts_with("tenant-")
+            || token.starts_with("cloud-")
+    }
+
+    let mut parts = session_id.base_key().splitn(3, ':');
+    let first = parts.next();
+    let second = parts.next();
+    let third = parts.next();
+
+    // (1) Candidate profile_id slot: 1st segment when it is NOT a
+    // registered channel name. This is structural — chat-id text
+    // cannot occupy this slot because a 2-segment base key with a
+    // registered-channel 1st segment is a legacy
+    // `{channel}:{chat_id}` shape (and we don't read the 1st segment
+    // as profile_id in that case).
+    if let Some(first) = first {
+        if !is_registered_channel_name(first) && token_marks_non_solo(first) {
+            return true;
+        }
+
+        // (2) Channel-slot scope marker: 2nd segment when it equals
+        // exactly `tenant`/`cloud` AND the 1st segment is NOT a
+        // registered channel. The 1st-segment guard prevents the
+        // false positive on `local:tenant:123` where `tenant:123` is
+        // chat-id text.
+        if !is_registered_channel_name(first) {
+            if let (Some(second), Some(_third)) = (second, third) {
+                let channel_slot = second.trim().to_ascii_lowercase();
+                if channel_slot == "tenant" || channel_slot == "cloud" {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Registered gateway-channel name set used by
+/// `session_id_encodes_non_solo_scope` to distinguish a legacy
+/// `{channel}:{chat_id_with_colons}` session from a tenant-scoped
+/// `{profile}:tenant:{chat}` session. This is a SUPERSET of
+/// `octos_core::types::is_channel_name` — core's list omits
+/// feature-gated channels (`line`, `wechat`, `mock`) that the
+/// gateway / bus crates emit in `BusMessage.channel`. Codex round 4
+/// review (#1167) caught the gap: a legacy
+/// `SessionKey::new("line", "tenant:123")` whose chat-id text starts
+/// with `tenant:` would be misclassified as tenant-scoped without
+/// recognising `line` here. Keep in sync when new gateway channels
+/// are added.
+fn is_registered_channel_name(value: &str) -> bool {
+    matches!(
+        value,
+        "api"
+            | "cli"
+            | "discord"
+            | "email"
+            | "feishu"
+            | "line"
+            | "local"
+            | "matrix"
+            | "mock"
+            | "qq-bot"
+            | "slack"
+            | "system"
+            | "telegram"
+            | "test"
+            | "twilio"
+            | "wechat"
+            | "wecom"
+            | "wecom-bot"
+            | "whatsapp"
+    )
+}
+
 fn permission_selection_allowed(
     state: &AppState,
+    session_id: &SessionKey,
     selection: octos_core::ui_protocol::PermissionProfileSelection,
     approval_policy: Option<octos_agent::ApprovalPolicy>,
     requested_runtime_mode: Option<&str>,
@@ -5013,7 +5153,14 @@ fn permission_selection_allowed(
         _ => false,
     };
     let server_is_local = state.deployment_mode == crate::config::DeploymentMode::Local;
-    let effective_local = server_is_local && request_relaxes_to_solo;
+    // #1162: defense-in-depth. A session whose key encodes a non-solo
+    // tenant scope (e.g. `coding:tenant:m12-negative`) MUST tighten the
+    // gate even when the client omitted the `runtime_mode` override.
+    // The M12-G soak negative probe relies on this signal so a
+    // non-conforming client cannot slip dangerous mode past the policy
+    // boundary by simply leaving the override out.
+    let session_is_non_solo_scoped = session_id_encodes_non_solo_scope(session_id);
+    let effective_local = server_is_local && request_relaxes_to_solo && !session_is_non_solo_scoped;
 
     effective_local
         || (selection.mode != Mode::DangerFullAccess
@@ -5063,10 +5210,11 @@ fn permission_profile_list_result(
 ) -> octos_core::ui_protocol::PermissionProfileListResult {
     let store = session_permission_profiles();
     let current = store.get(&params.session_id);
+    let profiles = permission_profile_supported_selections(state, &params.session_id);
     octos_core::ui_protocol::PermissionProfileListResult {
         session_id: params.session_id,
         current,
-        profiles: permission_profile_supported_selections(state),
+        profiles,
     }
 }
 
@@ -5083,6 +5231,7 @@ fn permission_profile_set_result(
     let requested = params.update.apply_to(previous);
     if !permission_selection_allowed(
         state,
+        &params.session_id,
         requested,
         approval_policy,
         params.runtime_mode.as_deref(),
@@ -17787,6 +17936,306 @@ ignore = []
         )
         .expect("normalized solo override must still relax on Local");
         assert_eq!(solo_allowed.session_id, solo_session);
+    }
+
+    /// #1162 — M12-G regression. A session whose base key carries a
+    /// tenant/cloud scope marker in a structural slot (the
+    /// `with_profile` first slot OR the M12-G soak's `{profile}:tenant:`
+    /// channel-slot literal) on a Local server must reject
+    /// `danger_full_access` even when the client omits the
+    /// `runtime_mode` override. The explicit override (UPCR-2026-018 /
+    /// #1086) is the PRIMARY signal but a buggy / older / non-conforming
+    /// client may omit it; this defense-in-depth gate prevents a
+    /// tenant-scoped session from slipping dangerous mode past the
+    /// policy boundary by leaving the override out.
+    ///
+    /// Codex P1/P2 (#1167) review: chat-id text is arbitrary so the
+    /// gate must NOT key off colon-delimited chat-id segments. The
+    /// channel-slot check is EXACT (`== "tenant"` / `== "cloud"`) to
+    /// avoid false positives on legitimate chat-id text like
+    /// `_main:api:tenant-demo` (2nd slot there is `api`, not `tenant`).
+    #[test]
+    fn danger_full_access_rejected_for_non_cloud_tenant_per_1162() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+
+        for (label, session_id) in [
+            // profile_id-slot markers (`with_profile` shape).
+            (
+                "profile=tenant-a",
+                SessionKey::with_profile("tenant-a", "api", "m12-negative"),
+            ),
+            (
+                "profile=tenant--child",
+                SessionKey::with_profile("tenant--child", "api", "m12-negative"),
+            ),
+            (
+                "profile=cloud--root",
+                SessionKey::with_profile("cloud--root", "api", "m12-negative"),
+            ),
+            (
+                "profile=TENANT-A (case-insensitive)",
+                SessionKey::with_profile("TENANT-A", "api", "m12-negative"),
+            ),
+            (
+                "profile=tenant-a + topic suffix",
+                SessionKey::with_profile_topic("tenant-a", "api", "m12-negative", "research"),
+            ),
+            // M12-G soak shape: `{profile}:tenant:{chat}` /
+            // `{profile}:cloud:{chat}` — `tenant`/`cloud` sits in the
+            // channel slot. `SessionKey::profile_id()` returns `None`
+            // because neither is a registered channel name, so the
+            // helper has to detect the channel-slot literal directly.
+            (
+                "channel-slot=tenant (soak shape)",
+                SessionKey("coding:tenant:m12-negative".into()),
+            ),
+            (
+                "channel-slot=cloud (soak shape)",
+                SessionKey("m12solo:cloud:m12-negative".into()),
+            ),
+            (
+                "channel-slot=tenant + topic suffix",
+                SessionKey("coding:tenant:m12-negative#1747".into()),
+            ),
+            (
+                "channel-slot=TENANT (case-insensitive)",
+                SessionKey("coding:TENANT:m12-negative".into()),
+            ),
+            // Codex P1 round 3 (#1167) — profiled tenant sessions on
+            // channels that core's `is_channel_name` doesn't include
+            // (`line`, `wechat`, …). The gate must reject these too,
+            // so it can't rely solely on `SessionKey::profile_id()`
+            // (which returns `None` when the 2nd segment isn't in
+            // the recognition list).
+            (
+                "profile=tenant-a + channel=line",
+                SessionKey("tenant-a:line:room-1".into()),
+            ),
+            (
+                "profile=cloud--root + channel=wechat",
+                SessionKey("cloud--root:wechat:group-42".into()),
+            ),
+            (
+                "profile=tenant + channel=line",
+                SessionKey("tenant:line:room-1".into()),
+            ),
+        ] {
+            let denied = match permission_profile_set_result(
+                &local,
+                PermissionProfileSetParams {
+                    session_id: session_id.clone(),
+                    update: PermissionProfileUpdate {
+                        mode: Some(Mode::DangerFullAccess),
+                        network: Some(Network::Allow),
+                        approval_policy: Some("never".into()),
+                    },
+                    runtime_mode: None,
+                },
+            ) {
+                Err(err) => err,
+                Ok(ok) => panic!(
+                    "{label} ({session_id}): expected PERMISSION_DENIED but accepted: {ok:?}",
+                ),
+            };
+            assert_eq!(
+                denied.code,
+                rpc_error_codes::PERMISSION_DENIED,
+                "{label} ({session_id}) must return PERMISSION_DENIED",
+            );
+            assert_eq!(
+                denied.data.as_ref().and_then(|data| data.get("kind")),
+                Some(&json!("permission_profile_disallowed")),
+                "{label} ({session_id}) must report permission_profile_disallowed",
+            );
+        }
+    }
+
+    /// #1162 codex P2 review (#1167) — `permission/profile/list` MUST
+    /// honor the same session-scope gate as `permission/profile/set`,
+    /// or clients see `danger_full_access` advertised as a selectable
+    /// option that `set` then rejects. Tenant-scoped sessions omit it
+    /// from the list on a Local server; solo-scoped sessions keep it.
+    #[test]
+    fn danger_full_access_omitted_from_list_for_tenant_scoped_session_per_1162() {
+        use octos_core::ui_protocol::{PermissionProfileListParams, PermissionProfileMode as Mode};
+
+        let local = AppState::empty_for_tests();
+
+        let tenant_session = SessionKey::with_profile("tenant-a", "api", "m12-negative");
+        let tenant_listing = permission_profile_list_result(
+            &local,
+            PermissionProfileListParams {
+                session_id: tenant_session,
+            },
+        );
+        assert!(
+            !tenant_listing
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "tenant-scoped session must NOT advertise danger_full_access",
+        );
+
+        let solo_session = SessionKey("local:m12-positive".into());
+        let solo_listing = permission_profile_list_result(
+            &local,
+            PermissionProfileListParams {
+                session_id: solo_session,
+            },
+        );
+        assert!(
+            solo_listing
+                .profiles
+                .iter()
+                .any(|profile| profile.mode == Mode::DangerFullAccess),
+            "solo-scoped session on Local must keep advertising danger_full_access",
+        );
+    }
+
+    /// #1162 codex P2 review (#1167) — chat-id text must NOT trigger
+    /// the tenant gate. `SessionKey` treats chat IDs as arbitrary, so
+    /// a Local session whose chat-id text happens to contain `cloud-`
+    /// or `tenant-` (e.g. `local:cloud-migration`, `_main:api:tenant-demo`)
+    /// must keep the existing relaxed path.
+    ///
+    /// Codex P2 round 2 (#1167) additionally pins the legacy
+    /// `{channel}:{chat_id_with_colons}` case where `chat_id` itself
+    /// contains `tenant:` / `cloud:` (e.g. `local:tenant:123`,
+    /// `telegram:cloud:42`). The channel-slot check must guard against
+    /// this by requiring the 1st segment to NOT be a registered
+    /// channel before treating the 2nd segment as structural.
+    #[test]
+    fn danger_full_access_chat_id_text_does_not_trigger_tenant_gate_per_1162() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+
+        for raw_session_id in [
+            // chat-id contains `cloud-migration` / `tenant-demo` — must NOT
+            // be conflated with a tenant-scoped profile.
+            "local:cloud-migration",
+            "local:tenant-demo",
+            "_main:api:cloud-migration",
+            "_main:api:tenant-demo",
+            // Codex P2 round 2 — legacy `{channel}:{chat_id_with_colons}`
+            // session where the chat-id text itself contains `tenant:`/
+            // `cloud:`. `SessionKey::new("local", "tenant:123")` produces
+            // base key `local:tenant:123`; channel `local` is registered
+            // so this is a chat-id-with-colons case, NOT a tenant scope.
+            "local:tenant:123",
+            "local:cloud:456",
+            "telegram:tenant:789",
+            "matrix:cloud:!room:abc",
+            // Codex P2 round 4 — feature-gated channels (`line`,
+            // `wechat`, `mock`) must also be recognised so legacy
+            // `{channel}:{chat_id_with_colons}` on those gateways
+            // doesn't trip the tenant gate.
+            "line:tenant:123",
+            "wechat:cloud:456",
+            "mock:tenant:abc",
+        ] {
+            let session_id = SessionKey(raw_session_id.into());
+            permission_profile_set_result(
+                &local,
+                PermissionProfileSetParams {
+                    session_id: session_id.clone(),
+                    update: PermissionProfileUpdate {
+                        mode: Some(Mode::DangerFullAccess),
+                        network: Some(Network::Allow),
+                        approval_policy: Some("never".into()),
+                    },
+                    runtime_mode: None,
+                },
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "{raw_session_id}: chat-id text containing tenant/cloud-like \
+                     substrings must NOT trigger the tenant gate — got: {err:?}",
+                )
+            });
+            // Sanity: list still advertises DangerFullAccess for this
+            // session because the chat-id text is not a structural
+            // tenant signal.
+            let listing = permission_profile_list_result(
+                &local,
+                octos_core::ui_protocol::PermissionProfileListParams {
+                    session_id: session_id.clone(),
+                },
+            );
+            assert!(
+                listing
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.mode == Mode::DangerFullAccess),
+                "{raw_session_id}: chat-id text must NOT remove danger from list",
+            );
+        }
+    }
+
+    /// Sanity counterpart to #1162 — a tenant-scoped session must STILL
+    /// reject when the runtime_mode override also says tenant (so we
+    /// don't drift the existing #1086 contract) and a solo-scoped
+    /// session keeps the existing relaxed path. The cloud-tenant
+    /// "accepted" sanity case for #1162 is the existing
+    /// `permission_profile_handlers_are_server_owned_and_reject_danger_outside_local`
+    /// test (no override + Local server → accepts danger_full_access).
+    #[test]
+    fn danger_full_access_session_scope_gate_does_not_drift_existing_behavior_per_1162() {
+        use octos_core::ui_protocol::{
+            PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
+            PermissionProfileSetParams, PermissionProfileUpdate,
+        };
+
+        let local = AppState::empty_for_tests();
+
+        // Solo-scoped session_id on Local + no override → existing relaxed
+        // path keeps allowing danger_full_access. The new gate must not
+        // tighten this case.
+        let solo_session = SessionKey("m12solo:local:m12-positive#1747".into());
+        let allowed = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: solo_session.clone(),
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: None,
+            },
+        )
+        .expect("solo-scoped session_id on Local must keep allowing danger");
+        assert_eq!(allowed.session_id, solo_session);
+
+        // Tenant-scoped session_id + explicit `runtime_mode: "tenant"` → still
+        // rejected (no regression on #1086).
+        let tenant_session = SessionKey("coding:tenant:m12-negative#1747".into());
+        let denied = permission_profile_set_result(
+            &local,
+            PermissionProfileSetParams {
+                session_id: tenant_session,
+                update: PermissionProfileUpdate {
+                    mode: Some(Mode::DangerFullAccess),
+                    network: Some(Network::Allow),
+                    approval_policy: Some("never".into()),
+                },
+                runtime_mode: Some("tenant".into()),
+            },
+        )
+        .expect_err("tenant-scoped session + tenant override must still reject");
+        assert_eq!(denied.code, rpc_error_codes::PERMISSION_DENIED);
+        assert_eq!(
+            denied.data.as_ref().and_then(|data| data.get("kind")),
+            Some(&json!("permission_profile_disallowed"))
+        );
     }
 
     #[test]
