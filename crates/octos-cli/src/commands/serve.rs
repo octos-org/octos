@@ -678,6 +678,9 @@ impl ServeCommand {
             // leaked the task on any non-`process::exit(0)` shutdown
             // path.
             preview_sweeper: Some(preview_sweeper),
+            // M9 #679 phase A — runtime opt-in. PR-B will fork dual-write
+            // on this flag; PR-A leaves it plumbed but unused.
+            thread_store_authoritative: crate::api::read_thread_store_authoritative_env(),
         });
 
         if self.stdio {

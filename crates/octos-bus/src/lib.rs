@@ -14,6 +14,14 @@ pub mod media;
 pub mod resume_policy;
 pub mod session;
 
+/// M9 #679 phase A — append-only `(session, topic, thread)` event log.
+/// Gated behind the `thread-store-authoritative` cargo feature so PR-A
+/// scaffolding can land without making the module a hard dependency.
+/// PR-B (#679 phase B) converts the writer sites; PR-C deletes the
+/// legacy dual-write path after one release of fleet soak.
+#[cfg(feature = "thread-store-authoritative")]
+pub mod thread_store;
+
 #[cfg(feature = "api")]
 pub mod api_channel;
 #[cfg(feature = "discord")]

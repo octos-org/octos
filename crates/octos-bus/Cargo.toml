@@ -9,6 +9,14 @@ description = "Message bus, channels, and session management for octos gateway"
 [features]
 default = []
 api = ["axum"]
+# M9 #679 phase A — append-only `(session, topic, thread)` event log.
+# Gates compilation of `crate::thread_store`. Default off; PR-B will flip
+# writer sites onto it; PR-C deletes the legacy dual-write path after one
+# release of fleet soak. The runtime env var
+# `OCTOS_THREADSTORE_AUTHORITATIVE=1` controls opt-in behaviour at the
+# AppState level; this cargo feature controls whether the module is even
+# compiled into the binary.
+thread-store-authoritative = []
 telegram = ["teloxide"]
 discord = ["serenity"]
 slack = ["tokio-tungstenite"]

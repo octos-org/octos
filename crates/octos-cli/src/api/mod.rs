@@ -303,6 +303,31 @@ pub struct AppState {
     /// it. `None` in tests and code paths that don't spawn the
     /// sweeper.
     pub preview_sweeper: Option<PreviewSweeperHandle>,
+    /// M9 #679 phase A — runtime opt-in for the authoritative ThreadStore
+    /// event log. Read once at process startup from
+    /// `OCTOS_THREADSTORE_AUTHORITATIVE` ("1", "true", "yes", "on" — case
+    /// insensitive — flip it on). PR-A only plumbs the flag through
+    /// AppState; no writer site consumes it yet. PR-B (#679 phase B)
+    /// forks the dual-write path on this boolean; PR-C deletes the legacy
+    /// path after fleet soak. See
+    /// [`octos_bus::thread_store`] (compiled in when the
+    /// `thread-store-authoritative` cargo feature is on).
+    pub thread_store_authoritative: bool,
+}
+
+/// Read the `OCTOS_THREADSTORE_AUTHORITATIVE` env var. Treats `"1"`,
+/// `"true"`, `"yes"`, `"on"` (case-insensitive) as opt-in; everything else
+/// (including the var being unset) keeps the legacy `Session::messages`
+/// writer path. Public so the `serve` and `gateway` command entry points
+/// can call it directly without re-implementing the parse.
+pub fn read_thread_store_authoritative_env() -> bool {
+    std::env::var("OCTOS_THREADSTORE_AUTHORITATIVE")
+        .ok()
+        .map(|raw| {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            matches!(trimmed.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 impl AppState {
@@ -364,6 +389,10 @@ impl AppState {
             // sweeper either drive `sweep_expired_all` directly or
             // build their own `PreviewSweeperHandle::spawn(...)`.
             preview_sweeper: None,
+            // PR-A scaffolding: env-driven runtime opt-in. Tests default
+            // off so legacy `Session::messages` paths stay authoritative.
+            // PR-B will use this to fork dual-write behaviour.
+            thread_store_authoritative: false,
         }
     }
 }
