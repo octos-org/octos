@@ -492,8 +492,19 @@ async fn handle_webhook(
         }
     };
 
+    // Plaintext url_verification challenge — answer before requiring the
+    // event-signature headers, since Lark's setup probe may arrive without
+    // them. Encrypted url_verification (with `encrypt` field) is handled
+    // after signature verification + decryption below. See codex review on
+    // PR #1163.
+    let is_plaintext_url_verification = body_json.get("encrypt").is_none()
+        && body_json.get("type").and_then(|v| v.as_str()) == Some("url_verification");
+
     // Signature verification: fail-closed when encrypt_key is set (#862).
-    if let Some(ref ek) = state.encrypt_key {
+    // Skipped for plaintext url_verification (handled above).
+    if let Some(ref ek) = state.encrypt_key
+        && !is_plaintext_url_verification
+    {
         let timestamp = headers
             .get("X-Lark-Request-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -1989,6 +2000,42 @@ mod tests {
             "without a configured secret, unsigned webhooks remain accepted"
         );
         assert!(rx.try_recv().is_ok(), "event should be forwarded");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_url_verification_passes_without_headers_when_secret_set() {
+        // Lark's initial URL verification probe may arrive without signature
+        // headers even when an encrypt_key is configured. The handler must
+        // answer the challenge instead of rejecting it (codex finding on PR
+        // #1163). This only applies to plaintext url_verification — the
+        // encrypted variant still goes through the signature gate.
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[]);
+        let body = r#"{"type":"url_verification","challenge":"abc123"}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "plaintext url_verification must be answered even without signature headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_non_url_verification_without_encrypt_field_still_requires_signature() {
+        // Belt-and-suspenders: a plaintext payload that is NOT
+        // url_verification must still be rejected when signature headers
+        // are missing and a secret is configured.
+        let (state, _rx) = webhook_state_with_secret(Some("mykey"));
+        let headers = build_headers(&[]);
+        let body = r#"{"type":"event_callback","event":{}}"#;
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "plaintext event_callback must still be rejected when signature headers are missing"
+        );
     }
 
     #[tokio::test]
