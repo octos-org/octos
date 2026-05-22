@@ -1669,7 +1669,19 @@ impl Tool for ViewImageTool {
         // only catches a symlink AT the final path component, so a
         // symlinked PARENT directory (`workspace/link -> /outside`)
         // would otherwise let `view_image` read outside the workspace.
-        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, &self.base_dir) {
+        //
+        // #1153 codex P2: host-scope (DangerFullAccess) callers
+        // legitimately read paths outside the workspace. The
+        // ancestor walk's workspace stop would never be reached for
+        // e.g. `/tmp/foo.png` on macOS — the walk would refuse `/tmp`
+        // (which is a symlink on macOS). Pass None to skip the walk
+        // for host scope; the Unix `O_NOFOLLOW` leaf guard below still
+        // protects the final-component symlink case.
+        let ancestor_stop: Option<&std::path::Path> = match self.filesystem_scope {
+            FilesystemScope::Workspace => Some(self.base_dir.as_path()),
+            FilesystemScope::Host => None,
+        };
+        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, ancestor_stop) {
             Ok(pair) => pair,
             Err(error) => {
                 return Ok(ToolResult {
@@ -1749,9 +1761,20 @@ impl Tool for ViewImageTool {
 /// symlink/reparse point. The walk stops at the workspace root
 /// (inclusive) so we never traverse system roots. The Unix
 /// `O_NOFOLLOW` flag is retained as defense in depth for the leaf.
+///
+/// `workspace_root` is `Some(path)` for workspace-scoped callers
+/// (the ancestor walk stops at that path); pass `None` for host-
+/// scoped callers (DangerFullAccess `FilesystemScope::Host`), where
+/// the resolved path can legitimately live outside the workspace —
+/// in that case ancestors like `/tmp` (a symlink on macOS) MUST NOT
+/// reject the read. Codex review on #1153 caught this regression:
+/// without the `Option` the workspace stop was never reached for a
+/// host path so the walk hit `/tmp` and refused. Host-scope callers
+/// still get the Unix `O_NOFOLLOW` leaf guard below as defense in
+/// depth against the final-component symlink.
 fn read_image_header_no_follow(
     resolved: &std::path::Path,
-    workspace_root: &std::path::Path,
+    workspace_root: Option<&std::path::Path>,
 ) -> std::io::Result<(Vec<u8>, u64)> {
     use std::io::Read;
     const HEADER_BYTES: usize = 512;
@@ -1761,7 +1784,13 @@ fn read_image_header_no_follow(
     // closes the Unix parent-symlink gap AND the Windows post-open
     // gap in one shot. The leaf check also acts as the Windows
     // symlink rejection (Unix still has O_NOFOLLOW below).
-    reject_symlink_ancestors(resolved, workspace_root)?;
+    //
+    // Skipped entirely for host-scope (workspace_root=None) because
+    // the resolved path is outside the workspace and the walk would
+    // hit system symlinks (e.g. `/tmp` on macOS).
+    if let Some(root) = workspace_root {
+        reject_symlink_ancestors(resolved, root)?;
+    }
 
     #[cfg(unix)]
     let file = {
@@ -2473,6 +2502,41 @@ mod tests {
         let meta = result.structured_metadata.expect("structured metadata");
         assert_eq!(meta["codex_tool"], json!("view_image"));
         assert_eq!(meta["format"], json!("png"));
+    }
+
+    /// Codex review #1153 P2 regression: `FilesystemScope::Host` (granted via
+    /// `DangerFullAccess`) lets `view_image` read images outside the
+    /// workspace. Pre-fix, the helper passed `self.base_dir` as the
+    /// ancestor-walk stop unconditionally. For a host path like `/tmp/foo.png`
+    /// on macOS, the walk never reached the workspace and refused `/tmp`
+    /// (which is a symlink to `/private/tmp` on macOS). Now host-scope skips
+    /// the ancestor walk entirely; the Unix O_NOFOLLOW leaf guard still
+    /// protects the final-component symlink case.
+    #[tokio::test]
+    async fn view_image_host_scope_accepts_path_outside_workspace_per_1153() {
+        // Build a host path under a SECOND tempdir so it's outside `base_dir`.
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let png = outside.path().join("host.png");
+        std::fs::write(&png, PNG_MAGIC).expect("write png");
+
+        let tool = ViewImageTool::new(workspace.path())
+            .with_filesystem_scope(FilesystemScope::Host);
+
+        // Absolute path: host scope must accept it even though it lives
+        // outside `workspace.path()`.
+        let result = tool
+            .execute(&json!({ "path": png.to_string_lossy() }))
+            .await
+            .expect("view_image runs");
+
+        assert!(
+            result.success,
+            "host-scope view_image must accept paths outside the workspace; got error: {}",
+            result.output
+        );
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        assert_eq!(payload["format"], json!("png"));
     }
 
     #[tokio::test]
