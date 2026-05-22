@@ -12,8 +12,12 @@
 #      HEAD~1) -> still gated because diff-range covers merge-base..HEAD.
 #   5. Whitespace-only protocol diff -> exempt (exit 0).
 #   6. Untracked UPCR file with staged protocol change -> exit 0.
-#   7. Spec revision instead of UPCR doc -> exit 0.
+#   7. Spec-only edit (no Rust protocol diff) -> exit 0 (self-coverage).
 #   8. UPCR_ALLOW_NO_DOC=1 override -> exit 0 even without a UPCR doc.
+#   9. Renamed protocol file with edits -> still gated (codex #2).
+#  10. Rust protocol change + unrelated spec edit + no UPCR -> exit non-zero
+#      (codex #3 — spec-as-coverage bypass closed for code-level changes).
+#  11. No base ref resolvable -> exit non-zero (codex #1 — closes CI bypass).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -37,7 +41,10 @@ fail() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
 # Make a throwaway git repo seeded with the placeholder protocol + spec
 # files that the gate inspects, so "no change" is a sane baseline.
+# Optional first argument disables the origin/main pointer so the
+# missing-base-ref scenarios can exercise that failure path.
 make_repo() {
+  local set_origin="${1:-1}"
   local dir
   dir="$(mktemp -d /tmp/upcr-gate-test.XXXXXX)"
   (
@@ -53,17 +60,23 @@ make_repo() {
 
     printf '// baseline\n' > crates/octos-core/src/ui_protocol.rs
     printf '// baseline\n' > crates/octos-cli/src/api/ui_protocol.rs
+    printf 'pub fn old() {}\n' > crates/octos-cli/src/api/ui_protocol_alpha.rs
     printf '# spec baseline\n' > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
     printf '# placeholder\n' > docs/.keep
 
     git add -A
     git commit --quiet -m "baseline"
 
-    # Pretend main is also our upstream so resolve_base_ref picks it up.
-    git update-ref refs/remotes/origin/main HEAD
-
-    # Create a feature branch for the case under test.
-    git checkout --quiet -b feature
+    if [ "$set_origin" = "1" ]; then
+      # Pretend main is also our upstream so resolve_base_ref picks it up.
+      git update-ref refs/remotes/origin/main HEAD
+      git checkout --quiet -b feature
+    else
+      # Move HEAD off main so the script can't find a base ref via
+      # main/origin/main and there is nowhere to merge-base against.
+      git checkout --quiet -b orphan
+      git branch --quiet -D main
+    fi
   )
   printf '%s\n' "$dir"
 }
@@ -90,9 +103,8 @@ scenario_protocol_plus_upcr() {
     git add -A
     git commit --quiet -m "feat: extend protocol + upcr"
   )
-  local out status
-  out="$(run_gate "$dir" 2>&1)"
-  status=$?
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
   if [ "$status" -eq 0 ] && grep -q "UPCR coverage" <<<"$out"; then
     pass "protocol + UPCR -> exit 0 with coverage line"
   else
@@ -217,23 +229,23 @@ scenario_uncommitted_upcr() {
   rm -rf "$dir"
 }
 
-# Scenario 7: protocol spec revision satisfies gate when no UPCR doc exists.
-scenario_spec_change() {
+# Scenario 7: spec-only edit (no Rust protocol diff) -> exit 0 (self-coverage).
+scenario_spec_only_self_coverage() {
   local dir
   dir="$(make_repo)"
   (
     cd "$dir"
-    printf '// extend\n' > crates/octos-core/src/ui_protocol.rs
-    printf '# spec v2\n' > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+    printf '# spec v2 (text update)\nfoo bar baz\n' \
+      > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
     git add -A
-    git commit --quiet -m "spec: extend"
+    git commit --quiet -m "spec: clarify wording"
   )
   local out status=0
   out="$(run_gate "$dir" 2>&1)" || status=$?
-  if [ "$status" -eq 0 ] && grep -q "protocol spec coverage" <<<"$out"; then
-    pass "spec revision satisfies gate"
+  if [ "$status" -eq 0 ] && grep -q "self-coverage" <<<"$out"; then
+    pass "spec-only edit -> exit 0 (self-coverage)"
   else
-    fail "spec revision: status=$status output=$out"
+    fail "spec-only: status=$status output=$out"
   fi
   rm -rf "$dir"
 }
@@ -258,6 +270,75 @@ scenario_reviewer_override() {
   rm -rf "$dir"
 }
 
+# Scenario 9: renamed protocol file with edits -> still gated (codex #2).
+# A rename with content edits in the new path is a protocol-visible change.
+scenario_renamed_protocol_file() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    git mv crates/octos-cli/src/api/ui_protocol_alpha.rs \
+           crates/octos-cli/src/api/ui_protocol_beta.rs
+    # Add content so it's a rename-with-edit (R<100).
+    printf 'pub fn old() {}\npub fn new_wire() {}\n' \
+      > crates/octos-cli/src/api/ui_protocol_beta.rs
+    git add -A
+    git commit --quiet -m "refactor: rename alpha -> beta"
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out"; then
+    pass "renamed protocol file is gated (rename detection)"
+  else
+    fail "renamed protocol file: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+# Scenario 10: Rust protocol change + unrelated spec edit + no UPCR -> fail
+# (codex #3 — spec-as-coverage must NOT satisfy the gate when code changed).
+scenario_unrelated_spec_does_not_cover_code() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    printf '// added v2 field\n' > crates/octos-core/src/ui_protocol.rs
+    printf '# spec baseline\n\nTypo fix.\n' \
+      > api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md
+    git add -A
+    git commit --quiet -m "feat: extend + spec typo"
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out" \
+       && grep -q "spec edit alone does NOT" <<<"$out"; then
+    pass "unrelated spec edit does not satisfy gate for code-level diff"
+  else
+    fail "unrelated spec coverage bypass: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
+# Scenario 11: no base ref resolvable -> exit non-zero (codex #1).
+scenario_no_base_ref_fails() {
+  local dir
+  dir="$(make_repo 0)"
+  (
+    cd "$dir"
+    printf '// extend\n' > crates/octos-core/src/ui_protocol.rs
+    git add -A
+    git commit --quiet -m "feat: extend"
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "could not resolve a base ref" <<<"$out"; then
+    pass "missing base ref fails loud (no silent CI bypass)"
+  else
+    fail "missing base ref: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
 echo "==> check-ui-protocol-upcr.sh scenario tests"
 echo "  target: $TARGET"
 
@@ -267,8 +348,11 @@ scenario_no_protocol
 scenario_split_commits_bypass
 scenario_whitespace_only
 scenario_uncommitted_upcr
-scenario_spec_change
+scenario_spec_only_self_coverage
 scenario_reviewer_override
+scenario_renamed_protocol_file
+scenario_unrelated_spec_does_not_cover_code
+scenario_no_base_ref_fails
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"

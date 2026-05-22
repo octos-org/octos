@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 # Ensure protocol-visible edits are paired with an explicit UI Protocol change
-# request (UPCR) doc or a protocol spec revision. Compares the current branch
-# against a base ref (default: origin/main, falling back to main) using
-# `git diff --name-only --diff-filter=AM` so the check covers committed work,
-# including changes the user split across multiple commits. Uncommitted
-# changes (staged + unstaged + untracked) are folded in so the gate behaves
-# correctly when run pre-commit. Whitespace-only diffs are exempted via
-# `git diff -w --stat`.
+# request (UPCR) doc. Compares the current branch against a base ref
+# (default: origin/main, falling back to main / origin/master / master) using
+# `git diff --name-status --diff-filter=AMR <merge-base>..HEAD` so the check
+# covers committed work — including changes the user split across multiple
+# commits and rename-with-edit moves where the destination is the file we
+# care about. Uncommitted changes (staged + unstaged + untracked) are folded
+# in so the gate behaves correctly when run pre-commit. Whitespace-only diffs
+# are exempted via `git diff -w --stat`.
+#
+# Coverage rules:
+#   * Any change to a *.rs protocol file requires an added/modified
+#     `docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md` in the same diff
+#     range. Editing the spec doc alone does NOT satisfy this because the
+#     spec edit may be unrelated (typo fix, broken link, etc.).
+#   * If the only protocol-visible change is the spec doc itself, the spec
+#     change is self-coverage.
+#   * `UPCR_ALLOW_NO_DOC=1` is a reviewer-override escape hatch.
+#
+# If neither a base ref nor a merge-base can be resolved, the gate refuses
+# to run rather than silently checking only uncommitted state — that
+# behaviour was the bypass closed by #717.
 
 set -euo pipefail
 
@@ -27,8 +41,14 @@ UPCR_TEMPLATE="docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md"
 # Resolve a base ref for the merge-base diff. Allow override via UPCR_BASE_REF.
 resolve_base_ref() {
   if [ -n "${UPCR_BASE_REF:-}" ]; then
-    printf '%s\n' "$UPCR_BASE_REF"
-    return 0
+    if git rev-parse --verify --quiet "$UPCR_BASE_REF" >/dev/null; then
+      printf '%s\n' "$UPCR_BASE_REF"
+      return 0
+    fi
+    cat >&2 <<EOF
+ui-protocol-upcr: UPCR_BASE_REF='$UPCR_BASE_REF' does not resolve in this checkout.
+EOF
+    return 2
   fi
   for candidate in origin/main main origin/master master; do
     if git rev-parse --verify --quiet "$candidate" >/dev/null; then
@@ -39,44 +59,90 @@ resolve_base_ref() {
   return 1
 }
 
-base_ref=""
-if base_ref="$(resolve_base_ref)"; then
+resolve_status=0
+base_ref="$(resolve_base_ref)" || resolve_status=$?
+
+merge_base=""
+if [ "$resolve_status" -eq 0 ] && [ -n "$base_ref" ]; then
   merge_base="$(git merge-base "$base_ref" HEAD 2>/dev/null || true)"
-else
-  merge_base=""
 fi
 
-# Names that changed between merge-base and HEAD (committed work),
-# restricted to Added/Modified (filters out renames/deletes whose new path
-# is what we actually care about). Whitespace-only changes are stripped via
-# `git diff -w --stat` -> empty stat means no semantic change.
+# If we cannot establish a merge-base for the committed range, fail loud.
+# This used to silently skip the committed-range check, which was a CI
+# bypass on shallow / single-branch checkouts (#717 codex review #1).
+# The fallback for environments that legitimately have no base ref is
+# `UPCR_ALLOW_NO_DOC=1` (already documented as the reviewer override).
+if [ -z "$merge_base" ]; then
+  if [ "${UPCR_ALLOW_NO_DOC:-0}" = "1" ]; then
+    printf 'ui-protocol-upcr: no base ref available; allowed by reviewer override\n'
+    exit 0
+  fi
+  cat >&2 <<'EOF'
+ui-protocol-upcr: could not resolve a base ref for the diff (tried origin/main,
+main, origin/master, master). The gate refuses to run with only uncommitted
+state because that lets committed protocol changes slip through CI.
+
+Fix: fetch origin/main (e.g. `git fetch --no-tags origin main`), or set
+UPCR_BASE_REF=<sha-or-ref>, or set UPCR_ALLOW_NO_DOC=1 only for a documented
+reviewer override.
+EOF
+  exit 2
+fi
+
+range="$merge_base..HEAD"
+
+# Emit destination paths from `git diff --name-status` in the committed
+# range. `--diff-filter=AMR` keeps Added / Modified / Renamed entries; for
+# renames the trailing column is the destination, which is what we want
+# (we care about the file that lives in the working tree at HEAD, not the
+# pre-rename path). Whitespace-only changes are filtered by re-running
+# `git diff -w --stat` on each candidate and dropping those with empty stat.
 diff_range_names() {
   local range="$1"
-  shift || true
+  shift
   if [ -z "$range" ]; then
     return 0
   fi
-  # First collect candidate names by AM filter, then re-confirm via -w --stat.
-  local candidates
-  candidates="$(git diff --name-only --diff-filter=AM "$range" -- "$@" 2>/dev/null || true)"
-  if [ -z "$candidates" ]; then
+  local raw
+  raw="$(git diff --name-status --diff-filter=AMR "$range" -- "$@" 2>/dev/null || true)"
+  if [ -z "$raw" ]; then
     return 0
   fi
-  local name
-  while IFS= read -r name; do
+  local line code src dst name
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    code="$(printf '%s' "$line" | awk '{print $1}')"
+    case "$code" in
+      R*)
+        # Format: "R100<TAB>old/path<TAB>new/path"
+        src="$(printf '%s' "$line" | awk '{print $2}')"
+        dst="$(printf '%s' "$line" | awk '{print $3}')"
+        # If the new path is one of the protocol paths, count it.
+        name="$dst"
+        ;;
+      *)
+        name="$(printf '%s' "$line" | awk '{print $2}')"
+        ;;
+    esac
     [ -z "$name" ] && continue
     local stat
+    # For renames the diff is between src and dst; only the dst path is
+    # tracked at HEAD, so diff on the dst path captures the post-rename
+    # content delta. Pure renames (no edit) will have an empty stat under
+    # `-w` because there is no in-content change.
     stat="$(git diff -w --stat "$range" -- "$name" 2>/dev/null || true)"
+    if [ -z "$stat" ] && [ "${code:0:1}" = "R" ]; then
+      # Pure rename of a protocol file is itself a protocol-visible event
+      # (consumers track file paths). Treat as a change regardless of -w.
+      stat="rename"
+    fi
     if [ -n "$stat" ]; then
       printf '%s\n' "$name"
     fi
-  done <<<"$candidates"
+  done <<<"$raw"
 }
 
 # Uncommitted change names (staged + unstaged + untracked) for matching paths.
-# Uses `git status --porcelain` so we still gate pre-commit work, but the
-# whitespace filter only applies to tracked changes (untracked files are by
-# definition new content).
 uncommitted_names() {
   local entries
   entries="$(git status --porcelain --untracked-files=all -- "$@" 2>/dev/null || true)"
@@ -93,7 +159,7 @@ uncommitted_names() {
       path="${path##* -> }"
     fi
     case "$status_code" in
-      "??"|"A "|"AM"|" A")
+      "??"|"A "|"AM"|" A"|R*)
         printf '%s\n' "$path"
         ;;
       *)
@@ -119,26 +185,20 @@ collect_names() {
   } | awk 'NF && !seen[$0]++'
 }
 
-range=""
-if [ -n "$merge_base" ]; then
-  range="$merge_base..HEAD"
-fi
+# Split changes into code-level (Rust source) and spec-doc buckets so the
+# coverage rules can treat them differently. Codex review #3 (#717): an
+# unrelated spec edit must not satisfy the gate for a code-level diff.
+code_changes="$(collect_names "$range" "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}")"
+spec_changes="$(collect_names "$range" "$SPEC_GLOB")"
 
-protocol_changes="$(collect_names "$range" "${PROTOCOL_PATHS[@]}" "${PROTOCOL_GLOBS[@]}" "$SPEC_GLOB")"
-
-if [ -z "$protocol_changes" ]; then
+if [ -z "$code_changes" ] && [ -z "$spec_changes" ]; then
   printf 'ui-protocol-upcr: no protocol-visible edits detected\n'
   exit 0
 fi
 
 upcr_changes="$(collect_names "$range" "$UPCR_GLOB" "$UPCR_TEMPLATE")"
-spec_changes="$(collect_names "$range" "$SPEC_GLOB")"
 
-# Sanity-check: at least one UPCR file looks like a real UPCR-YYYY-NNN doc
-# (i.e. matches docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md). The collect
-# step already restricts to that glob, but we re-verify the name pattern here
-# so a stray match (e.g. someone renaming the template) can't satisfy the
-# gate by accident.
+# Verify the matched UPCR file looks like a real UPCR-YYYY-NNN doc.
 upcr_real=""
 while IFS= read -r name; do
   [ -z "$name" ] && continue
@@ -155,8 +215,9 @@ if [ -n "$upcr_real" ]; then
   exit 0
 fi
 
-if [ -n "$spec_changes" ]; then
-  printf 'ui-protocol-upcr: protocol edits have protocol spec coverage\n'
+# No UPCR doc. Spec-only changes are self-coverage; otherwise fail.
+if [ -z "$code_changes" ] && [ -n "$spec_changes" ]; then
+  printf 'ui-protocol-upcr: spec-only edit, treated as self-coverage\n'
   exit 0
 fi
 
@@ -168,13 +229,20 @@ fi
 cat >&2 <<EOF
 ui-protocol-upcr: protocol-visible edits require a UPCR document.
 
-Detected protocol changes (range: ${range:-uncommitted only}):
+Detected code-level protocol changes (range: $range):
 EOF
-printf '  %s\n' $protocol_changes >&2
+printf '  %s\n' $code_changes >&2
+if [ -n "$spec_changes" ]; then
+  cat >&2 <<EOF
+
+Spec-doc changes are also present, but a spec edit alone does NOT satisfy the
+gate when Rust protocol surfaces have changed — it could be an unrelated fix.
+Add an explicit UPCR doc that references this change.
+EOF
+fi
 cat >&2 <<'EOF'
 
-Add or update docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md (or revise the
-api/OCTOS_UI_PROTOCOL_V1_SPEC_*.md spec) in the same branch, or set
-UPCR_ALLOW_NO_DOC=1 only for a documented reviewer override.
+Add or update docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md in the same
+branch, or set UPCR_ALLOW_NO_DOC=1 only for a documented reviewer override.
 EOF
 exit 1
