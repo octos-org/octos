@@ -1307,9 +1307,32 @@ impl Tool for SpawnAgentTool {
         // already mirrors the agent_type alias to `role` for the wire
         // payload; this hoist mirrors it for the boundary-side
         // template injection too.
-        let role_template = match args.get("role").and_then(Value::as_str).map(str::trim) {
+        // Issue #971 codex round-4 P3 (follow-up to PR #1177): trim AND
+        // lowercase the caller-supplied role before lookup so case-
+        // sloppy spellings (e.g. `role: "Reviewer"`, `role: " Reviewer "`,
+        // or the display label models sometimes echo back) canonicalize
+        // through the registry instead of returning `unknown_role`.
+        // `RoleTemplate::for_name` is case-sensitive (the registry's
+        // canonical names are all lower-case), so the normalization
+        // has to happen at the boundary.
+        //
+        // Issue #971 codex round-5 P2 follow-up: also normalize space
+        // and hyphen separators to underscore so display labels like
+        // `"Test Worker"` / `"Test-Worker"` map to the canonical
+        // `"test_worker"` key. The registry's canonical names use
+        // snake_case; display labels use Title Case with spaces, and
+        // models commonly echo back the display label. Without this
+        // additional normalization, `role: "Test Worker"` would
+        // lowercase to `"test worker"` and still miss the exact-name
+        // lookup.
+        let role_template = match args
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(|s| s.to_ascii_lowercase().replace(['-', ' '], "_"))
+        {
             Some(name) if !name.is_empty() => {
-                match crate::role_template::RoleTemplate::for_name(name) {
+                match crate::role_template::RoleTemplate::for_name(&name) {
                     Some(template) => Some(template),
                     None => {
                         let registered: Vec<&str> = crate::role_template::RoleTemplate::all()
@@ -2332,20 +2355,33 @@ impl Tool for DelegateAliasTool {
             });
         };
 
-        // Build the effective spawn payload: fold the role's prompt
-        // prefix into the task and pass the role + allowed_tools budget
-        // through so the supervisor / orchestrator can advertise them.
-        let task_prompt = if template.prompt_prefix.is_empty() {
-            task.to_string()
-        } else {
-            format!("{}\n\n{}", template.prompt_prefix, task)
-        };
+        // Issue #971 codex round-5 P2 fix: the prior `delegate`
+        // implementation manually prepended `template.prompt_prefix`
+        // to the task here AND forwarded `role` to `spawn_agent`,
+        // which then prepended the same prefix again through
+        // `spawn.rs::apply_role_template` — the child received the
+        // role's guardrails twice. Forwarding `role` is enough; the
+        // native delegate path is the authoritative single source of
+        // truth for the prefix prepend.
+        let task_prompt = task.to_string();
+        // Issue #971 codex round-4 P2 (follow-up to PR #1177): the
+        // `delegate` wrapper used to ship raw `template.allowed_tools`
+        // (a slice containing `group:*` identifiers) inside `spawn_args`.
+        // The downstream `spawn_agent` boundary treats any non-empty
+        // `allowed_tools` array as an inline override and SKIPS the
+        // `to_spawn_compatible_allow()` expansion, so the raw group
+        // entries reached the native `SpawnTool::ensure_subagent_tools_available`
+        // check and every `delegate({"role": <runtime/read-only role>})`
+        // call failed with "required tool not available: group:search".
+        // Pre-expand here so the override path receives the same
+        // spawn-compatible, exact-name list the explicit-role path
+        // gets.
         let spawn_args = json!({
             "task": task_prompt,
             "label": format!("delegate-{}", template.name),
             "mode": "background",
             "role": template.name,
-            "allowed_tools": template.allowed_tools,
+            "allowed_tools": template.to_spawn_compatible_allow(),
         });
 
         let before: HashSet<String> = supervisor
@@ -4173,6 +4209,285 @@ mod tests {
             json!(crate::role_template::ROLE_REVIEWER),
             "spawn payload MUST carry the trimmed canonical role name"
         );
+    }
+
+    /// Issue #971 codex round-4 P3 follow-up to PR #1177: case-sloppy
+    /// explicit role values (`"Reviewer"`, `"  REVIEWER  "`, the
+    /// display labels models sometimes echo back) MUST canonicalize
+    /// to the registered lower-case name instead of returning
+    /// `unknown_role`. The registry's canonical names are all
+    /// lower-case, so the boundary lowercases the trimmed input
+    /// before lookup.
+    #[tokio::test]
+    async fn m14_c_wiring_role_lookup_is_case_insensitive_per_971() {
+        for spelling in ["Reviewer", "REVIEWER", "  Reviewer  ", " reviewer "] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut registry = ToolRegistry::with_builtins(temp.path());
+            registry.register(FakeSpawnTool);
+            let supervisor = registry.supervisor();
+            let ctx = ToolContext {
+                task_supervisor: Some(supervisor.clone()),
+                parent_session_key: Some("api:test".to_string()),
+                ..ToolContext::zero()
+            };
+            let result = registry
+                .execute_with_context(
+                    &ctx,
+                    "spawn_agent",
+                    &json!({
+                        "message": "audit PR #1234",
+                        "role": spelling,
+                    }),
+                )
+                .await
+                .expect("spawn_agent");
+            assert!(
+                result.success,
+                "spawn_agent must accept case-sloppy role {spelling:?}; output={:?}",
+                result.output,
+            );
+            let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+            let agent_id = payload["agent_id"].as_str().expect("agent id");
+            let task = supervisor.get_task(agent_id).expect("task registered");
+            assert_eq!(
+                task.role.as_deref(),
+                Some(crate::role_template::ROLE_REVIEWER),
+                "role={spelling:?} must canonicalize to ROLE_REVIEWER",
+            );
+            let input = task.tool_input.expect("tool input recorded");
+            assert_eq!(
+                input["role"],
+                json!(crate::role_template::ROLE_REVIEWER),
+                "spawn payload must carry the canonical lower-case role name for {spelling:?}",
+            );
+        }
+    }
+
+    /// Issue #971 codex round-5 P2 follow-up: display labels and
+    /// hyphen-separated spellings must canonicalize to the
+    /// underscore-keyed registry name. The advertised `Test Worker`
+    /// display label MUST resolve to `test_worker`; the registry
+    /// key is snake_case and `RoleTemplate::for_name` is exact-name,
+    /// so the boundary normalizes both ` ` and `-` to `_` after
+    /// lowercase + trim.
+    #[tokio::test]
+    async fn m14_c_wiring_display_label_role_normalizes_to_registry_key_per_971() {
+        for (spelling, canonical) in [
+            ("Test Worker", crate::role_template::ROLE_TEST_WORKER),
+            ("Test-Worker", crate::role_template::ROLE_TEST_WORKER),
+            ("TEST WORKER", crate::role_template::ROLE_TEST_WORKER),
+            ("  test-worker  ", crate::role_template::ROLE_TEST_WORKER),
+            ("Implementer", crate::role_template::ROLE_IMPLEMENTER),
+            ("Explorer", crate::role_template::ROLE_EXPLORER),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut registry = ToolRegistry::with_builtins(temp.path());
+            registry.register(FakeSpawnTool);
+            let supervisor = registry.supervisor();
+            let ctx = ToolContext {
+                task_supervisor: Some(supervisor.clone()),
+                parent_session_key: Some("api:test".to_string()),
+                ..ToolContext::zero()
+            };
+            let result = registry
+                .execute_with_context(
+                    &ctx,
+                    "spawn_agent",
+                    &json!({
+                        "message": "audit",
+                        "role": spelling,
+                    }),
+                )
+                .await
+                .expect("spawn_agent");
+            assert!(
+                result.success,
+                "spawn_agent must accept display-label role {spelling:?}; output={:?}",
+                result.output,
+            );
+            let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+            let agent_id = payload["agent_id"].as_str().expect("agent id");
+            let task = supervisor.get_task(agent_id).expect("task registered");
+            assert_eq!(
+                task.role.as_deref(),
+                Some(canonical),
+                "role={spelling:?} must canonicalize to {canonical}",
+            );
+            let input = task.tool_input.expect("tool input recorded");
+            assert_eq!(
+                input["role"],
+                json!(canonical),
+                "spawn payload must carry the canonical role key for {spelling:?}",
+            );
+        }
+    }
+
+    /// Issue #971 codex round-4 P2 follow-up to PR #1177: the
+    /// `delegate` wrapper used to ship raw `template.allowed_tools`
+    /// (with `group:*` identifiers) inside its `spawn_agent` invocation.
+    /// `spawn_agent` then treated the non-empty array as an inline
+    /// override and skipped `to_spawn_compatible_allow()`, so the
+    /// raw group entries reached the native spawn tool's availability
+    /// check and the call failed with `required tool not available:
+    /// group:search`. This guard pins the fix: `delegate` now
+    /// pre-expands the template's allow-list before the override
+    /// path fires.
+    ///
+    /// Uses the same completer pattern as
+    /// `delegate_spawns_waits_and_returns_artifacts` so the test
+    /// doesn't time out waiting for the FakeSpawnTool task to finish.
+    #[tokio::test]
+    async fn m14_c_wiring_delegate_pre_expands_role_allow_list_per_971() {
+        use crate::role_template::ROLE_REVIEWER;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let supervisor_for_completer = supervisor.clone();
+        let completer = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Some(task) = supervisor_for_completer
+                    .get_all_tasks()
+                    .into_iter()
+                    .find(|task| task.tool_name == "spawn" || task.tool_name == "spawn_agent")
+                {
+                    supervisor_for_completer.mark_completed(&task.id, vec![]);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "delegate",
+                &json!({
+                    "role": "reviewer",
+                    "task": "audit PR #1234",
+                    "timeout_ms": 5_000,
+                }),
+            )
+            .await
+            .expect("delegate");
+        let _ = completer.await;
+        assert!(
+            result.success,
+            "delegate must succeed; output={:?}",
+            result.output,
+        );
+        // Pull the spawn task — the only registered task in this
+        // isolated registry.
+        let task = supervisor
+            .get_all_tasks()
+            .into_iter()
+            .find(|t| t.tool_name == "spawn" || t.tool_name == "spawn_agent")
+            .expect("task registered");
+        let input = task.tool_input.expect("tool input recorded");
+        let allowed = input["allowed_tools"]
+            .as_array()
+            .expect("allowed_tools array on delegate spawn payload");
+        let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+        // Codex round-4 P2 guard: no raw `group:*` identifiers on
+        // the wire — the delegate now pre-expands through
+        // `to_spawn_compatible_allow`.
+        for entry in &allowed {
+            assert!(
+                !entry.starts_with("group:"),
+                "delegate spawn payload MUST NOT contain raw group identifier {entry:?} \
+                 after codex round-4 P2 fix; got allowed={allowed:?}",
+            );
+        }
+        // Spot-check: reviewer's `group:search` expansion lands as
+        // concrete tool names on the wire.
+        for expected in ["glob", "grep", "list_dir", "read_file"] {
+            assert!(
+                allowed.contains(&expected),
+                "delegate spawn payload must include {expected:?} for reviewer; \
+                 got {allowed:?}",
+            );
+        }
+        // And the role is forwarded so spawn.rs::apply_role_template
+        // can layer the prefix.
+        assert_eq!(input["role"], json!(ROLE_REVIEWER));
+    }
+
+    /// Issue #971 codex round-5 P2 follow-up: the `delegate` wrapper
+    /// used to manually prepend `template.prompt_prefix` to the task
+    /// AND forward `role` to `spawn_agent`. `spawn.rs::apply_role_template`
+    /// also prepends the prefix when it sees `role` on the input, so
+    /// every delegate-spawned child received the role guardrails
+    /// TWICE. This guard pins the fix: delegate ships the bare task
+    /// text and lets `apply_role_template` be the single source of
+    /// prefix injection.
+    #[tokio::test]
+    async fn m14_c_wiring_delegate_does_not_double_prefix_role_per_971() {
+        use crate::role_template::{ROLE_REVIEWER, RoleTemplate};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let supervisor_for_completer = supervisor.clone();
+        let completer = tokio::spawn(async move {
+            for _ in 0..200 {
+                if let Some(task) = supervisor_for_completer
+                    .get_all_tasks()
+                    .into_iter()
+                    .find(|task| task.tool_name == "spawn" || task.tool_name == "spawn_agent")
+                {
+                    supervisor_for_completer.mark_completed(&task.id, vec![]);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        });
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "delegate",
+                &json!({
+                    "role": "reviewer",
+                    "task": "audit PR #1234",
+                    "timeout_ms": 5_000,
+                }),
+            )
+            .await
+            .expect("delegate");
+        let _ = completer.await;
+        assert!(
+            result.success,
+            "delegate must succeed; output={:?}",
+            result.output,
+        );
+        let task = supervisor
+            .get_all_tasks()
+            .into_iter()
+            .find(|t| t.tool_name == "spawn" || t.tool_name == "spawn_agent")
+            .expect("task registered");
+        let input = task.tool_input.expect("tool input recorded");
+        let reviewer = RoleTemplate::for_name(ROLE_REVIEWER).unwrap();
+        let task_text = input["task"].as_str().expect("task field on spawn payload");
+        // Codex round-5 P2 regression guard: the prefix MUST appear
+        // ZERO times in the task text the delegate forwards.
+        // `spawn.rs::apply_role_template` is the authoritative single
+        // source of prefix injection and reads from `additional_instructions`
+        // — not `task` — so a clean `task` field is the contract.
+        assert!(
+            !task_text.contains(reviewer.prompt_prefix),
+            "delegate MUST NOT embed prompt_prefix in `task` (spawn.rs::apply_role_template \
+             handles prefix injection from role); got task={task_text:?}",
+        );
+        // Role still gets forwarded so apply_role_template fires.
+        assert_eq!(input["role"], json!(ROLE_REVIEWER));
     }
 
     /// Issue #971 (M14-C) PR #1177 codex round-2 P2 regression: when
