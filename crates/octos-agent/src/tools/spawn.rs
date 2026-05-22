@@ -2857,9 +2857,7 @@ impl Tool for SpawnTool {
                     }
                     _ => None,
                 };
-                let harness_event_sink_path = harness_event_sink
-                    .as_ref()
-                    .map(|sink| sink.path().display().to_string());
+                let harness_event_sink_path = harness_event_sink.as_ref().map(|sink| sink.uri());
 
                 let mut tools = ToolRegistry::with_builtins(&working_dir);
                 // Load plugin tools so subagents can use fm_tts, etc.

@@ -2211,6 +2211,10 @@ mod tests {
             crate::harness_events::HARNESS_EVENT_SCHEMA_V1
         );
         assert_eq!(detail["session_id"], "api:session");
+        assert_eq!(
+            detail["schema_version"],
+            serde_json::json!(crate::abi_schema::HARNESS_PROGRESS_EVENT_SCHEMA_VERSION)
+        );
         assert_eq!(detail["task_id"], id);
         assert_eq!(detail["workflow_kind"], "deep_research");
         assert_eq!(detail["current_phase"], "fetch");

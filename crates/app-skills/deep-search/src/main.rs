@@ -2986,6 +2986,7 @@ impl ProgressPhase {
 #[derive(Serialize)]
 struct HarnessProgressEvent<'a> {
     schema: &'static str,
+    schema_version: u32,
     kind: &'static str,
     session_id: &'a str,
     task_id: &'a str,
@@ -3009,6 +3010,7 @@ fn emit_progress_event(phase: ProgressPhase, message: &str, progress_fraction: O
 
     let event = HarnessProgressEvent {
         schema: "octos.harness.event.v1",
+        schema_version: 1,
         kind: "progress",
         session_id: &context.session_id,
         task_id: &context.task_id,
@@ -3523,6 +3525,7 @@ mod tests {
         let events = [
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
+                schema_version: 1,
                 kind: "progress",
                 session_id: "api:session",
                 task_id: "task-1",
@@ -3533,6 +3536,7 @@ mod tests {
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
+                schema_version: 1,
                 kind: "progress",
                 session_id: "api:session",
                 task_id: "task-1",
@@ -3543,6 +3547,7 @@ mod tests {
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
+                schema_version: 1,
                 kind: "progress",
                 session_id: "api:session",
                 task_id: "task-1",
@@ -3553,6 +3558,7 @@ mod tests {
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
+                schema_version: 1,
                 kind: "progress",
                 session_id: "api:session",
                 task_id: "task-1",
@@ -3563,6 +3569,7 @@ mod tests {
             },
             HarnessProgressEvent {
                 schema: "octos.harness.event.v1",
+                schema_version: 1,
                 kind: "progress",
                 session_id: "api:session",
                 task_id: "task-1",
