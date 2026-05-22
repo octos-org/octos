@@ -57,6 +57,7 @@ const wsUiFeatures = [
   'pane.snapshots.v1',
   'session.workspace_cwd.v1',
   'harness.task_control.v1',
+  'harness.task_artifacts.v1',
   'state.session_hydrate.v1',
   'state.thread_graph.v1',
   'state.turn_state_get.v1',
@@ -1001,6 +1002,10 @@ function routeProbeParams(method) {
       return { session_id: sessionId, task_id: missingTaskId, node_id: 'design' };
     case 'task/output/read':
       return { session_id: sessionId, task_id: missingTaskId };
+    case 'task/artifact/list':
+      return { session_id: sessionId, task_id: missingTaskId };
+    case 'task/artifact/read':
+      return { session_id: sessionId, task_id: missingTaskId, artifact_id: missingId };
     case 'turn/state/get':
       return { session_id: sessionId, turn_id: missingTurnId };
     case 'agent/list':

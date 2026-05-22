@@ -18,6 +18,8 @@
     { "method": "task/cancel", "classification": "shared" },
     { "method": "task/restart_from_node", "classification": "shared" },
     { "method": "task/output/read", "classification": "shared" },
+    { "method": "task/artifact/list", "classification": "shared" },
+    { "method": "task/artifact/read", "classification": "shared" },
     { "method": "session/hydrate", "classification": "shared" },
     { "method": "thread/graph/get", "classification": "shared" },
     { "method": "turn/state/get", "classification": "shared" },

@@ -1,7 +1,7 @@
 //! UI Protocol v1 WebSocket transport.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -35,25 +35,27 @@ use octos_core::ui_protocol::{
     SessionDeleteParams, SessionFilesListParams, SessionHydrateParams, SessionHydrateResult,
     SessionListParams, SessionMessagesPageParams, SessionOpenParams, SessionOpenResult,
     SessionOpened, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams, TaskCancelParams,
-    TaskCancelResult, TaskListEntry, TaskListParams, TaskListResult, TaskOutputDeltaEvent,
-    TaskRestartFromNodeParams, TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState,
-    TaskUpdatedEvent, ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult,
-    ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
-    TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent,
-    TurnStartParams, TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    SessionTitleSetParams, SessionWorkspaceGetParams, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
+    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams,
+    TurnInterruptResult, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
+    TurnStateGetParams, TurnStateGetResult, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1, UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
-    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
-    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord, UiArtifactPaneItem,
-    UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord, UiContextNormalizationReport,
-    UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot,
-    UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent,
-    UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_MESSAGE_PERSISTED_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
     UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, approval_cancelled_reasons,
     approval_kinds, hydrate_sections, progress_kinds, thread_status,
 };
@@ -68,14 +70,17 @@ use tokio::task::AbortHandle;
 use tracing::{info, warn};
 
 use super::AppState;
-#[cfg(test)]
-use super::agent_orchestrator::clear_default_agent_orchestrator_for_test;
 use super::agent_orchestrator::{
     AgentArtifactReadRequest, AgentListRequest, AgentOrchestrator, AgentOutputRequest,
     AgentRequest, AgentUpsert, GoalSessionRequest, GoalSetRequest, LoopControlKind,
     LoopControlRequest, LoopCreateRequest, LoopListRequest, NativeSpecialistAppUiEvent,
     NativeSpecialistLaunchRequest, default_agent_orchestrator, master_continuation_prompt,
     master_continuation_reason_name, upsert_background_task_agent,
+};
+#[cfg(test)]
+use super::agent_orchestrator::{
+    AgentArtifactRecord as AgentRuntimeArtifactRecord, InProcessAgentOrchestrator,
+    clear_default_agent_orchestrator_for_test,
 };
 use super::master_continuation_scheduler::{
     MasterContinuationReason, MasterContinuationRuntimeState,
@@ -891,6 +896,7 @@ struct ConnectionUiFeatures {
     pane_snapshots: bool,
     session_workspace_cwd: bool,
     harness_task_control: bool,
+    harness_task_artifacts: bool,
     /// UPCR-2026-009 `state.session_hydrate.v1` negotiated.
     session_hydrate: bool,
     /// UPCR-2026-010 `state.thread_graph.v1` negotiated.
@@ -966,6 +972,11 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
             ),
+            harness_task_artifacts: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+            ),
             session_hydrate: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
             thread_graph: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
             turn_state_get: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
@@ -1017,6 +1028,7 @@ impl ConnectionUiFeatures {
             pane_snapshots: true,
             session_workspace_cwd: true,
             harness_task_control: true,
+            harness_task_artifacts: true,
             session_hydrate: true,
             thread_graph: true,
             turn_state_get: true,
@@ -1050,6 +1062,7 @@ impl ConnectionUiFeatures {
             pane_snapshots: has(UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1),
             session_workspace_cwd: has(UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1),
             harness_task_control: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1),
+            harness_task_artifacts: has(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1),
             session_hydrate: has(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1),
             thread_graph: has(UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1),
             turn_state_get: has(UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1),
@@ -1092,6 +1105,9 @@ impl ConnectionUiFeatures {
         }
         if self.harness_task_control {
             requested.push(UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1);
+        }
+        if self.harness_task_artifacts {
+            requested.push(UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1);
         }
         if self.session_hydrate {
             requested.push(UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1);
@@ -1138,6 +1154,10 @@ impl ConnectionUiFeatures {
 
     fn agent_control_available(self) -> bool {
         !self.header_present || (self.coding_autonomy_v1 && self.coding_agent_control_v1)
+    }
+
+    fn task_artifacts_available(self) -> bool {
+        !self.header_present || self.harness_task_artifacts
     }
 
     fn goal_runtime_available(self) -> bool {
@@ -3322,6 +3342,14 @@ async fn ui_protocol_connection(
             UiCommand::TaskOutputRead(params) => {
                 handle_task_output_read(&ws, &state, connection_profile_id, id, params).await;
             }
+            UiCommand::TaskArtifactList(params) => {
+                handle_task_artifact_list(&ws, &state, connection_profile_id, features, id, params)
+                    .await;
+            }
+            UiCommand::TaskArtifactRead(params) => {
+                handle_task_artifact_read(&ws, &state, connection_profile_id, features, id, params)
+                    .await;
+            }
             UiCommand::TaskList(params) => {
                 handle_task_list(&ws, &state, connection_profile_id, id, params).await;
             }
@@ -3814,6 +3842,28 @@ where
                     &ws,
                     &state,
                     connection_profile_id_owned.as_deref(),
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TaskArtifactList(params) => {
+                handle_task_artifact_list(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    features,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::TaskArtifactRead(params) => {
+                handle_task_artifact_read(
+                    &ws,
+                    &state,
+                    connection_profile_id_owned.as_deref(),
+                    features,
                     id,
                     params,
                 )
@@ -5467,6 +5517,15 @@ fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec
     names
 }
 
+fn registered_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+    let mut names = registry
+        .map(|registry| registry.tool_names())
+        .unwrap_or_else(|| model_visible_tool_names(None));
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Names of tools currently in the deferred set (registered but filtered
 /// out of `specs()` for LRU efficiency). These remain recoverable via
 /// `activate_tools`, so the M14 coding tool contract treats them as
@@ -5516,10 +5575,17 @@ async fn tool_status_list_result(
                 .map(|runtime| runtime.tool_specs.as_ref())
         });
     let tool_names = model_visible_tool_names(registry);
+    let registered_names = registered_tool_names(registry);
+    let visible_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
+    let disabled_tool_names = registered_names
+        .iter()
+        .filter(|name| !visible_names.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+    let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
     let deferred_names = deferred_model_tool_names(registry);
     let deferred_name_refs: Vec<&str> = deferred_names.iter().map(String::as_str).collect();
-    let disabled_tool_refs: [&str; 0] = [];
     let permission_state = session_permission_profiles().get_state(session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
@@ -7091,6 +7157,10 @@ fn route_rpc_command(
             | octos_core::ui_protocol::methods::TASK_CANCEL
             | octos_core::ui_protocol::methods::TASK_RESTART_FROM_NODE => {
                 Some(features.harness_task_control)
+            }
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST
+            | octos_core::ui_protocol::methods::TASK_ARTIFACT_READ => {
+                Some(features.harness_task_artifacts)
             }
             _ => None,
         };
@@ -9553,6 +9623,79 @@ async fn handle_task_output_read(
     }
 }
 
+async fn handle_task_artifact_list(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: TaskArtifactListParams,
+) {
+    if !features.task_artifacts_available() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST),
+        );
+        return;
+    }
+    match task_artifact_list_result(
+        state,
+        default_agent_orchestrator(),
+        connection_profile_id,
+        params,
+    ) {
+        Ok(result) => send_serialized_rpc_result(
+            ws,
+            id,
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_LIST,
+            result,
+        ),
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
+async fn handle_task_artifact_read(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    features: ConnectionUiFeatures,
+    id: String,
+    params: TaskArtifactReadParams,
+) {
+    if !features.task_artifacts_available() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::method_not_supported(octos_core::ui_protocol::methods::TASK_ARTIFACT_READ),
+        );
+        return;
+    }
+    let data_dir = match &state.sessions {
+        Some(sessions) => Some(sessions.lock().await.data_dir().to_path_buf()),
+        None => None,
+    };
+    match task_artifact_read_result(
+        state,
+        default_agent_orchestrator(),
+        connection_profile_id,
+        data_dir.as_deref(),
+        params,
+    ) {
+        Ok(result) => send_serialized_rpc_result(
+            ws,
+            id,
+            octos_core::ui_protocol::methods::TASK_ARTIFACT_READ,
+            result,
+        ),
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+        }
+    }
+}
+
 async fn handle_task_list(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -11363,6 +11506,377 @@ fn task_query_store_or_error(
         RpcError::runtime_not_ready("task supervisor not wired for AppUI task commands")
             .with_data(json!({ "kind": "runtime_unavailable" }))
     })
+}
+
+fn task_artifact_profile_id(
+    session_id: &SessionKey,
+    requested_profile_id: Option<&str>,
+    connection_profile_id: Option<&str>,
+) -> Result<String, RpcError> {
+    Ok(
+        validate_session_scope(session_id, requested_profile_id, connection_profile_id)?
+            .or_else(|| session_id.profile_id().map(ToOwned::to_owned))
+            .or_else(|| connection_profile_id.map(ToOwned::to_owned))
+            .unwrap_or_else(|| MAIN_PROFILE_ID.to_owned()),
+    )
+}
+
+fn task_artifact_list_result(
+    state: &Arc<AppState>,
+    orchestrator: &dyn AgentOrchestrator,
+    connection_profile_id: Option<&str>,
+    params: TaskArtifactListParams,
+) -> Result<TaskArtifactListResult, RpcError> {
+    let profile_id = task_artifact_profile_id(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let agent_id = resolve_task_artifact_agent_id(
+        orchestrator,
+        &params.session_id,
+        &params.task_id,
+        &profile_id,
+        params.agent_id.as_deref(),
+    )?;
+    if let Some(agent_id) = agent_id {
+        let result = orchestrator.list_agent_artifacts(AgentRequest {
+            agent_id: agent_id.clone(),
+            session_id: Some(params.session_id.clone()),
+            profile_id,
+        })?;
+        let artifacts = result
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .map(|artifacts| {
+                artifacts
+                    .iter()
+                    .map(task_artifact_record_from_value)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok(TaskArtifactListResult {
+            session_id: params.session_id,
+            task_id: params.task_id,
+            agent_id: Some(agent_id),
+            artifacts,
+        });
+    }
+
+    let task = task_entry_for_session(state, &params.session_id, &params.task_id)?;
+    Ok(TaskArtifactListResult {
+        session_id: params.session_id,
+        task_id: params.task_id,
+        agent_id: None,
+        artifacts: task_output_artifact_records(&task),
+    })
+}
+
+fn task_artifact_read_result(
+    state: &Arc<AppState>,
+    orchestrator: &dyn AgentOrchestrator,
+    connection_profile_id: Option<&str>,
+    data_dir: Option<&Path>,
+    params: TaskArtifactReadParams,
+) -> Result<TaskArtifactReadResult, RpcError> {
+    if params.artifact_id.is_none() && params.path.is_none() {
+        return Err(
+            RpcError::invalid_params("task/artifact/read requires artifact_id or path")
+                .with_data(json!({ "kind": "task_artifact_selector_invalid" })),
+        );
+    }
+    let profile_id = task_artifact_profile_id(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile_id,
+    )?;
+    let agent_id = resolve_task_artifact_agent_id(
+        orchestrator,
+        &params.session_id,
+        &params.task_id,
+        &profile_id,
+        params.agent_id.as_deref(),
+    )?;
+    if let Some(agent_id) = agent_id {
+        let result = orchestrator.read_agent_artifact(AgentArtifactReadRequest {
+            agent_id: agent_id.clone(),
+            artifact_id: params.artifact_id.clone(),
+            path: params.path.clone(),
+            session_id: Some(params.session_id.clone()),
+            profile_id,
+        })?;
+        let mut artifact = result
+            .get("artifact")
+            .map(task_artifact_record_from_value)
+            .unwrap_or_else(|| task_artifact_record_for_selector(&params));
+        if artifact.path.is_none() {
+            artifact.path = params.path.clone();
+        }
+        let full_content = result
+            .get("content")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| artifact.content.clone())
+            .or_else(|| {
+                artifact
+                    .path
+                    .as_deref()
+                    .and_then(|path| read_task_artifact_text(path, data_dir))
+            });
+        let (content, cursor, next_cursor, has_more) =
+            slice_task_artifact_content(full_content, params.cursor, params.limit_bytes);
+        return Ok(TaskArtifactReadResult {
+            session_id: params.session_id,
+            task_id: params.task_id,
+            agent_id: Some(agent_id),
+            artifact,
+            content,
+            cursor,
+            next_cursor,
+            has_more,
+        });
+    }
+
+    let task = task_entry_for_session(state, &params.session_id, &params.task_id)?;
+    let artifacts = task_output_artifact_records(&task);
+    let artifact = select_task_artifact(
+        &artifacts,
+        params.artifact_id.as_deref(),
+        params.path.as_deref(),
+    )?;
+    let full_content = artifact
+        .path
+        .as_deref()
+        .and_then(|path| read_task_artifact_text(path, data_dir));
+    let (content, cursor, next_cursor, has_more) =
+        slice_task_artifact_content(full_content, params.cursor, params.limit_bytes);
+    Ok(TaskArtifactReadResult {
+        session_id: params.session_id,
+        task_id: params.task_id,
+        agent_id: None,
+        artifact,
+        content,
+        cursor,
+        next_cursor,
+        has_more,
+    })
+}
+
+fn resolve_task_artifact_agent_id(
+    orchestrator: &dyn AgentOrchestrator,
+    session_id: &SessionKey,
+    task_id: &TaskId,
+    profile_id: &str,
+    explicit_agent_id: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    if let Some(agent_id) = explicit_agent_id.filter(|agent_id| !agent_id.trim().is_empty()) {
+        return Ok(Some(agent_id.to_owned()));
+    }
+    let result = orchestrator.list_agents(AgentListRequest {
+        session_id: Some(session_id.clone()),
+        profile_id: profile_id.to_owned(),
+        connection_profile_id: None,
+    })?;
+    let task_id = task_id.to_string();
+    Ok(result
+        .get("agents")
+        .and_then(Value::as_array)
+        .and_then(|agents| {
+            agents.iter().find_map(|agent| {
+                let agent_id = agent.get("agent_id").and_then(Value::as_str)?;
+                let matches_task = agent
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|candidate| candidate == task_id)
+                    || agent_id == task_id;
+                matches_task.then(|| agent_id.to_owned())
+            })
+        }))
+}
+
+fn task_entry_for_session(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    task_id: &TaskId,
+) -> Result<TaskListEntry, RpcError> {
+    task_list_snapshot(state, session_id)?
+        .into_iter()
+        .find(|task| &task.id == task_id)
+        .ok_or_else(|| RpcError::unknown_task_id(task_id))
+}
+
+fn task_artifact_record_from_value(value: &Value) -> TaskArtifactRecord {
+    let mut extra = BTreeMap::new();
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            if !matches!(
+                key.as_str(),
+                "id" | "artifact_id" | "title" | "kind" | "status" | "path" | "content"
+            ) {
+                extra.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let id = value
+        .get("id")
+        .or_else(|| value.get("artifact_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("artifact")
+        .to_owned();
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(&id)
+        .to_owned();
+    TaskArtifactRecord {
+        id,
+        title,
+        kind: value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_owned(),
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("ready")
+            .to_owned(),
+        path: value
+            .get("path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        content: value
+            .get("content")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        extra,
+    }
+}
+
+fn task_artifact_record_for_selector(params: &TaskArtifactReadParams) -> TaskArtifactRecord {
+    let id = params
+        .artifact_id
+        .clone()
+        .or_else(|| params.path.clone())
+        .unwrap_or_else(|| "artifact".to_owned());
+    TaskArtifactRecord {
+        title: id.clone(),
+        id,
+        kind: "file".to_owned(),
+        status: "ready".to_owned(),
+        path: params.path.clone(),
+        content: None,
+        extra: BTreeMap::new(),
+    }
+}
+
+fn task_output_artifact_records(task: &TaskListEntry) -> Vec<TaskArtifactRecord> {
+    task.output_files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let title = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path)
+                .to_owned();
+            TaskArtifactRecord {
+                id: format!("output-{:02}", index + 1),
+                title,
+                kind: task_artifact_kind_for_path(path),
+                status: "ready".to_owned(),
+                path: Some(path.clone()),
+                content: None,
+                extra: BTreeMap::new(),
+            }
+        })
+        .collect()
+}
+
+fn task_artifact_kind_for_path(path: &str) -> String {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("md" | "markdown") => "markdown",
+        Some("json") => "json",
+        Some("txt" | "log") => "text",
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp") => "image",
+        _ => "file",
+    }
+    .to_owned()
+}
+
+fn select_task_artifact(
+    artifacts: &[TaskArtifactRecord],
+    artifact_id: Option<&str>,
+    path: Option<&str>,
+) -> Result<TaskArtifactRecord, RpcError> {
+    artifacts
+        .iter()
+        .find(|artifact| {
+            artifact_id.is_some_and(|id| id == artifact.id)
+                || path.is_some_and(|path| artifact.path.as_deref() == Some(path))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            let selector = artifact_id.or(path).unwrap_or("artifact");
+            RpcError::not_found("task_artifact", selector)
+                .with_data(json!({ "kind": "task_artifact_not_found", "artifact_id": selector }))
+        })
+}
+
+fn read_task_artifact_text(path: &str, data_dir: Option<&Path>) -> Option<String> {
+    let resolved = data_dir
+        .and_then(|data_dir| {
+            octos_bus::file_handle::resolve_scoped_file_handle(data_dir, path)
+                .or_else(|| octos_bus::file_handle::resolve_legacy_file_request(data_dir, path))
+        })
+        .or_else(|| Path::new(path).is_absolute().then(|| PathBuf::from(path)))?;
+    std::fs::read(resolved)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn slice_task_artifact_content(
+    content: Option<String>,
+    cursor: Option<OutputCursor>,
+    limit_bytes: Option<u64>,
+) -> (
+    Option<String>,
+    Option<OutputCursor>,
+    Option<OutputCursor>,
+    bool,
+) {
+    let Some(content) = content else {
+        return (None, None, None, false);
+    };
+    let len = content.len();
+    let mut start = cursor
+        .map(|cursor| cursor.offset as usize)
+        .unwrap_or(0)
+        .min(len);
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    let limit = limit_bytes
+        .and_then(|limit| usize::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(64 * 1024);
+    let mut end = start.saturating_add(limit).min(len);
+    while end > start && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = content[start..end].to_owned();
+    (
+        Some(text),
+        Some(OutputCursor {
+            offset: start as u64,
+        }),
+        Some(OutputCursor { offset: end as u64 }),
+        end < len,
+    )
 }
 
 fn task_list_snapshot(
@@ -16800,6 +17314,7 @@ fn flush_replay_lossy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::coding_tool_contract;
     use crate::user_store::UserRole;
     use octos_core::ui_protocol::{
         ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
@@ -19802,6 +20317,96 @@ ignore = []
     }
 
     #[test]
+    fn task_artifact_commands_decode_protocol_params() {
+        let session_id = SessionKey("local:test".into());
+        let task_id = octos_core::TaskId::new();
+        let features = ConnectionUiFeatures {
+            harness_task_artifacts: true,
+            header_present: true,
+            ..ConnectionUiFeatures::default()
+        };
+
+        let list_request = RpcRequest::new(
+            "task-artifact-list-1",
+            methods::TASK_ARTIFACT_LIST,
+            json!({
+                "session_id": session_id.clone(),
+                "task_id": task_id.clone(),
+            }),
+        );
+        assert!(matches!(
+            route_rpc_command(list_request, features).expect("task/artifact/list routes"),
+            UiCommand::TaskArtifactList(params)
+                if params.session_id == session_id && params.task_id == task_id
+        ));
+
+        let read_request = RpcRequest::new(
+            "task-artifact-read-1",
+            methods::TASK_ARTIFACT_READ,
+            json!({
+                "session_id": session_id.clone(),
+                "task_id": task_id.clone(),
+                "artifact_id": "summary",
+                "cursor": { "offset": 2 },
+                "limit_bytes": 32,
+            }),
+        );
+        assert!(matches!(
+            route_rpc_command(read_request, features).expect("task/artifact/read routes"),
+            UiCommand::TaskArtifactRead(params)
+                if params.session_id == session_id
+                    && params.task_id == task_id
+                    && params.artifact_id.as_deref() == Some("summary")
+                    && params.cursor.is_some_and(|cursor| cursor.offset == 2)
+                    && params.limit_bytes == Some(32)
+        ));
+    }
+
+    #[test]
+    fn coding_tool_status_distinguishes_registered_hidden_tools_from_missing_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        registry.set_context_filter(vec!["read".into()]);
+
+        let visible = model_visible_tool_names(Some(&registry));
+        let registered = registered_tool_names(Some(&registry));
+        assert!(!visible.iter().any(|name| name == "exec_command"));
+        assert!(registered.iter().any(|name| name == "exec_command"));
+
+        let visible_set: HashSet<&str> = visible.iter().map(String::as_str).collect();
+        let disabled = registered
+            .iter()
+            .filter(|name| !visible_set.contains(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible_refs = visible.iter().map(String::as_str).collect::<Vec<_>>();
+        let disabled_refs = disabled.iter().map(String::as_str).collect::<Vec<_>>();
+        let payload = coding_tool_contract::tool_status_list_payload(
+            coding_tool_contract::ToolStatusListContext {
+                available_model_tools: &visible_refs,
+                disabled_model_tools: &disabled_refs,
+                ..coding_tool_contract::ToolStatusListContext::default_for_session("coding:test")
+            },
+        );
+        let required = payload["coding_tool_contract"]["required_tools"]
+            .as_array()
+            .expect("required tools");
+        let exec_command = required
+            .iter()
+            .find(|tool| tool["name"] == json!("exec_command"))
+            .expect("exec_command status");
+
+        assert_eq!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_DISABLED_BY_POLICY)
+        );
+        assert_ne!(
+            exec_command["status"],
+            json!(coding_tool_contract::TOOL_STATUS_MISSING)
+        );
+    }
+
+    #[test]
     fn typed_approval_feature_is_negotiated_by_header() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -19872,6 +20477,7 @@ ignore = []
                 pane_snapshots: false,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
@@ -19930,6 +20536,7 @@ ignore = []
                 pane_snapshots: false,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
@@ -20033,6 +20640,7 @@ ignore = []
                 pane_snapshots: false,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
@@ -20091,6 +20699,7 @@ ignore = []
                 pane_snapshots: false,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
@@ -20142,6 +20751,7 @@ ignore = []
                 pane_snapshots: false,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
@@ -20236,6 +20846,7 @@ ignore = []
                 pane_snapshots: false,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
@@ -20605,6 +21216,162 @@ ignore = []
         assert_eq!(tasks[0]["id"], task_id.to_string());
         assert_eq!(tasks[0]["status"], "running");
         assert_eq!(tasks[0]["state"], "running");
+    }
+
+    #[test]
+    fn appui_task_artifacts_project_task_output_files() {
+        let session_id = SessionKey("local:artifact-output".into());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output_dir = temp.path().join("reports");
+        std::fs::create_dir_all(&output_dir).expect("reports dir");
+        let output_path = output_dir.join("summary.md");
+        std::fs::write(&output_path, "# report\n").expect("write output file");
+
+        let supervisor = Arc::new(octos_agent::TaskSupervisor::new());
+        let task_id = supervisor.register(
+            "run_pipeline",
+            "call-appui-artifact",
+            Some(&session_id.to_string()),
+        );
+        supervisor.mark_completed(&task_id, vec![output_path.to_string_lossy().into_owned()]);
+        let task_id = task_id
+            .parse::<TaskId>()
+            .expect("supervisor task id is UUID");
+        let store = crate::session_actor::SessionTaskQueryStore::default();
+        store.register(&session_id, &supervisor, temp.path());
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let orchestrator = RecordingOrchestrator::default();
+
+        let list = task_artifact_list_result(
+            &state,
+            &orchestrator,
+            None,
+            TaskArtifactListParams {
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                profile_id: None,
+                agent_id: None,
+            },
+        )
+        .expect("task artifact list");
+
+        assert_eq!(list.agent_id, None);
+        assert_eq!(list.artifacts.len(), 1);
+        assert_eq!(list.artifacts[0].id, "output-01");
+        assert_eq!(list.artifacts[0].title, "summary.md");
+        assert_eq!(list.artifacts[0].kind, "markdown");
+        let artifact_path = list.artifacts[0].path.clone().expect("artifact path");
+        assert!(
+            artifact_path.starts_with("pf/"),
+            "task output files should stay profile-file handles on the wire: {artifact_path}"
+        );
+
+        let read = task_artifact_read_result(
+            &state,
+            &orchestrator,
+            None,
+            Some(temp.path()),
+            TaskArtifactReadParams {
+                session_id,
+                task_id,
+                artifact_id: Some("output-01".into()),
+                path: None,
+                cursor: None,
+                limit_bytes: None,
+                profile_id: None,
+                agent_id: None,
+            },
+        )
+        .expect("task artifact read");
+
+        assert_eq!(read.agent_id, None);
+        assert_eq!(read.artifact.id, "output-01");
+        assert_eq!(read.content.as_deref(), Some("# report\n"));
+        assert_eq!(read.cursor.expect("cursor").offset, 0);
+        assert_eq!(read.next_cursor.expect("next cursor").offset, 9);
+        assert!(!read.has_more);
+    }
+
+    #[test]
+    fn appui_task_artifacts_resolve_agent_task_artifacts() {
+        let profile_id = "tenant-a";
+        let session_id = SessionKey::with_profile(profile_id, "api", "agent-artifacts");
+        let task_id = TaskId::new();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        orchestrator.upsert_agent(AgentUpsert {
+            agent_id: "agent-1".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            path: "master/agent-1".into(),
+            role: "worker".into(),
+            nickname: "Worker".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("summarize".into()),
+            cwd: None,
+            profile_id: profile_id.into(),
+        });
+        orchestrator
+            .set_agent_artifacts(
+                "agent-1",
+                &session_id,
+                profile_id,
+                vec![AgentRuntimeArtifactRecord {
+                    id: "summary".into(),
+                    title: "Summary".into(),
+                    kind: "markdown".into(),
+                    status: "ready".into(),
+                    path: None,
+                    content: Some("agent summary".into()),
+                }],
+            )
+            .expect("seed agent artifact");
+        let state = Arc::new(AppState::empty_for_tests());
+
+        let list = task_artifact_list_result(
+            &state,
+            &orchestrator,
+            None,
+            TaskArtifactListParams {
+                session_id: session_id.clone(),
+                task_id: task_id.clone(),
+                profile_id: Some(profile_id.into()),
+                agent_id: None,
+            },
+        )
+        .expect("agent-backed task artifact list");
+
+        assert_eq!(list.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(list.artifacts.len(), 1);
+        assert_eq!(list.artifacts[0].id, "summary");
+        assert_eq!(list.artifacts[0].title, "Summary");
+
+        let read = task_artifact_read_result(
+            &state,
+            &orchestrator,
+            None,
+            None,
+            TaskArtifactReadParams {
+                session_id,
+                task_id,
+                artifact_id: Some("summary".into()),
+                path: None,
+                cursor: None,
+                limit_bytes: None,
+                profile_id: Some(profile_id.into()),
+                agent_id: None,
+            },
+        )
+        .expect("agent-backed task artifact read");
+
+        assert_eq!(read.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(read.artifact.id, "summary");
+        assert_eq!(read.content.as_deref(), Some("agent summary"));
+        assert!(!read.has_more);
     }
 
     #[tokio::test]
@@ -21864,6 +22631,7 @@ ignore = []
                 pane_snapshots: true,
                 session_workspace_cwd: false,
                 harness_task_control: false,
+                harness_task_artifacts: false,
                 session_hydrate: false,
                 thread_graph: false,
                 turn_state_get: false,
