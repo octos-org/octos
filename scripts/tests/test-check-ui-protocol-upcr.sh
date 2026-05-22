@@ -18,6 +18,8 @@
 #  10. Rust protocol change + unrelated spec edit + no UPCR -> exit non-zero
 #      (codex #3 — spec-as-coverage bypass closed for code-level changes).
 #  11. No base ref resolvable -> exit non-zero (codex #1 — closes CI bypass).
+#  12. Protocol file deletion (no UPCR) -> exit non-zero (codex #4 —
+#      deletions are protocol-visible too).
 #
 # Runs entirely offline. Each scenario uses an isolated temp repo so state
 # does not leak between cases.
@@ -339,6 +341,26 @@ scenario_no_base_ref_fails() {
   rm -rf "$dir"
 }
 
+# Scenario 12: deleting a protocol file without a UPCR is itself a
+# protocol-visible event and must be gated (codex review #4).
+scenario_deleted_protocol_file() {
+  local dir
+  dir="$(make_repo)"
+  (
+    cd "$dir"
+    git rm --quiet crates/octos-cli/src/api/ui_protocol_alpha.rs
+    git commit --quiet -m "chore: drop alpha"
+  )
+  local out status=0
+  out="$(run_gate "$dir" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ] && grep -q "require a UPCR document" <<<"$out"; then
+    pass "deleted protocol file is gated (no UPCR)"
+  else
+    fail "deleted protocol file: status=$status output=$out"
+  fi
+  rm -rf "$dir"
+}
+
 echo "==> check-ui-protocol-upcr.sh scenario tests"
 echo "  target: $TARGET"
 
@@ -353,6 +375,7 @@ scenario_reviewer_override
 scenario_renamed_protocol_file
 scenario_unrelated_spec_does_not_cover_code
 scenario_no_base_ref_fails
+scenario_deleted_protocol_file
 
 echo
 echo "==> Summary: $PASS passed, $FAIL failed"

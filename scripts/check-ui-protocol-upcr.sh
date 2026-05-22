@@ -104,7 +104,9 @@ diff_range_names() {
     return 0
   fi
   local raw
-  raw="$(git diff --name-status --diff-filter=AMR "$range" -- "$@" 2>/dev/null || true)"
+  # AMRD: Added, Modified, Renamed, Deleted. Deletions of protocol files are
+  # also protocol-visible events (codex review #4 / #717) and must be gated.
+  raw="$(git diff --name-status --diff-filter=AMRD "$range" -- "$@" 2>/dev/null || true)"
   if [ -z "$raw" ]; then
     return 0
   fi
@@ -123,20 +125,21 @@ diff_range_names() {
         ;;
     esac
     [ -z "$name" ] && continue
-    local stat
-    # For renames the diff is between src and dst; only the dst path is
-    # tracked at HEAD, so diff on the dst path captures the post-rename
-    # content delta. Pure renames (no edit) will have an empty stat under
-    # `-w` because there is no in-content change.
-    stat="$(git diff -w --stat "$range" -- "$name" 2>/dev/null || true)"
-    if [ -z "$stat" ] && [ "${code:0:1}" = "R" ]; then
-      # Pure rename of a protocol file is itself a protocol-visible event
-      # (consumers track file paths). Treat as a change regardless of -w.
-      stat="rename"
-    fi
-    if [ -n "$stat" ]; then
-      printf '%s\n' "$name"
-    fi
+    case "${code:0:1}" in
+      R|D)
+        # Pure rename or deletion is itself a protocol-visible event;
+        # `git diff -w --stat` on a deleted path is meaningless and a
+        # rename-only delta can come back empty under `-w`. Short-circuit.
+        printf '%s\n' "$name"
+        ;;
+      *)
+        local stat
+        stat="$(git diff -w --stat "$range" -- "$name" 2>/dev/null || true)"
+        if [ -n "$stat" ]; then
+          printf '%s\n' "$name"
+        fi
+        ;;
+    esac
   done <<<"$raw"
 }
 
@@ -157,7 +160,8 @@ uncommitted_names() {
       path="${path##* -> }"
     fi
     case "$status_code" in
-      "??"|"A "|"AM"|" A"|R*)
+      "??"|"A "|"AM"|" A"|R*|"D "|" D"|"DD"|"AD"|"MD")
+        # Adds, renames, and deletions are all protocol-visible events.
         printf '%s\n' "$path"
         ;;
       *)
