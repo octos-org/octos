@@ -30,4 +30,5 @@ pub use types::{
     AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID, Message,
     MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId,
 };
+pub use ui_protocol::{EventEnvelope, TurnContext};
 pub use utils::{tool_output_limit, truncate_head_tail, truncate_utf8, truncated_utf8};

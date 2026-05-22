@@ -7,7 +7,7 @@
 //! task-control requests so clients can target a stable AppUI contract while
 //! backend support lands behind capabilities.
 
-use crate::{SessionKey, TaskId};
+use crate::{SessionKey, TaskId, ThreadId};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,72 @@ pub const JSON_RPC_VERSION: &str = "2.0";
 
 /// Maximum accepted JSON-RPC text frame size for UI transports.
 pub const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Per-turn ownership context for UI/SSE emission.
+///
+/// Construct this once at ingress, before any live event is emitted, and pass
+/// it to emitters instead of re-deriving routing identity from ambient session
+/// state. The `thread_id` is required; callers that do not have one must fail
+/// before producing a live event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnContext {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub thread_id: ThreadId,
+}
+
+impl TurnContext {
+    pub fn new(session_id: impl Into<String>, topic: Option<String>, thread_id: ThreadId) -> Self {
+        Self {
+            session_id: session_id.into(),
+            topic,
+            thread_id,
+        }
+    }
+
+    pub fn thread_id_str(&self) -> &str {
+        self.thread_id.as_str()
+    }
+}
+
+/// Required server-stamped ownership envelope for web/SSE events.
+///
+/// This is intentionally generic over payload so individual event families can
+/// keep their existing typed payloads while sharing one ownership/routing
+/// contract at the emission boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelope<P> {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    pub thread_id: ThreadId,
+    pub event_seq: u64,
+    pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    pub payload: P,
+}
+
+impl<P> EventEnvelope<P> {
+    pub fn new(
+        ctx: &TurnContext,
+        event_seq: u64,
+        event_type: impl Into<String>,
+        tool_call_id: Option<String>,
+        payload: P,
+    ) -> Self {
+        Self {
+            session_id: ctx.session_id.clone(),
+            topic: ctx.topic.clone(),
+            thread_id: ctx.thread_id.clone(),
+            event_seq,
+            event_type: event_type.into(),
+            tool_call_id,
+            payload,
+        }
+    }
+}
 
 /// Feature flag for UPCR-2026-001 typed approval payloads.
 pub const UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1: &str = "approval.typed.v1";
