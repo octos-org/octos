@@ -608,6 +608,13 @@ pub use registry::ToolRegistry;
 pub mod policy;
 pub use policy::{PolicyDecision, ToolPolicy};
 
+// Shared dispatch-policy gate (#714 / #713) re-exported from the
+// crate root so [`SpawnTool::with_dispatch_policy`] callers can pull
+// the type alongside the other `tools::*` re-exports.
+pub use crate::dispatch_policy::{
+    DispatchPolicy, DispatchTarget, GateDenial, enforce_dispatch_gates,
+};
+
 // Robot safety-tier groups consulted by ToolPolicy evaluation.
 pub mod robot_groups;
 pub use robot_groups::{RobotToolRegistry, install_registry as install_robot_registry};

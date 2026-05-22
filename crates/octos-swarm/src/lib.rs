@@ -89,8 +89,12 @@ pub use dispatcher::{
     AggregateValidator, MAX_RETRY_ROUNDS, NoopSwarmEventSink, Swarm, SwarmBudget, SwarmBuilder,
     SwarmContext, SwarmCostBudget, SwarmEventSink, flatten_aggregate,
 };
-pub use gate::DispatchPolicy;
+// #714: the gate type now lives in `octos-agent` so both swarm and
+// spawn agent_mcp dispatch share a single source of truth. Re-export
+// here so existing `octos_swarm::DispatchPolicy` callers (CLI / tests
+// / harness) keep compiling without changes.
 pub use ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
+pub use octos_agent::DispatchPolicy;
 pub use persistence::{DISPATCH_RECORD_SCHEMA_VERSION, DispatchRecord, DispatchStore};
 pub use result::{AggregateArtifact, SubtaskOutcome, SubtaskStatus, SwarmOutcomeKind, SwarmResult};
 pub use topology::{ContractSpec, FanoutPattern, MAX_CONTRACTS_PER_DISPATCH, SwarmTopology};
