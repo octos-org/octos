@@ -2359,6 +2359,7 @@ impl Tool for SpawnTool {
                     &registry_for_validators,
                     &self.working_dir,
                     expected_kind,
+                    &response.files_to_send,
                 )
                 .await;
                 if let Some(reason) = report.first_failure_reason() {
@@ -2619,6 +2620,7 @@ impl Tool for SpawnTool {
                             child_tools_handle.as_ref(),
                             &self.working_dir,
                             expected_kind,
+                            &r.files_to_send,
                         )
                         .await;
                         if let Some(reason) = report.first_failure_reason() {
@@ -3044,10 +3046,15 @@ impl Tool for SpawnTool {
                     let expected_kind = workflow_metadata
                         .as_ref()
                         .and_then(workflow_contract_project_kind);
+                    let bg_files_to_send: &[PathBuf] = match &result {
+                        Ok(task_result) => &task_result.files_to_send,
+                        Err(_) => &[],
+                    };
                     let report = crate::workspace_contract::run_project_root_validators(
                         child_tools_handle.as_ref(),
                         &working_dir,
                         expected_kind,
+                        bg_files_to_send,
                     )
                     .await;
                     if let Some(reason) = report.first_failure_reason() {
@@ -4324,6 +4331,7 @@ PY
                     &registry,
                     temp.path(),
                     Some(crate::WorkspaceProjectKind::Slides),
+                    &[],
                 )
                 .await;
             });

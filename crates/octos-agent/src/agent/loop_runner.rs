@@ -1487,6 +1487,7 @@ impl Agent {
                                 self.tools.as_ref(),
                                 &task.context.working_dir,
                                 None,
+                                &files_to_send,
                             )
                             .await;
                         let contract_failures =
@@ -4657,6 +4658,7 @@ printf '{"output":"voice saved","success":true}\n'
             &registry,
             tmp_root,
             Some(WorkspaceProjectKind::Slides),
+            &[],
         )
         .await;
     }

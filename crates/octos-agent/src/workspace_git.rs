@@ -1025,6 +1025,7 @@ mod tests {
                 &registry,
                 workspace_root,
                 Some(WorkspaceProjectKind::Slides),
+                &[],
             )
             .await;
         });

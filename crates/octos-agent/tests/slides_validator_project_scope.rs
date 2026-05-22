@@ -245,9 +245,17 @@ async fn project_root_validators_write_to_project_ledger_without_manual_seeding(
     // calls after a successful `run_task` for slides workflows. No manual
     // ledger seeding.
     let registry = Arc::new(ToolRegistry::new());
-    let report =
-        run_project_root_validators(&registry, session_root, Some(WorkspaceProjectKind::Slides))
-            .await;
+    // Mirror what the spawn loop does on success: pass the plugin's
+    // `files_to_send` so the project-scope `MagicBytes(SpawnOnlyFiles)`
+    // validator can check the actual emitted deck path.
+    let files_to_send = vec![output_dir.join("deck.pptx")];
+    let report = run_project_root_validators(
+        &registry,
+        session_root,
+        Some(WorkspaceProjectKind::Slides),
+        &files_to_send,
+    )
+    .await;
 
     // The slides project should have been picked up + run.
     assert_eq!(
