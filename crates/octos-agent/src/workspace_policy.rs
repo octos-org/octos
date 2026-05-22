@@ -1503,7 +1503,7 @@ pub fn read_workspace_policy(project_root: &Path) -> Result<Option<WorkspacePoli
 
     let raw = std::fs::read_to_string(&path)
         .wrap_err_with(|| format!("read workspace policy failed: {}", path.display()))?;
-    let policy: WorkspacePolicy = toml::from_str(&raw)
+    let mut policy: WorkspacePolicy = toml::from_str(&raw)
         .wrap_err_with(|| format!("parse workspace policy failed: {}", path.display()))?;
     check_supported(
         "WorkspacePolicy",
@@ -1511,7 +1511,104 @@ pub fn read_workspace_policy(project_root: &Path) -> Result<Option<WorkspacePoli
         WORKSPACE_POLICY_SCHEMA_VERSION,
     )
     .wrap_err_with(|| format!("incompatible workspace policy: {}", path.display()))?;
+
+    // Auto-migrate pre-#997-round-3 slides policies on read. Existing
+    // deployments (e.g. mini3 dspfac) carry `.octos-workspace.toml` files
+    // with `file_exists:output/deck.pptx` on_completion entries and/or
+    // Glob-source MagicBytes validators — neither matches the production
+    // location (deck lands under `<workspace>/skill-output/...` via the
+    // host's plugin work-dir rebind). Detect those markers, rebuild the
+    // policy with slug-aware skill-output artifact paths + a
+    // SpawnOnlyFiles MagicBytes validator, and persist back to disk so
+    // the next read is cheap and the on-disk policy reflects the new
+    // contract.
+    if policy.workspace.kind == WorkspacePolicyKind::Slides && is_legacy_slides_policy(&policy) {
+        if let Some(slug) = project_root.file_name().and_then(|n| n.to_str()) {
+            let upgraded = build_modern_slides_policy(slug);
+            // Best-effort persist — a write failure (read-only mount,
+            // race with another writer) should not block the policy
+            // load; the in-memory upgrade still applies for this caller.
+            if let Err(error) = write_workspace_policy_force(project_root, &upgraded) {
+                tracing::warn!(
+                    project_root = %project_root.display(),
+                    error = %error,
+                    "auto-migration of slides policy: failed to persist upgrade"
+                );
+            } else {
+                tracing::info!(
+                    project_root = %project_root.display(),
+                    "migrated legacy slides workspace policy to skill-output / SpawnOnlyFiles contract"
+                );
+            }
+            policy = upgraded;
+        }
+    }
+
     Ok(Some(policy))
+}
+
+/// Detect a pre-#997-round-3 slides policy: declares
+/// `file_exists:output/...` `on_completion` checks (the broken project-
+/// rooted path that the host's plugin rebind never satisfies) OR carries
+/// a Glob-source MagicBytes validator (which can't see decks under
+/// `skill-output/`).
+fn is_legacy_slides_policy(policy: &WorkspacePolicy) -> bool {
+    let has_legacy_on_completion = policy
+        .validation
+        .on_completion
+        .iter()
+        .any(|s| s.starts_with("file_exists:output/"));
+    let has_glob_pptx_validator = policy.validation.validators.iter().any(|v| {
+        matches!(
+            &v.spec,
+            ValidatorSpec::MagicBytes {
+                format: MagicByteKind::Pptx,
+                source: ValidatorFileSource::Glob,
+                ..
+            }
+        )
+    });
+    has_legacy_on_completion || has_glob_pptx_validator
+}
+
+/// Build the post-migration slides policy with slug-aware skill-output
+/// artifact paths and the SpawnOnlyFiles MagicBytes validator. Mirrors
+/// what `slides_delivery::workspace_policy_for_slug(Some(slug))` returns
+/// from the CLI crate, kept inline here to avoid a layer flip
+/// (octos-agent must not depend on octos-cli).
+fn build_modern_slides_policy(slug: &str) -> WorkspacePolicy {
+    let mut policy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+    policy.artifacts = WorkspaceArtifactsPolicy {
+        entries: BTreeMap::from([
+            (
+                "primary".into(),
+                format!("skill-output/slides/{slug}/output/deck.pptx"),
+            ),
+            (
+                "deck".into(),
+                format!("skill-output/slides/{slug}/output/deck.pptx"),
+            ),
+            (
+                "previews".into(),
+                format!("skill-output/slides/{slug}/output/**/slide-*.png"),
+            ),
+        ]),
+    };
+    policy
+}
+
+/// `write_workspace_policy` without the `create_new` guard — used by the
+/// auto-migration path to OVERWRITE an existing legacy file.
+fn write_workspace_policy_force(project_root: &Path, policy: &WorkspacePolicy) -> Result<()> {
+    let path = workspace_policy_path(project_root);
+    let rendered = toml::to_string_pretty(policy)
+        .wrap_err_with(|| format!("serialize workspace policy failed: {}", path.display()))?;
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, rendered.as_bytes())
+        .wrap_err_with(|| format!("write workspace policy tmp failed: {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .wrap_err_with(|| format!("rename workspace policy failed: {}", path.display()))?;
+    Ok(())
 }
 
 pub fn write_workspace_policy(project_root: &Path, policy: &WorkspacePolicy) -> Result<()> {
@@ -2966,5 +3063,73 @@ ignore = []
             "expected kebab-case 'coding' in serialized policy:\n{}",
             rendered
         );
+    }
+
+    /// Migration: a slides project whose persisted policy was written
+    /// before #997 round-3 (still carries `file_exists:output/deck.pptx`
+    /// + a Glob-source MagicBytes validator) should be auto-upgraded on
+    /// `read_workspace_policy`, and the upgrade should rewrite the file
+    /// on disk so subsequent reads are cheap.
+    #[test]
+    fn read_workspace_policy_auto_migrates_legacy_slides_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().join("slides").join("demo-slug");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        // Hand-build a pre-migration slides policy that mirrors what
+        // mini3 dspfac has on disk: project-relative file_exists +
+        // Glob-source MagicBytes(Pptx).
+        let mut legacy = WorkspacePolicy::for_kind(WorkspaceProjectKind::Slides);
+        legacy.validation.on_completion = vec![
+            "file_exists:output/deck.pptx".into(),
+            "file_exists:output/**/slide-*.png".into(),
+        ];
+        legacy.validation.validators = vec![Validator {
+            id: "slides.mofa_slides.pptx_magic_bytes".into(),
+            required: true,
+            soft_fail: false,
+            timeout_ms: None,
+            phase: ValidatorPhaseKind::Completion,
+            spec: ValidatorSpec::MagicBytes {
+                glob: "**/*.pptx".into(),
+                format: MagicByteKind::Pptx,
+                source: ValidatorFileSource::Glob,
+                extension: None,
+            },
+        }];
+        legacy.artifacts = WorkspaceArtifactsPolicy {
+            entries: BTreeMap::from([
+                ("primary".into(), "output/deck.pptx".into()),
+                ("deck".into(), "output/deck.pptx".into()),
+                ("previews".into(), "output/**/slide-*.png".into()),
+            ]),
+        };
+        // Write the legacy policy via the *force* variant (skip the
+        // create_new guard) so we're guaranteed to start from the
+        // pre-migration state.
+        write_workspace_policy_force(&project_root, &legacy).unwrap();
+
+        // Read should auto-upgrade.
+        let upgraded = read_workspace_policy(&project_root).unwrap().unwrap();
+
+        // on_completion stripped + validator switched to SpawnOnlyFiles.
+        assert!(upgraded.validation.on_completion.is_empty());
+        assert_eq!(upgraded.validation.validators.len(), 1);
+        match &upgraded.validation.validators[0].spec {
+            ValidatorSpec::MagicBytes { source, .. } => {
+                assert_eq!(*source, ValidatorFileSource::SpawnOnlyFiles);
+            }
+            _ => panic!("expected MagicBytes validator"),
+        }
+        // Slug-aware artifact paths.
+        assert_eq!(
+            upgraded.artifacts.entries.get("deck").map(String::as_str),
+            Some("skill-output/slides/demo-slug/output/deck.pptx")
+        );
+
+        // Upgrade was persisted: a second read parses the modern policy
+        // without re-running the migration branch.
+        let reread = read_workspace_policy(&project_root).unwrap().unwrap();
+        assert_eq!(reread, upgraded);
     }
 }
