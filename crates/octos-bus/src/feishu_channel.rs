@@ -502,44 +502,47 @@ async fn handle_webhook(
 
     // Signature verification: fail-closed when encrypt_key is set (#862).
     // Skipped for plaintext url_verification (handled above).
-    if let Some(ref ek) = state.encrypt_key
-        && !is_plaintext_url_verification
-    {
-        let timestamp = headers
-            .get("X-Lark-Request-Timestamp")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let nonce = headers
-            .get("X-Lark-Request-Nonce")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let expected_sig = headers
-            .get("X-Lark-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+    //
+    // NB: nested `if let` instead of `if let ... && condition` let-chain
+    // — workspace MSRV is 1.85.0 and let-chains stabilized in Rust 1.88.
+    if let Some(ref ek) = state.encrypt_key {
+        if !is_plaintext_url_verification {
+            let timestamp = headers
+                .get("X-Lark-Request-Timestamp")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let nonce = headers
+                .get("X-Lark-Request-Nonce")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let expected_sig = headers
+                .get("X-Lark-Signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
 
-        if timestamp.is_empty() || nonce.is_empty() || expected_sig.is_empty() {
-            warn!(
-                has_timestamp = !timestamp.is_empty(),
-                has_nonce = !nonce.is_empty(),
-                has_signature = !expected_sig.is_empty(),
-                "Feishu webhook: missing required signature header(s); rejecting"
-            );
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({"error": "missing signature headers"})),
-            )
-                .into_response();
-        }
+            if timestamp.is_empty() || nonce.is_empty() || expected_sig.is_empty() {
+                warn!(
+                    has_timestamp = !timestamp.is_empty(),
+                    has_nonce = !nonce.is_empty(),
+                    has_signature = !expected_sig.is_empty(),
+                    "Feishu webhook: missing required signature header(s); rejecting"
+                );
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"error": "missing signature headers"})),
+                )
+                    .into_response();
+            }
 
-        let computed = verify_signature(timestamp, nonce, ek, &body);
-        if computed != expected_sig {
-            warn!("Feishu webhook: signature mismatch");
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({"error": "signature mismatch"})),
-            )
-                .into_response();
+            let computed = verify_signature(timestamp, nonce, ek, &body);
+            if computed != expected_sig {
+                warn!("Feishu webhook: signature mismatch");
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"error": "signature mismatch"})),
+                )
+                    .into_response();
+            }
         }
     }
 
