@@ -40,6 +40,9 @@ const LIVE_MARKER: &str = "org.matrix.msc4357.live";
 const HTML_FORMAT: &str = "org.matrix.custom.html";
 const METADATA_TARGET_PROFILE_ID: &str = "target_profile_id";
 const METADATA_TARGET_MATRIX_USER_ID: &str = "target_matrix_user_id";
+const CONTENT_APP: &str = "org.octos.app";
+const CONTENT_ACTIONS: &str = "org.octos.actions";
+const CONTENT_ACTION_RESPONSE: &str = "org.octos.action_response";
 const CONTENT_TARGET_USER_ID: &str = "org.octos.target_user_id";
 const CONTENT_TARGET_USER_ID_LEGACY: &str = "target_user_id";
 #[cfg(not(test))]
@@ -1142,6 +1145,9 @@ async fn handle_transaction(
 
         // Route to bot profile: explicit target first, then @mention, then DM room mapping
         let mut metadata = json!({});
+        if let Some(action_response) = content.get(CONTENT_ACTION_RESPONSE) {
+            metadata[CONTENT_ACTION_RESPONSE] = action_response.clone();
+        }
         if let Some(profile_id) = route_by_explicit_target(&state.bot_router, content).await {
             metadata[METADATA_TARGET_PROFILE_ID] = json!(profile_id);
         } else if let Some(profile_id) =
@@ -1328,13 +1334,13 @@ fn extract_prompt_flag(args: &str) -> (String, Option<String>) {
     let before = args[..idx].trim().to_string();
     let after = args[idx + prompt_marker.len()..].trim();
 
-    let prompt = if after.starts_with('"') {
+    let prompt = if let Some(stripped) = after.strip_prefix('"') {
         // Find closing quote
-        if let Some(end) = after[1..].find('"') {
-            Some(after[1..1 + end].to_string())
+        if let Some(end) = stripped.find('"') {
+            Some(stripped[..end].to_string())
         } else {
             // No closing quote — take everything after the opening quote
-            Some(after[1..].to_string())
+            Some(stripped.to_string())
         }
     } else {
         // No quotes — take everything as prompt
@@ -1583,7 +1589,13 @@ impl Channel for MatrixChannel {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let event_id = self
-            .send_matrix_message(&msg.chat_id, &msg.content, sender_user_id, live)
+            .send_matrix_message(
+                &msg.chat_id,
+                &msg.content,
+                sender_user_id,
+                live,
+                &msg.metadata,
+            )
             .await?;
 
         // Remember which sender sent this event so edit_message can use the same identity.
@@ -1709,6 +1721,7 @@ impl MatrixChannel {
         content: &str,
         sender_user_id: Option<&str>,
         live: bool,
+        metadata: &Value,
     ) -> Result<String> {
         let txn_id = uuid::Uuid::now_v7().to_string();
         let effective_sender_user_id = sender_user_id.unwrap_or(&self.bot_user_id);
@@ -1730,6 +1743,15 @@ impl MatrixChannel {
         });
         if live {
             body[LIVE_MARKER] = json!({});
+        }
+        if let Some(app) = metadata.get(CONTENT_APP) {
+            body[CONTENT_APP] = app.clone();
+        }
+        if let Some(actions) = metadata.get(CONTENT_ACTIONS) {
+            body[CONTENT_ACTIONS] = actions.clone();
+        }
+        if let Some(action_response) = metadata.get(CONTENT_ACTION_RESPONSE) {
+            body[CONTENT_ACTION_RESPONSE] = action_response.clone();
         }
 
         let resp = self
@@ -3912,6 +3934,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_matrix_send_projects_app_metadata_into_event_content() {
+        let (homeserver, requests, handle) = spawn_mock_homeserver().await;
+        let ch = MatrixChannel::new(
+            &homeserver,
+            "as_token_test",
+            "hs_token_test",
+            "localhost",
+            "octos_bot",
+            "octos_",
+            unused_local_port(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let msg = OutboundMessage {
+            channel: "matrix".into(),
+            chat_id: "!room:localhost".into(),
+            content: "mission update".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: json!({
+                CONTENT_APP: {
+                    "type": "mission_room",
+                    "version": 1,
+                    "scope": "room",
+                    "app_id": "mission:alpha",
+                    "initial_state": { "status": "green" }
+                },
+                CONTENT_ACTIONS: [{
+                    "id": "ack",
+                    "label": "Acknowledge"
+                }],
+                CONTENT_ACTION_RESPONSE: {
+                    "action_id": "ack",
+                    "state": { "acknowledged": true }
+                }
+            }),
+        };
+
+        ch.send_with_id(&msg).await.unwrap();
+
+        wait_for_request_count(&requests, 1).await;
+        let reqs = requests.lock().await;
+        let req = reqs
+            .iter()
+            .find(|r| r.path.contains("/send/"))
+            .expect("should have a send request");
+        assert_eq!(req.body[CONTENT_APP]["type"], json!("mission_room"));
+        assert_eq!(req.body[CONTENT_ACTIONS][0]["id"], json!("ack"));
+        assert_eq!(
+            req.body[CONTENT_ACTION_RESPONSE]["state"]["acknowledged"],
+            json!(true)
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn test_matrix_edit_message() {
         let (homeserver, requests, handle) = spawn_mock_homeserver().await;
         let ch = MatrixChannel::new(
@@ -5460,6 +5538,57 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("profile-weather"),
             "explicit target_user_id should route to the selected bot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transaction_copies_action_response_into_metadata() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+        let state = make_test_state(inbound_tx);
+
+        let app = Router::new()
+            .route(
+                "/_matrix/app/v1/transactions/{txn_id}",
+                put(handle_transaction),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "events": [{
+                "type": "m.room.message",
+                "sender": "@alice:localhost",
+                "room_id": "!room:localhost",
+                "event_id": "$action-response-1",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "ack",
+                    "org.octos.action_response": {
+                        "action_id": "ack",
+                        "app_id": "mission:alpha",
+                        "state": { "acknowledged": true }
+                    }
+                }
+            }]
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/_matrix/app/v1/transactions/txn-action-response?access_token=test_token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let msg = inbound_rx.try_recv().unwrap();
+        assert_eq!(
+            msg.metadata[CONTENT_ACTION_RESPONSE]["state"]["acknowledged"],
+            json!(true)
         );
     }
 
