@@ -44,13 +44,14 @@ use tracing::{debug, warn};
 
 use octos_agent::cost_ledger::{CostAccountant, CostAttributionEvent, project_cost_usd};
 
-use crate::gate::{DispatchPolicy, enforce_or_outcome};
+use crate::gate::enforce_or_outcome;
 use crate::ledger::{CostLedger, NoopCostLedger, SwarmCostAttribution};
 use crate::persistence::{DispatchRecord, DispatchStore};
 use crate::result::{
     AggregateArtifact, SubtaskOutcome, SubtaskStatus, SwarmOutcomeKind, SwarmResult,
 };
 use crate::topology::{ContractSpec, MAX_CONTRACTS_PER_DISPATCH, SwarmTopology};
+use octos_agent::DispatchPolicy;
 
 /// Maximum number of retry rounds the primitive performs before
 /// surfacing a partial result. Bounded per invariant 5 so a flaky
