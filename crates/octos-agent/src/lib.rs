@@ -17,6 +17,7 @@ pub mod bundled_app_skills;
 pub mod compaction;
 pub mod compaction_tiered;
 pub mod cost_ledger;
+pub mod dispatch_policy;
 pub mod event_bus;
 pub mod exec_env;
 pub mod file_state_cache;
@@ -86,6 +87,7 @@ pub use cost_ledger::{
     COST_USD_HISTOGRAM, ContractCostRollup, CostAccountant, CostAttributionEvent, CostBudgetPolicy,
     CostLedger, PersistentCostLedger, project_cost_usd,
 };
+pub use dispatch_policy::{DispatchPolicy, DispatchTarget, GateDenial, enforce_dispatch_gates};
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use file_state_cache::{
