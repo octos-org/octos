@@ -14379,10 +14379,7 @@ async fn run_standalone_turn(
     // augments rather than replaces.
     let agent_snapshot = session_runtime.agent.system_prompt_snapshot();
     let system_prompt_base = match session_id.topic().and_then(|topic| {
-        crate::project_templates::read_session_prompt(
-            &session_runtime.profile.data_dir,
-            topic,
-        )
+        crate::project_templates::read_session_prompt(&session_runtime.profile.data_dir, topic)
     }) {
         Some(session_prompt) => format!("{agent_snapshot}\n\n{session_prompt}"),
         None => agent_snapshot,
