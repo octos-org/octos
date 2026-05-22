@@ -56,6 +56,64 @@ pub const APPROVAL_ASK: &str = "ask";
 /// `ApprovalPolicy::Never`).
 pub const APPROVAL_NEVER: &str = "never";
 
+/// Tools the default `ToolRegistry::with_builtins`-constructed child
+/// registry reliably registers AND that actually function inside a
+/// detached subagent context (independent of memory store / research
+/// index / session actor / native-spawn delegate wiring). Issue #971
+/// (M14-C) codex P1 fix: `RoleTemplate::to_spawn_compatible_allow`
+/// intersects the role's expanded budget with this list so the spawn
+/// tool's availability check does not reject tools that aren't
+/// registered in the stand-alone child runtime.
+///
+/// Notably absent (issue #971 codex iter-3 P2.1): `spawn_agent`.
+/// `with_builtins` registers `SpawnAgentTool::new()` WITHOUT a native
+/// spawn delegate; the alias in a child therefore always returns the
+/// "spawn_agent requires the session runtime to register a native
+/// spawn tool delegate" error. Advertising it via the implementer
+/// template would offer a tool that fails with a no-delegate error
+/// rather than the session capability the template promises — so the
+/// alias is filtered here. When the session actor wires a real spawn
+/// delegate into a per-session registry, that path stays separate
+/// from the static M14-C role budget and the parent's `ToolPolicy`
+/// can re-grant the alias explicitly.
+///
+/// Kept in stable lexicographic order so the const slice can be
+/// searched via `.contains()` without allocating a HashSet at the
+/// caller. Update whenever
+/// `ToolRegistry::with_builtins_and_permissions` adds or removes a
+/// non-feature-gated builtin AND that builtin is actually usable
+/// from inside a detached subagent.
+pub(crate) const SPAWN_BUILTIN_TOOLS: &[&str] = &[
+    "apply_patch",
+    "bash",
+    "browser",
+    "check_workspace_contract",
+    "close_agent",
+    "diff_edit",
+    "edit_file",
+    "exec_command",
+    "glob",
+    "grep",
+    "list_dir",
+    "read_file",
+    "request_user_input",
+    "resume_agent",
+    "send_input",
+    "shell",
+    "tool_search",
+    "tool_suggest",
+    "update_plan",
+    "view_image",
+    "wait_agent",
+    "web_fetch",
+    "web_search",
+    "workspace_diff",
+    "workspace_log",
+    "workspace_show",
+    "write_file",
+    "write_stdin",
+];
+
 /// Soft model preference hint. Templates set this so the orchestrator
 /// can route review / implementation children to a coding-grade lane
 /// while letting explorers fall onto the cheap analyst lane. Treated as
@@ -198,12 +256,114 @@ impl RoleTemplate {
     }
 
     /// Return the template tool budget in the owned shape expected by
-    /// `SpawnTool::Input.allowed_tools`.
+    /// `SpawnTool::Input.allowed_tools` and `ToolPolicy.allow`.
+    /// Issue #971 (M14-C) wires this into the spawn aliases so a role
+    /// name on the wire resolves to the same allow list the runtime
+    /// gates the child agent on.
+    ///
+    /// The shape is identical to the static `allowed_tools` slice: each
+    /// entry is either a `group:*` identifier or a bare exact tool name.
+    /// Group expansion happens at `ToolPolicy::evaluate` time, so the
+    /// safety property guarded by the unit tests in this module
+    /// (read-only roles never advertise a mutating group) carries
+    /// through into the runtime allow list unchanged.
+    ///
+    /// Use [`Self::to_expanded_tool_names`] instead when feeding the
+    /// spawn tool's `allowed_tools` field — that consumer does exact-
+    /// name lookup against the tool registry and does NOT understand
+    /// `group:*` entries, so groups have to be expanded first.
     pub fn allowed_tools_vec(&self) -> Vec<String> {
         self.allowed_tools
             .iter()
             .map(|entry| (*entry).to_owned())
             .collect()
+    }
+
+    /// Expand the template's tool budget into the concrete exact tool
+    /// names the spawn tool's availability check expects. Each
+    /// `group:*` entry is resolved through
+    /// [`crate::tools::policy::tool_group_info`]; bare tool names pass
+    /// through unchanged. Unknown group names fall through as opaque
+    /// entries so the caller's downstream availability check surfaces
+    /// the same "required tool not available" error a typo on a bare
+    /// tool name would.
+    ///
+    /// Issue #971 (M14-C) codex P1: `SpawnTool::ensure_subagent_tools_available`
+    /// fails closed on every `group:*` entry it sees because it does
+    /// `tools.get(tool_name).is_none()`. Without this expansion the
+    /// real `spawn_agent({"role": "reviewer"})` path would error with
+    /// "required tool(s) not available: group:search" the moment the
+    /// role wiring fired.
+    ///
+    /// **Note**: this can return tool names not present in every
+    /// runtime (e.g. `recall_memory` requires a memory store provider;
+    /// `spawn` is only registered by the session actor, not by
+    /// `ToolRegistry::with_builtins`). Callers feeding the spawn
+    /// tool's child registry should use [`Self::to_spawn_compatible_allow`]
+    /// instead, which intersects this expansion with the set of tools
+    /// the default `ToolRegistry::with_builtins` reliably registers.
+    pub fn to_expanded_tool_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::with_capacity(self.allowed_tools.len());
+        for entry in self.allowed_tools {
+            if entry.starts_with("group:") {
+                if let Some(group) = crate::tools::policy::tool_group_info(entry) {
+                    for tool in group.tools {
+                        let owned = (*tool).to_string();
+                        if !out.contains(&owned) {
+                            out.push(owned);
+                        }
+                    }
+                    continue;
+                }
+                // Unknown group — fall through as-is so the caller's
+                // downstream availability check reports a clear error.
+            }
+            let owned = (*entry).to_string();
+            if !out.contains(&owned) {
+                out.push(owned);
+            }
+        }
+        out
+    }
+
+    /// Filtered variant of [`Self::to_expanded_tool_names`] that emits
+    /// only tools the default `ToolRegistry::with_builtins`-built child
+    /// registry actually registers. Issue #971 (M14-C) codex P1 fix
+    /// (iteration 2): the prior wiring forwarded `recall_memory` /
+    /// `synthesize_research` / `save_memory` / `spawn` from role
+    /// templates into the child's `Input.allowed_tools`, which
+    /// `ensure_subagent_tools_available` then rejected — every default
+    /// role-based spawn failed before the child could run.
+    ///
+    /// The kept set is the intersection of the role's expanded budget
+    /// with [`SPAWN_BUILTIN_TOOLS`] (the tools `with_builtins`
+    /// guarantees). Tools requiring extra runtime wiring (memory
+    /// store, research index, session-actor-bound spawn, ...) are
+    /// filtered out at the spawn boundary; if a session actor extends
+    /// the child registry with those, the parent's `ToolPolicy` still
+    /// gates them through the standard policy plumbing.
+    pub fn to_spawn_compatible_allow(&self) -> Vec<String> {
+        self.to_expanded_tool_names()
+            .into_iter()
+            .filter(|tool| SPAWN_BUILTIN_TOOLS.contains(&tool.as_str()))
+            .collect()
+    }
+
+    /// Bounded UX summary the orchestrator surfaces in `tool/status/list`
+    /// alongside the coding tool contract (issue #971 / M14-C deliverable
+    /// "Test: role/tool/sandbox/model policy is resolved by the server
+    /// runtime"). Mirrors `RoleTemplate` fields the UX cares about
+    /// without leaking the prompt prefix (which is server-owned).
+    pub fn summary(&self) -> RoleTemplateSummary<'static> {
+        RoleTemplateSummary {
+            name: self.name,
+            display_name: self.display_name,
+            description: self.description,
+            allowed_tools: self.allowed_tools,
+            default_sandbox_mode: self.default_sandbox_mode,
+            default_approval_policy: self.default_approval_policy,
+            model_preference: self.model_preference.as_str(),
+        }
     }
 
     /// Infer a canonical role from Codex-style `agent_type` values.
@@ -265,6 +425,23 @@ impl RoleTemplate {
             "requested_model": requested_model,
         })
     }
+}
+
+/// Bounded UX summary of a [`RoleTemplate`], emitted as part of the
+/// `tool/status/list` payload so AppUI / TUI can render a spawn-role
+/// picker without round-tripping to a dedicated endpoint. Mirrors every
+/// `RoleTemplate` field clients legitimately need; the `prompt_prefix`
+/// is intentionally excluded because it is a server-owned secret that
+/// shouldn't ride on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RoleTemplateSummary<'a> {
+    pub name: &'a str,
+    pub display_name: &'a str,
+    pub description: &'a str,
+    pub allowed_tools: &'a [&'a str],
+    pub default_sandbox_mode: &'a str,
+    pub default_approval_policy: &'a str,
+    pub model_preference: &'a str,
 }
 
 /// All registered role templates. Keep this list aligned with the
@@ -751,5 +928,371 @@ mod tests {
                 "synthesize_research"
             ])
         );
+    }
+
+    /// Issue #971 (M14-C) wiring contract: every template snapshots into
+    /// a `Vec<String>` whose entries match the static `allowed_tools`
+    /// slice exactly. This is the value the spawn/spawn_agent paths
+    /// feed into `ToolPolicy.allow` and the worker's `allowed_tools`
+    /// field, so a drift here would silently change the budget the
+    /// child agent runs under.
+    #[test]
+    fn m14_c_wiring_allowed_tools_vec_round_trips_static_slice_per_971() {
+        for tpl in RoleTemplate::all() {
+            let owned = tpl.allowed_tools_vec();
+            assert_eq!(
+                owned.len(),
+                tpl.allowed_tools.len(),
+                "{} allowed_tools_vec must preserve cardinality",
+                tpl.name
+            );
+            for (i, expected) in tpl.allowed_tools.iter().enumerate() {
+                assert_eq!(
+                    owned[i], *expected,
+                    "{} entry {} must match static slice",
+                    tpl.name, i
+                );
+            }
+        }
+    }
+
+    /// Issue #971 (M14-C) codex P1 regression: `to_expanded_tool_names`
+    /// MUST produce zero `group:*` entries — only concrete tool names.
+    /// `SpawnTool::ensure_subagent_tools_available` does exact-name
+    /// `tools.get(name).is_none()` lookup, so any `group:*` slipping
+    /// through would make every role-based `spawn_agent` call fail
+    /// availability with "required tool not available: group:search".
+    #[test]
+    fn m14_c_wiring_to_expanded_tool_names_emits_no_group_entries_per_971() {
+        for tpl in RoleTemplate::all() {
+            let expanded = tpl.to_expanded_tool_names();
+            for entry in &expanded {
+                assert!(
+                    !entry.starts_with("group:"),
+                    "{} emitted raw group identifier {:?} from to_expanded_tool_names; \
+                     the spawn tool's availability check does exact-name lookup and \
+                     would treat this as a missing tool",
+                    tpl.name,
+                    entry
+                );
+                assert!(!entry.is_empty(), "{} emitted empty tool name", tpl.name);
+            }
+            // Sanity: expansion preserves at least one of each group's
+            // member tools. We pick the static `group:search` =>
+            // {glob, grep, list_dir} mapping since every M14-C
+            // template advertises group:search.
+            if tpl.permits("group:search") {
+                for member in ["glob", "grep", "list_dir"] {
+                    assert!(
+                        expanded.contains(&member.to_string()),
+                        "{} permits group:search but expanded set missing {member:?}; \
+                         got {expanded:?}",
+                        tpl.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #971 (M14-C) codex P1 iteration 2: `to_spawn_compatible_allow`
+    /// MUST emit only tool names from `SPAWN_BUILTIN_TOOLS` (the set
+    /// the spawn tool's child `ToolRegistry::with_builtins` registry
+    /// reliably exposes). Without this filter, the prior wiring
+    /// forwarded `recall_memory` / `synthesize_research` / `save_memory`
+    /// / `spawn` from role templates into the child's allowed_tools
+    /// and `ensure_subagent_tools_available` rejected every default
+    /// role-based spawn.
+    #[test]
+    fn m14_c_wiring_to_spawn_compatible_allow_intersects_builtins_per_971() {
+        for tpl in RoleTemplate::all() {
+            let allow = tpl.to_spawn_compatible_allow();
+            for tool in &allow {
+                assert!(
+                    SPAWN_BUILTIN_TOOLS.contains(&tool.as_str()),
+                    "{} to_spawn_compatible_allow emitted {tool:?} which is not in \
+                     SPAWN_BUILTIN_TOOLS; the child availability check would fail",
+                    tpl.name
+                );
+            }
+            // No `group:*` identifiers (already filtered by
+            // `to_expanded_tool_names`, but pinned here so a future
+            // refactor that bypasses expansion still tripwires this).
+            for tool in &allow {
+                assert!(
+                    !tool.starts_with("group:"),
+                    "{} to_spawn_compatible_allow emitted group identifier {tool:?}",
+                    tpl.name
+                );
+            }
+            // Codex iter-3 P2.1 guard: the undelegated `spawn_agent`
+            // alias MUST NOT leak through. `with_builtins` registers
+            // `SpawnAgentTool::new()` without a native delegate, so
+            // advertising the alias to a child would offer a tool that
+            // always fails with "spawn_agent requires the session
+            // runtime to register a native spawn tool delegate".
+            assert!(
+                !allow.iter().any(|t| t == "spawn_agent"),
+                "{} to_spawn_compatible_allow emitted spawn_agent — that alias is \
+                 registered without a delegate in subagent registries and would \
+                 always fail at the tool boundary",
+                tpl.name
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C) PR #1177 codex round-1 P2 regression: the
+    /// Codex-naming `bash` alias is registered by
+    /// `ToolRegistry::with_builtins_and_permissions` (PR #1174) AND
+    /// it expands out of `group:runtime` for both `implementer` and
+    /// `test_worker`. If `SPAWN_BUILTIN_TOOLS` omits it,
+    /// `to_spawn_compatible_allow` silently drops the alias from
+    /// the wire payload — role-based children would call `bash` and
+    /// get a "not allowed" error even though the runtime registry
+    /// has it. This guard pins the inclusion at the registry edit
+    /// site so the runtime group cannot drift past the spawn budget.
+    #[test]
+    fn m14_c_wiring_spawn_compatible_allow_includes_bash_for_runtime_roles_per_971() {
+        for role_name in [ROLE_IMPLEMENTER, ROLE_TEST_WORKER] {
+            let tpl = RoleTemplate::for_name(role_name).unwrap();
+            let allow = tpl.to_spawn_compatible_allow();
+            assert!(
+                allow.contains(&"bash".to_string()),
+                "{role_name} runtime budget MUST include the bash alias once \
+                 group:runtime expands; got {allow:?}",
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C) codex P1 iteration 2: every role template
+    /// MUST emit at least one spawn-compatible tool, otherwise the
+    /// resulting spawn payload would carry `allowed_tools: []` which
+    /// the native spawn tool interprets as "all builtins" — defeating
+    /// the role's safety budget. The contract: a registered role MUST
+    /// surface at least one effective tool through the spawn path.
+    #[test]
+    fn m14_c_wiring_to_spawn_compatible_allow_is_non_empty_per_971() {
+        for tpl in RoleTemplate::all() {
+            assert!(
+                !tpl.to_spawn_compatible_allow().is_empty(),
+                "{} to_spawn_compatible_allow returned an empty set; the spawn tool \
+                 would interpret this as 'all builtins' and defeat the role budget",
+                tpl.name
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C) codex P1 regression: every group identifier
+    /// in a role template's `allowed_tools` slice MUST resolve through
+    /// `tool_group_info`. A typo on a `group:` entry that doesn't match
+    /// a registered `TOOL_GROUPS` row would let the raw `group:*`
+    /// identifier flow through `to_expanded_tool_names` unchanged and
+    /// fail `SpawnTool::ensure_subagent_tools_available` at runtime.
+    /// This guard catches that drift at the registry edit site.
+    #[test]
+    fn m14_c_wiring_every_group_entry_resolves_through_tool_group_info_per_971() {
+        for tpl in RoleTemplate::all() {
+            for entry in tpl.allowed_tools {
+                if entry.starts_with("group:") {
+                    let info = crate::tools::policy::tool_group_info(entry);
+                    assert!(
+                        info.is_some(),
+                        "{} advertises group {entry:?} but tool_group_info \
+                         returned None; either fix the typo or add the group \
+                         to tools::policy::TOOL_GROUPS",
+                        tpl.name
+                    );
+                    let info = info.unwrap();
+                    assert!(
+                        !info.tools.is_empty(),
+                        "{} advertises group {entry:?} but its tools slice is empty",
+                        tpl.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #971 (M14-C) safety property: when a read-only role's
+    /// allow list is interpreted by `tools::policy::ToolPolicy`, the
+    /// expanded set must NOT contain any disk-writing or session-
+    /// mutating tool. This is the runtime-side complement of the
+    /// `read_only_roles_do_not_advertise_mutating_groups` guard above:
+    /// even if a future template adds a new `group:` that happens to
+    /// expand to a mutating tool, this test fires on the actual
+    /// `ToolPolicy::is_allowed` decision.
+    #[test]
+    fn m14_c_wiring_reviewer_policy_denies_mutating_tools_per_971() {
+        use crate::tools::policy::ToolPolicy;
+        let tpl = RoleTemplate::for_name(ROLE_REVIEWER).unwrap();
+        let policy = ToolPolicy {
+            allow: tpl.allowed_tools_vec(),
+            ..Default::default()
+        };
+        for mutator in [
+            "write_file",
+            "edit_file",
+            "diff_edit",
+            "apply_patch",
+            "save_memory",
+            "shell",
+            "exec_command",
+            "write_stdin",
+            "spawn",
+            "spawn_agent",
+            "delegate_task",
+            "browser",
+            "deep_crawl",
+        ] {
+            assert!(
+                !policy.is_allowed(mutator),
+                "reviewer policy must deny mutating tool {mutator:?}; \
+                 allow list = {:?}",
+                policy.allow
+            );
+        }
+        // Sanity: the read-only tools the template DOES advertise stay
+        // allowed once the same allow list is piped through ToolPolicy.
+        for permitted in [
+            "read_file",
+            "glob",
+            "grep",
+            "list_dir",
+            "web_search",
+            "web_fetch",
+            "recall_memory",
+            "synthesize_research",
+        ] {
+            assert!(
+                policy.is_allowed(permitted),
+                "reviewer policy must allow {permitted:?}"
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C): explorer policy is strictly read-only AND
+    /// must NOT permit `group:runtime` tools (the explorer's role is to
+    /// READ the codebase, not run commands — even cheap ones like
+    /// `exec_command` would let the role drift into shell execution).
+    #[test]
+    fn m14_c_wiring_explorer_policy_denies_runtime_per_971() {
+        use crate::tools::policy::ToolPolicy;
+        let tpl = RoleTemplate::for_name(ROLE_EXPLORER).unwrap();
+        let policy = ToolPolicy {
+            allow: tpl.allowed_tools_vec(),
+            ..Default::default()
+        };
+        for runtime in ["shell", "exec_command", "write_stdin", "spawn"] {
+            assert!(
+                !policy.is_allowed(runtime),
+                "explorer must deny runtime tool {runtime:?}"
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C): test_worker IS the role allowed to run
+    /// commands, so `group:runtime` MUST expand to `shell` /
+    /// `exec_command` / `write_stdin` once piped through ToolPolicy.
+    /// But the test_worker MUST NOT be able to mutate files or spawn
+    /// further children — the runtime side of the
+    /// `test_worker_runs_commands_but_does_not_spawn` static guard.
+    #[test]
+    fn m14_c_wiring_test_worker_policy_allows_runtime_denies_fs_per_971() {
+        use crate::tools::policy::ToolPolicy;
+        let tpl = RoleTemplate::for_name(ROLE_TEST_WORKER).unwrap();
+        let policy = ToolPolicy {
+            allow: tpl.allowed_tools_vec(),
+            ..Default::default()
+        };
+        for runtime in ["shell", "exec_command", "write_stdin"] {
+            assert!(
+                policy.is_allowed(runtime),
+                "test_worker must allow runtime tool {runtime:?}"
+            );
+        }
+        for mutator in [
+            "write_file",
+            "edit_file",
+            "diff_edit",
+            "apply_patch",
+            "save_memory",
+            "spawn",
+            "spawn_agent",
+            "browser",
+        ] {
+            assert!(
+                !policy.is_allowed(mutator),
+                "test_worker must deny mutating tool {mutator:?}"
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C): implementer IS the read-write coding role,
+    /// so its policy must allow file mutation AND command execution
+    /// AND child spawning. This pins the runtime-side budget the
+    /// implementer template advertises.
+    #[test]
+    fn m14_c_wiring_implementer_policy_allows_fs_runtime_sessions_per_971() {
+        use crate::tools::policy::ToolPolicy;
+        let tpl = RoleTemplate::for_name(ROLE_IMPLEMENTER).unwrap();
+        let policy = ToolPolicy {
+            allow: tpl.allowed_tools_vec(),
+            ..Default::default()
+        };
+        for allowed in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "diff_edit",
+            "apply_patch",
+            "shell",
+            "exec_command",
+            "spawn",
+            "spawn_agent",
+            "save_memory",
+            "recall_memory",
+            "glob",
+            "grep",
+            "list_dir",
+        ] {
+            assert!(
+                policy.is_allowed(allowed),
+                "implementer must allow {allowed:?}"
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C): `RoleTemplate::summary()` exposes a bounded
+    /// wire-safe projection — every consumer (tool/status/list,
+    /// AppUI spawn-role picker) reads through this struct. The
+    /// `prompt_prefix` MUST stay server-owned and never appear on
+    /// the wire: this guard ensures the summary type has no field
+    /// accessor for it.
+    #[test]
+    fn m14_c_wiring_role_summary_omits_prompt_prefix_per_971() {
+        for tpl in RoleTemplate::all() {
+            let summary = tpl.summary();
+            assert_eq!(summary.name, tpl.name);
+            assert_eq!(summary.display_name, tpl.display_name);
+            assert_eq!(summary.description, tpl.description);
+            assert_eq!(summary.allowed_tools, tpl.allowed_tools);
+            assert_eq!(summary.default_sandbox_mode, tpl.default_sandbox_mode);
+            assert_eq!(summary.default_approval_policy, tpl.default_approval_policy);
+            assert_eq!(summary.model_preference, tpl.model_preference.as_str());
+            // Round-trip through serde: the JSON projection must not
+            // contain "prompt_prefix" because the summary struct does
+            // not expose it.
+            let json = serde_json::to_value(summary).expect("serialize summary");
+            assert!(
+                json.get("prompt_prefix").is_none(),
+                "{} summary leaked prompt_prefix on the wire: {json}",
+                tpl.name
+            );
+            // Sanity: the public fields ARE serialized.
+            assert!(json.get("name").is_some(), "summary must serialize name");
+            assert!(
+                json.get("allowed_tools").is_some(),
+                "summary must serialize allowed_tools"
+            );
+        }
     }
 }

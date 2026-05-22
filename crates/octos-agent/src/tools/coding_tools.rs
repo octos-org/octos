@@ -954,7 +954,22 @@ fn append_instruction(existing: Option<String>, instruction: String) -> Option<S
     })
 }
 
-fn normalize_spawn_agent_args(args: &Value) -> Value {
+/// Normalise the loose Codex `spawn_agent` arg shape into the strict
+/// `spawn` tool argument layout, optionally folding a resolved
+/// [`crate::role_template::RoleTemplate`] into the spawn payload.
+///
+/// Issue #971 (M14-C): when a caller passes `role: "reviewer"` (or any
+/// other registered template name), the alias resolves the template
+/// once at the spawn_agent boundary and forwards the template's
+/// `allowed_tools` budget + `prompt_prefix` to the native spawn tool.
+/// Inline-wins semantics still apply: a caller-supplied `allowed_tools`
+/// array overrides the template's, and a caller-supplied
+/// `additional_instructions` is appended TO (not replaced BY) the
+/// template's prompt prefix.
+fn normalize_spawn_agent_args_with_role(
+    args: &Value,
+    role: Option<&crate::role_template::RoleTemplate>,
+) -> Value {
     let mut out = serde_json::Map::new();
     if let Some(input) = args.as_object() {
         for key in [
@@ -1014,6 +1029,28 @@ fn normalize_spawn_agent_args(args: &Value) -> Value {
             );
         }
     }
+    // PR #1177 codex round-3 P2 fix: a client that serialises an
+    // unset `role` as `null` or `""` would otherwise leak that blank
+    // value through to the spawn delegate, whose `apply_role_template`
+    // treats blank/None as "no role" and skips the prompt-prefix
+    // injection — even though `SpawnAgentTool::execute_with_context`
+    // resolved a template from `agent_type` and stamped the task with
+    // that role. Drop the blank value here so either the resolved
+    // template below OR the spawn delegate's `apply_role_template`
+    // sees a clean absence; the resolved value is then written back
+    // unconditionally.
+    let blank_role = match out.get("role") {
+        Some(Value::Null) | None => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        _ => false,
+    };
+    if blank_role {
+        out.remove("role");
+    }
+    // Codex round-3 P2 fix: when an explicit `role` is absent AND a
+    // recognised `agent_type` alias is set, write the canonical role
+    // name so the spawn delegate's `apply_role_template` resolves the
+    // same template the boundary already stamped on the BackgroundTask.
     if !out.contains_key("role") {
         if let Some(role_template) = args
             .get("agent_type")
@@ -1026,6 +1063,16 @@ fn normalize_spawn_agent_args(args: &Value) -> Value {
             );
         }
     }
+    // Codex round-3 P2 fix: when the boundary already resolved a
+    // template (either from an explicit `role` arg or from the
+    // `agent_type` alias path), authoritatively write the canonical
+    // template name. This keeps the spawn delegate's view in lock-step
+    // with the BackgroundTask.role stamp even when the caller passed
+    // e.g. `role: " Reviewer "` (whitespace / wrong case) or relied
+    // on the `agent_type` alias.
+    if let Some(template) = role {
+        out.insert("role".to_string(), Value::String(template.name.to_string()));
+    }
     if !out.contains_key("model") {
         if let Some(model) = args.get("model").and_then(Value::as_str) {
             out.insert("model".to_string(), Value::String(model.to_string()));
@@ -1036,6 +1083,84 @@ fn normalize_spawn_agent_args(args: &Value) -> Value {
         .get("additional_instructions")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    // Issue #971 (M14-C): when the caller resolved a role template,
+    // seed the spawn payload's `allowed_tools` with the template's
+    // spawn-compatible budget. The native `SpawnTool::apply_role_template`
+    // is the authoritative layer for role-derived metadata
+    // (prompt-prefix prepending happens there so the path is uniform
+    // for ALL `role`-bearing spawns, not just `spawn_agent`-aliased
+    // ones); but `apply_role_template` falls back to
+    // `RoleTemplate::allowed_tools_vec()` which still carries
+    // `group:*` identifiers. Those raw group entries would then fail
+    // `ensure_subagent_tools_available` (it does exact-name lookup).
+    // Pre-populating the inline `allowed_tools` with
+    // `to_spawn_compatible_allow()` short-circuits the fallback so the
+    // wire payload only carries names the child's `with_builtins`
+    // registry actually has.
+    //
+    // Codex iter-2 P2 (PR #1171 → PR #1177): the prefix prepending
+    // is INTENTIONALLY NOT done here — `spawn.rs::apply_role_template`
+    // prepends `template.prompt_prefix` to `additional_instructions`
+    // for every native-delegate spawn, so doing it again at this
+    // boundary would double the prefix in the child's system context.
+    if let Some(template) = role {
+        // Issue #971 codex P1 fix iteration 2: only treat a NON-EMPTY
+        // `allowed_tools` array as an inline override. An empty array
+        // is interpreted by the native spawn tool as "all builtins",
+        // so without this guard a client that always serialises
+        // `allowed_tools: []` would bypass the role's restricted
+        // budget and silently receive write/shell/browser tools on a
+        // reviewer/explorer/test_worker spawn.
+        //
+        // Issue #971 codex iter-5 P1 fix: when `agent_definition_id`
+        // is set, `SpawnTool::apply_agent_definition` treats any
+        // non-empty `allowed_tools` on the inline Input as a CALLER
+        // override and skips the manifest's `tools` allow-list. Role
+        // defaults are NOT caller overrides — they should defer to
+        // the manifest's allow-list. Skip the role injection when a
+        // manifest reference is present so the manifest's `tools`
+        // gate fires; the role still contributes the prompt prefix
+        // through `spawn.rs::apply_role_template`.
+        let manifest_id_present = out
+            .get("agent_definition_id")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let inline_allowed_present = out
+            .get("allowed_tools")
+            .and_then(Value::as_array)
+            .is_some_and(|arr| !arr.is_empty());
+        if !inline_allowed_present && !manifest_id_present {
+            // Drop any caller-supplied empty array so the role's
+            // budget is the one that ships.
+            out.remove("allowed_tools");
+            // Issue #971 codex P1 fix: filter expanded `group:*`
+            // entries to those the child's `with_builtins` registry
+            // actually has. The prior wiring forwarded raw expansions
+            // including `recall_memory` / `synthesize_research` /
+            // `save_memory` / `spawn` — none of which `with_builtins`
+            // registers — so every default role-based spawn failed
+            // `SpawnTool::ensure_subagent_tools_available` before the
+            // child could run. `to_spawn_compatible_allow` returns
+            // the intersection of the role's expansion with the
+            // builtin set.
+            out.insert(
+                "allowed_tools".to_string(),
+                Value::Array(
+                    template
+                        .to_spawn_compatible_allow()
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        } else if manifest_id_present && !inline_allowed_present {
+            // Codex iter-5 P1: ensure we don't pass a stale empty
+            // array through when a manifest is set. Removing the key
+            // entirely lets `apply_agent_definition` install the
+            // manifest's `tools` allow-list unmolested.
+            out.remove("allowed_tools");
+        }
+    }
     if let Some(agent_type) = args
         .get("agent_type")
         .and_then(Value::as_str)
@@ -1131,6 +1256,14 @@ impl Tool for SpawnAgentTool {
     }
 
     fn input_schema(&self) -> Value {
+        // Issue #971 (M14-C): advertise `role` and enumerate the four
+        // backend-owned templates so the LLM can discover them without
+        // probing the server. Enum values stay in sync with
+        // `RoleTemplate::all()` via the static role constants.
+        let role_names: Vec<Value> = crate::role_template::RoleTemplate::all()
+            .iter()
+            .map(|tpl| Value::String(tpl.name.to_string()))
+            .collect();
         json!({
             "type": "object",
             "properties": {
@@ -1144,7 +1277,12 @@ impl Tool for SpawnAgentTool {
                 "label": {"type": "string"},
                 "role": {"type": "string"},
                 "mode": {"type": "string", "enum": ["background", "sync"]},
-                "allowed_tools": {"type": "array", "items": {"type": "string"}}
+                "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                "role": {
+                    "type": "string",
+                    "description": "Optional backend-owned role template that resolves to a tool budget + sandbox + model preference + prompt prefix. When set, the resolved template seeds the spawn payload; inline `allowed_tools` still wins.",
+                    "enum": role_names,
+                }
             }
         })
     }
@@ -1154,10 +1292,60 @@ impl Tool for SpawnAgentTool {
     }
 
     async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        // Issue #971 (M14-C): resolve the optional `role` argument
+        // against the typed `RoleTemplate` registry BEFORE we forward to
+        // the native spawn delegate. Unknown values fail at the boundary
+        // (structured error) rather than silently spawning under a role
+        // the LLM did not ask for.
+        //
+        // PR #1177 codex round-2 P2 fix: also consult the Codex
+        // `agent_type` alias path (`agent_type: "worker"` etc.) so a
+        // caller that uses the historical #1148 alias instead of an
+        // explicit `role` still gets the spawn-compatible
+        // `allowed_tools` budget folded in AND the BackgroundTask
+        // role/stamp populated. `normalize_spawn_agent_args_with_role`
+        // already mirrors the agent_type alias to `role` for the wire
+        // payload; this hoist mirrors it for the boundary-side
+        // template injection too.
+        let role_template = match args.get("role").and_then(Value::as_str).map(str::trim) {
+            Some(name) if !name.is_empty() => {
+                match crate::role_template::RoleTemplate::for_name(name) {
+                    Some(template) => Some(template),
+                    None => {
+                        let registered: Vec<&str> = crate::role_template::RoleTemplate::all()
+                            .iter()
+                            .map(|tpl| tpl.name)
+                            .collect();
+                        return Ok(ToolResult {
+                            output: format!(
+                                "spawn_agent: unknown role {:?}; registered roles: {}",
+                                name,
+                                registered.join(", ")
+                            ),
+                            success: false,
+                            structured_metadata: Some(json!({
+                                "codex_tool": "spawn_agent",
+                                "error": "unknown_role",
+                                "role": name,
+                                "registered_roles": registered,
+                            })),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            _ => args
+                .get("agent_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(crate::role_template::RoleTemplate::for_codex_agent_type),
+        };
+
         let Some(delegate) = self.delegate.as_ref() else {
             return spawn_agent_without_delegate(args, ctx).await;
         };
-        let spawn_args = normalize_spawn_agent_args(args);
+        let spawn_args = normalize_spawn_agent_args_with_role(args, role_template);
         let before = ctx
             .task_supervisor
             .as_ref()
@@ -1181,21 +1369,121 @@ impl Tool for SpawnAgentTool {
             "status": "started",
             "output": result.output,
         });
+        let mut resolved_task_id: Option<String> = None;
         if let Some(task) = task {
             payload["agent_id"] = json!(task.id);
             payload["status"] = json!(task.status.as_str());
             payload["runtime_state"] = json!(format!("{:?}", task.runtime_state));
             payload["child_session_key"] = json!(task.child_session_key);
             payload["terminal"] = json!(task.status.is_terminal());
+            resolved_task_id = Some(task.id);
+        }
+
+        // Issue #971 (M14-C): label the supervisor's BackgroundTask with
+        // the resolved role so the M13 `task/list` and `task/updated`
+        // projections inherit `role = "reviewer"` (or whatever the
+        // caller resolved). Without this the AppUI spawn-role badge
+        // cannot render and the M14-C acceptance check ("child task
+        // summaries and artifacts appear through M13 task/list") fails.
+        //
+        // Issue #971 codex iter-3 P2.2: also stamp a bounded
+        // `runtime_policy_stamp` snapshot of the resolved template +
+        // effective allow list, so reconnect hydration / `task/updated`
+        // subscribers see the server-resolved sandbox / approval /
+        // model preference / tool budget the child agent is running
+        // under. Without the stamp, `task/list` would only carry the
+        // role NAME and clients would have to re-resolve the template
+        // registry to learn the effective policy — defeating the
+        // M14-C acceptance "role/tool/sandbox/model policy resolved
+        // by the server runtime".
+        if let (Some(template), Some(task_id), Some(supervisor)) = (
+            role_template,
+            resolved_task_id.as_deref(),
+            ctx.task_supervisor.as_ref(),
+        ) {
+            // Issue #971 codex iter-4 P2 + iter-5 P2: the
+            // `allowed_tools` field IS effective when no manifest is
+            // referenced (the spawn tool's child registry runs under
+            // EXACTLY this allow list), but `sandbox_mode`,
+            // `approval_policy`, and `model_preference` are advisory
+            // — they're the template's DECLARED defaults, not the
+            // sandbox/approval settings the spawned `SpawnTool`
+            // actually applies. When `agent_definition_id` is set,
+            // `SpawnTool::apply_agent_definition` may further prune
+            // the allow list via the manifest's `tools` and
+            // `disallowed_tools`, so the stamp marks the dimension as
+            // `subject_to_manifest` and surfaces the manifest id —
+            // otherwise `task/list` could report tools as `enforced`
+            // allowed after the manifest pruned them.
+            let manifest_id = spawn_args
+                .get("agent_definition_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            let effective_allowed: Vec<&str> = spawn_args
+                .get("allowed_tools")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let allowed_tools_enforcement = if manifest_id.is_some() {
+                "subject_to_manifest"
+            } else {
+                "enforced"
+            };
+            let mut stamp = json!({
+                "role": template.name,
+                "role_display_name": template.display_name,
+                // Pre-manifest allow list. When a manifest is set,
+                // the child's actual policy may be tighter — see
+                // `policy_enforcement.allowed_tools`.
+                "allowed_tools": effective_allowed,
+                "policy_enforcement": {
+                    "allowed_tools": allowed_tools_enforcement,
+                    "sandbox_mode": "advisory",
+                    "approval_policy": "advisory",
+                    "model_preference": "advisory",
+                },
+                // Advisory: the role's declared defaults. The spawn
+                // tool does not currently propagate these to the
+                // child sandbox / approval / model resolution — they
+                // ride as metadata so a future wiring can surface
+                // the gap and so clients can render the role's
+                // self-description without re-resolving the registry.
+                "declared_sandbox_mode": template.default_sandbox_mode,
+                "declared_approval_policy": template.default_approval_policy,
+                "declared_model_preference": template.model_preference.as_str(),
+            });
+            if let Some(id) = manifest_id {
+                stamp["agent_definition_id"] = json!(id);
+            }
+            supervisor.set_m13b_projection(
+                task_id,
+                Some("model".to_string()),
+                Some(template.name.to_string()),
+                None,
+                None,
+                Some(stamp),
+            );
+        }
+
+        // PR #1177 reconciliation: the prefix prepending was moved
+        // downstream into `spawn.rs::apply_role_template` to avoid
+        // doubling the prefix in the child's system context. As a
+        // result `spawn_args.additional_instructions` no longer
+        // carries the server-owned prompt prefix at this layer, so
+        // the dedicated redaction step from PR #1171 is unnecessary.
+        let mut meta = json!({
+            "codex_tool": "spawn_agent",
+            "octos_tool": "spawn",
+            "spawn_args": spawn_args.clone(),
+        });
+        if let Some(template) = role_template {
+            meta["role"] = json!(template.name);
+            meta["role_summary"] = serde_json::to_value(template.summary()).unwrap_or(Value::Null);
         }
         Ok(ToolResult {
             output: payload.to_string(),
             success: true,
-            structured_metadata: Some(json!({
-                "codex_tool": "spawn_agent",
-                "octos_tool": "spawn",
-                "spawn_args": spawn_args,
-            })),
+            structured_metadata: Some(meta),
             ..Default::default()
         })
     }
@@ -3260,6 +3548,786 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("reasoning_effort: high")
+        );
+    }
+
+    /// Issue #971 (M14-C wiring contract): `spawn_agent` MUST accept a
+    /// `role` argument that resolves through `RoleTemplate::for_name`
+    /// and (1) seeds the dispatched spawn payload with the template's
+    /// `allowed_tools` budget, (2) appends the template's `prompt_prefix`
+    /// to the child's `additional_instructions`, (3) labels the
+    /// supervisor's `BackgroundTask.role` field so M13's `task/list`
+    /// projection inherits the role name without TUI/web doing any
+    /// orchestration of its own.
+    ///
+    /// The fake spawn tool below records the spawn payload it received
+    /// onto the supervised task's `tool_input`. We then assert on the
+    /// recorded payload + the supervisor's BackgroundTask projection.
+    #[tokio::test]
+    async fn spawn_agent_with_role_argument_uses_template_runtime_factory_per_971() {
+        use crate::role_template::{ROLE_REVIEWER, RoleTemplate};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "audit PR #1234",
+                    "role": ROLE_REVIEWER,
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        // (3) Supervisor's BackgroundTask MUST carry the role label so
+        // M13 task/list and task/updated emit `role = "reviewer"` to
+        // observers. Without this the AppUI spawn-role badge cannot
+        // render and the contract acceptance check breaks.
+        assert_eq!(
+            task.role.as_deref(),
+            Some(ROLE_REVIEWER),
+            "spawn_agent must label BackgroundTask.role with the resolved template"
+        );
+        // (1) The spawn payload the fake delegate received MUST include
+        // the template's tool budget so the child agent runs under the
+        // policy the template promises. Group entries are EXPANDED to
+        // concrete tool names (codex P1 fix) AND filtered to tools the
+        // child's `with_builtins` registry has (codex P1 iteration 2)
+        // — otherwise `SpawnTool::ensure_subagent_tools_available`
+        // would fail every default role-based spawn.
+        let spawn_input = task.tool_input.expect("tool input recorded");
+        let reviewer = RoleTemplate::for_name(ROLE_REVIEWER).unwrap();
+        let allowed = spawn_input["allowed_tools"]
+            .as_array()
+            .expect("allowed_tools array on spawn payload");
+        let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+        for expected in reviewer.to_spawn_compatible_allow() {
+            assert!(
+                allowed.contains(&expected.as_str()),
+                "spawn payload must include {expected:?}; got {allowed:?}"
+            );
+        }
+        // Codex P1 regression guard: NO `group:*` entries leak through
+        // to the spawn payload. The native spawn tool does exact-name
+        // lookup, so group identifiers would fail availability.
+        for entry in &allowed {
+            assert!(
+                !entry.starts_with("group:"),
+                "spawn payload must not contain raw group identifier {entry:?}; \
+                 it would fail SpawnTool::ensure_subagent_tools_available"
+            );
+        }
+        // Spot-check: reviewer's `group:search` expanded to glob/grep/
+        // list_dir on the wire.
+        for expected_member in ["glob", "grep", "list_dir"] {
+            assert!(
+                allowed.contains(&expected_member),
+                "reviewer's group:search must expand to include {expected_member:?}; \
+                 got {allowed:?}"
+            );
+        }
+        // Codex P1 iteration 2 regression: tools NOT in
+        // `ToolRegistry::with_builtins` (e.g. `recall_memory`,
+        // `synthesize_research`, `save_memory`, `spawn`) must NOT
+        // appear on the wire. Otherwise the child availability check
+        // fires.
+        for excluded in [
+            "recall_memory",
+            "synthesize_research",
+            "save_memory",
+            "spawn",
+        ] {
+            assert!(
+                !allowed.contains(&excluded),
+                "spawn payload must not include {excluded:?} (not in with_builtins child registry); \
+                 got {allowed:?}"
+            );
+        }
+        // (2) The reviewer role label MUST be propagated on the wire
+        // so the native spawn delegate's `apply_role_template` can
+        // prepend the prompt_prefix to the child's `additional_instructions`.
+        // Codex iter-2 fix (PR #1177): we no longer prepend the prefix
+        // at the `spawn_agent` boundary because `spawn.rs::apply_role_template`
+        // does it universally for every `role`-bearing spawn — doing it
+        // here too would double the prefix in the child's system context.
+        assert_eq!(
+            spawn_input["role"],
+            json!(ROLE_REVIEWER),
+            "spawn payload MUST forward role so spawn.rs::apply_role_template can layer prefix",
+        );
+        // Sanity: structured metadata carries the resolved role so the
+        // AppUI tool stream can show "spawned reviewer subagent" without
+        // re-resolving the registry.
+        let meta = result
+            .structured_metadata
+            .as_ref()
+            .expect("spawn_agent must emit structured_metadata");
+        assert_eq!(
+            meta["role"],
+            json!(ROLE_REVIEWER),
+            "structured_metadata must echo the resolved role"
+        );
+        // Codex P2 regression guard (PR #1171 → PR #1177): the
+        // server-owned `prompt_prefix` MUST NOT leak through
+        // `structured_metadata.spawn_args`. The role summary already
+        // keeps the prefix off the wire; this pins the spawn-payload
+        // echo to do the same. With the prefix prepending moved
+        // downstream into `spawn.rs::apply_role_template`, the boundary
+        // payload simply never carries the prefix in the first place.
+        let metadata_extra = meta["spawn_args"]["additional_instructions"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !metadata_extra.contains("code reviewer"),
+            "structured_metadata.spawn_args MUST NOT echo the role prompt prefix; \
+             got {metadata_extra:?}"
+        );
+
+        // Codex iter-3 P2.2 regression: BackgroundTask.runtime_policy_stamp
+        // MUST be populated for role-based spawns so reconnect hydration
+        // and `task/updated` subscribers see the server-resolved allow
+        // list. Codex iter-4 P2 refinement: the stamp distinguishes
+        // ENFORCED dimensions (`allowed_tools`) from ADVISORY ones
+        // (`declared_sandbox_mode` etc.) so clients render the role's
+        // self-description without trusting an unenforced policy.
+        let stamp = task
+            .runtime_policy_stamp
+            .as_ref()
+            .expect("BackgroundTask.runtime_policy_stamp MUST be populated for role spawns");
+        assert_eq!(stamp["role"], json!(ROLE_REVIEWER));
+        // Advisory declared defaults — surfaced under `declared_*`
+        // names so clients don't mistake them for enforced policy.
+        assert_eq!(stamp["declared_sandbox_mode"], json!("none"));
+        assert_eq!(stamp["declared_approval_policy"], json!("never"));
+        assert_eq!(stamp["declared_model_preference"], json!("coding"));
+        // Enforcement tag MUST mark `allowed_tools` as enforced and
+        // the rest as advisory — codex iter-4 P2 contract.
+        assert_eq!(
+            stamp["policy_enforcement"]["allowed_tools"],
+            json!("enforced")
+        );
+        for advisory in ["sandbox_mode", "approval_policy", "model_preference"] {
+            assert_eq!(
+                stamp["policy_enforcement"][advisory],
+                json!("advisory"),
+                "policy_enforcement.{advisory} must be 'advisory' until the spawn tool propagates it"
+            );
+        }
+        // The enforced allow_tools list MUST appear on the stamp.
+        let stamp_allowed = stamp["allowed_tools"]
+            .as_array()
+            .expect("runtime_policy_stamp.allowed_tools must be array");
+        let stamp_allowed: Vec<&str> = stamp_allowed.iter().filter_map(Value::as_str).collect();
+        for member in ["glob", "grep", "list_dir", "read_file"] {
+            assert!(
+                stamp_allowed.contains(&member),
+                "runtime_policy_stamp.allowed_tools must include {member:?}; \
+                 got {stamp_allowed:?}"
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C) PR #1177 reconciliation: with the prompt-
+    /// prefix prepending consolidated into `spawn.rs::apply_role_template`
+    /// (the codex iter-2 fix that removed the prefix doubling between
+    /// the `spawn_agent` boundary and the native spawn delegate), the
+    /// `spawn_agent` boundary's job is to FORWARD the resolved role and
+    /// any caller-supplied `additional_instructions` without doubling
+    /// either of them. This test pins that contract: role goes on the
+    /// wire as `role`, caller hint stays in `additional_instructions`,
+    /// the prompt_prefix is NOT prepended at this layer (so `apply_role_template`
+    /// can prepend it once and the child's system context carries a
+    /// single role prefix).
+    #[tokio::test]
+    async fn m14_c_wiring_spawn_agent_forwards_role_and_caller_instructions_per_971() {
+        use crate::role_template::{ROLE_REVIEWER, RoleTemplate};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "audit PR #1234",
+                    "role": ROLE_REVIEWER,
+                    "additional_instructions": "CALLER_HINT_SENTINEL",
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        let spawn_input = task.tool_input.expect("tool input recorded");
+
+        // Role is forwarded so spawn.rs::apply_role_template can layer
+        // the prompt prefix at the native spawn boundary.
+        assert_eq!(
+            spawn_input["role"],
+            json!(ROLE_REVIEWER),
+            "role must be forwarded on the spawn payload",
+        );
+        // Caller hint is preserved verbatim — the boundary does not
+        // touch additional_instructions for role purposes anymore.
+        let extra = spawn_input["additional_instructions"]
+            .as_str()
+            .expect("additional_instructions on spawn payload");
+        assert!(
+            extra.contains("CALLER_HINT_SENTINEL"),
+            "caller hint must be preserved; got {extra:?}"
+        );
+        // Codex iter-2 fix regression guard: the prompt_prefix MUST NOT
+        // be prepended at this layer (spawn.rs::apply_role_template
+        // would otherwise prepend it AGAIN, doubling the role prefix
+        // in the child's system context).
+        let reviewer = RoleTemplate::for_name(ROLE_REVIEWER).unwrap();
+        assert!(
+            !extra.contains(reviewer.prompt_prefix),
+            "spawn_agent boundary MUST NOT prepend prompt_prefix (spawn.rs::apply_role_template \
+             handles it); got {extra:?}"
+        );
+    }
+
+    /// Issue #971 (M14-C) codex iter-5 P1: when a caller passes BOTH
+    /// `role` AND `agent_definition_id`, the role MUST NOT inject its
+    /// `allowed_tools` into the spawn payload — `SpawnTool::apply_agent_definition`
+    /// treats any non-empty inline `allowed_tools` as a caller override
+    /// that skips the manifest's `tools` allow-list, so role defaults
+    /// would bypass the manifest's safety envelope (e.g. a `role="implementer"`
+    /// with the `research-worker` manifest could still receive
+    /// `apply_patch` / `diff_edit` / `exec_command` even though the
+    /// manifest never allowed them).
+    ///
+    /// This test asserts the wire payload: when both fields are
+    /// present, the role's tool budget is NOT in `allowed_tools` —
+    /// the manifest is left to install its own allow list downstream.
+    /// The role still contributes the prompt prefix.
+    #[tokio::test]
+    async fn spawn_agent_role_with_agent_definition_id_defers_to_manifest_per_971() {
+        use crate::role_template::ROLE_IMPLEMENTER;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "implement #1234",
+                    "role": ROLE_IMPLEMENTER,
+                    "agent_definition_id": "research-worker",
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        let spawn_input = task.tool_input.expect("tool input recorded");
+        // The wire payload MUST NOT carry the role's allowed_tools
+        // when a manifest is referenced. Leaving the field absent
+        // lets `apply_agent_definition` install the manifest's
+        // `tools` allow-list unmolested.
+        assert!(
+            spawn_input.get("allowed_tools").is_none()
+                || spawn_input["allowed_tools"]
+                    .as_array()
+                    .is_some_and(|a| a.is_empty()),
+            "spawn payload MUST NOT carry role-derived allowed_tools when a manifest is set; \
+             got allowed_tools = {:?}",
+            spawn_input.get("allowed_tools")
+        );
+        // The manifest id MUST be forwarded so the spawn tool can
+        // resolve it.
+        assert_eq!(
+            spawn_input["agent_definition_id"],
+            json!("research-worker"),
+            "spawn payload must forward agent_definition_id"
+        );
+        // The role label MUST still be forwarded so `spawn.rs::apply_role_template`
+        // can anchor the child's system prompt on the role's voice
+        // (codex iter-2 fix consolidated the prefix prepending downstream;
+        // at this boundary we only have to make sure the role survives
+        // the manifest-deference branch).
+        assert_eq!(
+            spawn_input["role"],
+            json!(ROLE_IMPLEMENTER),
+            "spawn payload MUST forward role even when manifest deference \
+             skips the role's tool budget",
+        );
+        // Codex iter-5 P2: when a manifest is present, the stamp
+        // must mark `policy_enforcement.allowed_tools` as
+        // `subject_to_manifest` (not `enforced`) so clients can tell
+        // the pre-manifest allow list is not authoritative.
+        let stamp = task
+            .runtime_policy_stamp
+            .as_ref()
+            .expect("BackgroundTask.runtime_policy_stamp MUST be populated for role spawns");
+        assert_eq!(
+            stamp["policy_enforcement"]["allowed_tools"],
+            json!("subject_to_manifest"),
+            "manifest-pruned stamp must mark allowed_tools as 'subject_to_manifest'"
+        );
+        assert_eq!(
+            stamp["agent_definition_id"],
+            json!("research-worker"),
+            "stamp must surface the manifest id so clients can re-resolve"
+        );
+    }
+
+    /// Issue #971 (M14-C) codex iter-3 P2.1: the `implementer` template
+    /// advertises `group:sessions`, which expands to `spawn_agent` /
+    /// `send_input` / `resume_agent` / `wait_agent` / `close_agent`.
+    /// `ToolRegistry::with_builtins` registers `SpawnAgentTool::new()`
+    /// WITHOUT a native `spawn` delegate, so an implementer child that
+    /// tried to use `spawn_agent` would always fail with "no native
+    /// delegate". Filter it from the spawn-compatible budget. The other
+    /// session aliases (`send_input` etc.) only need the supervisor
+    /// in `ctx`, which a child still inherits, so they stay.
+    #[tokio::test]
+    async fn spawn_agent_implementer_does_not_advertise_undelegated_spawn_agent_per_971() {
+        use crate::role_template::{ROLE_IMPLEMENTER, RoleTemplate};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "implement #1234",
+                    "role": ROLE_IMPLEMENTER,
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        let spawn_input = task.tool_input.expect("tool input recorded");
+        let allowed = spawn_input["allowed_tools"]
+            .as_array()
+            .expect("allowed_tools array");
+        let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+        // The undelegated alias MUST NOT appear in the wire allow list,
+        // otherwise the child would be offered a tool that always
+        // fails with "spawn_agent requires the session runtime to
+        // register a native spawn tool delegate".
+        assert!(
+            !allowed.contains(&"spawn_agent"),
+            "implementer's spawn payload MUST NOT advertise the undelegated \
+             spawn_agent alias; got {allowed:?}"
+        );
+        // The native `spawn` tool is also NOT in `with_builtins`, so
+        // the role budget should not include it either.
+        assert!(
+            !allowed.contains(&"spawn"),
+            "implementer's spawn payload MUST NOT advertise the unregistered \
+             native spawn tool; got {allowed:?}"
+        );
+        // Other session aliases stay — they only need the supervisor
+        // handle which IS in ctx.
+        for delegated in ["send_input", "resume_agent", "wait_agent", "close_agent"] {
+            assert!(
+                allowed.contains(&delegated),
+                "implementer's spawn payload should advertise {delegated:?} \
+                 (works via ctx.task_supervisor); got {allowed:?}"
+            );
+        }
+        // Sanity: the role template ITSELF still permits `group:sessions`
+        // (we only filter the wire projection, not the static schema).
+        // This pins the contract — the spec stays unchanged.
+        let implementer = RoleTemplate::for_name(ROLE_IMPLEMENTER).unwrap();
+        assert!(implementer.permits("group:sessions"));
+    }
+
+    /// Issue #971 (M14-C wiring contract): an unknown `role` value MUST
+    /// fail at the tool boundary with a structured error rather than
+    /// silently defaulting to a template the LLM did not ask for. The
+    /// `TaskListEntry.role` field is `Option<String>` precisely because
+    /// the caller is expected to handle the unknown case explicitly.
+    #[tokio::test]
+    async fn spawn_agent_rejects_unknown_role_per_971() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "audit PR #1234",
+                    "role": "review",
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(
+            !result.success,
+            "spawn_agent must refuse unknown role; output={:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("unknown role")
+                || (result.output.contains("role") && result.output.contains("review")),
+            "error must mention the offending role name; got {:?}",
+            result.output
+        );
+    }
+
+    /// Issue #971 (M14-C): `spawn_agent` MUST keep working WITHOUT an
+    /// explicit `role` argument so the #1148 P0/P1 alias parity does
+    /// not regress. PR #1177 codex round-2 P2 refinement: when the
+    /// caller still uses the Codex `agent_type` alias (e.g.
+    /// `agent_type: "worker"` for the implementer role), the
+    /// `spawn_agent` boundary resolves the role via
+    /// `for_codex_agent_type` so the spawn-compatible tool budget +
+    /// BackgroundTask role/stamp ARE applied — otherwise the real
+    /// spawn delegate's `apply_role_template` would fall back to the
+    /// raw `allowed_tools_vec()` (with `group:*` entries) and
+    /// `ensure_subagent_tools_available` would reject the spawn.
+    /// This test pins both halves: the normalization still emits the
+    /// historical `codex-worker` label, AND the role gets resolved.
+    #[tokio::test]
+    async fn spawn_agent_without_role_argument_preserves_1148_behavior() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "inspect parity",
+                    "agent_type": "worker",
+                    "reasoning_effort": "high",
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        // The historical #1148 normalization still fires.
+        let input = task.tool_input.clone().expect("tool input");
+        assert_eq!(input["task"], "inspect parity");
+        assert_eq!(input["label"], "codex-worker");
+        // PR #1177 codex round-2 P2: the agent_type alias path
+        // resolves to ROLE_IMPLEMENTER so the spawn-compatible
+        // budget is folded in; BackgroundTask.role now mirrors that
+        // resolution.
+        assert_eq!(
+            task.role.as_deref(),
+            Some(crate::role_template::ROLE_IMPLEMENTER),
+            "agent_type='worker' must resolve to ROLE_IMPLEMENTER so the spawn-compatible \
+             allow list is injected; got {:?}",
+            task.role,
+        );
+        assert_eq!(
+            input["role"],
+            json!(crate::role_template::ROLE_IMPLEMENTER),
+            "spawn payload must forward the resolved role label"
+        );
+    }
+
+    /// Issue #971 (M14-C) PR #1177 codex round-3 P2 regression: a
+    /// client that serialises an unset `role` as `null` or `""` MUST
+    /// NOT defeat the `agent_type` alias resolution. The boundary
+    /// strips blank role values before reading the agent_type alias,
+    /// then writes the canonical resolved role back into the spawn
+    /// payload so the spawn delegate's `apply_role_template` sees the
+    /// same template the BackgroundTask was stamped with. Without
+    /// this fix, the spawn delegate would receive `role: null` /
+    /// `role: ""` and skip the prompt-prefix injection even though
+    /// the wrapper stamped the role.
+    #[tokio::test]
+    async fn m14_c_wiring_blank_role_with_agent_type_resolves_template_per_971() {
+        for blank in [Value::Null, json!(""), json!("   ")] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut registry = ToolRegistry::with_builtins(temp.path());
+            registry.register(FakeSpawnTool);
+            let supervisor = registry.supervisor();
+            let ctx = ToolContext {
+                task_supervisor: Some(supervisor.clone()),
+                parent_session_key: Some("api:test".to_string()),
+                ..ToolContext::zero()
+            };
+            let result = registry
+                .execute_with_context(
+                    &ctx,
+                    "spawn_agent",
+                    &json!({
+                        "message": "inspect parity",
+                        "agent_type": "worker",
+                        "role": blank.clone(),
+                    }),
+                )
+                .await
+                .expect("spawn_agent");
+            assert!(result.success, "{}", result.output);
+            let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+            let agent_id = payload["agent_id"].as_str().expect("agent id");
+            let task = supervisor.get_task(agent_id).expect("task registered");
+            let input = task.tool_input.clone().expect("tool input");
+            assert_eq!(
+                input["role"],
+                json!(crate::role_template::ROLE_IMPLEMENTER),
+                "blank role={blank:?} + agent_type='worker' MUST write canonical ROLE_IMPLEMENTER \
+                 to the spawn payload so apply_role_template fires"
+            );
+            assert_eq!(
+                task.role.as_deref(),
+                Some(crate::role_template::ROLE_IMPLEMENTER),
+                "blank role={blank:?} + agent_type='worker' MUST stamp BackgroundTask.role with \
+                 the resolved template",
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C) PR #1177 codex round-3 P2: when the caller
+    /// passes a non-canonical (but case- or whitespace-sloppy) explicit
+    /// `role` that nevertheless resolves through the registry (e.g.
+    /// because the boundary lookup does `RoleTemplate::for_name` on
+    /// the trimmed value), the spawn payload MUST carry the canonical
+    /// name — not whatever sloppy spelling the caller used — so the
+    /// spawn delegate's `apply_role_template` does an exact-name
+    /// lookup against the registry without re-trimming.
+    #[tokio::test]
+    async fn m14_c_wiring_resolved_role_writes_canonical_name_per_971() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "audit PR #1234",
+                    // Explicit canonical name with surrounding
+                    // whitespace — boundary trims for lookup; ensure
+                    // the trimmed canonical name lands on the wire.
+                    "role": "  reviewer  ",
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        let input = task.tool_input.expect("tool input recorded");
+        assert_eq!(
+            input["role"],
+            json!(crate::role_template::ROLE_REVIEWER),
+            "spawn payload MUST carry the trimmed canonical role name"
+        );
+    }
+
+    /// Issue #971 (M14-C) PR #1177 codex round-2 P2 regression: when
+    /// the caller passes an `agent_type` alias whose `for_codex_agent_type`
+    /// resolution returns `None` (e.g. `agent_type: "planner"`), the
+    /// boundary MUST NOT label the task with a role — otherwise an
+    /// unrecognised agent_type would silently inherit some default
+    /// role's policy budget. This pins the negative case.
+    #[tokio::test]
+    async fn m14_c_wiring_unknown_agent_type_does_not_synthesize_role_per_971() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "inspect parity",
+                    "agent_type": "planner",
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        assert!(
+            task.role.is_none(),
+            "unknown agent_type MUST NOT synthesize a role label; got {:?}",
+            task.role,
+        );
+        assert!(
+            task.runtime_policy_stamp.is_none(),
+            "unknown agent_type MUST NOT stamp a runtime policy",
+        );
+    }
+
+    /// Issue #971 (M14-C) codex P1 iteration 2: when the caller passes
+    /// `role` AND an EMPTY `allowed_tools: []` array, the empty array
+    /// MUST NOT silently override the template's restricted budget.
+    /// The native spawn tool treats an empty allow-list as "all
+    /// builtins"; without this guard a client that always serialises
+    /// empty optional arrays would let a reviewer/explorer/test_worker
+    /// spawn receive write, shell, and browser tools.
+    #[tokio::test]
+    async fn spawn_agent_with_role_ignores_empty_allowed_tools_per_971() {
+        use crate::role_template::{ROLE_REVIEWER, RoleTemplate};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "audit PR #1234",
+                    "role": ROLE_REVIEWER,
+                    // Client serialises optional array as empty — this
+                    // MUST be treated as "no override", not as the
+                    // native spawn-tool sentinel for "all builtins".
+                    "allowed_tools": [],
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        let spawn_input = task.tool_input.expect("tool input recorded");
+        let reviewer = RoleTemplate::for_name(ROLE_REVIEWER).unwrap();
+        let allowed = spawn_input["allowed_tools"]
+            .as_array()
+            .expect("allowed_tools array on spawn payload");
+        let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+        // Empty inline override MUST be overridden BY the template's
+        // budget — every spawn-compatible tool the reviewer permits
+        // appears on the wire.
+        assert!(
+            !allowed.is_empty(),
+            "spawn payload allowed_tools MUST NOT be empty when a role is set; \
+             empty would be interpreted as 'all builtins' by the spawn tool"
+        );
+        for expected in reviewer.to_spawn_compatible_allow() {
+            assert!(
+                allowed.contains(&expected.as_str()),
+                "spawn payload must include {expected:?} after empty override; \
+                 got {allowed:?}"
+            );
+        }
+        // And the reviewer's deny set MUST NOT leak through.
+        for forbidden in ["write_file", "edit_file", "shell", "exec_command"] {
+            assert!(
+                !allowed.contains(&forbidden),
+                "reviewer spawn payload MUST NOT include {forbidden:?} after \
+                 empty override; got {allowed:?}"
+            );
+        }
+    }
+
+    /// Issue #971 (M14-C) codex P1 iteration 2: a NON-EMPTY inline
+    /// `allowed_tools` array MUST still override the template budget.
+    /// This pins the inline-wins contract: a caller can carve out a
+    /// custom budget for a one-off spawn even with `role` set.
+    #[tokio::test]
+    async fn spawn_agent_with_role_honors_nonempty_allowed_tools_override_per_971() {
+        use crate::role_template::ROLE_REVIEWER;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(FakeSpawnTool);
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:test".to_string()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                "spawn_agent",
+                &json!({
+                    "message": "audit PR #1234",
+                    "role": ROLE_REVIEWER,
+                    "allowed_tools": ["read_file", "grep"],
+                }),
+            )
+            .await
+            .expect("spawn_agent");
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+        let agent_id = payload["agent_id"].as_str().expect("agent id");
+        let task = supervisor.get_task(agent_id).expect("task registered");
+        let spawn_input = task.tool_input.expect("tool input recorded");
+        let allowed = spawn_input["allowed_tools"]
+            .as_array()
+            .expect("allowed_tools array on spawn payload");
+        let allowed: Vec<&str> = allowed.iter().filter_map(Value::as_str).collect();
+        assert_eq!(
+            allowed,
+            vec!["read_file", "grep"],
+            "non-empty inline allowed_tools must win over the role template"
         );
     }
 

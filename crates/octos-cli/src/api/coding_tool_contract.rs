@@ -712,6 +712,26 @@ pub(crate) fn coding_tool_contract_payload(
     let mut deferred_names: Vec<&str> = deferred_model_tools.iter().copied().collect();
     deferred_names.sort();
 
+    // Issue #971 (M14-C): advertise the four backend-owned role
+    // templates so the AppUI/TUI can render a spawn-role picker
+    // without hard-coding the names client-side. Each entry is the
+    // bounded `RoleTemplateSummary` projection — the server-owned
+    // `prompt_prefix` stays off the wire. The acceptance gate
+    // (`Test: role/tool/sandbox/model policy is resolved by the
+    // server runtime`) checks for this field's presence + shape.
+    let role_templates: Vec<Value> = octos_agent::RoleTemplate::all()
+        .iter()
+        .map(|tpl| {
+            serde_json::to_value(tpl.summary()).unwrap_or_else(|_| {
+                // Should not happen — RoleTemplateSummary is plain
+                // &str / &[&str] and infallibly serializable. Fall
+                // back to the role name so the client still gets
+                // SOMETHING bounded to render.
+                json!({ "name": tpl.name })
+            })
+        })
+        .collect();
+
     json!({
         "id": CODING_TOOL_CONTRACT_ID,
         "version": CODING_TOOL_CONTRACT_VERSION,
@@ -721,6 +741,7 @@ pub(crate) fn coding_tool_contract_payload(
         "required_tools": required_tools,
         "missing_required_tools": missing_required_tools,
         "deferred_model_tools": deferred_names,
+        "role_templates": role_templates,
         "policy": {
             "tool_policy_id": policy.tool_policy_id,
             "sandbox_mode": policy.sandbox_mode,
@@ -1002,6 +1023,68 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == json!(name))
             .expect("required tool")
+    }
+
+    /// Issue #971 (M14-C acceptance): the coding tool contract payload
+    /// MUST surface the four backend-owned role templates so AppUI / TUI
+    /// can render a spawn-role picker without hard-coding the role list
+    /// client-side. Each entry is the bounded `RoleTemplateSummary`
+    /// projection; the server-owned `prompt_prefix` MUST NOT leak.
+    #[test]
+    fn m14_c_contract_payload_surfaces_role_templates_per_971() {
+        let payload =
+            tool_status_list_payload(ToolStatusListContext::default_for_session("coding:test"));
+        let contract = &payload["coding_tool_contract"];
+        let role_templates = contract["role_templates"]
+            .as_array()
+            .expect("role_templates array must be present on coding_tool_contract");
+        assert_eq!(
+            role_templates.len(),
+            4,
+            "M14-C contracts four role templates; got {role_templates:?}"
+        );
+        let names: Vec<&str> = role_templates
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["reviewer", "implementer", "test_worker", "explorer"],
+            "role_templates must enumerate the M14-C canonical names in stable order"
+        );
+        for entry in role_templates {
+            // Required fields the UX needs.
+            assert!(entry.get("name").is_some(), "missing name: {entry}");
+            assert!(
+                entry.get("display_name").is_some(),
+                "missing display_name: {entry}"
+            );
+            assert!(
+                entry.get("description").is_some(),
+                "missing description: {entry}"
+            );
+            assert!(
+                entry.get("allowed_tools").is_some(),
+                "missing allowed_tools: {entry}"
+            );
+            assert!(
+                entry.get("default_sandbox_mode").is_some(),
+                "missing default_sandbox_mode: {entry}"
+            );
+            assert!(
+                entry.get("default_approval_policy").is_some(),
+                "missing default_approval_policy: {entry}"
+            );
+            assert!(
+                entry.get("model_preference").is_some(),
+                "missing model_preference: {entry}"
+            );
+            // Safety: server-owned prompt_prefix MUST NOT leak.
+            assert!(
+                entry.get("prompt_prefix").is_none(),
+                "prompt_prefix MUST stay server-owned: {entry}"
+            );
+        }
     }
 
     #[test]
