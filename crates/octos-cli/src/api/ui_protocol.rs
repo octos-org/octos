@@ -15841,22 +15841,42 @@ async fn run_standalone_turn(
                     if let Some(message) = final_assistant {
                         // Fleet-UX soak NEW-03: when the loop fabricated
                         // the synthesised "Background work started for
-                        // `<tool>`." ack, skip the persist entirely.
-                        // See the `skip_synthesized_spawn_only_ack`
-                        // comment above for the full rationale. We
-                        // still leave `final_assistant_persisted` at
-                        // its current value (false on this path) so
-                        // the `final_send` decision below routes the
-                        // post-turn self-paced reschedule through the
-                        // history-fallback scan — which is the right
-                        // shape because a spawn_only ack never carries
-                        // a `<<loop-next-in: ...>>` hint anyway.
+                        // `<tool>`." ack, skip the JSONL persist
+                        // entirely (see the
+                        // `skip_synthesized_spawn_only_ack` comment
+                        // above for the full rationale).
+                        //
+                        // Codex P2 follow-up on this PR: we MUST still
+                        // flip `final_assistant_persisted` to true on
+                        // this path so the `final_send` decision below
+                        // routes the captured reply to the post-turn
+                        // self-paced reschedule block. Without this,
+                        // a self-paced / maintenance loop firing a
+                        // bare spawn_only call with no LLM preamble
+                        // would skip the only non-empty assistant
+                        // content for the turn — `final_send` becomes
+                        // `None`, the history-fallback scan also finds
+                        // no non-empty row (because we skipped the
+                        // persist), and `apply_self_paced_response`
+                        // never fires. Since the fire-time
+                        // `next_run_at_ms` is cleared until
+                        // `apply_self_paced_response` stamps a fresh
+                        // delay, the loop would stall.
+                        //
+                        // A spawn_only ack never carries a
+                        // `<<loop-next-in: ...>>` hint, so the
+                        // reschedule falls back to
+                        // `SELF_PACED_DEFAULT_DELAY_SECONDS` — exactly
+                        // the pre-#1183 behaviour for autonomous
+                        // loops.
                         if skip_synthesized_spawn_only_ack {
                             debug!(
                                 session = %agent_session_id,
                                 "skipping JSONL persist for synthesised spawn_only ack \
-                                 (NEW-03: prevents ghost ack bubble on messages_page replay)"
+                                 (NEW-03: prevents ghost ack bubble on messages_page replay); \
+                                 flipping final_assistant_persisted so self-paced loops still reschedule"
                             );
+                            final_assistant_persisted = true;
                         } else {
                             // The `final_assistant` row is the synthesised
                             // carrier of `response.content`. By
@@ -28173,6 +28193,95 @@ ignore = []
         // Restore the global observer slot to None so subsequent tests
         // see a clean state.
         octos_bus::set_message_commit_observer(None);
+    }
+
+    /// Codex P2 follow-up on the NEW-03 fix: a self-paced (or
+    /// `maintenance`) loop that fires a bare spawn_only call with NO
+    /// LLM preamble has only the synthesised ack as its turn-final
+    /// assistant content. Pre-codex-P2 the new skip-persist path
+    /// dropped both the JSONL row AND the `final_send` signal — so
+    /// `apply_self_paced_response` never fired, `next_run_at_ms`
+    /// stayed cleared from the fire-time stamp, and the loop stalled.
+    ///
+    /// Post-codex-P2 the skip path flips `final_assistant_persisted`
+    /// to true, which routes the captured reply through to the
+    /// post-turn block. This test pins the orchestrator-level invariant
+    /// the fix relies on: feeding `apply_self_paced_response` the
+    /// synthesised ack text (which has no `<<loop-next-in: ...>>`
+    /// hint) MUST stamp a fresh `next_run_at_ms` ~= now +
+    /// `SELF_PACED_DEFAULT_DELAY_SECONDS` (15 min default), so the
+    /// loop keeps scheduling.
+    #[test]
+    fn self_paced_loop_reschedules_when_only_assistant_content_is_synth_ack() {
+        use crate::api::agent_orchestrator::{
+            LoopCreateRequest, LoopListRequest, default_agent_orchestrator,
+        };
+
+        let orchestrator = default_agent_orchestrator();
+        let session_id =
+            SessionKey::with_profile("tenant-new03", "api", "self-paced-bare-spawn-only");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-new03".into(),
+                prompt: Some("kick off the pipeline".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self-paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Simulate the synthesised spawn_only ack text exactly as
+        // `loop_runner::process_message_inner` fabricates it — note
+        // no `<<loop-next-in: ...>>` hint.
+        let ack_text = "Background work started for `run_pipeline`. \
+             The final result will be delivered automatically when it is ready.";
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let parsed = orchestrator
+            .apply_self_paced_response(&loop_id, "tenant-new03", ack_text)
+            .expect("apply_self_paced_response on synthesised ack");
+        assert_eq!(
+            parsed, None,
+            "ack carries no `<<loop-next-in: ...>>` hint, so the parser must return None",
+        );
+
+        // The default fallback delay is 15 minutes (900 s). Assert the
+        // next_run_at_ms lands inside a tolerant window around that.
+        // Use the public `list_loops` API to inspect the stamped value
+        // (the internal `state()` accessor is private).
+        let listed = orchestrator
+            .list_loops(LoopListRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-new03".into(),
+            })
+            .expect("list_loops");
+        let loops = listed
+            .get("loops")
+            .and_then(|v| v.as_array())
+            .expect("loops array");
+        let record = loops
+            .iter()
+            .find(|loop_val| loop_val.get("loop_id").and_then(|v| v.as_str()) == Some(&loop_id))
+            .expect("created loop record present");
+        let next = record
+            .get("next_run_at_ms")
+            .and_then(|v| v.as_i64())
+            .expect(
+                "self-paced loop MUST have a fresh next_run_at_ms after firing — \
+                 if this is null the loop has stalled (the NEW-03 codex P2 regression)",
+            );
+        let delta_ms = next - before;
+        assert!(
+            (890_000..=910_000).contains(&delta_ms),
+            "next_run_at_ms must be roughly 900s (SELF_PACED_DEFAULT_DELAY_SECONDS) in the \
+             future (got {delta_ms} ms) — confirms `apply_self_paced_response` fell back to \
+             the default delay when the ack carried no hint",
+        );
     }
 
     /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat
