@@ -224,9 +224,7 @@ mod tests {
              not a stopping point for a generation request (NEW-05 fix)"
         );
         assert!(
-            PROMPT.contains(
-                "you MUST immediately follow up with `podcast_generate`"
-            ),
+            PROMPT.contains("you MUST immediately follow up with `podcast_generate`"),
             "prompt must instruct the model to immediately follow up \
              with `podcast_generate` after calling `podcast_voices` for \
              a generation request; without this nudge deepseek-v4-pro \
@@ -257,9 +255,7 @@ mod tests {
              podcast_generate (codex P2 follow-up to NEW-05)"
         );
         assert!(
-            PROMPT.contains(
-                "call `podcast_voices` and return that list as the final answer"
-            ),
+            PROMPT.contains("call `podcast_voices` and return that list as the final answer"),
             "prompt must instruct the model to call `podcast_voices` \
              and return the list as the final answer for voice-list-only \
              prompts (codex P2 follow-up to NEW-05)"
@@ -310,9 +306,7 @@ mod tests {
         // review on d8eebec9, P2). The reconciled wording must prefer
         // `news_fetch` when it is registered.
         assert!(
-            PROMPT.contains(
-                "prefer the `news_fetch` specialist tool when it is registered"
-            ),
+            PROMPT.contains("prefer the `news_fetch` specialist tool when it is registered"),
             "Grounding Rules must explicitly prefer news_fetch over \
              web_search/web_fetch when news_fetch is registered (codex \
              P2 follow-up to B6 fix)"
@@ -320,9 +314,7 @@ mod tests {
         // The old conflicting phrasing — "news, current events" lumped
         // into the web_search bucket — must not return.
         assert!(
-            !PROMPT.contains(
-                "(stock prices, sports scores, exchange rates, news, current events"
-            ),
+            !PROMPT.contains("(stock prices, sports scores, exchange rates, news, current events"),
             "the unqualified 'news' entry in the web_search list must \
              not be reintroduced (codex P2 regression guard)"
         );

@@ -15834,14 +15834,13 @@ async fn run_standalone_turn(
                         let is_final_assistant_carrier = message.role == MessageRole::Assistant
                             && message.content == response.content
                             && !response.content.is_empty();
-                        let preamble_assistant_content =
-                            if message.role == MessageRole::Assistant
-                                && !message.content.trim().is_empty()
-                            {
-                                Some(message.content.clone())
-                            } else {
-                                None
-                            };
+                        let preamble_assistant_content = if message.role == MessageRole::Assistant
+                            && !message.content.trim().is_empty()
+                        {
+                            Some(message.content.clone())
+                        } else {
+                            None
+                        };
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();

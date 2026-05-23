@@ -8,7 +8,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use tracing::{debug, warn};
 
 use crate::episode::Episode;
-use crate::hybrid_search::HybridIndex;
+use crate::hybrid_search::{HybridIndex, HybridScore};
 
 /// Table for episodes: key = episode_id, value = JSON
 const EPISODES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("episodes");
@@ -554,23 +554,55 @@ impl EpisodeStore {
     }
 
     /// Hybrid search across all episodes (not cwd-scoped).
+    ///
+    /// Backward-compatible wrapper around [`Self::find_relevant_hybrid_scored`]
+    /// that drops the similarity score. Callers that need to gate episode
+    /// injection on a minimum similarity (e.g. the agent loop's "Relevant
+    /// Past Experiences" system message) should call the `_scored` variant
+    /// directly so cross-session contamination is filtered out (NEW-06).
     pub async fn find_relevant_hybrid(
         &self,
         query: &str,
         query_embedding: Option<Vec<f32>>,
         limit: usize,
     ) -> Result<Vec<Episode>> {
+        let scored = self
+            .find_relevant_hybrid_scored(query, query_embedding, limit)
+            .await?;
+        Ok(scored.into_iter().map(|(ep, _)| ep).collect())
+    }
+
+    /// Hybrid search across all episodes (not cwd-scoped), returning each
+    /// episode alongside a per-modality [`HybridScore`] breakdown.
+    ///
+    /// Results are sorted by descending `HybridScore::combined` (the
+    /// same weighted-sum ranking as
+    /// [`Self::find_relevant_hybrid`]). The breakdown lets callers
+    /// apply a modality-aware minimum-similarity gate so a strong
+    /// single-modality match (e.g. a keyword-perfect older episode
+    /// without a stored embedding) isn't dropped just because the
+    /// configured `bm25_weight` / `vector_weight` would down-weight the
+    /// combined score below the gate. Without this, the agent loop's
+    /// "Relevant Past Experiences" gate (NEW-06 fix) would strand
+    /// legitimately relevant keyword-only matches.
+    pub async fn find_relevant_hybrid_scored(
+        &self,
+        query: &str,
+        query_embedding: Option<Vec<f32>>,
+        limit: usize,
+    ) -> Result<Vec<(Episode, HybridScore)>> {
         // Search the in-memory index
         let matches = {
             let idx = self
                 .index
                 .read()
                 .map_err(|e| eyre::eyre!("index lock poisoned: {e}"))?;
-            idx.search(query, query_embedding.as_deref(), limit)
+            idx.search_scored(query, query_embedding.as_deref(), limit)
         };
 
-        // Fetch full episodes from DB
-        let ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
+        // Fetch full episodes from DB. Preserve (id, score) pairing so
+        // callers can gate on a similarity threshold.
+        let id_scores: Vec<(String, HybridScore)> = matches;
         // Degraded fallback: there is no on-disk store to read from.
         // The hybrid index only knows about episodes inserted in this
         // process's lifetime (which is empty at open for a degraded
@@ -583,24 +615,39 @@ impl EpisodeStore {
             let read_txn = db.begin_read()?;
             let table = read_txn.open_table(EPISODES_TABLE)?;
 
-            let mut episodes = Vec::new();
-            for id in &ids {
+            // Build id -> score map and an id-order index so we can
+            // attach the matching score to each fetched episode while
+            // preserving the hybrid ranking order.
+            let score_by_id: std::collections::HashMap<&str, HybridScore> =
+                id_scores.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+            let id_order: std::collections::HashMap<&str, usize> = id_scores
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _))| (id.as_str(), i))
+                .collect();
+
+            let mut scored: Vec<(Episode, HybridScore)> = Vec::new();
+            for (id, _) in &id_scores {
                 if let Some(json) = table.get(id.as_str())? {
                     if let Ok(episode) = serde_json::from_str::<Episode>(json.value()) {
-                        episodes.push(episode);
+                        let score =
+                            score_by_id
+                                .get(episode.id.as_str())
+                                .copied()
+                                .unwrap_or(HybridScore {
+                                    combined: 0.0,
+                                    bm25: 0.0,
+                                    vector: 0.0,
+                                });
+                        scored.push((episode, score));
                     }
                 }
             }
 
             // Preserve the ranking order from hybrid search
-            let id_order: std::collections::HashMap<&str, usize> = ids
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (id.as_str(), i))
-                .collect();
-            episodes.sort_by_key(|e| id_order.get(e.id.as_str()).copied().unwrap_or(usize::MAX));
+            scored.sort_by_key(|(e, _)| id_order.get(e.id.as_str()).copied().unwrap_or(usize::MAX));
 
-            Ok(episodes)
+            Ok(scored)
         })
         .await?
     }
@@ -716,6 +763,59 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].id, ep_id);
+    }
+
+    #[tokio::test]
+    async fn find_relevant_hybrid_scored_returns_similarity_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        store
+            .store(make_episode("rust ownership borrow checker", "/proj"))
+            .await
+            .unwrap();
+        store
+            .store(make_episode("python web flask framework", "/proj"))
+            .await
+            .unwrap();
+
+        let scored = store
+            .find_relevant_hybrid_scored("rust ownership", None, 10)
+            .await
+            .unwrap();
+
+        // At least one match returned with a populated HybridScore.
+        assert!(!scored.is_empty(), "expected at least one match");
+        let (top_ep, top_score) = &scored[0];
+        assert!(
+            top_ep.summary.contains("rust"),
+            "top match should be the rust episode, got: {}",
+            top_ep.summary
+        );
+        // BM25-only path (no query embedding): combined == bm25 score.
+        assert!(
+            top_score.combined > 0.0 && top_score.combined <= 1.0,
+            "top combined score should be in (0, 1], got {}",
+            top_score.combined
+        );
+        assert!(
+            top_score.bm25 > 0.0,
+            "BM25 score should be > 0 for the rust match (got {})",
+            top_score.bm25
+        );
+        assert_eq!(
+            top_score.vector, 0.0,
+            "no embedding stored, vector score should be 0"
+        );
+
+        // Backward-compat: find_relevant_hybrid returns the same episodes
+        // (without scores) in the same order.
+        let plain = store
+            .find_relevant_hybrid("rust ownership", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), scored.len());
+        assert_eq!(plain[0].id, scored[0].0.id);
     }
 
     #[tokio::test]

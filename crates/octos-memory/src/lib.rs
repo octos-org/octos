@@ -10,6 +10,6 @@ mod memory_store;
 mod store;
 
 pub use episode::{Episode, EpisodeOutcome};
-pub use hybrid_search::HybridIndex;
+pub use hybrid_search::{HybridIndex, HybridScore};
 pub use memory_store::MemoryStore;
 pub use store::EpisodeStore;
