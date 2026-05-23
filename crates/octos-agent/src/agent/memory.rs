@@ -43,6 +43,30 @@ use super::Agent;
 /// forking.
 pub const MIN_EPISODE_SIMILARITY: f32 = 0.55;
 
+/// Maximum number of "Relevant Past Experiences" injected into the
+/// agent's prompt after threshold filtering.
+const RELEVANT_EXPERIENCES_INJECT_LIMIT: usize = 6;
+
+/// Candidate over-fetch multiplier for the hybrid-scored search.
+///
+/// `find_relevant_hybrid_scored` ranks by the weighted-sum `combined`
+/// score and truncates before our `best_modality`-based threshold gate
+/// runs. With the raised 0.55 gate, a small fetch limit can let
+/// mid-tier sub-threshold *combined*-rank hits crowd out a
+/// keyword-perfect BM25-only older episode whose `combined` score is
+/// capped at `bm25_weight` (~0.30) under default weights — codex P2
+/// flagged this as a dead band (six vector hits at combined=0.378 each
+/// would beat one BM25=1.0/combined=0.30 episode in the top-6, then all
+/// six fail the 0.55 best_modality gate and the BM25 winner is lost).
+/// Over-fetching by this multiplier gives the threshold gate enough
+/// candidates that low-`combined`, high-`best_modality` matches still
+/// survive into the injected set.
+///
+/// 4× = 24 candidates per query — a few extra DB reads, but the result
+/// still funnels down to [`RELEVANT_EXPERIENCES_INJECT_LIMIT`] after
+/// filtering so the LLM prompt size is unchanged.
+const RELEVANT_EXPERIENCES_FETCH_MULTIPLIER: usize = 4;
+
 impl Agent {
     pub(super) async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
         let mut messages = vec![Message {
@@ -75,17 +99,25 @@ impl Agent {
         // already filtered by working directory and keyword overlap, so it
         // doesn't need the score gate.
         if let Some(ref embedder) = self.embedder {
+            // Over-fetch candidates so the modality-aware threshold gate
+            // (applied in `format_relevant_experiences`) has room to admit
+            // high-`best_modality` matches whose `combined`-rank position
+            // would otherwise be displaced by sub-threshold vector-only
+            // hits. See `RELEVANT_EXPERIENCES_FETCH_MULTIPLIER` for the
+            // codex P2 dead-band rationale.
+            let fetch_limit =
+                RELEVANT_EXPERIENCES_INJECT_LIMIT * RELEVANT_EXPERIENCES_FETCH_MULTIPLIER;
             let scored_result = match embedder.embed(&[query.as_str()]).await {
                 Ok(vecs) => {
                     let query_emb = vecs.into_iter().next();
                     self.memory
-                        .find_relevant_hybrid_scored(&query, query_emb, 6)
+                        .find_relevant_hybrid_scored(&query, query_emb, fetch_limit)
                         .await
                 }
                 Err(e) => {
                     warn!(error = %e, "embedding failed, falling back to keyword search");
                     self.memory
-                        .find_relevant_hybrid_scored(&query, None, 6)
+                        .find_relevant_hybrid_scored(&query, None, fetch_limit)
                         .await
                 }
             };
@@ -176,14 +208,18 @@ impl Agent {
 /// passes — see the `MIN_EPISODE_SIMILARITY` docs for the rationale.
 ///
 /// `scored` is expected to be sorted by descending combined score (the
-/// order `EpisodeStore::find_relevant_hybrid_scored` returns); the
-/// relative order is preserved after filtering so the top match remains
-/// first.
+/// order `EpisodeStore::find_relevant_hybrid_scored` returns). The
+/// caller over-fetches by [`RELEVANT_EXPERIENCES_FETCH_MULTIPLIER`] so
+/// that high-`best_modality` matches with low `combined` rank still
+/// reach this stage; we truncate to
+/// [`RELEVANT_EXPERIENCES_INJECT_LIMIT`] *after* filtering to keep
+/// prompt size bounded. Relative order is preserved.
 fn format_relevant_experiences(scored: &[(Episode, HybridScore)]) -> Option<String> {
     let filtered: Vec<&Episode> = scored
         .iter()
         .filter(|(_, score)| score.best_modality() >= MIN_EPISODE_SIMILARITY)
         .map(|(ep, _)| ep)
+        .take(RELEVANT_EXPERIENCES_INJECT_LIMIT)
         .collect();
     if filtered.is_empty() {
         return None;
@@ -406,5 +442,104 @@ mod tests {
             "keyword-perfect single-modality match must survive the gate even though combined (0.30) < threshold (0.55)",
         );
         assert!(rendered.contains("keyword-perfect older episode"));
+    }
+
+    #[test]
+    fn episode_injection_dead_band_resolved_by_overfetch() {
+        // Regression for codex P2 round-2 (this PR): with the 0.55 gate,
+        // a small fetch limit creates a dead band — six sub-threshold
+        // vector-only hits at combined=0.378 each rank ABOVE one
+        // keyword-perfect BM25-only episode at combined=0.30, so a
+        // limit-6 fetch would return only the six vector hits, all of
+        // which then fail the gate. Result: zero injected episodes, even
+        // though a perfect BM25 match exists.
+        //
+        // The agent loop now over-fetches by
+        // `RELEVANT_EXPERIENCES_FETCH_MULTIPLIER` (4×), so the BM25
+        // winner is in the candidate set. This test simulates what the
+        // over-fetched, combined-sorted result looks like and asserts
+        // that the gate + post-filter truncate produces the BM25
+        // winner.
+        //
+        // Per `find_relevant_hybrid_scored` semantics, results are
+        // sorted by descending combined score. With over-fetch (24
+        // candidates) the BM25-perfect episode is included in position
+        // ~24 (combined 0.30 < all vector hits at 0.378), but is the
+        // only one that passes the `best_modality()` gate.
+        let mut scored = Vec::new();
+        for i in 0..6 {
+            scored.push((
+                make_episode(&format!("VECTOR NOISE {i}")),
+                HybridScore {
+                    // combined ~0.378 = vector_weight 0.7 * vector 0.54
+                    combined: 0.378,
+                    bm25: 0.0,
+                    vector: 0.54, // sub-threshold (< 0.55)
+                },
+            ));
+        }
+        // The BM25-perfect episode appears LAST in combined-sorted order
+        // (combined 0.30 < 0.378), but over-fetch ensures it is in the
+        // candidate set.
+        scored.push((
+            make_episode("BM25 PERFECT older episode"),
+            HybridScore {
+                combined: 0.30,
+                bm25: 1.0,
+                vector: 0.0,
+            },
+        ));
+
+        let rendered = format_relevant_experiences(&scored).expect(
+            "the BM25-perfect episode must survive over-fetch + threshold filtering, not be dropped by the limit-6 truncate before the gate",
+        );
+        assert!(
+            rendered.contains("BM25 PERFECT older episode"),
+            "the BM25-only winner must reach the injected message"
+        );
+        for i in 0..6 {
+            assert!(
+                !rendered.contains(&format!("VECTOR NOISE {i}")),
+                "sub-threshold vector hit {i} must be filtered out"
+            );
+        }
+    }
+
+    #[test]
+    fn episode_injection_truncates_after_filtering_to_inject_limit() {
+        // Beyond the dead-band fix, the formatter must still cap the
+        // injected set at RELEVANT_EXPERIENCES_INJECT_LIMIT episodes
+        // (currently 6) so over-fetched candidates don't bloat the LLM
+        // prompt. Supply 10 above-threshold matches and assert only the
+        // first 6 (highest combined rank) make it into the output.
+        let mut scored = Vec::new();
+        for i in 0..10 {
+            scored.push((
+                make_episode(&format!("RANK {i:02}")),
+                // All clear the 0.55 gate; combined decreases with i so
+                // input order is the descending-combined-rank order
+                // we'd see from `find_relevant_hybrid_scored`.
+                score_bm25(0.9 - (i as f32) * 0.01),
+            ));
+        }
+        let rendered = format_relevant_experiences(&scored)
+            .expect("matches above threshold should produce output");
+
+        // First 6 ranks must appear.
+        for i in 0..RELEVANT_EXPERIENCES_INJECT_LIMIT {
+            let needle = format!("RANK {i:02}");
+            assert!(
+                rendered.contains(&needle),
+                "expected top-rank '{needle}' in injected output"
+            );
+        }
+        // Ranks 6..10 must be truncated.
+        for i in RELEVANT_EXPERIENCES_INJECT_LIMIT..10 {
+            let needle = format!("RANK {i:02}");
+            assert!(
+                !rendered.contains(&needle),
+                "expected rank '{needle}' to be truncated past the inject limit ({RELEVANT_EXPERIENCES_INJECT_LIMIT})"
+            );
+        }
     }
 }
