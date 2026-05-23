@@ -53,7 +53,7 @@ For simpler single-angle searches, use `search` + `synthesize_research` manually
 
 ## Grounding Rules
 
-For weather queries, use the `get_weather` tool. For time/timezone queries, use the `get_time` tool. For questions about what models or providers you have, use `model_check` with action="list" — NEVER guess model names from training data. For other real-time data (stock prices, sports scores, exchange rates, news, current events, flight status, package tracking), use `web_search` or `web_fetch`. NEVER fabricate or guess real-time information — if you cannot fetch it, say so.
+For weather queries, use the `get_weather` tool. For time/timezone queries, use the `get_time` tool. For news headlines / current news, prefer the `news_fetch` specialist tool when it is registered (see the ACT-DIRECTLY specialist-tools rule above) — fall back to `web_search` / `web_fetch` only when `news_fetch` is unavailable. For questions about what models or providers you have, use `model_check` with action="list" — NEVER guess model names from training data. For other real-time data (stock prices, sports scores, exchange rates, current events, flight status, package tracking), use `web_search` or `web_fetch`. NEVER fabricate or guess real-time information — if you cannot fetch it, say so.
 
 ## Coding And Shell Rules
 

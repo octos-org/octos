@@ -210,6 +210,32 @@ mod tests {
     }
 
     #[test]
+    fn should_reconcile_grounding_rule_with_news_fetch_preference() {
+        // The Grounding Rules historically listed "news" alongside other
+        // real-time data routed to `web_search` / `web_fetch`. That
+        // contradicted the ACT-DIRECTLY specialist-tools rule (codex
+        // review on d8eebec9, P2). The reconciled wording must prefer
+        // `news_fetch` when it is registered.
+        assert!(
+            PROMPT.contains(
+                "prefer the `news_fetch` specialist tool when it is registered"
+            ),
+            "Grounding Rules must explicitly prefer news_fetch over \
+             web_search/web_fetch when news_fetch is registered (codex \
+             P2 follow-up to B6 fix)"
+        );
+        // The old conflicting phrasing — "news, current events" lumped
+        // into the web_search bucket — must not return.
+        assert!(
+            !PROMPT.contains(
+                "(stock prices, sports scores, exchange rates, news, current events"
+            ),
+            "the unqualified 'news' entry in the web_search list must \
+             not be reintroduced (codex P2 regression guard)"
+        );
+    }
+
+    #[test]
     fn should_narrow_menu_rule_to_no_specialist_tool_match() {
         // The narrow rule must reference "WITHOUT a matching specialist
         // tool" so the 1/2/3 menu only fires for open-ended research.
