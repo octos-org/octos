@@ -12,6 +12,12 @@ use tracing;
 pub enum LlmErrorKind {
     /// Authentication failure (invalid/expired API key).
     Authentication,
+    /// Provider quota exhausted / billing-tier expired / no active package
+    /// (HTTP 403 with `insufficient_quota` / `quota_exceeded` /
+    /// `no_active_*_package` markers in body). Distinct from
+    /// `Authentication` so operators see a "top up or switch provider"
+    /// message rather than "bad API key".
+    Quota,
     /// Rate limited by the provider (429).
     RateLimited {
         /// Retry-After hint in seconds, if provided.
@@ -41,10 +47,18 @@ pub enum LlmErrorKind {
 }
 
 /// A structured LLM error with kind, message, and optional source.
+///
+/// `provider` carries the operator-visible label (e.g. "anthropic",
+/// "MiniMax-M2.5-highspeed") so user-facing messages identify which lane
+/// hit the failure without leaking secrets. Default is empty when the
+/// constructor does not have a label handy.
 #[derive(Debug)]
 pub struct LlmError {
     pub kind: LlmErrorKind,
     pub message: String,
+    /// Operator-visible provider/model label (e.g. "anthropic",
+    /// "MiniMax-M2.5-highspeed"). Empty when not provided.
+    pub provider: String,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -53,8 +67,15 @@ impl LlmError {
         Self {
             kind,
             message: message.into(),
+            provider: String::new(),
             source: None,
         }
+    }
+
+    /// Builder: attach the operator-visible provider/model label.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
     }
 
     pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
@@ -97,10 +118,43 @@ impl LlmError {
         )
     }
 
-    /// Classify an HTTP status code into an error kind.
+    /// Lowercased body markers that flag a quota / billing-tier failure.
+    /// Kept private so the classification stays the canonical contract for
+    /// `Quota` recognition.
+    fn body_signals_quota(body_lower: &str) -> bool {
+        body_lower.contains("insufficient_quota")
+            || body_lower.contains("quota_exceeded")
+            || body_lower.contains("no_active_wisemodel_package")
+            || (body_lower.contains("no_active_") && body_lower.contains("_package"))
+    }
+
+    /// Classify an HTTP status code into an error kind (legacy 2-arg form
+    /// kept for tests and downstream callers without a provider label).
     pub fn from_status(status: u16, body: &str) -> Self {
+        Self::from_status_with_label(status, body, "")
+    }
+
+    /// Classify an HTTP status code into an error kind, capturing the
+    /// operator-visible provider/model label for user-facing messages.
+    /// Primary entry point for provider HTTP error handlers — replaces the
+    /// previous `eyre::bail!("API error ({label}): ...")` pattern so the
+    /// loop-boundary classifier can downcast to `LlmError` and pick the
+    /// right `HarnessError` variant (issue: variant=internal recovery=bug
+    /// for Wisemodel 403 quota errors).
+    pub fn from_status_with_label(status: u16, body: &str, provider: impl Into<String>) -> Self {
+        let body_lower = body.to_ascii_lowercase();
         let kind = match status {
-            401 | 403 => LlmErrorKind::Authentication,
+            401 => LlmErrorKind::Authentication,
+            403 => {
+                // Disambiguate 403: quota / billing-tier failures get their
+                // own variant so the operator sees a "top up or switch
+                // provider" message instead of "bad API key".
+                if Self::body_signals_quota(&body_lower) {
+                    LlmErrorKind::Quota
+                } else {
+                    LlmErrorKind::Authentication
+                }
+            }
             429 => LlmErrorKind::RateLimited {
                 retry_after_secs: None,
             },
@@ -124,13 +178,48 @@ impl LlmError {
         };
         let truncated_body: String = body.chars().take(200).collect();
         tracing::debug!(status, body = %truncated_body, "LLM provider error response");
-        Self::new(kind, format!("HTTP {status}"))
+        let provider = provider.into();
+        // Keep the message short so the operator log line stays readable;
+        // the full body is available in the wire envelope on the SPA side.
+        let message = if truncated_body.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status} - {truncated_body}")
+        };
+        Self {
+            kind,
+            message,
+            provider,
+            source: None,
+        }
     }
 }
 
 impl fmt::Display for LlmError {
+    /// Human-readable rendering. Provider label is prefixed when non-empty
+    /// so the operator sees which lane failed (e.g.
+    /// "API error (MiniMax-M2.5-highspeed): provider quota exhausted — HTTP 403 - ...").
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.message)
+        let prefix = if self.provider.is_empty() {
+            "API error".to_string()
+        } else {
+            format!("API error ({})", self.provider)
+        };
+        let summary = match &self.kind {
+            LlmErrorKind::Authentication => "authentication failed",
+            LlmErrorKind::Quota => "provider quota exhausted",
+            LlmErrorKind::RateLimited { .. } => "rate limited by provider",
+            LlmErrorKind::ContextOverflow { .. } => "context window exceeded",
+            LlmErrorKind::ModelNotFound { .. } => "model not found",
+            LlmErrorKind::ServerError { .. } => "provider server error",
+            LlmErrorKind::Network => "network error",
+            LlmErrorKind::Timeout => "request timed out",
+            LlmErrorKind::InvalidRequest { .. } => "invalid request",
+            LlmErrorKind::ContentFiltered => "content filtered by provider",
+            LlmErrorKind::StreamError => "stream error",
+            LlmErrorKind::Provider { .. } => "provider error",
+        };
+        write!(f, "{prefix}: {summary} — {}", self.message)
     }
 }
 
@@ -151,6 +240,43 @@ mod tests {
         let err = LlmError::from_status(401, "Unauthorized");
         assert_eq!(err.kind, LlmErrorKind::Authentication);
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn should_classify_403_without_quota_marker_as_auth() {
+        let err = LlmError::from_status(403, "Forbidden");
+        assert_eq!(err.kind, LlmErrorKind::Authentication);
+    }
+
+    #[test]
+    fn should_classify_403_with_quota_marker_as_quota() {
+        // The exact body that surfaced on dspfac as "variant=internal
+        // recovery=bug": Wisemodel returned 403 with an insufficient_quota
+        // payload. We now map that to LlmErrorKind::Quota so the harness
+        // taxonomy can route it to a user-friendly message.
+        let body = r#"{"error":{"code":"no_active_wisemodel_package","message":"没有有效的 Wisemodel 资源包，请购买后再使用","type":"insufficient_quota"}}"#;
+        let err = LlmError::from_status_with_label(403, body, "MiniMax-M2.5-highspeed");
+        assert_eq!(err.kind, LlmErrorKind::Quota);
+        assert_eq!(err.provider, "MiniMax-M2.5-highspeed");
+        // Display surfaces the provider label so operators see which lane
+        // is the culprit.
+        let rendered = err.to_string();
+        assert!(rendered.contains("MiniMax-M2.5-highspeed"));
+        assert!(rendered.contains("quota exhausted"));
+    }
+
+    #[test]
+    fn should_recognise_generic_quota_keyword() {
+        let body = r#"{"error":{"type":"insufficient_quota","message":"out of credits"}}"#;
+        let err = LlmError::from_status(403, body);
+        assert_eq!(err.kind, LlmErrorKind::Quota);
+    }
+
+    #[test]
+    fn should_recognise_quota_exceeded_keyword() {
+        let body = r#"{"error":"quota_exceeded"}"#;
+        let err = LlmError::from_status(403, body);
+        assert_eq!(err.kind, LlmErrorKind::Quota);
     }
 
     #[test]
@@ -183,6 +309,16 @@ mod tests {
     }
 
     #[test]
+    fn should_classify_400_invalid_request_error_payload() {
+        // OpenAI-style 400 with explicit invalid_request_error type — must
+        // map to InvalidRequest (not ContextOverflow) for the harness to
+        // surface a user-friendly "provider rejected the request" message.
+        let body = r#"{"error":{"type":"invalid_request_error","message":"unknown parameter: temperature"}}"#;
+        let err = LlmError::from_status(400, body);
+        assert!(matches!(err.kind, LlmErrorKind::InvalidRequest { .. }));
+    }
+
+    #[test]
     fn should_create_convenience_errors() {
         assert!(!LlmError::auth("bad key").is_retryable());
         assert!(LlmError::rate_limited(Some(30)).is_retryable());
@@ -194,8 +330,16 @@ mod tests {
     fn should_display_error() {
         let err = LlmError::auth("invalid API key");
         let s = err.to_string();
-        assert!(s.contains("Authentication"));
+        assert!(s.contains("authentication failed"));
         assert!(s.contains("invalid API key"));
+    }
+
+    #[test]
+    fn should_display_error_with_provider_label() {
+        let err = LlmError::from_status_with_label(403, "Forbidden", "anthropic-vertex");
+        let s = err.to_string();
+        // Operator log line should identify the provider/model lane.
+        assert!(s.contains("anthropic-vertex"));
     }
 
     #[test]

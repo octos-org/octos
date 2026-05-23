@@ -343,11 +343,19 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "API error ({}): {status} - {}",
-                self.model,
-                crate::provider::truncate_error_body(&body)
-            );
+            // Route through LlmError so the loop-boundary classifier
+            // (`HarnessError::classify_report`) can downcast and pick the
+            // correct user-facing variant (auth / quota / bad-request /
+            // rate-limited / server) instead of falling through to
+            // Internal/Bug. The truncated body is preserved so the
+            // operator sees the provider's actual error payload.
+            let body = crate::provider::truncate_error_body(&body);
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                &self.model,
+            )
+            .into());
         }
 
         let api_response: OpenAIResponse = response
@@ -449,11 +457,13 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "API error ({}): {status} - {}",
-                self.model,
-                crate::provider::truncate_error_body(&text)
-            );
+            let body = crate::provider::truncate_error_body(&text);
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                &self.model,
+            )
+            .into());
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);

@@ -52,6 +52,9 @@ pub const OCTOS_LOOP_RETRY_TOTAL: &str = "octos_loop_retry_total";
 const DEFAULT_RATE_LIMIT_LIMIT: u32 = 5;
 const DEFAULT_CONTEXT_OVERFLOW_LIMIT: u32 = 2;
 const DEFAULT_AUTHENTICATION_LIMIT: u32 = 1;
+/// Quota errors are operator-action — auto-retry will keep failing until
+/// the operator tops up. Cap at 1 like Authentication.
+const DEFAULT_QUOTA_LIMIT: u32 = 1;
 const DEFAULT_INVALID_REQUEST_LIMIT: u32 = 2;
 const DEFAULT_CONTENT_FILTERED_LIMIT: u32 = 1;
 const DEFAULT_PROVIDER_UNAVAILABLE_LIMIT: u32 = 4;
@@ -72,6 +75,7 @@ pub struct LoopRetryLimits {
     pub rate_limited: u32,
     pub context_overflow: u32,
     pub authentication: u32,
+    pub quota: u32,
     pub invalid_request: u32,
     pub content_filtered: u32,
     pub provider_unavailable: u32,
@@ -92,6 +96,7 @@ impl Default for LoopRetryLimits {
             rate_limited: DEFAULT_RATE_LIMIT_LIMIT,
             context_overflow: DEFAULT_CONTEXT_OVERFLOW_LIMIT,
             authentication: DEFAULT_AUTHENTICATION_LIMIT,
+            quota: DEFAULT_QUOTA_LIMIT,
             invalid_request: DEFAULT_INVALID_REQUEST_LIMIT,
             content_filtered: DEFAULT_CONTENT_FILTERED_LIMIT,
             provider_unavailable: DEFAULT_PROVIDER_UNAVAILABLE_LIMIT,
@@ -172,6 +177,7 @@ pub struct LoopRetryCounters {
     pub rate_limited: u32,
     pub context_overflow: u32,
     pub authentication: u32,
+    pub quota: u32,
     pub invalid_request: u32,
     pub content_filtered: u32,
     pub provider_unavailable: u32,
@@ -355,6 +361,7 @@ impl LoopRetryState {
                 &mut self.counters.authentication,
                 self.limits.authentication,
             ),
+            HarnessError::Quota { .. } => (&mut self.counters.quota, self.limits.quota),
             HarnessError::InvalidRequest { .. } => (
                 &mut self.counters.invalid_request,
                 self.limits.invalid_request,
