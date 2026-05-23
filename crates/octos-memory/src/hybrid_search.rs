@@ -656,29 +656,11 @@ mod tests {
     }
 
     #[test]
-    fn add_embedding_respects_hnsw_capacity_invariant() {
-        // Regression for codex P2 round 6: `vector_fetch_count` caps
-        // the vector fetch at `HNSW_CAPACITY`, which is only correct
-        // if the HNSW index actually never holds more than that.
-        // `hnsw_rs` treats max_elements as a reservation hint, not a
-        // hard cap; without this guard `add_embedding` could grow the
-        // HNSW past capacity and the saturated fetch would silently
-        // omit valid matches.
-        //
-        // We can't realistically push 10_000+ embeddings in a unit
-        // test, so verify the guard via reflection on a small index
-        // with the capacity temporarily simulated by repeated
-        // `add_embedding` calls — but the trivial guard form is to
-        // check the WARN path returns false when the HNSW is full.
-        // Since HNSW_CAPACITY = 10_000 is the production value, we
-        // instead assert that `add_embedding` correctly reports
-        // `has_embedding` state after a successful add, and that
-        // calls beyond the cap leave the doc as BM25-only.
-        //
-        // The real protection here is the WARN path; this test acts
-        // as documentation of the contract rather than an exhaustive
-        // capacity test. A direct full-capacity test is left to the
-        // integration suite.
+    fn add_embedding_basic_contract() {
+        // Basic happy-path contract for `add_embedding` (NOT the
+        // capacity-branch regression — see
+        // `add_embedding_returns_false_when_hnsw_at_capacity` for
+        // that).
         let mut index = HybridIndex::new(4);
         index.insert("ep1", "alpha beta", None);
         // BM25-only initially.
@@ -694,6 +676,63 @@ mod tests {
 
         // Non-existent episode -> false.
         assert!(!index.add_embedding("nonexistent", &[1.0, 0.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn add_embedding_returns_false_when_hnsw_at_capacity() {
+        // Regression for codex P3 round 7: the previous capacity test
+        // never made `hnsw_full == true`. This test fills the HNSW
+        // index to `HNSW_CAPACITY` via `add_embedding` and then
+        // verifies the guard fires:
+        // - `add_embedding` returns false past capacity
+        // - `has_embedding[doc_idx]` stays false (BM25-only retained)
+        // - The HNSW point count does NOT exceed `HNSW_CAPACITY`
+        //   (so `vector_fetch_count.min(HNSW_CAPACITY)` saturation is
+        //    correct)
+        //
+        // Cost: 10_000 inserts + 10_001-th add_embedding. Sub-second
+        // in release/debug, well within unit-test budget.
+        let mut index = HybridIndex::new(4);
+        // Fill `HNSW_CAPACITY` BM25-only docs and attach an embedding
+        // to each. After this loop, hnsw.get_nb_point() == HNSW_CAPACITY.
+        for i in 0..HNSW_CAPACITY {
+            let id = format!("ep-{i}");
+            index.insert(&id, "text", None);
+            assert!(
+                index.add_embedding(&id, &[1.0, 0.0, 0.0, 0.0]),
+                "doc #{i} below capacity should accept embedding"
+            );
+        }
+        assert_eq!(
+            index.hnsw.as_ref().map(|h| h.get_nb_point()),
+            Some(HNSW_CAPACITY),
+            "HNSW should be filled exactly to capacity by the loop"
+        );
+
+        // One more doc + add_embedding past capacity — guard must
+        // fire.
+        let overflow_id = "ep-overflow";
+        index.insert(overflow_id, "text", None);
+        let overflow_idx = index
+            .ids
+            .iter()
+            .position(|id| id == overflow_id)
+            .expect("overflow doc must be in ids");
+
+        let result = index.add_embedding(overflow_id, &[0.5, 0.5, 0.0, 0.0]);
+        assert!(
+            !result,
+            "add_embedding past capacity must return false (got true)"
+        );
+        assert!(
+            !index.has_embedding[overflow_idx],
+            "has_embedding for the overflow doc must remain false so it's still BM25-only retrievable"
+        );
+        assert_eq!(
+            index.hnsw.as_ref().map(|h| h.get_nb_point()),
+            Some(HNSW_CAPACITY),
+            "HNSW point count must NOT grow past capacity — saturation invariant for vector_fetch_count"
+        );
     }
 
     #[test]
