@@ -12,11 +12,16 @@ use tracing;
 pub enum LlmErrorKind {
     /// Authentication failure (invalid/expired API key).
     Authentication,
-    /// Provider quota exhausted / billing-tier expired / no active package
-    /// (HTTP 403 with `insufficient_quota` / `quota_exceeded` /
-    /// `no_active_*_package` markers in body). Distinct from
-    /// `Authentication` so operators see a "top up or switch provider"
-    /// message rather than "bad API key".
+    /// Provider quota exhausted / billing-tier expired / no active package.
+    /// Sourced from HTTP 402 (Payment Required), or 403/429 bodies that
+    /// carry an explicit billing marker (`insufficient_quota`,
+    /// `quota_exceeded`, `no_active_*_package`) or a billing-class
+    /// keyword (`billing`, `monthly`, `spend`, `package`, `credit`).
+    /// Distinct from `Authentication` so operators see a "top up or
+    /// switch provider" message rather than "bad API key", and distinct
+    /// from `RateLimited` so the failover ladder skips the same-provider
+    /// backoff and tries the next configured lane (which may have a
+    /// different account/key with available billing).
     Quota,
     /// Rate limited by the provider (429).
     RateLimited {
@@ -122,19 +127,36 @@ impl LlmError {
     /// Kept private so the classification stays the canonical contract for
     /// `Quota` recognition.
     ///
-    /// Recognised markers (extended in codex round-2 MAJOR 1 to cover
-    /// the cross-provider 429-quota surface):
+    /// Codex round-3 MAJOR narrowing: bare `RESOURCE_EXHAUSTED` (Google /
+    /// Vertex) is ambiguous — it covers both billing exhaustion *and*
+    /// transient capacity. Treating it unconditionally as `Quota` blocks
+    /// retry/backoff AND (now that `Quota` triggers failover in
+    /// `RetryProvider::should_failover`) burns the next lane on what may
+    /// have been a recoverable load shed. We now require a billing-class
+    /// keyword (`billing`, `monthly`, `spend`, `package`, `credit`) to
+    /// flag `RESOURCE_EXHAUSTED` as quota; bare `RESOURCE_EXHAUSTED`
+    /// falls through to `RateLimited` so the same-provider backoff path
+    /// can drain transient capacity blips.
+    ///
+    /// Recognised explicit quota markers (no body-keyword combo needed):
     ///   * `insufficient_quota` — OpenAI billing exhausted
     ///   * `quota_exceeded` — generic
-    ///   * `resource_exhausted` — Gemini `RESOURCE_EXHAUSTED` envelope
     ///   * `no_active_wisemodel_package` — Wisemodel billing tier expired
     ///   * `no_active_*_package` — generalised Wisemodel-style marker
+    ///
+    /// Recognised billing-keyword fallbacks (any one is sufficient — these
+    /// surface across Anthropic 402, MiniMax 429, etc.):
+    ///   * `billing`, `monthly`, `spend`, `package`, `credit`
     fn body_signals_quota(body_lower: &str) -> bool {
         body_lower.contains("insufficient_quota")
             || body_lower.contains("quota_exceeded")
-            || body_lower.contains("resource_exhausted")
             || body_lower.contains("no_active_wisemodel_package")
             || (body_lower.contains("no_active_") && body_lower.contains("_package"))
+            || body_lower.contains("billing")
+            || body_lower.contains("monthly")
+            || body_lower.contains("spend")
+            || body_lower.contains("package")
+            || body_lower.contains("credit")
     }
 
     /// Classify an HTTP status code into an error kind (legacy 2-arg form
@@ -154,9 +176,11 @@ impl LlmError {
         let body_lower = body.to_ascii_lowercase();
         let kind = match status {
             401 => LlmErrorKind::Authentication,
-            // Anthropic uses 402 to signal billing failure / inactive
-            // subscription. Map to Quota so the operator sees a
-            // "top up or switch provider" message rather than "bad key".
+            // 402 Payment Required → Quota. Anthropic and other providers
+            // use this status code for billing / payment issues
+            // (inactive subscription, expired card, etc.). Map to Quota
+            // so the operator sees a "top up or switch provider" message
+            // rather than "bad key".
             402 => LlmErrorKind::Quota,
             403 => {
                 // Disambiguate 403: quota / billing-tier failures get their
@@ -172,13 +196,18 @@ impl LlmError {
                 // Codex round-2 MAJOR 1: 429 is overloaded across providers.
                 // Disambiguate the same way 403 already does:
                 //   * OpenAI 429 + `insufficient_quota` → exhausted billing
-                //   * Gemini 429 + `RESOURCE_EXHAUSTED` → exhausted billing
+                //   * Gemini 429 + `RESOURCE_EXHAUSTED` + billing keyword
+                //     → exhausted billing
+                //   * Gemini 429 + bare `RESOURCE_EXHAUSTED` (no billing
+                //     keyword) → real rate limit (capacity / transient)
                 //   * Wisemodel 429 + `no_active_*_package` → exhausted billing
                 //   * Anthropic 429 + `rate_limit_error` → real rate limit
                 //   * Bare 429 (no marker) → real rate limit (legacy default)
                 // Without this branch the failover ladder treats `Quota` as
                 // a retryable RateLimited and burns the next lane on
-                // identical billing failures.
+                // identical billing failures. Codex round-3 narrowed the
+                // `RESOURCE_EXHAUSTED` arm so transient capacity blips
+                // stay on the same provider's backoff path.
                 if Self::body_signals_quota(&body_lower) {
                     LlmErrorKind::Quota
                 } else {
@@ -332,10 +361,28 @@ mod tests {
     }
 
     #[test]
-    fn should_classify_429_with_resource_exhausted_as_quota() {
-        // Gemini billing-tier exhausted comes back as 429 +
-        // `RESOURCE_EXHAUSTED` envelope.
-        let body = r#"{"error":{"code":429,"message":"Quota exceeded for project","status":"RESOURCE_EXHAUSTED"}}"#;
+    fn should_classify_429_with_bare_resource_exhausted_as_rate_limited() {
+        // Codex round-3 MAJOR narrowing: bare `RESOURCE_EXHAUSTED`
+        // (without a billing keyword) is ambiguous between billing
+        // exhaustion and transient capacity. We now classify it as
+        // `RateLimited` so the same-provider backoff can drain capacity
+        // blips, and only escalate to `Quota` when the body explicitly
+        // names a billing/package marker.
+        let body = r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota)","status":"RESOURCE_EXHAUSTED"}}"#;
+        let err = LlmError::from_status_with_label(429, body, "gemini-1.5-pro");
+        assert!(matches!(err.kind, LlmErrorKind::RateLimited { .. }));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn should_classify_429_with_resource_exhausted_plus_billing_as_quota() {
+        // Codex round-3 MAJOR narrowing companion: when
+        // `RESOURCE_EXHAUSTED` is accompanied by a billing-class keyword
+        // (`billing`, `monthly`, `spend`, `package`, `credit`), we
+        // upgrade the classification to `Quota` so the failover ladder
+        // can move to a different account/lane rather than burn cycles
+        // retrying the same exhausted billing tier.
+        let body = r#"{"error":{"code":429,"message":"Billing quota exhausted for project","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = LlmError::from_status_with_label(429, body, "gemini-1.5-pro");
         assert_eq!(err.kind, LlmErrorKind::Quota);
     }

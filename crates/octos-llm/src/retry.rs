@@ -81,10 +81,15 @@ impl RetryProvider {
         for cause in error.chain() {
             if let Some(llm) = cause.downcast_ref::<LlmError>() {
                 return match &llm.kind {
-                    // Fail-fast — operator must top up billing or switch
-                    // provider manually. Auto-failover would just burn
-                    // the next lane's quota too.
-                    LlmErrorKind::Quota => false,
+                    // Quota is a per-lane/provider credential failure
+                    // (like Auth): the *same* provider won't recover on
+                    // retry (won't be `is_retryable`), but another
+                    // configured lane may have a different key/account
+                    // with available quota. Codex round-3 BLOCKER fix:
+                    // previous version returned `false` here which
+                    // collapsed the entire chain when the primary lane
+                    // ran out of billing.
+                    LlmErrorKind::Quota => true,
                     // The current provider's credentials are bad — try
                     // the next lane which may have a valid key.
                     LlmErrorKind::Authentication => true,
@@ -419,12 +424,17 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_should_not_failover_typed_quota() {
-        // Quota = fail-fast: top up or switch lane manually.
+    fn test_should_failover_typed_quota() {
+        // Codex round-3 BLOCKER: Quota is a per-lane credential failure.
+        // Same-provider retry stays false (quota won't reset on retry),
+        // but failover to the next provider must be true — another
+        // configured lane may have a different key/account with quota.
         let llm = LlmError::new(LlmErrorKind::Quota, "out of credits")
             .with_provider("MiniMax-M2.5-highspeed");
         let err: eyre::Report = llm.into();
-        assert!(!RetryProvider::should_failover(&err));
+        assert!(RetryProvider::should_failover(&err));
+        // But the same provider must NOT auto-retry the request.
+        assert!(!RetryProvider::is_retryable_error(&err));
     }
 
     #[test]
