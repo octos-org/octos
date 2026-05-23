@@ -28330,6 +28330,175 @@ ignore = []
         octos_bus::set_message_commit_observer(None);
     }
 
+    /// Fleet-UX soak round-2 NEW-03 follow-up (2026-05-23): the round-1
+    /// fix (PR #1190) hypothesised at first as tool-name-specific, but
+    /// actually keys on the generic `ConversationResponse
+    /// .synthesized_from_spawn_only` flag, which the agent loop sets
+    /// whenever the CURRENT iteration's response contains ANY tool
+    /// call where `tools.is_spawn_only(tc.name)` returns true. This
+    /// test pins that invariant explicitly across multiple spawn_only
+    /// tool names — `run_pipeline`, `podcast_generate`, `podcast_voices`,
+    /// `mofa_slides`, and an arbitrary generic name — to lock the
+    /// fix's name-agnostic shape into the test suite. A future
+    /// regression that narrows the skip path to a hard-coded tool
+    /// name (e.g. `if tc.name == "podcast_generate" { skip }`) would
+    /// flip this test red on the other names.
+    ///
+    /// Invariant under test: when the persist site receives a
+    /// `synthesized_from_spawn_only=true` response carrying ack text
+    /// for `<name>`, the ack row is NOT committed to JSONL and the
+    /// `MessageCommitObserver` does NOT fire for it — regardless of
+    /// `<name>`. The preamble row (containing the spawn_only tool
+    /// call) still persists normally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn synth_ack_not_persisted_for_run_pipeline_or_podcast_voices() {
+        use octos_core::ui_protocol::MessagePersistedSource;
+
+        // Cover every spawn_only tool name observed in the round-2 soak
+        // (mini1 / mini3 / mini5 evidence in
+        // `e2e/test-results-fleet-ux-soak/`) plus a couple of names that
+        // never appeared in the soak but ARE marked spawn_only in the
+        // production registry (`mofa_slides`, `bg_research`). A
+        // tool-name-specific regression would flip this test red on
+        // every name except the hard-coded one.
+        let tool_names = [
+            "run_pipeline",
+            "podcast_voices",
+            "podcast_generate",
+            "mofa_slides",
+            "bg_research",
+            "arbitrary_spawn_only_name_42",
+        ];
+
+        for tool_name in tool_names {
+            let _guard = message_commit_observer_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            // Fresh ledger + observer per iteration so envelope counts
+            // don't leak between tool-name cases.
+            let ledger = Arc::new(UiProtocolLedger::new(64));
+            install_message_commit_observer(ledger.clone());
+
+            let session_id =
+                SessionKey(format!("local:spawn-only-synth-ack-no-persist-{tool_name}"));
+            let mut subscriber = ledger.subscribe(&session_id);
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut manager =
+                octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+
+            // Step 1: the iter-1 preamble assistant row WITH a
+            // spawn_only tool call — this row is always persisted (the
+            // skip only applies to the synthesised ack carrier).
+            let preamble_text = format!("Calling `{tool_name}` now.");
+            let preamble = Message {
+                role: MessageRole::Assistant,
+                content: preamble_text.clone(),
+                media: vec![],
+                tool_calls: Some(vec![octos_core::ToolCall {
+                    id: format!("tc-{tool_name}-1"),
+                    name: tool_name.to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some(format!("thread-{tool_name}")),
+                timestamp: Utc::now(),
+            };
+            manager
+                .add_message_with_seq(&session_id, preamble)
+                .await
+                .expect("commit preamble assistant row");
+
+            // Step 2: simulate the production persist site's
+            // `skip_synthesized_spawn_only_ack` branch — the ack
+            // Message is built in scope but NEVER persisted, regardless
+            // of `<tool_name>`.
+            let _ack_that_must_not_persist = Message {
+                role: MessageRole::Assistant,
+                content: format!(
+                    "Background work started for `{tool_name}`. \
+                     The final result will be delivered automatically when it is ready."
+                ),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some(format!("thread-{tool_name}")),
+                timestamp: Utc::now(),
+            };
+            // Intentionally no `manager.add_message_with_seq(...)`.
+
+            // Invariant A: JSONL contains exactly ONE row (the
+            // preamble). For ANY spawn_only tool name, the ack row is
+            // absent — `session/messages_page` cannot resurface a ghost
+            // ack bubble on refresh.
+            let session = manager.get_or_create(&session_id).await;
+            let history = session.get_history(usize::MAX);
+            assert_eq!(
+                history.len(),
+                1,
+                "JSONL must contain ONLY the preamble row for spawn_only tool \
+                 `{tool_name}`; if a future regression narrowed the skip path to a \
+                 tool-name match, names other than the hard-coded one would fail \
+                 here. Got {} rows.",
+                history.len(),
+            );
+            assert_eq!(
+                history[0].content, preamble_text,
+                "the surviving row must be the preamble (not the ack) for `{tool_name}`",
+            );
+            assert!(
+                !history[0].content.starts_with("Background work started"),
+                "no row may carry the synthesised ack text for `{tool_name}` — \
+                 that was the round-1 ghost-ack signature",
+            );
+
+            // Invariant B: exactly ONE `message/persisted` envelope
+            // fires (the preamble with `source: assistant`) — regardless
+            // of `<tool_name>`. The ack persist is skipped, so the
+            // `MessageCommitObserver` never fires for it.
+            let mut assistant_envelopes: Vec<MessagePersistedEvent> = Vec::new();
+            while let Ok(event) = subscriber.try_recv() {
+                if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+                    &event.event
+                {
+                    if ev.role == octos_core::MessageRole::Assistant.as_str() {
+                        assistant_envelopes.push(ev.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                assistant_envelopes.len(),
+                1,
+                "exactly ONE `message/persisted` envelope must fire for spawn_only \
+                 tool `{tool_name}`; got {}",
+                assistant_envelopes.len(),
+            );
+            assert_eq!(
+                assistant_envelopes[0].source,
+                MessagePersistedSource::Assistant,
+                "the surviving envelope for `{tool_name}` must be the preamble \
+                 with source=Assistant",
+            );
+            assert!(
+                !assistant_envelopes
+                    .iter()
+                    .any(|env| matches!(env.source, MessagePersistedSource::Background)),
+                "NO Background envelope may fire for `{tool_name}` — the ack \
+                 persist is skipped entirely",
+            );
+
+            // Restore the global observer slot between iterations.
+            octos_bus::set_message_commit_observer(None);
+            drop(_guard);
+        }
+    }
+
     /// Codex P2 follow-up on the NEW-03 fix: a self-paced (or
     /// `maintenance`) loop that fires a bare spawn_only call with NO
     /// LLM preamble has only the synthesised ack as its turn-final
