@@ -210,6 +210,37 @@ mod tests {
     }
 
     #[test]
+    fn should_require_podcast_generate_follow_up_after_podcast_voices() {
+        // NEW-05 (round-2 soak): on mini1, `deepseek-v4-pro` called
+        // `podcast_voices`, got the preset/clone list, and STALLED — the
+        // model treated the voice list as the final answer. Other minis
+        // on `kimi-k2.5` proceeded correctly. The fix is a prompt nudge:
+        // if the model probes voices first, it MUST follow up with
+        // `podcast_generate`.
+        assert!(
+            PROMPT.contains("`podcast_voices`"),
+            "prompt must mention `podcast_voices` in the podcast \
+             ACT-DIRECTLY rule so the model knows it is reference data, \
+             not a stopping point (NEW-05 fix)"
+        );
+        assert!(
+            PROMPT.contains(
+                "you MUST immediately follow up with `podcast_generate`"
+            ),
+            "prompt must instruct the model to immediately follow up \
+             with `podcast_generate` after calling `podcast_voices`; \
+             without this nudge deepseek-v4-pro stalls on the voice \
+             list (NEW-05 fix)"
+        );
+        assert!(
+            PROMPT.contains("do NOT stop after the voice list"),
+            "prompt must explicitly forbid stopping after the voice \
+             list — the literal phrasing is the regression guard for \
+             NEW-05"
+        );
+    }
+
+    #[test]
     fn should_reconcile_grounding_rule_with_news_fetch_preference() {
         // The Grounding Rules historically listed "news" alongside other
         // real-time data routed to `web_search` / `web_fetch`. That
