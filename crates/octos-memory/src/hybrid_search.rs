@@ -218,16 +218,41 @@ impl HybridIndex {
             _ => HashMap::new(),
         };
 
-        // Merge scores
+        // Merge scores.
+        //
+        // When both modalities are queried we normalize per-document by the
+        // weights of the modalities that actually contributed. Without this,
+        // a document that matched on only one side (e.g. BM25-only because
+        // its embedding hasn't been written yet, or vector-only because the
+        // query terms don't overlap the summary) would be down-weighted to
+        // at most that single modality's weight (0.3 for BM25-only, 0.7 for
+        // vector-only) — small enough that a downstream similarity gate
+        // (e.g. `MIN_EPISODE_SIMILARITY` in the agent loop) would always
+        // drop genuinely relevant single-modality matches.
+        //
+        // Per-modality scores are already in [0, 1] (BM25 is max-normalized,
+        // vector similarity is cosine), so dividing by the contributing
+        // weight sum keeps the merged score in [0, 1] regardless of which
+        // modalities fired for any given document.
         let has_vectors = !vector_scores.is_empty();
         let mut combined: HashMap<usize, f32> = HashMap::new();
 
         if has_vectors {
+            let mut weight_sum: HashMap<usize, f32> = HashMap::new();
             for (&idx, &score) in &vector_scores {
                 *combined.entry(idx).or_default() += self.vector_weight * score;
+                *weight_sum.entry(idx).or_default() += self.vector_weight;
             }
             for (&idx, &score) in &bm25_scores {
                 *combined.entry(idx).or_default() += self.bm25_weight * score;
+                *weight_sum.entry(idx).or_default() += self.bm25_weight;
+            }
+            for (idx, score) in combined.iter_mut() {
+                if let Some(&w) = weight_sum.get(idx) {
+                    if w > 0.0 {
+                        *score /= w;
+                    }
+                }
             }
         } else {
             // BM25 only
@@ -400,5 +425,41 @@ mod tests {
         // Should still work with BM25 for ep1
         let results = index.search("hello", None, 2);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn bm25_only_match_is_not_down_weighted_when_some_docs_have_vectors() {
+        // Regression: previously, when the query had an embedding, the
+        // combined score for a BM25-only match was `bm25_weight * bm25` —
+        // capping at 0.3 with default weights. A downstream similarity
+        // gate (e.g. MIN_EPISODE_SIMILARITY = 0.35 in the agent loop)
+        // would then always drop genuinely relevant keyword-only matches
+        // (older episodes without embeddings, or any episode whose
+        // embedding hasn't been written yet). After the fix, per-document
+        // scores are normalized by the modalities that actually contributed,
+        // so a strong BM25-only match returns close to its raw BM25 score.
+        let mut index = HybridIndex::new(4);
+        // ep1: keyword-perfect match, NO embedding (old episode).
+        index.insert("ep1", "rust ownership borrow checker", None);
+        // ep2: has an embedding but irrelevant text and far-from-query vector.
+        index.insert("ep2", "python web flask", Some(&[0.0, 0.0, 1.0, 0.0]));
+
+        let query_emb: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        let results = index.search("rust ownership", Some(&query_emb), 5);
+        let ep1_score = results
+            .iter()
+            .find(|(id, _)| id == "ep1")
+            .map(|(_, s)| *s)
+            .expect("ep1 should appear in results");
+
+        // Pre-fix, ep1 maxed at bm25_weight (0.3). Post-fix, ep1's
+        // single-modality score is normalized to its raw BM25 score
+        // (which is 1.0 since it's the only BM25 match, max-normalized).
+        // Guarantee it crosses the agent loop's 0.35 threshold so the
+        // contamination fix doesn't strand keyword-only matches.
+        assert!(
+            ep1_score >= 0.35,
+            "BM25-only match should not be down-weighted below the agent loop's similarity gate (got {ep1_score})"
+        );
     }
 }
