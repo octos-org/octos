@@ -215,18 +215,20 @@ mod tests {
         // strengthening could not convince `deepseek-v4-pro` to follow
         // through after `podcast_voices` — the model kept stopping at
         // the voice list. The fix is to make `podcast_generate`
-        // self-contained: it picks default voices internally, and the
-        // prompt no longer routes the LLM through `podcast_voices` as a
-        // precondition. The verified manifest (mofa-podcast 0.4.5) does
-        // NOT require a `voice` argument, so this is purely a prompt
+        // self-contained: the prompt names the preset voices the skill
+        // ships with, and the model writes them straight into the
+        // markdown script — no `podcast_voices` precondition required.
+        // The verified manifest (mofa-podcast 0.4.5) does NOT require a
+        // top-level `voice` argument either, so this is purely a prompt
         // change. The generation bullet must:
         //
         // 1. Tell the model to call `podcast_generate` DIRECTLY.
         // 2. Explicitly forbid calling `podcast_voices` first as a
         //    precondition (this is the load-bearing nudge for
         //    deepseek-v4-pro).
-        // 3. Say defaults are selected automatically so the model
-        //    knows `voice` is not required.
+        // 3. Tell the model the voice list is NOT required for
+        //    generation (preset names are inlined in the prompt — see
+        //    `should_name_preset_voices_for_script_generation`).
         assert!(
             PROMPT.contains("`podcast_generate` DIRECTLY"),
             "prompt must instruct the model to call `podcast_generate` \
@@ -242,11 +244,11 @@ mod tests {
              voice list as the final answer"
         );
         assert!(
-            PROMPT.contains("default voices are selected automatically")
-                || PROMPT.contains("default voices are used automatically"),
-            "prompt must say default voices are selected automatically \
-             so the model knows `voice` is not a required argument \
-             (NEW-05 round-3 fix)"
+            PROMPT.contains("voice list is NOT a precondition")
+                || PROMPT.contains("voice list is NOT required for generation"),
+            "prompt must say the voice list is NOT a precondition / \
+             NOT required for generation so the model skips the \
+             podcast_voices probe (NEW-05 round-3 fix)"
         );
     }
 
@@ -356,6 +358,74 @@ mod tests {
             "the buggy 'with topic/duration' phrasing must not \
              return — podcast_generate does not accept those \
              arguments (codex P1 round-3 regression guard)"
+        );
+    }
+
+    #[test]
+    fn should_name_preset_voices_for_script_generation() {
+        // codex P2 round-3 follow-up: podcast_generate validates the
+        // `voice` token in every `[Character - voice, emotion]` line
+        // against the skill's built-in preset list. If the model
+        // invents voice names like `default`, `voice`, or
+        // role-derived strings, synthesis fails before TTS even
+        // starts. The prompt must name the concrete preset voices
+        // the skill ships with so the model has safe defaults to
+        // pick from.
+        //
+        // Skill source (mofa-podcast 0.4.5):
+        //   PRESET_VOICES = ["vivian", "serena", "ryan", "aiden",
+        //                    "eric", "dylan", "uncle_fu",
+        //                    "ono_anna", "sohee"]
+        for voice in [
+            "vivian", "serena", "ryan", "aiden", "eric", "dylan", "uncle_fu", "ono_anna", "sohee",
+        ] {
+            assert!(
+                PROMPT.contains(&format!("`{voice}`")),
+                "prompt must name the `{voice}` preset voice so the \
+                 model picks valid voice tokens for the script lines \
+                 (codex P2 round-3 follow-up)"
+            );
+        }
+        assert!(
+            PROMPT.contains("Do NOT invent voice names")
+                || PROMPT.contains("do NOT invent voice names"),
+            "prompt must explicitly forbid inventing voice names — \
+             arbitrary tokens like `default` or `voice` fail \
+             validation in podcast_generate (codex P2 round-3 \
+             follow-up)"
+        );
+    }
+
+    #[test]
+    fn should_not_let_bare_generate_token_trigger_listing_override() {
+        // codex P2 round-3 follow-up: the override carve-out on the
+        // voice-list-only bullet originally listed bare `生成` and
+        // `generate` as triggers that fall through to the
+        // generation bullet. But `生成可用的播客声音列表` /
+        // "generate the available voice list" is a LISTING request,
+        // not an episode-generation request. The override must
+        // require specific episode-generation phrasing.
+        let voice_list_bullet = PROMPT
+            .lines()
+            .find(|l| l.starts_with("- Podcast voice list only"))
+            .expect("voice-list-only bullet missing");
+        // The override must NOT use bare `生成` / `generate` as
+        // triggers any more.
+        assert!(
+            !voice_list_bullet.contains("`生成`, `make`, `generate`,"),
+            "override carve-out must not list bare `生成` / \
+             `generate` as triggers — they swallow listing requests \
+             like `生成可用的播客声音列表` (codex P2 round-3 \
+             follow-up). Current bullet: {voice_list_bullet}"
+        );
+        // The override must require a podcast-episode-specific phrase.
+        assert!(
+            voice_list_bullet.contains("`生成播客`")
+                || voice_list_bullet.contains("`generate a podcast`"),
+            "override carve-out must trigger on episode-specific \
+             phrasing like `生成播客` or `generate a podcast`, not \
+             bare verbs (codex P2 round-3 follow-up). Current \
+             bullet: {voice_list_bullet}"
         );
     }
 
