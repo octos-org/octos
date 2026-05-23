@@ -895,6 +895,7 @@ impl ToolRegistry {
         }
 
         if !activated.is_empty() {
+            drop(deferred);
             self.invalidate_cache_shared();
         }
         activated
@@ -1278,12 +1279,26 @@ impl ToolRegistry {
         registry
     }
 
-    /// Snapshot of every currently-registered tool as a [`ToolCatalogEntry`]
+    /// Snapshot of every currently model-visible tool as a [`ToolCatalogEntry`]
     /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
     /// against the effective coding tool contract.
     pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         self.tools
             .values()
+            .filter(|tool| !deferred.contains(tool.name()))
+            .filter(|tool| {
+                self.provider_policy.as_ref().is_none_or(|policy| {
+                    provider_policy_allows_equivalent_with_tags(policy, tool.name(), tool.tags())
+                })
+            })
+            .filter(|tool| {
+                self.context_filter.as_ref().is_none_or(|tags| {
+                    let tool_tags = tool.tags();
+                    tool_tags.is_empty()
+                        || tool_tags.iter().any(|tag| tags.contains(&tag.to_string()))
+                })
+            })
             .map(|tool| {
                 ToolCatalogEntry::new(
                     tool.name(),

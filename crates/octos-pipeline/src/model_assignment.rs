@@ -396,6 +396,7 @@ mod tests {
             id: "test".into(),
             label: None,
             default_model: None,
+            max_total_tokens: None,
             nodes: nodes.into_iter().collect::<HashMap<_, _>>(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
