@@ -645,6 +645,31 @@ fn extract_json_array(text: &str) -> Option<&str> {
     None
 }
 
+fn total_pipeline_tokens(usage: &TokenUsage) -> u32 {
+    usage.input_tokens.saturating_add(usage.output_tokens)
+}
+
+fn remaining_pipeline_tokens(max_total_tokens: Option<u32>, usage: &TokenUsage) -> Option<u32> {
+    let max_total_tokens = max_total_tokens?;
+    Some(max_total_tokens.saturating_sub(total_pipeline_tokens(usage)))
+}
+
+fn cap_node_output_tokens_for_remaining_budget(
+    node: &mut PipelineNode,
+    remaining_tokens: u32,
+    peer_count: usize,
+) {
+    if !matches!(node.handler, HandlerKind::Codergen) || remaining_tokens == 0 {
+        return;
+    }
+    let divisor = u32::try_from(peer_count.max(1)).unwrap_or(u32::MAX).max(1);
+    let per_node_cap = remaining_tokens.saturating_div(divisor).max(1);
+    node.max_output_tokens = Some(
+        node.max_output_tokens
+            .map_or(per_node_cap, |existing| existing.min(per_node_cap).max(1)),
+    );
+}
+
 /// Process results from parallel worker execution, producing merged content and summaries.
 fn process_worker_results(
     results: Vec<(String, PipelineNode, Duration, Result<NodeOutcome>)>,
@@ -1643,6 +1668,29 @@ impl PipelineExecutor {
                     return Err(eyre::eyre!(err));
                 }
 
+                let llm_target_count = targets
+                    .iter()
+                    .filter_map(|target_id| graph.nodes.get(target_id))
+                    .filter(|target| matches!(target.handler, HandlerKind::Codergen))
+                    .count()
+                    .max(1);
+                let parallel_remaining_tokens =
+                    remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens);
+                if matches!(parallel_remaining_tokens, Some(0)) {
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted before parallel node '{}': spent {} tokens",
+                            node.id,
+                            total_pipeline_tokens(&total_tokens)
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
+
                 let fan_start = Instant::now();
 
                 // Prepare and execute all targets concurrently, capped by semaphore
@@ -1681,6 +1729,13 @@ impl PipelineExecutor {
                     }
                     if target_with_prompt.model.is_none() {
                         target_with_prompt.model = graph.default_model.clone();
+                    }
+                    if let Some(remaining_tokens) = parallel_remaining_tokens {
+                        cap_node_output_tokens_for_remaining_budget(
+                            &mut target_with_prompt,
+                            remaining_tokens,
+                            llm_target_count,
+                        );
                     }
 
                     // Reserve budget for each LLM-call branch before
@@ -1917,6 +1972,22 @@ impl PipelineExecutor {
                 if let Some(ref bridge) = self.config.status_bridge {
                     bridge.add_tokens(&plan_usage);
                 }
+                let dynamic_remaining_tokens =
+                    remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens);
+                if matches!(dynamic_remaining_tokens, Some(0)) {
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted after dynamic_parallel planner '{}': spent {} tokens",
+                            node.id,
+                            total_pipeline_tokens(&total_tokens)
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
 
                 // Build synthetic PipelineNodes for each dynamic task
                 let worker_prompt_template = node.worker_prompt.as_deref().unwrap_or(
@@ -2052,6 +2123,13 @@ impl PipelineExecutor {
                             resolved = resolved.replace(&placeholder, value);
                         }
                         synth_node.prompt = Some(resolved.trim_end().to_string());
+                    }
+                    if let Some(remaining_tokens) = dynamic_remaining_tokens {
+                        cap_node_output_tokens_for_remaining_budget(
+                            &mut synth_node,
+                            remaining_tokens,
+                            total_workers,
+                        );
                     }
 
                     if let Some(handle) = self.reserve_node_budget(&graph.id, &synth_node).await? {
@@ -2212,6 +2290,30 @@ impl PipelineExecutor {
             // Resolve model from graph default if node doesn't specify one
             if node_with_prompt.model.is_none() {
                 node_with_prompt.model = graph.default_model.clone();
+            }
+
+            if let Some(remaining_tokens) =
+                remaining_pipeline_tokens(graph.max_total_tokens, &total_tokens)
+            {
+                if remaining_tokens == 0 {
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted before node '{}': spent {} tokens",
+                            node.id,
+                            total_pipeline_tokens(&total_tokens)
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
+                cap_node_output_tokens_for_remaining_budget(
+                    &mut node_with_prompt,
+                    remaining_tokens,
+                    1,
+                );
             }
 
             let input_bytes = input_text.len();
@@ -2985,6 +3087,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = Box::leak(Box::new(dir));
         EpisodeStore::open(dir.path()).await.unwrap()
+    }
+
+    #[test]
+    fn caps_codergen_output_tokens_by_remaining_pipeline_budget() {
+        let mut node = PipelineNode {
+            handler: HandlerKind::Codergen,
+            ..Default::default()
+        };
+        cap_node_output_tokens_for_remaining_budget(&mut node, 900, 3);
+        assert_eq!(node.max_output_tokens, Some(300));
+
+        node.max_output_tokens = Some(100);
+        cap_node_output_tokens_for_remaining_budget(&mut node, 900, 3);
+        assert_eq!(node.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn leaves_non_llm_nodes_uncapped_by_pipeline_budget() {
+        let mut node = PipelineNode {
+            handler: HandlerKind::Shell,
+            max_output_tokens: Some(500),
+            ..Default::default()
+        };
+        cap_node_output_tokens_for_remaining_budget(&mut node, 900, 3);
+        assert_eq!(node.max_output_tokens, Some(500));
     }
 
     // --- extract_json_array tests ---
