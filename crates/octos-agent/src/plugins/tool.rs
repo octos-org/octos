@@ -963,6 +963,67 @@ fn resolve_plugin_input_path(
             return Ok(resolved.absolute.to_string_lossy().into_owned());
         }
     }
+    // NEW-02 mini5 soak fix: when `write_file` resolves against the
+    // workspace ROOT but plugin work_dir is chrooted to
+    // `<workspace>/skill-output/`, the script lives one level ABOVE the
+    // chroot. The shared resolver doesn't probe `work_dir.parent()`, so
+    // a podcast script written to `<workspace>/octos_podcast_script.md`
+    // never resolves and the plugin spawn fails with `os error 2`.
+    //
+    // This rescue branch is bounded by FOUR safety constraints (see
+    // #1186 path-traversal review and codex review on #1189):
+    //   1. `raw_path` is already guarded against raw `..` at the entry
+    //      of this function — unsafe inputs returned Err above.
+    //   2. We ONLY probe `work_dir.parent()` when the work_dir basename
+    //      is exactly `skill-output`. The parent is then the workspace
+    //      root by construction (runtime/session.rs always chroots
+    //      `<workspace>/skill-output/`), NOT an arbitrary directory.
+    //   3. We use `Path::file_name()` (not the raw path) so any
+    //      directory components in `raw_path` are discarded — the only
+    //      candidate we ever try is `<workspace>/<basename>`. This
+    //      makes the rescue equivalent in scope to the basename scan
+    //      in `resolve_path_in_work_dir`, just probing one directory
+    //      level above the chroot instead of inside it.
+    //   4. We use `symlink_metadata` + `is_file()` (NOT `exists()`,
+    //      which follows symlinks). A `<workspace>/script.md` symlink
+    //      pointing at `/etc/passwd` MUST NOT resolve. This matches
+    //      the workspace's broader symlink-safety posture
+    //      (`O_NOFOLLOW` in file tools, see CLAUDE.md). Directories
+    //      are also rejected — the only acceptable candidate is a
+    //      regular file at the workspace root.
+    //
+    // TOCTOU note (codex review #1189): the host checks
+    // `symlink_metadata` before handing the path to the plugin
+    // (which then opens the file itself). A race where the path is
+    // swapped for a symlink AFTER the check would defeat this check
+    // — but that race is shared with the rest of this resolver chain
+    // (see `resolve_path_in_work_dir` line ~1116, which also uses
+    // `exists()`) and is fundamental to the plugin-spawn model: the
+    // host can't hold an `O_NOFOLLOW` fd that the plugin subprocess
+    // will then open. Closing the race fully requires plumbing file
+    // descriptors / O_NOFOLLOW opens through the plugin protocol,
+    // which is out of scope here. The static-symlink rejection
+    // implemented below CLOSES the realistic mistake (LLM-driven
+    // symlink in the workspace from a prior tool call), even if it
+    // doesn't fix the adversarial race.
+    if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
+        if let Some(parent) = work_dir.parent() {
+            if let Some(basename) = std::path::Path::new(raw_path).file_name() {
+                let candidate = parent.join(basename);
+                // Reject symlinks AND non-regular files (directories,
+                // sockets, FIFOs). symlink_metadata does not traverse,
+                // so a `script.md -> /etc/passwd` symlink at the
+                // workspace root returns FileType::is_symlink() == true
+                // and is_file() == false — safely refused.
+                let safe = std::fs::symlink_metadata(&candidate)
+                    .map(|m| m.file_type().is_file())
+                    .unwrap_or(false);
+                if safe {
+                    return Ok(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
     // Codex BLOCKER fix (PR #1186 review): the lexical-join branches
     // inside `resolve_path_in_work_dir` would otherwise let candidates
     // like `skill-output/../secret.md` resolve to `<workspace>/secret.md`
@@ -2280,13 +2341,231 @@ mod tests {
         // could over-zealously reject legitimate output args.
         let safe = absolutize_path_in_work_dir("sub/dir/out.toml", &skill_output)
             .expect("safe relative path must succeed");
-        assert_eq!(safe, skill_output.join("sub/dir/out.toml").to_string_lossy());
+        assert_eq!(
+            safe,
+            skill_output.join("sub/dir/out.toml").to_string_lossy()
+        );
         let abs_in = "/tmp/explicit-out.toml";
         let abs_out = absolutize_path_in_work_dir(abs_in, &skill_output)
             .expect("absolute path must succeed (sandbox is the next gate)");
         assert_eq!(abs_out, abs_in);
 
         let _ = bait;
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_recovers_workspace_root_script_for_podcast_generate() {
+        // NEW-02 mini5 soak fix: when `write_file` lands the podcast
+        // script at the workspace ROOT (because write_file's base_dir is
+        // `<workspace>/`, not `<workspace>/skill-output/`), but the
+        // plugin's `work_dir` is chrooted to
+        // `<workspace>/skill-output/`, the script lives one level ABOVE
+        // the chroot. Before this fix the resolver only probed inside
+        // `work_dir`, so #1186's shared resolver returned a non-existent
+        // path and the plugin spawn failed with `os error 2`.
+        //
+        // The rescue branch in `resolve_plugin_input_path` now probes
+        // `work_dir.parent()` (the workspace root) for the basename
+        // when `work_dir` ends in `skill-output`. Both raw forms the
+        // LLM tends to emit MUST recover:
+        //   * `script.md`                — bare basename
+        //   * `skill-output/script.md`   — with the redundant prefix
+        //     (mirrors write_file's workspace-root resolution)
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Mimic write_file landing the script at the workspace ROOT.
+        let script = workspace.path().join("script.md");
+        std::fs::write(&script, b"# podcast script\n").unwrap();
+
+        // Form 1: bare basename. The legacy resolver would return
+        // `<skill-output>/script.md` (lexical join, doesn't exist) or
+        // fall through to the basename-scan inside the chroot (also
+        // empty). Rescue must promote the workspace-root candidate.
+        let resolved_bare = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("bare basename must resolve to workspace-root script");
+        assert_eq!(
+            std::path::Path::new(&resolved_bare),
+            &script,
+            "bare basename rescue must point at the workspace-root script",
+        );
+
+        // Form 2: `skill-output/`-prefixed path. The first strip-probe
+        // would yield `script.md`, which doesn't exist inside the
+        // chroot either. Same rescue must apply.
+        let resolved_prefixed = resolve_plugin_input_path("skill-output/script.md", &skill_output)
+            .expect("prefixed path must resolve to workspace-root script");
+        assert_eq!(
+            std::path::Path::new(&resolved_prefixed),
+            &script,
+            "prefixed-form rescue must point at the workspace-root script",
+        );
+
+        // End-to-end via `rewrite_workspace_file_args`: the
+        // `script_path` key must be rewritten to the absolute
+        // workspace-root path so the plugin spawn opens the right file.
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"script_path": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(skill_output.clone());
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({"script_path": "script.md"}))
+            .expect("rewrite must succeed for workspace-root script");
+        let rewritten_path = rewritten
+            .get("script_path")
+            .and_then(|v| v.as_str())
+            .expect("script_path must remain a string after rewrite");
+        assert_eq!(
+            std::path::Path::new(rewritten_path),
+            &script,
+            "rewrite must point script_path at the workspace-root file",
+        );
+
+        // SECURITY GUARANTEE — #1186 fail-closed contract for raw `..`
+        // must STILL hold. The rescue is bounded to `work_dir.parent()`
+        // via `Path::file_name()` (basename only), so directory
+        // components in the raw path are discarded. But the entry
+        // guard rejects `..` long before we get there, and that
+        // behaviour must NOT regress.
+        let traversal_err = resolve_plugin_input_path("../../etc/passwd", &skill_output)
+            .expect_err("raw `..` traversal must still fail-closed per #1186");
+        let msg = traversal_err.to_string();
+        assert!(
+            msg.contains("../../etc/passwd"),
+            "error must echo the rejected raw path: {msg}",
+        );
+        assert!(
+            msg.contains("escapes plugin work dir"),
+            "error must explain rejection reason: {msg}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_rescue_rejects_symlink_to_outside_workspace() {
+        // Codex review on PR #1189 (BLOCKER): the rescue branch
+        // originally used `candidate.exists()`, which FOLLOWS symlinks.
+        // A `<workspace>/script.md -> /etc/passwd` symlink would have
+        // satisfied `exists()` and the plugin would have received an
+        // absolute path to a host file outside the workspace. The
+        // hardened branch uses `symlink_metadata` + `is_file()` so
+        // symlinks are caught before the path is handed off.
+        //
+        // This regression test creates a symlink at the workspace root
+        // pointing at `/etc/passwd` and asserts the resolver REFUSES
+        // to promote it via the rescue branch. The expected behaviour
+        // is that the resolver falls through to the deeper fallbacks
+        // (which either succeed inside `skill-output/` or, on absence,
+        // produce the lexical-join string — neither lands on the
+        // outside-workspace file).
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Symlink at the workspace ROOT pointing OUTSIDE the workspace.
+        let bait = workspace.path().join("script.md");
+        std::os::unix::fs::symlink("/etc/passwd", &bait).unwrap();
+        // Sanity check: the symlink target exists on a real host
+        // (so `exists()` would have succeeded), but it MUST NOT drive
+        // the rescue.
+        assert!(
+            std::fs::symlink_metadata(&bait)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "test setup: bait must be a symlink"
+        );
+
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("resolver still returns a path (lexical fallback) but NOT the bait");
+        let resolved_path = std::path::Path::new(&resolved);
+        // Critical: the resolved path MUST NOT be the workspace-root
+        // symlink. Any value pointing at `/etc/passwd` (directly or
+        // through the symlink) would be a security failure.
+        assert_ne!(
+            resolved_path, bait,
+            "rescue must not return the symlinked workspace-root path"
+        );
+        assert!(
+            !resolved_path.starts_with("/etc"),
+            "resolved path must not escape into /etc: {resolved}",
+        );
+        // The expected fall-through is `<skill_output>/script.md`
+        // (lexical join from the basename scan inside work_dir, or the
+        // final absolutize step). That path doesn't exist either — but
+        // it's CONTAINED to the chroot, so the plugin will hit a clean
+        // os error 2 instead of reading the bait.
+        assert!(
+            resolved_path.starts_with(&skill_output) || resolved_path.starts_with(workspace.path()),
+            "resolver must stay within the workspace: {resolved}",
+        );
+        // Defense in depth.
+        let _ = bait;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_rescue_rejects_symlink_to_inside_workspace() {
+        // Defense-in-depth: codex review #1189 noted that symlinks
+        // pointing INSIDE the workspace should also be rejected by
+        // the rescue branch. The check is symlink-target-agnostic —
+        // any symlink at the rescue candidate path fails because
+        // `is_file()` (on `symlink_metadata`) returns false for the
+        // symlink itself, regardless of what it points at. This test
+        // pins that behaviour so a future refactor doesn't loosen
+        // the predicate to e.g. follow symlinks within the workspace
+        // and re-introduce TOCTOU swap risk.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Real file lives inside skill-output.
+        let real = skill_output.join("real.md");
+        std::fs::write(&real, b"real").unwrap();
+        // Symlink at the workspace root pointing INSIDE the workspace.
+        let aliased = workspace.path().join("script.md");
+        std::os::unix::fs::symlink(&real, &aliased).unwrap();
+
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("resolver still returns a path via fallback");
+        let resolved_path = std::path::Path::new(&resolved);
+        assert_ne!(
+            resolved_path, aliased,
+            "rescue must NOT return the workspace-root symlink even when it points inside",
+        );
+    }
+
+    #[test]
+    fn workspace_root_rescue_rejects_directory_at_workspace_root() {
+        // The rescue branch must also reject non-file candidates
+        // (directories, sockets, FIFOs). A directory at
+        // `<workspace>/script.md` should NOT satisfy the rescue —
+        // plugins expect to read a file, and handing them a directory
+        // path is at best confusing, at worst exploitable.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Create a DIRECTORY (not a file) at the rescue candidate.
+        let dir_at_root = workspace.path().join("script.md");
+        std::fs::create_dir(&dir_at_root).unwrap();
+
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("resolver still returns a path via fallback");
+        let resolved_path = std::path::Path::new(&resolved);
+        // The directory MUST NOT be promoted by the rescue branch.
+        assert_ne!(
+            resolved_path, dir_at_root,
+            "rescue must not return a directory at the workspace root"
+        );
     }
 
     #[test]
