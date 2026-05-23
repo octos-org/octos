@@ -991,6 +991,21 @@ fn resolve_plugin_input_path(
     //      (`O_NOFOLLOW` in file tools, see CLAUDE.md). Directories
     //      are also rejected — the only acceptable candidate is a
     //      regular file at the workspace root.
+    //
+    // TOCTOU note (codex review #1189): the host checks
+    // `symlink_metadata` before handing the path to the plugin
+    // (which then opens the file itself). A race where the path is
+    // swapped for a symlink AFTER the check would defeat this check
+    // — but that race is shared with the rest of this resolver chain
+    // (see `resolve_path_in_work_dir` line ~1116, which also uses
+    // `exists()`) and is fundamental to the plugin-spawn model: the
+    // host can't hold an `O_NOFOLLOW` fd that the plugin subprocess
+    // will then open. Closing the race fully requires plumbing file
+    // descriptors / O_NOFOLLOW opens through the plugin protocol,
+    // which is out of scope here. The static-symlink rejection
+    // implemented below CLOSES the realistic mistake (LLM-driven
+    // symlink in the workspace from a prior tool call), even if it
+    // doesn't fix the adversarial race.
     if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
         if let Some(parent) = work_dir.parent() {
             if let Some(basename) = std::path::Path::new(raw_path).file_name() {
@@ -2496,6 +2511,37 @@ mod tests {
         );
         // Defense in depth.
         let _ = bait;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_rescue_rejects_symlink_to_inside_workspace() {
+        // Defense-in-depth: codex review #1189 noted that symlinks
+        // pointing INSIDE the workspace should also be rejected by
+        // the rescue branch. The check is symlink-target-agnostic —
+        // any symlink at the rescue candidate path fails because
+        // `is_file()` (on `symlink_metadata`) returns false for the
+        // symlink itself, regardless of what it points at. This test
+        // pins that behaviour so a future refactor doesn't loosen
+        // the predicate to e.g. follow symlinks within the workspace
+        // and re-introduce TOCTOU swap risk.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Real file lives inside skill-output.
+        let real = skill_output.join("real.md");
+        std::fs::write(&real, b"real").unwrap();
+        // Symlink at the workspace root pointing INSIDE the workspace.
+        let aliased = workspace.path().join("script.md");
+        std::os::unix::fs::symlink(&real, &aliased).unwrap();
+
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("resolver still returns a path via fallback");
+        let resolved_path = std::path::Path::new(&resolved);
+        assert_ne!(
+            resolved_path, aliased,
+            "rescue must NOT return the workspace-root symlink even when it points inside",
+        );
     }
 
     #[test]
