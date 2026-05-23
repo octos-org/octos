@@ -215,28 +215,52 @@ mod tests {
         // `podcast_voices`, got the preset/clone list, and STALLED — the
         // model treated the voice list as the final answer. Other minis
         // on `kimi-k2.5` proceeded correctly. The fix is a prompt nudge:
-        // if the model probes voices first, it MUST follow up with
-        // `podcast_generate`.
+        // if the model probes voices first for a *generation* request,
+        // it MUST follow up with `podcast_generate`.
         assert!(
             PROMPT.contains("`podcast_voices`"),
             "prompt must mention `podcast_voices` in the podcast \
              ACT-DIRECTLY rule so the model knows it is reference data, \
-             not a stopping point (NEW-05 fix)"
+             not a stopping point for a generation request (NEW-05 fix)"
         );
         assert!(
             PROMPT.contains(
                 "you MUST immediately follow up with `podcast_generate`"
             ),
             "prompt must instruct the model to immediately follow up \
-             with `podcast_generate` after calling `podcast_voices`; \
-             without this nudge deepseek-v4-pro stalls on the voice \
-             list (NEW-05 fix)"
+             with `podcast_generate` after calling `podcast_voices` for \
+             a generation request; without this nudge deepseek-v4-pro \
+             stalls on the voice list (NEW-05 fix)"
         );
         assert!(
             PROMPT.contains("do NOT stop after the voice list"),
             "prompt must explicitly forbid stopping after the voice \
-             list — the literal phrasing is the regression guard for \
-             NEW-05"
+             list for a generation request — the literal phrasing is \
+             the regression guard for NEW-05"
+        );
+    }
+
+    #[test]
+    fn should_preserve_voice_list_only_podcast_requests() {
+        // codex P2 follow-up on NEW-05: the follow-up rule must NOT
+        // over-apply to legitimate listing requests. If the user only
+        // wants to see available podcast voices, returning the voice
+        // list IS the right answer — the model should not silently
+        // start generating a podcast.
+        assert!(
+            PROMPT.contains(
+                "If the user only asked to list/see available podcast voices"
+            ),
+            "prompt must carve out the voice-list-only case so the \
+             model is allowed to stop after `podcast_voices` when the \
+             user asked for the list, not a generated podcast (codex \
+             P2 follow-up to NEW-05)"
+        );
+        assert!(
+            PROMPT.contains("not just list voices"),
+            "prompt must explicitly qualify the follow-up rule with \
+             'not just list voices' so the listing case is distinct \
+             from generation (codex P2 follow-up to NEW-05)"
         );
     }
 
