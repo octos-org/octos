@@ -15798,6 +15798,19 @@ async fn run_standalone_turn(
                     // suppress on the live channel — is dropped.
                     let skip_synthesized_spawn_only_ack =
                         response.synthesized_from_spawn_only && final_assistant.is_some();
+                    // Codex round-2 P2 on this PR: track whether any
+                    // non-empty assistant row landed during the
+                    // preamble persist loop. When we skip the
+                    // synthesised ack but the preamble carried a
+                    // non-empty assistant row (e.g. self-paced loop
+                    // says "Starting... <<loop-next-in: 60s>>" plus
+                    // the spawn_only tool call), we want the post-turn
+                    // self-paced rescheduler to fall back to the
+                    // history walk so it finds THAT row's hint —
+                    // NOT to receive the synthesised ack (which has no
+                    // hint) on the oneshot and lose the model's
+                    // requested delay.
+                    let mut any_preamble_assistant_persisted = false;
                     let mut skipped_internal_user = false;
                     for message in response.messages.iter().cloned() {
                         if skip_internal_user_persist
@@ -15815,6 +15828,9 @@ async fn run_standalone_turn(
                         let is_final_assistant_carrier = message.role == MessageRole::Assistant
                             && message.content == response.content
                             && !response.content.is_empty();
+                        let is_non_empty_assistant_row =
+                            message.role == MessageRole::Assistant
+                                && !message.content.trim().is_empty();
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();
@@ -15836,6 +15852,9 @@ async fn run_standalone_turn(
                             if is_final_assistant_carrier {
                                 final_assistant_persisted = true;
                             }
+                            if is_non_empty_assistant_row {
+                                any_preamble_assistant_persisted = true;
+                            }
                         }
                     }
                     if let Some(message) = final_assistant {
@@ -15846,37 +15865,62 @@ async fn run_standalone_turn(
                         // `skip_synthesized_spawn_only_ack` comment
                         // above for the full rationale).
                         //
-                        // Codex P2 follow-up on this PR: we MUST still
-                        // flip `final_assistant_persisted` to true on
-                        // this path so the `final_send` decision below
-                        // routes the captured reply to the post-turn
-                        // self-paced reschedule block. Without this,
-                        // a self-paced / maintenance loop firing a
-                        // bare spawn_only call with no LLM preamble
-                        // would skip the only non-empty assistant
-                        // content for the turn — `final_send` becomes
-                        // `None`, the history-fallback scan also finds
-                        // no non-empty row (because we skipped the
+                        // Codex P2 (rounds 1-2) on this PR: a
+                        // self-paced / `maintenance` loop firing a
+                        // BARE spawn_only call with NO LLM preamble
+                        // has only the synthesised ack as its
+                        // turn-final assistant content. If we skip
+                        // the ack persist AND leave
+                        // `final_assistant_persisted=false`,
+                        // `final_send` becomes `None`, the
+                        // history-fallback scan also finds no
+                        // non-empty row (because we skipped the
                         // persist), and `apply_self_paced_response`
-                        // never fires. Since the fire-time
-                        // `next_run_at_ms` is cleared until
+                        // never fires. Since fire-time clears
+                        // `next_run_at_ms` until
                         // `apply_self_paced_response` stamps a fresh
                         // delay, the loop would stall.
                         //
-                        // A spawn_only ack never carries a
-                        // `<<loop-next-in: ...>>` hint, so the
-                        // reschedule falls back to
-                        // `SELF_PACED_DEFAULT_DELAY_SECONDS` — exactly
-                        // the pre-#1183 behaviour for autonomous
-                        // loops.
+                        // BUT codex round-2 caught the dual:
+                        // unconditionally flipping
+                        // `final_assistant_persisted` regresses
+                        // turns that DID emit a non-empty preamble
+                        // carrying a model-provided
+                        // `<<loop-next-in: 60s>>` hint. The post-turn
+                        // rescheduler would prefer the captured
+                        // (synthesised, hint-less) ack on the
+                        // oneshot over the persisted preamble's
+                        // hint, falling back to the 15-min default
+                        // and dropping the model's requested delay.
+                        //
+                        // So flip ONLY when no non-empty assistant
+                        // row landed during the preamble loop. With
+                        // a preamble row present, leave
+                        // `final_assistant_persisted` at false here
+                        // — the rescheduler walks history, picks the
+                        // preamble row, and honours its hint.
                         if skip_synthesized_spawn_only_ack {
-                            debug!(
-                                session = %agent_session_id,
-                                "skipping JSONL persist for synthesised spawn_only ack \
-                                 (NEW-03: prevents ghost ack bubble on messages_page replay); \
-                                 flipping final_assistant_persisted so self-paced loops still reschedule"
-                            );
-                            final_assistant_persisted = true;
+                            if should_force_final_assistant_persisted_on_synth_ack_skip(
+                                skip_synthesized_spawn_only_ack,
+                                any_preamble_assistant_persisted,
+                            ) {
+                                debug!(
+                                    session = %agent_session_id,
+                                    "skipping JSONL persist for synthesised spawn_only ack \
+                                     (NEW-03); no preamble assistant content, flipping \
+                                     final_assistant_persisted so a self-paced loop firing a \
+                                     bare spawn_only call still reschedules at the default delay"
+                                );
+                                final_assistant_persisted = true;
+                            } else {
+                                debug!(
+                                    session = %agent_session_id,
+                                    "skipping JSONL persist for synthesised spawn_only ack \
+                                     (NEW-03); preamble carried non-empty assistant content so \
+                                     post-turn rescheduler will use the history walk and honour \
+                                     any `<<loop-next-in: ...>>` hint there"
+                                );
+                            }
                         } else {
                             // The `final_assistant` row is the synthesised
                             // carrier of `response.content`. By
@@ -16817,6 +16861,37 @@ fn final_assistant_message(
     let mut message = Message::assistant(content.to_owned());
     message.reasoning_content = reasoning_content;
     Some(message)
+}
+
+/// Decide whether to force `final_assistant_persisted = true` on the
+/// synthesised-spawn-only-ack skip path (NEW-03 fix).
+///
+/// The post-turn block at `run_standalone_turn` uses
+/// `final_assistant_persisted` to pick between sending the captured
+/// LLM reply on the oneshot (`Some(captured_final_reply)`) and falling
+/// back to a session-history walk (`None`). When the ack is skipped:
+///
+/// - **No preamble assistant content was persisted** → the
+///   history-fallback would find nothing and
+///   `apply_self_paced_response` would never fire, stalling self-paced
+///   / `maintenance` loops. Force the flag so the captured (ack) text
+///   flows through; the parser finds no hint and stamps the default
+///   delay. (Codex round-1 P2.)
+///
+/// - **A preamble assistant row landed** (e.g. self-paced loop says
+///   "Starting... <<loop-next-in: 60s>>" plus the spawn_only tool
+///   call) → leave the flag at its current value so the rescheduler
+///   walks history, picks the preamble row, and honours its
+///   `<<loop-next-in: ...>>` hint instead of seeing the hint-less
+///   ack on the oneshot. (Codex round-2 P2.)
+///
+/// Returns `true` iff the caller should set
+/// `final_assistant_persisted = true` (i.e. the bare-spawn-only case).
+fn should_force_final_assistant_persisted_on_synth_ack_skip(
+    skip_synthesized_spawn_only_ack: bool,
+    any_preamble_assistant_persisted: bool,
+) -> bool {
+    skip_synthesized_spawn_only_ack && !any_preamble_assistant_persisted
 }
 
 async fn abort_connection_turns(
@@ -24004,6 +24079,43 @@ ignore = []
         assert!(final_assistant_message(&messages, "world", None).is_none());
     }
 
+    /// NEW-03 (codex round-2 P2): the synth-ack skip path MUST force
+    /// `final_assistant_persisted = true` ONLY when no preamble
+    /// assistant content landed during the response-messages persist
+    /// loop. Otherwise (e.g. a self-paced loop emitted
+    /// "Starting... <<loop-next-in: 60s>>" alongside the spawn_only
+    /// tool call), forcing the flag would route the hint-less ack
+    /// onto the post-turn oneshot and bury the model's hint.
+    #[test]
+    fn force_final_assistant_persisted_only_when_bare_spawn_only_skip() {
+        // Bare spawn_only (no preamble assistant content): force
+        // through so the loop still reschedules at the default delay.
+        assert!(
+            should_force_final_assistant_persisted_on_synth_ack_skip(true, false),
+            "bare spawn_only skip MUST flip final_assistant_persisted to keep self-paced loops scheduled"
+        );
+
+        // Spawn_only with non-empty preamble: do NOT force; let the
+        // history-fallback walk pick the preamble row so any
+        // `<<loop-next-in: ...>>` hint there wins.
+        assert!(
+            !should_force_final_assistant_persisted_on_synth_ack_skip(true, true),
+            "spawn_only WITH preamble assistant content MUST NOT force the flag — the rescheduler must read the preamble's hint via the history walk"
+        );
+
+        // Non-skip path: always false; the existing
+        // `is_final_assistant_carrier` logic in the persist loop
+        // handles persisted-content tracking.
+        assert!(
+            !should_force_final_assistant_persisted_on_synth_ack_skip(false, false),
+            "non-skip path must NEVER force the flag — the persist loop's carrier check is authoritative"
+        );
+        assert!(
+            !should_force_final_assistant_persisted_on_synth_ack_skip(false, true),
+            "non-skip path must NEVER force the flag regardless of preamble state"
+        );
+    }
+
     /// M10 Phase 6.1: the standalone-turn persist loop must pre-stamp the
     /// `User` row with the originating `TurnId`-derived thread id so the
     /// user prompt and the assistant reply land in the same thread on the
@@ -28214,10 +28326,16 @@ ignore = []
     #[test]
     fn self_paced_loop_reschedules_when_only_assistant_content_is_synth_ack() {
         use crate::api::agent_orchestrator::{
-            LoopCreateRequest, LoopListRequest, default_agent_orchestrator,
+            InProcessAgentOrchestrator, LoopCreateRequest, LoopListRequest,
         };
 
-        let orchestrator = default_agent_orchestrator();
+        // Codex round-2 P3: use a private orchestrator (NOT the
+        // process-wide `default_agent_orchestrator` singleton) so
+        // this test can't race with another module test that calls
+        // `clear_autonomy_runtime_state_for_test` or otherwise
+        // mutates the global state between our `create_loop` and
+        // `list_loops`.
+        let orchestrator = InProcessAgentOrchestrator::default();
         let session_id =
             SessionKey::with_profile("tenant-new03", "api", "self-paced-bare-spawn-only");
         let created = orchestrator
