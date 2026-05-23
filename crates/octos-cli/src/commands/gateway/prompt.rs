@@ -210,91 +210,78 @@ mod tests {
     }
 
     #[test]
-    fn should_require_podcast_generate_follow_up_after_podcast_voices() {
-        // NEW-05 (round-2 soak): on mini1, `deepseek-v4-pro` called
-        // `podcast_voices`, got the preset/clone list, and STALLED — the
-        // model treated the voice list as the final answer. Other minis
-        // on `kimi-k2.5` proceeded correctly. The fix is a prompt nudge:
-        // if the model probes voices first for a *generation* request,
-        // it MUST follow up with `podcast_generate`.
+    fn should_call_podcast_generate_directly_without_voice_probe() {
+        // NEW-05 round-3 (codex recommendation): three rounds of prompt
+        // strengthening could not convince `deepseek-v4-pro` to follow
+        // through after `podcast_voices` — the model kept stopping at
+        // the voice list. The fix is to make `podcast_generate`
+        // self-contained: it picks default voices internally, and the
+        // prompt no longer routes the LLM through `podcast_voices` as a
+        // precondition. The verified manifest (mofa-podcast 0.4.5) does
+        // NOT require a `voice` argument, so this is purely a prompt
+        // change. The generation bullet must:
+        //
+        // 1. Tell the model to call `podcast_generate` DIRECTLY.
+        // 2. Explicitly forbid calling `podcast_voices` first as a
+        //    precondition (this is the load-bearing nudge for
+        //    deepseek-v4-pro).
+        // 3. Say defaults are selected automatically so the model
+        //    knows `voice` is not required.
         assert!(
-            PROMPT.contains("`podcast_voices`"),
-            "prompt must mention `podcast_voices` in the podcast \
-             ACT-DIRECTLY rule so the model knows it is reference data, \
-             not a stopping point for a generation request (NEW-05 fix)"
+            PROMPT.contains("`podcast_generate` DIRECTLY"),
+            "prompt must instruct the model to call `podcast_generate` \
+             DIRECTLY for podcast generation (NEW-05 round-3 fix); the \
+             previous voice-probe workflow stalled deepseek-v4-pro on \
+             the voice list"
         );
         assert!(
-            PROMPT.contains("you MUST immediately follow up with `podcast_generate`"),
-            "prompt must instruct the model to immediately follow up \
-             with `podcast_generate` after calling `podcast_voices` for \
-             a generation request; without this nudge deepseek-v4-pro \
-             stalls on the voice list (NEW-05 fix)"
+            PROMPT.contains("Do NOT call `podcast_voices` first"),
+            "prompt must explicitly forbid calling `podcast_voices` \
+             first as a precondition for generation (NEW-05 round-3 \
+             fix); without this nudge deepseek-v4-pro stalls on the \
+             voice list as the final answer"
         );
         assert!(
-            PROMPT.contains("do NOT stop after the voice list"),
-            "prompt must explicitly forbid stopping after the voice \
-             list for a generation request — the literal phrasing is \
-             the regression guard for NEW-05"
+            PROMPT.contains("default voices are selected automatically")
+                || PROMPT.contains("default voices are used automatically"),
+            "prompt must say default voices are selected automatically \
+             so the model knows `voice` is not a required argument \
+             (NEW-05 round-3 fix)"
         );
     }
 
     #[test]
-    fn should_preserve_voice_list_only_podcast_requests() {
-        // codex P2 follow-up on NEW-05 (round 2): the original carve-out
-        // still let voice-list-only prompts fall through to the generic
-        // podcast bullet's "spawn podcast_generate" instruction because
-        // the trigger word `podcast` was shared between both cases.
-        // Codex's correction was to SPLIT the route so a dedicated bullet
-        // matches voice-list-only triggers BEFORE the generation bullet
-        // can match. The model should call `podcast_voices` and stop.
+    fn should_strip_voice_probe_from_generation_surface() {
+        // Regression guard for NEW-05 round-3: the old workflow that
+        // probed `podcast_voices` BEFORE `podcast_generate` for episode
+        // requests must not return. The voice-probe phrasings that
+        // caused deepseek-v4-pro to stall are:
+        //
+        // - "follow up with `podcast_generate`" (round-2 fix)
+        // - "do NOT stop after the voice list" (round-2 fix)
+        // - "Podcast voice list only" dedicated bullet (round-2 P2)
+        //
+        // All three were attempts to coerce the model THROUGH
+        // `podcast_voices`. The round-3 fix removes that route
+        // entirely from the generation surface.
         assert!(
-            PROMPT.contains("Podcast voice list only"),
-            "prompt must have a dedicated 'Podcast voice list only' \
-             route that matches BEFORE the generic generation bullet \
-             so listing requests do not fall through to \
-             podcast_generate (codex P2 follow-up to NEW-05)"
+            !PROMPT.contains("you MUST immediately follow up with `podcast_generate`"),
+            "the round-2 follow-up rule must not return — round-3 \
+             removes podcast_voices from the generation surface"
         );
         assert!(
-            PROMPT.contains("call `podcast_voices` and return that list as the final answer"),
-            "prompt must instruct the model to call `podcast_voices` \
-             and return the list as the final answer for voice-list-only \
-             prompts (codex P2 follow-up to NEW-05)"
+            !PROMPT.contains("do NOT stop after the voice list"),
+            "the round-2 'do NOT stop after voice list' nudge must \
+             not return — round-3 removes the voice-probe step \
+             entirely"
         );
         assert!(
-            PROMPT.contains("Do NOT spawn `podcast_generate`"),
-            "prompt must explicitly forbid spawning `podcast_generate` \
-             on a voice-list-only request (codex P2 follow-up to NEW-05)"
-        );
-        // The voice-list-only bullet must appear BEFORE the generation
-        // bullet so the model matches it first.
-        let voice_list_idx = PROMPT
-            .find("Podcast voice list only")
-            .expect("voice-list-only bullet missing");
-        let generation_idx = PROMPT
-            .find("Podcast generation")
-            .expect("podcast generation bullet missing");
-        assert!(
-            voice_list_idx < generation_idx,
-            "the voice-list-only bullet must appear BEFORE the \
-             podcast-generation bullet so it matches first (codex P2 \
-             follow-up to NEW-05)"
-        );
-        // codex P2 round 3: the listing route MUST defer to the
-        // generation route when the same message ALSO asks to
-        // make/generate a podcast. Otherwise prompts like
-        // "用播客声音做一期播客" or "use available podcast voices to
-        // make a podcast" get swallowed by the list route.
-        assert!(
-            PROMPT.contains("Override"),
-            "voice-list-only bullet must include an Override clause so \
-             generation requests that mention voice selection still \
-             route to podcast_generate (codex P2 round 3 on NEW-05)"
-        );
-        assert!(
-            PROMPT.contains("fall through to the Podcast generation rule below"),
-            "voice-list-only bullet must explicitly fall through to \
-             the Podcast generation rule when the message asks to \
-             make/generate a podcast (codex P2 round 3 on NEW-05)"
+            !PROMPT.contains("Podcast voice list only"),
+            "the round-2 'Podcast voice list only' bullet must not \
+             return — round-3 removes voice-probe routing from the \
+             generation surface; if users explicitly ask to list \
+             voices, the skill can still be invoked directly but the \
+             prompt should not advertise it as a separate route"
         );
     }
 
