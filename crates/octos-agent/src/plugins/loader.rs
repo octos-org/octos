@@ -1938,7 +1938,9 @@ edition = "2021"
         assert_eq!(tools.len(), 1);
         // Inject through prepare_effective_args to verify the loader propagated
         // the config into the constructed PluginTool.
-        let prepared = tools[0].prepare_effective_args(&serde_json::json!({"query": "x"}), None);
+        let prepared = tools[0]
+            .prepare_effective_args(&serde_json::json!({"query": "x"}), None)
+            .unwrap();
         assert_eq!(prepared["synthesis_config"]["api_key"], "sk-loader-test");
     }
 
@@ -1991,7 +1993,9 @@ edition = "2021"
         )
         .unwrap();
         assert_eq!(tools.len(), 1);
-        let prepared = tools[0].prepare_effective_args(&serde_json::json!({}), None);
+        let prepared = tools[0]
+            .prepare_effective_args(&serde_json::json!({}), None)
+            .unwrap();
         assert!(
             prepared.get("synthesis_config").is_none(),
             "non-opted-in plugin must not see synthesis_config: {prepared}"
