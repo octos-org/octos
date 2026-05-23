@@ -104,8 +104,15 @@ pub enum HarnessError {
         used: Option<u32>,
         message: String,
     },
-    /// Authentication failed (HTTP 401/403). Never retry — surface to operator.
+    /// Authentication failed (HTTP 401, or 403 without a quota marker).
+    /// Never retry — surface to operator with "check your API key".
     Authentication { message: String },
+    /// Provider quota / billing-tier exhausted (HTTP 403 with
+    /// `insufficient_quota` / `quota_exceeded` / `no_active_*_package`).
+    /// Distinct from `Authentication` so the operator sees "top up or
+    /// switch provider" instead of "bad API key". Never retry — auto-retry
+    /// will keep failing until the operator acts.
+    Quota { message: String },
     /// The request itself was malformed (HTTP 400, non-context) — bad
     /// parameters, invalid schema, etc.
     InvalidRequest { detail: String, message: String },
@@ -193,6 +200,7 @@ impl HarnessError {
             HarnessError::RateLimited { .. } => "rate_limited",
             HarnessError::ContextOverflow { .. } => "context_overflow",
             HarnessError::Authentication { .. } => "authentication",
+            HarnessError::Quota { .. } => "quota",
             HarnessError::InvalidRequest { .. } => "invalid_request",
             HarnessError::ContentFiltered { .. } => "content_filtered",
             HarnessError::ProviderUnavailable { .. } => "provider_unavailable",
@@ -225,6 +233,7 @@ impl HarnessError {
 
             // Non-retryable — surface to operator.
             HarnessError::Authentication { .. }
+            | HarnessError::Quota { .. }
             | HarnessError::InvalidRequest { .. }
             | HarnessError::ContentFiltered { .. }
             | HarnessError::DelegateDepthExceeded { .. }
@@ -244,6 +253,7 @@ impl HarnessError {
             HarnessError::RateLimited { message, .. }
             | HarnessError::ContextOverflow { message, .. }
             | HarnessError::Authentication { message }
+            | HarnessError::Quota { message }
             | HarnessError::InvalidRequest { message, .. }
             | HarnessError::ContentFiltered { message }
             | HarnessError::ProviderUnavailable { message, .. }
@@ -301,41 +311,63 @@ impl HarnessError {
 
     /// Classify an owned `LlmError` borrow without consuming it. Public so
     /// callers can opportunistically classify in diagnostic paths.
+    ///
+    /// The user-facing messages embedded here are what the SPA renders when
+    /// no specific variant handling exists on the client — they MUST be
+    /// actionable ("check API key", "top up provider", "switch lane") and
+    /// MUST identify the provider lane that failed so operators can pivot
+    /// without digging through daemon logs.
     pub fn from_llm_error(err: &LlmError) -> Self {
-        let message = truncate(&err.message, MAX_HARNESS_ERROR_MESSAGE_BYTES);
+        let raw = truncate(&err.message, MAX_HARNESS_ERROR_MESSAGE_BYTES);
+        // Identify the provider lane in user-facing messages. Empty label
+        // is rendered as a generic "provider" so the message still parses.
+        let lane = if err.provider.is_empty() {
+            "provider".to_string()
+        } else {
+            err.provider.clone()
+        };
         match &err.kind {
-            LlmErrorKind::Authentication => HarnessError::Authentication { message },
+            LlmErrorKind::Authentication => HarnessError::Authentication {
+                message: format!("Authentication failed for {lane} — check your API key ({raw})"),
+            },
+            LlmErrorKind::Quota => HarnessError::Quota {
+                message: format!(
+                    "Provider quota exhausted ({lane}) — top up or switch provider ({raw})"
+                ),
+            },
             LlmErrorKind::RateLimited { retry_after_secs } => HarnessError::RateLimited {
                 retry_after_secs: *retry_after_secs,
-                message,
+                message: format!("{lane} rate-limited — backing off ({raw})"),
             },
             LlmErrorKind::ContextOverflow { limit, used } => HarnessError::ContextOverflow {
                 limit: *limit,
                 used: *used,
-                message,
+                message: raw,
             },
             LlmErrorKind::ModelNotFound { model } => HarnessError::ProviderUnavailable {
                 status: Some(404),
-                message: format!("model not found: {model}"),
+                message: format!("model not found on {lane}: {model}"),
             },
             LlmErrorKind::ServerError { status } => HarnessError::ProviderUnavailable {
                 status: Some(*status),
-                message,
+                message: format!("{lane} temporarily unavailable ({raw})"),
             },
-            LlmErrorKind::Network => HarnessError::Network { message },
-            LlmErrorKind::Timeout => HarnessError::Timeout { message },
+            LlmErrorKind::Network => HarnessError::Network { message: raw },
+            LlmErrorKind::Timeout => HarnessError::Timeout { message: raw },
             LlmErrorKind::InvalidRequest { detail } => HarnessError::InvalidRequest {
                 detail: truncate(detail, MAX_HARNESS_ERROR_MESSAGE_BYTES),
-                message,
+                message: format!(
+                    "Provider rejected the request ({lane}): {raw}. This often means a model/feature mismatch."
+                ),
             },
-            LlmErrorKind::ContentFiltered => HarnessError::ContentFiltered { message },
+            LlmErrorKind::ContentFiltered => HarnessError::ContentFiltered { message: raw },
             LlmErrorKind::StreamError => HarnessError::ProviderUnavailable {
                 status: None,
-                message,
+                message: format!("{lane} stream broke ({raw})"),
             },
             LlmErrorKind::Provider { .. } => HarnessError::ProviderUnavailable {
                 status: None,
-                message,
+                message: format!("{lane} returned an error ({raw})"),
             },
         }
     }
@@ -426,6 +458,7 @@ impl HarnessError {
                 out.insert("limit".into(), Value::from(*limit));
             }
             HarnessError::Authentication { .. }
+            | HarnessError::Quota { .. }
             | HarnessError::ContentFiltered { .. }
             | HarnessError::Network { .. }
             | HarnessError::Timeout { .. }
@@ -489,6 +522,9 @@ mod tests {
                 message: "x".into(),
             },
             HarnessError::Authentication {
+                message: "x".into(),
+            },
+            HarnessError::Quota {
                 message: "x".into(),
             },
             HarnessError::InvalidRequest {
@@ -585,5 +621,61 @@ mod tests {
         let err = HarnessError::Internal { message: huge };
         let body = err.to_event_body("s", "t", None, None);
         assert!(body.message.len() <= MAX_HARNESS_ERROR_MESSAGE_BYTES + "…".len());
+    }
+
+    #[test]
+    fn quota_403_classifies_as_quota_not_internal() {
+        // Regression test for the dspfac (mini1) symptom: 403 with
+        // Wisemodel `no_active_wisemodel_package` body was surfacing as
+        // `variant=internal recovery=bug` because the eyre::bail!() report
+        // could not downcast to LlmError. With the new from_status_with_label
+        // path, providers route HTTP errors through LlmError and the
+        // harness picks the Quota variant with a user-actionable message.
+        let body = r#"{"error":{"code":"no_active_wisemodel_package","message":"没有有效的 Wisemodel 资源包，请购买后再使用","type":"insufficient_quota"}}"#;
+        let llm = LlmError::from_status_with_label(403, body, "MiniMax-M2.5-highspeed");
+        let err: HarnessError = llm.into();
+        assert_eq!(err.variant_name(), "quota");
+        assert_eq!(err.recovery_hint(), RecoveryHint::FailFast);
+        assert!(err.message().contains("MiniMax-M2.5-highspeed"));
+        assert!(err.message().contains("top up or switch provider"));
+    }
+
+    #[test]
+    fn classify_report_downcasts_quota_through_eyre() {
+        // End-to-end: a provider would do `return Err(LlmError::from_status_with_label(...).into())`,
+        // and classify_report at the loop boundary must extract Quota.
+        let body = r#"{"type":"insufficient_quota"}"#;
+        let llm = LlmError::from_status_with_label(403, body, "lane-x");
+        let report: eyre::Report = llm.into();
+        let classified = HarnessError::classify_report(&report, None);
+        assert_eq!(classified.variant_name(), "quota");
+        assert_ne!(classified.recovery_hint(), RecoveryHint::Bug);
+    }
+
+    #[test]
+    fn classify_report_downcasts_auth_403_through_eyre() {
+        // 403 without quota marker stays Authentication.
+        let llm = LlmError::from_status_with_label(403, "Forbidden", "openai");
+        let report: eyre::Report = llm.into();
+        let classified = HarnessError::classify_report(&report, None);
+        assert_eq!(classified.variant_name(), "authentication");
+        assert_eq!(classified.recovery_hint(), RecoveryHint::FailFast);
+        assert!(classified.message().contains("openai"));
+        assert!(classified.message().contains("check your API key"));
+    }
+
+    #[test]
+    fn classify_report_downcasts_invalid_request_through_eyre() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"unknown parameter"}}"#;
+        let llm = LlmError::from_status_with_label(400, body, "anthropic");
+        let report: eyre::Report = llm.into();
+        let classified = HarnessError::classify_report(&report, None);
+        assert_eq!(classified.variant_name(), "invalid_request");
+        assert!(
+            classified
+                .message()
+                .contains("Provider rejected the request")
+        );
+        assert!(classified.message().contains("anthropic"));
     }
 }

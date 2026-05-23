@@ -15909,9 +15909,22 @@ async fn run_standalone_turn(
                 // back to the session-history scan, matching the
                 // pre-#1134 behaviour.
                 let _ = final_reply_tx.send(None);
+                // Codex round-2 MAJOR 2: prefer the typed user-actionable
+                // message over the raw LLM Display string. The agent
+                // loop's classifier (`HarnessError::classify_report` at
+                // loop_runner.rs:419) maps a raw `LlmError` to a
+                // user-friendly `HarnessError` variant whose
+                // `message()` says "top up or switch provider" /
+                // "check your API key" — but the loop currently bails
+                // with the ORIGINAL `eyre::Report` (still wrapping
+                // `LlmError`), so `error.to_string()` here would emit
+                // the raw `"API error (lane): provider quota exhausted
+                // — HTTP 403 ..."` instead. Downcast and re-classify
+                // so the SPA sees the actionable text.
+                let wire_message = classify_runtime_error_message(&error);
                 let error = json!({
                     "type": "error",
-                    "message": error.to_string(),
+                    "message": wire_message,
                 });
                 let _ = progress_tx_for_result.send(error.to_string()).await;
             }
@@ -16361,6 +16374,42 @@ async fn transition_to_terminal(
     };
     *state = TurnState::Terminal(reason);
     Some(TerminalTransition { reason, ack })
+}
+
+/// Translate an `eyre::Report` escaping the agent loop into the
+/// user-facing string the SPA renders inside a `runtime_error` envelope.
+///
+/// Codex round-2 MAJOR 2: the agent loop bails with the original
+/// `eyre::Report` (still wrapping `LlmError`), so a naive
+/// `error.to_string()` here would surface the operator-grade Display
+/// string ("API error (anthropic/...): provider quota exhausted —
+/// HTTP 403 ...") instead of the user-actionable
+/// `HarnessError::message()` ("Provider quota exhausted (anthropic/...)
+/// — top up or switch provider (...)").
+///
+/// Resolution ladder:
+///   1. If a `HarnessError` is already in the chain (future-proofing
+///      for loops that bail with a typed wrapper), use its
+///      `message()` directly.
+///   2. Else if an `LlmError` is in the chain, re-classify it via
+///      `HarnessError::from_llm_error` and emit that message.
+///   3. Fall through to the raw report Display string for non-LLM
+///      failures (tool execution errors, plugin protocol errors, etc.)
+///      where the report already carries the right text.
+fn classify_runtime_error_message(error: &eyre::Report) -> String {
+    use octos_agent::HarnessError;
+    use octos_llm::LlmError;
+    for cause in error.chain() {
+        if let Some(harness) = cause.downcast_ref::<HarnessError>() {
+            return harness.message().to_string();
+        }
+    }
+    for cause in error.chain() {
+        if let Some(llm) = cause.downcast_ref::<LlmError>() {
+            return HarnessError::from_llm_error(llm).message().to_string();
+        }
+    }
+    error.to_string()
 }
 
 /// Atomically transition state and emit exactly one terminal event. No-op if
@@ -29784,5 +29833,78 @@ ignore = []
             "failover reason should describe the upstream error — got {}",
             event.reason
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Codex round-2 MAJOR 2 regression: the runtime_error wire envelope
+    // must surface `HarnessError::message()` (user-actionable) rather
+    // than the raw `LlmError::Display` operator log line.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn runtime_error_envelope_surfaces_harness_message_for_quota() {
+        let llm = octos_llm::LlmError::from_status_with_label(
+            403,
+            r#"{"error":{"type":"insufficient_quota","message":"out of credits"}}"#,
+            "MiniMax-M2.5-highspeed",
+        );
+        let report: eyre::Report = llm.into();
+        let wire = super::classify_runtime_error_message(&report);
+        // The user-facing message should mention the provider lane and
+        // direct the operator to top up or switch.
+        assert!(
+            wire.contains("quota") || wire.contains("Quota"),
+            "wire message should call out quota exhaustion — got {wire}"
+        );
+        assert!(
+            wire.contains("top up") || wire.contains("switch provider"),
+            "wire message should be actionable — got {wire}"
+        );
+        assert!(
+            wire.contains("MiniMax-M2.5-highspeed"),
+            "wire message must identify the failing lane — got {wire}"
+        );
+    }
+
+    #[test]
+    fn runtime_error_envelope_surfaces_harness_message_for_auth() {
+        let llm = octos_llm::LlmError::from_status_with_label(401, "Unauthorized", "openai/gpt-4");
+        let report: eyre::Report = llm.into();
+        let wire = super::classify_runtime_error_message(&report);
+        assert!(
+            wire.contains("Authentication") || wire.contains("API key"),
+            "wire message should call out auth failure — got {wire}"
+        );
+        assert!(
+            wire.contains("openai/gpt-4"),
+            "wire message must identify the failing lane — got {wire}"
+        );
+    }
+
+    #[test]
+    fn runtime_error_envelope_surfaces_harness_message_for_bad_request() {
+        let llm = octos_llm::LlmError::from_status_with_label(
+            400,
+            "reasoning_content missing in assistant tool call message",
+            "deepseek/v4-pro",
+        );
+        let report: eyre::Report = llm.into();
+        let wire = super::classify_runtime_error_message(&report);
+        assert!(
+            wire.contains("rejected") || wire.contains("Provider"),
+            "wire message should describe a request rejection — got {wire}"
+        );
+        assert!(
+            wire.contains("deepseek/v4-pro"),
+            "wire message must identify the failing lane — got {wire}"
+        );
+    }
+
+    #[test]
+    fn runtime_error_envelope_falls_through_for_non_llm_errors() {
+        // A tool-execution failure surfaces unchanged.
+        let report: eyre::Report = eyre::eyre!("shell tool: command not found: foo");
+        let wire = super::classify_runtime_error_message(&report);
+        assert_eq!(wire, "shell tool: command not found: foo");
     }
 }

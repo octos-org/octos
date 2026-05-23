@@ -9,6 +9,7 @@ use octos_core::Message;
 use tracing::{debug, warn};
 
 use crate::config::ChatConfig;
+use crate::error::{LlmError, LlmErrorKind};
 use crate::provider::LlmProvider;
 use crate::types::{ChatResponse, ChatStream, ToolSpec};
 
@@ -62,7 +63,58 @@ impl RetryProvider {
     /// This is broader than `is_retryable_error`: auth failures (401/403)
     /// should not be retried on the *same* provider but should failover to
     /// a different provider which may have valid credentials.
+    ///
+    /// Codex round-2 BLOCKER fix: prior versions only string-matched the
+    /// legacy `"API error: <code>"` shape. The typed `LlmError::Display`
+    /// renders as `"API error (<provider>): <summary> — HTTP <code> ..."`
+    /// which the legacy match misses, so `FallbackProvider` and
+    /// `ProviderChain` failed to failover for Quota / Auth / Rate-Limited /
+    /// Server-Error classifications. We now downcast to `LlmError` first
+    /// and switch on `LlmErrorKind` directly; the legacy string-match
+    /// branch is preserved for non-typed callers and bare `eyre::eyre!`
+    /// reports.
     pub(crate) fn should_failover(error: &eyre::Report) -> bool {
+        // Typed-error path: walk the cause chain and switch on the
+        // structured kind. This is the canonical entry point — once a
+        // provider emits `LlmError::from_status_with_label`, this branch
+        // wins.
+        for cause in error.chain() {
+            if let Some(llm) = cause.downcast_ref::<LlmError>() {
+                return match &llm.kind {
+                    // Quota is a per-lane/provider credential failure
+                    // (like Auth): the *same* provider won't recover on
+                    // retry (won't be `is_retryable`), but another
+                    // configured lane may have a different key/account
+                    // with available quota. Codex round-3 BLOCKER fix:
+                    // previous version returned `false` here which
+                    // collapsed the entire chain when the primary lane
+                    // ran out of billing.
+                    LlmErrorKind::Quota => true,
+                    // The current provider's credentials are bad — try
+                    // the next lane which may have a valid key.
+                    LlmErrorKind::Authentication => true,
+                    LlmErrorKind::RateLimited { .. } => true,
+                    // BadRequest / InvalidRequest is failover-worthy:
+                    // e.g. deepseek's `reasoning_content` 400 may pass
+                    // through openai-compat lanes with different
+                    // validation rules.
+                    LlmErrorKind::InvalidRequest { .. } => true,
+                    LlmErrorKind::ServerError { status } => (500..600).contains(status),
+                    // Transient — failover gives us a chance to swap to
+                    // a healthy lane while the primary recovers.
+                    LlmErrorKind::Network
+                    | LlmErrorKind::Timeout
+                    | LlmErrorKind::StreamError
+                    | LlmErrorKind::ContextOverflow { .. } => true,
+                    // 4xx other / generic provider error — keep current
+                    // provider, the next one will hit the same wall.
+                    LlmErrorKind::ContentFiltered
+                    | LlmErrorKind::ModelNotFound { .. }
+                    | LlmErrorKind::Provider { .. } => false,
+                };
+            }
+        }
+
         // Auth errors and timeouts: don't retry same provider, but do failover
         for cause in error.chain() {
             if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
@@ -105,6 +157,15 @@ impl RetryProvider {
     /// (reqwest errors carry status). Falls back to keyword matching for
     /// non-HTTP errors like connection failures.
     pub(crate) fn is_retryable_error(error: &eyre::Report) -> bool {
+        // Typed-error path: the new provider error path constructs
+        // `LlmError` directly. Honor `is_retryable()` so RateLimited /
+        // ServerError / Network / Timeout / StreamError get the same
+        // backoff treatment they had under the legacy string match.
+        for cause in error.chain() {
+            if let Some(llm) = cause.downcast_ref::<LlmError>() {
+                return llm.is_retryable();
+            }
+        }
         // Check for reqwest errors with status codes (most reliable)
         for cause in error.chain() {
             if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
@@ -351,6 +412,101 @@ mod tests {
     fn test_should_not_failover_400() {
         let err = eyre::eyre!("API error: 400 - bad request");
         assert!(!RetryProvider::should_failover(&err));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Codex round-2 BLOCKER regression: pin each `LlmErrorKind` branch so
+    // the typed-error path stays in sync with `should_failover`. These
+    // tests would have caught the original bug where the typed Display
+    // string (`"API error (<provider>): … — HTTP 403 …"`) didn't match
+    // the legacy `"API error: 403"` string-match, so 403/quota/auth/etc.
+    // silently bypassed failover.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_should_failover_typed_quota() {
+        // Codex round-3 BLOCKER: Quota is a per-lane credential failure.
+        // Same-provider retry stays false (quota won't reset on retry),
+        // but failover to the next provider must be true — another
+        // configured lane may have a different key/account with quota.
+        let llm = LlmError::new(LlmErrorKind::Quota, "out of credits")
+            .with_provider("MiniMax-M2.5-highspeed");
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::should_failover(&err));
+        // But the same provider must NOT auto-retry the request.
+        assert!(!RetryProvider::is_retryable_error(&err));
+    }
+
+    #[test]
+    fn test_should_failover_typed_authentication() {
+        // Auth = next lane may have a valid key.
+        let llm = LlmError::new(LlmErrorKind::Authentication, "bad key");
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_failover_typed_rate_limited() {
+        let llm = LlmError::rate_limited(Some(30));
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_failover_typed_bad_request() {
+        // Provider rejected the request body — try a different provider
+        // whose validation rules may be looser (e.g. deepseek
+        // `reasoning_content` 400 → kimi works).
+        let llm = LlmError::new(
+            LlmErrorKind::InvalidRequest {
+                detail: "reasoning_content missing".into(),
+            },
+            "HTTP 400",
+        );
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_failover_typed_server_error_5xx() {
+        let llm = LlmError::new(LlmErrorKind::ServerError { status: 503 }, "service down");
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_should_not_failover_typed_content_filtered() {
+        let llm = LlmError::new(LlmErrorKind::ContentFiltered, "blocked");
+        let err: eyre::Report = llm.into();
+        assert!(!RetryProvider::should_failover(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_typed_rate_limited() {
+        let llm = LlmError::rate_limited(None);
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::is_retryable_error(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_typed_server_error() {
+        let llm = LlmError::new(LlmErrorKind::ServerError { status: 502 }, "bad gateway");
+        let err: eyre::Report = llm.into();
+        assert!(RetryProvider::is_retryable_error(&err));
+    }
+
+    #[test]
+    fn test_not_retryable_typed_auth() {
+        let llm = LlmError::auth("bad key");
+        let err: eyre::Report = llm.into();
+        assert!(!RetryProvider::is_retryable_error(&err));
+    }
+
+    #[test]
+    fn test_not_retryable_typed_quota() {
+        let llm = LlmError::new(LlmErrorKind::Quota, "out of credits");
+        let err: eyre::Report = llm.into();
+        assert!(!RetryProvider::is_retryable_error(&err));
     }
 
     #[test]

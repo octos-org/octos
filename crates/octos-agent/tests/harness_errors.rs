@@ -219,6 +219,7 @@ fn should_count_errors_per_variant_in_metrics() {
         "rate_limited",
         "context_overflow",
         "authentication",
+        "quota",
         "invalid_request",
         "content_filtered",
         "provider_unavailable",
@@ -237,6 +238,72 @@ fn should_count_errors_per_variant_in_metrics() {
             "metric label variant '{name}' must be snake_case ASCII"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Phase 3 — Provider HTTP errors classify to user-friendly variants
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn should_classify_403_quota_as_quota_with_provider_label() {
+    // The exact dspfac symptom (mini1): MiniMax via Wisemodel returned a
+    // 403 with `no_active_wisemodel_package` / `insufficient_quota`. This
+    // used to surface as `variant=internal recovery=bug` because the
+    // provider used eyre::bail!() which loses the LlmError type — now it
+    // routes through LlmError::from_status_with_label and the harness
+    // emits a user-actionable `variant=quota recovery=fail_fast`.
+    let body = r#"{"error":{"code":"no_active_wisemodel_package","message":"没有有效的 Wisemodel 资源包，请购买后再使用","type":"insufficient_quota"}}"#;
+    let err = LlmError::from_status_with_label(403, body, "MiniMax-M2.5-highspeed");
+    let classified = HarnessError::from(err);
+    assert!(
+        matches!(classified, HarnessError::Quota { .. }),
+        "expected Quota, got {classified:?}"
+    );
+    assert_eq!(classified.variant_name(), "quota");
+    assert_eq!(classified.recovery_hint(), RecoveryHint::FailFast);
+    assert!(classified.message().contains("MiniMax-M2.5-highspeed"));
+    assert!(classified.message().contains("top up or switch provider"));
+}
+
+#[test]
+fn should_classify_403_without_quota_marker_as_auth_with_provider_label() {
+    let err = LlmError::from_status_with_label(403, "Forbidden", "openai/gpt-4");
+    let classified = HarnessError::from(err);
+    assert!(matches!(classified, HarnessError::Authentication { .. }));
+    assert!(classified.message().contains("openai/gpt-4"));
+    assert!(classified.message().contains("check your API key"));
+}
+
+#[test]
+fn should_preserve_quota_classification_when_routed_through_eyre_report() {
+    // The full provider error path: provider builds an LlmError, returns it
+    // as `Err(llm_err.into())`. The agent loop boundary calls
+    // `classify_report(&report, ...)` which must downcast and find Quota.
+    let body = r#"{"error":"quota_exceeded","detail":"out of credits"}"#;
+    let llm = LlmError::from_status_with_label(403, body, "kimi/k2");
+    let report: eyre::Report = llm.into();
+    let classified = HarnessError::classify_report(&report, None);
+    assert_eq!(classified.variant_name(), "quota");
+    assert_ne!(
+        classified.recovery_hint(),
+        RecoveryHint::Bug,
+        "quota must not surface as recovery=bug"
+    );
+}
+
+#[test]
+fn should_emit_quota_event_with_user_facing_message() {
+    let body = r#"{"type":"insufficient_quota"}"#;
+    let llm = LlmError::from_status_with_label(403, body, "lane-A");
+    let classified: HarnessError = llm.into();
+    let event = classified.to_event("s", "t", None, None);
+    let HarnessEventPayload::Error { data } = event.payload else {
+        panic!("expected Error payload");
+    };
+    assert_eq!(data.variant, "quota");
+    assert_eq!(data.recovery, "fail_fast");
+    assert!(data.message.contains("lane-A"));
+    assert!(data.message.contains("top up or switch provider"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

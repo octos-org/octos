@@ -343,11 +343,26 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "API error ({}): {status} - {}",
-                self.model,
-                crate::provider::truncate_error_body(&body)
-            );
+            // Route through LlmError so the loop-boundary classifier
+            // (`HarnessError::classify_report`) can downcast and pick the
+            // correct user-facing variant (auth / quota / bad-request /
+            // rate-limited / server) instead of falling through to
+            // Internal/Bug. The truncated body is preserved so the
+            // operator sees the provider's actual error payload.
+            //
+            // Codex round-2 MINOR: thread the provider_label so the
+            // operator sees e.g. "minimax/MiniMax-M2.5-highspeed"
+            // instead of just "MiniMax-M2.5-highspeed". This is the
+            // lane label the AdaptiveRouter and failover ledger use,
+            // so the wire envelope can be cross-referenced with the
+            // router events.
+            let body = crate::provider::truncate_error_body(&body);
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                format!("{}/{}", self.provider_label, self.model),
+            )
+            .into());
         }
 
         let api_response: OpenAIResponse = response
@@ -449,11 +464,15 @@ impl LlmProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "API error ({}): {status} - {}",
-                self.model,
-                crate::provider::truncate_error_body(&text)
-            );
+            let body = crate::provider::truncate_error_body(&text);
+            // Codex round-2 MINOR: see chat() — thread provider_label so
+            // the streaming error path identifies the lane the same way.
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                format!("{}/{}", self.provider_label, self.model),
+            )
+            .into());
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);

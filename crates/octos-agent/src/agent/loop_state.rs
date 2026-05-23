@@ -52,6 +52,16 @@ pub const OCTOS_LOOP_RETRY_TOTAL: &str = "octos_loop_retry_total";
 const DEFAULT_RATE_LIMIT_LIMIT: u32 = 5;
 const DEFAULT_CONTEXT_OVERFLOW_LIMIT: u32 = 2;
 const DEFAULT_AUTHENTICATION_LIMIT: u32 = 1;
+/// Quota errors are operator-action — auto-retry will keep failing until
+/// the operator tops up. Cap at 1 like Authentication.
+const DEFAULT_QUOTA_LIMIT: u32 = 1;
+
+/// `#[serde(default = "...")]` helper for `LoopRetryLimits::quota`. Lets
+/// legacy retry-state JSON (pre-quota field) deserialize cleanly with the
+/// canonical default instead of `0`, which would disable the bucket.
+fn default_quota_limit() -> u32 {
+    DEFAULT_QUOTA_LIMIT
+}
 const DEFAULT_INVALID_REQUEST_LIMIT: u32 = 2;
 const DEFAULT_CONTENT_FILTERED_LIMIT: u32 = 1;
 const DEFAULT_PROVIDER_UNAVAILABLE_LIMIT: u32 = 4;
@@ -72,6 +82,10 @@ pub struct LoopRetryLimits {
     pub rate_limited: u32,
     pub context_overflow: u32,
     pub authentication: u32,
+    /// Added in codex round-3 (Quota variant). `serde(default)` keeps
+    /// legacy retry-state sidecar JSON (pre-quota) deserializable.
+    #[serde(default = "default_quota_limit")]
+    pub quota: u32,
     pub invalid_request: u32,
     pub content_filtered: u32,
     pub provider_unavailable: u32,
@@ -92,6 +106,7 @@ impl Default for LoopRetryLimits {
             rate_limited: DEFAULT_RATE_LIMIT_LIMIT,
             context_overflow: DEFAULT_CONTEXT_OVERFLOW_LIMIT,
             authentication: DEFAULT_AUTHENTICATION_LIMIT,
+            quota: DEFAULT_QUOTA_LIMIT,
             invalid_request: DEFAULT_INVALID_REQUEST_LIMIT,
             content_filtered: DEFAULT_CONTENT_FILTERED_LIMIT,
             provider_unavailable: DEFAULT_PROVIDER_UNAVAILABLE_LIMIT,
@@ -172,6 +187,11 @@ pub struct LoopRetryCounters {
     pub rate_limited: u32,
     pub context_overflow: u32,
     pub authentication: u32,
+    /// Added in codex round-3 (Quota variant). `serde(default)` keeps
+    /// legacy retry-state sidecar JSON (pre-quota) deserializable; a
+    /// missing field deserializes to `0`.
+    #[serde(default)]
+    pub quota: u32,
     pub invalid_request: u32,
     pub content_filtered: u32,
     pub provider_unavailable: u32,
@@ -355,6 +375,7 @@ impl LoopRetryState {
                 &mut self.counters.authentication,
                 self.limits.authentication,
             ),
+            HarnessError::Quota { .. } => (&mut self.counters.quota, self.limits.quota),
             HarnessError::InvalidRequest { .. } => (
                 &mut self.counters.invalid_request,
                 self.limits.invalid_request,
@@ -542,6 +563,67 @@ mod tests {
         });
         assert_eq!(state.observe_shell_spiral(), LoopDecision::Escalate);
         assert_eq!(state.observe_shell_spiral(), LoopDecision::Exhausted);
+    }
+
+    #[test]
+    fn legacy_retry_state_json_without_quota_field_deserializes() {
+        // Codex round-6: `LoopRetryLimits` and `LoopRetryCounters` gained a
+        // `quota` field in round-3. Without `#[serde(default)]`, retry-state
+        // sidecar JSON written by pre-round-3 builds would fail to
+        // deserialize, and `load_retry_state` would silently reset every
+        // counter to zero. This test pins the backward-compat behavior.
+        let legacy_json = r#"{
+            "counters": {
+                "rate_limited": 3,
+                "context_overflow": 1,
+                "authentication": 0,
+                "invalid_request": 0,
+                "content_filtered": 0,
+                "provider_unavailable": 2,
+                "network": 1,
+                "timeout": 0,
+                "tool_execution": 0,
+                "plugin_spawn": 0,
+                "plugin_timeout": 0,
+                "plugin_protocol": 0,
+                "delegate_depth_exceeded": 0,
+                "internal": 0,
+                "shell_spiral": 0
+            },
+            "limits": {
+                "rate_limited": 5,
+                "context_overflow": 2,
+                "authentication": 1,
+                "invalid_request": 2,
+                "content_filtered": 1,
+                "provider_unavailable": 4,
+                "network": 4,
+                "timeout": 3,
+                "tool_execution": 5,
+                "plugin_spawn": 2,
+                "plugin_timeout": 3,
+                "plugin_protocol": 2,
+                "delegate_depth_exceeded": 1,
+                "internal": 1,
+                "shell_spiral": 1
+            },
+            "productive_tool_calls_since_last_grace": 4,
+            "grace_calls_fired": 0
+        }"#;
+
+        let state: LoopRetryState =
+            serde_json::from_str(legacy_json).expect("legacy JSON should deserialize");
+
+        // Existing counters preserved.
+        assert_eq!(state.counters.rate_limited, 3);
+        assert_eq!(state.counters.provider_unavailable, 2);
+        // Missing quota counter defaults to 0 (a clean Default::default()).
+        assert_eq!(state.counters.quota, 0);
+        // Missing quota limit defaults to the canonical DEFAULT_QUOTA_LIMIT
+        // (1) — not 0, which would disable the bucket entirely.
+        assert_eq!(state.limits.quota, DEFAULT_QUOTA_LIMIT);
+        // Productive history preserved so grace-call gating survives.
+        assert_eq!(state.productive_tool_calls_since_last_grace, 4);
     }
 
     #[test]

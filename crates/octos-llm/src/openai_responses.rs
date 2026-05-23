@@ -124,10 +124,13 @@ impl LlmProvider for OpenAIResponsesProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "OpenAI Responses API error: {status} - {}",
-                crate::provider::truncate_error_body(&body)
-            );
+            let body = crate::provider::truncate_error_body(&body);
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                format!("openai-responses/{}", self.model),
+            )
+            .into());
         }
 
         let api_response: ResponsesApiResponse = response
@@ -163,10 +166,13 @@ impl LlmProvider for OpenAIResponsesProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            eyre::bail!(
-                "OpenAI Responses API error: {status} - {}",
-                crate::provider::truncate_error_body(&text)
-            );
+            let body = crate::provider::truncate_error_body(&text);
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &body,
+                format!("openai-responses/{}", self.model),
+            )
+            .into());
         }
 
         let sse_stream = crate::sse::parse_sse_response(response);
