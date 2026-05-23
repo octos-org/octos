@@ -734,7 +734,10 @@ impl Handler for CodergenHandler {
         // policy must be present — the workspace is how the runner
         // resolves declared artifact names to glob patterns.
         if let Some(compaction_policy) = self.compaction_policy.clone() {
-            let compaction_provider = self.compaction_llm_provider.clone().unwrap_or(provider);
+            let compaction_provider = self
+                .compaction_llm_provider
+                .clone()
+                .unwrap_or_else(|| provider.clone());
             let runner = octos_agent::compaction::CompactionRunner::with_provider(
                 compaction_policy,
                 compaction_provider,
@@ -750,7 +753,8 @@ impl Handler for CodergenHandler {
             }
         }
 
-        let instruction = compact_pipeline_instruction(&ctx.input, node.context_window, max_tokens);
+        let instruction =
+            compact_pipeline_instruction(&ctx.input, Some(provider.context_window()), max_tokens);
         let task = Task::new(
             TaskKind::Code {
                 instruction,
@@ -1010,7 +1014,10 @@ fn compact_pipeline_instruction(
     let reserved = max_output_tokens
         .unwrap_or(DEFAULT_PIPELINE_MAX_OUTPUT_TOKENS)
         .saturating_add(PIPELINE_INPUT_COMPACTION_RESERVE_TOKENS);
-    let budget = context_window.saturating_sub(reserved).max(512);
+    let half_context = context_window / 2;
+    let budget = half_context
+        .min(context_window.saturating_sub(reserved))
+        .max(512);
     if octos_llm::context::estimate_tokens(input) <= budget {
         return input.to_string();
     }
@@ -1021,7 +1028,7 @@ fn compact_pipeline_instruction(
         return input.to_string();
     }
 
-    let head_chars = max_chars / 2;
+    let head_chars = max_chars.saturating_mul(7) / 10;
     let tail_chars = max_chars.saturating_sub(head_chars);
     let head: String = input.chars().take(head_chars).collect();
     let tail: String = input

@@ -27,6 +27,8 @@ use crate::session::SessionLimits;
 use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
 
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
+const MAX_TOKENS_CONTINUATION_LIMIT: usize = 2;
+const MAX_TOKENS_CONTINUATION_PROMPT: &str = "Your output was truncated at the token limit. Continue directly from where you stopped. Do not repeat or summarize what you already wrote.";
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
 
 /// Audit Gap-8 helper: consult the workspace-contract layer at EndTurn time
@@ -1331,6 +1333,8 @@ impl Agent {
             let mut files_modified = Vec::new();
             let mut files_to_send = Vec::new();
             let mut turn = LoopTurnState::new(task_start);
+            let mut max_token_continuations = 0usize;
+            let mut max_token_fragments = Vec::new();
             // M6.2: per-run retry-bucket state machine. Same instance lives
             // across all iterations of the task loop so bucket counters
             // accumulate the way operators expect.
@@ -1447,8 +1451,10 @@ impl Agent {
 
                 match response.stop_reason {
                     StopReason::EndTurn | StopReason::StopSequence => {
+                        let final_response =
+                            response_with_max_token_fragments(&response, &max_token_fragments);
                         if self.config.save_episodes {
-                            let summary = response.content.clone().unwrap_or_default();
+                            let summary = final_response.content.clone().unwrap_or_default();
                             let summary_truncated =
                                 octos_core::truncated_utf8(&summary, 500, "...");
 
@@ -1495,7 +1501,7 @@ impl Agent {
                             }
                         }
 
-                        self.emit_cost_update(turn.total_usage(), &response);
+                        self.emit_cost_update(turn.total_usage(), &final_response);
 
                         // Audit Gap-8: auto-fire `check_workspace_contract`
                         // on Completion. The LLM-callable wrapper stays for
@@ -1550,7 +1556,7 @@ impl Agent {
                             "task completed"
                         );
                         let mut result = self.build_result(
-                            &response,
+                            &final_response,
                             turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
@@ -1595,14 +1601,33 @@ impl Agent {
                         }
                     }
                     StopReason::MaxTokens => {
-                        self.emit_cost_update(turn.total_usage(), &response);
+                        if max_token_continuations < MAX_TOKENS_CONTINUATION_LIMIT {
+                            if let Some(content) = response.content.clone() {
+                                if !content.trim().is_empty() {
+                                    max_token_fragments.push(content);
+                                }
+                            }
+                            push_max_tokens_continuation(&mut messages, &response);
+                            max_token_continuations += 1;
+                            warn!(
+                                iteration,
+                                continuation = max_token_continuations,
+                                max = MAX_TOKENS_CONTINUATION_LIMIT,
+                                "task output hit max_tokens; continuing in the same agent loop"
+                            );
+                            continue;
+                        }
+
+                        let final_response =
+                            response_with_max_token_fragments(&response, &max_token_fragments);
+                        self.emit_cost_update(turn.total_usage(), &final_response);
                         self.reporter().report(ProgressEvent::TaskCompleted {
                             success: false,
                             iterations: iteration,
                             duration: task_start.elapsed(),
                         });
                         return Ok(self.build_result(
-                            &response,
+                            &final_response,
                             turn.total_usage().clone(),
                             files_modified,
                             files_to_send,
@@ -2231,6 +2256,36 @@ fn strip_success_exit_suffix(content: &str) -> String {
         .to_string()
 }
 
+fn push_max_tokens_continuation(messages: &mut Vec<Message>, response: &ChatResponse) {
+    let mut assistant = Message::assistant(response.content.clone().unwrap_or_default());
+    assistant.reasoning_content = response.reasoning_content.clone();
+    messages.push(assistant);
+    messages.push(Message::user(MAX_TOKENS_CONTINUATION_PROMPT));
+}
+
+fn response_with_max_token_fragments(
+    response: &ChatResponse,
+    fragments: &[String],
+) -> ChatResponse {
+    if fragments.is_empty() {
+        return response.clone();
+    }
+
+    let mut combined_parts: Vec<&str> = fragments
+        .iter()
+        .map(String::as_str)
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    let final_content = response.content.as_deref().unwrap_or_default();
+    if !final_content.trim().is_empty() {
+        combined_parts.push(final_content);
+    }
+
+    let mut combined = response.clone();
+    combined.content = Some(combined_parts.join("\n"));
+    combined
+}
+
 fn shell_retry_limit_message(content: &str) -> String {
     let latest_output =
         octos_core::truncated_utf8(content.trim(), 1200, "\n... (shell output truncated)");
@@ -2344,6 +2399,67 @@ mod tests {
     struct RecordingToolThenEndProvider {
         calls: AtomicUsize,
         observed_prompts: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    struct MaxTokensThenEndProvider {
+        calls: AtomicUsize,
+        observed_prompts: Arc<StdMutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MaxTokensThenEndProvider {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.observed_prompts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(
+                    messages
+                        .iter()
+                        .map(|message| message.content.clone())
+                        .collect(),
+                );
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: Some("part one".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::MaxTokens,
+                    usage: LlmTokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 10,
+                        ..Default::default()
+                    },
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("part two".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage {
+                        input_tokens: 4,
+                        output_tokens: 11,
+                        ..Default::default()
+                    },
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
     }
 
     #[async_trait]
@@ -2749,6 +2865,57 @@ mod tests {
         assert!(result.success);
         assert!(result.files_modified.is_empty());
         assert_eq!(result.files_to_send, vec![file_path]);
+    }
+
+    #[tokio::test]
+    async fn run_task_continues_after_max_tokens_in_same_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let observed_prompts = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(MaxTokensThenEndProvider {
+            calls: AtomicUsize::new(0),
+            observed_prompts: Arc::clone(&observed_prompts),
+        });
+        let provider_for_agent: Arc<dyn LlmProvider> = provider.clone();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("max-tokens-test"),
+            provider_for_agent,
+            tools,
+            memory,
+        );
+        let task = Task::new(
+            TaskKind::Code {
+                instruction: "Write a long report".to_string(),
+                files: vec![],
+            },
+            TaskContext {
+                working_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let result = agent.run_task(&task).await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(
+            result.output,
+            "part one
+part two"
+        );
+        assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(result.token_usage.input_tokens, 7);
+        assert_eq!(result.token_usage.output_tokens, 21);
+        let prompts = observed_prompts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].iter().any(|content| content == "part one"));
+        assert!(
+            prompts[1]
+                .iter()
+                .any(|content| content.contains("Continue directly from where you stopped"))
+        );
     }
 
     #[tokio::test]
