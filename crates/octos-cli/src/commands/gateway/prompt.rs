@@ -252,36 +252,110 @@ mod tests {
 
     #[test]
     fn should_strip_voice_probe_from_generation_surface() {
-        // Regression guard for NEW-05 round-3: the old workflow that
-        // probed `podcast_voices` BEFORE `podcast_generate` for episode
-        // requests must not return. The voice-probe phrasings that
-        // caused deepseek-v4-pro to stall are:
-        //
-        // - "follow up with `podcast_generate`" (round-2 fix)
-        // - "do NOT stop after the voice list" (round-2 fix)
-        // - "Podcast voice list only" dedicated bullet (round-2 P2)
-        //
-        // All three were attempts to coerce the model THROUGH
-        // `podcast_voices`. The round-3 fix removes that route
-        // entirely from the generation surface.
+        // Regression guard for NEW-05 round-3: the round-2 coercion
+        // phrasings that tried to push the model THROUGH
+        // `podcast_voices` for an episode-generation request must not
+        // return. The voice-list-only bullet itself is preserved
+        // (codex P2 round-3 review: explicit "list podcast voices"
+        // requests still need a home), but the generation path no
+        // longer routes through it.
         assert!(
             !PROMPT.contains("you MUST immediately follow up with `podcast_generate`"),
             "the round-2 follow-up rule must not return — round-3 \
-             removes podcast_voices from the generation surface"
+             removes the podcast_voices coercion from the generation \
+             surface"
         );
         assert!(
             !PROMPT.contains("do NOT stop after the voice list"),
             "the round-2 'do NOT stop after voice list' nudge must \
              not return — round-3 removes the voice-probe step \
-             entirely"
+             entirely from the generation path"
+        );
+        // The Podcast generation bullet must NOT include bare `播客`
+        // or `podcast` as triggers any more — those swallowed
+        // voice-list-only asks like `list podcast voices` /
+        // `播客有哪些声音`. codex P2 round-3 review caught this.
+        let gen_bullet = PROMPT
+            .lines()
+            .find(|l| l.starts_with("- Podcast generation"))
+            .expect("Podcast generation bullet missing");
+        assert!(
+            !gen_bullet.starts_with("- Podcast generation (`播客`,"),
+            "Podcast generation triggers must not lead with bare \
+             `播客` — it overlaps with voice-list-only requests \
+             (codex P2 round-3 review)"
         );
         assert!(
-            !PROMPT.contains("Podcast voice list only"),
-            "the round-2 'Podcast voice list only' bullet must not \
-             return — round-3 removes voice-probe routing from the \
-             generation surface; if users explicitly ask to list \
-             voices, the skill can still be invoked directly but the \
-             prompt should not advertise it as a separate route"
+            !gen_bullet.contains("`播客`, `podcast`,"),
+            "Podcast generation triggers must not include bare \
+             `播客` / `podcast` — those swallow voice-list-only \
+             asks (codex P2 round-3 review)"
+        );
+    }
+
+    #[test]
+    fn should_preserve_voice_list_only_route_for_explicit_listing() {
+        // codex P2 round-3 review: removing the voice-list-only
+        // bullet caused explicit "list podcast voices" /
+        // `播客有哪些声音` requests to be misrouted into
+        // podcast_generate. The fix is to keep the dedicated bullet
+        // (with the Override carve-out) ahead of the generation
+        // bullet. It is no longer load-bearing for the generation
+        // flow — it just serves explicit listing intent.
+        assert!(
+            PROMPT.contains("Podcast voice list only"),
+            "explicit voice-list requests (`list podcast voices`, \
+             `播客有哪些声音`) need a dedicated route or they get \
+             misrouted into podcast_generate (codex P2 round-3 \
+             review)"
+        );
+        let voice_list_idx = PROMPT
+            .find("Podcast voice list only")
+            .expect("voice-list-only bullet missing");
+        let generation_idx = PROMPT
+            .find("Podcast generation")
+            .expect("podcast generation bullet missing");
+        assert!(
+            voice_list_idx < generation_idx,
+            "the voice-list-only bullet must appear BEFORE the \
+             podcast-generation bullet so explicit listing requests \
+             match first"
+        );
+        assert!(
+            PROMPT.contains("fall through to the Podcast generation bullet below"),
+            "voice-list-only bullet must explicitly fall through to \
+             the Podcast generation bullet when the message asks to \
+             make/generate a podcast (codex P2 round-3 carve-out)"
+        );
+    }
+
+    #[test]
+    fn should_instruct_model_to_draft_script_inline() {
+        // codex P1 round-3 review: the original round-3 prompt told
+        // the model to call `podcast_generate` "with topic/duration",
+        // but the tool actually requires `script` or `script_path`.
+        // The prompt must now tell the model to draft a markdown
+        // script inline and pass it as the `script` argument.
+        assert!(
+            PROMPT.contains("draft a full markdown dialogue script"),
+            "prompt must tell the model to draft a markdown dialogue \
+             script inline — podcast_generate requires script or \
+             script_path, not topic/duration (codex P1 round-3 \
+             review)"
+        );
+        assert!(
+            PROMPT.contains("`script` argument"),
+            "prompt must name the `script` argument explicitly so \
+             the model knows which parameter receives the markdown \
+             (codex P1 round-3 review)"
+        );
+        // The round-3 draft incorrectly said "with topic/duration".
+        // That phrasing must not return.
+        assert!(
+            !PROMPT.contains("`podcast_generate` with topic/duration"),
+            "the buggy 'with topic/duration' phrasing must not \
+             return — podcast_generate does not accept those \
+             arguments (codex P1 round-3 regression guard)"
         );
     }
 
