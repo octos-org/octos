@@ -242,25 +242,46 @@ mod tests {
 
     #[test]
     fn should_preserve_voice_list_only_podcast_requests() {
-        // codex P2 follow-up on NEW-05: the follow-up rule must NOT
-        // over-apply to legitimate listing requests. If the user only
-        // wants to see available podcast voices, returning the voice
-        // list IS the right answer — the model should not silently
-        // start generating a podcast.
+        // codex P2 follow-up on NEW-05 (round 2): the original carve-out
+        // still let voice-list-only prompts fall through to the generic
+        // podcast bullet's "spawn podcast_generate" instruction because
+        // the trigger word `podcast` was shared between both cases.
+        // Codex's correction was to SPLIT the route so a dedicated bullet
+        // matches voice-list-only triggers BEFORE the generation bullet
+        // can match. The model should call `podcast_voices` and stop.
         assert!(
-            PROMPT.contains(
-                "If the user only asked to list/see available podcast voices"
-            ),
-            "prompt must carve out the voice-list-only case so the \
-             model is allowed to stop after `podcast_voices` when the \
-             user asked for the list, not a generated podcast (codex \
-             P2 follow-up to NEW-05)"
+            PROMPT.contains("Podcast voice list only"),
+            "prompt must have a dedicated 'Podcast voice list only' \
+             route that matches BEFORE the generic generation bullet \
+             so listing requests do not fall through to \
+             podcast_generate (codex P2 follow-up to NEW-05)"
         );
         assert!(
-            PROMPT.contains("not just list voices"),
-            "prompt must explicitly qualify the follow-up rule with \
-             'not just list voices' so the listing case is distinct \
-             from generation (codex P2 follow-up to NEW-05)"
+            PROMPT.contains(
+                "call `podcast_voices` and return that list as the final answer"
+            ),
+            "prompt must instruct the model to call `podcast_voices` \
+             and return the list as the final answer for voice-list-only \
+             prompts (codex P2 follow-up to NEW-05)"
+        );
+        assert!(
+            PROMPT.contains("Do NOT spawn `podcast_generate`"),
+            "prompt must explicitly forbid spawning `podcast_generate` \
+             on a voice-list-only request (codex P2 follow-up to NEW-05)"
+        );
+        // The voice-list-only bullet must appear BEFORE the generation
+        // bullet so the model matches it first.
+        let voice_list_idx = PROMPT
+            .find("Podcast voice list only")
+            .expect("voice-list-only bullet missing");
+        let generation_idx = PROMPT
+            .find("Podcast generation")
+            .expect("podcast generation bullet missing");
+        assert!(
+            voice_list_idx < generation_idx,
+            "the voice-list-only bullet must appear BEFORE the \
+             podcast-generation bullet so it matches first (codex P2 \
+             follow-up to NEW-05)"
         );
     }
 
