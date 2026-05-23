@@ -18,6 +18,9 @@ use octos_agent::tools::{TOOL_CTX, Tool, ToolRegistry};
 use crate::condition;
 use crate::graph::{HandlerKind, NodeOutcome, OutcomeStatus, PipelineNode};
 
+const DEFAULT_PIPELINE_MAX_OUTPUT_TOKENS: u32 = 4096;
+const PIPELINE_INPUT_COMPACTION_RESERVE_TOKENS: u32 = 1024;
+
 /// Cached snapshot of plugin tools loaded from `plugin_dirs`.
 ///
 /// Computed once per `CodergenHandler` instance and shared across every
@@ -747,9 +750,10 @@ impl Handler for CodergenHandler {
             }
         }
 
+        let instruction = compact_pipeline_instruction(&ctx.input, node.context_window, max_tokens);
         let task = Task::new(
             TaskKind::Code {
-                instruction: ctx.input.clone(),
+                instruction,
                 files: vec![],
             },
             TaskContext {
@@ -995,6 +999,41 @@ impl Handler for NoopHandler {
     }
 }
 
+fn compact_pipeline_instruction(
+    input: &str,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> String {
+    let Some(context_window) = context_window else {
+        return input.to_string();
+    };
+    let reserved = max_output_tokens
+        .unwrap_or(DEFAULT_PIPELINE_MAX_OUTPUT_TOKENS)
+        .saturating_add(PIPELINE_INPUT_COMPACTION_RESERVE_TOKENS);
+    let budget = context_window.saturating_sub(reserved).max(512);
+    if octos_llm::context::estimate_tokens(input) <= budget {
+        return input.to_string();
+    }
+
+    let max_chars = (budget as usize).saturating_mul(4).max(256);
+    let char_count = input.chars().count();
+    if char_count <= max_chars {
+        return input.to_string();
+    }
+
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head: String = input.chars().take(head_chars).collect();
+    let tail: String = input
+        .chars()
+        .skip(char_count.saturating_sub(tail_chars))
+        .collect();
+    format!(
+        "{head}\n\n[... pipeline input compacted: omitted approximately {} tokens ...]\n\n{tail}",
+        octos_llm::context::estimate_tokens(input).saturating_sub(budget)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,6 +1175,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1204,6 +1244,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1256,6 +1297,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1318,6 +1360,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1380,6 +1423,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1440,6 +1484,7 @@ mod tests {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: vec![],
         };
 
@@ -1480,5 +1525,16 @@ mod tests {
             e,
             ProgressEvent::ToolProgress { name, .. } if name == "run_pipeline"
         )));
+    }
+
+    #[test]
+    fn compact_pipeline_instruction_keeps_head_and_tail() {
+        let input = format!("HEAD:{}:TAIL", " middle".repeat(2_000));
+        let compacted = super::compact_pipeline_instruction(&input, Some(1_024), Some(256));
+
+        assert!(compacted.starts_with("HEAD:"));
+        assert!(compacted.ends_with(":TAIL"));
+        assert!(compacted.contains("pipeline input compacted"));
+        assert!(compacted.len() < input.len());
     }
 }

@@ -252,6 +252,7 @@ mod default_priority {
 
 /// Minimum interval between message edits (rate limit protection).
 const EDIT_THROTTLE: Duration = Duration::from_millis(1000);
+const MAX_VISIBLE_STATUS_LAYERS: usize = 3;
 
 /// Composable status message system for messaging channels.
 ///
@@ -783,6 +784,9 @@ fn compose_message(
     let mut lines: Vec<String> = Vec::new();
 
     for layer in layers {
+        if lines.len() >= MAX_VISIBLE_STATUS_LAYERS {
+            break;
+        }
         // Skip disabled layers
         if layer.id == layer_id::PROVIDER && !provider_visible {
             continue;
@@ -1006,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn should_include_all_layers_in_order() {
+    fn should_cap_default_layers_in_priority_order() {
         let config = UserStatusConfig::default();
         let layers = build_layers(&config);
 
@@ -1028,12 +1032,14 @@ mod tests {
 
         let composed = compose_message(&layers, true, true, None);
         let lines: Vec<&str> = composed.lines().collect();
-        // Priority order: greeting(10), operation(20), retry(25), provider(30), metrics(40)
-        assert_eq!(lines[0], "👋 Hey!");
-        assert_eq!(lines[1], "✦ Pondering...");
-        assert_eq!(lines[2], "⟳ Switching to deepseek...");
-        assert_eq!(lines[3], "via moonshot");
-        assert_eq!(lines[4], "5s");
+        // Priority order: greeting(10), operation(20), retry(25).
+        // Provider and metrics stay suppressed once the default cap is reached.
+        assert_eq!(
+            lines,
+            vec!["👋 Hey!", "✦ Pondering...", "⟳ Switching to deepseek..."]
+        );
+        assert!(!composed.contains("via moonshot"));
+        assert!(!composed.contains("5s"));
     }
 
     #[test]

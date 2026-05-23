@@ -5213,6 +5213,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_search_live_catalog_respects_visibility_filters() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+
+        let search_tool = registry
+            .get_tool("tool_search")
+            .expect("tool_search registered by with_builtins");
+
+        registry.defer(["bash".to_string()]);
+        let result = search_tool
+            .execute(&serde_json::json!({ "query": "bash" }))
+            .await
+            .expect("tool_search ok");
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        let names: Vec<_> = payload["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"bash"),
+            "deferred tools must stay out of tool_search: {names:?}"
+        );
+
+        registry.activate("bash");
+        registry.set_provider_policy(crate::tools::ToolPolicy {
+            deny: vec!["bash".to_string()],
+            ..Default::default()
+        });
+        let result = search_tool
+            .execute(&serde_json::json!({ "query": "bash" }))
+            .await
+            .expect("tool_search ok");
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        let names: Vec<_> = payload["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"bash"),
+            "provider-denied tools must stay out of tool_search: {names:?}"
+        );
+
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        let search_tool = registry
+            .get_tool("tool_search")
+            .expect("tool_search registered by with_builtins");
+        registry.set_context_filter(vec!["web".to_string()]);
+        let result = search_tool
+            .execute(&serde_json::json!({ "query": "apply_patch" }))
+            .await
+            .expect("tool_search ok");
+        let payload: Value = serde_json::from_str(&result.output).expect("payload");
+        let names: Vec<_> = payload["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|m| m["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"apply_patch"),
+            "context-hidden tools must stay out of tool_search: {names:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn builtins_expose_p1_codex_tool_names() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = ToolRegistry::with_builtins(temp.path());

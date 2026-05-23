@@ -2553,7 +2553,7 @@ impl PipelineExecutor {
             }
 
             // Handle errors
-            if outcome.status == OutcomeStatus::Error {
+            if outcome.status == OutcomeStatus::Error && !node.continue_on_error {
                 warn!(
                     node = %node.id,
                     "node returned error, stopping pipeline"
@@ -2566,6 +2566,37 @@ impl PipelineExecutor {
                     files_modified: vec![],
                     node_costs: node_costs.clone(),
                 });
+            }
+            if outcome.status == OutcomeStatus::Error && node.continue_on_error {
+                warn!(
+                    node = %node.id,
+                    "node returned error, continuing because continue_on_error=true"
+                );
+            }
+
+            if let Some(max_total_tokens) = graph.max_total_tokens {
+                let spent = total_tokens
+                    .input_tokens
+                    .saturating_add(total_tokens.output_tokens);
+                if spent >= max_total_tokens {
+                    warn!(
+                        pipeline = %graph.id,
+                        spent,
+                        max_total_tokens,
+                        "pipeline token budget exhausted"
+                    );
+                    return Ok(PipelineResult {
+                        output: format!(
+                            "Pipeline token budget exhausted after node '{}': spent {spent}/{max_total_tokens} tokens",
+                            node.id
+                        ),
+                        success: false,
+                        token_usage: total_tokens,
+                        node_summaries: summaries,
+                        files_modified: vec![],
+                        node_costs: node_costs.clone(),
+                    });
+                }
             }
 
             // Select next edge

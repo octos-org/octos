@@ -1642,11 +1642,21 @@ impl Agent {
         files_modified: Vec<std::path::PathBuf>,
         files_to_send: Vec<std::path::PathBuf>,
     ) -> TaskResult {
-        let success = response.stop_reason != StopReason::MaxTokens;
+        let truncated = response.stop_reason == StopReason::MaxTokens;
+        let success = !truncated;
+        let mut output = response.content.clone().unwrap_or_default();
+        if truncated {
+            let marker = "[partial output: max_output_tokens reached before a final answer]";
+            output = if output.trim().is_empty() {
+                marker.to_string()
+            } else {
+                format!("{marker}\n\n{output}")
+            };
+        }
         TaskResult {
             schema_version: octos_core::TASK_RESULT_SCHEMA_VERSION,
             success,
-            output: response.content.clone().unwrap_or_default(),
+            output,
             files_modified,
             files_to_send,
             subtasks: Vec::new(),

@@ -14,6 +14,10 @@ pub struct PipelineGraph {
     pub label: Option<String>,
     /// Default model key for nodes that don't specify one.
     pub default_model: Option<String>,
+    /// Optional run-level token budget. The executor stops between nodes once
+    /// cumulative input + output tokens reaches this cap.
+    #[serde(default)]
+    pub max_total_tokens: Option<u32>,
     /// Nodes keyed by their ID.
     pub nodes: HashMap<String, PipelineNode>,
     /// Directed edges.
@@ -134,6 +138,10 @@ pub struct PipelineNode {
     /// deadline is set but no action is specified.
     #[serde(default)]
     pub deadline_action: Option<DeadlineAction>,
+    /// When true, preserve an Error outcome and continue edge routing instead
+    /// of aborting the whole pipeline immediately.
+    #[serde(default)]
+    pub continue_on_error: bool,
     /// Mission-level checkpoints to persist after this node completes.
     /// An empty list means no checkpoint is written for this node.
     #[serde(default)]
@@ -161,6 +169,7 @@ impl Default for PipelineNode {
             max_tasks: None,
             deadline_secs: None,
             deadline_action: None,
+            continue_on_error: false,
             checkpoints: Vec::new(),
         }
     }

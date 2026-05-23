@@ -58,6 +58,7 @@ impl<'a> DotParser<'a> {
             id,
             label: None,
             default_model: None,
+            max_total_tokens: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
@@ -494,6 +495,9 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     if let Some(model) = attrs.get("default_model") {
         graph.default_model = Some(model.clone());
     }
+    if let Some(max_total_tokens) = attrs.get("max_total_tokens") {
+        graph.max_total_tokens = max_total_tokens.parse().ok();
+    }
 }
 
 /// Parse a duration string like "900s", "15m", "2h" into seconds.
@@ -572,6 +576,10 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
         deadline_secs,
         deadline_action,
+        continue_on_error: attrs
+            .get("continue_on_error")
+            .and_then(|s| parse_bool(s))
+            .unwrap_or(false),
         checkpoints,
     }
 }
@@ -1100,6 +1108,29 @@ mod tests {
         "#;
         let graph = parse_dot(dot).unwrap();
         assert!(graph.nodes["n3"].checkpoints.is_empty());
+    }
+
+    #[test]
+    fn should_parse_run_level_token_budget() {
+        let dot = r#"
+            digraph test {
+                graph [max_total_tokens="1234"]
+                n1 [prompt="a"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.max_total_tokens, Some(1234));
+    }
+
+    #[test]
+    fn should_parse_continue_on_error() {
+        let dot = r#"
+            digraph test {
+                n1 [prompt="a", continue_on_error="true"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.nodes["n1"].continue_on_error);
     }
 
     #[test]
