@@ -121,9 +121,18 @@ impl LlmError {
     /// Lowercased body markers that flag a quota / billing-tier failure.
     /// Kept private so the classification stays the canonical contract for
     /// `Quota` recognition.
+    ///
+    /// Recognised markers (extended in codex round-2 MAJOR 1 to cover
+    /// the cross-provider 429-quota surface):
+    ///   * `insufficient_quota` — OpenAI billing exhausted
+    ///   * `quota_exceeded` — generic
+    ///   * `resource_exhausted` — Gemini `RESOURCE_EXHAUSTED` envelope
+    ///   * `no_active_wisemodel_package` — Wisemodel billing tier expired
+    ///   * `no_active_*_package` — generalised Wisemodel-style marker
     fn body_signals_quota(body_lower: &str) -> bool {
         body_lower.contains("insufficient_quota")
             || body_lower.contains("quota_exceeded")
+            || body_lower.contains("resource_exhausted")
             || body_lower.contains("no_active_wisemodel_package")
             || (body_lower.contains("no_active_") && body_lower.contains("_package"))
     }
@@ -145,6 +154,10 @@ impl LlmError {
         let body_lower = body.to_ascii_lowercase();
         let kind = match status {
             401 => LlmErrorKind::Authentication,
+            // Anthropic uses 402 to signal billing failure / inactive
+            // subscription. Map to Quota so the operator sees a
+            // "top up or switch provider" message rather than "bad key".
+            402 => LlmErrorKind::Quota,
             403 => {
                 // Disambiguate 403: quota / billing-tier failures get their
                 // own variant so the operator sees a "top up or switch
@@ -155,9 +168,25 @@ impl LlmError {
                     LlmErrorKind::Authentication
                 }
             }
-            429 => LlmErrorKind::RateLimited {
-                retry_after_secs: None,
-            },
+            429 => {
+                // Codex round-2 MAJOR 1: 429 is overloaded across providers.
+                // Disambiguate the same way 403 already does:
+                //   * OpenAI 429 + `insufficient_quota` → exhausted billing
+                //   * Gemini 429 + `RESOURCE_EXHAUSTED` → exhausted billing
+                //   * Wisemodel 429 + `no_active_*_package` → exhausted billing
+                //   * Anthropic 429 + `rate_limit_error` → real rate limit
+                //   * Bare 429 (no marker) → real rate limit (legacy default)
+                // Without this branch the failover ladder treats `Quota` as
+                // a retryable RateLimited and burns the next lane on
+                // identical billing failures.
+                if Self::body_signals_quota(&body_lower) {
+                    LlmErrorKind::Quota
+                } else {
+                    LlmErrorKind::RateLimited {
+                        retry_after_secs: None,
+                    }
+                }
+            }
             404 => LlmErrorKind::ModelNotFound {
                 model: String::new(),
             },
@@ -284,6 +313,59 @@ mod tests {
         let err = LlmError::from_status(429, "Too Many Requests");
         assert!(matches!(err.kind, LlmErrorKind::RateLimited { .. }));
         assert!(err.is_retryable());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Codex round-2 MAJOR 1: 429 quota disambiguation. 429 is overloaded
+    // — providers use it for both throttling and exhausted billing. The
+    // body markers tell them apart.
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn should_classify_429_with_insufficient_quota_as_quota() {
+        // OpenAI billing-tier exhausted comes back as 429 +
+        // `insufficient_quota` (distinct from a transient TPM 429).
+        let body = r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota","type":"insufficient_quota"}}"#;
+        let err = LlmError::from_status_with_label(429, body, "openai/gpt-4");
+        assert_eq!(err.kind, LlmErrorKind::Quota);
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn should_classify_429_with_resource_exhausted_as_quota() {
+        // Gemini billing-tier exhausted comes back as 429 +
+        // `RESOURCE_EXHAUSTED` envelope.
+        let body = r#"{"error":{"code":429,"message":"Quota exceeded for project","status":"RESOURCE_EXHAUSTED"}}"#;
+        let err = LlmError::from_status_with_label(429, body, "gemini-1.5-pro");
+        assert_eq!(err.kind, LlmErrorKind::Quota);
+    }
+
+    #[test]
+    fn should_classify_429_with_no_active_package_as_quota() {
+        // Wisemodel returns 429 + `no_active_*_package` when the user's
+        // resource pack is exhausted (mirroring the 403 surface).
+        let body =
+            r#"{"error":{"code":"no_active_wisemodel_package","type":"insufficient_quota"}}"#;
+        let err = LlmError::from_status_with_label(429, body, "MiniMax-M2.5-highspeed");
+        assert_eq!(err.kind, LlmErrorKind::Quota);
+    }
+
+    #[test]
+    fn should_classify_429_with_anthropic_rate_limit_error_as_rate_limited() {
+        // Anthropic uses 429 + `{"type": "rate_limit_error"}` for real
+        // transient throttling (not billing exhaustion).
+        let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit"}}"#;
+        let err = LlmError::from_status_with_label(429, body, "anthropic/claude-3-5-sonnet");
+        assert!(matches!(err.kind, LlmErrorKind::RateLimited { .. }));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn should_classify_402_as_quota() {
+        // Anthropic returns 402 for billing failures / inactive subscription.
+        let err = LlmError::from_status(402, "Payment Required");
+        assert_eq!(err.kind, LlmErrorKind::Quota);
+        assert!(!err.is_retryable());
     }
 
     #[test]

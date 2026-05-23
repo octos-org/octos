@@ -349,11 +349,18 @@ impl LlmProvider for OpenAIProvider {
             // rate-limited / server) instead of falling through to
             // Internal/Bug. The truncated body is preserved so the
             // operator sees the provider's actual error payload.
+            //
+            // Codex round-2 MINOR: thread the provider_label so the
+            // operator sees e.g. "minimax/MiniMax-M2.5-highspeed"
+            // instead of just "MiniMax-M2.5-highspeed". This is the
+            // lane label the AdaptiveRouter and failover ledger use,
+            // so the wire envelope can be cross-referenced with the
+            // router events.
             let body = crate::provider::truncate_error_body(&body);
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                &self.model,
+                format!("{}/{}", self.provider_label, self.model),
             )
             .into());
         }
@@ -458,10 +465,12 @@ impl LlmProvider for OpenAIProvider {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             let body = crate::provider::truncate_error_body(&text);
+            // Codex round-2 MINOR: see chat() — thread provider_label so
+            // the streaming error path identifies the lane the same way.
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                &self.model,
+                format!("{}/{}", self.provider_label, self.model),
             )
             .into());
         }
