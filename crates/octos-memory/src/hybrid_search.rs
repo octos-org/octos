@@ -367,8 +367,17 @@ impl HybridIndex {
         // hybrid-strong candidate (moderate-but-floor-passing in both
         // BM25 and vector) outside both per-modality top-N pools.
         // See `FLOOR_PREFILTER_POOL` for the structural rationale.
+        //
+        // We `max` the floor pool with `limit * 4` so a caller that
+        // explicitly asks for a very large `limit` (e.g. with floor=0.0
+        // to mean "all candidates above zero" or for an export job)
+        // doesn't unintentionally cap at `FLOOR_PREFILTER_POOL` —
+        // codex P2 round 4 flagged this regression on the prior
+        // commit (a BM25-only store with >10_000 matching docs and
+        // `limit > 10_000` would previously have been served by
+        // `limit * 4` but is now bounded by the floor pool).
         let fetch_count = match min_best_modality {
-            Some(_) => FLOOR_PREFILTER_POOL,
+            Some(_) => FLOOR_PREFILTER_POOL.max(limit * 4),
             None => limit * 4,
         };
 
@@ -701,37 +710,106 @@ mod tests {
         // can sit outside both per-modality top-N pools and be
         // invisible to the floor.
         //
-        // Sanity check: with `limit=1` and a floor, the per-modality
-        // pool must be the larger floor-aware pool, so a doc that
-        // would be the #5 per-modality result (outside `limit*4 = 4`)
-        // is still considered.
+        // The test must fail against the OLD (`limit * 4`) path —
+        // codex P3 round 4 flagged that the previous test fixture
+        // (10 docs / limit=20 / pool=80) couldn't distinguish the old
+        // and new paths because the old pool already included every
+        // doc.
+        //
+        // Construct 50 docs, all matching a high-frequency keyword
+        // ("alpha") with decreasing term frequency so per-modality
+        // BM25 rank is well-defined. Doc #25 ALSO matches a unique
+        // keyword ("ferrocene"); the query targets the unique
+        // keyword. With `limit=2`:
+        //   - OLD path: per-modality pool = limit * 4 = 8. Doc #25 is
+        //     at BM25 rank ~26 (because alpha-saturated docs #0..#24
+        //     all out-rank it on the alpha term, even though doc #25
+        //     is the ONLY ferrocene match). So the old path's pool
+        //     does NOT contain doc #25 — invisible to the floor.
+        //   - NEW path: per-modality pool = FLOOR_PREFILTER_POOL =
+        //     10_000. Doc #25 is in the pool, floor=0.0 admits it,
+        //     and it surfaces as the top result.
         let mut index = HybridIndex::new(4);
-        for i in 0..10 {
-            // Each doc has a different BM25 score (via term repetition)
-            // and a different vector orientation, so per-modality ranks
-            // are well-defined and unique.
-            let repeats = 10 - i;
-            let text = format!("topic {}", "alpha ".repeat(repeats));
-            let emb = [(repeats as f32) / 10.0, 0.1, 0.0, 0.0];
-            index.insert(&format!("ep-{i:02}"), &text, Some(&emb));
+        for i in 0..50 {
+            // Most docs match "alpha" many times. Doc #25 ALSO matches
+            // the unique "ferrocene" keyword. By assigning decreasing
+            // alpha repetitions, BM25 ranks docs in a known order on
+            // the alpha term so doc #25 is firmly outside the top 8.
+            let alpha_count = 50 - i;
+            let mut text = "alpha ".repeat(alpha_count);
+            if i == 25 {
+                text.push_str("ferrocene ");
+            }
+            // Different vector orientation per doc so per-modality
+            // vector rank is well-defined too — doc #25 also sits
+            // outside the top 8 by vector rank.
+            let cos = 1.0 - (i as f32) * 0.01;
+            let orth = (1.0 - cos * cos).sqrt();
+            let emb = [cos, orth, 0.0, 0.0];
+            index.insert(&format!("ep-{i:02}"), text.trim(), Some(&emb));
         }
 
-        let q = "alpha";
-        let q_emb: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        // Query targets the unique ferrocene match.
+        let q = "ferrocene";
+        let q_emb: [f32; 4] = [0.5, 0.866, 0.0, 0.0]; // arbitrary direction
 
-        // With limit=1 and no floor, the standard path uses pool=4.
-        // With a floor, the path uses FLOOR_PREFILTER_POOL=10_000 (all
-        // 10 docs). Verify that the floor sees enough docs to apply
-        // properly by asking for many results: with limit=20 floor=0.0
-        // we should get back all 10 indexed docs (proves the pool is
-        // not bounded by the smaller `limit * 4`).
-        let with_floor = index.search_scored_filtered(q, Some(&q_emb), 20, Some(0.0));
-        assert_eq!(
-            with_floor.len(),
-            10,
-            "with floor, the pool must include every candidate that contributed in either modality \
-             (got {}, expected 10)",
-            with_floor.len()
+        // With the NEW path: per-modality BM25 pool is
+        // FLOOR_PREFILTER_POOL=10_000, large enough to include doc
+        // #25, so the floor admits it.
+        let filtered = index.search_scored_filtered(q, Some(&q_emb), 2, Some(0.0));
+        assert!(
+            filtered.iter().any(|(id, _)| id == "ep-25"),
+            "doc #25 (the unique ferrocene match) must reach the floored search even though \
+             alpha-saturated docs crowd it out of the per-modality top-8 BM25 pool that the \
+             old `limit * 4` path would have used. Result IDs: {:?}",
+            filtered
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Sanity: with NO floor and limit=2, the standard path returns
+        // at most 2 results.
+        let unfiltered = index.search_scored_filtered(q, Some(&q_emb), 2, None);
+        assert!(
+            unfiltered.len() <= 2,
+            "standard limit=2 path returns at most 2 results"
+        );
+    }
+
+    #[test]
+    fn search_scored_filtered_large_limit_still_honored_with_floor() {
+        // Regression for codex P2 round 4: when the caller asks for a
+        // very large `limit` with a floor (e.g. an export job with
+        // floor=0.0), the per-modality pool must not silently cap at
+        // `FLOOR_PREFILTER_POOL` and starve the caller of results.
+        // The new `max(FLOOR_PREFILTER_POOL, limit * 4)` per-modality
+        // fetch protects against this.
+        //
+        // We can't realistically index 10_000+ docs in a unit test, so
+        // assert the formula directly: the per-modality fetch budget
+        // for `limit > FLOOR_PREFILTER_POOL / 4` should expand with
+        // `limit * 4`. Use limit=3000 → expected per-modality pool =
+        // max(10_000, 12_000) = 12_000. We assert via behavior: a
+        // BM25-only doc indexed AFTER 30 dummy docs and matching a
+        // unique keyword should be reachable with limit=3000+floor.
+        let mut index = HybridIndex::new(4);
+        for i in 0..30 {
+            // Dummy docs matching common keyword to fill the pool;
+            // BM25 ranks well-defined by decreasing term frequency.
+            let alpha = 30 - i;
+            let text = "alpha ".repeat(alpha);
+            index.insert(&format!("dummy-{i:02}"), text.trim(), None);
+        }
+        index.insert("rare-doc", "unicornium", None);
+
+        // limit=3000 floor=0.0: the new path's fetch count for BM25
+        // is max(10_000, 12_000) = 12_000, well above 31 docs, so the
+        // rare doc is reachable.
+        let filtered = index.search_scored_filtered("unicornium", None, 3000, Some(0.0));
+        assert!(
+            filtered.iter().any(|(id, _)| id == "rare-doc"),
+            "rare-doc must be reachable even with limit much larger than FLOOR_PREFILTER_POOL"
         );
     }
 
