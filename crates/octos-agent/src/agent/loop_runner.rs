@@ -6448,15 +6448,13 @@ printf '{"output":"voice saved","success":true}\n'
             message: "required tool(s) not available on this host: shell-helper",
         });
 
-        let provider: Arc<dyn LlmProvider> =
-            Arc::new(SanitizedIdSpawnOnlyAndErroringProvider {
-                calls: AtomicUsize::new(0),
-                spawn_only_name: "run_pipeline",
-                erroring_name: "shell",
-                erroring_raw_id: "admin_view_sessions:11",
-                final_content:
-                    "Pipeline launched; shell-helper failed — cannot proceed.",
-            });
+        let provider: Arc<dyn LlmProvider> = Arc::new(SanitizedIdSpawnOnlyAndErroringProvider {
+            calls: AtomicUsize::new(0),
+            spawn_only_name: "run_pipeline",
+            erroring_name: "shell",
+            erroring_raw_id: "admin_view_sessions:11",
+            final_content: "Pipeline launched; shell-helper failed — cannot proceed.",
+        });
         let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
         let agent = Agent::new(
             AgentId::new("spawn-only-sanitized-id-test"),
@@ -6490,8 +6488,7 @@ printf '{"output":"voice saved","success":true}\n'
              sanitized tool_call_id reported success=false"
         );
         assert_eq!(
-            result.content,
-            "Pipeline launched; shell-helper failed — cannot proceed.",
+            result.content, "Pipeline launched; shell-helper failed — cannot proceed.",
             "the LLM's recovery reply must surface, not the synth-ack"
         );
 
@@ -6505,9 +6502,10 @@ printf '{"output":"voice saved","success":true}\n'
         // proving sanitization ran end-to-end.
         let sanitized_tool_msg = result.messages.iter().find(|message| {
             message.role == MessageRole::Tool
-                && message.tool_call_id.as_deref().is_some_and(|id| {
-                    !id.contains(':') && id.contains("admin_view_sessions_11")
-                })
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| !id.contains(':') && id.contains("admin_view_sessions_11"))
         });
         assert!(
             sanitized_tool_msg.is_some(),
