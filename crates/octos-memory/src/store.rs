@@ -554,12 +554,39 @@ impl EpisodeStore {
     }
 
     /// Hybrid search across all episodes (not cwd-scoped).
+    ///
+    /// Backward-compatible wrapper around [`Self::find_relevant_hybrid_scored`]
+    /// that drops the similarity score. Callers that need to gate episode
+    /// injection on a minimum similarity (e.g. the agent loop's "Relevant
+    /// Past Experiences" system message) should call the `_scored` variant
+    /// directly so cross-session contamination is filtered out (NEW-06).
     pub async fn find_relevant_hybrid(
         &self,
         query: &str,
         query_embedding: Option<Vec<f32>>,
         limit: usize,
     ) -> Result<Vec<Episode>> {
+        let scored = self
+            .find_relevant_hybrid_scored(query, query_embedding, limit)
+            .await?;
+        Ok(scored.into_iter().map(|(ep, _)| ep).collect())
+    }
+
+    /// Hybrid search across all episodes (not cwd-scoped), returning each
+    /// episode alongside its hybrid relevance score in `[0.0, 1.0]`.
+    ///
+    /// Higher scores indicate higher relevance. Results are sorted by
+    /// descending score. The score is the same value used internally to
+    /// rank candidates, so callers can apply a minimum-similarity gate
+    /// to avoid injecting unrelated past experiences (NEW-06: prior
+    /// behavior returned the top-K regardless of score, which let an
+    /// unrelated prior session contaminate the current task's context).
+    pub async fn find_relevant_hybrid_scored(
+        &self,
+        query: &str,
+        query_embedding: Option<Vec<f32>>,
+        limit: usize,
+    ) -> Result<Vec<(Episode, f32)>> {
         // Search the in-memory index
         let matches = {
             let idx = self
@@ -569,8 +596,9 @@ impl EpisodeStore {
             idx.search(query, query_embedding.as_deref(), limit)
         };
 
-        // Fetch full episodes from DB
-        let ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
+        // Fetch full episodes from DB. Preserve (id, score) pairing so
+        // callers can gate on a similarity threshold.
+        let id_scores: Vec<(String, f32)> = matches;
         // Degraded fallback: there is no on-disk store to read from.
         // The hybrid index only knows about episodes inserted in this
         // process's lifetime (which is empty at open for a degraded
@@ -583,24 +611,31 @@ impl EpisodeStore {
             let read_txn = db.begin_read()?;
             let table = read_txn.open_table(EPISODES_TABLE)?;
 
-            let mut episodes = Vec::new();
-            for id in &ids {
+            // Build id -> score map and an id-order index so we can
+            // attach the matching score to each fetched episode while
+            // preserving the hybrid ranking order.
+            let score_by_id: std::collections::HashMap<&str, f32> =
+                id_scores.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+            let id_order: std::collections::HashMap<&str, usize> = id_scores
+                .iter()
+                .enumerate()
+                .map(|(i, (id, _))| (id.as_str(), i))
+                .collect();
+
+            let mut scored: Vec<(Episode, f32)> = Vec::new();
+            for (id, _) in &id_scores {
                 if let Some(json) = table.get(id.as_str())? {
                     if let Ok(episode) = serde_json::from_str::<Episode>(json.value()) {
-                        episodes.push(episode);
+                        let score = score_by_id.get(episode.id.as_str()).copied().unwrap_or(0.0);
+                        scored.push((episode, score));
                     }
                 }
             }
 
             // Preserve the ranking order from hybrid search
-            let id_order: std::collections::HashMap<&str, usize> = ids
-                .iter()
-                .enumerate()
-                .map(|(i, id)| (id.as_str(), i))
-                .collect();
-            episodes.sort_by_key(|e| id_order.get(e.id.as_str()).copied().unwrap_or(usize::MAX));
+            scored.sort_by_key(|(e, _)| id_order.get(e.id.as_str()).copied().unwrap_or(usize::MAX));
 
-            Ok(episodes)
+            Ok(scored)
         })
         .await?
     }
@@ -716,6 +751,48 @@ mod tests {
             .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].id, ep_id);
+    }
+
+    #[tokio::test]
+    async fn find_relevant_hybrid_scored_returns_similarity_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        store
+            .store(make_episode("rust ownership borrow checker", "/proj"))
+            .await
+            .unwrap();
+        store
+            .store(make_episode("python web flask framework", "/proj"))
+            .await
+            .unwrap();
+
+        let scored = store
+            .find_relevant_hybrid_scored("rust ownership", None, 10)
+            .await
+            .unwrap();
+
+        // At least one match returned with a positive score in [0, 1].
+        assert!(!scored.is_empty(), "expected at least one match");
+        let (top_ep, top_score) = &scored[0];
+        assert!(
+            top_ep.summary.contains("rust"),
+            "top match should be the rust episode, got: {}",
+            top_ep.summary
+        );
+        assert!(
+            *top_score > 0.0 && *top_score <= 1.0,
+            "top score should be in (0, 1], got {top_score}"
+        );
+
+        // Backward-compat: find_relevant_hybrid returns the same episodes
+        // (without scores) in the same order.
+        let plain = store
+            .find_relevant_hybrid("rust ownership", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), scored.len());
+        assert_eq!(plain[0].id, scored[0].0.id);
     }
 
     #[tokio::test]
