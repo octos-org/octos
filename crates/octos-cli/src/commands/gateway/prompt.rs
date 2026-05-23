@@ -283,6 +283,23 @@ mod tests {
              podcast-generation bullet so it matches first (codex P2 \
              follow-up to NEW-05)"
         );
+        // codex P2 round 3: the listing route MUST defer to the
+        // generation route when the same message ALSO asks to
+        // make/generate a podcast. Otherwise prompts like
+        // "用播客声音做一期播客" or "use available podcast voices to
+        // make a podcast" get swallowed by the list route.
+        assert!(
+            PROMPT.contains("Override"),
+            "voice-list-only bullet must include an Override clause so \
+             generation requests that mention voice selection still \
+             route to podcast_generate (codex P2 round 3 on NEW-05)"
+        );
+        assert!(
+            PROMPT.contains("fall through to the Podcast generation rule below"),
+            "voice-list-only bullet must explicitly fall through to \
+             the Podcast generation rule when the message asks to \
+             make/generate a podcast (codex P2 round 3 on NEW-05)"
+        );
     }
 
     #[test]
