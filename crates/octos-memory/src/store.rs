@@ -591,13 +591,41 @@ impl EpisodeStore {
         query_embedding: Option<Vec<f32>>,
         limit: usize,
     ) -> Result<Vec<(Episode, HybridScore)>> {
+        self.find_relevant_hybrid_scored_filtered(query, query_embedding, limit, None)
+            .await
+    }
+
+    /// Like [`Self::find_relevant_hybrid_scored`] but applies an
+    /// optional `min_best_modality` floor on
+    /// [`HybridScore::best_modality`] BEFORE the in-index
+    /// combined-rank truncation to `limit`.
+    ///
+    /// This is the contamination-safe entry point for callers (such as
+    /// the agent loop's "Relevant Past Experiences" injection) that
+    /// would otherwise face the dead band where `limit` or more
+    /// sub-threshold vector-only candidates crowd out a high-
+    /// `best_modality` low-`combined` candidate (codex P2 round 2 on
+    /// PR #1195). Pushing the floor down into the index ensures the
+    /// guarantee holds regardless of memory-store size: if ANY
+    /// candidate clears the floor, it reaches the returned set
+    /// (subject to `limit`).
+    ///
+    /// `min_best_modality == None` matches
+    /// [`Self::find_relevant_hybrid_scored`] semantics exactly.
+    pub async fn find_relevant_hybrid_scored_filtered(
+        &self,
+        query: &str,
+        query_embedding: Option<Vec<f32>>,
+        limit: usize,
+        min_best_modality: Option<f32>,
+    ) -> Result<Vec<(Episode, HybridScore)>> {
         // Search the in-memory index
         let matches = {
             let idx = self
                 .index
                 .read()
                 .map_err(|e| eyre::eyre!("index lock poisoned: {e}"))?;
-            idx.search_scored(query, query_embedding.as_deref(), limit)
+            idx.search_scored_filtered(query, query_embedding.as_deref(), limit, min_best_modality)
         };
 
         // Fetch full episodes from DB. Preserve (id, score) pairing so
