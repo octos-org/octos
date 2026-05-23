@@ -144,3 +144,125 @@ async fn codergen_handler_defaults_to_no_embedder() {
          callers stay byte-for-byte identical"
     );
 }
+
+/// NEW-06 codex follow-up — the executor->handler hop is the load-
+/// bearing wiring point that the earlier builder tests do NOT cover.
+/// If a future refactor breaks `PipelineExecutor::build_codergen` (the
+/// internal seam that copies `ExecutorConfig.embedder` onto the per-node
+/// `CodergenHandler`), the four pre-existing builder tests above would
+/// still all pass — so this test drives the full `PipelineExecutor::new`
+/// -> `build_codergen_for_test()` chain and asserts the embedder
+/// survives.
+#[tokio::test]
+async fn build_codergen_propagates_embedder_from_executor_config() {
+    use octos_pipeline::PipelineExecutor;
+    use octos_pipeline::executor::ExecutorConfig;
+
+    let embedder = Arc::new(StubEmbedder) as Arc<dyn EmbeddingProvider>;
+    let config = ExecutorConfig {
+        default_provider: Arc::new(MockProvider) as Arc<dyn octos_llm::LlmProvider>,
+        provider_router: None,
+        memory: temp_episode_store().await,
+        working_dir: std::env::temp_dir(),
+        provider_policy: None,
+        plugin_dirs: vec![],
+        plugin_require_signed: false,
+        status_bridge: None,
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        max_parallel_workers: 8,
+        max_pipeline_fanout_total: None,
+        checkpoint_store: None,
+        hook_executor: None,
+        workspace_context: octos_pipeline::PipelineContext::default(),
+        host_context: octos_pipeline::PipelineHostContext::default(),
+        embedder: Some(embedder),
+    };
+
+    let executor = PipelineExecutor::new(config);
+    let codergen = executor.build_codergen_for_test();
+
+    assert!(
+        codergen.embedder_for_test().is_some(),
+        "PipelineExecutor::build_codergen must copy `ExecutorConfig.embedder` \
+         onto the per-node CodergenHandler — otherwise worker Agents built \
+         by the handler never see the embedder and fall back to the \
+         unfiltered cwd-only memory recall path (NEW-06 contamination)."
+    );
+}
+
+/// NEW-06 codex follow-up — the executor->handler hop must also leave
+/// `embedder = None` alone when no embedder was attached on the
+/// `ExecutorConfig`. Guards against a future refactor accidentally
+/// fabricating one from defaults / lazily-cached state.
+#[tokio::test]
+async fn build_codergen_omits_embedder_when_executor_config_has_none() {
+    use octos_pipeline::PipelineExecutor;
+    use octos_pipeline::executor::ExecutorConfig;
+
+    let config = ExecutorConfig {
+        default_provider: Arc::new(MockProvider) as Arc<dyn octos_llm::LlmProvider>,
+        provider_router: None,
+        memory: temp_episode_store().await,
+        working_dir: std::env::temp_dir(),
+        provider_policy: None,
+        plugin_dirs: vec![],
+        plugin_require_signed: false,
+        status_bridge: None,
+        shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        max_parallel_workers: 8,
+        max_pipeline_fanout_total: None,
+        checkpoint_store: None,
+        hook_executor: None,
+        workspace_context: octos_pipeline::PipelineContext::default(),
+        host_context: octos_pipeline::PipelineHostContext::default(),
+        embedder: None,
+    };
+
+    let executor = PipelineExecutor::new(config);
+    let codergen = executor.build_codergen_for_test();
+
+    assert!(
+        codergen.embedder_for_test().is_none(),
+        "build_codergen must not synthesise an embedder when none was \
+         configured — that would silently change the legacy path."
+    );
+}
+
+/// NEW-06 codex follow-up — `RunPipelineTool::execute` is the user-
+/// facing entrypoint. The earlier builder test pins
+/// `RunPipelineTool::with_embedder` but does NOT cover the `execute`
+/// path's `ExecutorConfig` build. The integration-level assertion below
+/// drives `RunPipelineTool::with_embedder` and inspects the stored
+/// handle via `embedder_for_test`, which is the same field `execute`
+/// reads when constructing the `ExecutorConfig`. The pairing
+/// (`with_embedder` -> stored field -> `ExecutorConfig` read site -> the
+/// `build_codergen` propagation test above) closes the chain end to end
+/// without needing to spin up an LLM-driven pipeline run.
+#[tokio::test]
+async fn run_pipeline_tool_with_embedder_chain_pin() {
+    let memory = temp_episode_store().await;
+    let llm = Arc::new(MockProvider) as Arc<dyn octos_llm::LlmProvider>;
+    let embedder = Arc::new(StubEmbedder) as Arc<dyn EmbeddingProvider>;
+
+    // 1) RunPipelineTool::with_embedder stores the handle.
+    let tool = RunPipelineTool::new(
+        llm.clone(),
+        memory.clone(),
+        std::env::temp_dir(),
+        std::env::temp_dir(),
+    )
+    .with_embedder(embedder.clone());
+    assert!(tool.embedder_for_test().is_some());
+
+    // 2) The handle Arc-points at the same provider instance — guards
+    //    against a future refactor that re-wraps the embedder in a
+    //    different `Arc` (legal at the type level but breaks any
+    //    identity-based downstream wiring).
+    let stored = tool.embedder_for_test().cloned().unwrap();
+    assert!(
+        Arc::ptr_eq(&stored, &embedder),
+        "RunPipelineTool::with_embedder must not re-wrap the supplied Arc — \
+         the executor and worker Agents rely on the handle identity to \
+         share scoring state."
+    );
+}

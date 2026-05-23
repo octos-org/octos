@@ -359,14 +359,32 @@ impl EpisodeStore {
             if !filtered.is_empty() {
                 return Ok(filtered);
             }
+            // NEW-06 codex follow-up: when a caller passed a
+            // `min_best_modality` floor and the scored+CWD-filtered set
+            // came back empty, returning empty is the correct answer —
+            // nothing in the index cleared the contamination floor for
+            // this cwd. Falling through to the unscored
+            // `find_relevant_db_scan` would silently bypass the floor
+            // (the scan is keyword-substring only with no scoring
+            // infrastructure), which is exactly the contamination
+            // pattern this filter exists to prevent.
+            //
+            // Only fall through to the unscored DB scan when no floor
+            // was requested (legacy `find_relevant` semantics).
+            if min_best_modality.is_some() {
+                return Ok(Vec::new());
+            }
             // Fall through to DB scan if hybrid returned no CWD matches
+            // AND no contamination floor was requested.
         }
 
         // Fallback: direct DB scan (for empty index or no CWD matches).
         // The DB scan path is keyword-substring based with no scoring
         // infrastructure, so we can't apply `min_best_modality` here
-        // without rewriting it. Keep legacy behaviour — the index path
-        // is the contamination vector callers actually care about.
+        // without rewriting it. We only reach this path when the caller
+        // did not request a floor (see early-return above), so legacy
+        // unscored behaviour is preserved without bypassing the
+        // contamination filter when one was asked for.
         self.find_relevant_db_scan(cwd, query, limit).await
     }
 
@@ -801,6 +819,100 @@ mod tests {
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    /// NEW-06 codex follow-up — when `min_best_modality` is supplied
+    /// and the scored+cwd-filtered set comes back empty, the function
+    /// MUST return empty instead of falling through to the unscored
+    /// `find_relevant_db_scan` (which has no scoring infrastructure
+    /// and would silently bypass the contamination floor).
+    ///
+    /// Reproduces the codex follow-up bug at lines 365-370. The
+    /// scenario engineered below:
+    /// * one episode at cwd `/proj` with a deliberately weak BM25
+    ///   match for the query (so it does NOT clear the 0.99 floor);
+    /// * one episode at a foreign cwd with a strong BM25 match (so
+    ///   its score normalises high but it gets dropped by the cwd
+    ///   filter).
+    ///
+    /// Pre-fix, `find_relevant_hybrid_scored_filtered` would return
+    /// the foreign-cwd episode, the cwd filter would drop it, the
+    /// `!filtered.is_empty()` short-circuit would fail, and execution
+    /// would fall through to the DB scan — which IS cwd-scoped and
+    /// matches by substring, so the weak `/proj` episode would be
+    /// returned despite never having cleared the floor.
+    ///
+    /// Post-fix, when the caller supplies a floor, the fallthrough is
+    /// gated off and the function returns empty.
+    #[tokio::test]
+    async fn find_relevant_filtered_returns_empty_when_floor_set_and_no_cwd_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        // Foreign-cwd episode with a strong BM25 match (verbatim query
+        // tokens). Normalises to BM25=1.0 in the result set so it
+        // clears any reasonable floor — but the cwd filter drops it.
+        store
+            .store(make_episode(
+                "gravitational lensing observations of distant galaxies",
+                "/foreign-cwd",
+            ))
+            .await
+            .unwrap();
+        // Target-cwd episode whose summary shares only the noise-token
+        // "podcast" with the query. Its BM25 score is positive but
+        // far below the foreign-cwd episode's score after normalisation,
+        // so it does NOT clear the floor.
+        store
+            .store(make_episode("Apple CEO podcast", "/proj"))
+            .await
+            .unwrap();
+
+        let results = store
+            .find_relevant_filtered(
+                Path::new("/proj"),
+                "gravitational lensing observations",
+                10,
+                Some(0.5), // floor — foreign-cwd clears it, /proj does not
+            )
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "find_relevant_filtered with a floor must NOT fall through \
+             to unscored DB scan when the scored+cwd set is empty; \
+             returned {} contaminated episodes: {results:?}",
+            results.len()
+        );
+    }
+
+    /// NEW-06 codex follow-up companion — when `min_best_modality` is
+    /// `None`, the legacy fall-through to the unscored DB scan stays in
+    /// place. Locks the "no behaviour change for legacy callers" half
+    /// of the fix.
+    #[tokio::test]
+    async fn find_relevant_filtered_falls_through_to_db_scan_when_no_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        store
+            .store(make_episode("Fixed parser bug in tokenizer", "/proj"))
+            .await
+            .unwrap();
+
+        // No floor → legacy behaviour: keyword-substring matching via
+        // the index OR the DB scan returns the episode.
+        let results = store
+            .find_relevant_filtered(Path::new("/proj"), "parser", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "find_relevant_filtered with no floor must keep legacy \
+             behaviour byte-for-byte — got {} episodes",
+            results.len()
+        );
     }
 
     #[tokio::test]
