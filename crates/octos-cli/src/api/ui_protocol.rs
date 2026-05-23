@@ -15741,8 +15741,25 @@ async fn run_standalone_turn(
                         &response.content,
                         response.reasoning_content.clone(),
                     );
+                    // dspfac "two bubbles per turn" fix: when the loop
+                    // returned a synthesised spawn_only ack
+                    // (`response.synthesized_from_spawn_only = true`),
+                    // the row carrying that ack content is the one
+                    // returned from `final_assistant_message`. The
+                    // capability filter at
+                    // `live_event_passes_capability_filter` suppresses
+                    // `message/persisted` events whose
+                    // `source: background` so dual-negotiated clients
+                    // (those carrying `event.spawn_complete.v1`) drop
+                    // the duplicate of the iter-1 preamble row,
+                    // collapsing the visible chat shape from two
+                    // bubbles to one. Legacy clients without that
+                    // capability still receive the ack as an
+                    // assistant row — backward-compatible.
+                    let final_assistant_uses_background_source =
+                        response.synthesized_from_spawn_only && final_assistant.is_some();
                     let mut skipped_internal_user = false;
-                    for message in response.messages.iter().cloned().chain(final_assistant) {
+                    for message in response.messages.iter().cloned() {
                         if skip_internal_user_persist
                             && !skipped_internal_user
                             && message.role == MessageRole::User
@@ -15779,6 +15796,45 @@ async fn run_standalone_turn(
                             if is_final_assistant_carrier {
                                 final_assistant_persisted = true;
                             }
+                        }
+                    }
+                    if let Some(message) = final_assistant {
+                        // The `final_assistant` row is the synthesised
+                        // carrier of `response.content`. By
+                        // construction this is an Assistant row (so
+                        // the skip_internal_user_persist branch does
+                        // not apply) and its content equals
+                        // `response.content` (so it is the
+                        // final-assistant carrier).
+                        let to_save =
+                            pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                        let saved_for_context = to_save.clone();
+                        let session_id_for_persist = agent_session_id.clone();
+                        let persist = async {
+                            sessions
+                                .add_message_with_seq(&session_id_for_persist, to_save)
+                                .await
+                        };
+                        let commit = if final_assistant_uses_background_source {
+                            MESSAGE_PERSISTED_SOURCE_OVERRIDE
+                                .scope(Some(MessagePersistedSource::Background), persist)
+                                .await
+                        } else {
+                            persist.await
+                        };
+                        if let Ok(seq) = commit {
+                            record_appui_context_manager_message(
+                                &context_data_dir_for_result,
+                                &context_manager_for_result,
+                                &agent_session_id,
+                                &saved_for_context,
+                                seq,
+                            );
+                            cursor = Some(UiCursor {
+                                stream: agent_session_id.0.clone(),
+                                seq: seq as u64,
+                            });
+                            final_assistant_persisted = true;
                         }
                     }
                 }
@@ -27782,6 +27838,162 @@ ignore = []
         // After the scope ends, the default behaviour is restored.
         let after = current_message_persisted_source(MessageRole::Assistant);
         assert_eq!(after, MessagePersistedSource::Assistant);
+    }
+
+    /// dspfac "two bubbles per turn" fix: a spawn_only loop turn emits
+    /// TWO persisted assistant rows — the iter-1 LLM reply carrying the
+    /// preamble TEXT + `tool_calls`, and the synthesised ack
+    /// ("Background work started for `<tool>`. ...") fabricated in
+    /// `loop_runner::process_message_inner`. Pre-fix both landed with
+    /// `source: assistant`, so SPAs negotiating
+    /// `event.spawn_complete.v1` (which suppress `source: background`
+    /// rows via `live_event_passes_capability_filter`) rendered both as
+    /// chat bubbles.
+    ///
+    /// Post-fix the API persist site wraps ONLY the synthesised ack row
+    /// in `MESSAGE_PERSISTED_SOURCE_OVERRIDE.scope(Background, _)` —
+    /// gated on `ConversationResponse.synthesized_from_spawn_only`. This
+    /// test mirrors that wire shape and asserts the ledger emits the
+    /// preamble as `Assistant` and the ack as `Background`. The
+    /// downstream capability filter (already covered by the
+    /// background-persist suppression tests above) then collapses the
+    /// observable chat shape to one bubble for upgraded clients while
+    /// remaining backward-compatible for legacy clients.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_only_synthesized_ack_emits_as_background_source() {
+        use octos_core::ui_protocol::MessagePersistedSource;
+
+        let _guard = message_commit_observer_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Wire a fresh ledger + observer the same way the live server
+        // wires them on first `event_ledger` call.
+        let ledger = Arc::new(UiProtocolLedger::new(64));
+        install_message_commit_observer(ledger.clone());
+
+        let session_id = SessionKey("local:spawn-only-synth-ack".into());
+        let mut subscriber = ledger.subscribe(&session_id);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut manager =
+            octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+
+        // The iter-1 LLM reply that drove the spawn_only branch:
+        // non-empty preamble TEXT plus the tool_calls that selected
+        // `run_pipeline`. This is `response.messages` — persisted with
+        // the role-derived default `source: Assistant`.
+        let preamble_text = "Sure, I'll kick off the pipeline now.".to_string();
+        let preamble = Message {
+            role: MessageRole::Assistant,
+            content: preamble_text.clone(),
+            media: vec![],
+            tool_calls: Some(vec![octos_core::ToolCall {
+                id: "tc-run_pipeline-1".into(),
+                name: "run_pipeline".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some("thread-spawn-only-synth".into()),
+            timestamp: Utc::now(),
+        };
+        manager
+            .add_message_with_seq(&session_id, preamble)
+            .await
+            .expect("commit preamble assistant row");
+
+        // The synthesised ack fabricated by the spawn_only branch in
+        // `loop_runner::process_message_inner`. Persisted INSIDE the
+        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE.scope(Background, _)`
+        // because `ConversationResponse.synthesized_from_spawn_only`
+        // was true — exactly what the production persist site does.
+        let ack_text = "Background work started for `run_pipeline`. \
+             The final result will be delivered automatically when it is ready."
+            .to_string();
+        let ack = Message {
+            role: MessageRole::Assistant,
+            content: ack_text.clone(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: Some("thread-spawn-only-synth".into()),
+            timestamp: Utc::now(),
+        };
+        let session_id_for_persist = session_id.clone();
+        let persist = async {
+            manager
+                .add_message_with_seq(&session_id_for_persist, ack)
+                .await
+        };
+        let commit = MESSAGE_PERSISTED_SOURCE_OVERRIDE
+            .scope(Some(MessagePersistedSource::Background), persist)
+            .await;
+        commit.expect("commit synthesised ack row");
+
+        // Drain the broadcast and bucket every assistant
+        // `MessagePersisted` envelope by source.
+        let mut assistant_envelopes: Vec<MessagePersistedEvent> = Vec::new();
+        while let Ok(event) = subscriber.try_recv() {
+            if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+                &event.event
+            {
+                if ev.role == octos_core::MessageRole::Assistant.as_str() {
+                    assistant_envelopes.push(ev.clone());
+                }
+            }
+        }
+
+        assert_eq!(
+            assistant_envelopes.len(),
+            2,
+            "spawn_only turn must commit BOTH the preamble and the ack — \
+             pre-fix both were `source: assistant` (the two-bubble bug); \
+             post-fix the preamble is Assistant and the ack is Background; \
+             got {} envelopes",
+            assistant_envelopes.len(),
+        );
+
+        // Preamble (carries `tool_calls` + preamble TEXT): default
+        // role-derived source `Assistant`. The capability filter at
+        // `live_event_passes_capability_filter` leaves Assistant rows
+        // alone, so dual-negotiated SPAs still render this row — that
+        // is the surviving "single bubble" of the turn.
+        let preamble_env = &assistant_envelopes[0];
+        assert_eq!(
+            preamble_env.source,
+            MessagePersistedSource::Assistant,
+            "iter-1 preamble row (carrying tool_calls + preamble text) must keep source=Assistant",
+        );
+
+        // Synthesised ack: tagged `Background` via the override scope.
+        // The capability filter then suppresses this row for SPAs that
+        // negotiated `event.spawn_complete.v1`, collapsing the chat
+        // shape to a single bubble per turn.
+        let ack_env = &assistant_envelopes[1];
+        assert_eq!(
+            ack_env.source,
+            MessagePersistedSource::Background,
+            "synthesised spawn_only ack row must carry source=Background so \
+             `live_event_passes_capability_filter` suppresses the second bubble",
+        );
+
+        // Sanity: the override scope is correctly scoped — after the
+        // ack persist returns, the task-local is back to its default.
+        let after = current_message_persisted_source(MessageRole::Assistant);
+        assert_eq!(
+            after,
+            MessagePersistedSource::Assistant,
+            "override is scoped to the ack persist call only — must not leak",
+        );
+
+        // Restore the global observer slot to None so subsequent tests
+        // see a clean state.
+        octos_bus::set_message_commit_observer(None);
     }
 
     /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat

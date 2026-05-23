@@ -786,6 +786,7 @@ impl Agent {
                                 streamed: false,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                     }
@@ -969,6 +970,7 @@ impl Agent {
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                         StopReason::ToolUse => {
@@ -1064,6 +1066,7 @@ impl Agent {
                                                 history.len(),
                                             ),
                                             tool_results: tool_structured_metadata.clone(),
+                                            synthesized_from_spawn_only: false,
                                         });
                                     }
                                     // Two-stage loop-detector recovery:
@@ -1126,6 +1129,7 @@ impl Agent {
                                                     history.len(),
                                                 ),
                                                 tool_results: tool_structured_metadata.clone(),
+                                                synthesized_from_spawn_only: false,
                                             });
                                         }
                                     }
@@ -1222,6 +1226,7 @@ impl Agent {
                                         history.len(),
                                     ),
                                     tool_results: tool_structured_metadata.clone(),
+                                    synthesized_from_spawn_only: false,
                                 });
                             }
 
@@ -1259,6 +1264,19 @@ impl Agent {
                                     streamed,
                                     messages: LoopTurnState::new_messages(&messages, history.len()),
                                     tool_results: tool_structured_metadata.clone(),
+                                    // dspfac "two bubbles per turn" fix: this
+                                    // branch synthesises `content` as the
+                                    // "Background work started for `<tool>`..."
+                                    // acknowledgement. The API persist site
+                                    // reads this flag and tags the wire
+                                    // envelope for the synthesised row with
+                                    // `MessagePersistedSource::Background`,
+                                    // which the existing capability filter
+                                    // for `event.spawn_complete.v1` clients
+                                    // suppresses. Legacy clients (without
+                                    // the capability) still see the ack as
+                                    // an assistant row — backward-compatible.
+                                    synthesized_from_spawn_only: true,
                                 });
                             }
                         }
@@ -1276,6 +1294,7 @@ impl Agent {
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                         StopReason::ContentFiltered => {
@@ -1299,6 +1318,7 @@ impl Agent {
                                 streamed,
                                 messages: LoopTurnState::new_messages(&messages, history.len()),
                                 tool_results: tool_structured_metadata.clone(),
+                                synthesized_from_spawn_only: false,
                             });
                         }
                     }
