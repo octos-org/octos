@@ -621,40 +621,6 @@ pub(crate) fn build_pipeline_run_summary(
 
 /// #1126 codex P2 follow-up to #1020 / M17-B — write a `summary.json`
 /// for the timeout failure path. Without this, runs that hit the
-/// Cascade-fail every still-active `pipeline:<node>` child task
-/// registered in the supervisor under the `run_pipeline` parent's
-/// `tool_call_id`. Invoked from the `RunPipelineTool::execute` timeout
-/// arm so dropped child futures don't leave orphan `state: "running"`
-/// entries in the supervisor (the bug that surfaced as
-/// `pipeline:analyze running` indefinitely on the dashboard).
-///
-/// No-op when the host context didn't snapshot a supervisor (legacy
-/// callers / unit tests) or didn't carry a parent_tool_call_id. The
-/// underlying [`TaskSupervisor::mark_descendants_failed`] is itself
-/// idempotent on already-terminal tasks, so re-invocation is safe.
-fn cascade_fail_orphan_node_tasks(
-    host_context: &crate::host_context::PipelineHostContext,
-    timeout_secs: u64,
-) -> usize {
-    let Some(supervisor) = host_context.task_supervisor.as_ref() else {
-        return 0;
-    };
-    let Some(parent_tcid) = host_context.parent_tool_call_id.as_deref() else {
-        return 0;
-    };
-    let reason = format!("pipeline timed out after {timeout_secs}s");
-    let cascaded = supervisor.mark_descendants_failed(parent_tcid, &reason);
-    if cascaded > 0 {
-        tracing::warn!(
-            parent_tool_call_id = %parent_tcid,
-            cascaded,
-            timeout_secs,
-            "run_pipeline timeout cascade-failed orphan child node tasks",
-        );
-    }
-    cascaded
-}
-
 /// pipeline-level timeout had no audit-trail marker at all, even
 /// though pipeline workers had been launched and consumed budget.
 /// Records `success: false`, a `duration_ms` equal to the elapsed
@@ -701,6 +667,45 @@ fn emit_external_context_unmanaged_timeout_summary(
             "failed to write M17-B timeout summary; downstream evidence validators may flag this run"
         );
     }
+}
+
+/// Cascade-fail every still-active `pipeline:<node>` child task
+/// registered in the supervisor under the `run_pipeline` parent's
+/// `tool_call_id`. Invoked from the `RunPipelineTool::execute` timeout
+/// arm so dropped child futures don't leave orphan `state: "running"`
+/// entries in the supervisor (the bug that surfaced as
+/// `pipeline:analyze running` indefinitely on the dashboard).
+///
+/// No-op when the host context didn't snapshot a supervisor (legacy
+/// callers / unit tests) or didn't carry a parent_tool_call_id. The
+/// underlying [`TaskSupervisor::mark_descendants_failed`] filters to
+/// the `pipeline:` `tool_name` prefix so the parent `run_pipeline`
+/// task (which shares the same `tool_call_id` as its node children)
+/// is never touched by the cascade — its own `mark_failed` path in
+/// the timeout arm handles parent-level transition. The supervisor
+/// method is also idempotent on already-terminal tasks, so
+/// re-invocation is safe.
+fn cascade_fail_orphan_node_tasks(
+    host_context: &crate::host_context::PipelineHostContext,
+    timeout_secs: u64,
+) -> usize {
+    let Some(supervisor) = host_context.task_supervisor.as_ref() else {
+        return 0;
+    };
+    let Some(parent_tcid) = host_context.parent_tool_call_id.as_deref() else {
+        return 0;
+    };
+    let reason = format!("pipeline timed out after {timeout_secs}s");
+    let cascaded = supervisor.mark_descendants_failed(parent_tcid, &reason);
+    if cascaded > 0 {
+        tracing::warn!(
+            parent_tool_call_id = %parent_tcid,
+            cascaded,
+            timeout_secs,
+            "run_pipeline timeout cascade-failed orphan child node tasks",
+        );
+    }
+    cascaded
 }
 
 /// #1020 / M17-B — write a `summary.json` carrying the
@@ -1178,6 +1183,11 @@ mod tests {
     /// showed parent task hitting `task_updated:failed` while
     /// `pipeline:analyze` had exactly ONE `state:running` event and
     /// never a terminal mark.
+    ///
+    /// Codex MAJOR follow-up on #1180: the cascade MUST NOT touch the
+    /// parent `run_pipeline` task even though it shares the same
+    /// `tool_call_id` as its node children — the parent's own
+    /// `mark_failed` path handles parent-level transition.
     #[test]
     fn cascade_fail_orphan_node_tasks_marks_all_active_children_failed() {
         use octos_agent::task_supervisor::TaskSupervisor;
@@ -1185,6 +1195,15 @@ mod tests {
 
         let supervisor = Arc::new(TaskSupervisor::new());
         let parent_tcid = "tool-call-run_pipeline-timeout";
+
+        // The parent run_pipeline task is registered with the SAME
+        // tool_call_id its node children reuse (see
+        // execution.rs::register_task_with_input_and_cmid +
+        // executor.rs::register_node_task). The cascade must filter
+        // by `pipeline:` prefix and skip this parent.
+        let parent_task =
+            supervisor.register("run_pipeline", parent_tcid, Some("session-timeout-test"));
+        supervisor.mark_running(&parent_task);
 
         // Two pipeline-node child tasks registered under the parent
         // tool_call_id, both moved to running (matching what the
@@ -1233,6 +1252,23 @@ mod tests {
                 "error must carry the canonical timeout reason, got: {err}",
             );
         }
+
+        // Parent task must remain Running — the cascade filters by
+        // `pipeline:` prefix so the parent run_pipeline task is
+        // never touched even though it shares the same tool_call_id.
+        let parent_after = supervisor
+            .get_task(&parent_task)
+            .expect("parent run_pipeline task survives");
+        assert_eq!(
+            parent_after.status.as_str(),
+            "running",
+            "parent run_pipeline task must NOT be touched by the cascade — \
+             its own mark_failed path in the timeout arm handles parent-level transition"
+        );
+        assert!(
+            parent_after.error.is_none(),
+            "cascade must not write an error to the parent task"
+        );
     }
 
     /// `cascade_fail_orphan_node_tasks` is a no-op when the host
