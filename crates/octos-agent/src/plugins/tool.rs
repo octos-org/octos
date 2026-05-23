@@ -873,6 +873,28 @@ fn value_kind_label(value: &serde_json::Value) -> &'static str {
 ///    sees an empty string.
 fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> String {
     use octos_bus::file_handle::ToolPathScope;
+    // Codex round-2 BLOCKER fix (PR #1186 review): fail fast at the
+    // resolver entry. A raw input like `../secret.md` (no `skill-output/`
+    // prefix) would previously slip through every branch and land in
+    // `absolutize_path_in_work_dir`, which lexically joins with
+    // `work_dir` to produce `<work_dir>/../secret.md` — escaping the
+    // chrooted plugin `work_dir`. Reject any candidate carrying `..`
+    // (`ParentDir`) components at the very top, BEFORE any branch
+    // (`resolve_tool_path` lookup, `strip_redundant_skill_output_prefix`,
+    // `resolve_path_in_work_dir`, or the `absolutize_path_in_work_dir`
+    // fallback) can construct an escape. Returning the raw path
+    // unchanged surfaces a benign "file not found" downstream rather
+    // than silently reading the bait file above the chroot.
+    // Note: absolute paths and Windows prefixes are NOT blocked here —
+    // they're handled correctly by `resolve_tool_path` (rejects out-of-
+    // scope) and by `resolve_path_in_work_dir`'s basename-fallback
+    // (which discards directory components and is safe by construction).
+    if std::path::Path::new(raw_path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return raw_path.to_string();
+    }
     // B1 fleet UX soak (mini2/iter1, mini5/iter2): when the host has
     // chrooted plugin `work_dir` into `<workspace>/skill-output/` (the
     // modern `runtime/session.rs` path), but the LLM passes a
@@ -980,6 +1002,24 @@ fn strip_redundant_skill_output_prefix(
 
 fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Option<String> {
     let candidate = std::path::Path::new(raw_path);
+
+    // Codex round-2 BLOCKER fix (PR #1186 review): fail fast for any
+    // candidate carrying `..` (`ParentDir`) — before ANY branch. The
+    // basename-fallback below joins `work_dir.join(file_name())`,
+    // which CANNOT escape (file_name discards directory components),
+    // so absolute paths and Windows prefixes are still allowed to flow
+    // through to the basename fallback (legitimate use: LLM passes an
+    // absolute path that doesn't exist on this host, but the basename
+    // exists in `work_dir`). Only `..` poisons the resolution because
+    // the upstream `resolve_plugin_input_path` would otherwise fall
+    // back to `absolutize_path_in_work_dir` on a `None` here and
+    // construct `<work_dir>/../foo` — escaping the chroot.
+    if candidate
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
 
     // Codex BLOCKER fix (PR #1186 review): the absolute, raw-relative,
     // and lexical-join branches below must NOT accept inputs that
@@ -1939,6 +1979,57 @@ mod tests {
             resolved,
             secret.to_string_lossy().to_string(),
             "parent-dir escape must NOT resolve to the workspace-root bait file (resolved={resolved})"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_input_path_rejects_raw_parent_dir_escape() {
+        // Codex round-2 BLOCKER fix (PR #1186 review): the prior fixup
+        // only blocked `skill-output/../secret.md` (the prefix-stripped
+        // form). A RAW `../secret.md` (no `skill-output/` prefix) would
+        // still fall through `strip_redundant_skill_output_prefix`
+        // (returns None — no prefix to strip), then `resolve_tool_path`
+        // (rejects), then `resolve_path_in_work_dir` (returns None
+        // after the existing guard), and finally land in
+        // `absolutize_path_in_work_dir`, which lexically joins to
+        // produce `<skill_output>/../secret.md` — escaping the chrooted
+        // plugin work_dir.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Bait file ABOVE the chroot.
+        let secret = workspace.path().join("secret.md");
+        std::fs::write(&secret, b"SECRET").unwrap();
+
+        // 1. The low-level resolver must return None for the unsafe
+        //    raw path at the entry, before any branch (Codex round-2
+        //    option 1: fail fast at the resolver).
+        assert!(
+            resolve_path_in_work_dir("../secret.md", &skill_output).is_none(),
+            "resolve_path_in_work_dir must return None for raw `..` escape"
+        );
+
+        // 2. End-to-end: the top-level resolver must NOT construct a
+        //    path that escapes the chroot. The bait file path
+        //    `<workspace>/secret.md` is what `<skill_output>/../secret.md`
+        //    resolves to on disk; the resolver must avoid producing
+        //    either the lexical-escape string OR the canonical bait
+        //    path.
+        let resolved = resolve_plugin_input_path("../secret.md", &skill_output);
+        let escape_lexical = skill_output
+            .join("../secret.md")
+            .to_string_lossy()
+            .to_string();
+        assert_ne!(
+            resolved, escape_lexical,
+            "raw parent-dir escape must NOT lexically resolve to the bait path \
+             (resolved={resolved}, escape_lexical={escape_lexical})"
+        );
+        assert_ne!(
+            resolved,
+            secret.to_string_lossy().to_string(),
+            "raw parent-dir escape must NOT resolve to the workspace-root bait file \
+             (resolved={resolved})"
         );
     }
 
