@@ -220,15 +220,16 @@ mod tests {
         // markdown script — no `podcast_voices` precondition required.
         // The verified manifest (mofa-podcast 0.4.5) does NOT require a
         // top-level `voice` argument either, so this is purely a prompt
-        // change. The generation bullet must:
+        // change.
         //
-        // 1. Tell the model to call `podcast_generate` DIRECTLY.
-        // 2. Explicitly forbid calling `podcast_voices` first as a
-        //    precondition (this is the load-bearing nudge for
-        //    deepseek-v4-pro).
-        // 3. Tell the model the voice list is NOT required for
-        //    generation (preset names are inlined in the prompt — see
-        //    `should_name_preset_voices_for_script_generation`).
+        // codex round-4 follow-up: the previous round-3 nudges
+        // ("Do NOT call `podcast_voices` first", "voice list is NOT a
+        // precondition") still surfaced the `podcast_voices` token on
+        // the generation rules. Some literal-instruction models latched
+        // onto the negation and probed anyway. The generation bullets
+        // must now scrub the `podcast_voices` token entirely and rely
+        // on a generic "no separate voice-listing step is required"
+        // phrasing.
         assert!(
             PROMPT.contains("`podcast_generate` DIRECTLY"),
             "prompt must instruct the model to call `podcast_generate` \
@@ -236,19 +237,51 @@ mod tests {
              previous voice-probe workflow stalled deepseek-v4-pro on \
              the voice list"
         );
+        // Round-4 regression guard: the generation surface must NOT
+        // mention `podcast_voices` (positively or negatively). The
+        // only allowed mention is the explicit "Podcast voice list
+        // only" carve-out (see
+        // `should_preserve_voice_list_only_route_for_explicit_listing`).
         assert!(
-            PROMPT.contains("Do NOT call `podcast_voices` first"),
-            "prompt must explicitly forbid calling `podcast_voices` \
-             first as a precondition for generation (NEW-05 round-3 \
-             fix); without this nudge deepseek-v4-pro stalls on the \
-             voice list as the final answer"
+            !PROMPT.contains("Do NOT call `podcast_voices` first"),
+            "round-4 fix: the negated `podcast_voices` nudge must not \
+             return on the generation surface — the token itself was \
+             enough to make literal-instruction models probe anyway. \
+             Use a generic 'no separate voice-listing step is \
+             required' phrasing instead."
         );
         assert!(
-            PROMPT.contains("voice list is NOT a precondition")
-                || PROMPT.contains("voice list is NOT required for generation"),
-            "prompt must say the voice list is NOT a precondition / \
-             NOT required for generation so the model skips the \
-             podcast_voices probe (NEW-05 round-3 fix)"
+            !PROMPT.contains("voice list is NOT a precondition"),
+            "round-4 fix: the 'voice list is NOT a precondition' \
+             phrasing must not return — round-4 strips voice-listing \
+             references off the generation path entirely (the \
+             dedicated voice-list bullet still handles explicit \
+             listing intent)"
+        );
+        assert!(
+            !PROMPT.contains("voice list is NOT required for generation"),
+            "round-4 fix: the 'voice list is NOT required for \
+             generation' phrasing must not return — round-4 removes \
+             voice-listing references from the generation path"
+        );
+        assert!(
+            PROMPT.contains("no separate voice-listing step is required"),
+            "round-4 fix: the generation surface must use the generic \
+             'no separate voice-listing step is required' wording to \
+             discourage a separate listing call without naming \
+             `podcast_voices`"
+        );
+        // Round-4 structural guard: count `podcast_voices` mentions
+        // and ensure there is exactly one (the dedicated voice-list
+        // bullet). Any extra mention must live in a "list voices"
+        // carve-out, but right now we only ship one such carve-out.
+        let mentions = PROMPT.matches("podcast_voices").count();
+        assert_eq!(
+            mentions, 1,
+            "expected exactly one `podcast_voices` mention (the \
+             dedicated voice-list-only bullet), found {mentions}. \
+             The generation surface must not reference \
+             `podcast_voices` (codex round-4)"
         );
     }
 
