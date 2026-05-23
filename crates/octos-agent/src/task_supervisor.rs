@@ -1551,6 +1551,62 @@ impl TaskSupervisor {
         }
     }
 
+    /// Cascade-fail every still-active child of `parent_tool_call_id`.
+    ///
+    /// Used by the `run_pipeline` timeout arm to flush orphan
+    /// `pipeline:<node>` child tasks when the parent future is dropped
+    /// before per-node `mark_completed` / `mark_failed` can fire. Without
+    /// this cascade the children stay forever as `state: "running"` in
+    /// the supervisor, and the SessionTaskIndicator on the dashboard
+    /// shows e.g. `pipeline:analyze running` indefinitely.
+    ///
+    /// IMPORTANT: filters to NODE children only via the `pipeline:`
+    /// `tool_name` prefix. The parent `run_pipeline` task is itself
+    /// registered with the same `tool_call_id` (see
+    /// `execution.rs::register_task_with_input_and_cmid`), and pipeline
+    /// node tasks reuse that id via `executor.rs::register_node_task`.
+    /// Without the prefix filter the cascade would also mark the parent
+    /// failed, racing with the parent runner's own `mark_failed` path.
+    /// `pipeline:` is the only prefix `register_node_task` ever emits,
+    /// so this is a precise filter for "node tasks under this run".
+    ///
+    /// Snapshots the matching active task ids under the `tasks` mutex
+    /// first, then drops the lock and calls `mark_failed` per id so the
+    /// per-task lock acquisition inside `mark_failed` does not deadlock
+    /// on the snapshot. Returns the number of children that were
+    /// transitioned to `Failed`. Already-terminal tasks are skipped by
+    /// `is_active()` and the deadlock-safe `mark_failed` guard.
+    pub fn mark_descendants_failed(&self, parent_tool_call_id: &str, reason: &str) -> usize {
+        if parent_tool_call_id.is_empty() {
+            return 0;
+        }
+        let active_children: Vec<String> = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|task| {
+                task.tool_call_id == parent_tool_call_id
+                    && task.status.is_active()
+                    && task.tool_name.starts_with("pipeline:")
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        let count = active_children.len();
+        for child_id in active_children {
+            self.mark_failed(&child_id, reason.to_string());
+        }
+        if count > 0 {
+            tracing::info!(
+                parent_tool_call_id = %parent_tool_call_id,
+                cascaded = count,
+                reason = %reason,
+                "cascade-failed child tasks under parent tool_call_id"
+            );
+        }
+        count
+    }
+
     /// Emit a `SpawnOnlyFailureSignal` for a freshly-failed task, if a
     /// failure callback has been registered. The error_message is taken
     /// from the task's `error` field (set immediately before this call).
@@ -2298,6 +2354,142 @@ mod tests {
         let active = supervisor.get_active_tasks();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].tool_call_id, "call-2");
+    }
+
+    /// Cascade-fail every active child of a parent's `tool_call_id`.
+    /// Regression pin for the `run_pipeline` timeout orphan bug —
+    /// without `mark_descendants_failed` child `pipeline:<node>` tasks
+    /// registered before the timeout future was dropped stayed in
+    /// `state: "running"` forever (visible to dashboard users as e.g.
+    /// `pipeline:analyze running` indefinitely).
+    #[test]
+    fn mark_descendants_failed_cascades_active_children_under_parent_tcid() {
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-run_pipeline-parent";
+        // The parent `run_pipeline` task is registered with the same
+        // tool_call_id its node children reuse via
+        // `executor.rs::register_node_task`. The cascade MUST NOT
+        // touch the parent (it has its own `mark_failed` path in the
+        // timeout arm of `RunPipelineTool::execute`).
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-1"));
+        // Three node children share the parent's tool_call_id. The
+        // first is pre-completed (should stay completed), the other
+        // two are running (should both transition to Failed with the
+        // timeout reason).
+        let child1 = supervisor.register("pipeline:setup", parent_tcid, Some("sess-1"));
+        let child2 = supervisor.register("pipeline:analyze", parent_tcid, Some("sess-1"));
+        let child3 = supervisor.register("pipeline:plan_and_search", parent_tcid, Some("sess-1"));
+        // A sibling task NOT under the timing-out parent: must be
+        // untouched by the cascade.
+        let unrelated = supervisor.register("tts", "call-other-parent", Some("sess-1"));
+
+        supervisor.mark_running(&parent);
+        supervisor.mark_running(&child2);
+        supervisor.mark_running(&child3);
+        supervisor.mark_running(&unrelated);
+        supervisor.mark_completed(&child1, vec![]);
+
+        let cascaded =
+            supervisor.mark_descendants_failed(parent_tcid, "pipeline timed out after 1200s");
+        assert_eq!(
+            cascaded, 2,
+            "exactly two pipeline:<node> children were active and should cascade-fail"
+        );
+
+        // child1 was completed before the cascade — must stay completed
+        // (mark_failed's terminal-state guard preserves it).
+        let t1 = supervisor.get_task(&child1).expect("child1");
+        assert_eq!(t1.status, TaskStatus::Completed);
+
+        // child2 and child3 were running — must now be Failed with the
+        // pipeline-timeout reason carried in the error field.
+        for cid in [&child2, &child3] {
+            let task = supervisor.get_task(cid).expect("child task");
+            assert_eq!(
+                task.status,
+                TaskStatus::Failed,
+                "child {cid} must be Failed after cascade"
+            );
+            assert_eq!(task.runtime_state, TaskRuntimeState::Failed);
+            assert!(task.completed_at.is_some());
+            let err = task.error.clone().unwrap_or_default();
+            assert!(
+                err.contains("pipeline timed out after 1200s"),
+                "child {cid} error must carry the timeout reason, got: {err}"
+            );
+        }
+
+        // The parent `run_pipeline` task itself must remain Running —
+        // its own `mark_failed` path in the timeout arm of
+        // `RunPipelineTool::execute` is responsible for transitioning
+        // it (the cascade must not race with that).
+        let parent_task = supervisor.get_task(&parent).expect("parent");
+        assert_eq!(
+            parent_task.status,
+            TaskStatus::Running,
+            "parent run_pipeline task must NOT be cascaded — it has its own mark_failed path"
+        );
+
+        // The unrelated sibling under a different parent tool_call_id
+        // must remain Running.
+        let other = supervisor.get_task(&unrelated).expect("unrelated");
+        assert_eq!(
+            other.status,
+            TaskStatus::Running,
+            "task under a different parent tool_call_id must not be cascaded"
+        );
+    }
+
+    /// Explicit regression pin for the codex MAJOR on #1180: the
+    /// cascade MUST filter to `pipeline:<node>` children and skip the
+    /// parent `run_pipeline` task even though both share the same
+    /// `tool_call_id`. Without the prefix filter, the cascade would
+    /// race with `RunPipelineTool::execute`'s own `mark_failed` path
+    /// for the parent.
+    #[test]
+    fn mark_descendants_failed_does_not_touch_parent_run_pipeline_task() {
+        let supervisor = TaskSupervisor::new();
+        let parent_tcid = "call-run_pipeline-only-parent";
+        // Register ONLY the parent (no node children yet — pipeline
+        // timed out before any node was dispatched, or all nodes
+        // already completed). Cascade must be a no-op for the parent.
+        let parent = supervisor.register("run_pipeline", parent_tcid, Some("sess-only"));
+        supervisor.mark_running(&parent);
+
+        let cascaded =
+            supervisor.mark_descendants_failed(parent_tcid, "pipeline timed out after 1200s");
+        assert_eq!(
+            cascaded, 0,
+            "no pipeline:<node> children registered, so cascade must be a no-op"
+        );
+
+        let parent_task = supervisor.get_task(&parent).expect("parent survives");
+        assert_eq!(
+            parent_task.status,
+            TaskStatus::Running,
+            "parent run_pipeline task must remain Running — cascade only targets pipeline:<node>"
+        );
+        assert!(
+            parent_task.error.is_none(),
+            "cascade must not write an error to the parent task"
+        );
+    }
+
+    /// `mark_descendants_failed` with an empty parent tool_call_id is
+    /// a no-op (defensive guard — empty strings never match a real
+    /// registered task, and we don't want to mass-fail tasks that
+    /// happened to register with no parent context).
+    #[test]
+    fn mark_descendants_failed_with_empty_parent_is_noop() {
+        let supervisor = TaskSupervisor::new();
+        let id = supervisor.register("pipeline:work", "", Some("sess"));
+        supervisor.mark_running(&id);
+
+        let cascaded = supervisor.mark_descendants_failed("", "timeout");
+        assert_eq!(cascaded, 0, "empty parent tcid must short-circuit");
+
+        let task = supervisor.get_task(&id).expect("task survives");
+        assert_eq!(task.status, TaskStatus::Running);
     }
 
     #[test]
