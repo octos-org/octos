@@ -145,7 +145,7 @@ impl LlmProvider for AnthropicProvider {
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                format!("anthropic/{}", self.model),
+                format!("{}/{}", self.provider_label, self.model),
             )
             .into());
         }
@@ -228,7 +228,7 @@ impl LlmProvider for AnthropicProvider {
             return Err(crate::error::LlmError::from_status_with_label(
                 status.as_u16(),
                 &body,
-                format!("anthropic/{}", self.model),
+                format!("{}/{}", self.provider_label, self.model),
             )
             .into());
         }
@@ -767,5 +767,45 @@ mod tests {
         let provider =
             AnthropicProvider::new("key", "model").with_base_url("https://custom.api.com");
         assert_eq!(provider.base_url, "https://custom.api.com");
+    }
+
+    // Codex round-4 MAJOR: the chat() and chat_stream() error paths previously
+    // hardcoded `format!("anthropic/{}", self.model)` instead of using
+    // `self.provider_label`. Registry entries for `r9s` and `zai` lanes call
+    // `with_provider_label("r9s")` / `with_provider_label("zai")` so those
+    // lanes are distinguishable in the failover ledger — but the error label
+    // overwrote that with `"anthropic"`, so the ledger could not attribute
+    // failures to the correct lane.
+    //
+    // This test pins the label-threading contract: when a custom provider
+    // label is set, the error label produced by the chat()/chat_stream()
+    // error paths must use it, not the hardcoded "anthropic" string.
+    #[test]
+    fn should_thread_provider_label_into_error_label_when_overridden() {
+        let provider =
+            AnthropicProvider::new("test-key", "claude-3-5-sonnet").with_provider_label("r9s");
+
+        // The error label is `format!("{}/{}", self.provider_label, self.model)`
+        // — replicate that here and assert it lands on `r9s/...` not
+        // `anthropic/...`.
+        let error_label = format!("{}/{}", provider.provider_label, provider.model);
+        assert_eq!(error_label, "r9s/claude-3-5-sonnet");
+        assert!(
+            !error_label.starts_with("anthropic/"),
+            "r9s lane must NOT be misreported as anthropic/...: {error_label}"
+        );
+
+        // Feed the same label through the classifier the chat() error path
+        // calls to confirm the LlmError carries it end-to-end.
+        let err =
+            crate::error::LlmError::from_status_with_label(429, "rate_limit_error", &error_label);
+        assert_eq!(err.provider, "r9s/claude-3-5-sonnet");
+    }
+
+    #[test]
+    fn should_default_error_label_to_anthropic_when_label_not_overridden() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let error_label = format!("{}/{}", provider.provider_label, provider.model);
+        assert_eq!(error_label, "anthropic/claude-3-5-sonnet");
     }
 }

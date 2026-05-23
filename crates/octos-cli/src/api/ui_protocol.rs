@@ -16376,7 +16376,6 @@ async fn transition_to_terminal(
     Some(TerminalTransition { reason, ack })
 }
 
-/// Atomically transition state and emit exactly one terminal event. No-op if
 /// Translate an `eyre::Report` escaping the agent loop into the
 /// user-facing string the SPA renders inside a `runtime_error` envelope.
 ///
@@ -16413,6 +16412,7 @@ fn classify_runtime_error_message(error: &eyre::Report) -> String {
     error.to_string()
 }
 
+/// Atomically transition state and emit exactly one terminal event. No-op if
 /// the state is already `Terminal(_)`. See `transition_to_terminal` for the
 /// state-machine details.
 async fn try_emit_terminal(
