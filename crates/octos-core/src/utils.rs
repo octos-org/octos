@@ -70,6 +70,13 @@ pub fn truncate_head_tail(s: &str, max_len: usize, head_ratio: f32) -> String {
 }
 
 /// Default per-tool output limits (max chars). Tools not listed use the global default.
+///
+/// High-volume aggregation tools (`news_fetch`, `deep_search`) intentionally
+/// exceed the 50K default: their JSON payloads bundle dozens of headlines or
+/// hits in a single call. When their output is middle-elided the LLM mistakes
+/// the elision marker for "incomplete results" and retries with drifting
+/// arguments — see the `web-1779494658716-mxrxe8` diagnostic and PR
+/// `fix/news-fetch-loop-and-detect-recovery`.
 pub fn tool_output_limit(tool_name: &str) -> usize {
     match tool_name {
         "read_file" => 50_000,
@@ -78,7 +85,9 @@ pub fn tool_output_limit(tool_name: &str) -> usize {
         "web_fetch" => 40_000,
         "web_search" => 20_000,
         "search" => 50_000,
+        "deep_search" => 200_000,
         "deep_research" => 50_000,
+        "news_fetch" => 200_000,
         "spawn" => 50_000,
         _ => 50_000, // global default
     }
@@ -157,5 +166,33 @@ mod tests {
         assert_eq!(tool_output_limit("read_file"), 50_000);
         assert_eq!(tool_output_limit("shell"), 30_000);
         assert_eq!(tool_output_limit("unknown_tool"), 50_000);
+    }
+
+    /// Regression: `news_fetch` returns a JSON payload bundling dozens of
+    /// headlines and can easily exceed the 50K global default. When the
+    /// output is middle-elided ("... [N bytes omitted] ..."), kimi-class
+    /// models mistake the marker for incomplete results and retry with
+    /// drifting `categories=` argument lists — the exact spiral observed
+    /// on session `web-1779494658716-mxrxe8` (ledger seq 214-562). Guard
+    /// against a future silent shrink.
+    #[test]
+    fn news_fetch_limit_is_at_least_100k_bytes() {
+        assert!(
+            tool_output_limit("news_fetch") >= 100_000,
+            "news_fetch tool_output_limit must stay >=100K bytes to avoid \
+             middle-elision triggering a retry spiral; current value is {}",
+            tool_output_limit("news_fetch")
+        );
+    }
+
+    /// Companion regression for `deep_search`: similar aggregation profile.
+    #[test]
+    fn deep_search_limit_is_at_least_100k_bytes() {
+        assert!(
+            tool_output_limit("deep_search") >= 100_000,
+            "deep_search tool_output_limit must stay >=100K bytes to avoid \
+             middle-elision triggering retry behaviour; current value is {}",
+            tool_output_limit("deep_search")
+        );
     }
 }
