@@ -2115,11 +2115,26 @@ fn inject_loop_detected_synthetic_results(
     let stub_body =
         "[LOOP DETECTED] (companion call in the same batch; see paired result for the warning).";
 
-    // Push the assistant turn (carries `tool_calls`) so the synthetic
-    // tool-result messages have a corresponding `tool_use` to bind to.
-    messages.push(agent.response_to_message(response));
+    // Sanitize tool_call_ids the same way the normal `handle_tool_use` path
+    // does (see loop_runner.rs line ~1685): some providers (Moonshot/kimi)
+    // emit IDs containing colons like "admin_view_sessions:11" which OpenAI
+    // and our duplicate-repair logic both reject/collapse. Skipping this on
+    // the synthetic path would leave the next LLM call with unanswered
+    // tool_calls or a 400 from the next request. We sanitize on a clone of
+    // the response so the SAME id flows into BOTH the assistant message's
+    // `tool_calls` (via `response_to_message`) and the matching tool-result
+    // `tool_call_id` below, preserving the 1:1 pairing end-to-end.
+    let mut sanitized_response = response.clone();
+    for tc in sanitized_response.tool_calls.iter_mut() {
+        tc.id = sanitize_tool_call_id(&tc.id);
+    }
 
-    for (idx, tc) in response.tool_calls.iter().enumerate() {
+    // Push the assistant turn (carries the sanitized `tool_calls`) so the
+    // synthetic tool-result messages have a corresponding `tool_use` to
+    // bind to.
+    messages.push(agent.response_to_message(&sanitized_response));
+
+    for (idx, tc) in sanitized_response.tool_calls.iter().enumerate() {
         let body = if idx == 0 { &primary_body } else { stub_body };
         messages.push(Message {
             role: MessageRole::Tool,
@@ -4760,6 +4775,93 @@ printf '{"output":"voice saved","success":true}\n'
                 && messages[2].content.contains("companion"),
             "companion tool result should mark itself as such: got `{}`",
             messages[2].content
+        );
+    }
+
+    /// Codex MAJOR on PR #1181: the synthetic injection path bypassed the
+    /// `sanitize_tool_call_id` step that the normal `handle_tool_use` path
+    /// applies (loop_runner.rs ~line 1685). Moonshot/kimi (which dspfac uses)
+    /// emits IDs with colons like `admin_view_sessions:11` — OpenAI-style
+    /// schemas reject those, and our own duplicate-repair logic can collapse
+    /// them, leaving unanswered tool_calls on the next LLM call.
+    ///
+    /// This test simulates a looping ChatResponse with a colon-bearing id and
+    /// asserts:
+    ///   1. The injected synthetic messages carry a sanitized id (no colon).
+    ///   2. The assistant message's `tool_calls[].id` matches the tool
+    ///      result's `tool_call_id` 1:1 (same sanitized id end-to-end).
+    #[test]
+    fn inject_synthetic_results_sanitizes_tool_call_ids_with_colons() {
+        let raw_id = "admin_view_sessions:11";
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: raw_id.to_string(),
+                name: "news_fetch".to_string(),
+                arguments: serde_json::json!({"categories": ["tech"]}),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let memory = runtime.block_on(async {
+            Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap())
+        });
+        let agent = Agent::new(AgentId::new("sanitize-test"), provider, tools, memory);
+
+        let mut messages: Vec<Message> = Vec::new();
+        super::super::loop_runner::inject_loop_detected_synthetic_results(
+            &mut messages,
+            &response,
+            "[LOOP DETECTED] cycle length 1.",
+            &agent,
+        );
+
+        // Layout: 1 assistant + 1 tool result.
+        assert_eq!(messages.len(), 2, "expected 1 assistant + 1 tool result");
+
+        // Extract the assistant tool_call id and the tool result's
+        // tool_call_id; both must be the SAME sanitized value.
+        let assistant_tc_id = messages[0]
+            .tool_calls
+            .as_ref()
+            .and_then(|tcs| tcs.first())
+            .map(|tc| tc.id.clone())
+            .expect("assistant message must carry sanitized tool_calls");
+        let tool_result_id = messages[1]
+            .tool_call_id
+            .clone()
+            .expect("tool result must carry tool_call_id");
+
+        // 1. Sanitized — no colon left over.
+        assert!(
+            !assistant_tc_id.contains(':'),
+            "assistant tool_call id must be sanitized (no colon): got `{assistant_tc_id}`"
+        );
+        assert!(
+            !tool_result_id.contains(':'),
+            "tool result tool_call_id must be sanitized (no colon): got `{tool_result_id}`"
+        );
+
+        // 2. Same id on BOTH sides — providers bind tool_use ↔ tool_result
+        // by exact id match, so any drift here would orphan the pair.
+        assert_eq!(
+            assistant_tc_id, tool_result_id,
+            "assistant tool_calls[].id and tool result tool_call_id must \
+             share the SAME sanitized id (1:1 pairing); raw_id was `{raw_id}`"
+        );
+
+        // 3. Concrete sanitized form: `:` → `_` per `sanitize_tool_call_id`.
+        assert_eq!(
+            assistant_tc_id, "admin_view_sessions_11",
+            "sanitize_tool_call_id should replace `:` with `_`"
         );
     }
 
