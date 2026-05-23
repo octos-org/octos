@@ -67,7 +67,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::AppState;
 use super::agent_orchestrator::{
@@ -15752,7 +15752,7 @@ async fn run_standalone_turn(
                 // block call `apply_self_paced_response` from a
                 // reply that never made it into session history.
                 // Defer the send until below the persist block.
-                let captured_final_reply = response.content.clone();
+                let mut captured_final_reply = response.content.clone();
                 let mut cursor = None;
                 // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
                 // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
@@ -15771,23 +15771,49 @@ async fn run_standalone_turn(
                         &response.content,
                         response.reasoning_content.clone(),
                     );
-                    // dspfac "two bubbles per turn" fix: when the loop
-                    // returned a synthesised spawn_only ack
-                    // (`response.synthesized_from_spawn_only = true`),
-                    // the row carrying that ack content is the one
-                    // returned from `final_assistant_message`. The
-                    // capability filter at
+                    // Fleet-UX soak NEW-03 (mini3/mini5, 2026-05-23):
+                    // the #1183 fix tagged the synthesised spawn_only
+                    // ack's WIRE envelope with `source: background`
+                    // so the per-connection capability filter at
                     // `live_event_passes_capability_filter` suppresses
-                    // `message/persisted` events whose
-                    // `source: background` so dual-negotiated clients
-                    // (those carrying `event.spawn_complete.v1`) drop
-                    // the duplicate of the iter-1 preamble row,
-                    // collapsing the visible chat shape from two
-                    // bubbles to one. Legacy clients without that
-                    // capability still receive the ack as an
-                    // assistant row — backward-compatible.
-                    let final_assistant_uses_background_source =
+                    // the LIVE `message/persisted` for dual-negotiated
+                    // clients — but the JSONL row was still committed
+                    // with `role: assistant`. The page handler at
+                    // `handle_session_messages_page` walks JSONL
+                    // directly with NO source filter, so any SPA
+                    // refresh / replay re-rendered the suppressed
+                    // bubble. Soak captured 33 occurrences of the
+                    // ack text in messages_page payloads under one
+                    // turn — the "ghost ack" bug.
+                    //
+                    // Post-fix: when `synthesized_from_spawn_only`
+                    // is set, skip the ack persist entirely. The
+                    // background task's real outcome still flows via
+                    // `BackgroundResultSender` (its own persist +
+                    // `turn/spawn_complete` envelope), so the
+                    // legitimate "task finished" signal is unaffected.
+                    // Only the foreground synthesised "started" bubble
+                    // — which the foreground cannot actually verify
+                    // and which dual-negotiated clients already
+                    // suppress on the live channel — is dropped.
+                    let skip_synthesized_spawn_only_ack =
                         response.synthesized_from_spawn_only && final_assistant.is_some();
+                    // Codex round-2/3 P2 on this PR: track the LAST
+                    // non-empty preamble assistant content that lands.
+                    // When we skip the synthesised ack and a preamble
+                    // row carried content (e.g. self-paced loop says
+                    // "Starting... <<loop-next-in: 60s>>" plus the
+                    // spawn_only tool call), we substitute this
+                    // captured text for `response.content` on the
+                    // oneshot. That makes `apply_self_paced_response`
+                    // parse the PREAMBLE's hint directly — bypassing
+                    // the history-fallback walk which is unsafe in the
+                    // presence of fast background completions (the
+                    // walk uses `.last()` on assistant rows, so a
+                    // BackgroundResultSender row that lands before the
+                    // post-turn reschedule would otherwise win and
+                    // drop the preamble's hint).
+                    let mut last_persisted_preamble_assistant: Option<String> = None;
                     let mut skipped_internal_user = false;
                     for message in response.messages.iter().cloned() {
                         if skip_internal_user_persist
@@ -15805,6 +15831,14 @@ async fn run_standalone_turn(
                         let is_final_assistant_carrier = message.role == MessageRole::Assistant
                             && message.content == response.content
                             && !response.content.is_empty();
+                        let preamble_assistant_content =
+                            if message.role == MessageRole::Assistant
+                                && !message.content.trim().is_empty()
+                            {
+                                Some(message.content.clone())
+                            } else {
+                                None
+                            };
                         let to_save =
                             pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
                         let saved_for_context = to_save.clone();
@@ -15826,45 +15860,115 @@ async fn run_standalone_turn(
                             if is_final_assistant_carrier {
                                 final_assistant_persisted = true;
                             }
+                            if let Some(content) = preamble_assistant_content {
+                                last_persisted_preamble_assistant = Some(content);
+                            }
                         }
                     }
+                    let any_preamble_assistant_persisted =
+                        last_persisted_preamble_assistant.is_some();
                     if let Some(message) = final_assistant {
-                        // The `final_assistant` row is the synthesised
-                        // carrier of `response.content`. By
-                        // construction this is an Assistant row (so
-                        // the skip_internal_user_persist branch does
-                        // not apply) and its content equals
-                        // `response.content` (so it is the
-                        // final-assistant carrier).
-                        let to_save =
-                            pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
-                        let saved_for_context = to_save.clone();
-                        let session_id_for_persist = agent_session_id.clone();
-                        let persist = async {
-                            sessions
-                                .add_message_with_seq(&session_id_for_persist, to_save)
-                                .await
-                        };
-                        let commit = if final_assistant_uses_background_source {
-                            MESSAGE_PERSISTED_SOURCE_OVERRIDE
-                                .scope(Some(MessagePersistedSource::Background), persist)
-                                .await
-                        } else {
-                            persist.await
-                        };
-                        if let Ok(seq) = commit {
-                            record_appui_context_manager_message(
-                                &context_data_dir_for_result,
-                                &context_manager_for_result,
-                                &agent_session_id,
-                                &saved_for_context,
-                                seq,
+                        // Fleet-UX soak NEW-03: when the loop fabricated
+                        // the synthesised "Background work started for
+                        // `<tool>`." ack, skip the JSONL persist
+                        // entirely (see the
+                        // `skip_synthesized_spawn_only_ack` comment
+                        // above for the full rationale).
+                        //
+                        // Codex P2 (rounds 1-2) on this PR: a
+                        // self-paced / `maintenance` loop firing a
+                        // BARE spawn_only call with NO LLM preamble
+                        // has only the synthesised ack as its
+                        // turn-final assistant content. If we skip
+                        // the ack persist AND leave
+                        // `final_assistant_persisted=false`,
+                        // `final_send` becomes `None`, the
+                        // history-fallback scan also finds no
+                        // non-empty row (because we skipped the
+                        // persist), and `apply_self_paced_response`
+                        // never fires. Since fire-time clears
+                        // `next_run_at_ms` until
+                        // `apply_self_paced_response` stamps a fresh
+                        // delay, the loop would stall.
+                        //
+                        // BUT codex round-2 caught the dual:
+                        // unconditionally flipping
+                        // `final_assistant_persisted` regresses
+                        // turns that DID emit a non-empty preamble
+                        // carrying a model-provided
+                        // `<<loop-next-in: 60s>>` hint. The post-turn
+                        // rescheduler would prefer the captured
+                        // (synthesised, hint-less) ack on the
+                        // oneshot over the persisted preamble's
+                        // hint, falling back to the 15-min default
+                        // and dropping the model's requested delay.
+                        //
+                        // So flip ONLY when no non-empty assistant
+                        // row landed during the preamble loop. With
+                        // a preamble row present, leave
+                        // `final_assistant_persisted` at false here
+                        // — the rescheduler walks history, picks the
+                        // preamble row, and honours its hint.
+                        if skip_synthesized_spawn_only_ack {
+                            // Codex rounds 1-3 P2 on this PR: route a
+                            // self-paced / `maintenance` loop's
+                            // reschedule signal deterministically WITHOUT
+                            // touching the unsafe history-fallback walk
+                            // (whose `.last()` semantics can race with a
+                            // fast `BackgroundResultSender` row landing
+                            // before the post-turn block runs).
+                            //
+                            // Strategy: always flip
+                            // `final_assistant_persisted` to true on
+                            // the skip path, and substitute the
+                            // captured_final_reply with the persisted
+                            // preamble's content when present
+                            // (round-3 fix) — or fall back to the
+                            // synth-ack text for a bare-spawn-only
+                            // turn (round-1 fix). See
+                            // `captured_final_reply_for_synth_ack_skip`
+                            // for the truth table.
+                            debug!(
+                                session = %agent_session_id,
+                                preamble_present = %any_preamble_assistant_persisted,
+                                "skipping JSONL persist for synthesised spawn_only ack (NEW-03); \
+                                 routing reschedule signal deterministically without the \
+                                 history-fallback walk"
                             );
-                            cursor = Some(UiCursor {
-                                stream: agent_session_id.0.clone(),
-                                seq: seq as u64,
-                            });
+                            captured_final_reply = captured_final_reply_for_synth_ack_skip(
+                                captured_final_reply,
+                                last_persisted_preamble_assistant.as_deref(),
+                            );
                             final_assistant_persisted = true;
+                        } else {
+                            // The `final_assistant` row is the synthesised
+                            // carrier of `response.content`. By
+                            // construction this is an Assistant row (so
+                            // the skip_internal_user_persist branch does
+                            // not apply) and its content equals
+                            // `response.content` (so it is the
+                            // final-assistant carrier).
+                            let to_save =
+                                pre_stamp_turn_thread_id(message, &turn_thread_id_for_persist);
+                            let saved_for_context = to_save.clone();
+                            let session_id_for_persist = agent_session_id.clone();
+                            let commit = sessions
+                                .add_message_with_seq(&session_id_for_persist, to_save)
+                                .await;
+                            if let Ok(seq) = commit {
+                                record_appui_context_manager_message(
+                                    &context_data_dir_for_result,
+                                    &context_manager_for_result,
+                                    &agent_session_id,
+                                    &saved_for_context,
+                                    seq,
+                                );
+                                cursor = Some(UiCursor {
+                                    stream: agent_session_id.0.clone(),
+                                    seq: seq as u64,
+                                });
+                                final_assistant_persisted = true;
+                            }
                         }
                     }
                 }
@@ -16776,6 +16880,37 @@ fn final_assistant_message(
     let mut message = Message::assistant(content.to_owned());
     message.reasoning_content = reasoning_content;
     Some(message)
+}
+
+/// On the NEW-03 synthesised-spawn-only-ack skip path, pick the text
+/// to feed the post-turn self-paced reschedule oneshot.
+///
+/// Inputs:
+/// - `synth_ack_content`: the synthesised "Background work started
+///   for `<tool>`. ..." text from `response.content`.
+/// - `last_persisted_preamble_assistant`: the LAST non-empty
+///   preamble assistant row that the persist loop committed for this
+///   turn, if any.
+///
+/// Strategy:
+/// - When a preamble row was persisted (e.g. a self-paced loop emits
+///   "Starting... <<loop-next-in: 60s>>" alongside the spawn_only
+///   tool call), return that preamble text. The post-turn parser
+///   reads its `<<loop-next-in: ...>>` hint deterministically
+///   without depending on the history-fallback walk (whose `.last()`
+///   semantics can race with a fast `BackgroundResultSender` row
+///   landing before the post-turn block runs). (Codex round-3 P2.)
+/// - Otherwise return the synth-ack text. The parser finds no hint
+///   and `apply_self_paced_response` stamps the default delay,
+///   keeping a bare-spawn-only self-paced loop scheduled. (Codex
+///   round-1 P2.)
+fn captured_final_reply_for_synth_ack_skip(
+    synth_ack_content: String,
+    last_persisted_preamble_assistant: Option<&str>,
+) -> String {
+    last_persisted_preamble_assistant
+        .map(ToOwned::to_owned)
+        .unwrap_or(synth_ack_content)
 }
 
 async fn abort_connection_turns(
@@ -23963,6 +24098,47 @@ ignore = []
         assert!(final_assistant_message(&messages, "world", None).is_none());
     }
 
+    /// NEW-03 (codex rounds 1-3 P2): the synth-ack skip path picks
+    /// the captured_final_reply by precedence:
+    ///   1. If a non-empty preamble assistant row was persisted →
+    ///      return that text. The post-turn parser reads the
+    ///      preamble's `<<loop-next-in: ...>>` hint directly — no
+    ///      dependency on the unsafe history-fallback walk.
+    ///   2. Otherwise → return the synth-ack text. The parser finds
+    ///      no hint and `apply_self_paced_response` stamps the
+    ///      default delay, so a bare-spawn-only self-paced loop
+    ///      stays scheduled.
+    #[test]
+    fn captured_final_reply_on_synth_ack_skip_picks_preamble_when_available() {
+        let ack = "Background work started for `run_pipeline`. \
+                   The final result will be delivered automatically when it is ready."
+            .to_string();
+        let preamble = "Starting the pipeline now. <<loop-next-in: 60s>>";
+
+        // Round-3 case: preamble persisted → use preamble text so
+        // the parser sees the hint deterministically.
+        assert_eq!(
+            captured_final_reply_for_synth_ack_skip(ack.clone(), Some(preamble)),
+            preamble,
+            "preamble assistant content present → captured_final_reply must be the preamble text",
+        );
+
+        // Round-1 case: bare spawn_only with no preamble → fall
+        // back to the synth-ack so the loop still reschedules.
+        assert_eq!(
+            captured_final_reply_for_synth_ack_skip(ack.clone(), None),
+            ack,
+            "no preamble assistant content → captured_final_reply must be the synth-ack text",
+        );
+
+        // Empty preamble option still routes to the synth-ack.
+        assert_eq!(
+            captured_final_reply_for_synth_ack_skip(ack.clone(), None),
+            ack,
+            "None preamble (regardless of how it became None) → use synth-ack",
+        );
+    }
+
     /// M10 Phase 6.1: the standalone-turn persist loop must pre-stamp the
     /// `User` row with the originating `TurnId`-derived thread id so the
     /// user prompt and the assistant reply land in the same thread on the
@@ -27998,27 +28174,34 @@ ignore = []
         assert_eq!(after, MessagePersistedSource::Assistant);
     }
 
-    /// dspfac "two bubbles per turn" fix: a spawn_only loop turn emits
-    /// TWO persisted assistant rows — the iter-1 LLM reply carrying the
-    /// preamble TEXT + `tool_calls`, and the synthesised ack
-    /// ("Background work started for `<tool>`. ...") fabricated in
-    /// `loop_runner::process_message_inner`. Pre-fix both landed with
-    /// `source: assistant`, so SPAs negotiating
-    /// `event.spawn_complete.v1` (which suppress `source: background`
-    /// rows via `live_event_passes_capability_filter`) rendered both as
-    /// chat bubbles.
+    /// Fleet-UX soak NEW-03 (mini3 / mini5, 2026-05-23): the #1183 fix
+    /// suppressed the synthesised "Background work started for `<tool>`."
+    /// ack on the LIVE `message/persisted` broadcast for dual-negotiated
+    /// clients by tagging the wire envelope `source: background`, but
+    /// the JSONL row was still committed with `role: assistant`. The
+    /// page handler at `handle_session_messages_page` walks JSONL
+    /// directly with NO source filter, so any SPA refresh / replay
+    /// re-rendered the suppressed bubble — soak captured 33 occurrences
+    /// of the ack text in messages_page payloads under one turn.
     ///
-    /// Post-fix the API persist site wraps ONLY the synthesised ack row
-    /// in `MESSAGE_PERSISTED_SOURCE_OVERRIDE.scope(Background, _)` —
-    /// gated on `ConversationResponse.synthesized_from_spawn_only`. This
-    /// test mirrors that wire shape and asserts the ledger emits the
-    /// preamble as `Assistant` and the ack as `Background`. The
-    /// downstream capability filter (already covered by the
-    /// background-persist suppression tests above) then collapses the
-    /// observable chat shape to one bubble for upgraded clients while
-    /// remaining backward-compatible for legacy clients.
+    /// Post-fix the API persist site SKIPS the ack persist entirely
+    /// when `ConversationResponse.synthesized_from_spawn_only` is true.
+    /// The preamble (carrying `tool_calls` + preamble text) still
+    /// persists as a normal assistant row. The background task's real
+    /// outcome still flows via `BackgroundResultSender` (its own
+    /// persist + `turn/spawn_complete` envelope), so the legitimate
+    /// "task finished" signal is unaffected.
+    ///
+    /// This test simulates the full production persist sequence and
+    /// asserts both invariants:
+    ///   1. JSONL contains exactly ONE row (the preamble) — the ack
+    ///      row is absent, so messages_page replay can NEVER ghost it.
+    ///   2. Exactly ONE `message/persisted` envelope fires (the
+    ///      preamble with `source: assistant`) — no Background
+    ///      envelope appears because the persist that would have
+    ///      triggered the observer never happens.
     #[tokio::test(flavor = "current_thread")]
-    async fn spawn_only_synthesized_ack_emits_as_background_source() {
+    async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         use octos_core::ui_protocol::MessagePersistedSource;
 
         let _guard = message_commit_observer_test_lock()
@@ -28030,17 +28213,17 @@ ignore = []
         let ledger = Arc::new(UiProtocolLedger::new(64));
         install_message_commit_observer(ledger.clone());
 
-        let session_id = SessionKey("local:spawn-only-synth-ack".into());
+        let session_id = SessionKey("local:spawn-only-synth-ack-no-persist".into());
         let mut subscriber = ledger.subscribe(&session_id);
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut manager =
             octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
 
-        // The iter-1 LLM reply that drove the spawn_only branch:
-        // non-empty preamble TEXT plus the tool_calls that selected
-        // `run_pipeline`. This is `response.messages` — persisted with
-        // the role-derived default `source: Assistant`.
+        // Step 1: persist the iter-1 LLM reply (preamble + tool_calls)
+        // exactly as the production persist loop at ui_protocol.rs
+        // does — this is the `response.messages` walk, which always
+        // commits regardless of `synthesized_from_spawn_only`.
         let preamble_text = "Sure, I'll kick off the pipeline now.".to_string();
         let preamble = Message {
             role: MessageRole::Assistant,
@@ -28055,7 +28238,7 @@ ignore = []
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
-            thread_id: Some("thread-spawn-only-synth".into()),
+            thread_id: Some("thread-spawn-only-synth-no-persist".into()),
             timestamp: Utc::now(),
         };
         manager
@@ -28063,38 +28246,55 @@ ignore = []
             .await
             .expect("commit preamble assistant row");
 
-        // The synthesised ack fabricated by the spawn_only branch in
-        // `loop_runner::process_message_inner`. Persisted INSIDE the
-        // `MESSAGE_PERSISTED_SOURCE_OVERRIDE.scope(Background, _)`
-        // because `ConversationResponse.synthesized_from_spawn_only`
-        // was true — exactly what the production persist site does.
-        let ack_text = "Background work started for `run_pipeline`. \
-             The final result will be delivered automatically when it is ready."
-            .to_string();
-        let ack = Message {
+        // Step 2: simulate the production persist site's branch for
+        // the synthesised ack. The new code path at
+        // `ui_protocol.rs`'s `if skip_synthesized_spawn_only_ack`
+        // gates: when `response.synthesized_from_spawn_only` is true,
+        // skip the `add_message_with_seq` call entirely. We mirror
+        // that here: a `final_assistant` Message exists in scope (the
+        // synthesised ack) but we DO NOT persist it.
+        let _ack_that_must_not_persist = Message {
             role: MessageRole::Assistant,
-            content: ack_text.clone(),
+            content: "Background work started for `run_pipeline`. \
+                 The final result will be delivered automatically when it is ready."
+                .to_string(),
             media: vec![],
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
             client_message_id: None,
-            thread_id: Some("thread-spawn-only-synth".into()),
+            thread_id: Some("thread-spawn-only-synth-no-persist".into()),
             timestamp: Utc::now(),
         };
-        let session_id_for_persist = session_id.clone();
-        let persist = async {
-            manager
-                .add_message_with_seq(&session_id_for_persist, ack)
-                .await
-        };
-        let commit = MESSAGE_PERSISTED_SOURCE_OVERRIDE
-            .scope(Some(MessagePersistedSource::Background), persist)
-            .await;
-        commit.expect("commit synthesised ack row");
+        // Intentionally no `manager.add_message_with_seq(...)` call.
+        // This is the post-fix shape — the ack never reaches JSONL.
 
-        // Drain the broadcast and bucket every assistant
-        // `MessagePersisted` envelope by source.
+        // Invariant 1: JSONL contains exactly ONE row (the preamble).
+        // The ack is absent — so `session/messages_page` walking
+        // history can never resurface a ghost ack bubble on refresh.
+        let session = manager.get_or_create(&session_id).await;
+        let history = session.get_history(usize::MAX);
+        assert_eq!(
+            history.len(),
+            1,
+            "JSONL must contain ONLY the preamble row after the persist site \
+             skips the synthesised ack; pre-fix the ack was persisted too \
+             (the NEW-03 ghost ack bug). Got {} rows.",
+            history.len(),
+        );
+        assert_eq!(
+            history[0].content, preamble_text,
+            "the surviving row must be the preamble (the iter-1 LLM reply with tool_calls)",
+        );
+        assert!(
+            !history[0].content.starts_with("Background work started"),
+            "no row may carry the synthesised ack text — that was the ghost-ack signature",
+        );
+
+        // Invariant 2: exactly ONE `message/persisted` envelope fires
+        // (the preamble with `source: assistant`). The ack persist is
+        // skipped, so the `MessageCommitObserver` never fires for it
+        // — no Background envelope is emitted either.
         let mut assistant_envelopes: Vec<MessagePersistedEvent> = Vec::new();
         while let Ok(event) = subscriber.try_recv() {
             if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
@@ -28105,53 +28305,211 @@ ignore = []
                 }
             }
         }
-
         assert_eq!(
             assistant_envelopes.len(),
-            2,
-            "spawn_only turn must commit BOTH the preamble and the ack — \
-             pre-fix both were `source: assistant` (the two-bubble bug); \
-             post-fix the preamble is Assistant and the ack is Background; \
-             got {} envelopes",
+            1,
+            "exactly ONE `message/persisted` envelope must fire (the preamble); \
+             pre-fix TWO fired (preamble Assistant + ack Background); got {}",
             assistant_envelopes.len(),
         );
-
-        // Preamble (carries `tool_calls` + preamble TEXT): default
-        // role-derived source `Assistant`. The capability filter at
-        // `live_event_passes_capability_filter` leaves Assistant rows
-        // alone, so dual-negotiated SPAs still render this row — that
-        // is the surviving "single bubble" of the turn.
-        let preamble_env = &assistant_envelopes[0];
         assert_eq!(
-            preamble_env.source,
+            assistant_envelopes[0].source,
             MessagePersistedSource::Assistant,
-            "iter-1 preamble row (carrying tool_calls + preamble text) must keep source=Assistant",
+            "the surviving envelope must be the preamble with source=Assistant",
         );
-
-        // Synthesised ack: tagged `Background` via the override scope.
-        // The capability filter then suppresses this row for SPAs that
-        // negotiated `event.spawn_complete.v1`, collapsing the chat
-        // shape to a single bubble per turn.
-        let ack_env = &assistant_envelopes[1];
-        assert_eq!(
-            ack_env.source,
-            MessagePersistedSource::Background,
-            "synthesised spawn_only ack row must carry source=Background so \
-             `live_event_passes_capability_filter` suppresses the second bubble",
-        );
-
-        // Sanity: the override scope is correctly scoped — after the
-        // ack persist returns, the task-local is back to its default.
-        let after = current_message_persisted_source(MessageRole::Assistant);
-        assert_eq!(
-            after,
-            MessagePersistedSource::Assistant,
-            "override is scoped to the ack persist call only — must not leak",
+        assert!(
+            !assistant_envelopes
+                .iter()
+                .any(|env| matches!(env.source, MessagePersistedSource::Background)),
+            "NO Background envelope may fire — the ack persist is skipped \
+             entirely so the observer never fabricates a Background source row",
         );
 
         // Restore the global observer slot to None so subsequent tests
         // see a clean state.
         octos_bus::set_message_commit_observer(None);
+    }
+
+    /// Codex P2 follow-up on the NEW-03 fix: a self-paced (or
+    /// `maintenance`) loop that fires a bare spawn_only call with NO
+    /// LLM preamble has only the synthesised ack as its turn-final
+    /// assistant content. Pre-codex-P2 the new skip-persist path
+    /// dropped both the JSONL row AND the `final_send` signal — so
+    /// `apply_self_paced_response` never fired, `next_run_at_ms`
+    /// stayed cleared from the fire-time stamp, and the loop stalled.
+    ///
+    /// Post-codex-P2 the skip path flips `final_assistant_persisted`
+    /// to true, which routes the captured reply through to the
+    /// post-turn block. This test pins the orchestrator-level invariant
+    /// the fix relies on: feeding `apply_self_paced_response` the
+    /// synthesised ack text (which has no `<<loop-next-in: ...>>`
+    /// hint) MUST stamp a fresh `next_run_at_ms` ~= now +
+    /// `SELF_PACED_DEFAULT_DELAY_SECONDS` (15 min default), so the
+    /// loop keeps scheduling.
+    /// Codex round-3 P2 acceptance: when a spawn_only self-paced
+    /// turn has a preamble carrying a `<<loop-next-in: 60s>>` hint,
+    /// the captured_final_reply must end up as the PREAMBLE text
+    /// (not the synthesised ack) so `apply_self_paced_response`
+    /// parses the model-requested 60s delay — NOT the 15-min
+    /// default — and stamps `next_run_at_ms` accordingly.
+    ///
+    /// This pins the integration shape: feed the preamble text
+    /// (which `captured_final_reply_for_synth_ack_skip` returns
+    /// when a preamble is persisted) through
+    /// `apply_self_paced_response` and assert the parsed delay is
+    /// the hint, not the fallback.
+    #[test]
+    fn self_paced_loop_honours_preamble_hint_when_spawn_only_skipped() {
+        use crate::api::agent_orchestrator::{
+            InProcessAgentOrchestrator, LoopCreateRequest, LoopListRequest,
+        };
+
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id =
+            SessionKey::with_profile("tenant-round3", "api", "self-paced-preamble-hint");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-round3".into(),
+                prompt: Some("watch the build".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self-paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Wire shape: a preamble with hint AND a synth ack present.
+        // The helper picks the preamble.
+        let preamble = "Starting the pipeline. <<loop-next-in: 60s>>";
+        let synth_ack = "Background work started for `run_pipeline`. \
+                         The final result will be delivered automatically when it is ready."
+            .to_string();
+        let captured = captured_final_reply_for_synth_ack_skip(synth_ack, Some(preamble));
+        assert_eq!(
+            captured, preamble,
+            "helper must pick the preamble text when present",
+        );
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let parsed = orchestrator
+            .apply_self_paced_response(&loop_id, "tenant-round3", &captured)
+            .expect("apply_self_paced_response on preamble");
+        assert_eq!(
+            parsed,
+            Some(std::time::Duration::from_secs(60)),
+            "preamble carried `<<loop-next-in: 60s>>` — parser MUST return 60s, NOT the 15-min default",
+        );
+
+        // Verify next_run_at_ms is ~60s ahead (NOT 900s) — the
+        // model-requested delay deterministically beats the
+        // history-fallback race.
+        let listed = orchestrator
+            .list_loops(LoopListRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-round3".into(),
+            })
+            .expect("list_loops");
+        let loops = listed
+            .get("loops")
+            .and_then(|v| v.as_array())
+            .expect("loops array");
+        let record = loops
+            .iter()
+            .find(|loop_val| loop_val.get("loop_id").and_then(|v| v.as_str()) == Some(&loop_id))
+            .expect("loop record present");
+        let next = record
+            .get("next_run_at_ms")
+            .and_then(|v| v.as_i64())
+            .expect("self-paced loop must have a fresh next_run_at_ms");
+        let delta_ms = next - before;
+        assert!(
+            (50_000..=70_000).contains(&delta_ms),
+            "next_run_at_ms must be ~60s in the future (got {delta_ms} ms) — proves the preamble's \
+             `<<loop-next-in: 60s>>` hint beat the default 15-min fallback",
+        );
+    }
+
+    #[test]
+    fn self_paced_loop_reschedules_when_only_assistant_content_is_synth_ack() {
+        use crate::api::agent_orchestrator::{
+            InProcessAgentOrchestrator, LoopCreateRequest, LoopListRequest,
+        };
+
+        // Codex round-2 P3: use a private orchestrator (NOT the
+        // process-wide `default_agent_orchestrator` singleton) so
+        // this test can't race with another module test that calls
+        // `clear_autonomy_runtime_state_for_test` or otherwise
+        // mutates the global state between our `create_loop` and
+        // `list_loops`.
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session_id =
+            SessionKey::with_profile("tenant-new03", "api", "self-paced-bare-spawn-only");
+        let created = orchestrator
+            .create_loop(LoopCreateRequest {
+                session_id: session_id.clone(),
+                profile_id: "tenant-new03".into(),
+                prompt: Some("kick off the pipeline".into()),
+                command: None,
+                interval_seconds: None,
+                mode: Some("self_paced".into()),
+            })
+            .expect("create self-paced loop");
+        let loop_id = created["loop_id"].as_str().expect("loop id").to_owned();
+
+        // Simulate the synthesised spawn_only ack text exactly as
+        // `loop_runner::process_message_inner` fabricates it — note
+        // no `<<loop-next-in: ...>>` hint.
+        let ack_text = "Background work started for `run_pipeline`. \
+             The final result will be delivered automatically when it is ready.";
+
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let parsed = orchestrator
+            .apply_self_paced_response(&loop_id, "tenant-new03", ack_text)
+            .expect("apply_self_paced_response on synthesised ack");
+        assert_eq!(
+            parsed, None,
+            "ack carries no `<<loop-next-in: ...>>` hint, so the parser must return None",
+        );
+
+        // The default fallback delay is 15 minutes (900 s). Assert the
+        // next_run_at_ms lands inside a tolerant window around that.
+        // Use the public `list_loops` API to inspect the stamped value
+        // (the internal `state()` accessor is private).
+        let listed = orchestrator
+            .list_loops(LoopListRequest {
+                session_id: Some(session_id.clone()),
+                profile_id: "tenant-new03".into(),
+            })
+            .expect("list_loops");
+        let loops = listed
+            .get("loops")
+            .and_then(|v| v.as_array())
+            .expect("loops array");
+        let record = loops
+            .iter()
+            .find(|loop_val| loop_val.get("loop_id").and_then(|v| v.as_str()) == Some(&loop_id))
+            .expect("created loop record present");
+        let next = record
+            .get("next_run_at_ms")
+            .and_then(|v| v.as_i64())
+            .expect(
+                "self-paced loop MUST have a fresh next_run_at_ms after firing — \
+                 if this is null the loop has stalled (the NEW-03 codex P2 regression)",
+            );
+        let delta_ms = next - before;
+        assert!(
+            (890_000..=910_000).contains(&delta_ms),
+            "next_run_at_ms must be roughly 900s (SELF_PACED_DEFAULT_DELAY_SECONDS) in the \
+             future (got {delta_ms} ms) — confirms `apply_self_paced_response` fell back to \
+             the default delay when the ack carried no hint",
+        );
     }
 
     /// Codex P2 follow-up: the `turn/spawn_complete` envelope's flat
