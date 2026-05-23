@@ -970,8 +970,8 @@ fn resolve_plugin_input_path(
     // a podcast script written to `<workspace>/octos_podcast_script.md`
     // never resolves and the plugin spawn fails with `os error 2`.
     //
-    // This rescue branch is bounded by two safety constraints (see
-    // #1186 path-traversal review):
+    // This rescue branch is bounded by FOUR safety constraints (see
+    // #1186 path-traversal review and codex review on #1189):
     //   1. `raw_path` is already guarded against raw `..` at the entry
     //      of this function — unsafe inputs returned Err above.
     //   2. We ONLY probe `work_dir.parent()` when the work_dir basename
@@ -984,11 +984,26 @@ fn resolve_plugin_input_path(
     //      makes the rescue equivalent in scope to the basename scan
     //      in `resolve_path_in_work_dir`, just probing one directory
     //      level above the chroot instead of inside it.
+    //   4. We use `symlink_metadata` + `is_file()` (NOT `exists()`,
+    //      which follows symlinks). A `<workspace>/script.md` symlink
+    //      pointing at `/etc/passwd` MUST NOT resolve. This matches
+    //      the workspace's broader symlink-safety posture
+    //      (`O_NOFOLLOW` in file tools, see CLAUDE.md). Directories
+    //      are also rejected — the only acceptable candidate is a
+    //      regular file at the workspace root.
     if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
         if let Some(parent) = work_dir.parent() {
             if let Some(basename) = std::path::Path::new(raw_path).file_name() {
                 let candidate = parent.join(basename);
-                if candidate.exists() {
+                // Reject symlinks AND non-regular files (directories,
+                // sockets, FIFOs). symlink_metadata does not traverse,
+                // so a `script.md -> /etc/passwd` symlink at the
+                // workspace root returns FileType::is_symlink() == true
+                // and is_file() == false — safely refused.
+                let safe = std::fs::symlink_metadata(&candidate)
+                    .map(|m| m.file_type().is_file())
+                    .unwrap_or(false);
+                if safe {
                     return Ok(candidate.to_string_lossy().into_owned());
                 }
             }
@@ -2418,6 +2433,92 @@ mod tests {
         assert!(
             msg.contains("escapes plugin work dir"),
             "error must explain rejection reason: {msg}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_rescue_rejects_symlink_to_outside_workspace() {
+        // Codex review on PR #1189 (BLOCKER): the rescue branch
+        // originally used `candidate.exists()`, which FOLLOWS symlinks.
+        // A `<workspace>/script.md -> /etc/passwd` symlink would have
+        // satisfied `exists()` and the plugin would have received an
+        // absolute path to a host file outside the workspace. The
+        // hardened branch uses `symlink_metadata` + `is_file()` so
+        // symlinks are caught before the path is handed off.
+        //
+        // This regression test creates a symlink at the workspace root
+        // pointing at `/etc/passwd` and asserts the resolver REFUSES
+        // to promote it via the rescue branch. The expected behaviour
+        // is that the resolver falls through to the deeper fallbacks
+        // (which either succeed inside `skill-output/` or, on absence,
+        // produce the lexical-join string — neither lands on the
+        // outside-workspace file).
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Symlink at the workspace ROOT pointing OUTSIDE the workspace.
+        let bait = workspace.path().join("script.md");
+        std::os::unix::fs::symlink("/etc/passwd", &bait).unwrap();
+        // Sanity check: the symlink target exists on a real host
+        // (so `exists()` would have succeeded), but it MUST NOT drive
+        // the rescue.
+        assert!(
+            std::fs::symlink_metadata(&bait)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "test setup: bait must be a symlink"
+        );
+
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("resolver still returns a path (lexical fallback) but NOT the bait");
+        let resolved_path = std::path::Path::new(&resolved);
+        // Critical: the resolved path MUST NOT be the workspace-root
+        // symlink. Any value pointing at `/etc/passwd` (directly or
+        // through the symlink) would be a security failure.
+        assert_ne!(
+            resolved_path, bait,
+            "rescue must not return the symlinked workspace-root path"
+        );
+        assert!(
+            !resolved_path.starts_with("/etc"),
+            "resolved path must not escape into /etc: {resolved}",
+        );
+        // The expected fall-through is `<skill_output>/script.md`
+        // (lexical join from the basename scan inside work_dir, or the
+        // final absolutize step). That path doesn't exist either — but
+        // it's CONTAINED to the chroot, so the plugin will hit a clean
+        // os error 2 instead of reading the bait.
+        assert!(
+            resolved_path.starts_with(&skill_output) || resolved_path.starts_with(workspace.path()),
+            "resolver must stay within the workspace: {resolved}",
+        );
+        // Defense in depth.
+        let _ = bait;
+    }
+
+    #[test]
+    fn workspace_root_rescue_rejects_directory_at_workspace_root() {
+        // The rescue branch must also reject non-file candidates
+        // (directories, sockets, FIFOs). A directory at
+        // `<workspace>/script.md` should NOT satisfy the rescue —
+        // plugins expect to read a file, and handing them a directory
+        // path is at best confusing, at worst exploitable.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Create a DIRECTORY (not a file) at the rescue candidate.
+        let dir_at_root = workspace.path().join("script.md");
+        std::fs::create_dir(&dir_at_root).unwrap();
+
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("resolver still returns a path via fallback");
+        let resolved_path = std::path::Path::new(&resolved);
+        // The directory MUST NOT be promoted by the rescue branch.
+        assert_ne!(
+            resolved_path, dir_at_root,
+            "rescue must not return a directory at the workspace root"
         );
     }
 
