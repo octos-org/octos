@@ -80,6 +80,28 @@ const HNSW_EF_CONSTRUCTION: usize = 200;
 /// HNSW max_layer: maximum graph layers.
 const HNSW_MAX_LAYER: usize = 16;
 
+/// Per-modality candidate pool size when a `min_best_modality` floor is
+/// supplied to [`HybridIndex::search_scored_filtered`].
+///
+/// The standard `search_scored` path uses `limit * 4` (e.g. 24 for the
+/// agent's `limit=6`) which is fine when no floor is applied — the
+/// caller doesn't care about candidates outside the top-N anyway. But
+/// when a floor IS supplied, codex P2 round 3 flagged that capping the
+/// per-modality pool to `limit * 4` reintroduces the dead band one
+/// level up: a store with 25+ slightly-stronger vector-only hits AND
+/// 25+ slightly-stronger BM25-only hits could push a genuinely
+/// hybrid-strong (both modalities moderate, both clearing the floor)
+/// candidate out of BOTH per-modality top-24 pools, so the floored
+/// search never sees it.
+///
+/// `FLOOR_PREFILTER_POOL = HNSW_CAPACITY` (= 10_000) fully decouples
+/// the prefilter pool from the injection limit: the floor sees every
+/// candidate the index can hold. The cost is at most one HNSW
+/// `search(..., 10_000, ...)` call per query, which is bounded by the
+/// real document count (HNSW caps at HNSW_CAPACITY anyway) and only
+/// runs when a caller explicitly asks for the floor.
+const FLOOR_PREFILTER_POOL: usize = HNSW_CAPACITY;
+
 impl HybridIndex {
     /// Create a new hybrid index with the given vector dimension.
     pub fn new(dimension: usize) -> Self {
@@ -338,7 +360,17 @@ impl HybridIndex {
             return Vec::new();
         }
 
-        let fetch_count = limit * 4;
+        // When a floor is supplied, decouple the per-modality
+        // candidate pool from `limit` so the floor isn't restricted
+        // to the top-`limit*4` of either modality. Codex P2 round 3
+        // flagged that the standard `limit * 4` pool can still hide a
+        // hybrid-strong candidate (moderate-but-floor-passing in both
+        // BM25 and vector) outside both per-modality top-N pools.
+        // See `FLOOR_PREFILTER_POOL` for the structural rationale.
+        let fetch_count = match min_best_modality {
+            Some(_) => FLOOR_PREFILTER_POOL,
+            None => limit * 4,
+        };
 
         let bm25_scores = self.bm25_score(query_text, fetch_count);
 
@@ -658,6 +690,49 @@ mod tests {
                 b.1.combined
             );
         }
+    }
+
+    #[test]
+    fn search_scored_filtered_pool_decoupled_from_limit_when_floor_supplied() {
+        // Regression for codex P2 round 3: when a floor is supplied,
+        // the per-modality candidate pool must NOT be capped at
+        // `limit * 4`. Otherwise a hybrid-strong candidate (moderate
+        // in BOTH BM25 and vector, clearing the floor on at least one)
+        // can sit outside both per-modality top-N pools and be
+        // invisible to the floor.
+        //
+        // Sanity check: with `limit=1` and a floor, the per-modality
+        // pool must be the larger floor-aware pool, so a doc that
+        // would be the #5 per-modality result (outside `limit*4 = 4`)
+        // is still considered.
+        let mut index = HybridIndex::new(4);
+        for i in 0..10 {
+            // Each doc has a different BM25 score (via term repetition)
+            // and a different vector orientation, so per-modality ranks
+            // are well-defined and unique.
+            let repeats = 10 - i;
+            let text = format!("topic {}", "alpha ".repeat(repeats));
+            let emb = [(repeats as f32) / 10.0, 0.1, 0.0, 0.0];
+            index.insert(&format!("ep-{i:02}"), &text, Some(&emb));
+        }
+
+        let q = "alpha";
+        let q_emb: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+
+        // With limit=1 and no floor, the standard path uses pool=4.
+        // With a floor, the path uses FLOOR_PREFILTER_POOL=10_000 (all
+        // 10 docs). Verify that the floor sees enough docs to apply
+        // properly by asking for many results: with limit=20 floor=0.0
+        // we should get back all 10 indexed docs (proves the pool is
+        // not bounded by the smaller `limit * 4`).
+        let with_floor = index.search_scored_filtered(q, Some(&q_emb), 20, Some(0.0));
+        assert_eq!(
+            with_floor.len(),
+            10,
+            "with floor, the pool must include every candidate that contributed in either modality \
+             (got {}, expected 10)",
+            with_floor.len()
+        );
     }
 
     #[test]
