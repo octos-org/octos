@@ -117,6 +117,17 @@ pub struct ConversationResponse {
     /// actor pulls these into the SSE `done` event so the W1.G4 cost panel
     /// can render real per-node attribution. Empty when no tool opted in.
     pub tool_results: Vec<(String, serde_json::Value)>,
+    /// Marks `content` as a synthesized acknowledgement fabricated by the
+    /// spawn_only branch in `loop_runner::process_message_inner` (the
+    /// "Background work started for `<tool>`. The final result will be
+    /// delivered automatically when it is ready." string). When `true`,
+    /// the API persist site tags the corresponding wire envelope with
+    /// `MessagePersistedSource::Background` so dual-negotiated clients
+    /// (those carrying `event.spawn_complete.v1`) suppress it via the
+    /// existing capability filter — collapsing the legacy
+    /// "two bubbles per turn" shape into a single preamble row.
+    /// Defaults to `false`; only set in the spawn_only synthesis path.
+    pub synthesized_from_spawn_only: bool,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).

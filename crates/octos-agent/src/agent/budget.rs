@@ -413,6 +413,7 @@ mod tests {
             streamed: false,
             messages: vec![],
             tool_results: vec![],
+            synthesized_from_spawn_only: false,
         };
         let cloned = resp.clone();
         assert_eq!(cloned.content, "test");
