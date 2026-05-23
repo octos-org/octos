@@ -520,7 +520,10 @@ impl PluginTool {
 
         let mut rewritten = serde_json::Map::with_capacity(obj.len());
         for (key, value) in obj {
-            if matches!(key.as_str(), "audio_path" | "file_path" | "input") {
+            if matches!(
+                key.as_str(),
+                "audio_path" | "file_path" | "input" | "script_path"
+            ) {
                 if let Some(path) = value.as_str() {
                     rewritten.insert(
                         key.clone(),
@@ -869,6 +872,28 @@ fn value_kind_label(value: &serde_json::Value) -> &'static str {
 ///    sees an empty string.
 fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> String {
     use octos_bus::file_handle::ToolPathScope;
+    // B1 fleet UX soak (mini2/iter1, mini5/iter2): when the host has
+    // chrooted plugin `work_dir` into `<workspace>/skill-output/` (the
+    // modern `runtime/session.rs` path), but the LLM passes a
+    // workspace-relative path that still carries the `skill-output/`
+    // prefix (because `write_file` resolves against the workspace
+    // ROOT and the LLM mirrors that path), the naive
+    // `work_dir.join(raw_path)` produces
+    // `<workspace>/skill-output/skill-output/<rest>` and
+    // `read_to_string` fails with `os error 2`. Strip the redundant
+    // prefix the same way `mofa-podcast::resolve_output_dir` does for
+    // output paths, then probe both forms — the stripped path wins
+    // when it exists.
+    let stripped = strip_redundant_skill_output_prefix(raw_path, work_dir);
+    if let Some(ref stripped_path) = stripped {
+        if let Ok(resolved) =
+            octos_bus::file_handle::resolve_tool_path(work_dir, None, stripped_path)
+        {
+            if matches!(resolved.scope, ToolPathScope::Workspace) && resolved.absolute.exists() {
+                return resolved.absolute.to_string_lossy().into_owned();
+            }
+        }
+    }
     if let Ok(resolved) = octos_bus::file_handle::resolve_tool_path(work_dir, None, raw_path) {
         let accept = match resolved.scope {
             // Upload / profile scopes go through `canonicalize_under`,
@@ -885,8 +910,39 @@ fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> Stri
             return resolved.absolute.to_string_lossy().into_owned();
         }
     }
+    if let Some(ref stripped_path) = stripped {
+        if let Some(resolved) = resolve_path_in_work_dir(stripped_path, work_dir) {
+            return resolved;
+        }
+    }
     resolve_path_in_work_dir(raw_path, work_dir)
         .unwrap_or_else(|| absolutize_path_in_work_dir(raw_path, work_dir))
+}
+
+/// Returns `Some(stripped)` when `raw_path` carries a redundant
+/// `skill-output/` prefix that should be removed before joining with
+/// `work_dir` — i.e. `work_dir` itself terminates in a `skill-output`
+/// component AND `raw_path` is relative and starts with `skill-output/`.
+/// Mirrors the same guard the mofa-podcast skill applies for output
+/// directories (see `resolve_output_dir` in mofa-podcast/src/main.rs).
+fn strip_redundant_skill_output_prefix(
+    raw_path: &str,
+    work_dir: &std::path::Path,
+) -> Option<String> {
+    if std::path::Path::new(raw_path).is_absolute() {
+        return None;
+    }
+    if work_dir.file_name().and_then(|s| s.to_str()) != Some("skill-output") {
+        return None;
+    }
+    let stripped = std::path::Path::new(raw_path)
+        .strip_prefix("skill-output")
+        .ok()?;
+    let stripped_str = stripped.to_str()?.to_string();
+    if stripped_str.is_empty() {
+        return None;
+    }
+    Some(stripped_str)
 }
 
 fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Option<String> {
@@ -1705,6 +1761,97 @@ mod tests {
         // Must recover `<work_dir>/mark.wav` via the legacy filename
         // fallback, NOT return the missing `<work_dir>/uploads/mark.wav`.
         assert_eq!(rewritten["audio_path"], mark.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_strips_redundant_skill_output_prefix_for_script_path() {
+        // B1 fleet UX soak (mini2/iter1 + mini5/iter2): the modern
+        // `runtime/session.rs` path chroots plugin `work_dir` into
+        // `<workspace>/skill-output/`, while `write_file`'s base_dir
+        // is the workspace ROOT. When the LLM passes the same
+        // `skill-output/mofa-podcast/<file>.md` path to both, the
+        // naive `work_dir.join(...)` doubles the prefix and the
+        // plugin's `read_to_string` fails with `No such file or
+        // directory (os error 2)`. The rewrite must detect this and
+        // resolve the path against `work_dir` WITHOUT the redundant
+        // prefix.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        let podcast_dir = skill_output.join("mofa-podcast");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        let script = podcast_dir.join("octos_intro_script.md");
+        std::fs::write(&script, b"# Podcast script").unwrap();
+
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "script_path": {"type": "string"}
+                }
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        // Plugin's work_dir mirrors the modern `runtime/session.rs`
+        // path: `<workspace>/skill-output/`.
+        let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(skill_output.clone());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "script_path": "skill-output/mofa-podcast/octos_intro_script.md",
+        }));
+
+        assert_eq!(
+            rewritten["script_path"],
+            script.to_string_lossy().to_string(),
+            "script_path must resolve to <work_dir>/mofa-podcast/<file>.md, \
+             NOT the doubled <work_dir>/skill-output/mofa-podcast/<file>.md"
+        );
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_keeps_skill_output_prefix_when_work_dir_is_workspace_root() {
+        // Symmetric guard for the legacy `session_actor.rs` path:
+        // when `work_dir` IS the workspace root (not chrooted into
+        // `skill-output/`), the LLM's `skill-output/<file>` path is
+        // correct as-is and must resolve to
+        // `<workspace>/skill-output/<file>` — NOT have its prefix
+        // stripped.
+        let workspace = tempfile::tempdir().unwrap();
+        let podcast_dir = workspace.path().join("skill-output").join("mofa-podcast");
+        std::fs::create_dir_all(&podcast_dir).unwrap();
+        let script = podcast_dir.join("intro.md");
+        std::fs::write(&script, b"# script").unwrap();
+
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"script_path": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(workspace.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "script_path": "skill-output/mofa-podcast/intro.md",
+        }));
+
+        assert_eq!(
+            rewritten["script_path"],
+            script.to_string_lossy().to_string(),
+        );
     }
 
     #[test]
