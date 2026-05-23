@@ -341,13 +341,43 @@ impl EpisodeStore {
             .unwrap_or(false);
 
         if index_populated {
-            // Over-fetch to account for CWD filtering, then filter.
-            // We use the `_scored_filtered` variant so the floor is
-            // applied INSIDE the index BEFORE the combined-rank
-            // truncation — same dead-band-safe contract as the
-            // hybrid path documented in agent::memory.
+            // Inner-fetch sizing — codex P2 round 4 follow-up:
+            //
+            // The hybrid index is global (not cwd-scoped). After we
+            // ask for the top-N candidates, we apply the cwd filter
+            // locally. If we used the standard `limit * 4` pool, a
+            // shared episode store with many foreign-cwd matches that
+            // clear the same floor could truncate a current-cwd
+            // match out BEFORE the cwd filter ever sees it — flipping
+            // the "return empty when floor set" branch into a false-
+            // negative for legitimately relevant local memories.
+            //
+            // Two regimes:
+            // * No floor → keep the legacy `limit * 4` over-fetch.
+            //   Without a floor there is no natural cap on the
+            //   candidate set; growing the pool unboundedly would be
+            //   wasted work and the legacy fall-through to
+            //   `find_relevant_db_scan` already handles the no-cwd-
+            //   match case.
+            // * Floor supplied → request the full floor-prefilter
+            //   pool (`FLOOR_PREFILTER_POOL = HNSW_CAPACITY = 10_000`,
+            //   the structural ceiling of the in-memory index). The
+            //   floor itself bounds the candidate set, so this is the
+            //   tightest pool that guarantees a current-cwd match
+            //   clearing the floor reaches the cwd filter regardless
+            //   of how many foreign-cwd matches share the floor pass.
+            //
+            // `usize::MAX` would also work but is dishonest: the index
+            // can't hold more than HNSW_CAPACITY documents, so asking
+            // for it is wasted intent. The constant is re-exported
+            // from `hybrid_search` for this exact reuse.
+            let inner_limit = if min_best_modality.is_some() {
+                crate::hybrid_search::FLOOR_PREFILTER_POOL
+            } else {
+                limit * 4
+            };
             let candidates = self
-                .find_relevant_hybrid_scored_filtered(query, None, limit * 4, min_best_modality)
+                .find_relevant_hybrid_scored_filtered(query, None, inner_limit, min_best_modality)
                 .await?;
             let filtered: Vec<Episode> = candidates
                 .into_iter()
@@ -361,13 +391,13 @@ impl EpisodeStore {
             }
             // NEW-06 codex follow-up: when a caller passed a
             // `min_best_modality` floor and the scored+CWD-filtered set
-            // came back empty, returning empty is the correct answer —
-            // nothing in the index cleared the contamination floor for
-            // this cwd. Falling through to the unscored
-            // `find_relevant_db_scan` would silently bypass the floor
-            // (the scan is keyword-substring only with no scoring
-            // infrastructure), which is exactly the contamination
-            // pattern this filter exists to prevent.
+            // came back empty (with an exhaustive `inner_limit`), the
+            // correct answer is empty — nothing in the index cleared
+            // the contamination floor for this cwd. Falling through to
+            // the unscored `find_relevant_db_scan` would silently
+            // bypass the floor (the scan is keyword-substring only
+            // with no scoring infrastructure), which is exactly the
+            // contamination pattern this filter exists to prevent.
             //
             // Only fall through to the unscored DB scan when no floor
             // was requested (legacy `find_relevant` semantics).
@@ -883,6 +913,79 @@ mod tests {
              to unscored DB scan when the scored+cwd set is empty; \
              returned {} contaminated episodes: {results:?}",
             results.len()
+        );
+    }
+
+    /// NEW-06 codex P2 round 4 — when a floor is supplied AND the
+    /// hybrid index holds many foreign-cwd matches that all clear the
+    /// floor with stronger scores, a current-cwd match that ALSO
+    /// clears the floor must not be truncated out by the inner
+    /// `limit * 4` pool before the cwd filter sees it.
+    ///
+    /// Pre-fix-round-4: with `limit=1` and ~10 stronger foreign-cwd
+    /// exact matches sharing the same query token, the inner fetch
+    /// pool (`limit * 4 = 4`) returned only foreign episodes; the
+    /// cwd filter dropped them all; the floor-set early-return then
+    /// returned empty even though a local episode clearing the floor
+    /// existed in the store. Functional regression in local memory
+    /// recall.
+    ///
+    /// Post-fix-round-4: when a floor is supplied, the inner fetch
+    /// exhausts the floor-prefilter pool (`FLOOR_PREFILTER_POOL =
+    /// HNSW_CAPACITY = 10_000`) so the cwd filter sees every
+    /// floor-clearing candidate regardless of how many foreign-cwd
+    /// matches share the floor pass.
+    #[tokio::test]
+    async fn find_relevant_filtered_returns_local_match_through_many_foreign_with_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::open(dir.path()).await.unwrap();
+
+        // 20 foreign-cwd episodes that all match the query token —
+        // these will all clear the floor and crowd the inner pool.
+        // `limit * 4 = 4` (with the caller's `limit = 1`) is far
+        // below 20, so without round-4 the local episode below would
+        // be truncated out.
+        for i in 0..20 {
+            store
+                .store(make_episode(
+                    "deep_research gravitational lensing JWST",
+                    &format!("/foreign-cwd-{i}"),
+                ))
+                .await
+                .unwrap();
+        }
+        // Single local episode that also clears the floor.
+        store
+            .store(make_episode(
+                "deep_research gravitational lensing JWST",
+                "/proj",
+            ))
+            .await
+            .unwrap();
+
+        let results = store
+            .find_relevant_filtered(
+                Path::new("/proj"),
+                "deep_research gravitational lensing JWST",
+                1,
+                Some(0.5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "find_relevant_filtered must return the local floor-clearing \
+             episode even when many foreign-cwd matches share the floor \
+             pass (codex P2 round 4); returned {} episodes",
+            results.len()
+        );
+        assert_eq!(
+            results[0].working_dir,
+            PathBuf::from("/proj"),
+            "local match must be the one returned, not a foreign-cwd \
+             leak: got {:?}",
+            results[0].working_dir
         );
     }
 

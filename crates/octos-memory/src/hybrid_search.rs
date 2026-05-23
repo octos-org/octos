@@ -100,7 +100,7 @@ const HNSW_MAX_LAYER: usize = 16;
 /// `search(..., 10_000, ...)` call per query, which is bounded by the
 /// real document count (HNSW caps at HNSW_CAPACITY anyway) and only
 /// runs when a caller explicitly asks for the floor.
-const FLOOR_PREFILTER_POOL: usize = HNSW_CAPACITY;
+pub(crate) const FLOOR_PREFILTER_POOL: usize = HNSW_CAPACITY;
 
 /// Compute the BM25 per-modality candidate pool size for a single
 /// `search_scored_filtered` call.
