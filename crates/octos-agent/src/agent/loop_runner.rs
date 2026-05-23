@@ -1142,7 +1142,18 @@ impl Agent {
                             // the current iteration, never stale bits from
                             // earlier ones in the same turn.
                             let mut iter_tool_success: Vec<(String, bool)> = Vec::new();
-                            if let Err(e) = self
+                            // Codex round-3 MAJOR (PR #1187 follow-up): bind
+                            // the SANITIZED response returned by
+                            // `handle_tool_use` so the synth-ack gate below
+                            // sees the same tool_call_ids that the
+                            // dispatcher keyed `iter_tool_success` by. If we
+                            // kept using the original `response`, a real
+                            // `success=false` could be missed when
+                            // sanitization rewrote the id (colon, empty,
+                            // duplicate) — and the content-fallback in the
+                            // gate also keys on the original id, so it
+                            // misses too. See doc on `handle_tool_use`.
+                            let sanitized_response = match self
                                 .handle_tool_use(
                                     &response,
                                     &mut messages,
@@ -1156,16 +1167,19 @@ impl Agent {
                                 )
                                 .await
                             {
-                                match self.handle_loop_error_with_dispatch(
-                                    &e,
-                                    &mut retry_state,
-                                    iteration,
-                                    &mut messages,
-                                ) {
-                                    LoopErrorAction::Retry => continue,
-                                    LoopErrorAction::Bail => return Err(e),
+                                Ok(sanitized) => sanitized,
+                                Err(e) => {
+                                    match self.handle_loop_error_with_dispatch(
+                                        &e,
+                                        &mut retry_state,
+                                        iteration,
+                                        &mut messages,
+                                    ) {
+                                        LoopErrorAction::Retry => continue,
+                                        LoopErrorAction::Bail => return Err(e),
+                                    }
                                 }
-                            }
+                            };
 
                             let spiral_iteration = turn.iteration();
                             if let Some(outcome) = self.dispatch_shell_retry_recovery(
@@ -1288,9 +1302,19 @@ impl Agent {
                                 // that channel; we only suppress the
                                 // turn-final fabricated "started" bubble
                                 // that the foreground can't actually verify.
+                                // Codex round-3 MAJOR (PR #1187 follow-up):
+                                // pass the SANITIZED response so the
+                                // tool_call_id keys here line up with the
+                                // ones the dispatcher used for
+                                // `iter_tool_success`. Using the original
+                                // `response` here is the bug: sanitization
+                                // may have rewritten an id (colon, empty,
+                                // duplicate) and the lookup would miss,
+                                // letting a real `success=false` slip past
+                                // the gate.
                                 if any_tool_invocation_errored(
                                     &messages,
-                                    &response,
+                                    &sanitized_response,
                                     &iter_tool_success,
                                 ) {
                                     warn!(
@@ -1666,7 +1690,9 @@ impl Agent {
                         // Task loop never emits the synth-ack so the per-call
                         // success-bit sink is unused here — pass `None`. (The
                         // conversation loop wires this up to the spawn_only
-                        // gate; see the matching call site above.)
+                        // gate; see the matching call site above.) Codex
+                        // round-3: ignore the sanitized response too — task
+                        // loop has no synth-ack gate that would need it.
                         if let Err(e) = self
                             .handle_tool_use(
                                 &response,
@@ -1786,6 +1812,20 @@ impl Agent {
     }
 
     /// Execute tool calls from an LLM response and accumulate results.
+    ///
+    /// On success returns the SANITIZED response — IDs after
+    /// `sanitize_tool_call_id` + empty/duplicate repair + name+args dedup.
+    /// Callers that subsequently key into `tool_success_by_id` MUST use the
+    /// sanitized response so the lookup matches; the original response's
+    /// tool_call_ids are stale once sanitization rewrites them.
+    ///
+    /// Codex round-3 MAJOR (PR #1187 follow-up): the prior signature returned
+    /// `Result<()>`, leaving the synth-ack gate at the call site to feed the
+    /// CALLER'S original `response` into `any_tool_invocation_errored`. When
+    /// sanitization changed an ID (colon, empty, duplicate) the success-bit
+    /// lookup in the gate missed and the content-fallback also missed (it
+    /// keys on the original ID too), so a real `success=false` slipped past
+    /// and synth-ack still fired alongside the red error chip.
     #[allow(clippy::too_many_arguments)]
     async fn handle_tool_use(
         &self,
@@ -1804,7 +1844,7 @@ impl Agent {
         // the content shape of each tool message). Background callers
         // pass `None` because the task-loop never emits the synth-ack.
         tool_success_by_id: Option<&mut Vec<(String, bool)>>,
-    ) -> Result<()> {
+    ) -> Result<ChatResponse> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
         // Also sanitize characters: some providers (e.g. Moonshot/kimi) generate IDs
@@ -1927,7 +1967,10 @@ impl Agent {
             files_to_send.extend(tool_send_files);
         }
         turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
-        Ok(())
+        // Codex round-3: return the sanitized response so the caller's
+        // synth-ack gate sees the SAME tool_call_ids that the success-bit
+        // sink was keyed by. See doc-comment on this fn.
+        Ok(response)
     }
 }
 
@@ -6285,6 +6328,209 @@ printf '{"output":"voice saved","success":true}\n'
                 .iter()
                 .map(|m| (m.role, m.content.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// Provider for the codex round-3 MAJOR (PR #1187 follow-up): emits, in
+    /// a single turn, a spawn_only tool call AND a sibling regular tool call
+    /// whose tool_call_id contains a `:` so that `handle_tool_use` rewrites
+    /// it via `sanitize_tool_call_id`. Then on the next call emits an
+    /// EndTurn with a terminal assistant message.
+    ///
+    /// Models the round-3 bug: with the pre-fix code, the post-tool gate
+    /// at `any_tool_invocation_errored` was called with the CALLER'S
+    /// ORIGINAL response (`admin_view:11` still on it), so the success-bit
+    /// lookup keyed by the SANITIZED id (`admin_view_11`) missed, the
+    /// content-fallback scan also keyed on the original id (still missed),
+    /// and the synth-ack fired even though the sibling reported
+    /// `success=false`.
+    struct SanitizedIdSpawnOnlyAndErroringProvider {
+        calls: AtomicUsize,
+        spawn_only_name: &'static str,
+        erroring_name: &'static str,
+        erroring_raw_id: &'static str,
+        final_content: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SanitizedIdSpawnOnlyAndErroringProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_pipeline".to_string(),
+                            name: self.spawn_only_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            // Colon in the id mirrors the dspfac /
+                            // Moonshot-kimi pattern (`admin_view_sessions:11`).
+                            // `handle_tool_use` rewrites this to
+                            // `admin_view_sessions_11` via
+                            // `sanitize_tool_call_id`. With the round-3
+                            // bug, the post-tool gate sees the ORIGINAL id
+                            // (with the colon) and misses the success-bit
+                            // entry that the dispatcher keyed by the
+                            // SANITIZED id.
+                            id: self.erroring_raw_id.to_string(),
+                            name: self.erroring_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some(self.final_content.to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Codex round-3 MAJOR (PR #1187 follow-up). The post-tool synth-ack
+    /// gate (`any_tool_invocation_errored`) was called with the CALLER'S
+    /// ORIGINAL response, but `handle_tool_use` had sanitized/dedup'd a
+    /// CLONE before executing tools. When sanitization rewrote a tool_call_id
+    /// (e.g. `admin_view:11` → `admin_view_11`), the success-bit lookup
+    /// (keyed by the sanitized id) missed, the content-fallback scan (also
+    /// keyed on the original id) also missed, and a real `success=false`
+    /// would slip past the gate — the synth-ack still fired.
+    ///
+    /// Fix: `handle_tool_use` now returns the sanitized response; the
+    /// caller passes that sanitized response into the gate so the keys
+    /// align with the success-bit sink.
+    ///
+    /// This test verifies: when the sibling failing tool has a
+    /// colon-bearing id that gets sanitized AND `success=false` is
+    /// reported, the synth-ack is correctly suppressed (the bug would
+    /// produce a `synthesized_from_spawn_only=true` ack here).
+    #[tokio::test]
+    async fn synth_ack_suppressed_when_failing_tool_has_sanitized_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        // spawn_only foreground returns the handle envelope (success=true)
+        // and flips the spawn_only-was-invoked flag.
+        tools.register(NamedEchoTool {
+            name: "run_pipeline",
+            output: "unused (foreground returns the handle envelope, not this)",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // Sibling tool errors; dispatcher keys the success-bit entry by
+        // the SANITIZED tool_call_id (the LLM-supplied id had a colon).
+        tools.register(ErroringTool {
+            name: "shell",
+            message: "required tool(s) not available on this host: shell-helper",
+        });
+
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(SanitizedIdSpawnOnlyAndErroringProvider {
+                calls: AtomicUsize::new(0),
+                spawn_only_name: "run_pipeline",
+                erroring_name: "shell",
+                erroring_raw_id: "admin_view_sessions:11",
+                final_content:
+                    "Pipeline launched; shell-helper failed — cannot proceed.",
+            });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("spawn-only-sanitized-id-test"),
+            provider,
+            tools,
+            memory,
+        );
+
+        let result = agent
+            .process_message("kick off a deep search", &[], vec![])
+            .await
+            .unwrap();
+
+        // With the pre-fix code, the gate misses the sanitized-id
+        // success=false entry and the synth-ack fires:
+        //   result.content starts with "Background work started for `run_pipeline`."
+        //   result.synthesized_from_spawn_only == true
+        //
+        // With the round-3 fix, the gate sees the sanitized id, finds
+        // success=false, suppresses the ack, the loop continues, and the
+        // LLM's iter-2 EndTurn produces the terminal reply.
+        assert!(
+            !result.content.starts_with("Background work started"),
+            "synth-ack must be suppressed when sibling tool errored AND its \
+             tool_call_id was rewritten by sanitization; got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.synthesized_from_spawn_only,
+            "synthesized_from_spawn_only must be false when sibling with \
+             sanitized tool_call_id reported success=false"
+        );
+        assert_eq!(
+            result.content,
+            "Pipeline launched; shell-helper failed — cannot proceed.",
+            "the LLM's recovery reply must surface, not the synth-ack"
+        );
+
+        // Sanity: the failing-sibling tool-result lives under a SANITIZED
+        // id (no colon). After `handle_tool_use` sanitizes the colon to
+        // `_`, downstream prepare-message steps (`normalize_tool_call_ids`,
+        // see loop_compaction.rs) may additionally add the `call_` prefix
+        // before the next LLM call — so we accept either
+        // `admin_view_sessions_11` or `call_admin_view_sessions_11`. What
+        // matters is: NO message carries the original colon-bearing id,
+        // proving sanitization ran end-to-end.
+        let sanitized_tool_msg = result.messages.iter().find(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id.as_deref().is_some_and(|id| {
+                    !id.contains(':') && id.contains("admin_view_sessions_11")
+                })
+        });
+        assert!(
+            sanitized_tool_msg.is_some(),
+            "expected the failing sibling's tool-result keyed by a sanitized id \
+             (containing `admin_view_sessions_11`, no colon); messages were: {:?}",
+            result
+                .messages
+                .iter()
+                .map(|m| (m.role, m.tool_call_id.clone()))
+                .collect::<Vec<_>>()
+        );
+        // And NOT under the original colonized id — sanitization rewrote it.
+        let original_colonized_msg = result.messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id == "admin_view_sessions:11")
+        });
+        assert!(
+            !original_colonized_msg,
+            "no tool-result should carry the original colon-bearing id; \
+             sanitization should have rewritten it"
         );
     }
 
