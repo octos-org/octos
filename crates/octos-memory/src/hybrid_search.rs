@@ -302,6 +302,38 @@ impl HybridIndex {
         query_embedding: Option<&[f32]>,
         limit: usize,
     ) -> Vec<(String, HybridScore)> {
+        self.search_scored_filtered(query_text, query_embedding, limit, None)
+    }
+
+    /// Like [`Self::search_scored`] but applies a `min_best_modality`
+    /// floor on every candidate's [`HybridScore::best_modality`] BEFORE
+    /// the `combined`-rank truncation to `limit`.
+    ///
+    /// Without this pre-truncation floor, a memory store containing
+    /// `limit` or more sub-threshold vector-only matches will crowd out
+    /// a high-`best_modality` low-`combined` candidate (e.g. a
+    /// keyword-perfect older episode where `combined = bm25_weight *
+    /// 1.0 ≈ 0.30` falls below a mid-tier `combined = vector_weight *
+    /// 0.54 ≈ 0.378`). Codex P2 (PR #1195 review round 2) flagged that
+    /// the agent's previous over-fetch-by-4× workaround was just a
+    /// numeric band-aid: any store large enough to hold 4× sub-threshold
+    /// vector hits would still strand the BM25 winner.
+    ///
+    /// The floor is applied INSIDE the index where the full per-modality
+    /// breakdown is available for ALL candidates that contributed in
+    /// either modality (not just the top-`limit`-by-combined). This
+    /// guarantees that if ANY candidate in the index clears the floor,
+    /// it survives into the returned set (subject to `limit`).
+    ///
+    /// `min_best_modality == None` matches [`Self::search_scored`]
+    /// semantics exactly.
+    pub fn search_scored_filtered(
+        &self,
+        query_text: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+        min_best_modality: Option<f32>,
+    ) -> Vec<(String, HybridScore)> {
         if self.ids.is_empty() {
             return Vec::new();
         }
@@ -358,6 +390,13 @@ impl HybridIndex {
                         vector,
                     },
                 )
+            })
+            // Modality-aware floor — applied BEFORE truncation so a
+            // high-`best_modality` low-`combined` candidate isn't
+            // crowded out by sub-threshold combined-rank hits.
+            .filter(|(_, score)| match min_best_modality {
+                Some(floor) => score.best_modality() >= floor,
+                None => true,
             })
             .collect();
 
@@ -617,6 +656,114 @@ mod tests {
                 a.0,
                 a.1,
                 b.1.combined
+            );
+        }
+    }
+
+    #[test]
+    fn search_scored_filtered_none_floor_matches_unfiltered() {
+        // `search_scored_filtered` with `min_best_modality == None` must
+        // be a no-op wrapper around `search_scored` so callers can
+        // adopt the floor API without changing existing behavior.
+        let mut index = HybridIndex::new(4);
+        index.insert("ep1", "alpha beta", Some(&[1.0, 0.0, 0.0, 0.0]));
+        index.insert("ep2", "gamma delta", Some(&[0.0, 1.0, 0.0, 0.0]));
+        index.insert("ep3", "alpha gamma", Some(&[0.7, 0.3, 0.0, 0.0]));
+
+        let q = "alpha";
+        let q_emb: [f32; 4] = [0.8, 0.2, 0.0, 0.0];
+        let plain = index.search_scored(q, Some(&q_emb), 5);
+        let unfiltered = index.search_scored_filtered(q, Some(&q_emb), 5, None);
+
+        assert_eq!(
+            plain.len(),
+            unfiltered.len(),
+            "no-op floor must preserve length"
+        );
+        for (a, b) in plain.iter().zip(unfiltered.iter()) {
+            assert_eq!(a.0, b.0, "no-op floor must preserve order");
+            assert!((a.1.combined - b.1.combined).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn search_scored_filtered_admits_bm25_only_winner_across_large_noise() {
+        // Regression for codex P2 round-2 (the storage-layer fix):
+        // simulate a memory store where the BM25-perfect older episode
+        // is buried under many sub-threshold vector-only candidates.
+        // With combined-rank truncation BEFORE filtering, the BM25
+        // winner would be stranded. The floor applied inside the index
+        // (before truncation) guarantees it survives — this is the
+        // contamination-safe BM25-only recall guarantee.
+        //
+        // Construct 12 vector-only docs with vector ~0.54 each
+        // (sub-threshold for the 0.55 gate). Then one keyword-perfect
+        // BM25-only doc with no embedding. Default weights: combined
+        // for vector docs ~ 0.7 * 0.54 = 0.378; combined for BM25
+        // winner = bm25_weight * 1.0 = 0.30. With `limit=6` and
+        // floor=0.55, the result MUST contain the BM25 winner and
+        // NONE of the vector noise.
+        let mut index = HybridIndex::new(4);
+        // Vector-only sub-threshold noise. Each gets a slightly
+        // different embedding so they're all valid candidates but
+        // all score ~0.54 against the query.
+        let query_emb: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        for i in 0..12 {
+            // Pick an embedding whose cosine-with-query is ~0.54: at
+            // angle theta with cos(theta) = 0.54, vector (0.54, sqrt(1-0.54^2), 0, 0).
+            let cosine_target: f32 = 0.54;
+            let orth = (1.0 - cosine_target * cosine_target).sqrt();
+            let emb = [cosine_target, orth, 0.0, 0.0];
+            index.insert(
+                &format!("vec-noise-{i}"),
+                &format!("noise topic {i}"),
+                Some(&emb),
+            );
+        }
+        // BM25-perfect older episode, no embedding.
+        index.insert("bm25-winner", "ferrocene rustacean ownership", None);
+
+        // Query keywords match only "bm25-winner"; query embedding is
+        // close to the vector-noise embeddings.
+        let q = "ferrocene rustacean ownership";
+
+        // Without the floor: the 12 vector-noise docs at combined~0.378
+        // each rank above bm25-winner at combined=0.30 (when has_vectors=true,
+        // bm25-winner gets combined = bm25_weight * bm25 = 0.3 * 1.0 = 0.3),
+        // so a limit-6 unfiltered call returns only vector noise.
+        let unfiltered = index.search_scored_filtered(q, Some(&query_emb), 6, None);
+        assert_eq!(
+            unfiltered.len(),
+            6,
+            "without floor, top-6 fills with vector noise"
+        );
+        let any_winner = unfiltered.iter().any(|(id, _)| id == "bm25-winner");
+        assert!(
+            !any_winner,
+            "without floor, the BM25 winner is crowded out of top-6 by vector noise — \
+             this is the dead band codex P2 round 2 flagged"
+        );
+
+        // With the floor: vector-noise docs (best_modality ≈ 0.54) are
+        // dropped INSIDE the index before truncation, so bm25-winner
+        // (best_modality = 1.0) survives.
+        let filtered = index.search_scored_filtered(q, Some(&query_emb), 6, Some(0.55));
+        let winner = filtered.iter().find(|(id, _)| id == "bm25-winner").expect(
+            "BM25 winner must survive the index-level floor regardless of how much vector \
+                 noise sits ahead of it in combined-rank order",
+        );
+        assert!(
+            winner.1.bm25 >= 0.99,
+            "BM25 winner should have a near-1.0 BM25 score (got {})",
+            winner.1.bm25
+        );
+        assert_eq!(winner.1.vector, 0.0, "BM25 winner has no embedding");
+        for (id, score) in &filtered {
+            assert!(
+                score.best_modality() >= 0.55,
+                "every returned candidate must clear the floor (got {} for {})",
+                score.best_modality(),
+                id
             );
         }
     }
