@@ -36,6 +36,40 @@ const DEFAULT_VECTOR_WEIGHT: f32 = 0.7;
 /// Default weight for BM25 text relevance in hybrid scoring.
 const DEFAULT_BM25_WEIGHT: f32 = 0.3;
 
+/// Per-modality score breakdown returned by [`HybridIndex::search_scored`].
+///
+/// `combined` is the same weighted-sum score [`HybridIndex::search`] would
+/// return — preserved here so the caller can keep using the existing
+/// ranking semantics (operator-configured `with_weights` still controls
+/// ranking). `bm25` and `vector` expose the underlying per-modality
+/// similarity in `[0, 1]` so downstream gates can be modality-aware,
+/// admitting a strong single-modality match (e.g. a keyword-perfect
+/// episode without a stored embedding) that the combined score would
+/// down-weight below the gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HybridScore {
+    /// Weighted-sum score in `[0, 1]`, matching the documented
+    /// semantics of [`HybridIndex::search`].
+    pub combined: f32,
+    /// Normalized BM25 score in `[0, 1]`. `0.0` means the document did
+    /// not match any query keyword.
+    pub bm25: f32,
+    /// Cosine similarity in `[0, 1]`. `0.0` means either the document
+    /// has no embedding, the query has no embedding, or the embeddings
+    /// are orthogonal.
+    pub vector: f32,
+}
+
+impl HybridScore {
+    /// Best per-modality score for this document. Useful as input to a
+    /// modality-aware similarity gate: a document with a perfect BM25
+    /// match (1.0) and no embedding still scores 1.0 here, instead of
+    /// being capped at `bm25_weight` by the combined score.
+    pub fn best_modality(&self) -> f32 {
+        self.bm25.max(self.vector)
+    }
+}
+
 /// HNSW index parameters.
 /// max_nb_connection: max edges per node in the graph (higher = more accurate, more memory).
 const HNSW_MAX_NB_CONNECTION: usize = 16;
@@ -218,41 +252,16 @@ impl HybridIndex {
             _ => HashMap::new(),
         };
 
-        // Merge scores.
-        //
-        // When both modalities are queried we normalize per-document by the
-        // weights of the modalities that actually contributed. Without this,
-        // a document that matched on only one side (e.g. BM25-only because
-        // its embedding hasn't been written yet, or vector-only because the
-        // query terms don't overlap the summary) would be down-weighted to
-        // at most that single modality's weight (0.3 for BM25-only, 0.7 for
-        // vector-only) — small enough that a downstream similarity gate
-        // (e.g. `MIN_EPISODE_SIMILARITY` in the agent loop) would always
-        // drop genuinely relevant single-modality matches.
-        //
-        // Per-modality scores are already in [0, 1] (BM25 is max-normalized,
-        // vector similarity is cosine), so dividing by the contributing
-        // weight sum keeps the merged score in [0, 1] regardless of which
-        // modalities fired for any given document.
+        // Merge scores
         let has_vectors = !vector_scores.is_empty();
         let mut combined: HashMap<usize, f32> = HashMap::new();
 
         if has_vectors {
-            let mut weight_sum: HashMap<usize, f32> = HashMap::new();
             for (&idx, &score) in &vector_scores {
                 *combined.entry(idx).or_default() += self.vector_weight * score;
-                *weight_sum.entry(idx).or_default() += self.vector_weight;
             }
             for (&idx, &score) in &bm25_scores {
                 *combined.entry(idx).or_default() += self.bm25_weight * score;
-                *weight_sum.entry(idx).or_default() += self.bm25_weight;
-            }
-            for (idx, score) in combined.iter_mut() {
-                if let Some(&w) = weight_sum.get(idx) {
-                    if w > 0.0 {
-                        *score /= w;
-                    }
-                }
             }
         } else {
             // BM25 only
@@ -268,6 +277,95 @@ impl HybridIndex {
             .collect();
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        results
+    }
+
+    /// Search the index and return per-modality score breakdowns.
+    ///
+    /// Like [`Self::search`] but exposes the underlying BM25 and vector
+    /// similarity scores separately so downstream gates can be
+    /// modality-aware. This lets callers admit a strong single-modality
+    /// match (e.g. an older episode without a stored embedding, scoring
+    /// 1.0 on BM25 but 0.0 on vector similarity) that would otherwise be
+    /// down-weighted by the configured `bm25_weight` / `vector_weight`
+    /// — useful for the agent loop's "Relevant Past Experiences"
+    /// similarity gate that must not strand keyword-perfect matches
+    /// (NEW-06 follow-up).
+    ///
+    /// Ranking still uses the same configured weighted sum as
+    /// [`Self::search`] — this method only adds the per-modality
+    /// breakdown so callers can gate independently from ranking.
+    pub fn search_scored(
+        &self,
+        query_text: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> Vec<(String, HybridScore)> {
+        if self.ids.is_empty() {
+            return Vec::new();
+        }
+
+        let fetch_count = limit * 4;
+
+        let bm25_scores = self.bm25_score(query_text, fetch_count);
+
+        let valid_query_emb = query_embedding
+            .filter(|e| e.len() == self.dimension)
+            .and_then(l2_normalize);
+        let vector_scores: HashMap<usize, f32> = match (&valid_query_emb, &self.hnsw) {
+            (Some(normalized), Some(hnsw)) => {
+                let neighbors = hnsw.search(normalized, fetch_count, 30);
+                let mut scores: HashMap<usize, f32> = HashMap::new();
+                for n in neighbors {
+                    let sim: f32 = 1.0 - n.distance;
+                    scores.insert(n.d_id, sim.max(0.0));
+                }
+                scores
+            }
+            _ => HashMap::new(),
+        };
+
+        let has_vectors = !vector_scores.is_empty();
+        // Collect every doc that contributed in either modality.
+        let mut docs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        docs.extend(bm25_scores.keys().copied());
+        docs.extend(vector_scores.keys().copied());
+
+        let mut results: Vec<(String, HybridScore)> = docs
+            .into_iter()
+            .filter(|idx| !self.ids[*idx].is_empty()) // skip tombstoned
+            .map(|idx| {
+                let bm25 = bm25_scores.get(&idx).copied().unwrap_or(0.0);
+                let vector = vector_scores.get(&idx).copied().unwrap_or(0.0);
+                // The "combined" score below preserves the documented
+                // weighted-sum ranking semantics from `search()` so
+                // operator-configured `with_weights` still controls
+                // ranking. BM25-only candidates are skipped from the
+                // combined score when no vector results exist so the
+                // BM25-only branch (`has_vectors == false`) matches
+                // `search()` exactly.
+                let combined = if has_vectors {
+                    self.vector_weight * vector + self.bm25_weight * bm25
+                } else {
+                    bm25
+                };
+                (
+                    self.ids[idx].clone(),
+                    HybridScore {
+                        combined,
+                        bm25,
+                        vector,
+                    },
+                )
+            })
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.1.combined
+                .partial_cmp(&a.1.combined)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
@@ -428,38 +526,94 @@ mod tests {
     }
 
     #[test]
-    fn bm25_only_match_is_not_down_weighted_when_some_docs_have_vectors() {
-        // Regression: previously, when the query had an embedding, the
-        // combined score for a BM25-only match was `bm25_weight * bm25` —
-        // capping at 0.3 with default weights. A downstream similarity
-        // gate (e.g. MIN_EPISODE_SIMILARITY = 0.35 in the agent loop)
-        // would then always drop genuinely relevant keyword-only matches
-        // (older episodes without embeddings, or any episode whose
-        // embedding hasn't been written yet). After the fix, per-document
-        // scores are normalized by the modalities that actually contributed,
-        // so a strong BM25-only match returns close to its raw BM25 score.
+    fn search_scored_exposes_per_modality_breakdown() {
+        // The agent loop's similarity gate (MIN_EPISODE_SIMILARITY = 0.35)
+        // must still accept genuinely relevant single-modality matches
+        // (e.g. older episodes without embeddings, where BM25 is the
+        // only signal). The new `search_scored` exposes both modalities
+        // so the agent can gate on `best_modality()` instead of the
+        // combined weighted-sum score that down-weights BM25-only hits
+        // to `bm25_weight` (0.3 with default weights) when any vector
+        // result exists.
         let mut index = HybridIndex::new(4);
         // ep1: keyword-perfect match, NO embedding (old episode).
         index.insert("ep1", "rust ownership borrow checker", None);
-        // ep2: has an embedding but irrelevant text and far-from-query vector.
-        index.insert("ep2", "python web flask", Some(&[0.0, 0.0, 1.0, 0.0]));
+        // ep2: irrelevant text, vector close to query.
+        index.insert("ep2", "python web flask", Some(&[1.0, 0.0, 0.0, 0.0]));
 
         let query_emb: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
-        let results = index.search("rust ownership", Some(&query_emb), 5);
-        let ep1_score = results
+        let results = index.search_scored("rust ownership", Some(&query_emb), 5);
+        let ep1 = results
             .iter()
             .find(|(id, _)| id == "ep1")
             .map(|(_, s)| *s)
             .expect("ep1 should appear in results");
+        let ep2 = results
+            .iter()
+            .find(|(id, _)| id == "ep2")
+            .map(|(_, s)| *s)
+            .expect("ep2 should appear in results");
 
-        // Pre-fix, ep1 maxed at bm25_weight (0.3). Post-fix, ep1's
-        // single-modality score is normalized to its raw BM25 score
-        // (which is 1.0 since it's the only BM25 match, max-normalized).
-        // Guarantee it crosses the agent loop's 0.35 threshold so the
-        // contamination fix doesn't strand keyword-only matches.
+        // ep1: BM25-perfect (max-normalized = 1.0), no embedding.
         assert!(
-            ep1_score >= 0.35,
-            "BM25-only match should not be down-weighted below the agent loop's similarity gate (got {ep1_score})"
+            ep1.bm25 >= 0.99,
+            "ep1 should have a near-1.0 BM25 score (got {})",
+            ep1.bm25
         );
+        assert_eq!(ep1.vector, 0.0, "ep1 has no embedding");
+        // Combined still preserves documented weighted-sum semantics:
+        // ep1's combined = bm25_weight * 1.0 = ~0.3 with default weights.
+        assert!(
+            (ep1.combined - 0.3).abs() < 0.05,
+            "ep1.combined should equal bm25_weight * 1.0 (got {})",
+            ep1.combined
+        );
+        // best_modality() is the modality-aware floor — the agent gate
+        // uses this so BM25-only matches survive the threshold check.
+        assert!(
+            ep1.best_modality() >= 0.35,
+            "ep1.best_modality() should clear the agent's 0.35 gate (got {})",
+            ep1.best_modality()
+        );
+
+        // ep2: vector-perfect, no keyword overlap.
+        assert_eq!(ep2.bm25, 0.0, "ep2 has no keyword match");
+        assert!(
+            ep2.vector >= 0.99,
+            "ep2 should have a near-1.0 vector score (got {})",
+            ep2.vector
+        );
+    }
+
+    #[test]
+    fn search_scored_combined_matches_search_for_ranking_parity() {
+        // `search_scored` must produce the same combined score that
+        // `search` would, so callers that switch don't get different
+        // rankings.
+        let mut index = HybridIndex::new(4);
+        index.insert(
+            "ep1",
+            "rust ownership borrow checker",
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        );
+        index.insert("ep2", "python web flask", Some(&[0.0, 1.0, 0.0, 0.0]));
+        index.insert("ep3", "rust async programming", Some(&[0.5, 0.5, 0.0, 0.0]));
+
+        let q = "rust programming";
+        let q_emb: [f32; 4] = [0.7, 0.3, 0.0, 0.0];
+        let plain = index.search(q, Some(&q_emb), 5);
+        let scored = index.search_scored(q, Some(&q_emb), 5);
+
+        assert_eq!(plain.len(), scored.len());
+        for (a, b) in plain.iter().zip(scored.iter()) {
+            assert_eq!(a.0, b.0, "ranking order must match");
+            assert!(
+                (a.1 - b.1.combined).abs() < 1e-5,
+                "combined score must match plain score for {}: search={} search_scored.combined={}",
+                a.0,
+                a.1,
+                b.1.combined
+            );
+        }
     }
 }

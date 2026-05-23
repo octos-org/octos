@@ -73,6 +73,7 @@ pub use agent::{
         LoopDecision, LoopRetryCounters, LoopRetryLimits, LoopRetryState, OCTOS_LOOP_RETRY_TOTAL,
         SHELL_SPIRAL_VARIANT,
     },
+    memory::MIN_EPISODE_SIMILARITY,
     realtime::{
         AgentError, Heartbeat, HeartbeatState, RealtimeConfig, RealtimeHookEnricher,
         SensorContextInjector, SensorSnapshot, SensorSource,

@@ -1,13 +1,14 @@
 //! Initial message building and episodic memory context for the agent.
 
 use octos_core::{Message, MessageRole, Task};
-use octos_memory::Episode;
+use octos_memory::{Episode, HybridScore};
 use tracing::warn;
 
 use super::Agent;
 
-/// Minimum hybrid similarity score required for a retrieved past episode
-/// to be injected into the agent's prompt as a "Relevant Past Experience".
+/// Minimum per-modality similarity score required for a retrieved past
+/// episode to be injected into the agent's prompt as a "Relevant Past
+/// Experience".
 ///
 /// **Why this constant exists.** `EpisodeStore::find_relevant_hybrid` returns
 /// the top-K episodes by hybrid score regardless of how relevant they
@@ -18,10 +19,21 @@ use super::Agent;
 /// episodes from a prior Tim Cook / GPT-5.5 podcast session).
 ///
 /// 0.35 is the codex-recommended baseline: above this, the hybrid score
-/// reflects genuine BM25 keyword + cosine similarity overlap; below it the
-/// match is essentially noise. Exposed as `pub const` so operators can tune
-/// it without forking — exporting from the crate root is intentional so
-/// downstream tools (e.g. an admin tuning helper) can reference the value.
+/// reflects genuine BM25 keyword or cosine similarity overlap; below it
+/// the match is essentially noise.
+///
+/// **Modality-aware gating.** The gate is compared against
+/// [`HybridScore::best_modality`] (the max of BM25 and vector), not
+/// against the configured weighted-sum `combined` score. Otherwise a
+/// keyword-perfect match scoring `1.0` on BM25 would be capped at
+/// `bm25_weight` (`0.3` with defaults) when an embedder is configured,
+/// and the gate would always strand legitimately relevant single-modality
+/// matches (older episodes without embeddings, or queries that don't
+/// overlap any episode summary keywords).
+///
+/// Exposed as `pub const` and re-exported from the crate root so
+/// operators / admin tooling can reference the threshold without
+/// forking.
 pub const MIN_EPISODE_SIMILARITY: f32 = 0.35;
 
 impl Agent {
@@ -145,19 +157,25 @@ impl Agent {
 }
 
 /// Format scored hybrid-search results into the "Relevant Past Experiences"
-/// system message body. Episodes with score below
+/// system message body. Episodes whose best per-modality score falls below
 /// [`MIN_EPISODE_SIMILARITY`] are dropped to prevent cross-session
 /// contamination (NEW-06). Returns `None` when no episode survives the
 /// filter — callers must omit the entire system message in that case
 /// instead of injecting an empty header.
 ///
-/// `scored` is expected to be sorted by descending score (the order
-/// `EpisodeStore::find_relevant_hybrid_scored` returns); the relative
-/// order is preserved after filtering so the top match remains first.
-fn format_relevant_experiences(scored: &[(Episode, f32)]) -> Option<String> {
+/// Gating uses [`HybridScore::best_modality`] (max of BM25 and vector)
+/// rather than the configured weighted-sum `combined` score, so a
+/// keyword-perfect older episode without a stored embedding still
+/// passes — see the `MIN_EPISODE_SIMILARITY` docs for the rationale.
+///
+/// `scored` is expected to be sorted by descending combined score (the
+/// order `EpisodeStore::find_relevant_hybrid_scored` returns); the
+/// relative order is preserved after filtering so the top match remains
+/// first.
+fn format_relevant_experiences(scored: &[(Episode, HybridScore)]) -> Option<String> {
     let filtered: Vec<&Episode> = scored
         .iter()
-        .filter(|(_, score)| *score >= MIN_EPISODE_SIMILARITY)
+        .filter(|(_, score)| score.best_modality() >= MIN_EPISODE_SIMILARITY)
         .map(|(ep, _)| ep)
         .collect();
     if filtered.is_empty() {
@@ -205,7 +223,7 @@ where
 mod tests {
     use super::*;
     use octos_core::{AgentId, TaskId};
-    use octos_memory::{Episode, EpisodeOutcome};
+    use octos_memory::{Episode, EpisodeOutcome, HybridScore};
     use std::path::PathBuf;
 
     fn make_episode(summary: &str) -> Episode {
@@ -218,15 +236,33 @@ mod tests {
         )
     }
 
+    /// Construct a HybridScore where the BM25 channel carries the test's
+    /// chosen similarity value (vector left at zero, combined unused for
+    /// gating). The agent gate compares against `best_modality()` so this
+    /// mirrors the "older episode with no embedding" case.
+    fn score_bm25(s: f32) -> HybridScore {
+        HybridScore {
+            combined: s,
+            bm25: s,
+            vector: 0.0,
+        }
+    }
+
     #[test]
     fn episode_injection_filters_below_threshold() {
         // 3 episodes scored at [0.5, 0.3, 0.1]; only the 0.5 episode is
         // above the 0.35 threshold so only it should appear in the
         // formatted message.
         let scored = vec![
-            (make_episode("HIGH RELEVANCE rust ownership"), 0.5_f32),
-            (make_episode("MID RELEVANCE python flask"), 0.3_f32),
-            (make_episode("LOW RELEVANCE weather report"), 0.1_f32),
+            (
+                make_episode("HIGH RELEVANCE rust ownership"),
+                score_bm25(0.5),
+            ),
+            (make_episode("MID RELEVANCE python flask"), score_bm25(0.3)),
+            (
+                make_episode("LOW RELEVANCE weather report"),
+                score_bm25(0.1),
+            ),
         ];
 
         let rendered =
@@ -252,9 +288,9 @@ mod tests {
         // caller skips injecting the "Past Experiences" system message
         // entirely — no empty header allowed.
         let scored = vec![
-            (make_episode("Noisy match A"), 0.34_f32),
-            (make_episode("Noisy match B"), 0.20_f32),
-            (make_episode("Noisy match C"), 0.05_f32),
+            (make_episode("Noisy match A"), score_bm25(0.34)),
+            (make_episode("Noisy match B"), score_bm25(0.20)),
+            (make_episode("Noisy match C"), score_bm25(0.05)),
         ];
 
         assert!(
@@ -269,8 +305,8 @@ mod tests {
         // formatted block (the function preserves input order which is the
         // hybrid search's descending-score order).
         let scored = vec![
-            (make_episode("TOP MATCH first"), 0.6_f32),
-            (make_episode("RUNNER UP second"), 0.45_f32),
+            (make_episode("TOP MATCH first"), score_bm25(0.6)),
+            (make_episode("RUNNER UP second"), score_bm25(0.45)),
         ];
 
         let rendered = format_relevant_experiences(&scored).expect("matches exist above threshold");
@@ -289,9 +325,34 @@ mod tests {
     #[test]
     fn episode_injection_threshold_boundary_is_inclusive() {
         // Sanity: a score exactly at the threshold is admitted.
-        let scored = vec![(make_episode("exactly at threshold"), MIN_EPISODE_SIMILARITY)];
+        let scored = vec![(
+            make_episode("exactly at threshold"),
+            score_bm25(MIN_EPISODE_SIMILARITY),
+        )];
         let rendered = format_relevant_experiences(&scored)
             .expect("score == threshold should be admitted (>=)");
         assert!(rendered.contains("exactly at threshold"));
+    }
+
+    #[test]
+    fn episode_injection_admits_bm25_only_match_with_weak_combined_score() {
+        // Regression for codex P2: when an embedder is configured, the
+        // combined weighted-sum score for a BM25-only match maxes out
+        // at `bm25_weight` (0.3 with defaults) — below the 0.35 gate.
+        // The agent gate uses `best_modality()` so the match still
+        // passes on its raw BM25 score (1.0).
+        let scored = vec![(
+            make_episode("keyword-perfect older episode"),
+            HybridScore {
+                combined: 0.30, // weighted-sum (bm25_weight=0.3 * bm25=1.0)
+                bm25: 1.0,
+                vector: 0.0,
+            },
+        )];
+
+        let rendered = format_relevant_experiences(&scored).expect(
+            "keyword-perfect single-modality match must survive the gate even though combined < 0.35",
+        );
+        assert!(rendered.contains("keyword-perfect older episode"));
     }
 }
