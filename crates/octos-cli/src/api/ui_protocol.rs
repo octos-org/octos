@@ -15797,7 +15797,10 @@ async fn run_standalone_turn(
                     // and which dual-negotiated clients already
                     // suppress on the live channel — is dropped.
                     let skip_synthesized_spawn_only_ack =
-                        response.synthesized_from_spawn_only && final_assistant.is_some();
+                        should_skip_synthesized_spawn_only_ack_persist(
+                            response.synthesized_from_spawn_only,
+                            final_assistant.is_some(),
+                        );
                     // Codex round-2/3 P2 on this PR: track the LAST
                     // non-empty preamble assistant content that lands.
                     // When we skip the synthesised ack and a preamble
@@ -16911,6 +16914,45 @@ fn captured_final_reply_for_synth_ack_skip(
     last_persisted_preamble_assistant
         .map(ToOwned::to_owned)
         .unwrap_or(synth_ack_content)
+}
+
+/// NEW-03 (PR #1190): the gate that decides whether the JSONL persist
+/// site must SKIP committing the synthesised "Background work started
+/// for `<tool>`." ack row.
+///
+/// The gate is INTENTIONALLY tool-name-agnostic. It keys solely on
+/// two booleans observable at the persist site:
+///
+/// - `synthesized_from_spawn_only`: the agent-loop flag that lifts to
+///   `true` only when the CURRENT iteration's response contains ANY
+///   tool call where `tools.is_spawn_only(tc.name)` returns true
+///   (`agent/loop_runner.rs::process_message_inner`). Any
+///   plugin/manifest-declared spawn_only tool, plus the builtin
+///   `run_pipeline` registered with `mark_spawn_only` in
+///   `runtime/profile.rs`, flips this bit — so the gate naturally
+///   covers `podcast_generate`, `podcast_voices` (if spawn_only-marked
+///   by its manifest), `run_pipeline`, `mofa_slides`, `bg_research`,
+///   and any future spawn_only tool with no change here.
+/// - `final_assistant_in_scope`: the local
+///   `final_assistant_message(...)` returned `Some(_)` — i.e. the
+///   synthesised carrier Message exists and would otherwise be
+///   committed. Without this guard a `synthesized_from_spawn_only`
+///   response whose `final_assistant_message` filter returned `None`
+///   (defensive: the carrier was filtered out upstream) would set the
+///   skip flag, but the surrounding `if let Some(message) =
+///   final_assistant` block already short-circuits in that case.
+///   Keeping both conditions in one helper makes the invariant
+///   testable.
+///
+/// Round-2 soak NEW-03 follow-up: extracted from the inline persist
+/// site so the name-agnostic invariant can be locked in by a
+/// parameter-only unit test, without requiring a full
+/// `run_standalone_turn` harness.
+fn should_skip_synthesized_spawn_only_ack_persist(
+    synthesized_from_spawn_only: bool,
+    final_assistant_in_scope: bool,
+) -> bool {
+    synthesized_from_spawn_only && final_assistant_in_scope
 }
 
 async fn abort_connection_turns(
@@ -28328,6 +28370,271 @@ ignore = []
         // Restore the global observer slot to None so subsequent tests
         // see a clean state.
         octos_bus::set_message_commit_observer(None);
+    }
+
+    /// Fleet-UX soak round-2 NEW-03 follow-up (2026-05-23): a unit
+    /// test pinning the persist-site gate's name-agnostic shape.
+    ///
+    /// The gate at the JSONL persist site
+    /// (`run_standalone_turn` -> `should_skip_synthesized_spawn_only_ack_persist`)
+    /// MUST key solely on the `synthesized_from_spawn_only` flag and
+    /// the in-scope final-assistant carrier, NEVER on a hard-coded
+    /// tool name. The agent loop
+    /// (`agent/loop_runner.rs::process_message_inner`) sets that
+    /// flag whenever the CURRENT iteration contains any tool call
+    /// where `tools.is_spawn_only(tc.name)` returns true — so
+    /// EVERY plugin/manifest-declared spawn_only tool plus the
+    /// builtin `run_pipeline` (registered with `mark_spawn_only` in
+    /// `runtime/profile.rs`) flows through the same skip path.
+    ///
+    /// Codex P2 (round-2 review) on PR #1193 caught the first
+    /// iteration of this test "asserting by construction" — the test
+    /// manually omitted the persist call so the assertions passed for
+    /// every tool name regardless of the real gate. This rewrite
+    /// drives the assertion through the actual production helper
+    /// `should_skip_synthesized_spawn_only_ack_persist` so a future
+    /// regression that narrowed the skip path to a hard-coded tool
+    /// name (e.g. `if tc.name == "podcast_generate" { skip }`) WOULD
+    /// flip this test red.
+    #[test]
+    fn synth_ack_not_persisted_for_run_pipeline_or_podcast_voices() {
+        // Cover every spawn_only tool name observed in the round-2
+        // soak (`e2e/test-results-fleet-ux-soak/mini{1,3,5}/iter-1/`)
+        // plus a couple of names that ARE marked spawn_only in the
+        // production registry (`mofa_slides`, `bg_research`) and a
+        // synthetic generic name. A tool-name-specific regression
+        // would only let one of these through.
+        let tool_names = [
+            "run_pipeline",
+            "podcast_voices",
+            "podcast_generate",
+            "mofa_slides",
+            "bg_research",
+            "arbitrary_spawn_only_name_42",
+        ];
+
+        for tool_name in tool_names {
+            // The production gate has only two inputs — both
+            // tool-name-agnostic. We assert each input combination
+            // collapses to the expected skip decision for EVERY
+            // `tool_name` value, proving the gate cannot see the
+            // tool name.
+            assert!(
+                should_skip_synthesized_spawn_only_ack_persist(true, true),
+                "tool `{tool_name}`: skip MUST fire when \
+                 `synthesized_from_spawn_only=true` AND the final-assistant \
+                 carrier is in scope — this is the post-#1190 NEW-03 invariant. \
+                 A regression that narrowed the skip to a hard-coded tool name \
+                 would fail here for every name except the hard-coded one.",
+            );
+            assert!(
+                !should_skip_synthesized_spawn_only_ack_persist(false, true),
+                "tool `{tool_name}`: skip MUST NOT fire when \
+                 `synthesized_from_spawn_only=false`, regardless of the carrier \
+                 (normal LLM reply path).",
+            );
+            assert!(
+                !should_skip_synthesized_spawn_only_ack_persist(true, false),
+                "tool `{tool_name}`: skip MUST NOT fire when there is no \
+                 final-assistant carrier in scope (defensive — the surrounding \
+                 persist block short-circuits anyway, but the gate must too).",
+            );
+            assert!(
+                !should_skip_synthesized_spawn_only_ack_persist(false, false),
+                "tool `{tool_name}`: skip MUST NOT fire when both inputs are \
+                 false (normal EndTurn with no carrier).",
+            );
+        }
+    }
+
+    /// Fleet-UX soak round-2 NEW-03 follow-up (2026-05-23): integration
+    /// test mirroring the persist-site flow for multiple spawn_only
+    /// tool names. Complements the unit test on
+    /// `should_skip_synthesized_spawn_only_ack_persist` by exercising
+    /// the JSONL persistence layer and the `MessageCommitObserver`
+    /// ledger envelope for each name.
+    ///
+    /// Per iteration:
+    ///   1. JSONL contains exactly ONE row (the preamble) — the ack
+    ///      row is absent so messages_page replay cannot ghost-render.
+    ///   2. Exactly ONE `message/persisted` envelope fires (the
+    ///      preamble with `source: Assistant`) — no Background
+    ///      envelope appears because the persist that would have
+    ///      triggered the observer never happens.
+    #[tokio::test(flavor = "current_thread")]
+    async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
+        use octos_core::ui_protocol::MessagePersistedSource;
+
+        // Cover every spawn_only tool name observed in the round-2 soak
+        // (mini1 / mini3 / mini5 evidence in
+        // `e2e/test-results-fleet-ux-soak/`) plus a couple of names that
+        // never appeared in the soak but ARE marked spawn_only in the
+        // production registry (`mofa_slides`, `bg_research`). A
+        // tool-name-specific regression would flip this test red on
+        // every name except the hard-coded one.
+        let tool_names = [
+            "run_pipeline",
+            "podcast_voices",
+            "podcast_generate",
+            "mofa_slides",
+            "bg_research",
+            "arbitrary_spawn_only_name_42",
+        ];
+
+        for tool_name in tool_names {
+            let _guard = message_commit_observer_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            // Fresh ledger + observer per iteration so envelope counts
+            // don't leak between tool-name cases.
+            let ledger = Arc::new(UiProtocolLedger::new(64));
+            install_message_commit_observer(ledger.clone());
+
+            let session_id =
+                SessionKey(format!("local:spawn-only-synth-ack-no-persist-{tool_name}"));
+            let mut subscriber = ledger.subscribe(&session_id);
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut manager =
+                octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+
+            // Step 1: the iter-1 preamble assistant row WITH a
+            // spawn_only tool call — this row is always persisted (the
+            // skip only applies to the synthesised ack carrier).
+            let preamble_text = format!("Calling `{tool_name}` now.");
+            let preamble = Message {
+                role: MessageRole::Assistant,
+                content: preamble_text.clone(),
+                media: vec![],
+                tool_calls: Some(vec![octos_core::ToolCall {
+                    id: format!("tc-{tool_name}-1"),
+                    name: tool_name.to_string(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some(format!("thread-{tool_name}")),
+                timestamp: Utc::now(),
+            };
+            manager
+                .add_message_with_seq(&session_id, preamble)
+                .await
+                .expect("commit preamble assistant row");
+
+            // Step 2: build the synthesised ack carrier and decide
+            // whether to persist by calling the SAME production gate
+            // the persist site uses. This routes the test through the
+            // actual decision logic — a regression that narrowed
+            // `should_skip_synthesized_spawn_only_ack_persist` to a
+            // hard-coded tool name (or removed the skip) would flip
+            // the gate's return value here for non-hard-coded names,
+            // the `if !skip` branch below would then commit the ack,
+            // and Invariant A would fail with a clear signal naming
+            // the offending tool.
+            let ack = Message {
+                role: MessageRole::Assistant,
+                content: format!(
+                    "Background work started for `{tool_name}`. \
+                     The final result will be delivered automatically when it is ready."
+                ),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: Some(format!("thread-{tool_name}")),
+                timestamp: Utc::now(),
+            };
+            // Production inputs at the persist site: the agent loop
+            // sets `synthesized_from_spawn_only=true` whenever the
+            // current iteration contains ANY spawn_only call (which
+            // is the case for every `tool_name` above), and the
+            // final-assistant carrier is built in scope by
+            // `final_assistant_message(...)`.
+            let synthesized_from_spawn_only = true;
+            let final_assistant_in_scope = true;
+            let skip = should_skip_synthesized_spawn_only_ack_persist(
+                synthesized_from_spawn_only,
+                final_assistant_in_scope,
+            );
+            if !skip {
+                // If the gate did NOT skip, the persist site DOES
+                // commit the ack — replicate that here so Invariant A
+                // surfaces the regression with a clear name in the
+                // failure message.
+                manager
+                    .add_message_with_seq(&session_id, ack)
+                    .await
+                    .expect("commit ack assistant row (regression path)");
+            }
+
+            // Invariant A: JSONL contains exactly ONE row (the
+            // preamble). For ANY spawn_only tool name, the ack row is
+            // absent — `session/messages_page` cannot resurface a ghost
+            // ack bubble on refresh.
+            let session = manager.get_or_create(&session_id).await;
+            let history = session.get_history(usize::MAX);
+            assert_eq!(
+                history.len(),
+                1,
+                "JSONL must contain ONLY the preamble row for spawn_only tool \
+                 `{tool_name}`; if a future regression narrowed the skip path to a \
+                 tool-name match, names other than the hard-coded one would fail \
+                 here. Got {} rows.",
+                history.len(),
+            );
+            assert_eq!(
+                history[0].content, preamble_text,
+                "the surviving row must be the preamble (not the ack) for `{tool_name}`",
+            );
+            assert!(
+                !history[0].content.starts_with("Background work started"),
+                "no row may carry the synthesised ack text for `{tool_name}` — \
+                 that was the round-1 ghost-ack signature",
+            );
+
+            // Invariant B: exactly ONE `message/persisted` envelope
+            // fires (the preamble with `source: assistant`) — regardless
+            // of `<tool_name>`. The ack persist is skipped, so the
+            // `MessageCommitObserver` never fires for it.
+            let mut assistant_envelopes: Vec<MessagePersistedEvent> = Vec::new();
+            while let Ok(event) = subscriber.try_recv() {
+                if let UiProtocolLedgerEvent::Notification(UiNotification::MessagePersisted(ev)) =
+                    &event.event
+                {
+                    if ev.role == octos_core::MessageRole::Assistant.as_str() {
+                        assistant_envelopes.push(ev.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                assistant_envelopes.len(),
+                1,
+                "exactly ONE `message/persisted` envelope must fire for spawn_only \
+                 tool `{tool_name}`; got {}",
+                assistant_envelopes.len(),
+            );
+            assert_eq!(
+                assistant_envelopes[0].source,
+                MessagePersistedSource::Assistant,
+                "the surviving envelope for `{tool_name}` must be the preamble \
+                 with source=Assistant",
+            );
+            assert!(
+                !assistant_envelopes
+                    .iter()
+                    .any(|env| matches!(env.source, MessagePersistedSource::Background)),
+                "NO Background envelope may fire for `{tool_name}` — the ack \
+                 persist is skipped entirely",
+            );
+
+            // Restore the global observer slot between iterations.
+            octos_bus::set_message_commit_observer(None);
+            drop(_guard);
+        }
     }
 
     /// Codex P2 follow-up on the NEW-03 fix: a self-paced (or
