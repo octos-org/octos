@@ -1604,6 +1604,21 @@ impl Agent {
         Vec<std::path::PathBuf>,
         TokenUsage,
         Vec<(String, serde_json::Value)>,
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): per-tool-call success bit
+        // keyed by `tool_call_id`. The dispatcher already computes this for
+        // the M8.8 serial-cascade scheduler (see [`ToolCallResult`] field 5);
+        // we surface it now so `any_tool_invocation_errored` in the
+        // loop_runner can authoritatively decide whether a tool failed
+        // without guessing from content prefixes. The content-based
+        // classifier was missing many real failure shapes — shell
+        // timeouts ("Command timed out after ..."), sandbox path
+        // rejections ("Path outside working directory ..."), browser
+        // navigation failures, plugin tools with `success: false` and
+        // arbitrary error messages — every one of which renders a red
+        // error chip but did NOT carry a recognised error envelope, so
+        // the synth-ack branch would still fabricate a "Background work
+        // started" bubble alongside it.
+        Vec<(String, bool)>,
     )> {
         let tool_names: Vec<&str> = response
             .tool_calls
@@ -1687,7 +1702,7 @@ impl Agent {
                         tools = %tool_names.join(", "),
                         "tool execution timed out -- spawned tasks continue running for cleanup"
                     );
-                    let messages = response
+                    let messages: Vec<Message> = response
                         .tool_calls
                         .iter()
                         .map(|tc| Message {
@@ -1705,7 +1720,24 @@ impl Agent {
                             timestamp: chrono::Utc::now(),
                         })
                         .collect();
-                    return Ok((messages, vec![], vec![], TokenUsage::default(), Vec::new()));
+                    // Batch-wide timeout: every tool in the batch failed.
+                    // Surface the success bit (false for all) so the
+                    // spawn_only synth-ack gate in loop_runner can suppress
+                    // the fabricated "Background work started" bubble
+                    // without depending on content-prefix matching.
+                    let success_by_id: Vec<(String, bool)> = response
+                        .tool_calls
+                        .iter()
+                        .map(|tc| (tc.id.clone(), false))
+                        .collect();
+                    return Ok((
+                        messages,
+                        vec![],
+                        vec![],
+                        TokenUsage::default(),
+                        Vec::new(),
+                        success_by_id,
+                    ));
                 }
             }
         };
@@ -1730,16 +1762,27 @@ impl Agent {
         let mut files_to_send = Vec::new();
         let mut tokens_used = TokenUsage::default();
         let mut structured_metadata: Vec<(String, serde_json::Value)> = Vec::new();
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): collect the per-call
+        // `success` bit keyed by `tool_call_id` so the loop_runner can
+        // authoritatively decide whether the synth-ack branch fires
+        // alongside a failed tool. Capacity matches the result count.
+        let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
 
         for (
             message,
             tool_files_modified,
             tool_files_to_send,
             tool_tokens,
-            _success,
+            success,
             tool_structured_metadata,
         ) in results
         {
+            // Pair every executed tool result with its `tool_call_id` so
+            // downstream gating logic does not need to guess at the
+            // identity from content shape.
+            if let Some(id) = message.tool_call_id.clone() {
+                success_by_id.push((id, success));
+            }
             messages.push(message);
             files_modified.extend(tool_files_modified);
             files_to_send.extend(tool_files_to_send);
@@ -1758,6 +1801,7 @@ impl Agent {
             files_to_send,
             tokens_used,
             structured_metadata,
+            success_by_id,
         ))
     }
 
