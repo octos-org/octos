@@ -1231,53 +1231,85 @@ impl Agent {
                             }
 
                             if self.tools.spawn_only_was_invoked() {
-                                self.emit_cost_update(turn.total_usage(), &response);
-                                let background_tools = response
-                                    .tool_calls
-                                    .iter()
-                                    .filter(|tc| self.tools.is_spawn_only(&tc.name))
-                                    .map(|tc| tc.name.as_str())
-                                    .collect::<Vec<_>>();
-                                let content = if background_tools.is_empty() {
-                                    "Background work started. The final result will be delivered automatically when it is ready.".to_string()
-                                } else if background_tools.len() == 1 {
-                                    format!(
-                                        "Background work started for `{}`. The final result will be delivered automatically when it is ready.",
-                                        background_tools[0]
-                                    )
+                                // Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22):
+                                // when the LLM called a spawn_only tool AND
+                                // any tool in the same turn-batch produced an
+                                // error-shaped result (pre-flight rejection,
+                                // provider/hook deny, panic, timeout, or
+                                // sibling-cancel in a serial batch), the
+                                // synthesized "Background work started for
+                                // `<tool>`." acknowledgement would sit
+                                // alongside the red error chip the UI
+                                // already renders for the failed tool — a
+                                // confusing dual signal where the user sees
+                                // both a successful-looking ack bubble and a
+                                // failed-tool chip for the same turn.
+                                //
+                                // When the gate fires, skip the synthesized
+                                // ack and fall through to the normal
+                                // next-iteration path so the LLM sees the
+                                // error tool result and can react. The
+                                // background task — when one was actually
+                                // dispatched — still completes asynchronously
+                                // and routes its outcome via the
+                                // BackgroundResultSender, so the legitimate
+                                // "task finished" signal still arrives on
+                                // that channel; we only suppress the
+                                // turn-final fabricated "started" bubble
+                                // that the foreground can't actually verify.
+                                if any_tool_invocation_errored(&messages, &response) {
+                                    warn!(
+                                        "tool invocation errored in spawn_only turn — suppressing synthesized 'Background work started' ack and letting the LLM react to the error"
+                                    );
                                 } else {
-                                    format!(
-                                        "Background work started for {} tasks ({}). The final results will be delivered automatically when they are ready.",
-                                        background_tools.len(),
-                                        background_tools.join(", ")
-                                    )
-                                };
-                                return Ok(ConversationResponse {
-                                    content,
-                                    reasoning_content: None,
-                                    provider_metadata: Some(
-                                        self.llm.provider_metadata_for_index(response.provider_index),
-                                    ),
-                                    token_usage: turn.total_usage().clone(),
-                                    files_modified,
-                                    files_to_send,
-                                    streamed,
-                                    messages: LoopTurnState::new_messages(&messages, history.len()),
-                                    tool_results: tool_structured_metadata.clone(),
-                                    // dspfac "two bubbles per turn" fix: this
-                                    // branch synthesises `content` as the
-                                    // "Background work started for `<tool>`..."
-                                    // acknowledgement. The API persist site
-                                    // reads this flag and tags the wire
-                                    // envelope for the synthesised row with
-                                    // `MessagePersistedSource::Background`,
-                                    // which the existing capability filter
-                                    // for `event.spawn_complete.v1` clients
-                                    // suppresses. Legacy clients (without
-                                    // the capability) still see the ack as
-                                    // an assistant row — backward-compatible.
-                                    synthesized_from_spawn_only: true,
-                                });
+                                    self.emit_cost_update(turn.total_usage(), &response);
+                                    let background_tools = response
+                                        .tool_calls
+                                        .iter()
+                                        .filter(|tc| self.tools.is_spawn_only(&tc.name))
+                                        .map(|tc| tc.name.as_str())
+                                        .collect::<Vec<_>>();
+                                    let content = if background_tools.is_empty() {
+                                        "Background work started. The final result will be delivered automatically when it is ready.".to_string()
+                                    } else if background_tools.len() == 1 {
+                                        format!(
+                                            "Background work started for `{}`. The final result will be delivered automatically when it is ready.",
+                                            background_tools[0]
+                                        )
+                                    } else {
+                                        format!(
+                                            "Background work started for {} tasks ({}). The final results will be delivered automatically when they are ready.",
+                                            background_tools.len(),
+                                            background_tools.join(", ")
+                                        )
+                                    };
+                                    return Ok(ConversationResponse {
+                                        content,
+                                        reasoning_content: None,
+                                        provider_metadata: Some(
+                                            self.llm.provider_metadata_for_index(response.provider_index),
+                                        ),
+                                        token_usage: turn.total_usage().clone(),
+                                        files_modified,
+                                        files_to_send,
+                                        streamed,
+                                        messages: LoopTurnState::new_messages(&messages, history.len()),
+                                        tool_results: tool_structured_metadata.clone(),
+                                        // dspfac "two bubbles per turn" fix: this
+                                        // branch synthesises `content` as the
+                                        // "Background work started for `<tool>`..."
+                                        // acknowledgement. The API persist site
+                                        // reads this flag and tags the wire
+                                        // envelope for the synthesised row with
+                                        // `MessagePersistedSource::Background`,
+                                        // which the existing capability filter
+                                        // for `event.spawn_complete.v1` clients
+                                        // suppresses. Legacy clients (without
+                                        // the capability) still see the ack as
+                                        // an assistant row — backward-compatible.
+                                        synthesized_from_spawn_only: true,
+                                    });
+                                }
                             }
                         }
                         StopReason::MaxTokens => {
@@ -1833,6 +1865,99 @@ impl Agent {
         turn.record_usage(tool_tokens.input_tokens, tool_tokens.output_tokens, tracker);
         Ok(())
     }
+}
+
+/// Classify a tool-result `content` string as an error / denial / cancellation
+/// emitted by the in-process tool dispatcher.
+///
+/// Mirrors the well-known conventions emitted by [`crate::agent::execution`]:
+///
+/// - `"Error: …"` — wrapper text added by `execute_tools` for any tool whose
+///   `execute_with_context` call returned `Err`.
+/// - `"[VALIDATION FAILED] …"` — spawn_only pre-flight rejection (the
+///   `Tool::pre_flight_validate` hook returned `Err`).
+/// - `"[POLICY DENIED] …"` / `"[HOOK DENIED] …"` — registry / lifecycle-hook
+///   refusals at the call boundary.
+/// - `"[SESSION LIMIT] …"` / `"[SHELL RETRY LIMIT] …"` — session-scoped
+///   limiter refusals.
+/// - `"Tool '<name>' panicked …"` / `"Tool '<name>' timed out …"` /
+///   `"Tool '<name>' cancelled due to earlier sibling error …"` — synthetic
+///   results minted by `panic_result` / the batch timeout path /
+///   `cancelled_result`.
+///
+/// Used by the spawn_only branch in [`Agent::process_message_inner`] to
+/// decide whether the synthesized "Background work started for `<tool>`."
+/// acknowledgement is safe to emit. When any spawn_only tool the LLM called
+/// produced one of these error-shaped results, the ack would otherwise sit
+/// alongside the red error chip the UI already shows for the failed
+/// invocation — a confusing dual signal (the fleet-UX soak symptom B4).
+///
+/// Returns `false` for the canonical spawn_only success placeholder
+/// (`task_handle` envelope from `spawn_only_handle_message` /
+/// `spawn_only_message`) and for every regular successful tool body, so the
+/// detector never produces a false positive that suppresses the ack for a
+/// genuinely-started background task.
+fn is_error_tool_message(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("Error:")
+        || trimmed.starts_with("[VALIDATION FAILED]")
+        || trimmed.starts_with("[POLICY DENIED]")
+        || trimmed.starts_with("[HOOK DENIED]")
+        || trimmed.starts_with("[SESSION LIMIT]")
+        || trimmed.starts_with("[SHELL RETRY LIMIT]")
+    {
+        return true;
+    }
+    if trimmed.starts_with("Tool '")
+        && (trimmed.contains("panicked")
+            || trimmed.contains("timed out")
+            || trimmed.contains("cancelled due to earlier"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Scan the tool-result messages appended during this turn for any tool
+/// invocation (spawn_only or otherwise) that returned an error-shaped body.
+///
+/// The dispatcher pairs each `Tool` message back to its originating tool call
+/// via `tool_call_id`; we walk the `response.tool_calls` that the LLM emitted
+/// in this turn, look up the matching result message in `messages`, and check
+/// whether the body is shaped like one of the well-known error conventions in
+/// [`is_error_tool_message`].
+///
+/// Used by the spawn_only branch in [`Agent::process_message_inner`] to gate
+/// the synthesized "Background work started for `<tool>`." acknowledgement.
+/// When `true`, the ack is suppressed and the agent loop falls through to its
+/// normal next-iteration path so the LLM observes the error tool result and
+/// can react (acknowledge, retry, fall back, or surface the failure to the
+/// user) instead of the harness fabricating a "started" confirmation
+/// alongside the red error chip the UI already renders for the failed
+/// tool — see the fleet-UX soak B4 finding (mini1 / dspfac, 2026-05-22).
+///
+/// The check spans EVERY tool call in the response (not just the spawn_only
+/// ones) because the user-visible UX bug is the synth-ack rendering as a
+/// success bubble while any sibling tool's red error chip is showing. The
+/// LLM still has the next iteration to acknowledge / recover regardless of
+/// which tool failed, so suppressing the ack here is strictly better UX.
+fn any_tool_invocation_errored(messages: &[Message], response: &ChatResponse) -> bool {
+    response.tool_calls.iter().any(|tc| {
+        // The dispatcher synthesises one Tool message per tool_call_id, so a
+        // linear scan over recent messages is bounded by the per-turn batch
+        // size (≤ MAX_PARALLEL_TOOL_CALLS_PER_BATCH = 8 in production).
+        messages.iter().rev().any(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id == tc.id)
+                && is_error_tool_message(&message.content)
+        })
+    })
 }
 
 /// Classify a tool-result `content` string as productive for the M6.2
@@ -5398,6 +5523,377 @@ printf '{"output":"voice saved","success":true}\n'
             result.success,
             "no-policy workspace must keep Success (got {:?})",
             result.output
+        );
+    }
+
+    // ── Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22) ─────────────────
+    //
+    // Suite for the spawn_only synthesized-ack suppression. When the LLM
+    // calls a spawn_only tool whose dispatcher returns an error, the agent
+    // must NOT fabricate a "Background work started for `<tool>`."
+    // acknowledgement — the user already sees a red error chip on the tool
+    // card and the synthesized ack reads as a confusing dual signal.
+
+    #[test]
+    fn is_error_tool_message_classifies_error_envelopes() {
+        // Positive cases — every well-known error convention emitted by
+        // crate::agent::execution must classify as an error.
+        assert!(is_error_tool_message("Error: tool dispatch failed"));
+        assert!(is_error_tool_message(
+            "[VALIDATION FAILED] Tool 'run_pipeline' rejected input: bad DOT"
+        ));
+        assert!(is_error_tool_message(
+            "[POLICY DENIED] Tool 'foo' is blocked by provider policy (deny)"
+        ));
+        assert!(is_error_tool_message(
+            "[HOOK DENIED] Tool 'foo' was blocked by a lifecycle hook."
+        ));
+        assert!(is_error_tool_message("[SESSION LIMIT] cap"));
+        assert!(is_error_tool_message("[SHELL RETRY LIMIT] stop"));
+        assert!(is_error_tool_message("Tool 'foo' panicked: boom"));
+        assert!(is_error_tool_message(
+            "Tool 'foo' timed out after 30 seconds"
+        ));
+        assert!(is_error_tool_message(
+            "Tool 'foo' cancelled due to earlier sibling error in the same batch."
+        ));
+
+        // Leading whitespace must not defeat the prefix check.
+        assert!(is_error_tool_message("   Error: trimmed"));
+
+        // Negative cases — successful and neutral bodies must NOT be flagged.
+        assert!(!is_error_tool_message(""));
+        assert!(!is_error_tool_message("   "));
+        assert!(!is_error_tool_message("ok"));
+        assert!(!is_error_tool_message(
+            "{\"task_handle\": \"abc\", \"output_dir\": \"/tmp\"}"
+        ));
+        assert!(!is_error_tool_message(
+            "Background research kicked off; results pending."
+        ));
+        // A "Tool '...'" message that doesn't match panicked/timed-out/
+        // cancelled-due-to-earlier is informational, not an error envelope.
+        assert!(!is_error_tool_message(
+            "Tool 'spawn' produced files: report.md"
+        ));
+    }
+
+    fn spawn_only_tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }
+    }
+
+    fn spawn_only_tool_result(tool_call_id: &str, content: &str) -> Message {
+        Message {
+            role: MessageRole::Tool,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.to_string()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn spawn_only_chat_response(tool_calls: Vec<ToolCall>) -> ChatResponse {
+        ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        }
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_detects_error_envelope() {
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_1", "any_tool")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_1",
+            "Error: any_tool dispatch failed",
+        )];
+
+        assert!(any_tool_invocation_errored(&messages, &response));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_false_when_all_results_successful() {
+        // Mix of a spawn_only-style handle envelope and a regular successful
+        // tool result — neither carries an error convention, so the gate must
+        // not fire.
+        let response = spawn_only_chat_response(vec![
+            spawn_only_tool_call("call_a", "bg_research"),
+            spawn_only_tool_call("call_b", "shell"),
+        ]);
+        let messages = vec![
+            spawn_only_tool_result(
+                "call_a",
+                "{\"task_handle\": \"abc\", \"output_dir\": \"/tmp/research\"}",
+            ),
+            spawn_only_tool_result("call_b", "ls\nfile1\nfile2\nExit code: 0"),
+        ];
+
+        assert!(!any_tool_invocation_errored(&messages, &response));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_detects_validation_failed_envelope() {
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_1", "run_pipeline")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_1",
+            "[VALIDATION FAILED] Tool 'run_pipeline' rejected input: bad arg\n\nFix the input and retry.",
+        )];
+
+        assert!(any_tool_invocation_errored(&messages, &response));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_mixed_batch_one_failed() {
+        // The realistic production shape: spawn_only tool returned its
+        // task-handle envelope (foreground always reports success for
+        // spawn_only) AND a sibling regular tool errored in the same batch.
+        // The gate MUST fire so the synthesized "Background work started"
+        // ack is suppressed — otherwise the user sees a successful-looking
+        // ack alongside the red error chip from the sibling tool.
+        let response = spawn_only_chat_response(vec![
+            spawn_only_tool_call("call_pipeline", "run_pipeline"),
+            spawn_only_tool_call("call_shell", "shell"),
+        ]);
+        let messages = vec![
+            spawn_only_tool_result(
+                "call_pipeline",
+                "{\"task_handle\": \"deep-research-xyz\", \"output_dir\": \"/tmp/dr\"}",
+            ),
+            spawn_only_tool_result("call_shell", "Error: command not found: foo"),
+        ];
+
+        assert!(any_tool_invocation_errored(&messages, &response));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_ignores_unrelated_error_in_history() {
+        // A historical error message from an EARLIER turn that doesn't
+        // correspond to any tool_call in the current response must NOT
+        // trip the gate — otherwise once any tool ever failed in the
+        // session, the spawn_only ack would be permanently suppressed.
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_now", "bg_research")]);
+        let messages = vec![
+            // Stale tool message from a previous iteration with a
+            // tool_call_id the current response doesn't reference.
+            spawn_only_tool_result("call_old", "Error: old failure"),
+            // Current invocation's successful handle envelope.
+            spawn_only_tool_result("call_now", "{\"task_handle\": \"abc\"}"),
+        ];
+
+        assert!(!any_tool_invocation_errored(&messages, &response));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_detects_panic_and_timeout_envelopes() {
+        let response = spawn_only_chat_response(vec![
+            spawn_only_tool_call("call_a", "tool_a"),
+            spawn_only_tool_call("call_b", "tool_b"),
+        ]);
+        let messages_panic = vec![spawn_only_tool_result(
+            "call_a",
+            "Tool 'tool_a' panicked: boom",
+        )];
+        assert!(any_tool_invocation_errored(&messages_panic, &response));
+
+        let messages_timeout = vec![spawn_only_tool_result(
+            "call_b",
+            "Tool 'tool_b' timed out after 30 seconds",
+        )];
+        assert!(any_tool_invocation_errored(&messages_timeout, &response));
+    }
+
+    /// Tool that mimics a regular sibling whose `execute` returns `Err`.
+    /// Mirrors what happens on mini1 / dspfac (2026-05-22) when the LLM
+    /// dispatches a tool whose host-side binary is missing — the
+    /// execution layer wraps the eyre error as `"Error: <reason>"` on the
+    /// tool-result message and tags the per-tool success bit as `false`.
+    struct ErroringTool {
+        name: &'static str,
+        message: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for ErroringTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Tool that always returns an Err to mimic a missing-host failure"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Err(eyre::eyre!(self.message))
+        }
+    }
+
+    /// Provider that emits, in one turn, a spawn_only tool call AND a
+    /// sibling regular tool call (which errors). Then on its second call
+    /// emits an EndTurn with a terminal assistant message. Models the
+    /// fleet-UX soak symptom: the LLM batched both calls; the spawn_only
+    /// one launched (foreground returns success handle, flag set), the
+    /// sibling errored, AND the spawn_only branch in
+    /// `process_message_inner` would fabricate a "Background work started"
+    /// ack alongside the red error chip.
+    struct MixedBatchSpawnOnlyAndErroringProvider {
+        calls: AtomicUsize,
+        spawn_only_name: &'static str,
+        erroring_name: &'static str,
+        final_content: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MixedBatchSpawnOnlyAndErroringProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_pipeline".to_string(),
+                            name: self.spawn_only_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            id: "call_sibling".to_string(),
+                            name: self.erroring_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some(self.final_content.to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                }
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Integration: when an LLM turn emits a spawn_only tool_call AND a
+    /// sibling tool_call whose dispatcher returned `Err`, the harness MUST
+    /// NOT fabricate a "Background work started for `<tool>`."
+    /// acknowledgement. The synthesized ack would render as a successful
+    /// bubble alongside the red error chip the UI already shows for the
+    /// failed sibling — a confusing dual signal. Instead the LLM must get
+    /// another iteration to react to the error and produce a real reply.
+    ///
+    /// Fleet-UX soak finding B4 (mini1 / dspfac, 2026-05-22): dspfac saw
+    /// `× run_pipeline error: required tool(s) not available on this host:
+    /// run_pipeline` AND a fake "已后台启动 …" outline bubble
+    /// simultaneously; the harness emitted the synthesised ack as the
+    /// turn-final assistant content even though a tool in the same batch
+    /// reported a failure result that the LLM still needed to acknowledge.
+    #[tokio::test]
+    async fn spawn_only_branch_skipped_when_invocation_returned_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        // The spawn_only tool succeeds on the foreground (returns the
+        // canonical handle envelope) and sets the `spawn_only_was_invoked`
+        // flag — exactly as `run_pipeline` does in production.
+        tools.register(NamedEchoTool {
+            name: "run_pipeline",
+            output: "unused (foreground returns the handle envelope, not this)",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // The sibling tool errors synchronously; the dispatcher wraps the
+        // eyre into `"Error: <reason>"` on the tool-result message.
+        tools.register(ErroringTool {
+            name: "shell",
+            message: "required tool(s) not available on this host: shell-helper",
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MixedBatchSpawnOnlyAndErroringProvider {
+            calls: AtomicUsize::new(0),
+            spawn_only_name: "run_pipeline",
+            erroring_name: "shell",
+            final_content: "Pipeline launched; shell-helper failed and I cannot proceed without it.",
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("spawn-only-err-test"), provider, tools, memory);
+
+        let result = agent
+            .process_message("深度研究 James Webb...", &[], vec![])
+            .await
+            .unwrap();
+
+        // The synthesised ack would carry this prefix. With the gate
+        // active, the spawn_only branch is skipped, the loop continues,
+        // and the LLM's second (EndTurn) reply becomes the turn-final
+        // content.
+        assert!(
+            !result.content.starts_with("Background work started"),
+            "expected NO synthesized 'Background work started' ack alongside the failed sibling tool, got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.synthesized_from_spawn_only,
+            "synthesized_from_spawn_only flag must be false when a tool in the same batch errored"
+        );
+        assert_eq!(
+            result.content,
+            "Pipeline launched; shell-helper failed and I cannot proceed without it.",
+            "the LLM's recovery reply must be surfaced, not the synthesized ack"
+        );
+
+        // The error tool-result MUST stay visible in the message history so
+        // the SPA can keep rendering the red error chip on the tool card.
+        let error_visible = result.messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message
+                    .content
+                    .contains("required tool(s) not available on this host")
+        });
+        assert!(
+            error_visible,
+            "the failed sibling tool-result must remain in messages so the SPA keeps the red error chip: {:?}",
+            result
+                .messages
+                .iter()
+                .map(|m| (m.role, m.content.clone()))
+                .collect::<Vec<_>>()
         );
     }
 
