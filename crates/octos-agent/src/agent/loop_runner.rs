@@ -1064,28 +1064,69 @@ impl Agent {
                                             tool_results: tool_structured_metadata.clone(),
                                         });
                                     }
-                                    // Single-fire-per-burst: first fire emits the
-                                    // warning; subsequent fires within the same
-                                    // burst (before the next process_message reset)
-                                    // surface a terminal error instead of repeating
-                                    // identical noise.
-                                    let warning_content = self.dedup_loop_warning(warning)?;
-                                    // Don't execute the tools — break out with a message
+                                    // Two-stage loop-detector recovery:
+                                    //
+                                    // 1. First fire in this turn — inject the
+                                    //    warning as a SYNTHETIC tool-result
+                                    //    message paired with the looping
+                                    //    assistant message, then continue
+                                    //    the loop. The LLM gets one more
+                                    //    iteration to synthesise an answer
+                                    //    from prior context or switch
+                                    //    tools/arguments. This rescues the
+                                    //    kimi-k2.5 news_fetch retry spiral
+                                    //    documented in PR
+                                    //    `fix/news-fetch-loop-and-detect-recovery`
+                                    //    (session `web-1779494658716-mxrxe8`,
+                                    //    ledger seq 214-562).
+                                    //
+                                    // 2. Second fire in the same turn — the
+                                    //    LLM ignored the warning and looped
+                                    //    again. Return a terminal
+                                    //    ConversationResponse with a
+                                    //    hard-stop message so the user sees
+                                    //    a clean reply rather than a thrash.
+                                    //
+                                    // The single-fire-per-burst flag
+                                    // (`loop_detected_recently`) is owned by
+                                    // `dedup_loop_warning`. The Err it
+                                    // returns on second fire is caught and
+                                    // converted to a terminal Ok response
+                                    // here so callers don't see an error.
                                     self.emit_cost_update(turn.total_usage(), &response);
-                                    return Ok(ConversationResponse {
-                                        content: warning_content,
-                                        reasoning_content: None,
-                                        provider_metadata: None,
-                                        token_usage: turn.total_usage().clone(),
-                                        files_modified,
-                                        files_to_send,
-                                        streamed,
-                                        messages: LoopTurnState::new_messages(
-                                            &messages,
-                                            history.len(),
-                                        ),
-                                        tool_results: tool_structured_metadata.clone(),
-                                    });
+                                    match self.dedup_loop_warning(warning) {
+                                        Ok(warning_content) => {
+                                            inject_loop_detected_synthetic_results(
+                                                &mut messages,
+                                                &response,
+                                                &warning_content,
+                                                self,
+                                            );
+                                            warn!(
+                                                "loop detected — injected synthetic tool results with warning and continuing for ONE more iteration"
+                                            );
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                "loop detected AGAIN after warning was already injected — terminating turn"
+                                            );
+                                            return Ok(ConversationResponse {
+                                                content: loop_detected_terminal_message(),
+                                                reasoning_content: None,
+                                                provider_metadata: None,
+                                                token_usage: turn.total_usage().clone(),
+                                                files_modified,
+                                                files_to_send,
+                                                streamed,
+                                                messages: LoopTurnState::new_messages(
+                                                    &messages,
+                                                    history.len(),
+                                                ),
+                                                tool_results: tool_structured_metadata.clone(),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             if let Err(e) = self
@@ -2044,6 +2085,78 @@ fn shell_retry_terminal_user_message(content: &str) -> String {
             "I tried multiple shell approaches but couldn't converge on an answer. Latest output:\n\n{tail}"
         )
     }
+}
+
+/// Inject a synthetic conversation pair when the loop detector fires for the
+/// FIRST time in a turn so the LLM gets the chance to course-correct.
+///
+/// Specifically:
+///   1. Push the looping assistant message (with its `tool_calls`).
+///   2. For EVERY tool call in the response, push a matching tool-result
+///      message — provider chat schemas require a 1:1 pairing.
+///   3. The FIRST tool-result carries `warning` (the loop-detector text +
+///      synthesis hint). Companion tool calls in the same response get a
+///      short stub so the LLM doesn't think they actually executed.
+///
+/// We never call the tools — the looping calls would just produce more
+/// drifted output. The synthesis hint tells the LLM to fall back to prior
+/// results already in the conversation or switch tools.
+///
+/// See PR `fix/news-fetch-loop-and-detect-recovery`
+/// (session `web-1779494658716-mxrxe8`, ledger seq 214-562).
+fn inject_loop_detected_synthetic_results(
+    messages: &mut Vec<Message>,
+    response: &ChatResponse,
+    warning: &str,
+    agent: &Agent,
+) {
+    let synthesis_hint = "\n\nTry a different approach — synthesise from prior tool results already in this conversation, call a different tool, or finish the turn with the partial information you have.";
+    let primary_body = format!("{warning}{synthesis_hint}");
+    let stub_body =
+        "[LOOP DETECTED] (companion call in the same batch; see paired result for the warning).";
+
+    // Sanitize tool_call_ids the same way the normal `handle_tool_use` path
+    // does (see loop_runner.rs line ~1685): some providers (Moonshot/kimi)
+    // emit IDs containing colons like "admin_view_sessions:11" which OpenAI
+    // and our duplicate-repair logic both reject/collapse. Skipping this on
+    // the synthetic path would leave the next LLM call with unanswered
+    // tool_calls or a 400 from the next request. We sanitize on a clone of
+    // the response so the SAME id flows into BOTH the assistant message's
+    // `tool_calls` (via `response_to_message`) and the matching tool-result
+    // `tool_call_id` below, preserving the 1:1 pairing end-to-end.
+    let mut sanitized_response = response.clone();
+    for tc in sanitized_response.tool_calls.iter_mut() {
+        tc.id = sanitize_tool_call_id(&tc.id);
+    }
+
+    // Push the assistant turn (carries the sanitized `tool_calls`) so the
+    // synthetic tool-result messages have a corresponding `tool_use` to
+    // bind to.
+    messages.push(agent.response_to_message(&sanitized_response));
+
+    for (idx, tc) in sanitized_response.tool_calls.iter().enumerate() {
+        let body = if idx == 0 { &primary_body } else { stub_body };
+        messages.push(Message {
+            role: MessageRole::Tool,
+            content: body.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some(tc.id.clone()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+}
+
+/// Terminal message returned when the LLM ignores the loop-detector
+/// warning and trips the detector a SECOND time in the same turn.
+fn loop_detected_terminal_message() -> String {
+    "[LOOP DETECTED] The agent kept calling the same tool with the same arguments \
+     even after a warning was injected. Stopping the turn to avoid a thrash. \
+     Please rephrase your request or try a different angle."
+        .to_string()
 }
 
 fn is_useful_shell_output(content: &str) -> bool {
@@ -4571,6 +4684,294 @@ printf '{"output":"voice saved","success":true}\n'
         // Reset at start of process_message clears the flag, so a brand-new
         // burst is allowed and emits a warning (Ok), not a terminal Err.
         assert!(second.is_ok(), "second call should not error after reset");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // PR `fix/news-fetch-loop-and-detect-recovery` —
+    // LOOP DETECTED non-terminal recovery (`session web-1779494658716-mxrxe8`,
+    // ledger seq 214-562). On first fire we now inject a synthetic tool
+    // result carrying the warning and continue the loop for one more LLM
+    // iteration; on second fire we return a terminal `ConversationResponse`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn inject_synthetic_results_pushes_assistant_then_tool_for_every_call() {
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_a".to_string(),
+                    name: "news_fetch".to_string(),
+                    arguments: serde_json::json!({"categories": ["tech"]}),
+                    metadata: None,
+                },
+                ToolCall {
+                    id: "call_b".to_string(),
+                    name: "news_fetch".to_string(),
+                    arguments: serde_json::json!({"categories": ["world"]}),
+                    metadata: None,
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let memory = runtime.block_on(async {
+            Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap())
+        });
+        let agent = Agent::new(AgentId::new("inject-test"), provider, tools, memory);
+
+        let mut messages: Vec<Message> = Vec::new();
+        super::super::loop_runner::inject_loop_detected_synthetic_results(
+            &mut messages,
+            &response,
+            "[LOOP DETECTED] cycle length 1.",
+            &agent,
+        );
+
+        // 1 assistant + 2 tool results (one per tool_call).
+        assert_eq!(messages.len(), 3, "expected 1 assistant + 2 tool results");
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(
+            messages[0]
+                .tool_calls
+                .as_ref()
+                .map(|tcs| tcs.len())
+                .unwrap_or(0),
+            2,
+            "assistant message must carry the looping tool_calls so providers \
+             can bind the synthetic tool-result messages back to them"
+        );
+
+        for (idx, msg) in messages[1..].iter().enumerate() {
+            assert_eq!(msg.role, MessageRole::Tool, "tool message #{idx}");
+            let id_expected = if idx == 0 { "call_a" } else { "call_b" };
+            assert_eq!(msg.tool_call_id.as_deref(), Some(id_expected));
+        }
+
+        // First tool-result carries the warning + synthesis hint; second is
+        // a short companion stub so the LLM doesn't think the second call
+        // actually executed.
+        assert!(
+            messages[1].content.contains("[LOOP DETECTED]"),
+            "primary tool result must echo the warning: got `{}`",
+            messages[1].content
+        );
+        assert!(
+            messages[1].content.contains("synthesise")
+                || messages[1].content.contains("different tool"),
+            "primary tool result must contain a synthesis hint so the LLM \
+             knows how to course-correct: got `{}`",
+            messages[1].content
+        );
+        assert!(
+            messages[2].content.contains("[LOOP DETECTED]")
+                && messages[2].content.contains("companion"),
+            "companion tool result should mark itself as such: got `{}`",
+            messages[2].content
+        );
+    }
+
+    /// Codex MAJOR on PR #1181: the synthetic injection path bypassed the
+    /// `sanitize_tool_call_id` step that the normal `handle_tool_use` path
+    /// applies (loop_runner.rs ~line 1685). Moonshot/kimi (which dspfac uses)
+    /// emits IDs with colons like `admin_view_sessions:11` — OpenAI-style
+    /// schemas reject those, and our own duplicate-repair logic can collapse
+    /// them, leaving unanswered tool_calls on the next LLM call.
+    ///
+    /// This test simulates a looping ChatResponse with a colon-bearing id and
+    /// asserts:
+    ///   1. The injected synthetic messages carry a sanitized id (no colon).
+    ///   2. The assistant message's `tool_calls[].id` matches the tool
+    ///      result's `tool_call_id` 1:1 (same sanitized id end-to-end).
+    #[test]
+    fn inject_synthetic_results_sanitizes_tool_call_ids_with_colons() {
+        let raw_id = "admin_view_sessions:11";
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: raw_id.to_string(),
+                name: "news_fetch".to_string(),
+                arguments: serde_json::json!({"categories": ["tech"]}),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysSameToolProvider);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let memory = runtime.block_on(async {
+            Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap())
+        });
+        let agent = Agent::new(AgentId::new("sanitize-test"), provider, tools, memory);
+
+        let mut messages: Vec<Message> = Vec::new();
+        super::super::loop_runner::inject_loop_detected_synthetic_results(
+            &mut messages,
+            &response,
+            "[LOOP DETECTED] cycle length 1.",
+            &agent,
+        );
+
+        // Layout: 1 assistant + 1 tool result.
+        assert_eq!(messages.len(), 2, "expected 1 assistant + 1 tool result");
+
+        // Extract the assistant tool_call id and the tool result's
+        // tool_call_id; both must be the SAME sanitized value.
+        let assistant_tc_id = messages[0]
+            .tool_calls
+            .as_ref()
+            .and_then(|tcs| tcs.first())
+            .map(|tc| tc.id.clone())
+            .expect("assistant message must carry sanitized tool_calls");
+        let tool_result_id = messages[1]
+            .tool_call_id
+            .clone()
+            .expect("tool result must carry tool_call_id");
+
+        // 1. Sanitized — no colon left over.
+        assert!(
+            !assistant_tc_id.contains(':'),
+            "assistant tool_call id must be sanitized (no colon): got `{assistant_tc_id}`"
+        );
+        assert!(
+            !tool_result_id.contains(':'),
+            "tool result tool_call_id must be sanitized (no colon): got `{tool_result_id}`"
+        );
+
+        // 2. Same id on BOTH sides — providers bind tool_use ↔ tool_result
+        // by exact id match, so any drift here would orphan the pair.
+        assert_eq!(
+            assistant_tc_id, tool_result_id,
+            "assistant tool_calls[].id and tool result tool_call_id must \
+             share the SAME sanitized id (1:1 pairing); raw_id was `{raw_id}`"
+        );
+
+        // 3. Concrete sanitized form: `:` → `_` per `sanitize_tool_call_id`.
+        assert_eq!(
+            assistant_tc_id, "admin_view_sessions_11",
+            "sanitize_tool_call_id should replace `:` with `_`"
+        );
+    }
+
+    #[test]
+    fn loop_detected_terminal_message_is_user_facing_and_non_empty() {
+        let msg = super::super::loop_runner::loop_detected_terminal_message();
+        assert!(msg.contains("[LOOP DETECTED]"));
+        assert!(
+            msg.contains("rephrase") || msg.contains("different angle"),
+            "terminal message should guide the user to rephrase: got `{msg}`"
+        );
+    }
+
+    /// LLM mock that always returns the SAME tool call so the loop
+    /// detector fires repeatedly. Counts invocations so the test can
+    /// assert how many LLM calls happened across the recovery window.
+    struct CountingAlwaysSameToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingAlwaysSameToolProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_loopy".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "loopy.txt"}),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_detected_first_fire_continues_then_second_fire_terminates() {
+        // Exercises the full PR `fix/news-fetch-loop-and-detect-recovery`
+        // recovery contract end-to-end:
+        //   1. The looping LLM trips the detector on the 4th call (cycle-1).
+        //   2. First detection MUST NOT terminate — it injects a synthetic
+        //      tool result with the warning and calls the LLM again.
+        //   3. If the LLM repeats the same call, the SECOND detection
+        //      terminates with `loop_detected_terminal_message()`.
+        //
+        // We assert via:
+        //   - The flag (`is_loop_detected_recently`) is set after the run.
+        //   - The terminal `content` matches `loop_detected_terminal_message`
+        //     (proves the second-fire path ran, not the original first-fire
+        //     return-immediately path).
+        //   - The mock LLM was called AT LEAST 5 times (>=4 to trigger first
+        //     fire, +1 for the recovery iteration), confirming the loop
+        //     continued after the first fire.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loopy.txt"), b"x").unwrap();
+        let provider = Arc::new(CountingAlwaysSameToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider_arc: Arc<dyn LlmProvider> = provider.clone();
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("recover"), provider_arc, tools, memory).with_config(
+            crate::AgentConfig {
+                max_iterations: 30,
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+
+        let result = agent
+            .process_message("please loop", &[], vec![])
+            .await
+            .expect("process_message should return Ok even when the loop terminates");
+
+        // The terminal message proves the second-fire branch ran. The
+        // pre-fix behaviour would have returned the FIRST-fire warning
+        // text and stopped before issuing another LLM call.
+        assert_eq!(
+            result.content,
+            loop_detected_terminal_message(),
+            "expected the terminal hard-stop message after the second \
+             loop detection; pre-fix code would have returned the warning \
+             text on the first fire"
+        );
+        assert!(agent.is_loop_detected_recently());
+
+        let total_calls = provider.calls.load(AtomicOrdering::SeqCst);
+        assert!(
+            total_calls >= 5,
+            "expected at least 5 LLM calls (4 to trigger first detection + \
+             1 recovery iteration); got {total_calls}"
+        );
     }
 
     // ----- Audit Gap-8: auto-fire check_workspace_contract on Completion -----

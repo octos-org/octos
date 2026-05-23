@@ -70,6 +70,21 @@ pub fn truncate_head_tail(s: &str, max_len: usize, head_ratio: f32) -> String {
 }
 
 /// Default per-tool output limits (max chars). Tools not listed use the global default.
+///
+/// High-volume aggregation tools (`news_fetch`, `search` / `deep_search`)
+/// intentionally exceed the 50K default: their JSON payloads bundle dozens of
+/// headlines or hits in a single call. When their output is middle-elided the
+/// LLM mistakes the elision marker for "incomplete results" and retries with
+/// drifting arguments — see the `web-1779494658716-mxrxe8` diagnostic and PR
+/// `fix/news-fetch-loop-and-detect-recovery`.
+///
+/// Note on `search` vs `deep_search`: the bundled deep-search skill exposes
+/// its runtime tool as `search` (see `app-skills/deep-search/manifest.json`
+/// — `"tool_name": "search"`). Execution looks limits up by the runtime tool
+/// name, so the 200K budget MUST be keyed on `search` to take effect for the
+/// shipping skill. `deep_search` is kept as a defensive alias / contract slot
+/// for future variants and any external consumers that key on the contract
+/// name rather than the runtime name.
 pub fn tool_output_limit(tool_name: &str) -> usize {
     match tool_name {
         "read_file" => 50_000,
@@ -77,8 +92,13 @@ pub fn tool_output_limit(tool_name: &str) -> usize {
         "grep" => 30_000,
         "web_fetch" => 40_000,
         "web_search" => 20_000,
-        "search" => 50_000,
+        // `search` is the runtime tool name of the bundled deep-search skill
+        // (see `app-skills/deep-search/manifest.json`); `deep_search` is the
+        // contract slot kept as a defensive alias for future variants.
+        "search" => 200_000,
+        "deep_search" => 200_000,
         "deep_research" => 50_000,
+        "news_fetch" => 200_000,
         "spawn" => 50_000,
         _ => 50_000, // global default
     }
@@ -157,5 +177,49 @@ mod tests {
         assert_eq!(tool_output_limit("read_file"), 50_000);
         assert_eq!(tool_output_limit("shell"), 30_000);
         assert_eq!(tool_output_limit("unknown_tool"), 50_000);
+    }
+
+    /// Regression: `news_fetch` returns a JSON payload bundling dozens of
+    /// headlines and can easily exceed the 50K global default. When the
+    /// output is middle-elided ("... [N bytes omitted] ..."), kimi-class
+    /// models mistake the marker for incomplete results and retry with
+    /// drifting `categories=` argument lists — the exact spiral observed
+    /// on session `web-1779494658716-mxrxe8` (ledger seq 214-562). Guard
+    /// against a future silent shrink.
+    #[test]
+    fn news_fetch_limit_is_at_least_100k_bytes() {
+        assert!(
+            tool_output_limit("news_fetch") >= 100_000,
+            "news_fetch tool_output_limit must stay >=100K bytes to avoid \
+             middle-elision triggering a retry spiral; current value is {}",
+            tool_output_limit("news_fetch")
+        );
+    }
+
+    /// Companion regression for `deep_search` AND the runtime tool name
+    /// `search` exposed by the bundled deep-search skill
+    /// (`app-skills/deep-search/manifest.json` — `"tool_name": "search"`).
+    ///
+    /// Execution keys the truncation budget on the runtime tool name, so
+    /// the `deep_search` arm alone never takes effect for the shipping skill.
+    /// We MUST guard both — `search` is the load-bearing one in production,
+    /// `deep_search` is the contract-slot alias for future variants and any
+    /// external consumers that key on the contract name.
+    #[test]
+    fn deep_search_limit_is_at_least_100k_bytes() {
+        assert!(
+            tool_output_limit("search") >= 100_000,
+            "search tool_output_limit must stay >=100K bytes — this is the \
+             runtime tool name of the bundled deep-search skill, and elision \
+             of its aggregated payload causes the same retry spiral as \
+             news_fetch; current value is {}",
+            tool_output_limit("search")
+        );
+        assert!(
+            tool_output_limit("deep_search") >= 100_000,
+            "deep_search tool_output_limit must stay >=100K bytes to avoid \
+             middle-elision triggering retry behaviour; current value is {}",
+            tool_output_limit("deep_search")
+        );
     }
 }
