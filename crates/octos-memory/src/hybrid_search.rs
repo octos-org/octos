@@ -102,6 +102,36 @@ const HNSW_MAX_LAYER: usize = 16;
 /// runs when a caller explicitly asks for the floor.
 const FLOOR_PREFILTER_POOL: usize = HNSW_CAPACITY;
 
+/// Compute the BM25 per-modality candidate pool size for a single
+/// `search_scored_filtered` call.
+///
+/// Pulled out as a free helper so a direct unit test can guard the
+/// formula against regression (codex P3 round 5: the prior
+/// large-`limit` regression test couldn't fail on a fixed-10_000
+/// implementation because indexing 10_000+ docs in a unit test is
+/// impractical).
+///
+/// Semantics:
+/// - No floor: `limit * 4` matches the standard `search_scored` budget.
+/// - Floor supplied: `max(FLOOR_PREFILTER_POOL, limit * 4)` — at
+///   least the floor pool (so small-`limit` callers get the
+///   contamination-safe pool) AND at least `limit * 4` (so
+///   large-`limit` callers aren't capped at the floor pool).
+fn bm25_fetch_count(limit: usize, min_best_modality: Option<f32>) -> usize {
+    match min_best_modality {
+        Some(_) => FLOOR_PREFILTER_POOL.max(limit * 4),
+        None => limit * 4,
+    }
+}
+
+/// Compute the vector per-modality candidate pool size for a single
+/// `search_scored_filtered` call. Always saturated at `HNSW_CAPACITY`
+/// because the HNSW index can never hold more docs than that —
+/// asking for more is wasted work (codex P2 round 5).
+fn vector_fetch_count(limit: usize, min_best_modality: Option<f32>) -> usize {
+    bm25_fetch_count(limit, min_best_modality).min(HNSW_CAPACITY)
+}
+
 impl HybridIndex {
     /// Create a new hybrid index with the given vector dimension.
     pub fn new(dimension: usize) -> Self {
@@ -368,27 +398,21 @@ impl HybridIndex {
         // BM25 and vector) outside both per-modality top-N pools.
         // See `FLOOR_PREFILTER_POOL` for the structural rationale.
         //
-        // We `max` the floor pool with `limit * 4` so a caller that
-        // explicitly asks for a very large `limit` (e.g. with floor=0.0
-        // to mean "all candidates above zero" or for an export job)
-        // doesn't unintentionally cap at `FLOOR_PREFILTER_POOL` —
-        // codex P2 round 4 flagged this regression on the prior
-        // commit (a BM25-only store with >10_000 matching docs and
-        // `limit > 10_000` would previously have been served by
-        // `limit * 4` but is now bounded by the floor pool).
-        let fetch_count = match min_best_modality {
-            Some(_) => FLOOR_PREFILTER_POOL.max(limit * 4),
-            None => limit * 4,
-        };
+        // Per-modality candidate pool sizes — see free helpers above
+        // for the per-channel rationale (BM25 may need >10_000 for
+        // large-`limit` floored exports; HNSW is always saturated at
+        // HNSW_CAPACITY because it cannot hold more docs).
+        let bm25_pool = bm25_fetch_count(limit, min_best_modality);
+        let vector_pool = vector_fetch_count(limit, min_best_modality);
 
-        let bm25_scores = self.bm25_score(query_text, fetch_count);
+        let bm25_scores = self.bm25_score(query_text, bm25_pool);
 
         let valid_query_emb = query_embedding
             .filter(|e| e.len() == self.dimension)
             .and_then(l2_normalize);
         let vector_scores: HashMap<usize, f32> = match (&valid_query_emb, &self.hnsw) {
             (Some(normalized), Some(hnsw)) => {
-                let neighbors = hnsw.search(normalized, fetch_count, 30);
+                let neighbors = hnsw.search(normalized, vector_pool, 30);
                 let mut scores: HashMap<usize, f32> = HashMap::new();
                 for n in neighbors {
                     let sim: f32 = 1.0 - n.distance;
@@ -778,39 +802,57 @@ mod tests {
     }
 
     #[test]
-    fn search_scored_filtered_large_limit_still_honored_with_floor() {
-        // Regression for codex P2 round 4: when the caller asks for a
-        // very large `limit` with a floor (e.g. an export job with
-        // floor=0.0), the per-modality pool must not silently cap at
-        // `FLOOR_PREFILTER_POOL` and starve the caller of results.
-        // The new `max(FLOOR_PREFILTER_POOL, limit * 4)` per-modality
-        // fetch protects against this.
-        //
-        // We can't realistically index 10_000+ docs in a unit test, so
-        // assert the formula directly: the per-modality fetch budget
-        // for `limit > FLOOR_PREFILTER_POOL / 4` should expand with
-        // `limit * 4`. Use limit=3000 → expected per-modality pool =
-        // max(10_000, 12_000) = 12_000. We assert via behavior: a
-        // BM25-only doc indexed AFTER 30 dummy docs and matching a
-        // unique keyword should be reachable with limit=3000+floor.
-        let mut index = HybridIndex::new(4);
-        for i in 0..30 {
-            // Dummy docs matching common keyword to fill the pool;
-            // BM25 ranks well-defined by decreasing term frequency.
-            let alpha = 30 - i;
-            let text = "alpha ".repeat(alpha);
-            index.insert(&format!("dummy-{i:02}"), text.trim(), None);
-        }
-        index.insert("rare-doc", "unicornium", None);
+    fn bm25_fetch_count_formula_guards_floor_and_large_limit() {
+        // Direct unit test for the per-modality pool formula. This is
+        // the regression guard codex P3 round 5 asked for: tested via
+        // the helper function so we don't need to index 10_000+ docs
+        // to detect a regression to fixed `FLOOR_PREFILTER_POOL`.
 
-        // limit=3000 floor=0.0: the new path's fetch count for BM25
-        // is max(10_000, 12_000) = 12_000, well above 31 docs, so the
-        // rare doc is reachable.
-        let filtered = index.search_scored_filtered("unicornium", None, 3000, Some(0.0));
-        assert!(
-            filtered.iter().any(|(id, _)| id == "rare-doc"),
-            "rare-doc must be reachable even with limit much larger than FLOOR_PREFILTER_POOL"
+        // No floor: pool is `limit * 4`, matching the standard
+        // `search_scored` budget.
+        assert_eq!(bm25_fetch_count(6, None), 24);
+        assert_eq!(bm25_fetch_count(100, None), 400);
+        // A huge no-floor limit still gets `limit * 4` (no floor cap).
+        assert_eq!(bm25_fetch_count(100_000, None), 400_000);
+
+        // Small `limit` with floor: pool floors at FLOOR_PREFILTER_POOL
+        // so the contamination-safe BM25-only recall guarantee holds
+        // even for tiny limits (codex round 3).
+        assert_eq!(bm25_fetch_count(6, Some(0.55)), FLOOR_PREFILTER_POOL);
+        assert_eq!(bm25_fetch_count(1, Some(0.0)), FLOOR_PREFILTER_POOL);
+        // Right at the crossover: limit*4 = FLOOR_PREFILTER_POOL.
+        assert_eq!(
+            bm25_fetch_count(FLOOR_PREFILTER_POOL / 4, Some(0.55)),
+            FLOOR_PREFILTER_POOL
         );
+
+        // Large `limit` with floor: pool expands with `limit * 4` so
+        // export jobs aren't capped at FLOOR_PREFILTER_POOL (codex
+        // round 4). This is the regression the previous test fixture
+        // couldn't reach because it only indexed 31 docs.
+        assert_eq!(bm25_fetch_count(3_000, Some(0.0)), 12_000);
+        assert_eq!(bm25_fetch_count(100_000, Some(0.0)), 400_000);
+    }
+
+    #[test]
+    fn vector_fetch_count_saturates_at_hnsw_capacity() {
+        // Regression for codex P2 round 5: vector-side fetch must not
+        // exceed `HNSW_CAPACITY` since the HNSW index can never hold
+        // more docs than that — asking for more is wasted work.
+
+        // Small limit, with or without floor: vector pool == bm25
+        // pool because both are below HNSW_CAPACITY.
+        assert_eq!(vector_fetch_count(6, None), 24);
+        assert_eq!(vector_fetch_count(6, Some(0.55)), HNSW_CAPACITY);
+
+        // Large limit with floor: BM25 pool expands to limit*4, but
+        // vector pool MUST saturate at HNSW_CAPACITY.
+        assert_eq!(bm25_fetch_count(100_000, Some(0.0)), 400_000);
+        assert_eq!(vector_fetch_count(100_000, Some(0.0)), HNSW_CAPACITY);
+        assert_eq!(vector_fetch_count(50_000, Some(0.0)), HNSW_CAPACITY);
+
+        // Large limit without floor: same saturation rule.
+        assert_eq!(vector_fetch_count(100_000, None), HNSW_CAPACITY);
     }
 
     #[test]
