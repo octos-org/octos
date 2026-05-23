@@ -522,7 +522,7 @@ impl PluginTool {
         for (key, value) in obj {
             if matches!(
                 key.as_str(),
-                "audio_path" | "file_path" | "input" | "script_path"
+                "audio_path" | "file_path" | "input" | "script_path" | "video_path" | "text_path"
             ) {
                 if let Some(path) = value.as_str() {
                     rewritten.insert(
@@ -847,7 +847,8 @@ fn value_kind_label(value: &serde_json::Value) -> &'static str {
 }
 
 /// Resolve a plugin tool's input path (`audio_path` / `file_path` /
-/// `input` / per-slide `source_image`) to an absolute on-disk string.
+/// `input` / `script_path` / `video_path` / `text_path` / per-slide
+/// `source_image`) to an absolute on-disk string.
 ///
 /// Order:
 ///
@@ -910,6 +911,14 @@ fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> Stri
             return resolved.absolute.to_string_lossy().into_owned();
         }
     }
+    // Codex BLOCKER fix (PR #1186 review): the lexical-join branches
+    // inside `resolve_path_in_work_dir` would otherwise let candidates
+    // like `skill-output/../secret.md` resolve to `<workspace>/secret.md`
+    // (escaping the chrooted `skill-output/` work_dir). The unsafe-
+    // component guard inside `resolve_path_in_work_dir` skips those
+    // branches but still permits the SAFE basename-only fallback,
+    // and `strip_redundant_skill_output_prefix` independently refuses
+    // to strip `..`-containing raw paths.
     if let Some(ref stripped_path) = stripped {
         if let Some(resolved) = resolve_path_in_work_dir(stripped_path, work_dir) {
             return resolved;
@@ -917,6 +926,23 @@ fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> Stri
     }
     resolve_path_in_work_dir(raw_path, work_dir)
         .unwrap_or_else(|| absolutize_path_in_work_dir(raw_path, work_dir))
+}
+
+/// Reject paths that carry `..` (`ParentDir`) components or absolute
+/// roots (`RootDir` / `Prefix`). Used as a defense-in-depth guard around
+/// the lexical `work_dir.join(...)` fallback in
+/// [`resolve_plugin_input_path`] — without it, a candidate like
+/// `skill-output/../secret.md` would resolve to `<work_dir>/../secret.md`
+/// (one level above the chrooted plugin work_dir) even though the
+/// shared `resolve_tool_path` resolver would have rejected it.
+fn has_unsafe_components(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
 }
 
 /// Returns `Some(stripped)` when `raw_path` carries a redundant
@@ -929,15 +955,22 @@ fn strip_redundant_skill_output_prefix(
     raw_path: &str,
     work_dir: &std::path::Path,
 ) -> Option<String> {
-    if std::path::Path::new(raw_path).is_absolute() {
+    let raw = std::path::Path::new(raw_path);
+    if raw.is_absolute() {
+        return None;
+    }
+    // Codex BLOCKER fix (PR #1186 review): refuse to strip when the raw
+    // path contains any `..` component. Otherwise
+    // `skill-output/../secret.md` would strip to `../secret.md` and the
+    // fallback `work_dir.join(...)` would escape the chrooted
+    // `skill-output/` subdir.
+    if has_unsafe_components(raw) {
         return None;
     }
     if work_dir.file_name().and_then(|s| s.to_str()) != Some("skill-output") {
         return None;
     }
-    let stripped = std::path::Path::new(raw_path)
-        .strip_prefix("skill-output")
-        .ok()?;
+    let stripped = raw.strip_prefix("skill-output").ok()?;
     let stripped_str = stripped.to_str()?.to_string();
     if stripped_str.is_empty() {
         return None;
@@ -947,17 +980,28 @@ fn strip_redundant_skill_output_prefix(
 
 fn resolve_path_in_work_dir(raw_path: &str, work_dir: &std::path::Path) -> Option<String> {
     let candidate = std::path::Path::new(raw_path);
-    if candidate.is_absolute() && candidate.exists() {
-        return Some(raw_path.to_string());
-    }
 
-    let nested = work_dir.join(candidate);
-    if nested.exists() {
-        return Some(nested.to_string_lossy().into_owned());
-    }
+    // Codex BLOCKER fix (PR #1186 review): the absolute, raw-relative,
+    // and lexical-join branches below must NOT accept inputs that
+    // would let a plugin arg escape `work_dir`. Skip them entirely
+    // when the candidate carries `..` (`ParentDir`) components or is
+    // absolute / has a Windows prefix. The basename-fallback branch
+    // further down is still safe because it discards directory
+    // components and only joins `file_name()` onto `work_dir`.
+    let contained = !has_unsafe_components(candidate);
+    if contained {
+        if candidate.is_absolute() && candidate.exists() {
+            return Some(raw_path.to_string());
+        }
 
-    if candidate.exists() {
-        return Some(raw_path.to_string());
+        let nested = work_dir.join(candidate);
+        if nested.exists() {
+            return Some(nested.to_string_lossy().into_owned());
+        }
+
+        if candidate.exists() {
+            return Some(raw_path.to_string());
+        }
     }
 
     let filename = candidate.file_name()?;
@@ -1851,6 +1895,130 @@ mod tests {
         assert_eq!(
             rewritten["script_path"],
             script.to_string_lossy().to_string(),
+        );
+    }
+
+    #[test]
+    fn strip_redundant_skill_output_prefix_rejects_parent_dir_escape() {
+        // Codex BLOCKER fix (PR #1186 review): malicious input like
+        // `skill-output/../secret.md` must NOT slip through the
+        // `strip_redundant_skill_output_prefix` helper, AND the
+        // unsafe-component guard inside `resolve_path_in_work_dir`
+        // must skip the existence-check branches so the lexical
+        // `work_dir.join(...)` fallback cannot escape the chrooted
+        // `skill-output/` subdir.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Bait file ABOVE the chroot — escape attempt would land here.
+        let secret = workspace.path().join("secret.md");
+        std::fs::write(&secret, b"SECRET").unwrap();
+
+        // 1. The helper itself refuses the unsafe candidate.
+        assert!(
+            strip_redundant_skill_output_prefix("skill-output/../secret.md", &skill_output)
+                .is_none(),
+            "stripped output of a `..`-containing raw path must be None"
+        );
+
+        // 2. resolve_path_in_work_dir must return None (so the
+        //    existence-check branches are bypassed) — i.e. the EXISTENCE
+        //    of the bait file must not drive the result.
+        assert!(
+            resolve_path_in_work_dir("skill-output/../secret.md", &skill_output).is_none(),
+            "resolve_path_in_work_dir must return None for `..` escape, \
+             NOT the existing bait file's resolved path"
+        );
+
+        // 3. End-to-end: the full resolver must NOT return the path of
+        //    the bait file. The lexical absolutize fallback may still
+        //    return a string for an unresolvable input, but it must
+        //    not point at the parent-dir escape target.
+        let resolved = resolve_plugin_input_path("skill-output/../secret.md", &skill_output);
+        assert_ne!(
+            resolved,
+            secret.to_string_lossy().to_string(),
+            "parent-dir escape must NOT resolve to the workspace-root bait file (resolved={resolved})"
+        );
+    }
+
+    #[test]
+    fn strip_redundant_skill_output_prefix_rejects_absolute_paths() {
+        // Codex BLOCKER fix (PR #1186 review): absolute paths (e.g.
+        // `/etc/passwd`) must not be accepted by the strip helper or
+        // by the existence-check branches of
+        // `resolve_path_in_work_dir`. The shared `resolve_tool_path`
+        // resolver in the upstream caller already rejects them, but
+        // the legacy fallback chain must not silently accept them
+        // either: the EXISTENCE of the absolute file on disk must
+        // never drive the result.
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+
+        assert!(
+            strip_redundant_skill_output_prefix("/etc/passwd", &skill_output).is_none(),
+            "absolute paths must not be stripped"
+        );
+
+        // Critical security guarantee: the existence-check branches of
+        // resolve_path_in_work_dir are skipped for absolute paths.
+        // Returns None (so the caller falls back to a lexical join or
+        // the absolutize fallback — both safe in that the sandbox
+        // gates the real subprocess), NOT Some("/etc/passwd").
+        assert!(
+            resolve_path_in_work_dir("/etc/passwd", &skill_output).is_none(),
+            "resolve_path_in_work_dir must return None for absolute paths, \
+             NOT the raw path because the file exists on disk"
+        );
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_rewrites_video_path_and_text_path() {
+        // Codex MAJOR fix (PR #1186 review): mofa-frame uses
+        // `video_path` and the (unpublished) mofa-videolizer uses
+        // `text_path` for their input args. Both must be subject to
+        // the same workspace-relative rewrite as `audio_path` /
+        // `file_path` / `script_path`.
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("clip.mp4");
+        let text = dir.path().join("transcript.txt");
+        std::fs::write(&video, b"mp4").unwrap();
+        std::fs::write(&text, b"hello").unwrap();
+
+        let def = PluginToolDef {
+            name: "frame_tool".to_string(),
+            description: "mofa-frame style tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "video_path": {"type": "string"},
+                    "text_path": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-frame".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "video_path": "clip.mp4",
+            "text_path": "transcript.txt",
+        }));
+
+        assert_eq!(
+            rewritten["video_path"],
+            video.to_string_lossy().to_string(),
+            "mofa-frame video_path must be rewritten to absolute work_dir path"
+        );
+        assert_eq!(
+            rewritten["text_path"],
+            text.to_string_lossy().to_string(),
+            "mofa-videolizer text_path must be rewritten to absolute work_dir path"
         );
     }
 
