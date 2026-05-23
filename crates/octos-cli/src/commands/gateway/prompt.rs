@@ -210,6 +210,99 @@ mod tests {
     }
 
     #[test]
+    fn should_require_podcast_generate_follow_up_after_podcast_voices() {
+        // NEW-05 (round-2 soak): on mini1, `deepseek-v4-pro` called
+        // `podcast_voices`, got the preset/clone list, and STALLED — the
+        // model treated the voice list as the final answer. Other minis
+        // on `kimi-k2.5` proceeded correctly. The fix is a prompt nudge:
+        // if the model probes voices first for a *generation* request,
+        // it MUST follow up with `podcast_generate`.
+        assert!(
+            PROMPT.contains("`podcast_voices`"),
+            "prompt must mention `podcast_voices` in the podcast \
+             ACT-DIRECTLY rule so the model knows it is reference data, \
+             not a stopping point for a generation request (NEW-05 fix)"
+        );
+        assert!(
+            PROMPT.contains(
+                "you MUST immediately follow up with `podcast_generate`"
+            ),
+            "prompt must instruct the model to immediately follow up \
+             with `podcast_generate` after calling `podcast_voices` for \
+             a generation request; without this nudge deepseek-v4-pro \
+             stalls on the voice list (NEW-05 fix)"
+        );
+        assert!(
+            PROMPT.contains("do NOT stop after the voice list"),
+            "prompt must explicitly forbid stopping after the voice \
+             list for a generation request — the literal phrasing is \
+             the regression guard for NEW-05"
+        );
+    }
+
+    #[test]
+    fn should_preserve_voice_list_only_podcast_requests() {
+        // codex P2 follow-up on NEW-05 (round 2): the original carve-out
+        // still let voice-list-only prompts fall through to the generic
+        // podcast bullet's "spawn podcast_generate" instruction because
+        // the trigger word `podcast` was shared between both cases.
+        // Codex's correction was to SPLIT the route so a dedicated bullet
+        // matches voice-list-only triggers BEFORE the generation bullet
+        // can match. The model should call `podcast_voices` and stop.
+        assert!(
+            PROMPT.contains("Podcast voice list only"),
+            "prompt must have a dedicated 'Podcast voice list only' \
+             route that matches BEFORE the generic generation bullet \
+             so listing requests do not fall through to \
+             podcast_generate (codex P2 follow-up to NEW-05)"
+        );
+        assert!(
+            PROMPT.contains(
+                "call `podcast_voices` and return that list as the final answer"
+            ),
+            "prompt must instruct the model to call `podcast_voices` \
+             and return the list as the final answer for voice-list-only \
+             prompts (codex P2 follow-up to NEW-05)"
+        );
+        assert!(
+            PROMPT.contains("Do NOT spawn `podcast_generate`"),
+            "prompt must explicitly forbid spawning `podcast_generate` \
+             on a voice-list-only request (codex P2 follow-up to NEW-05)"
+        );
+        // The voice-list-only bullet must appear BEFORE the generation
+        // bullet so the model matches it first.
+        let voice_list_idx = PROMPT
+            .find("Podcast voice list only")
+            .expect("voice-list-only bullet missing");
+        let generation_idx = PROMPT
+            .find("Podcast generation")
+            .expect("podcast generation bullet missing");
+        assert!(
+            voice_list_idx < generation_idx,
+            "the voice-list-only bullet must appear BEFORE the \
+             podcast-generation bullet so it matches first (codex P2 \
+             follow-up to NEW-05)"
+        );
+        // codex P2 round 3: the listing route MUST defer to the
+        // generation route when the same message ALSO asks to
+        // make/generate a podcast. Otherwise prompts like
+        // "用播客声音做一期播客" or "use available podcast voices to
+        // make a podcast" get swallowed by the list route.
+        assert!(
+            PROMPT.contains("Override"),
+            "voice-list-only bullet must include an Override clause so \
+             generation requests that mention voice selection still \
+             route to podcast_generate (codex P2 round 3 on NEW-05)"
+        );
+        assert!(
+            PROMPT.contains("fall through to the Podcast generation rule below"),
+            "voice-list-only bullet must explicitly fall through to \
+             the Podcast generation rule when the message asks to \
+             make/generate a podcast (codex P2 round 3 on NEW-05)"
+        );
+    }
+
+    #[test]
     fn should_reconcile_grounding_rule_with_news_fetch_preference() {
         // The Grounding Rules historically listed "news" alongside other
         // real-time data routed to `web_search` / `web_fetch`. That
