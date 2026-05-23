@@ -292,15 +292,28 @@ impl ChatCommand {
         // Section B (codex review follow-up): propagate
         // `plugins.require_signed` so pipeline workers enforce the same
         // gate as the main session.
-        let pipeline_tool = octos_pipeline::RunPipelineTool::new(
+        //
+        // NEW-06 codex follow-up: also propagate the embedder so the
+        // pipeline-spawned worker `Agent` instances inherit the same
+        // hybrid scored + filtered episodic-memory recall the parent
+        // chat agent gets at the `agent = agent.with_embedder(..)` line
+        // below. Without this, `octos chat`'s pipeline workers fall back
+        // to the unfiltered cwd-only path in `EpisodeStore::find_relevant`
+        // and can pull in cross-domain episodes (the NEW-06 contamination
+        // root cause). Construction is extracted into
+        // [`build_run_pipeline_tool`] so the regression test in
+        // `octos-pipeline/tests/embedder_propagation.rs` can pin the
+        // wiring without instantiating the full chat command.
+        let pipeline_tool = build_run_pipeline_tool(
             llm.clone(),
             memory.clone(),
             cwd.clone(),
             data_dir.clone(),
-        )
-        .with_provider_policy(tools.provider_policy().cloned())
-        .with_plugin_dirs(plugin_dirs)
-        .with_plugin_require_signed(config.plugins.require_signed);
+            tools.provider_policy().cloned(),
+            plugin_dirs,
+            config.plugins.require_signed,
+            create_embedder(&config),
+        );
         tools.register(pipeline_tool);
         tools.mark_spawn_only(
             "run_pipeline",
@@ -727,6 +740,39 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
     Some(Arc::new(e))
 }
 
+/// Build the [`octos_pipeline::RunPipelineTool`] used by the chat command,
+/// threading through the per-session policy / plugin dirs / signing gate /
+/// embedder.
+///
+/// NEW-06 codex follow-up — extracted into a stand-alone function so the
+/// regression test in `octos-pipeline/tests/embedder_propagation.rs` can
+/// pin the embedder propagation without instantiating the entire chat
+/// command (which depends on rustyline, hooks, profiles, MCP, etc.).
+///
+/// Keep the construction order byte-for-byte identical to the inline
+/// path it replaced — the policy/plugin builders rely on insertion order
+/// (`with_plugin_dirs` invalidates the plugin cache, etc.).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_run_pipeline_tool(
+    llm: Arc<dyn LlmProvider>,
+    memory: Arc<EpisodeStore>,
+    cwd: PathBuf,
+    data_dir: PathBuf,
+    provider_policy: Option<octos_agent::ToolPolicy>,
+    plugin_dirs: Vec<PathBuf>,
+    plugin_require_signed: bool,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
+) -> octos_pipeline::RunPipelineTool {
+    let mut pipeline_tool = octos_pipeline::RunPipelineTool::new(llm, memory, cwd, data_dir)
+        .with_provider_policy(provider_policy)
+        .with_plugin_dirs(plugin_dirs)
+        .with_plugin_require_signed(plugin_require_signed);
+    if let Some(embedder) = embedder {
+        pipeline_tool = pipeline_tool.with_embedder(embedder);
+    }
+    pipeline_tool
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -765,6 +811,138 @@ mod tests {
         let config = Config::default();
         assert!(
             resolve_provider_policy(&config, "anthropic", "claude-sonnet-4-20250514").is_none()
+        );
+    }
+
+    /// NEW-06 codex follow-up — when [`build_run_pipeline_tool`] is
+    /// given an embedder, the resulting [`octos_pipeline::RunPipelineTool`]
+    /// must carry it through so pipeline workers spawned from `octos chat`
+    /// inherit the contamination-safe hybrid memory recall path.
+    ///
+    /// Regression guard: if a future refactor drops the
+    /// `.with_embedder(...)` call on the chat construction path the
+    /// `embedder_for_test()` assertion below goes red.
+    #[tokio::test]
+    async fn build_run_pipeline_tool_propagates_embedder_when_present() {
+        use async_trait::async_trait;
+        use octos_llm::EmbeddingProvider;
+
+        struct StubEmbedder;
+        #[async_trait]
+        impl EmbeddingProvider for StubEmbedder {
+            async fn embed(&self, texts: &[&str]) -> eyre::Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![0.0]; texts.len()])
+            }
+            fn dimension(&self) -> usize {
+                1
+            }
+        }
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmProvider for MockLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("ok".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+            fn model_id(&self) -> &str {
+                "mock-1"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        let llm = Arc::new(MockLlm) as Arc<dyn LlmProvider>;
+        let embedder = Arc::new(StubEmbedder) as Arc<dyn EmbeddingProvider>;
+
+        let tool = build_run_pipeline_tool(
+            llm,
+            memory,
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            false,
+            Some(embedder),
+        );
+
+        assert!(
+            tool.embedder_for_test().is_some(),
+            "build_run_pipeline_tool must call `.with_embedder(..)` when \
+             the caller supplies one — otherwise `octos chat` pipeline \
+             workers fall back to the unfiltered cwd-only memory recall \
+             path and re-introduce the NEW-06 contamination."
+        );
+    }
+
+    /// NEW-06 codex follow-up — without an embedder argument the helper
+    /// produces a tool that matches pre-fix behaviour byte-for-byte
+    /// (`embedder_for_test()` returns `None`). Locks the legacy fall-through
+    /// for callers that don't have an embedder configured.
+    #[tokio::test]
+    async fn build_run_pipeline_tool_defaults_to_no_embedder() {
+        use async_trait::async_trait;
+
+        struct MockLlm;
+        #[async_trait]
+        impl LlmProvider for MockLlm {
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("ok".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+            fn model_id(&self) -> &str {
+                "mock-1"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path()).await.unwrap());
+        let llm = Arc::new(MockLlm) as Arc<dyn LlmProvider>;
+
+        let tool = build_run_pipeline_tool(
+            llm,
+            memory,
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            false,
+            None,
+        );
+
+        assert!(
+            tool.embedder_for_test().is_none(),
+            "build_run_pipeline_tool with `embedder = None` must not \
+             attach one — otherwise legacy callers that never configured \
+             an embedder would observe a behaviour change."
         );
     }
 }

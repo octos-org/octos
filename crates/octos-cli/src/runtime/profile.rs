@@ -669,7 +669,7 @@ impl ProfileRuntime {
             // by `RetryProvider` → `ProviderChain` → `AdaptiveRouter`
             // when adaptive is configured, so per-node calls still
             // fan out through the adaptive layer.
-            let pt = octos_pipeline::RunPipelineTool::new(
+            let mut pt = octos_pipeline::RunPipelineTool::new(
                 llm.clone(),
                 memory.clone(),
                 data_dir.to_path_buf(),
@@ -678,6 +678,20 @@ impl ProfileRuntime {
             .with_provider_policy(config.tool_policy.clone())
             .with_plugin_dirs(plugin_dirs.clone())
             .with_octos_home(effective_octos_home.clone());
+            // NEW-06 fix: propagate the embedder down to pipeline
+            // worker `Agent` instances so episodic memory recall stays
+            // on the contamination-safe hybrid scored + filtered path
+            // (`MIN_EPISODE_SIMILARITY`). Without this, deep_research
+            // pipeline workers (mini5 / round-3 soak) hit the
+            // unfiltered cwd-only fallback in
+            // `EpisodeStore::find_relevant` and pulled cross-domain
+            // episodes (Apple CEO / GPT-5.5 podcast) into a JWST
+            // research worker's prompt.
+            if let Some(embedder) =
+                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>)
+            {
+                pt = pt.with_embedder(embedder);
+            }
             tools.register(pt);
             tools.mark_spawn_only(
                 "run_pipeline",

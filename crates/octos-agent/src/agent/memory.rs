@@ -2,7 +2,7 @@
 
 use octos_core::{Message, MessageRole, Task};
 use octos_memory::{Episode, HybridScore};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::Agent;
 
@@ -121,6 +121,30 @@ impl Agent {
             };
 
             if let Ok(scored) = scored_result {
+                // NEW-06 diagnostic: surface which episodes (id + per-
+                // modality scores) the gate ultimately admitted. The
+                // round-3 mini5 contamination shipped silently because
+                // the agent loop had no telemetry on what cleared the
+                // threshold — only the rendered prompt downstream. We
+                // emit one structured log per `build_initial_messages`
+                // so fleet operators can confirm the gate is active
+                // and which episodes contributed without inspecting
+                // the model-visible prompt directly.
+                let admitted: Vec<(String, f32, f32, f32)> = scored
+                    .iter()
+                    .filter(|(_, s)| s.best_modality() >= MIN_EPISODE_SIMILARITY)
+                    .map(|(ep, s)| (ep.id.clone(), s.bm25, s.vector, s.combined))
+                    .collect();
+                info!(
+                    caller = "agent_memory_hybrid",
+                    agent = %self.id,
+                    query_len = query.len(),
+                    candidates = scored.len(),
+                    admitted = admitted.len(),
+                    threshold = MIN_EPISODE_SIMILARITY,
+                    episodes = ?admitted,
+                    "memory recall: hybrid scored + filtered path"
+                );
                 if let Some(content) = format_relevant_experiences(&scored) {
                     messages.push(Message {
                         role: MessageRole::System,
@@ -137,13 +161,49 @@ impl Agent {
             }
         } else if let Ok(episodes) = self
             .memory
-            .find_relevant(&task.context.working_dir, &query, 3)
+            .find_relevant_filtered(
+                &task.context.working_dir,
+                &query,
+                3,
+                // NEW-06 defense-in-depth: apply the modality-aware
+                // similarity gate to the no-embedder fallback path too.
+                // The primary fix is propagating the parent embedder
+                // to pipeline workers via `RunPipelineTool::with_embedder`
+                // (crates/octos-pipeline/src/tool.rs); this is the
+                // belt-and-suspenders rail for the case where a worker
+                // still ends up here (embedder construction failed, an
+                // older call site not yet updated, etc.).
+                Some(MIN_EPISODE_SIMILARITY),
+            )
             .await
         {
             // CWD-scoped fallback path. No scoring infrastructure here;
             // the cwd filter + keyword match already constrain results.
             // Inject only when there's something to inject (no empty header).
+            //
+            // NEW-06 diagnostic: ALSO log on the no-embedder path so we
+            // can detect contamination here too. The round-3 root
+            // cause was that pipeline workers fell through to THIS
+            // branch because their parent agent's embedder wasn't
+            // propagated. The wiring fix lives in
+            // crates/octos-pipeline (RunPipelineTool::with_embedder ->
+            // CodergenHandler -> worker Agent::with_embedder); this
+            // log gives us evidence when a worker still ends up here
+            // despite the fix (e.g. embedder failed to construct).
             if !episodes.is_empty() {
+                let ids: Vec<String> = episodes.iter().map(|e| e.id.clone()).collect();
+                warn!(
+                    caller = "agent_memory_cwd_fallback",
+                    agent = %self.id,
+                    cwd = %task.context.working_dir.display(),
+                    query_len = query.len(),
+                    injected = episodes.len(),
+                    episodes = ?ids,
+                    "memory recall: no-embedder CWD fallback (no similarity gate). \
+                     If this agent is a pipeline worker, the parent embedder did NOT \
+                     propagate — investigate the RunPipelineTool::with_embedder wiring \
+                     (NEW-06)."
+                );
                 let content = render_relevant_experiences(&episodes);
                 messages.push(Message {
                     role: MessageRole::System,

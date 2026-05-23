@@ -100,7 +100,7 @@ const HNSW_MAX_LAYER: usize = 16;
 /// `search(..., 10_000, ...)` call per query, which is bounded by the
 /// real document count (HNSW caps at HNSW_CAPACITY anyway) and only
 /// runs when a caller explicitly asks for the floor.
-const FLOOR_PREFILTER_POOL: usize = HNSW_CAPACITY;
+pub(crate) const FLOOR_PREFILTER_POOL: usize = HNSW_CAPACITY;
 
 /// Compute the BM25 per-modality candidate pool size for a single
 /// `search_scored_filtered` call.
@@ -152,6 +152,20 @@ impl HybridIndex {
     /// Returns true if no documents have been indexed.
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+
+    /// Total number of documents inserted into the index (including
+    /// tombstoned ones — the BM25 inverted index still has them).
+    ///
+    /// Returned to callers like
+    /// [`crate::store::EpisodeStore::find_relevant_filtered`] that need
+    /// to size an inner-fetch pool exhaustively. Because BM25-only
+    /// inserts continue beyond `HNSW_CAPACITY` (HNSW gracefully
+    /// degrades to BM25-only insertion), the BM25 inverted index can
+    /// outgrow the HNSW graph; callers MUST NOT assume the corpus
+    /// size is capped at `HNSW_CAPACITY`.
+    pub fn len(&self) -> usize {
+        self.ids.len()
     }
 
     /// Set custom hybrid scoring weights. Weights should sum to 1.0.
