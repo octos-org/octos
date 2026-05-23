@@ -1135,6 +1135,13 @@ impl Agent {
                                     }
                                 }
                             }
+                            // Codex round-2 MAJOR 2 (PR #1187 fixup): collect
+                            // per-tool-call success bits for THIS iteration
+                            // only. Declared fresh inside the loop body so
+                            // the spawn_only synth-ack gate reads bits for
+                            // the current iteration, never stale bits from
+                            // earlier ones in the same turn.
+                            let mut iter_tool_success: Vec<(String, bool)> = Vec::new();
                             if let Err(e) = self
                                 .handle_tool_use(
                                     &response,
@@ -1145,6 +1152,7 @@ impl Agent {
                                     &mut retry_state,
                                     tracker,
                                     Some(&mut tool_structured_metadata),
+                                    Some(&mut iter_tool_success),
                                 )
                                 .await
                             {
@@ -1230,7 +1238,30 @@ impl Agent {
                                 });
                             }
 
-                            if self.tools.spawn_only_was_invoked() {
+                            // Codex round-2 MAJOR 1 (PR #1187 fixup):
+                            // the previous gate read
+                            // `self.tools.spawn_only_was_invoked()`, which is
+                            // a TURN-wide AtomicBool set by `execution.rs`
+                            // when ANY iteration in the turn invokes a
+                            // spawn_only tool. Once flipped it stays true
+                            // until the next turn begins, so on a
+                            // multi-iteration turn the LLM could call
+                            // run_pipeline (spawn_only) in iter 1, get an
+                            // error response, react by calling read_file
+                            // (regular) in iter 2, then EndTurn in iter 3 —
+                            // and the iter-2 ToolUse arm would still see
+                            // the flag set and synthesise "Background work
+                            // started." even though THIS iteration never
+                            // touched a spawn_only tool. The synth-ack is
+                            // only ever appropriate when the CURRENT
+                            // iteration's response actually contains a
+                            // spawn_only tool call, so gate on that
+                            // directly.
+                            let current_iter_has_spawn_only = response
+                                .tool_calls
+                                .iter()
+                                .any(|tc| self.tools.is_spawn_only(&tc.name));
+                            if current_iter_has_spawn_only {
                                 // Fleet-UX soak B4 (mini1 / dspfac, 2026-05-22):
                                 // when the LLM called a spawn_only tool AND
                                 // any tool in the same turn-batch produced an
@@ -1257,7 +1288,11 @@ impl Agent {
                                 // that channel; we only suppress the
                                 // turn-final fabricated "started" bubble
                                 // that the foreground can't actually verify.
-                                if any_tool_invocation_errored(&messages, &response) {
+                                if any_tool_invocation_errored(
+                                    &messages,
+                                    &response,
+                                    &iter_tool_success,
+                                ) {
                                     warn!(
                                         "tool invocation errored in spawn_only turn — suppressing synthesized 'Background work started' ack and letting the LLM react to the error"
                                     );
@@ -1628,6 +1663,10 @@ impl Agent {
                         return Ok(result);
                     }
                     StopReason::ToolUse => {
+                        // Task loop never emits the synth-ack so the per-call
+                        // success-bit sink is unused here — pass `None`. (The
+                        // conversation loop wires this up to the spawn_only
+                        // gate; see the matching call site above.)
                         if let Err(e) = self
                             .handle_tool_use(
                                 &response,
@@ -1636,6 +1675,7 @@ impl Agent {
                                 Some(&mut files_to_send),
                                 &mut turn,
                                 &mut retry_state,
+                                None,
                                 None,
                                 None,
                             )
@@ -1757,6 +1797,13 @@ impl Agent {
         retry_state: &mut LoopRetryState,
         tracker: Option<&TokenTracker>,
         tool_structured_metadata: Option<&mut Vec<(String, serde_json::Value)>>,
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): out-parameter that, when
+        // supplied, receives the per-tool-call success bit keyed by
+        // `tool_call_id`. The conversation-loop call site uses this to
+        // gate the synth-ack branch authoritatively (rather than reading
+        // the content shape of each tool message). Background callers
+        // pass `None` because the task-loop never emits the synth-ack.
+        tool_success_by_id: Option<&mut Vec<(String, bool)>>,
     ) -> Result<()> {
         // Fix tool_call IDs -- some models (e.g. qwen via dashscope) generate
         // duplicate or empty IDs which downstream providers reject with 400.
@@ -1823,20 +1870,37 @@ impl Agent {
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
         let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
+        // Codex round-2 MAJOR 2 (PR #1187 fixup): collect per-tool-call
+        // success bits across every batch in this turn. Threaded out via
+        // `tool_success_by_id` so the synth-ack gate can read the
+        // authoritative `ToolResult.success` value rather than guessing
+        // from content prefixes (which missed shell timeouts, sandbox
+        // path rejections, browser nav failures, etc.).
+        let mut tool_success: Vec<(String, bool)> = Vec::new();
         for batch in tool_batches {
             let mut batch_response = limited_response.clone();
             batch_response.tool_calls = batch.to_vec();
-            let (batch_messages, batch_files, batch_send_files, batch_tokens, batch_metadata) =
-                self.execute_tools(&batch_response).await?;
+            let (
+                batch_messages,
+                batch_files,
+                batch_send_files,
+                batch_tokens,
+                batch_metadata,
+                batch_success,
+            ) = self.execute_tools(&batch_response).await?;
             tool_messages.extend(batch_messages);
             tool_files.extend(batch_files);
             tool_send_files.extend(batch_send_files);
             tool_tokens.input_tokens += batch_tokens.input_tokens;
             tool_tokens.output_tokens += batch_tokens.output_tokens;
             tool_metadata.extend(batch_metadata);
+            tool_success.extend(batch_success);
         }
         if let Some(sink) = tool_structured_metadata {
             sink.extend(tool_metadata);
+        }
+        if let Some(sink) = tool_success_by_id {
+            sink.extend(tool_success);
         }
 
         let merged = merge_tool_messages_in_order(
@@ -1924,12 +1988,6 @@ fn is_error_tool_message(content: &str) -> bool {
 /// Scan the tool-result messages appended during this turn for any tool
 /// invocation (spawn_only or otherwise) that returned an error-shaped body.
 ///
-/// The dispatcher pairs each `Tool` message back to its originating tool call
-/// via `tool_call_id`; we walk the `response.tool_calls` that the LLM emitted
-/// in this turn, look up the matching result message in `messages`, and check
-/// whether the body is shaped like one of the well-known error conventions in
-/// [`is_error_tool_message`].
-///
 /// Used by the spawn_only branch in [`Agent::process_message_inner`] to gate
 /// the synthesized "Background work started for `<tool>`." acknowledgement.
 /// When `true`, the ack is suppressed and the agent loop falls through to its
@@ -1944,11 +2002,44 @@ fn is_error_tool_message(content: &str) -> bool {
 /// success bubble while any sibling tool's red error chip is showing. The
 /// LLM still has the next iteration to acknowledge / recover regardless of
 /// which tool failed, so suppressing the ack here is strictly better UX.
-fn any_tool_invocation_errored(messages: &[Message], response: &ChatResponse) -> bool {
+///
+/// Codex round-2 MAJOR 2 (PR #1187 fixup): the per-call `tool_success_by_id`
+/// map is the AUTHORITATIVE signal. When the dispatcher reports
+/// `success == false` for a tool_call_id present in the current response
+/// we return `true` immediately, regardless of content shape. This catches
+/// every legitimate failure mode whose tool body did NOT carry one of the
+/// well-known error prefixes — shell timeouts ("Command timed out after
+/// ..."), sandbox path rejections ("Path outside working directory ..."),
+/// browser navigation failures, plugin tools returning `success: false`
+/// with arbitrary error messages — every one of which renders a red error
+/// chip but used to slip past the content-only classifier.
+///
+/// We retain the content-based fallback ([`is_error_tool_message`]) for
+/// tool_call_ids that have NO entry in the success map. That covers
+/// blocked-by-session-limit and other synthesised messages constructed
+/// outside `execute_tools` (see `session_limit_message` /
+/// `merge_tool_messages_in_order`) which never carry an executed `success`
+/// bit but DO start with `[SESSION LIMIT]` / `[SHELL RETRY LIMIT]` so the
+/// content classifier still gates them correctly.
+fn any_tool_invocation_errored(
+    messages: &[Message],
+    response: &ChatResponse,
+    tool_success_by_id: &[(String, bool)],
+) -> bool {
     response.tool_calls.iter().any(|tc| {
-        // The dispatcher synthesises one Tool message per tool_call_id, so a
-        // linear scan over recent messages is bounded by the per-turn batch
-        // size (≤ MAX_PARALLEL_TOOL_CALLS_PER_BATCH = 8 in production).
+        // Primary path: read the executed-tool success bit.
+        if let Some((_, success)) = tool_success_by_id
+            .iter()
+            .find(|(id, _)| id.as_str() == tc.id)
+        {
+            return !*success;
+        }
+        // Fallback for tool_call_ids that bypassed `execute_tools` (e.g.
+        // session-limit blocks emit a synthetic tool message via
+        // `session_limit_message`). The dispatcher synthesises one Tool
+        // message per tool_call_id, so a linear scan over recent messages
+        // is bounded by the per-turn batch size
+        // (≤ MAX_PARALLEL_TOOL_CALLS_PER_BATCH = 8 in production).
         messages.iter().rev().any(|message| {
             message.role == MessageRole::Tool
                 && message
@@ -5620,7 +5711,10 @@ printf '{"output":"voice saved","success":true}\n'
             "Error: any_tool dispatch failed",
         )];
 
-        assert!(any_tool_invocation_errored(&messages, &response));
+        // Empty success-map exercises the content-classifier fallback path
+        // (the success bit is the post-#1187 authoritative input; absence
+        // means the call bypassed execute_tools, e.g. session-limit block).
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
     }
 
     #[test]
@@ -5640,7 +5734,7 @@ printf '{"output":"voice saved","success":true}\n'
             spawn_only_tool_result("call_b", "ls\nfile1\nfile2\nExit code: 0"),
         ];
 
-        assert!(!any_tool_invocation_errored(&messages, &response));
+        assert!(!any_tool_invocation_errored(&messages, &response, &[]));
     }
 
     #[test]
@@ -5652,7 +5746,7 @@ printf '{"output":"voice saved","success":true}\n'
             "[VALIDATION FAILED] Tool 'run_pipeline' rejected input: bad arg\n\nFix the input and retry.",
         )];
 
-        assert!(any_tool_invocation_errored(&messages, &response));
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
     }
 
     #[test]
@@ -5675,7 +5769,7 @@ printf '{"output":"voice saved","success":true}\n'
             spawn_only_tool_result("call_shell", "Error: command not found: foo"),
         ];
 
-        assert!(any_tool_invocation_errored(&messages, &response));
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
     }
 
     #[test]
@@ -5694,7 +5788,7 @@ printf '{"output":"voice saved","success":true}\n'
             spawn_only_tool_result("call_now", "{\"task_handle\": \"abc\"}"),
         ];
 
-        assert!(!any_tool_invocation_errored(&messages, &response));
+        assert!(!any_tool_invocation_errored(&messages, &response, &[]));
     }
 
     #[test]
@@ -5707,13 +5801,135 @@ printf '{"output":"voice saved","success":true}\n'
             "call_a",
             "Tool 'tool_a' panicked: boom",
         )];
-        assert!(any_tool_invocation_errored(&messages_panic, &response));
+        assert!(any_tool_invocation_errored(&messages_panic, &response, &[],));
 
         let messages_timeout = vec![spawn_only_tool_result(
             "call_b",
             "Tool 'tool_b' timed out after 30 seconds",
         )];
-        assert!(any_tool_invocation_errored(&messages_timeout, &response));
+        assert!(any_tool_invocation_errored(
+            &messages_timeout,
+            &response,
+            &[],
+        ));
+    }
+
+    // ─── Codex round-2 MAJOR 2 (PR #1187 fixup) ────────────────────────
+    //
+    // The new authoritative path: success bit from the dispatcher's
+    // `ToolResult` is plumbed through as a (tool_call_id, success) slice.
+    // These cover the failure shapes the content-only classifier missed.
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_shell_timeout() {
+        // shell.rs:396 emits "Command timed out after ..." with success=false.
+        // The content does NOT start with "Error:" / "[VALIDATION FAILED]" /
+        // etc., so the content classifier returns false. With the success
+        // bit available, the gate MUST still fire.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_sh", "shell")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_sh",
+            "Command timed out after 60s\nExit code: -1",
+        )];
+        let success_map = vec![("call_sh".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_sandbox_path_reject() {
+        // coding_tools.rs:680 emits "Path outside working directory ..."
+        // with success=false. Same content-classifier blind spot as above.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_rf", "read_file")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_rf",
+            "Path outside working directory: /etc/passwd",
+        )];
+        let success_map = vec![("call_rf".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_browser_nav_fail() {
+        // Browser tool emits "Navigation failed: <reason>" with success=false.
+        // Content does not match any well-known prefix.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_br", "browser")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_br",
+            "Navigation failed: net::ERR_NAME_NOT_RESOLVED for https://example.invalid/",
+        )];
+        let success_map = vec![("call_br".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_uses_success_bit_for_plugin_failure() {
+        // Plugin tools emit arbitrary failure text with success=false. The
+        // body looks like normal output ("Could not connect to host" etc.)
+        // and the content classifier would miss it entirely.
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_pl", "deep_search")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_pl",
+            "Could not connect to host: search.api.invalid (connection refused)",
+        )];
+        let success_map = vec![("call_pl".to_string(), false)];
+
+        assert!(any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_success_bit_authoritative_over_content() {
+        // Authoritative-over-content: even if a tool's body happens to
+        // contain "Failed to execute" anywhere in it, when the success
+        // bit is TRUE the gate must NOT fire — the dispatcher signed off
+        // on the call, the body is just narrative.
+        let response = spawn_only_chat_response(vec![spawn_only_tool_call("call_ok", "shell")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_ok",
+            "Failed to execute previously, retried, ran cleanly second time.\nExit code: 0",
+        )];
+        let success_map = vec![("call_ok".to_string(), true)];
+
+        assert!(!any_tool_invocation_errored(
+            &messages,
+            &response,
+            &success_map,
+        ));
+    }
+
+    #[test]
+    fn any_tool_invocation_errored_falls_back_to_content_when_id_missing() {
+        // Bypass-execute_tools shape: session-limit blocking emits a
+        // synthetic tool message via `session_limit_message` whose
+        // tool_call_id has NO entry in the success map. The content
+        // classifier still catches `[SESSION LIMIT]` so the gate fires.
+        let response =
+            spawn_only_chat_response(vec![spawn_only_tool_call("call_blocked", "shell")]);
+        let messages = vec![spawn_only_tool_result(
+            "call_blocked",
+            "[SESSION LIMIT] Tool 'shell' was blocked: cap reached",
+        )];
+
+        assert!(any_tool_invocation_errored(&messages, &response, &[]));
     }
 
     /// Tool that mimics a regular sibling whose `execute` returns `Err`.
@@ -5810,6 +6026,181 @@ printf '{"output":"voice saved","success":true}\n'
         fn provider_name(&self) -> &str {
             "mock"
         }
+    }
+
+    /// Provider for the codex round-2 MAJOR 1 sticky-flag regression: emits
+    /// three iterations —
+    ///   iter 1: spawn_only call (foreground returns success handle, sets
+    ///           the turn-wide `spawn_only_was_invoked` flag).
+    ///   iter 2: a SINGLE regular non-spawn-only tool call. Its result is
+    ///           happy. The CURRENT iteration's response contains NO
+    ///           spawn_only call. The bug: the sticky flag is still `true`
+    ///           from iter 1, no tool in iter 2 errored, so the iter-2
+    ///           ToolUse arm would fall through to the synth-ack branch
+    ///           and fabricate "Background work started for `<spawn_only>`."
+    ///           even though the iter-2 LLM call invoked NO spawn_only
+    ///           tool. Without the fix, iter 1 ALREADY returns the
+    ///           synth-ack (everything succeeded) so the loop terminates
+    ///           before reaching iter 2 at all — we therefore reshape the
+    ///           sequence so iter 1's batch SUPPRESSES the synth-ack
+    ///           naturally (via the existing B4 erroring-sibling gate)
+    ///           and only the sticky-flag-only path reaches iter 2.
+    ///   iter 3: EndTurn — the LLM produces the actual user-facing reply.
+    struct StickyFlagThreeIterProvider {
+        calls: AtomicUsize,
+        spawn_only_name: &'static str,
+        erroring_sibling_name: &'static str,
+        iter2_regular_name: &'static str,
+        final_content: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StickyFlagThreeIterProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(match call {
+                0 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "call_iter1_spawnonly".to_string(),
+                            name: self.spawn_only_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                        ToolCall {
+                            id: "call_iter1_sibling".to_string(),
+                            name: self.erroring_sibling_name.to_string(),
+                            arguments: serde_json::json!({}),
+                            metadata: None,
+                        },
+                    ],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                1 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_iter2_regular".to_string(),
+                        name: self.iter2_regular_name.to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                _ => ChatResponse {
+                    content: Some(self.final_content.to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Integration: codex round-2 MAJOR 1 (PR #1187 fixup). The sticky
+    /// `spawn_only_was_invoked` AtomicBool stayed `true` across iterations
+    /// once any iteration in the turn called a spawn_only tool. If a
+    /// later iteration in the SAME turn (a) called only a regular
+    /// non-spawn-only tool, (b) got a happy result from it, and then
+    /// (c) reached the post-tool ToolUse arm, the synth-ack branch would
+    /// fabricate a "Background work started." bubble at that iteration
+    /// even though the LLM was just calling read_file / shell. The fix
+    /// narrows the gate to the CURRENT iteration's `response.tool_calls`
+    /// via [`ToolRegistry::is_spawn_only`].
+    ///
+    /// This test models a 3-iteration turn:
+    ///   iter 1: run_pipeline (spawn_only) + erroring sibling
+    ///           — existing B4 gate suppresses the synth-ack
+    ///   iter 2: read_task_output (regular) returns happy output
+    ///           — sticky flag would re-fire the gate without the fix
+    ///   iter 3: EndTurn — produces the user-facing reply
+    ///
+    /// With the bug, iter 2 returned a synthesised ack with
+    /// `synthesized_from_spawn_only = true` as the turn-final content.
+    /// With the fix, iter 2 falls through and iter 3's EndTurn becomes
+    /// the turn-final reply.
+    #[tokio::test]
+    async fn spawn_only_sticky_flag_does_not_synthesize_ack_in_later_regular_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        // Iter 1: spawn_only tool (succeeds on foreground; returns handle
+        // envelope — sets `spawn_only_was_invoked` AtomicBool to true).
+        tools.register(NamedEchoTool {
+            name: "run_pipeline",
+            output: "unused (foreground returns the handle envelope)",
+        });
+        tools.mark_spawn_only("run_pipeline", None);
+        // Iter 1 sibling: erroring tool — the existing B4 gate suppresses
+        // the iter-1 synth-ack because of THIS error, allowing the loop
+        // to actually reach iter 2 where the sticky-flag bug fires.
+        tools.register(ErroringTool {
+            name: "shell",
+            message: "required tool(s) not available on this host: shell-helper",
+        });
+        // Iter 2: regular tool that returns a happy body. The CURRENT
+        // iteration's response calls only this tool — no spawn_only call.
+        tools.register(NamedEchoTool {
+            name: "read_task_output",
+            output: "<happy log lines>\nExit code: 0",
+        });
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(StickyFlagThreeIterProvider {
+            calls: AtomicUsize::new(0),
+            spawn_only_name: "run_pipeline",
+            erroring_sibling_name: "shell",
+            iter2_regular_name: "read_task_output",
+            final_content: "Pipeline launched; shell-helper failed; read_task_output is clean — done.",
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("spawn-only-sticky-test"),
+            provider,
+            tools,
+            memory,
+        );
+
+        let result = agent.process_message("run …", &[], vec![]).await.unwrap();
+
+        // Iter 2's regular tool MUST NOT trigger the synth-ack — the
+        // CURRENT iteration's response contains no spawn_only call. With
+        // the sticky-flag bug, the harness fabricates a "Background work
+        // started for `run_pipeline`." bubble at iter 2 even though iter
+        // 2 only called read_task_output (a regular tool).
+        assert!(
+            !result.content.starts_with("Background work started"),
+            "iter-2 regular tool must NOT synthesize spawn_only ack — current iteration has no spawn_only tool call. Got: {:?}",
+            result.content
+        );
+        assert!(
+            !result.synthesized_from_spawn_only,
+            "synthesized_from_spawn_only flag must be false when CURRENT iteration's response contains no spawn_only tool call, regardless of earlier iterations in the same turn"
+        );
+        assert_eq!(
+            result.content,
+            "Pipeline launched; shell-helper failed; read_task_output is clean — done.",
+            "the LLM's iter-3 EndTurn reply must be surfaced, not a synthesised ack"
+        );
     }
 
     /// Integration: when an LLM turn emits a spawn_only tool_call AND a
