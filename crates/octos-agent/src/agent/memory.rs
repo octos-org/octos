@@ -18,9 +18,16 @@ use super::Agent;
 /// sessions (round-2 soak NEW-06: a JWST research prompt was answered using
 /// episodes from a prior Tim Cook / GPT-5.5 podcast session).
 ///
-/// 0.35 is the codex-recommended baseline: above this, the hybrid score
-/// reflects genuine BM25 keyword or cosine similarity overlap; below it
-/// the match is essentially noise.
+/// **History.** 0.35 was the original codex-recommended baseline introduced
+/// in PR #1192. Round-3 soak (2026-05-23) showed it was still too lax —
+/// 3 of 4 minis (mini1/mini2/mini5) returned contaminated content on a
+/// JWST prompt (Apple CEO / GPT-5.5 / agentic-AI-history episodes leaked
+/// through). Only mini3 stayed on-topic. The cross-session noise floor
+/// at 0.35 is high enough that fuzzy BM25/cosine overlaps between
+/// *unrelated* topic domains still clear the gate. Tightening to 0.55
+/// requires a substantially closer semantic match — keyword-perfect
+/// (BM25 1.0) or genuinely on-topic vector hits still pass, but loose
+/// "both mention some shared token" noise no longer does.
 ///
 /// **Modality-aware gating.** The gate is compared against
 /// [`HybridScore::best_modality`] (the max of BM25 and vector), not
@@ -34,7 +41,7 @@ use super::Agent;
 /// Exposed as `pub const` and re-exported from the crate root so
 /// operators / admin tooling can reference the threshold without
 /// forking.
-pub const MIN_EPISODE_SIMILARITY: f32 = 0.35;
+pub const MIN_EPISODE_SIMILARITY: f32 = 0.55;
 
 impl Agent {
     pub(super) async fn build_initial_messages(&self, task: &Task) -> Vec<Message> {
@@ -250,15 +257,15 @@ mod tests {
 
     #[test]
     fn episode_injection_filters_below_threshold() {
-        // 3 episodes scored at [0.5, 0.3, 0.1]; only the 0.5 episode is
-        // above the 0.35 threshold so only it should appear in the
+        // 3 episodes scored at [0.7, 0.5, 0.1]; only the 0.7 episode is
+        // above the 0.55 threshold so only it should appear in the
         // formatted message.
         let scored = vec![
             (
                 make_episode("HIGH RELEVANCE rust ownership"),
-                score_bm25(0.5),
+                score_bm25(0.7),
             ),
-            (make_episode("MID RELEVANCE python flask"), score_bm25(0.3)),
+            (make_episode("MID RELEVANCE python flask"), score_bm25(0.5)),
             (
                 make_episode("LOW RELEVANCE weather report"),
                 score_bm25(0.1),
@@ -274,7 +281,7 @@ mod tests {
         );
         assert!(
             !rendered.contains("MID RELEVANCE python flask"),
-            "expected the 0.30 episode to be filtered (below threshold 0.35)"
+            "expected the 0.50 episode to be filtered (below threshold 0.55)"
         );
         assert!(
             !rendered.contains("LOW RELEVANCE weather report"),
@@ -284,12 +291,12 @@ mod tests {
 
     #[test]
     fn episode_injection_skipped_when_all_below_threshold() {
-        // All scores < MIN_EPISODE_SIMILARITY (0.35). Expect None so the
+        // All scores < MIN_EPISODE_SIMILARITY (0.55). Expect None so the
         // caller skips injecting the "Past Experiences" system message
         // entirely — no empty header allowed.
         let scored = vec![
-            (make_episode("Noisy match A"), score_bm25(0.34)),
-            (make_episode("Noisy match B"), score_bm25(0.20)),
+            (make_episode("Noisy match A"), score_bm25(0.54)),
+            (make_episode("Noisy match B"), score_bm25(0.40)),
             (make_episode("Noisy match C"), score_bm25(0.05)),
         ];
 
@@ -301,12 +308,12 @@ mod tests {
 
     #[test]
     fn episode_injection_preserves_top_match() {
-        // Top score 0.6 should appear before lower-scored entries in the
+        // Top score 0.8 should appear before lower-scored entries in the
         // formatted block (the function preserves input order which is the
         // hybrid search's descending-score order).
         let scored = vec![
-            (make_episode("TOP MATCH first"), score_bm25(0.6)),
-            (make_episode("RUNNER UP second"), score_bm25(0.45)),
+            (make_episode("TOP MATCH first"), score_bm25(0.8)),
+            (make_episode("RUNNER UP second"), score_bm25(0.6)),
         ];
 
         let rendered = format_relevant_experiences(&scored).expect("matches exist above threshold");
@@ -318,8 +325,52 @@ mod tests {
             .expect("runner up should be present");
         assert!(
             top_idx < runner_idx,
-            "top match (score 0.6) should appear before runner-up (score 0.45) — got top_idx={top_idx}, runner_idx={runner_idx}"
+            "top match (score 0.8) should appear before runner-up (score 0.6) — got top_idx={top_idx}, runner_idx={runner_idx}"
         );
+    }
+
+    #[test]
+    fn episode_injection_filters_round_3_soak_contamination_scenario() {
+        // Regression for round-3 fleet soak (NEW-06 round 2): on mini5 a
+        // JWST research prompt rendered final content about "Apple CEO
+        // Succession / Google-Anthropic / OpenAI GPT-5.5" because a prior
+        // tech-news podcast episode survived the (then) 0.35 gate with a
+        // weak cross-domain hybrid score of ~0.4. Such a score reflects
+        // shared incidental tokens ("the", "research", "report") between
+        // wholly unrelated topics, not genuine semantic overlap. The 0.55
+        // gate keeps that loose noise out while still admitting close
+        // matches (>=0.55 means substantial keyword overlap or strong
+        // cosine similarity, not just shared boilerplate vocabulary).
+        let scored = vec![(
+            make_episode(
+                "Tech news podcast: Apple CEO Tim Cook succession, John Ternus, GPT-5.5 launch",
+            ),
+            HybridScore {
+                // Cross-domain noise score that USED to pass at 0.35
+                // (PR #1192 baseline) — round-3 soak proved this is
+                // still contamination, not signal.
+                combined: 0.40,
+                bm25: 0.40,
+                vector: 0.40,
+            },
+        )];
+
+        assert!(
+            format_relevant_experiences(&scored).is_none(),
+            "cross-domain Apple/GPT episode at hybrid score 0.40 must be filtered when query is \
+             'James Webb telescope research' — 0.40 cleared the old 0.35 gate but is noise per \
+             round-3 soak evidence"
+        );
+
+        // Sanity check the other direction: a genuinely on-topic match at
+        // 0.7 still passes the tightened gate.
+        let on_topic = vec![(
+            make_episode("Deep research: James Webb Space Telescope observations 2024"),
+            score_bm25(0.7),
+        )];
+        let rendered = format_relevant_experiences(&on_topic)
+            .expect("on-topic JWST episode at 0.70 must still pass the tightened 0.55 gate");
+        assert!(rendered.contains("James Webb Space Telescope"));
     }
 
     #[test]
@@ -336,11 +387,12 @@ mod tests {
 
     #[test]
     fn episode_injection_admits_bm25_only_match_with_weak_combined_score() {
-        // Regression for codex P2: when an embedder is configured, the
-        // combined weighted-sum score for a BM25-only match maxes out
-        // at `bm25_weight` (0.3 with defaults) — below the 0.35 gate.
-        // The agent gate uses `best_modality()` so the match still
-        // passes on its raw BM25 score (1.0).
+        // Regression for codex P2 (PR #1192): when an embedder is
+        // configured, the combined weighted-sum score for a BM25-only
+        // match maxes out at `bm25_weight` (0.3 with defaults) — well
+        // below the agent's similarity gate (now 0.55). The agent gate
+        // uses `best_modality()` so the match still passes on its raw
+        // BM25 score (1.0), preserving older-episode recall.
         let scored = vec![(
             make_episode("keyword-perfect older episode"),
             HybridScore {
@@ -351,7 +403,7 @@ mod tests {
         )];
 
         let rendered = format_relevant_experiences(&scored).expect(
-            "keyword-perfect single-modality match must survive the gate even though combined < 0.35",
+            "keyword-perfect single-modality match must survive the gate even though combined (0.30) < threshold (0.55)",
         );
         assert!(rendered.contains("keyword-perfect older episode"));
     }

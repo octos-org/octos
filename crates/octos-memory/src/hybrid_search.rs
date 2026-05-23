@@ -527,14 +527,14 @@ mod tests {
 
     #[test]
     fn search_scored_exposes_per_modality_breakdown() {
-        // The agent loop's similarity gate (MIN_EPISODE_SIMILARITY = 0.35)
-        // must still accept genuinely relevant single-modality matches
-        // (e.g. older episodes without embeddings, where BM25 is the
-        // only signal). The new `search_scored` exposes both modalities
-        // so the agent can gate on `best_modality()` instead of the
-        // combined weighted-sum score that down-weights BM25-only hits
-        // to `bm25_weight` (0.3 with default weights) when any vector
-        // result exists.
+        // The agent loop's similarity gate (MIN_EPISODE_SIMILARITY,
+        // currently 0.55) must still accept genuinely relevant
+        // single-modality matches (e.g. older episodes without
+        // embeddings, where BM25 is the only signal). The new
+        // `search_scored` exposes both modalities so the agent can gate
+        // on `best_modality()` instead of the combined weighted-sum
+        // score that down-weights BM25-only hits to `bm25_weight` (0.3
+        // with default weights) when any vector result exists.
         let mut index = HybridIndex::new(4);
         // ep1: keyword-perfect match, NO embedding (old episode).
         index.insert("ep1", "rust ownership borrow checker", None);
@@ -570,9 +570,13 @@ mod tests {
         );
         // best_modality() is the modality-aware floor — the agent gate
         // uses this so BM25-only matches survive the threshold check.
+        // A keyword-perfect match (BM25 ~1.0) clears any reasonable gate
+        // (current threshold is 0.55, originally 0.35); the test asserts
+        // it clears 0.55 so this remains valid after future tightening
+        // without spurious failures.
         assert!(
-            ep1.best_modality() >= 0.35,
-            "ep1.best_modality() should clear the agent's 0.35 gate (got {})",
+            ep1.best_modality() >= 0.55,
+            "ep1.best_modality() should clear the agent's 0.55 gate (got {})",
             ep1.best_modality()
         );
 
