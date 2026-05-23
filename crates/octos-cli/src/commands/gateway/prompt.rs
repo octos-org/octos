@@ -397,6 +397,41 @@ mod tests {
     }
 
     #[test]
+    fn should_allow_clone_voices_in_generated_script() {
+        // codex round-3 P2 (third pass): the previous wording "voice
+        // token MUST be a built-in preset" forbade clone voices like
+        // `clone:yangmi`, but podcast_generate accepts them. The
+        // prompt must allow callers' explicit clone voices and treat
+        // presets only as the fallback when no clone voice is named.
+        assert!(
+            PROMPT.contains("`clone:"),
+            "prompt must mention the `clone:` voice prefix so the \
+             model knows clone voices are valid in scripts (codex \
+             round-3 P2 third-pass review)"
+        );
+        // The MUST-built-in language must not return on either
+        // podcast rule.
+        assert!(
+            !PROMPT.contains("`voice` token MUST be a built-in preset"),
+            "the over-constrained 'MUST be a built-in preset' \
+             wording must not return — clone voices are valid \
+             inputs (codex round-3 P2 third-pass review)"
+        );
+        assert!(
+            !PROMPT.contains("voice token MUST be a built-in preset"),
+            "the over-constrained 'MUST be a built-in preset' \
+             wording must not return — clone voices are valid \
+             inputs (codex round-3 P2 third-pass review)"
+        );
+        assert!(
+            !PROMPT.contains("`voice` token in each `[Character - voice, emotion]` header MUST be a built-in preset voice"),
+            "the over-constrained 'MUST be a built-in preset voice' \
+             phrasing must not return (codex round-3 P2 third-pass \
+             review)"
+        );
+    }
+
+    #[test]
     fn should_not_let_bare_generate_token_trigger_listing_override() {
         // codex P2 round-3 follow-up: the override carve-out on the
         // voice-list-only bullet originally listed bare `生成` and
