@@ -309,6 +309,30 @@ impl EpisodeStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<Episode>> {
+        self.find_relevant_filtered(cwd, query, limit, None).await
+    }
+
+    /// NEW-06 defense-in-depth: CWD-scoped relevance search with an
+    /// optional `min_best_modality` floor applied to the BM25 score
+    /// (the only modality available on the no-embedder fallback path).
+    ///
+    /// The agent loop calls this when no embedder is configured so
+    /// pipeline workers spawned without the parent embedder still
+    /// drop sub-threshold matches BEFORE injection — even though the
+    /// `find_relevant_hybrid` path inside this fallback only has BM25
+    /// scores. A score of `1.0` on BM25 still passes; loose
+    /// cross-domain "shared token" matches (the NEW-06 contamination
+    /// pattern) do not.
+    ///
+    /// `min_best_modality == None` matches [`Self::find_relevant`]
+    /// semantics exactly.
+    pub async fn find_relevant_filtered(
+        &self,
+        cwd: &Path,
+        query: &str,
+        limit: usize,
+        min_best_modality: Option<f32>,
+    ) -> Result<Vec<Episode>> {
         // Check if hybrid index has documents
         let index_populated = self
             .index
@@ -317,11 +341,18 @@ impl EpisodeStore {
             .unwrap_or(false);
 
         if index_populated {
-            // Over-fetch to account for CWD filtering, then filter
-            let candidates = self.find_relevant_hybrid(query, None, limit * 4).await?;
+            // Over-fetch to account for CWD filtering, then filter.
+            // We use the `_scored_filtered` variant so the floor is
+            // applied INSIDE the index BEFORE the combined-rank
+            // truncation — same dead-band-safe contract as the
+            // hybrid path documented in agent::memory.
+            let candidates = self
+                .find_relevant_hybrid_scored_filtered(query, None, limit * 4, min_best_modality)
+                .await?;
             let filtered: Vec<Episode> = candidates
                 .into_iter()
-                .filter(|ep| ep.working_dir == cwd)
+                .filter(|(ep, _)| ep.working_dir == cwd)
+                .map(|(ep, _)| ep)
                 .take(limit)
                 .collect();
 
@@ -331,7 +362,11 @@ impl EpisodeStore {
             // Fall through to DB scan if hybrid returned no CWD matches
         }
 
-        // Fallback: direct DB scan (for empty index or no CWD matches)
+        // Fallback: direct DB scan (for empty index or no CWD matches).
+        // The DB scan path is keyword-substring based with no scoring
+        // infrastructure, so we can't apply `min_best_modality` here
+        // without rewriting it. Keep legacy behaviour — the index path
+        // is the contamination vector callers actually care about.
         self.find_relevant_db_scan(cwd, query, limit).await
     }
 

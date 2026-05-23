@@ -354,6 +354,14 @@ pub struct ExecutorConfig {
     /// at run_pipeline dispatch. Default = empty, which keeps every
     /// pre-M8 invocation site bitwise identical.
     pub host_context: crate::host_context::PipelineHostContext,
+    /// NEW-06 fix: parent-session embedder forwarded onto every per-
+    /// node worker [`octos_agent::Agent`] so episodic memory recall
+    /// stays on the contamination-safe hybrid scored + filtered path.
+    ///
+    /// `None` keeps the legacy unfiltered cwd-only fallback in
+    /// `EpisodeStore::find_relevant` — identical to pre-fix behaviour
+    /// for callers that don't propagate the orchestrator's embedder.
+    pub embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -1415,6 +1423,15 @@ impl PipelineExecutor {
         // SubAgentOutputRouter / AgentSummaryGenerator. Empty context
         // keeps pre-M8 behaviour bitwise identical.
         .with_host_context(self.config.host_context.clone());
+
+        // NEW-06 fix: thread the parent embedder through to the
+        // handler so every per-node worker Agent runs the
+        // contamination-safe hybrid memory recall path. When unset
+        // (legacy callers without an embedder configured) workers stay
+        // on the cwd-only fallback — identical to pre-fix behaviour.
+        if let Some(ref embedder) = self.config.embedder {
+            codergen = codergen.with_embedder(embedder.clone());
+        }
 
         if let Some(ref router) = self.config.provider_router {
             codergen = codergen.with_provider_router(router.clone());
@@ -3047,6 +3064,7 @@ mod tests {
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
             host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
         }
     }
 
@@ -3218,6 +3236,7 @@ mod tests {
             hook_executor: None,
             workspace_context: crate::context::PipelineContext::default(),
             host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
         }
     }
 

@@ -938,6 +938,12 @@ impl GatewayRuntime {
                     router: Option<Arc<ProviderRouter>>,
                     octos_home: Option<PathBuf>,
                     plugin_require_signed: bool,
+                    /// NEW-06 fix: forwarded to every worker `Agent`
+                    /// via `RunPipelineTool::with_embedder` so
+                    /// pipeline-spawned agents inherit hybrid scored +
+                    /// filtered memory recall instead of the cwd-only
+                    /// unfiltered fallback.
+                    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
                 }
 
                 impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
@@ -957,9 +963,20 @@ impl GatewayRuntime {
                         if let Some(ref octos_home) = self.octos_home {
                             pt = pt.with_octos_home(octos_home.clone());
                         }
+                        if let Some(ref embedder) = self.embedder {
+                            pt = pt.with_embedder(embedder.clone());
+                        }
                         Arc::new(pt)
                     }
                 }
+
+                // NEW-06 fix: capture the gateway's embedder so pipeline
+                // workers inherit the same contamination-safe memory
+                // recall the gateway's own session agent gets via
+                // `ActorFactory::embedder` -> `with_embedder` (see
+                // session_actor.rs).
+                let embedder_c =
+                    create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
                 pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
                     llm: llm_c,
@@ -971,6 +988,7 @@ impl GatewayRuntime {
                     router: router_c,
                     octos_home: octos_home_c,
                     plugin_require_signed: plugin_require_signed_c,
+                    embedder: embedder_c,
                 })
                     as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
             }

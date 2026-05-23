@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use eyre::Result;
 use octos_core::{AgentId, Task, TaskContext, TaskKind, TokenUsage};
-use octos_llm::{ContextWindowOverride, LlmProvider, ProviderRouter};
+use octos_llm::{ContextWindowOverride, EmbeddingProvider, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use tracing::{info, warn};
 
@@ -304,6 +304,15 @@ pub struct CodergenHandler {
     /// the SHA-256 verification + 100 MB executable read that would
     /// otherwise re-run on every node and starve the SSE window.
     plugin_cache: Arc<OnceLock<Arc<CachedPluginRegistration>>>,
+    /// NEW-06 fix: optional embedder propagated onto every worker
+    /// `Agent` built by this handler so episodic memory recall stays
+    /// on the contamination-safe hybrid scored + filtered path
+    /// (`MIN_EPISODE_SIMILARITY`). Without it, workers fall back to
+    /// the unfiltered cwd-only path in `EpisodeStore::find_relevant`
+    /// — the round-3 fleet soak (mini5 / deep_research) proved this
+    /// is the missing wiring that lets cross-domain episodes
+    /// contaminate worker prompts.
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl CodergenHandler {
@@ -327,7 +336,25 @@ impl CodergenHandler {
             compaction_llm_provider: None,
             host_context: crate::host_context::PipelineHostContext::default(),
             plugin_cache: Arc::new(OnceLock::new()),
+            embedder: None,
         }
+    }
+
+    /// NEW-06 fix: attach the parent embedder. Each per-node worker
+    /// [`Agent`] built by this handler will receive a `.with_embedder`
+    /// call so episodic memory recall runs the modality-aware hybrid
+    /// scored + filtered path (`MIN_EPISODE_SIMILARITY`) instead of
+    /// the unfiltered cwd-only fallback.
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Doc-hidden test accessor — confirms the embedder propagation
+    /// path is wired (NEW-06 regression guard).
+    #[doc(hidden)]
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
+        self.embedder.as_ref()
     }
 
     /// Section B (codex review P1.1): opt into strict signature
@@ -702,6 +729,18 @@ impl Handler for CodergenHandler {
         .with_reporter(reporter);
         if let Some(sink) = inherited_harness_sink {
             worker = worker.with_harness_event_sink(sink);
+        }
+
+        // NEW-06 fix: thread the parent embedder onto the worker so
+        // `build_initial_messages` runs the hybrid scored + filtered
+        // memory recall path (`MIN_EPISODE_SIMILARITY` gate). Without
+        // this the worker falls back to the cwd-only unfiltered path
+        // in `EpisodeStore::find_relevant` and pulls cross-domain
+        // episodes into its prompt (e.g. round-3 mini5/deep_research:
+        // JWST research contaminated by an Apple CEO / GPT-5.5 podcast
+        // episode).
+        if let Some(ref embedder) = self.embedder {
+            worker = worker.with_embedder(embedder.clone());
         }
 
         // M8 parity (W1.A1): wire the parent session's shared

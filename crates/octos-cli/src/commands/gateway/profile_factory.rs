@@ -808,6 +808,11 @@ impl ProfileActorFactoryBuilder {
                 router: Option<Arc<ProviderRouter>>,
                 octos_home: PathBuf,
                 plugin_require_signed: bool,
+                /// NEW-06 fix: forwarded to every worker `Agent` via
+                /// `RunPipelineTool::with_embedder` so pipeline-spawned
+                /// agents inherit hybrid scored + filtered memory
+                /// recall instead of the cwd-only unfiltered fallback.
+                embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
             }
 
             impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
@@ -825,9 +830,19 @@ impl ProfileActorFactoryBuilder {
                     if let Some(ref router) = self.router {
                         pt = pt.with_provider_router(router.clone());
                     }
+                    if let Some(ref embedder) = self.embedder {
+                        pt = pt.with_embedder(embedder.clone());
+                    }
                     Arc::new(pt)
                 }
             }
+
+            // NEW-06 fix: the parent ActorFactory's session agent gets
+            // its embedder from `create_embedder(profile_config)`; mirror
+            // that here so child-profile pipeline workers run on the
+            // same contamination-safe hybrid memory path.
+            let child_pipeline_embedder = create_embedder(&profile_config)
+                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
 
             pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
                 llm: llm.clone(),
@@ -840,6 +855,7 @@ impl ProfileActorFactoryBuilder {
                 // Section B (codex review follow-up): propagate the
                 // profile's strict-signing policy.
                 plugin_require_signed: profile_config.plugins.require_signed,
+                embedder: child_pipeline_embedder,
             })
                 as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
 

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use octos_agent::cost_ledger::CostAccountant;
 use octos_agent::{Tool, ToolPolicy, ToolResult};
-use octos_llm::{LlmProvider, ProviderRouter};
+use octos_llm::{EmbeddingProvider, LlmProvider, ProviderRouter};
 use octos_memory::EpisodeStore;
 use serde::Deserialize;
 
@@ -50,6 +50,17 @@ pub struct RunPipelineTool {
     /// auto-populates from the workspace policy. Defaults to the
     /// graph id + `"pipeline"` fallback when empty.
     contract_id: Option<String>,
+    /// NEW-06 fix: optional embedder for hybrid memory search.
+    ///
+    /// Without this set, worker `Agent` instances spawned per pipeline
+    /// node fall through to the unfiltered cwd-only fallback path in
+    /// `EpisodeStore::find_relevant` — which only does keyword overlap
+    /// plus CWD filtering, NOT the modality-aware similarity gate in
+    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`]. The
+    /// gateway / serve runtimes own the embedder; this lets the
+    /// orchestrator propagate it down to pipeline workers so episodic
+    /// memory recall is contamination-safe end-to-end.
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl RunPipelineTool {
@@ -72,7 +83,24 @@ impl RunPipelineTool {
             status_bridge: std::sync::Mutex::new(None),
             cost_accountant: None,
             contract_id: None,
+            embedder: None,
         }
+    }
+
+    /// NEW-06 fix: attach an embedder that the pipeline executor will
+    /// propagate onto every per-node worker [`octos_agent::Agent`].
+    ///
+    /// When set, the worker's "Relevant Past Experiences" memory recall
+    /// runs the modality-aware hybrid path that applies
+    /// [`octos_agent::agent::memory::MIN_EPISODE_SIMILARITY`] BEFORE
+    /// injecting episodes into the worker's prompt. Without it, workers
+    /// fell back to the unfiltered cwd-only path in
+    /// `EpisodeStore::find_relevant` and pulled in cross-domain
+    /// episodes (e.g. a JWST research prompt rendered with an Apple
+    /// CEO / GPT-5.5 podcast episode on mini5).
+    pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// Attach a [`CostAccountant`] (coding-blue FA-7). When set, pipeline
@@ -239,6 +267,16 @@ impl RunPipelineTool {
     /// StatusIndicator (status words + token tracker).
     pub fn set_status_bridge(&self, bridge: PipelineStatusBridge) {
         *self.status_bridge.lock().unwrap_or_else(|e| e.into_inner()) = Some(bridge);
+    }
+
+    /// Doc-hidden test accessor — confirms the embedder propagation
+    /// path is wired (NEW-06 regression guard). The pipeline worker
+    /// memory-recall threshold gate only runs when an embedder is
+    /// present; this lets tests assert the constructor + builder paths
+    /// keep it threaded through.
+    #[doc(hidden)]
+    pub fn embedder_for_test(&self) -> Option<&Arc<dyn EmbeddingProvider>> {
+        self.embedder.as_ref()
     }
 }
 
@@ -421,6 +459,13 @@ impl Tool for RunPipelineTool {
             // path.
             workspace_context: self.build_workspace_context_with_host(&host_context),
             host_context,
+            // NEW-06 fix: thread the parent embedder onto every pipeline
+            // worker Agent so episodic memory recall stays on the
+            // contamination-safe hybrid scored + filtered path. When
+            // unset (legacy callers or hosts without an embedder
+            // configured), workers stay on the cwd-only fallback path —
+            // identical to pre-fix behaviour.
+            embedder: self.embedder.clone(),
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
