@@ -154,6 +154,20 @@ impl HybridIndex {
         self.ids.is_empty()
     }
 
+    /// Total number of documents inserted into the index (including
+    /// tombstoned ones — the BM25 inverted index still has them).
+    ///
+    /// Returned to callers like
+    /// [`crate::store::EpisodeStore::find_relevant_filtered`] that need
+    /// to size an inner-fetch pool exhaustively. Because BM25-only
+    /// inserts continue beyond `HNSW_CAPACITY` (HNSW gracefully
+    /// degrades to BM25-only insertion), the BM25 inverted index can
+    /// outgrow the HNSW graph; callers MUST NOT assume the corpus
+    /// size is capped at `HNSW_CAPACITY`.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
     /// Set custom hybrid scoring weights. Weights should sum to 1.0.
     pub fn with_weights(mut self, vector_weight: f32, bm25_weight: f32) -> Self {
         self.vector_weight = vector_weight;

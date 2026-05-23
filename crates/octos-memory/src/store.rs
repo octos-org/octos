@@ -341,7 +341,7 @@ impl EpisodeStore {
             .unwrap_or(false);
 
         if index_populated {
-            // Inner-fetch sizing — codex P2 round 4 follow-up:
+            // Inner-fetch sizing — codex P2 rounds 4 and 5 follow-up:
             //
             // The hybrid index is global (not cwd-scoped). After we
             // ask for the top-N candidates, we apply the cwd filter
@@ -359,20 +359,22 @@ impl EpisodeStore {
             //   wasted work and the legacy fall-through to
             //   `find_relevant_db_scan` already handles the no-cwd-
             //   match case.
-            // * Floor supplied → request the full floor-prefilter
-            //   pool (`FLOOR_PREFILTER_POOL = HNSW_CAPACITY = 10_000`,
-            //   the structural ceiling of the in-memory index). The
-            //   floor itself bounds the candidate set, so this is the
-            //   tightest pool that guarantees a current-cwd match
-            //   clearing the floor reaches the cwd filter regardless
-            //   of how many foreign-cwd matches share the floor pass.
-            //
-            // `usize::MAX` would also work but is dishonest: the index
-            // can't hold more than HNSW_CAPACITY documents, so asking
-            // for it is wasted intent. The constant is re-exported
-            // from `hybrid_search` for this exact reuse.
+            // * Floor supplied → size the inner fetch from the actual
+            //   corpus (`HybridIndex::len`). Round 4 used
+            //   `FLOOR_PREFILTER_POOL = HNSW_CAPACITY = 10_000`, but
+            //   codex round 5 flagged that the BM25 inverted index
+            //   keeps inserting documents AFTER HNSW saturates, so a
+            //   corpus larger than 10K BM25-only docs could still
+            //   truncate a local floor-clearing match. Reading the
+            //   corpus size directly closes that gap without
+            //   over-allocating for small stores.
+            let corpus_size = self
+                .index
+                .read()
+                .map(|idx| idx.len())
+                .unwrap_or(crate::hybrid_search::FLOOR_PREFILTER_POOL);
             let inner_limit = if min_best_modality.is_some() {
-                crate::hybrid_search::FLOOR_PREFILTER_POOL
+                corpus_size
             } else {
                 limit * 4
             };
@@ -916,25 +918,29 @@ mod tests {
         );
     }
 
-    /// NEW-06 codex P2 round 4 — when a floor is supplied AND the
+    /// NEW-06 codex P2 rounds 4 + 5 — when a floor is supplied AND the
     /// hybrid index holds many foreign-cwd matches that all clear the
     /// floor with stronger scores, a current-cwd match that ALSO
-    /// clears the floor must not be truncated out by the inner
-    /// `limit * 4` pool before the cwd filter sees it.
+    /// clears the floor must not be truncated out before the cwd
+    /// filter sees it.
     ///
     /// Pre-fix-round-4: with `limit=1` and ~10 stronger foreign-cwd
     /// exact matches sharing the same query token, the inner fetch
     /// pool (`limit * 4 = 4`) returned only foreign episodes; the
     /// cwd filter dropped them all; the floor-set early-return then
     /// returned empty even though a local episode clearing the floor
-    /// existed in the store. Functional regression in local memory
-    /// recall.
+    /// existed in the store.
     ///
-    /// Post-fix-round-4: when a floor is supplied, the inner fetch
-    /// exhausts the floor-prefilter pool (`FLOOR_PREFILTER_POOL =
-    /// HNSW_CAPACITY = 10_000`) so the cwd filter sees every
-    /// floor-clearing candidate regardless of how many foreign-cwd
-    /// matches share the floor pass.
+    /// Round 4 raised the inner pool to `FLOOR_PREFILTER_POOL = 10_000`
+    /// (the HNSW capacity), but codex round 5 flagged that the BM25
+    /// inverted index keeps inserting beyond `HNSW_CAPACITY` (HNSW
+    /// gracefully degrades to BM25-only), so a corpus with >10K
+    /// foreign-cwd BM25 matches could still truncate out a local hit.
+    ///
+    /// Post-fix-round-5: the inner pool is sized from the actual
+    /// corpus (`HybridIndex::len`), so no truncation happens before
+    /// the cwd filter regardless of how large the BM25-only index
+    /// grows.
     #[tokio::test]
     async fn find_relevant_filtered_returns_local_match_through_many_foreign_with_floor() {
         let dir = tempfile::tempdir().unwrap();
