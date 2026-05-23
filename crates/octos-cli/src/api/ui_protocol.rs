@@ -2985,6 +2985,10 @@ fn tool_risk_registry_test_lock() -> &'static std::sync::Mutex<()> {
 /// present-but-empty as absent and allow. A header with non-ASCII
 /// bytes (`to_str().is_err()`) still rejects — that is malformed input,
 /// not the same as omitting the header.
+///
+/// PR #929: the bare `<base_domain>` host (the canonical landing URL,
+/// e.g. `https://ocean.ominix.io/chat`) is also allowed when the request
+/// is authenticated. See `decide_ws_origin_gate` for the rationale.
 #[derive(Debug, PartialEq, Eq)]
 enum WsOriginDecision {
     Allow,
@@ -2992,7 +2996,11 @@ enum WsOriginDecision {
     RejectMalformed,
 }
 
-fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOriginDecision {
+fn decide_ws_origin_gate(
+    headers: &HeaderMap,
+    base_domain: Option<&str>,
+    is_authenticated: bool,
+) -> WsOriginDecision {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         return WsOriginDecision::Allow;
     };
@@ -3020,6 +3028,19 @@ fn decide_ws_origin_gate(headers: &HeaderMap, base_domain: Option<&str>) -> WsOr
                             return WsOriginDecision::Allow;
                         }
                     }
+                    // PR #929 bug-fix: the bare `<base_domain>` is the
+                    // canonical landing URL (`https://ocean.ominix.io/chat`,
+                    // `https://crew.ominix.io/chat`). The pre-fix gate only
+                    // accepted `<tenant>.<base>` subdomains, so users hitting
+                    // the bare host got HTTP 403 "disallowed origin" on the
+                    // WS upgrade. Allow `https://<base>` (no subdomain, no
+                    // port) ONLY when the request is already authenticated —
+                    // unauthenticated deployments rely on the Origin gate as
+                    // their sole CSRF protection and must keep the strict
+                    // tenant-subdomain rule.
+                    if is_authenticated && host == base {
+                        return WsOriginDecision::Allow;
+                    }
                 }
             }
             WsOriginDecision::RejectDisallowed {
@@ -3040,7 +3061,16 @@ pub async fn ws_handler(
 ) -> Response {
     // #923.3 + #924 BLOCK 5: gate the upgrade on Origin. See
     // `decide_ws_origin_gate` for the full decision table.
-    match decide_ws_origin_gate(&headers, state.base_domain.as_deref()) {
+    //
+    // PR #929: pass through whether the request reached the handler with
+    // an authenticated identity so the gate can allow the bare
+    // `<base_domain>` landing host. The auth middleware runs before this
+    // handler, so `identity.is_some()` ⇔ the request carried a valid
+    // bearer / OTP session / trusted-proxy `X-Profile-Id`. In no-auth
+    // deployments (`has_auth == false` in `router.rs`) `identity` is
+    // `None` and the gate falls back to the strict tenant-subdomain rule.
+    let is_authenticated = identity.is_some();
+    match decide_ws_origin_gate(&headers, state.base_domain.as_deref(), is_authenticated) {
         WsOriginDecision::Allow => {}
         WsOriginDecision::RejectDisallowed { origin } => {
             tracing::warn!(
@@ -25485,7 +25515,7 @@ ignore = []
         // No Origin header at all → allow (TUI / gateway / scripts).
         let headers = HeaderMap::new();
         assert_eq!(
-            decide_ws_origin_gate(&headers, None),
+            decide_ws_origin_gate(&headers, None, false),
             WsOriginDecision::Allow,
         );
 
@@ -25493,14 +25523,14 @@ ignore = []
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::ORIGIN, "".parse().unwrap());
         assert_eq!(
-            decide_ws_origin_gate(&headers, None),
+            decide_ws_origin_gate(&headers, None, false),
             WsOriginDecision::Allow,
         );
 
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::ORIGIN, "   ".parse().unwrap());
         assert_eq!(
-            decide_ws_origin_gate(&headers, None),
+            decide_ws_origin_gate(&headers, None, false),
             WsOriginDecision::Allow,
         );
     }
@@ -25512,7 +25542,10 @@ ignore = []
             axum::http::header::ORIGIN,
             "https://evil.example.com".parse().unwrap(),
         );
-        let decision = decide_ws_origin_gate(&headers, Some("bot.ominix.io"));
+        // Even authenticated, an unrelated cross-origin must still be
+        // rejected — the auth gate is a separate layer, the Origin
+        // gate is what stops a hijacked browser tab on another origin.
+        let decision = decide_ws_origin_gate(&headers, Some("bot.ominix.io"), true);
         assert!(matches!(
             decision,
             WsOriginDecision::RejectDisallowed { ref origin }
@@ -25533,9 +25566,85 @@ ignore = []
             "https://dspfac.ocean.ominix.io".parse().unwrap(),
         );
         assert_eq!(
-            decide_ws_origin_gate(&headers, Some("ocean.ominix.io")),
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), false),
             WsOriginDecision::Allow,
         );
+    }
+
+    /// PR #929 regression: the bare `<base_domain>` host (the canonical
+    /// landing URL — users navigating to `https://ocean.ominix.io/chat`
+    /// directly) must be accepted when the request is authenticated. The
+    /// pre-fix gate required a tenant subdomain prefix and 403'd bare
+    /// hosts with `WARN rejected WS upgrade from disallowed Origin
+    /// origin=https://ocean.ominix.io` (logged repeatedly during user
+    /// testing on mini5).
+    #[test]
+    fn ws_origin_gate_allows_bare_base_domain_when_authenticated() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://ocean.ominix.io".parse().unwrap(),
+        );
+        assert_eq!(
+            decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true),
+            WsOriginDecision::Allow,
+        );
+    }
+
+    /// PR #929 follow-up: keep the gate tight when there's no auth.
+    /// `has_auth == false` in `router.rs` means the deployment is
+    /// running auth-less — the Origin gate is the only CSRF guard. In
+    /// that mode, do NOT widen the allowlist to the bare `<base>`. The
+    /// existing strict tenant-subdomain rule still applies.
+    #[test]
+    fn ws_origin_gate_rejects_bare_base_domain_without_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://ocean.ominix.io".parse().unwrap(),
+        );
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), false);
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { ref origin }
+                if origin == "https://ocean.ominix.io"
+        ));
+    }
+
+    /// PR #929: an attacker can't smuggle a bare-host bypass by
+    /// appending an explicit port (`https://<base>:1234`). Tenant
+    /// subdomains already reject ports — the bare-host path must too.
+    #[test]
+    fn ws_origin_gate_rejects_bare_base_domain_with_port_even_when_authenticated() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://ocean.ominix.io:8443".parse().unwrap(),
+        );
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true);
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
+    }
+
+    /// PR #929: a different base_domain entirely must still be rejected
+    /// even when authenticated. The bare-host carve-out only fires when
+    /// `host == base_domain` (exact match against the operator-
+    /// configured value), so `evil.com` with the user's token can't
+    /// open the gate.
+    #[test]
+    fn ws_origin_gate_rejects_cross_origin_even_when_authenticated() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://attacker.example.com".parse().unwrap(),
+        );
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true);
+        assert!(matches!(
+            decision,
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
     }
 
     /// Multi-label subdomain (e.g. `a.b.<base>`) is NOT a single
@@ -25548,7 +25657,7 @@ ignore = []
             axum::http::header::ORIGIN,
             "https://attacker.dspfac.ocean.ominix.io".parse().unwrap(),
         );
-        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), true);
         assert!(matches!(
             decision,
             WsOriginDecision::RejectDisallowed { .. }
@@ -25564,7 +25673,7 @@ ignore = []
             axum::http::header::ORIGIN,
             "https://dspfac.ocean.ominix.io:8443".parse().unwrap(),
         );
-        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"));
+        let decision = decide_ws_origin_gate(&headers, Some("ocean.ominix.io"), false);
         assert!(matches!(
             decision,
             WsOriginDecision::RejectDisallowed { .. }
@@ -25585,7 +25694,7 @@ ignore = []
             .expect("HeaderValue accepts arbitrary visible bytes");
         headers.insert(axum::http::header::ORIGIN, val);
         assert_eq!(
-            decide_ws_origin_gate(&headers, None),
+            decide_ws_origin_gate(&headers, None, false),
             WsOriginDecision::RejectMalformed,
         );
     }
