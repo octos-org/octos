@@ -963,6 +963,37 @@ fn resolve_plugin_input_path(
             return Ok(resolved.absolute.to_string_lossy().into_owned());
         }
     }
+    // NEW-02 mini5 soak fix: when `write_file` resolves against the
+    // workspace ROOT but plugin work_dir is chrooted to
+    // `<workspace>/skill-output/`, the script lives one level ABOVE the
+    // chroot. The shared resolver doesn't probe `work_dir.parent()`, so
+    // a podcast script written to `<workspace>/octos_podcast_script.md`
+    // never resolves and the plugin spawn fails with `os error 2`.
+    //
+    // This rescue branch is bounded by two safety constraints (see
+    // #1186 path-traversal review):
+    //   1. `raw_path` is already guarded against raw `..` at the entry
+    //      of this function — unsafe inputs returned Err above.
+    //   2. We ONLY probe `work_dir.parent()` when the work_dir basename
+    //      is exactly `skill-output`. The parent is then the workspace
+    //      root by construction (runtime/session.rs always chroots
+    //      `<workspace>/skill-output/`), NOT an arbitrary directory.
+    //   3. We use `Path::file_name()` (not the raw path) so any
+    //      directory components in `raw_path` are discarded — the only
+    //      candidate we ever try is `<workspace>/<basename>`. This
+    //      makes the rescue equivalent in scope to the basename scan
+    //      in `resolve_path_in_work_dir`, just probing one directory
+    //      level above the chroot instead of inside it.
+    if work_dir.file_name().and_then(|s| s.to_str()) == Some("skill-output") {
+        if let Some(parent) = work_dir.parent() {
+            if let Some(basename) = std::path::Path::new(raw_path).file_name() {
+                let candidate = parent.join(basename);
+                if candidate.exists() {
+                    return Ok(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
     // Codex BLOCKER fix (PR #1186 review): the lexical-join branches
     // inside `resolve_path_in_work_dir` would otherwise let candidates
     // like `skill-output/../secret.md` resolve to `<workspace>/secret.md`
@@ -2280,13 +2311,114 @@ mod tests {
         // could over-zealously reject legitimate output args.
         let safe = absolutize_path_in_work_dir("sub/dir/out.toml", &skill_output)
             .expect("safe relative path must succeed");
-        assert_eq!(safe, skill_output.join("sub/dir/out.toml").to_string_lossy());
+        assert_eq!(
+            safe,
+            skill_output.join("sub/dir/out.toml").to_string_lossy()
+        );
         let abs_in = "/tmp/explicit-out.toml";
         let abs_out = absolutize_path_in_work_dir(abs_in, &skill_output)
             .expect("absolute path must succeed (sandbox is the next gate)");
         assert_eq!(abs_out, abs_in);
 
         let _ = bait;
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_recovers_workspace_root_script_for_podcast_generate() {
+        // NEW-02 mini5 soak fix: when `write_file` lands the podcast
+        // script at the workspace ROOT (because write_file's base_dir is
+        // `<workspace>/`, not `<workspace>/skill-output/`), but the
+        // plugin's `work_dir` is chrooted to
+        // `<workspace>/skill-output/`, the script lives one level ABOVE
+        // the chroot. Before this fix the resolver only probed inside
+        // `work_dir`, so #1186's shared resolver returned a non-existent
+        // path and the plugin spawn failed with `os error 2`.
+        //
+        // The rescue branch in `resolve_plugin_input_path` now probes
+        // `work_dir.parent()` (the workspace root) for the basename
+        // when `work_dir` ends in `skill-output`. Both raw forms the
+        // LLM tends to emit MUST recover:
+        //   * `script.md`                — bare basename
+        //   * `skill-output/script.md`   — with the redundant prefix
+        //     (mirrors write_file's workspace-root resolution)
+        let workspace = tempfile::tempdir().unwrap();
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // Mimic write_file landing the script at the workspace ROOT.
+        let script = workspace.path().join("script.md");
+        std::fs::write(&script, b"# podcast script\n").unwrap();
+
+        // Form 1: bare basename. The legacy resolver would return
+        // `<skill-output>/script.md` (lexical join, doesn't exist) or
+        // fall through to the basename-scan inside the chroot (also
+        // empty). Rescue must promote the workspace-root candidate.
+        let resolved_bare = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("bare basename must resolve to workspace-root script");
+        assert_eq!(
+            std::path::Path::new(&resolved_bare),
+            &script,
+            "bare basename rescue must point at the workspace-root script",
+        );
+
+        // Form 2: `skill-output/`-prefixed path. The first strip-probe
+        // would yield `script.md`, which doesn't exist inside the
+        // chroot either. Same rescue must apply.
+        let resolved_prefixed = resolve_plugin_input_path("skill-output/script.md", &skill_output)
+            .expect("prefixed path must resolve to workspace-root script");
+        assert_eq!(
+            std::path::Path::new(&resolved_prefixed),
+            &script,
+            "prefixed-form rescue must point at the workspace-root script",
+        );
+
+        // End-to-end via `rewrite_workspace_file_args`: the
+        // `script_path` key must be rewritten to the absolute
+        // workspace-root path so the plugin spawn opens the right file.
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"script_path": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(skill_output.clone());
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({"script_path": "script.md"}))
+            .expect("rewrite must succeed for workspace-root script");
+        let rewritten_path = rewritten
+            .get("script_path")
+            .and_then(|v| v.as_str())
+            .expect("script_path must remain a string after rewrite");
+        assert_eq!(
+            std::path::Path::new(rewritten_path),
+            &script,
+            "rewrite must point script_path at the workspace-root file",
+        );
+
+        // SECURITY GUARANTEE — #1186 fail-closed contract for raw `..`
+        // must STILL hold. The rescue is bounded to `work_dir.parent()`
+        // via `Path::file_name()` (basename only), so directory
+        // components in the raw path are discarded. But the entry
+        // guard rejects `..` long before we get there, and that
+        // behaviour must NOT regress.
+        let traversal_err = resolve_plugin_input_path("../../etc/passwd", &skill_output)
+            .expect_err("raw `..` traversal must still fail-closed per #1186");
+        let msg = traversal_err.to_string();
+        assert!(
+            msg.contains("../../etc/passwd"),
+            "error must echo the rejected raw path: {msg}",
+        );
+        assert!(
+            msg.contains("escapes plugin work dir"),
+            "error must explain rejection reason: {msg}",
+        );
     }
 
     #[test]
