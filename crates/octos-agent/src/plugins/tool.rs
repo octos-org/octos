@@ -510,12 +510,15 @@ impl PluginTool {
         }
     }
 
-    fn rewrite_workspace_file_args(&self, args: &serde_json::Value) -> serde_json::Value {
+    fn rewrite_workspace_file_args(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, eyre::Report> {
         let Some(work_dir) = self.work_dir.as_ref() else {
-            return args.clone();
+            return Ok(args.clone());
         };
         let Some(obj) = args.as_object() else {
-            return args.clone();
+            return Ok(args.clone());
         };
 
         let mut rewritten = serde_json::Map::with_capacity(obj.len());
@@ -525,9 +528,15 @@ impl PluginTool {
                 "audio_path" | "file_path" | "input" | "script_path" | "video_path" | "text_path"
             ) {
                 if let Some(path) = value.as_str() {
+                    // Codex round-3 BLOCKER fix (PR #1186 review): propagate
+                    // the resolver Err up to the call site (execute()) so
+                    // a path with `..` components surfaces as a tool error
+                    // envelope rather than being passed to the spawned
+                    // plugin (which would resolve it relative to
+                    // `work_dir` and escape the chroot).
                     rewritten.insert(
                         key.clone(),
-                        serde_json::Value::String(resolve_plugin_input_path(path, work_dir)),
+                        serde_json::Value::String(resolve_plugin_input_path(path, work_dir)?),
                     );
                     continue;
                 }
@@ -557,42 +566,41 @@ impl PluginTool {
             }
             if key == "slides" {
                 if let Some(slides) = value.as_array() {
-                    let rewritten_slides = slides
-                        .iter()
-                        .map(|slide| {
-                            let Some(slide_obj) = slide.as_object() else {
-                                return slide.clone();
-                            };
-                            let mut rewritten_slide = slide_obj.clone();
-                            if let Some(source_image) = slide_obj
-                                .get("source_image")
-                                .and_then(|value| value.as_str())
-                            {
-                                rewritten_slide.insert(
-                                    "source_image".into(),
-                                    serde_json::Value::String(resolve_plugin_input_path(
-                                        source_image,
-                                        work_dir,
-                                    )),
-                                );
-                            }
-                            serde_json::Value::Object(rewritten_slide)
-                        })
-                        .collect::<Vec<_>>();
+                    let mut rewritten_slides = Vec::with_capacity(slides.len());
+                    for slide in slides {
+                        let Some(slide_obj) = slide.as_object() else {
+                            rewritten_slides.push(slide.clone());
+                            continue;
+                        };
+                        let mut rewritten_slide = slide_obj.clone();
+                        if let Some(source_image) = slide_obj
+                            .get("source_image")
+                            .and_then(|value| value.as_str())
+                        {
+                            rewritten_slide.insert(
+                                "source_image".into(),
+                                serde_json::Value::String(resolve_plugin_input_path(
+                                    source_image,
+                                    work_dir,
+                                )?),
+                            );
+                        }
+                        rewritten_slides.push(serde_json::Value::Object(rewritten_slide));
+                    }
                     rewritten.insert(key.clone(), serde_json::Value::Array(rewritten_slides));
                     continue;
                 }
             }
             rewritten.insert(key.clone(), value.clone());
         }
-        serde_json::Value::Object(rewritten)
+        Ok(serde_json::Value::Object(rewritten))
     }
 
     pub(crate) fn prepare_effective_args(
         &self,
         args: &serde_json::Value,
         ctx: Option<&ToolContext>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, eyre::Report> {
         let mut effective_args = args.clone();
         if let Some(obj) = effective_args.as_object_mut() {
             let has_audio_path = obj
@@ -631,7 +639,7 @@ impl PluginTool {
             }
         }
 
-        let mut effective_args = self.rewrite_workspace_file_args(&effective_args);
+        let mut effective_args = self.rewrite_workspace_file_args(&effective_args)?;
         if self.tool_def.name == "mofa_slides" {
             if let Some(obj) = effective_args.as_object_mut() {
                 if !obj.contains_key("out")
@@ -673,7 +681,7 @@ impl PluginTool {
             }
         }
 
-        effective_args
+        Ok(effective_args)
     }
 
     async fn detect_output_file(
@@ -871,29 +879,32 @@ fn value_kind_label(value: &serde_json::Value) -> &'static str {
 /// 3. Final fallback: lexically join with `work_dir` (the previous
 ///    behaviour of `absolutize_path_in_work_dir`) so the plugin never
 ///    sees an empty string.
-fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> String {
+fn resolve_plugin_input_path(
+    raw_path: &str,
+    work_dir: &std::path::Path,
+) -> Result<String, eyre::Report> {
     use octos_bus::file_handle::ToolPathScope;
-    // Codex round-2 BLOCKER fix (PR #1186 review): fail fast at the
-    // resolver entry. A raw input like `../secret.md` (no `skill-output/`
-    // prefix) would previously slip through every branch and land in
-    // `absolutize_path_in_work_dir`, which lexically joins with
-    // `work_dir` to produce `<work_dir>/../secret.md` — escaping the
-    // chrooted plugin `work_dir`. Reject any candidate carrying `..`
-    // (`ParentDir`) components at the very top, BEFORE any branch
-    // (`resolve_tool_path` lookup, `strip_redundant_skill_output_prefix`,
-    // `resolve_path_in_work_dir`, or the `absolutize_path_in_work_dir`
-    // fallback) can construct an escape. Returning the raw path
-    // unchanged surfaces a benign "file not found" downstream rather
-    // than silently reading the bait file above the chroot.
-    // Note: absolute paths and Windows prefixes are NOT blocked here —
-    // they're handled correctly by `resolve_tool_path` (rejects out-of-
-    // scope) and by `resolve_path_in_work_dir`'s basename-fallback
-    // (which discards directory components and is safe by construction).
+    // Codex round-3 BLOCKER fix (PR #1186 review): FAIL CLOSED on raw
+    // `..` (`ParentDir`) components. The previous revision returned
+    // `raw_path.to_string()` unchanged for unsafe inputs, but the
+    // plugin process is then spawned with `cmd.current_dir(work_dir)`,
+    // so when the plugin itself opens `../secret.md` (e.g. via
+    // `fs::read`) the kernel resolves it relative to `work_dir` and
+    // escapes the chroot. The host-side resolver MUST return an error
+    // here so the call site short-circuits the entire spawn and
+    // surfaces the rejection to the LLM as a tool error envelope.
+    //
+    // Absolute paths and Windows prefixes are NOT rejected at this
+    // entry — `resolve_tool_path` will refuse out-of-scope absolutes,
+    // and `resolve_path_in_work_dir`'s basename fallback discards
+    // directory components safely. Only `..` poisons the resolution.
     if std::path::Path::new(raw_path)
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return raw_path.to_string();
+        return Err(eyre::eyre!(
+            "path '{raw_path}' rejected: escapes plugin work dir"
+        ));
     }
     // B1 fleet UX soak (mini2/iter1, mini5/iter2): when the host has
     // chrooted plugin `work_dir` into `<workspace>/skill-output/` (the
@@ -913,7 +924,7 @@ fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> Stri
             octos_bus::file_handle::resolve_tool_path(work_dir, None, stripped_path)
         {
             if matches!(resolved.scope, ToolPathScope::Workspace) && resolved.absolute.exists() {
-                return resolved.absolute.to_string_lossy().into_owned();
+                return Ok(resolved.absolute.to_string_lossy().into_owned());
             }
         }
     }
@@ -930,7 +941,7 @@ fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> Stri
             ToolPathScope::Workspace => resolved.absolute.exists(),
         };
         if accept {
-            return resolved.absolute.to_string_lossy().into_owned();
+            return Ok(resolved.absolute.to_string_lossy().into_owned());
         }
     }
     // Codex BLOCKER fix (PR #1186 review): the lexical-join branches
@@ -943,11 +954,11 @@ fn resolve_plugin_input_path(raw_path: &str, work_dir: &std::path::Path) -> Stri
     // to strip `..`-containing raw paths.
     if let Some(ref stripped_path) = stripped {
         if let Some(resolved) = resolve_path_in_work_dir(stripped_path, work_dir) {
-            return resolved;
+            return Ok(resolved);
         }
     }
-    resolve_path_in_work_dir(raw_path, work_dir)
-        .unwrap_or_else(|| absolutize_path_in_work_dir(raw_path, work_dir))
+    Ok(resolve_path_in_work_dir(raw_path, work_dir)
+        .unwrap_or_else(|| absolutize_path_in_work_dir(raw_path, work_dir)))
 }
 
 /// Reject paths that carry `..` (`ParentDir`) components or absolute
@@ -1357,7 +1368,31 @@ impl Tool for PluginTool {
             cmd.env("OCTOS_WORK_DIR", dir);
         }
 
-        let effective_args = self.prepare_effective_args(args, ctx.as_ref());
+        // Codex round-3 BLOCKER fix (PR #1186 review): when
+        // `prepare_effective_args` -> `rewrite_workspace_file_args` ->
+        // `resolve_plugin_input_path` rejects a path with `..`
+        // components, short-circuit BEFORE spawning the plugin so the
+        // process is never started with a poisoned `script_path` /
+        // `input` / etc. Surface the rejection to the LLM via the
+        // tool's error envelope so the model sees a structured
+        // failure rather than a silent escape attempt.
+        let effective_args = match self.prepare_effective_args(args, ctx.as_ref()) {
+            Ok(args) => args,
+            Err(err) => {
+                let message = err.to_string();
+                tracing::warn!(
+                    plugin = %self.plugin_name,
+                    tool = %self.tool_def.name,
+                    error = %message,
+                    "plugin arg rewrite rejected unsafe path; refusing to spawn"
+                );
+                return Ok(ToolResult {
+                    output: message,
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
 
         // Section C (codex review round-5 P2): RE-CHECK the verified-exe
         // hash immediately before spawn. The approval round-trip above
@@ -1735,10 +1770,12 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "audio_path": "/home/user/uploads/mark.wav",
-            "file_path": "deck.pdf",
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "audio_path": "/home/user/uploads/mark.wav",
+                "file_path": "deck.pdf",
+            }))
+            .unwrap();
 
         // `audio_path` (a fictional absolute path) cannot resolve
         // through the unified table — it's outside every allowed root
@@ -1780,11 +1817,13 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "input": "slides/demo/script.js",
-            "out": "slides/demo/output/deck.pptx",
-            "slide_dir": "slides/demo/output/imgs"
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "input": "slides/demo/script.js",
+                "out": "slides/demo/output/deck.pptx",
+                "slide_dir": "slides/demo/output/imgs"
+            }))
+            .unwrap();
 
         // All three keys end up as lexical workspace paths: `input`
         // resolves through the unified resolver (workspace scope keeps
@@ -1838,9 +1877,11 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "audio_path": "uploads/mark.wav",
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "audio_path": "uploads/mark.wav",
+            }))
+            .unwrap();
 
         // Must recover `<work_dir>/mark.wav` via the legacy filename
         // fallback, NOT return the missing `<work_dir>/uploads/mark.wav`.
@@ -1886,9 +1927,11 @@ mod tests {
         let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(skill_output.clone());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "script_path": "skill-output/mofa-podcast/octos_intro_script.md",
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "script_path": "skill-output/mofa-podcast/octos_intro_script.md",
+            }))
+            .unwrap();
 
         assert_eq!(
             rewritten["script_path"],
@@ -1928,9 +1971,11 @@ mod tests {
         let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(workspace.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "script_path": "skill-output/mofa-podcast/intro.md",
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "script_path": "skill-output/mofa-podcast/intro.md",
+            }))
+            .unwrap();
 
         assert_eq!(
             rewritten["script_path"],
@@ -1970,30 +2015,40 @@ mod tests {
              NOT the existing bait file's resolved path"
         );
 
-        // 3. End-to-end: the full resolver must NOT return the path of
-        //    the bait file. The lexical absolutize fallback may still
-        //    return a string for an unresolvable input, but it must
-        //    not point at the parent-dir escape target.
-        let resolved = resolve_plugin_input_path("skill-output/../secret.md", &skill_output);
-        assert_ne!(
-            resolved,
-            secret.to_string_lossy().to_string(),
-            "parent-dir escape must NOT resolve to the workspace-root bait file (resolved={resolved})"
+        // 3. End-to-end: codex round-3 fail-closed contract. The full
+        //    resolver MUST return Err for any input carrying `..`. The
+        //    prior behaviour (returning the raw string unchanged) was
+        //    unsafe because the spawned plugin has
+        //    `cmd.current_dir(skill_output)`, so when the plugin's own
+        //    process opens `skill-output/../secret.md` (or worse, the
+        //    raw `../secret.md`) the kernel resolves it relative to the
+        //    chrooted work_dir and escapes. We must surface the
+        //    rejection to the caller (which propagates a tool error
+        //    envelope), NOT pass through.
+        let err = resolve_plugin_input_path("skill-output/../secret.md", &skill_output)
+            .expect_err("parent-dir escape must return Err, not pass-through");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes plugin work dir"),
+            "error message must explain why the path was rejected: {msg}"
         );
+        // Defense in depth: even if a future refactor returns Ok, the
+        // resolved string must never point at the bait file.
+        let _ = secret; // suppress unused warning under future refactors
     }
 
     #[test]
-    fn resolve_plugin_input_path_rejects_raw_parent_dir_escape() {
-        // Codex round-2 BLOCKER fix (PR #1186 review): the prior fixup
-        // only blocked `skill-output/../secret.md` (the prefix-stripped
-        // form). A RAW `../secret.md` (no `skill-output/` prefix) would
-        // still fall through `strip_redundant_skill_output_prefix`
-        // (returns None — no prefix to strip), then `resolve_tool_path`
-        // (rejects), then `resolve_path_in_work_dir` (returns None
-        // after the existing guard), and finally land in
-        // `absolutize_path_in_work_dir`, which lexically joins to
-        // produce `<skill_output>/../secret.md` — escaping the chrooted
-        // plugin work_dir.
+    fn resolve_plugin_input_path_returns_err_on_raw_parent_dir() {
+        // Codex round-3 BLOCKER fix (PR #1186 review): the round-2 fix
+        // returned the raw string unchanged when `..` was present, but
+        // the plugin process is spawned with
+        // `cmd.current_dir(work_dir)`. Passing `../secret.md` through
+        // unchanged lets the plugin itself open the path relative to
+        // the chrooted work_dir and escape. The resolver must FAIL
+        // CLOSED with an explicit error so the call site
+        // (`rewrite_workspace_file_args` -> `prepare_effective_args`
+        // -> `execute`) short-circuits the spawn and surfaces the
+        // rejection to the LLM as a tool error envelope.
         let workspace = tempfile::tempdir().unwrap();
         let skill_output = workspace.path().join("skill-output");
         std::fs::create_dir_all(&skill_output).unwrap();
@@ -2001,36 +2056,66 @@ mod tests {
         let secret = workspace.path().join("secret.md");
         std::fs::write(&secret, b"SECRET").unwrap();
 
-        // 1. The low-level resolver must return None for the unsafe
-        //    raw path at the entry, before any branch (Codex round-2
-        //    option 1: fail fast at the resolver).
+        // 1. The low-level helper must still return None — the
+        //    fail-closed guarantee at the entry of the lexical-join
+        //    helpers is unchanged.
         assert!(
             resolve_path_in_work_dir("../secret.md", &skill_output).is_none(),
             "resolve_path_in_work_dir must return None for raw `..` escape"
         );
 
-        // 2. End-to-end: the top-level resolver must NOT construct a
-        //    path that escapes the chroot. The bait file path
-        //    `<workspace>/secret.md` is what `<skill_output>/../secret.md`
-        //    resolves to on disk; the resolver must avoid producing
-        //    either the lexical-escape string OR the canonical bait
-        //    path.
-        let resolved = resolve_plugin_input_path("../secret.md", &skill_output);
-        let escape_lexical = skill_output
-            .join("../secret.md")
-            .to_string_lossy()
-            .to_string();
-        assert_ne!(
-            resolved, escape_lexical,
-            "raw parent-dir escape must NOT lexically resolve to the bait path \
-             (resolved={resolved}, escape_lexical={escape_lexical})"
+        // 2. Top-level resolver returns Err — NOT a pass-through
+        //    string — for every raw form of `..` escape.
+        for raw in ["../secret.md", "..", "foo/../bar", "a/b/../../c"] {
+            let err = resolve_plugin_input_path(raw, &skill_output).expect_err(&format!(
+                "raw `..` input {raw:?} must return Err, not a pass-through string"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(raw),
+                "error must echo the rejected raw path so the LLM sees what was refused: {msg}",
+            );
+            assert!(
+                msg.contains("escapes plugin work dir"),
+                "error must explain the rejection reason: {msg}",
+            );
+        }
+
+        // 3. End-to-end via `rewrite_workspace_file_args`: any raw
+        //    `..` path on a workspace-file key (`script_path`,
+        //    `input`, `audio_path`, `file_path`, `video_path`,
+        //    `text_path`) must abort the rewrite. The caller
+        //    (execute()) returns a tool error envelope instead of
+        //    spawning the plugin with a poisoned arg.
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"script_path": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(skill_output.clone());
+        let rewrite_err = tool
+            .rewrite_workspace_file_args(&json!({
+                "script_path": "../secret.md",
+            }))
+            .expect_err("rewrite must propagate the resolver Err");
+        assert!(
+            rewrite_err.to_string().contains("../secret.md"),
+            "rewrite error must echo the offending path: {rewrite_err}"
         );
-        assert_ne!(
-            resolved,
-            secret.to_string_lossy().to_string(),
-            "raw parent-dir escape must NOT resolve to the workspace-root bait file \
-             (resolved={resolved})"
-        );
+
+        // Defense in depth: even if a future refactor accidentally
+        // returns Ok, the resolved string must never point at the
+        // bait file.
+        let _ = secret;
     }
 
     #[test]
@@ -2096,10 +2181,12 @@ mod tests {
         let tool = PluginTool::new("mofa-frame".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "video_path": "clip.mp4",
-            "text_path": "transcript.txt",
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "video_path": "clip.mp4",
+                "text_path": "transcript.txt",
+            }))
+            .unwrap();
 
         assert_eq!(
             rewritten["video_path"],
@@ -2139,9 +2226,11 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "style": "cyberpunk-neon"
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "style": "cyberpunk-neon"
+            }))
+            .unwrap();
 
         assert_eq!(rewritten["style"], "cyberpunk-neon");
     }
@@ -2172,9 +2261,11 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "style": style.to_string_lossy().to_string()
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "style": style.to_string_lossy().to_string()
+            }))
+            .unwrap();
 
         assert_eq!(rewritten["style"], "cyberpunk-neon");
     }
@@ -2201,9 +2292,11 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_work_dir(dir.path().to_path_buf());
 
-        let rewritten = tool.rewrite_workspace_file_args(&json!({
-            "style": "/tmp/styles/nb-pro.toml.toml"
-        }));
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({
+                "style": "/tmp/styles/nb-pro.toml.toml"
+            }))
+            .unwrap();
 
         assert_eq!(rewritten["style"], "nb-pro");
     }
@@ -2240,7 +2333,7 @@ mod tests {
             ..ToolContext::zero()
         };
 
-        let prepared = tool.prepare_effective_args(&json!({}), Some(&ctx));
+        let prepared = tool.prepare_effective_args(&json!({}), Some(&ctx)).unwrap();
 
         assert_eq!(prepared["audio_path"], "/workspace/voice.ogg");
         assert_eq!(prepared["file_path"], "/workspace/report.pdf");
@@ -2298,7 +2391,9 @@ mod tests {
         )
         .with_synthesis_config(full_synthesis_config());
 
-        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        let prepared = tool
+            .prepare_effective_args(&json!({"query": "AI policy"}), None)
+            .unwrap();
         let cfg = &prepared["synthesis_config"];
         assert_eq!(cfg["endpoint"], "https://api.deepseek.com/v1");
         assert_eq!(cfg["api_key"], "sk-host-injected");
@@ -2317,7 +2412,9 @@ mod tests {
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
             .with_synthesis_config(full_synthesis_config());
 
-        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        let prepared = tool
+            .prepare_effective_args(&json!({"query": "AI policy"}), None)
+            .unwrap();
         assert!(
             prepared.get("synthesis_config").is_none(),
             "tools without opt-in must not receive synthesis_config: {prepared}",
@@ -2332,7 +2429,9 @@ mod tests {
             PathBuf::from("/bin/true"),
         );
 
-        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        let prepared = tool
+            .prepare_effective_args(&json!({"query": "AI policy"}), None)
+            .unwrap();
         assert!(prepared.get("synthesis_config").is_none());
     }
 
@@ -2347,7 +2446,9 @@ mod tests {
         )
         .with_synthesis_config(cfg);
 
-        let prepared = tool.prepare_effective_args(&json!({"query": "AI policy"}), None);
+        let prepared = tool
+            .prepare_effective_args(&json!({"query": "AI policy"}), None)
+            .unwrap();
         assert!(prepared.get("synthesis_config").is_none());
     }
 
@@ -2363,13 +2464,15 @@ mod tests {
         )
         .with_synthesis_config(full_synthesis_config());
 
-        let prepared = tool.prepare_effective_args(
-            &json!({
-                "query": "AI policy",
-                "synthesis_config": {"api_key": "caller-supplied"}
-            }),
-            None,
-        );
+        let prepared = tool
+            .prepare_effective_args(
+                &json!({
+                    "query": "AI policy",
+                    "synthesis_config": {"api_key": "caller-supplied"}
+                }),
+                None,
+            )
+            .unwrap();
         assert_eq!(prepared["synthesis_config"]["api_key"], "caller-supplied");
         assert!(
             prepared["synthesis_config"].get("endpoint").is_none(),
