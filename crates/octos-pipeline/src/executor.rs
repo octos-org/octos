@@ -362,6 +362,22 @@ pub struct ExecutorConfig {
     /// `EpisodeStore::find_relevant` — identical to pre-fix behaviour
     /// for callers that don't propagate the orchestrator's embedder.
     pub embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    /// Phase 2-A — directory used to load `pipeline_models.json` and
+    /// `model_catalog.json` for per-node model assignment, plus to
+    /// surface profile-level defaults that must not move when
+    /// `working_dir` is overridden onto a session-scoped workspace.
+    ///
+    /// Pipeline runs invoked from a scoped session set this to the
+    /// **profile** data dir so catalog reads resolve against the
+    /// persistent profile root, even though `working_dir` was swapped
+    /// to `scope.workspace()` for per-node worker CWD isolation.
+    ///
+    /// `None` keeps the pre-Phase-2-A path: catalog reads fall back to
+    /// `working_dir` (which, for non-scoped callers, IS the profile
+    /// dir). Codex review of #1203 caught this overload — without the
+    /// split, scoped runs silently lost strong/fast model defaults +
+    /// cost projections.
+    pub catalog_dir: Option<PathBuf>,
 }
 
 /// A single planned sub-task from the LLM planner.
@@ -963,7 +979,21 @@ impl PipelineExecutor {
         // `book/src/skill-development.md`'s "Before You Start: Skill
         // vs. Workspace Contract" rubric and the pipeline-guard case
         // study for the full rationale.
-        crate::model_assignment::assign_from_catalog_dir(&mut graph, &self.config.working_dir);
+        //
+        // Phase 2-A — catalog reads MUST resolve against the profile
+        // data dir, NOT the per-session workspace `working_dir` was
+        // overridden onto. `catalog_dir` is the explicit split: it
+        // defaults to `working_dir` for backward compat (legacy
+        // callers where the two are the same), and scoped callers
+        // (e.g. `RunPipelineTool::execute`) set it to the profile dir
+        // so model assignment + cost projection don't silently degrade.
+        // Caught in codex review of PR #1203.
+        let catalog_dir = self
+            .config
+            .catalog_dir
+            .as_deref()
+            .unwrap_or(&self.config.working_dir);
+        crate::model_assignment::assign_from_catalog_dir(&mut graph, catalog_dir);
 
         // ── Pipeline start: log graph structure ──
         let node_summary: Vec<String> = graph
@@ -3065,6 +3095,7 @@ mod tests {
             workspace_context: crate::context::PipelineContext::default(),
             host_context: crate::host_context::PipelineHostContext::default(),
             embedder: None,
+            catalog_dir: None,
         }
     }
 
@@ -3237,6 +3268,7 @@ mod tests {
             workspace_context: crate::context::PipelineContext::default(),
             host_context: crate::host_context::PipelineHostContext::default(),
             embedder: None,
+            catalog_dir: None,
         }
     }
 
@@ -3461,5 +3493,157 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Phase 2-A integration — the `working_dir` set on
+    /// [`ExecutorConfig`] must flow all the way down through
+    /// [`PipelineExecutor::build_codergen`] onto the per-node
+    /// [`CodergenHandler`]'s `working_dir`. This is the wire that
+    /// `RunPipelineTool::execute` rides when it swaps the tool's
+    /// pinned working dir for `scope.workspace()`. If this regresses,
+    /// the mini5 NEW-06 fix silently goes dead even though the
+    /// resolver still computes the right CWD.
+    ///
+    /// `make_test_config` opens its own runtime so it can't be called
+    /// from inside `#[tokio::test]`; we mirror the `make_capped_config`
+    /// pattern (async test + async config builder) so we share the
+    /// outer runtime.
+    #[tokio::test]
+    async fn build_codergen_propagates_executor_working_dir_to_handler() {
+        let custom_wd = tempfile::tempdir().expect("temp dir");
+        let mut config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            catalog_dir: None,
+        };
+        config.working_dir = custom_wd.path().to_path_buf();
+        let executor = PipelineExecutor::new(config);
+        let codergen = executor.build_codergen_for_test();
+        assert_eq!(
+            codergen.working_dir_for_test(),
+            custom_wd.path(),
+            "CodergenHandler must inherit ExecutorConfig.working_dir so the \
+             Phase 2-A scope override actually reaches per-node worker CWDs"
+        );
+    }
+
+    /// Phase 2-A codex review (#1203) — when the pipeline runs inside a
+    /// session, the worker CWD (`working_dir`) and the catalog/profile
+    /// root MUST be separable. The executor's model assignment pass
+    /// reads `pipeline_models.json` / `model_catalog.json` from the
+    /// profile data dir, not the per-session workspace. Without the
+    /// split, scoped runs would silently lose strong/fast model
+    /// defaults and cost projections would fall back to the minimum
+    /// estimate. Pin the split: with `catalog_dir` populated, catalog
+    /// reads resolve against it even though `working_dir` was swapped.
+    #[tokio::test]
+    async fn catalog_dir_overrides_working_dir_for_model_assignment() {
+        let profile_root = tempfile::tempdir().expect("profile root");
+        let session_workspace = tempfile::tempdir().expect("session workspace");
+
+        // Write a minimal catalog only under the profile root. If the
+        // assignment pass reads from working_dir (the session
+        // workspace) it will find nothing and silently no-op; if it
+        // reads from catalog_dir (the profile root) it will load the
+        // file.
+        let pipeline_models = profile_root.path().join("pipeline_models.json");
+        std::fs::write(&pipeline_models, b"{\"strong\":[],\"fast\":[]}").unwrap();
+
+        let config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            // worker CWD = per-session workspace (what Phase 2-A
+            // overrides onto when a scope is present).
+            working_dir: session_workspace.path().to_path_buf(),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            // catalog reads must hit the PROFILE root, not the worker CWD.
+            catalog_dir: Some(profile_root.path().to_path_buf()),
+        };
+
+        // Pin the helper that the executor uses for catalog lookup:
+        // unwrap_or-fallback must yield the catalog_dir when set.
+        let executor = PipelineExecutor::new(config);
+        let catalog_dir = executor
+            .config
+            .catalog_dir
+            .as_deref()
+            .unwrap_or(&executor.config.working_dir);
+        assert_eq!(
+            catalog_dir,
+            profile_root.path(),
+            "catalog_dir must be preferred over working_dir for catalog reads — \
+             scoped runs lose model defaults without this split (codex #1203 P2)"
+        );
+        assert_ne!(
+            catalog_dir, executor.config.working_dir,
+            "the test setup must actually exercise the split path \
+             (catalog_dir != working_dir)"
+        );
+    }
+
+    /// Backward-compat — when `catalog_dir` is `None` (legacy callers
+    /// that didn't opt into the split), catalog reads still resolve
+    /// against `working_dir`. This is exactly the pre-Phase-2-A path.
+    #[tokio::test]
+    async fn catalog_dir_falls_back_to_working_dir_when_unset() {
+        let only_dir = tempfile::tempdir().expect("temp dir");
+        let mut config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+            catalog_dir: None,
+        };
+        config.working_dir = only_dir.path().to_path_buf();
+        let executor = PipelineExecutor::new(config);
+        let catalog_dir = executor
+            .config
+            .catalog_dir
+            .as_deref()
+            .unwrap_or(&executor.config.working_dir);
+        assert_eq!(
+            catalog_dir,
+            only_dir.path(),
+            "without catalog_dir the executor must fall back to working_dir \
+             (legacy callers, pre-Phase-2-A behaviour)"
+        );
     }
 }

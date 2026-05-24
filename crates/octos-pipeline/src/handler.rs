@@ -357,6 +357,15 @@ impl CodergenHandler {
         self.embedder.as_ref()
     }
 
+    /// Doc-hidden test accessor — exposes the per-handler working dir
+    /// so Phase 2-A acceptance tests can confirm the session-scoped
+    /// override is propagated from `RunPipelineTool` -> `ExecutorConfig`
+    /// -> `CodergenHandler` -> per-node worker spawn CWD.
+    #[doc(hidden)]
+    pub fn working_dir_for_test(&self) -> &std::path::Path {
+        &self.working_dir
+    }
+
     /// Section B (codex review P1.1): opt into strict signature
     /// enforcement for the pipeline's plugin-load cache. Set this
     /// when the host config carries `plugins.require_signed = true`.

@@ -176,6 +176,7 @@ async fn build_codergen_propagates_embedder_from_executor_config() {
         workspace_context: octos_pipeline::PipelineContext::default(),
         host_context: octos_pipeline::PipelineHostContext::default(),
         embedder: Some(embedder),
+        catalog_dir: None,
     };
 
     let executor = PipelineExecutor::new(config);
@@ -216,6 +217,7 @@ async fn build_codergen_omits_embedder_when_executor_config_has_none() {
         workspace_context: octos_pipeline::PipelineContext::default(),
         host_context: octos_pipeline::PipelineHostContext::default(),
         embedder: None,
+        catalog_dir: None,
     };
 
     let executor = PipelineExecutor::new(config);
