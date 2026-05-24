@@ -440,6 +440,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // System metrics
         .route("/api/admin/system/metrics", get(admin::system_metrics))
+        .route("/api/admin/serve/logs", get(admin::serve_logs))
         .route("/api/admin/operator/summary", get(admin::operator_summary))
         .route("/api/admin/operator/tasks", get(admin::operator_tasks))
         // Monitor control
