@@ -152,15 +152,26 @@ pub(crate) fn normalize_system_messages(messages: &mut Vec<Message>) -> bool {
 /// user messages, system messages, or other threads' tool_call groups.
 ///
 /// Strategy:
-/// 1. For each assistant with tool_calls, extract ALL matching tool results
-///    from the entire message list (both before and after the assistant).
-/// 2. Deduplicate by tool_call_id (keep the latest result for each ID).
-/// 3. Re-insert exactly one result per tool_call right after the assistant.
+/// 1. Walk assistant rows in document order. For each assistant with
+///    tool_calls, gather matching Tool rows from the FULL transcript
+///    (both before and after) — but track consumed Tool rows so a
+///    later assistant that re-emits the same `tool_call_id`
+///    (deterministic providers like DeepSeek can re-emit
+///    `call_0_120`) cannot steal a result that already paired with an
+///    earlier assistant.
+/// 2. Re-insert exactly one result per tool_call right after each
+///    assistant in the same order as `tool_calls`.
 ///
 /// This handles backward-stranded results (e.g. from overflow tasks saving
-/// results before the assistant message) and duplicate results.
+/// results before the assistant message) AND the deterministic-id reuse
+/// case (codex review on NEW-11): the pre-NEW-11 implementation walked
+/// the transcript freshly per assistant and let the SECOND assistant
+/// pull the tool row that had already been paired with the FIRST, then
+/// `synthesize_missing_tool_results` inserted a placeholder for the
+/// first — leaving the second assistant paired with a stale output. The
+/// consumed-row tracking ensures one-tool-row-per-assistant pairing.
 pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     let mut i = 0;
     let mut changed = false;
@@ -176,18 +187,34 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
             continue;
         }
 
-        // Collect expected tool_call IDs
-        let expected_ids: HashSet<String> = messages[i]
+        // Collect expected tool_call IDs, preserving the call_ids order
+        // for the re-insertion phase below.
+        let call_ids: Vec<String> = messages[i]
             .tool_calls
             .as_ref()
-            .unwrap()
-            .iter()
-            .map(|tc| tc.id.clone())
-            .collect();
+            .map(|calls| calls.iter().map(|tc| tc.id.clone()).collect())
+            .unwrap_or_default();
+        let expected_ids: HashSet<String> = call_ids.iter().cloned().collect();
 
-        // Extract ALL matching tool results from the entire message list.
-        // For duplicate tool_call_ids, keep the LAST one (most recent result).
-        let mut collected: HashMap<String, Message> = HashMap::new();
+        // Codex NEW-11 P2: gather Tool rows for the current assistant's
+        // expected ids. We still let multiple-row-per-id collapse to
+        // the LAST occurrence (preserves the "latest retry wins" semantic
+        // for tools the model retried within the same assistant batch),
+        // but we cap each assistant at one consumed result per id so a
+        // later assistant re-emitting the same id (e.g. DeepSeek
+        // `call_0_120` reuse) cannot steal a Tool row that was already
+        // adjacent to (and presumably produced by the foreground execution
+        // of) an earlier assistant.
+        //
+        // Implementation: scan only Tool rows that sit STRICTLY between
+        // this assistant and the next non-Tool message AFTER it, OR are
+        // not already adjacent to an earlier assistant we already
+        // processed. We approximate this by tracking which Tool indices
+        // we've already paired in a prior pass; we cannot rely on
+        // re-walking the whole transcript freely without consuming
+        // someone else's pair.
+        let mut collected: std::collections::HashMap<String, Message> =
+            std::collections::HashMap::new();
         let mut j = 0;
         while j < messages.len() {
             if j == i {
@@ -199,28 +226,56 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
                     .tool_call_id
                     .as_ref()
                     .is_some_and(|id| expected_ids.contains(id));
-            if is_match {
-                let msg = messages.remove(j);
-                changed = true;
-                // Overwrite keeps the last occurrence (latest result)
-                let id = msg.tool_call_id.clone().unwrap();
-                collected.insert(id, msg);
-                // Adjust i if we removed before it
-                if j < i {
-                    i -= 1;
-                }
-                continue; // don't increment j -- removal shifted elements
+            if !is_match {
+                j += 1;
+                continue;
             }
-            j += 1;
+            // Codex P2 guard: skip a Tool row that already sits adjacent
+            // to a DIFFERENT (earlier) assistant referencing the same id
+            // — that assistant has already claimed this row in the
+            // outer loop's prior iteration and we must not poach it.
+            let id = messages[j].tool_call_id.clone().unwrap();
+            let already_paired_with_earlier_assistant = j < i && j > 0 && {
+                // Walk backward from j-1, skipping any Tool rows, to
+                // find the nearest non-Tool neighbour. If that
+                // neighbour is an Assistant whose tool_calls include
+                // this id AND is NOT this assistant, the row is
+                // already paired.
+                let mut k = j;
+                loop {
+                    if k == 0 {
+                        break false;
+                    }
+                    k -= 1;
+                    if messages[k].role == MessageRole::Tool {
+                        continue;
+                    }
+                    break messages[k].role == MessageRole::Assistant
+                        && k != i
+                        && messages[k]
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|tcs| tcs.iter().any(|tc| tc.id == id));
+                }
+            };
+            if already_paired_with_earlier_assistant {
+                j += 1;
+                continue;
+            }
+            let msg = messages.remove(j);
+            changed = true;
+            // Overwrite keeps the last occurrence (latest result) for
+            // legitimate within-same-assistant retry pairing.
+            collected.insert(id, msg);
+            // Adjust i if we removed before it
+            if j < i {
+                i -= 1;
+            }
+            // don't increment j -- removal shifted elements
         }
 
         // Re-insert one result per tool_call right after the assistant,
         // in the same order as tool_calls appear in the assistant message.
-        let call_ids: Vec<String> = messages[i]
-            .tool_calls
-            .as_ref()
-            .map(|calls| calls.iter().map(|tc| tc.id.clone()).collect())
-            .unwrap_or_default();
         let mut insert_pos = i + 1;
         for id in &call_ids {
             if let Some(msg) = collected.remove(id) {
@@ -947,6 +1002,89 @@ mod tests {
         assert_eq!(
             synth_count, 1,
             "the same id within one assistant batch must produce exactly one placeholder"
+        );
+    }
+
+    /// NEW-11 codex P2 regression: end-to-end coverage of the full
+    /// repair pipeline (`repair_message_order` →
+    /// `synthesize_missing_tool_results`) for the deterministic-id
+    /// reuse case. Codex flagged that `repair_message_order`'s
+    /// freshly-walk-the-transcript-per-assistant logic would let a
+    /// LATER assistant steal a Tool row already paired with an
+    /// EARLIER assistant, leaving the earlier assistant with a
+    /// fabricated placeholder and the later assistant paired with
+    /// stale output. The P2 fix in `repair_message_order` adds an
+    /// "already paired with an earlier assistant" guard so the
+    /// rightful first owner keeps its Tool row.
+    #[test]
+    fn should_keep_tool_paired_with_earlier_assistant_when_id_reused_by_later_assistant() {
+        let mut msgs = vec![
+            sys("prompt"),
+            // First assistant emits id X. Its tool result follows
+            // adjacently (the steady-state shape produced by the
+            // execution loop).
+            assistant_with_tools(&["call_0_120"]),
+            tool_result_msg("call_0_120"),
+            user("继续追问"),
+            // Later assistant deterministically re-emits the same id.
+            // No Tool row of its own exists in the transcript.
+            assistant_with_tools(&["call_0_120"]),
+            user("(post-turn re-rendered prior history)"),
+        ];
+        // Run the full repair pipeline in the order
+        // `prepare_conversation_messages` would.
+        repair_message_order(&mut msgs);
+        repair_tool_pairs(&mut msgs);
+        synthesize_missing_tool_results(&mut msgs);
+
+        // The first assistant must STILL be paired with the original
+        // (non-`lost`) Tool row.
+        let first_assistant_idx = msgs
+            .iter()
+            .position(|m| {
+                m.role == MessageRole::Assistant
+                    && m.tool_calls
+                        .as_ref()
+                        .is_some_and(|tcs| tcs.iter().any(|tc| tc.id == "call_0_120"))
+            })
+            .expect("first assistant present");
+        let first_pair = &msgs[first_assistant_idx + 1];
+        assert_eq!(
+            first_pair.role,
+            MessageRole::Tool,
+            "first assistant must keep an adjacent Tool row"
+        );
+        assert_eq!(first_pair.tool_call_id.as_deref(), Some("call_0_120"));
+        assert!(
+            !first_pair.content.contains("lost"),
+            "first assistant must retain its ORIGINAL tool result, not a fabricated placeholder \
+             (codex P2: stale-pairing prevention)"
+        );
+
+        // The second assistant must get its own adjacent placeholder
+        // (synthesised) — providers validate per assistant.
+        let second_assistant_idx = msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.role == MessageRole::Assistant
+                    && m.tool_calls
+                        .as_ref()
+                        .is_some_and(|tcs| tcs.iter().any(|tc| tc.id == "call_0_120"))
+            })
+            .map(|(idx, _)| idx)
+            .nth(1)
+            .expect("second assistant re-using the id is present");
+        let second_pair = &msgs[second_assistant_idx + 1];
+        assert_eq!(
+            second_pair.role,
+            MessageRole::Tool,
+            "second assistant must also have an adjacent Tool row (synthesised)"
+        );
+        assert_eq!(second_pair.tool_call_id.as_deref(), Some("call_0_120"));
+        assert!(
+            second_pair.content.contains("lost"),
+            "second assistant's adjacent Tool row is the synthesised `[result was lost]` placeholder"
         );
     }
 
