@@ -1,6 +1,53 @@
 {
   "schema": "octos.ux.validation.v1",
   "status": "passed",
+  "validators": [
+    "artifact_abi",
+    "appui_transcript_parseable",
+    "capabilities_before_followups",
+    "no_unadvertised_methods_called",
+    "real_tmux_evidence",
+    "appui_transcript_semantic",
+    "rendered_screen_no_known_bug_patterns",
+    "screen_geometry_consistent",
+    "final_answer_visible",
+    "composer_usable",
+    "secret_redaction",
+    "terminal_layout_snapshot",
+    "permission_selection_visible_contract",
+    "provider_missing_visible_contract",
+    "approval_denial_visible_contract",
+    "task_subagent_tree_visible_contract",
+    "restart_reconnect_visible_contract",
+    "dropped_completion_backpressure_contract",
+    "lower_soak_summary_semantic"
+  ],
+  "layout_snapshot": {
+    "schema": "octos.ux.terminal_layout_snapshot.v1",
+    "terminal": {
+      "cols": 120,
+      "rows": 40
+    },
+    "cursor_samples": {
+      "present": false,
+      "count": 0,
+      "samples": []
+    },
+    "regions": [
+      {
+        "name": "history",
+        "start_row": 3,
+        "end_row": 3,
+        "detected": true
+      },
+      {
+        "name": "composer",
+        "start_row": 7,
+        "end_row": 7,
+        "detected": true
+      }
+    ]
+  },
   "checks": [
     {
       "id": "artifact_abi",

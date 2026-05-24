@@ -211,6 +211,8 @@ test("validator registry emits required M19 checks and layout snapshot", () => {
   }
   const layout = checkById(result, "terminal_layout_snapshot").layout_snapshot;
   assert.equal(layout.schema, "octos.ux.terminal_layout_snapshot.v1");
+  assert.ok(result.validators.includes("terminal_layout_snapshot"));
+  assert.equal(result.layout_snapshot.schema, "octos.ux.terminal_layout_snapshot.v1");
   assert.ok(layout.regions.some((region) => region.name === "composer"));
 });
 

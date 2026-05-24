@@ -1802,9 +1802,12 @@ function buildValidation(artifactDir) {
       detail: check.detail,
       evidence: check.evidence,
     }));
+  const layoutCheck = checks.find((check) => check.id === 'terminal_layout_snapshot');
   return {
     schema: VALIDATION_SCHEMA,
     status: failures.length === 0 ? 'passed' : 'failed',
+    validators: checks.map((check) => check.id),
+    layout_snapshot: layoutCheck?.layout_snapshot ?? null,
     checks,
     failures,
   };
