@@ -6,6 +6,7 @@ type ProcSortKey = 'pid' | 'name' | 'cpu_percent' | 'memory_bytes'
 type SortDir = 'asc' | 'desc'
 
 const POLL_INTERVAL = 5000
+const CLOCK_INTERVAL = 1000
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -21,6 +22,15 @@ function formatUptime(secs: number): string {
   if (days > 0) return `${days}d ${hours}h ${mins}m`
   if (hours > 0) return `${hours}h ${mins}m`
   return `${mins}m`
+}
+
+function formatRelativeAge(timestampMs: number | null, nowMs: number): string {
+  if (timestampMs === null) return 'never'
+  const ageSecs = Math.max(0, Math.floor((nowMs - timestampMs) / 1000))
+  if (ageSecs < 60) return `${ageSecs}s ago`
+  const ageMins = Math.floor(ageSecs / 60)
+  if (ageMins < 60) return `${ageMins}m ago`
+  return `${Math.floor(ageMins / 60)}h ago`
 }
 
 function cpuColor(pct: number): string {
@@ -87,16 +97,22 @@ export default function ServerMetricsPage() {
   const [procSort, setProcSort] = useState<ProcSortKey>('memory_bytes')
   const [procDir, setProcDir] = useState<SortDir>('desc')
   const [procOpen, setProcOpen] = useState(false)
+  const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null)
+  const [now, setNow] = useState(() => Date.now())
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const procOpenRef = useRef(false)
 
   const fetchMetrics = async () => {
     try {
       const data = await api.systemMetrics({ procs: procOpenRef.current })
+      const fetchedAt = Date.now()
       setMetrics(data)
+      setLastSuccessAt(fetchedAt)
+      setNow(fetchedAt)
       setError(null)
-    } catch (e: any) {
-      setError(e.message)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+      setNow(Date.now())
     }
   }
 
@@ -106,6 +122,11 @@ export default function ServerMetricsPage() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
     }
+  }, [])
+
+  useEffect(() => {
+    const clock = setInterval(() => setNow(Date.now()), CLOCK_INTERVAL)
+    return () => clearInterval(clock)
   }, [])
 
   const toggleLive = () => {
@@ -164,6 +185,7 @@ export default function ServerMetricsPage() {
   const swapPercent = m.swap.total_bytes > 0
     ? (m.swap.used_bytes / m.swap.total_bytes) * 100
     : 0
+  const updatedAgo = formatRelativeAge(lastSuccessAt, now)
 
   return (
     <div className="space-y-6">
@@ -175,18 +197,21 @@ export default function ServerMetricsPage() {
             {m.platform.os} {m.platform.os_version} &middot; up {formatUptime(m.platform.uptime_secs)}
           </p>
         </div>
-        <button
-          onClick={toggleLive}
-          className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-700 hover:bg-white/5 transition"
-        >
-          <span className={`inline-block w-2 h-2 rounded-full ${live ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
-          {live ? 'Live' : 'Paused'}
-        </button>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-500">Updated {updatedAgo}</span>
+          <button
+            onClick={toggleLive}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-700 hover:bg-white/5 transition"
+          >
+            <span className={`inline-block w-2 h-2 rounded-full ${live ? 'bg-green-500 animate-pulse' : 'bg-gray-600'}`} />
+            {live ? 'Live' : 'Paused'}
+          </button>
+        </div>
       </div>
 
       {error && (
         <div className="text-xs text-yellow-500 bg-yellow-500/10 rounded-lg px-3 py-2">
-          Update failed: {error} (showing last known data)
+          Update failed: {error}. Last successful update: {updatedAgo}.
         </div>
       )}
 
