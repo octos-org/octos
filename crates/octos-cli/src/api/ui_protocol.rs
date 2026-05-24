@@ -16994,17 +16994,86 @@ fn final_assistant_message(
     content: &str,
     reasoning_content: Option<String>,
 ) -> Option<Message> {
-    if content.is_empty()
-        || messages
-            .iter()
-            .any(|message| message.role == MessageRole::Assistant && message.content == content)
-    {
+    if content.is_empty() || final_assistant_content_already_persisted(messages, content) {
         return None;
     }
 
     let mut message = Message::assistant(content.to_owned());
     message.reasoning_content = reasoning_content;
     Some(message)
+}
+
+/// NEW-10 (Fleet-UX soak, mini3/kimi-k2.5, 2026-05-23): the iter-N
+/// `response.messages` Assistant carrier (the one that holds
+/// `tool_calls`) sometimes lands with text content that visually
+/// matches `response.content` from the LLM's final EndTurn iteration
+/// — kimi-k2.5 in particular repeats its preamble verbatim in the
+/// EndTurn message after a fan-out of `get_weather` calls. The
+/// pre-#1183 exact-equality dedupe in `final_assistant_message`
+/// missed when the two strings differed only in trailing whitespace,
+/// or when the iter-N carrier wrapped the final content in a
+/// preamble like "Here's the result: <final>". Both shapes
+/// double-persisted (`response.messages` loop + `final_assistant`
+/// synth), and the SPA rendered TWO identical chat bubbles around
+/// the tool chip.
+///
+/// Strategy (codex-reviewed):
+///
+/// 1. **Empty-after-trim guard.** If the final content collapses to
+///    `""` after `trim()`, the caller has nothing meaningful to
+///    dedupe against — let the caller decide via the
+///    `content.is_empty()` branch above (we return `false` here so
+///    the helper is composable in isolation).
+///
+/// 2. **Trimmed equality** over every prior Assistant message.
+///    Catches the whitespace-only-difference case (a kimi-k2.5
+///    pattern where the iter-N carrier ends in `\n` and the
+///    EndTurn response.content does not).
+///
+/// 3. **Substring containment** over every prior Assistant message,
+///    gated by a 32-byte minimum on `trimmed_content`. The min-length
+///    guard prevents trivial matches (e.g. `final="OK"` would
+///    otherwise dedupe against any iter-N carrier that happens to
+///    contain "OK" anywhere in its text). 32 bytes is large enough
+///    that a substring match represents an intentional repeat of a
+///    full sentence/paragraph, not coincidence.
+///
+/// 4. **Legitimate two-bubble flows are preserved.** When the iter-N
+///    carrier holds a SHORT preamble ("Looking that up...") and the
+///    final EndTurn produces a DIFFERENT long answer, neither
+///    trimmed-equality nor substring-containment fires — both rows
+///    persist as before, and the SPA renders the preamble bubble +
+///    the answer bubble around the tool chip.
+fn final_assistant_content_already_persisted(messages: &[Message], content: &str) -> bool {
+    /// Substring-containment dedupe is gated to content of at least
+    /// this many bytes (post-trim) so that a `final="OK"` or
+    /// `final="done"` cannot dedupe against any prior Assistant row
+    /// that happens to contain those substrings. 32 bytes is the
+    /// shortest plausible "intentional model repeat" — a short
+    /// sentence in either English or CJK.
+    const MIN_SUBSTRING_DEDUPE_BYTES: usize = 32;
+
+    let trimmed_content = content.trim();
+    if trimmed_content.is_empty() {
+        return false;
+    }
+    messages.iter().any(|message| {
+        if message.role != MessageRole::Assistant {
+            return false;
+        }
+        let trimmed_msg = message.content.trim();
+        // Catches the byte-equal case AND the whitespace-only-diff
+        // case in one branch.
+        if trimmed_msg == trimmed_content {
+            return true;
+        }
+        // Catches the preamble-wraps-final case (iter-N carrier
+        // emitted "<preamble> <final>" verbatim and the EndTurn
+        // response repeats just the `<final>` segment). Gated by
+        // the min-length floor so it cannot false-positive on
+        // short tokens.
+        trimmed_content.len() >= MIN_SUBSTRING_DEDUPE_BYTES && trimmed_msg.contains(trimmed_content)
+    })
 }
 
 /// On the NEW-03 synthesised-spawn-only-ack skip path, pick the text
@@ -24260,6 +24329,159 @@ ignore = []
         let messages = vec![Message::assistant("world")];
 
         assert!(final_assistant_message(&messages, "world", None).is_none());
+    }
+
+    /// NEW-10 (Fleet-UX soak, mini3/kimi-k2.5): the iter-N carrier
+    /// message in `response.messages` ends with a trailing newline
+    /// (a frequent kimi-k2.5 streaming artefact) while the EndTurn
+    /// `response.content` does not. Pre-fix byte-equality dedupe
+    /// missed and BOTH rows persisted; the SPA rendered two
+    /// identical bubbles around the tool chip. The trimmed-equality
+    /// branch must close this case.
+    #[test]
+    fn final_assistant_message_skips_when_iter_n_carrier_has_trailing_whitespace() {
+        let iter_n_carrier = Message::assistant("旧金山今天天气晴朗，气温17.1°C\n");
+        let messages = vec![iter_n_carrier];
+        let final_content = "旧金山今天天气晴朗，气温17.1°C";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_none(),
+            "trimmed-equal iter-N content must be deduped against final response.content",
+        );
+    }
+
+    /// NEW-10: kimi-k2.5 sometimes wraps the final answer in a
+    /// preamble in the iter-N carrier (e.g. "Here's the result: <X>")
+    /// and then repeats just `<X>` verbatim as the EndTurn
+    /// `response.content`. When `<X>` is long enough that an
+    /// intentional repeat is overwhelmingly more likely than a
+    /// coincidental substring match, dedupe it.
+    #[test]
+    fn final_assistant_message_skips_when_iter_n_carrier_wraps_final_in_preamble() {
+        let final_content =
+            "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要我查询更详细的湾区天气预报吗？";
+        let iter_n_carrier = Message::assistant(format!("Here's the result: {final_content}"));
+        let messages = vec![iter_n_carrier];
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_none(),
+            "substring-contained final_assistant content must be deduped \
+             when content is long enough to make coincidence implausible",
+        );
+    }
+
+    /// NEW-10: substring-containment dedupe MUST gate on minimum
+    /// length, otherwise a final="OK" would dedupe against any
+    /// prior Assistant row that incidentally contains the bytes
+    /// "OK" — e.g. "OKR planning session preamble".
+    #[test]
+    fn final_assistant_message_does_not_dedupe_short_substring_matches() {
+        let iter_n_carrier =
+            Message::assistant("OKR planning is the workflow. We finalize a focus theme then act.");
+        let messages = vec![iter_n_carrier];
+
+        assert!(
+            final_assistant_message(&messages, "OK", None).is_some(),
+            "short final_assistant content must not dedupe against incidental \
+             substring matches in unrelated prior Assistant text",
+        );
+    }
+
+    /// NEW-10 NEGATIVE: the legitimate two-bubble flow (iter-N
+    /// emits a SHORT preamble "Looking that up..." and the EndTurn
+    /// produces a DIFFERENT long answer) must STILL render both
+    /// rows. Neither trimmed-equality nor substring-containment can
+    /// fire here: the preamble is shorter than the final, so the
+    /// preamble cannot contain the final.
+    #[test]
+    fn final_assistant_message_preserves_preamble_plus_distinct_final() {
+        let preamble = Message::assistant("Looking that up...");
+        let messages = vec![preamble];
+        let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
+
+        let synthesised = final_assistant_message(&messages, final_content, None);
+        assert!(
+            synthesised.is_some(),
+            "preamble + distinct-final flow must persist BOTH rows",
+        );
+        assert_eq!(synthesised.unwrap().content, final_content);
+    }
+
+    /// NEW-10 NEGATIVE: when iter-N carrier holds tool_calls AND
+    /// genuinely-distinct text (no overlap with final), both rows
+    /// must persist. This is the bread-and-butter "two-bubble"
+    /// flow where the model narrates progress then delivers the
+    /// answer.
+    #[test]
+    fn final_assistant_message_preserves_when_iter_n_text_is_unrelated_to_final() {
+        let iter_n_carrier = Message::assistant("I'll fetch the weather data now.");
+        let messages = vec![iter_n_carrier];
+        let final_content =
+            "Based on the readings, San Francisco is sunny at 17.1°C today with 68% humidity.";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "iter-N narrative + distinct-final answer must persist BOTH rows",
+        );
+    }
+
+    /// NEW-10: bare spawn_only / tool-call-only iter-N carriers
+    /// (empty `content`) must NEVER block the final_assistant
+    /// synthesis. Empty content has nothing to dedupe against.
+    #[test]
+    fn final_assistant_message_persists_when_iter_n_carrier_has_empty_content() {
+        // The iter-N carrier exists (it held tool_calls) but its
+        // text content is empty — typical of a fan-out tool call
+        // from a non-chat model.
+        let iter_n_carrier = Message::assistant("");
+        let messages = vec![iter_n_carrier];
+        let final_content = "Here are the weather readings: 17.1°C, sunny.";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "empty iter-N carrier content cannot dedupe against the final response",
+        );
+    }
+
+    /// NEW-10 helper-level contract: empty/whitespace `content`
+    /// itself MUST return `false` from the helper so the caller's
+    /// `content.is_empty()` branch in `final_assistant_message`
+    /// remains the single source of truth for "skip synthesis".
+    #[test]
+    fn final_assistant_content_already_persisted_returns_false_for_empty_input() {
+        let messages = vec![Message::assistant("anything goes here")];
+        assert!(!final_assistant_content_already_persisted(&messages, ""));
+        assert!(!final_assistant_content_already_persisted(&messages, "   "));
+        assert!(!final_assistant_content_already_persisted(
+            &messages, "\n\t  "
+        ));
+    }
+
+    /// NEW-10: a `Tool` row whose body coincidentally contains the
+    /// final assistant content MUST NOT trigger dedupe — tool
+    /// outputs render as tool chips, not chat bubbles, so they
+    /// cannot be the source of a duplicate bubble.
+    #[test]
+    fn final_assistant_content_already_persisted_ignores_tool_rows() {
+        let tool_row = Message {
+            role: MessageRole::Tool,
+            content: "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？"
+                .to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let messages = vec![tool_row];
+        let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "Tool rows must not be considered when deduping the final assistant message",
+        );
     }
 
     /// NEW-03 (codex rounds 1-3 P2): the synth-ack skip path picks
