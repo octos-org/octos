@@ -582,6 +582,7 @@ mod tests {
             memory_store,
             tool_config,
             cron_service: None,
+            pipeline_factory: None,
             hook_executor: None,
         })
     }

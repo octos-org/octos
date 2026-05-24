@@ -614,6 +614,7 @@ mod tests {
             memory_store,
             tool_config,
             cron_service: None,
+            pipeline_factory: None,
             hook_executor: None,
         })
     }
@@ -1092,6 +1093,7 @@ mod tests {
             memory_store,
             tool_config,
             cron_service: None,
+            pipeline_factory: None,
             hook_executor: Some(executor),
         })
     }
@@ -1142,6 +1144,7 @@ mod tests {
             memory_store,
             tool_config,
             cron_service: None,
+            pipeline_factory: None,
             hook_executor: None,
         });
         let key = SessionKey::new("api", "activate-tools-probe");
@@ -1220,6 +1223,7 @@ mod tests {
             memory_store,
             tool_config,
             cron_service: None,
+            pipeline_factory: None,
             hook_executor: None,
         });
 
