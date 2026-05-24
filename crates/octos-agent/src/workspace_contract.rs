@@ -1468,19 +1468,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mofa_cards_contract_satisfies_when_png_files_match_recursive_glob() {
-        // P1-5: mofa_cards emits PNGs under a per-task card_dir.
+    async fn mofa_cards_contract_satisfies_when_png_files_are_reported() {
+        // octos #1041: mofa_cards emits PNGs under a per-task card_dir
+        // and reports each generated PNG through files_to_send. The
+        // contract validates those exact reported paths.
         let temp = tempfile::tempdir().unwrap();
         write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
         let card_dir = temp.path().join("cards/abc");
         std::fs::create_dir_all(&card_dir).unwrap();
-        std::fs::write(card_dir.join("a.png"), PNG_1X1).unwrap();
+        let card = card_dir.join("a.png");
+        std::fs::write(&card, PNG_1X1).unwrap();
 
         let result = enforce_spawn_task_contract_with_args(
             &ToolRegistry::with_builtins(temp.path()),
             "mofa_cards",
             "tool-call-cards",
-            &[],
+            std::slice::from_ref(&card),
             UNIX_EPOCH,
             None,
             Some(&json!({"card_dir": "cards/abc"})),
@@ -1490,6 +1493,41 @@ mod tests {
         match result {
             SpawnTaskContractResult::Satisfied { .. } => {}
             other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mofa_cards_contract_rejects_stale_png_without_files_to_send_octos_1041() {
+        // octos #1041: a stale PNG in the workspace must not satisfy
+        // the cards contract unless the plugin reported it via
+        // files_to_send for this spawn_only invocation.
+        let temp = tempfile::tempdir().unwrap();
+        write_workspace_policy(temp.path(), &WorkspacePolicy::for_session()).unwrap();
+
+        let stale = temp.path().join("cards/old/a.png");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, PNG_1X1).unwrap();
+
+        let result = enforce_spawn_task_contract_with_args(
+            &ToolRegistry::with_builtins(temp.path()),
+            "mofa_cards",
+            "tool-call-cards-stale",
+            &[],
+            UNIX_EPOCH,
+            None,
+            Some(&json!({"card_dir": "cards/new"})),
+        )
+        .await;
+
+        match result {
+            SpawnTaskContractResult::Failed { error, notify_user } => {
+                assert!(
+                    error.contains("files_to_send"),
+                    "expected failure to come from missing files_to_send, got: {error}"
+                );
+                assert_eq!(notify_user.as_deref(), Some("Card generation failed"));
+            }
+            other => panic!("expected failure for missing files_to_send, got {other:?}"),
         }
     }
 
