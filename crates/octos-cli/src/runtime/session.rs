@@ -860,36 +860,41 @@ mod tests {
         assert_eq!(turn_scope.root(), data_dir.as_path());
     }
 
-    /// Phase 3-A codex round-3 P2 regression-pin: when a coding-agent
-    /// UI opens a session with an explicit `cwd` hint, the cached
+    /// Phase 3-A codex round-4 regression-pin: when a coding-agent UI
+    /// opens a session with an explicit `cwd` hint, the cached
     /// `SessionRuntime` honours the hint for `workspace_root` and the
     /// rebound tool registry, but `bootstrap` still builds the
     /// `SessionScope` from the canonical `<data>/users/<id>/workspace`
     /// layout — so the cached scope's workspace does NOT match the
-    /// runtime's. The WS turn handler MUST synthesize a solo scope
-    /// rooted at `workspace_root` AND granting the upload tmpdir
-    /// (`octos_bus::file_handle::temp_upload_root()`).
+    /// runtime's. The WS turn handler MUST skip propagation in this
+    /// case and leave the per-turn agent's `session_scope` as None
+    /// so hint sessions stay on their pre-Phase-3-A (legacy) behaviour.
     ///
-    /// Round-2 of this fix synthesized the workspace scope but with
-    /// EMPTY granted_dirs, which made hint sessions lose `up/...`
-    /// upload-handle resolution: the file/plugin path resolvers prefer
-    /// `ctx.session_scope` when present, and the new scope-aware path
-    /// classified attachment paths under `/tmp/octos-uploads` as
-    /// `OutOfScope`, rejecting them. The legacy unscoped resolver
-    /// always allowed `canonical_path.starts_with(&upload_root)`, so
-    /// adding the upload root as a `granted_dir` reaffirms that trust
-    /// contract through the new path without widening it. Fix-line:
-    /// pass `vec![temp_upload_root()]` to `SessionScope::solo(...)`
-    /// at `api/ui_protocol.rs::15693-15703`.
+    /// Why skip rather than synthesize? Rounds 2 and 3 of this fix
+    /// tried synthesizing a workspace-rooted solo scope (round-2 with
+    /// empty grants, round-3 with `temp_upload_root` granted), but
+    /// each surfaced further regressions:
+    /// - The scope-aware resolver does not decode `up/...` handles
+    ///   (codex round-3 P2.a) — it treats them as workspace-relative
+    ///   `<workspace>/up/...`, so attachment resolution breaks.
+    /// - The plugin tool's classifier uses lexical (not canonical)
+    ///   classification (codex round-3 P2.b), so on macOS the
+    ///   `/var/folders/...` raw form and the `/private/var/folders/...`
+    ///   canonical form mismatch — granting one doesn't cover the
+    ///   other.
     ///
-    /// This test mirrors the round-3 rebuild and confirms the
-    /// synthesized scope's `granted_dirs` carries the upload tmpdir
-    /// (so `up/...` handles + absolute upload paths still resolve)
-    /// alongside the user-selected workspace.
+    /// Both of those are Phase-2 consumer changes the user explicitly
+    /// bounded out of this PR ("stay in plumbing — additive scope
+    /// propagation only"). The minimal-blast-radius landing is to
+    /// SKIP propagation for hint sessions and document the deferral
+    /// via a `TODO(phase3b)` at the call site.
+    ///
+    /// This test mirrors the round-4 rebuild and confirms hint
+    /// sessions keep their pre-Phase-3-A `session_scope: None`
+    /// behaviour byte-for-byte.
     #[tokio::test]
-    async fn ui_protocol_ws_turn_agent_synthesizes_workspace_scope_on_workspace_hint() {
+    async fn ui_protocol_ws_turn_agent_skips_session_scope_on_workspace_hint() {
         use octos_agent::Agent;
-        use octos_core::{ScopeMode, SessionScope};
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("profile-data");
@@ -925,19 +930,12 @@ mod tests {
             runtime_scope.workspace(),
             rt.workspace_root.as_path(),
             "Phase 1 design: scope still uses default <data>/users/<id>/workspace \
-             — this is the mismatch the round-3 fix at ui_protocol.rs handles"
+             — this is the mismatch the round-4 skip at ui_protocol.rs guards against"
         );
 
         // Mirror the WS turn handler's per-turn rebuild WITH the
-        // round-3 fix: when the cached scope's workspace doesn't match
-        // the runtime's workspace_root, synthesize a solo scope rooted
-        // at workspace_root AND granting the upload tmpdir.
-        let upload_root = octos_bus::file_handle::temp_upload_root();
-        let granted_dirs = if upload_root.is_absolute() {
-            vec![upload_root.clone()]
-        } else {
-            Vec::new()
-        };
+        // round-4 skip gate: when the cached scope's workspace doesn't
+        // match the runtime's workspace_root, skip propagation.
         let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
         let mut request_agent = Agent::new_shared(
             AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
@@ -948,53 +946,19 @@ mod tests {
         if let Some(scope) = rt.agent.session_scope() {
             if scope.workspace() == rt.workspace_root.as_path() {
                 request_agent = request_agent.with_session_scope(scope.clone());
-            } else {
-                let synthesized = SessionScope::solo(rt.workspace_root.clone(), granted_dirs)
-                    .expect("solo scope from absolute workspace_root + upload root grant");
-                request_agent = request_agent.with_session_scope(Arc::new(synthesized));
             }
+            // else: skip — see api/ui_protocol.rs round-4 comment for
+            // the full trade-off matrix; deferred to phase3b.
         }
 
-        let observed = request_agent
-            .session_scope()
-            .expect(
-                "per-turn agent MUST carry a synthesized scope for hint sessions \
-                 (round-2 fix — round-1 erroneously skipped propagation, leaving the \
-                 plugin tool's boundary check disabled)",
-            )
-            .clone();
-        assert_eq!(
-            observed.workspace(),
-            rt.workspace_root.as_path(),
-            "synthesized scope's workspace MUST be the runtime's workspace_root \
-             (= user-selected repo via hint) so Phase 2 consumers validate against \
-             the right tree, not the cached scope's empty default layout"
-        );
-        assert_eq!(
-            observed.root(),
-            rt.workspace_root.as_path(),
-            "solo scope: workspace == root == hint path"
-        );
         assert!(
-            observed.shared_zones().is_empty(),
-            "solo scope must declare no cross-session shared zones — hint sessions own \
-             their workspace boundary, not a multi-tenant layout"
+            request_agent.session_scope().is_none(),
+            "per-turn agent must skip the mismatched scope when the session was \
+             opened with a workspace hint — hint sessions keep their pre-Phase-3-A \
+             `session_scope: None` behaviour byte-for-byte (Phase 3-B PR will revisit \
+             once the scope-aware resolver handles `up/...` decoding and canonical \
+             classification)",
         );
-        // Round-3 pin: the synthesized scope MUST grant the upload
-        // tmpdir so `up/...` handles + absolute upload paths still
-        // resolve through `resolve_path_for_session_scope_*` for
-        // hint sessions (otherwise attachments are classified
-        // `OutOfScope` and rejected).
-        match observed.mode() {
-            ScopeMode::Solo { granted_dirs } => {
-                assert!(
-                    granted_dirs.iter().any(|d| d == &upload_root),
-                    "synthesized scope MUST grant temp_upload_root() so hint sessions \
-                     can still resolve uploaded attachments; got granted_dirs = {granted_dirs:?}",
-                );
-            }
-            other => panic!("synthesized scope must be solo, got {other:?}"),
-        }
     }
 
     #[tokio::test]

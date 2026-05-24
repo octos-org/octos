@@ -15665,72 +15665,70 @@ async fn run_standalone_turn(
         if scope.workspace() == session_runtime.workspace_root.as_path() {
             request_agent = request_agent.with_session_scope(scope.clone());
         } else {
-            // Phase 3-A codex round-3 P2: the synthesized solo scope
-            // MUST grant the upload tmpdir alongside the workspace,
-            // otherwise hinted sessions lose the ability to resolve
-            // `up/...` handles and absolute paths under
-            // `octos_bus::file_handle::temp_upload_root()` through the
-            // scope-aware path resolver. Without it,
-            // `resolve_path_for_session_scope_*` would classify
-            // attachment paths as `OutOfScope` and reject them,
-            // breaking hinted coding turns that ask the agent to
-            // process an uploaded file or audio attachment.
+            // Phase 3-A codex round-4 (rolling back rounds 2/3): for
+            // hint sessions (the workspace mismatch case), do NOT
+            // propagate any SessionScope onto the per-turn agent —
+            // keep them on the pre-Phase-3-A `session_scope: None`
+            // path. Rationale + history:
             //
-            // The upload root is a stable, profile-independent path
-            // (`std::env::temp_dir().join("octos-uploads")`), so
-            // granting it does not widen the boundary beyond what the
-            // legacy unscoped resolver already trusted: that resolver
-            // unconditionally allowed `canonical_path.starts_with(
-            // &upload_root)` for send_file and friends. Adding it as
-            // a `granted_dir` re-affirms that trust contract through
-            // the new scope-aware path while leaving the workspace as
-            // the primary write target.
-            let upload_root = octos_bus::file_handle::temp_upload_root();
-            let granted_dirs = if upload_root.is_absolute() {
-                vec![upload_root]
-            } else {
-                // Defensive: `temp_upload_root` returns
-                // `temp_dir().join("octos-uploads")` so it should
-                // always be absolute; bail out cleanly if a future
-                // platform tweak ever breaks the invariant rather
-                // than letting `SessionScope::solo` reject it.
-                Vec::new()
-            };
-            match octos_core::SessionScope::solo(
-                session_runtime.workspace_root.clone(),
-                granted_dirs,
-            ) {
-                Ok(synthesized) => {
-                    tracing::debug!(
-                        session = %session_id.0,
-                        turn = %turn_id.0,
-                        scope_workspace = %scope.workspace().display(),
-                        runtime_workspace = %session_runtime.workspace_root.display(),
-                        "synthesising solo SessionScope rooted at workspace_root: \
-                         cached scope's workspace does not match \
-                         SessionRuntime.workspace_root (hint session); \
-                         a solo scope keeps Phase-2 consumers' boundary validation \
-                         active for the user-selected repo + the upload tmpdir"
-                    );
-                    request_agent = request_agent.with_session_scope(Arc::new(synthesized));
-                }
-                Err(err) => {
-                    // `SessionScope::solo` only fails when the cwd is
-                    // not absolute — that should never happen here
-                    // because `resolve_workspace_root` always returns
-                    // an absolute path. Log defensively and fall back
-                    // to legacy `None` (= pre-Phase-3-A behaviour for
-                    // hint sessions).
-                    tracing::warn!(
-                        session = %session_id.0,
-                        turn = %turn_id.0,
-                        runtime_workspace = %session_runtime.workspace_root.display(),
-                        error = %err,
-                        "failed to synthesise solo SessionScope for hint session; \
-                         per-turn agent will run without scope (legacy fallback)"
-                    );
-                }
-            }
+            // - Round-2 synthesized a workspace-rooted solo scope so
+            //   the Phase-2 consumers' boundary check would kick in,
+            //   addressing codex round-1's plugin path-escape concern.
+            //   But that introduced an upload-handle regression
+            //   (codex round-2 P2): the new scope-aware resolver
+            //   classified `up/...` and absolute upload-tmpdir paths
+            //   as OutOfScope, breaking attachment resolution.
+            // - Round-3 added `temp_upload_root()` as a granted_dir to
+            //   close the absolute-path arm, but codex round-3 P2
+            //   showed two remaining gaps the scoped resolver still
+            //   can't handle: (a) `up/...` handles are not decoded by
+            //   `resolve_path_for_session_scope_*` (they're treated as
+            //   workspace-relative `<workspace>/up/...`); (b) on macOS
+            //   the canonical upload root is `/private/var/folders/...`
+            //   while `temp_upload_root()` returns `/var/folders/...`
+            //   — the plugin tool's LEXICAL classifier doesn't follow
+            //   firmlinks, so canonical paths and decoded handles
+            //   remain OutOfScope.
+            //
+            // Both of those gaps are properly addressed in `octos-bus`
+            // (handle decoding) and `octos-agent` plugins (canonical
+            // classification) — i.e. Phase-2 consumer changes that the
+            // user explicitly bounded out of this PR ("stay in
+            // plumbing — additive scope propagation only"). Until a
+            // follow-up Phase 3-B PR closes those, the safer landing
+            // for THIS PR is to leave hint sessions on their
+            // pre-existing legacy (None) behaviour: handle resolution
+            // works through `resolve_tool_path` as before; the
+            // pre-existing plugin path-escape risk codex round-1
+            // surfaced is NEITHER introduced NOR closed by this PR
+            // (it's pre-existing — Phase-2 PRs are the right place to
+            // close it via either a bootstrap-side scope rebuild for
+            // hint sessions or scope-aware handle decoding).
+            //
+            // Default-layout sessions (the common mini5 NEW-06 path)
+            // still get full propagation through the `if` branch
+            // above. This gate ONLY skips for hint sessions whose
+            // cached scope was built under the canonical
+            // `<data>/users/<id>/workspace` layout while
+            // workspace_root tracks a caller-supplied repo path.
+            //
+            // TODO(phase3b): reconcile `SessionRuntime::bootstrap`'s
+            // SessionScope construction with `workspace_hint` (build
+            // `SessionScope::solo` from workspace_root for hint
+            // sessions, with `temp_upload_root` granted and canonical
+            // upload root pre-resolved) so this skip branch becomes
+            // unreachable and hint sessions also benefit from the
+            // Phase-2 consumer boundary checks.
+            tracing::debug!(
+                session = %session_id.0,
+                turn = %turn_id.0,
+                scope_workspace = %scope.workspace().display(),
+                runtime_workspace = %session_runtime.workspace_root.display(),
+                "skipping SessionScope propagation onto per-turn agent: \
+                 scope workspace does not match SessionRuntime.workspace_root \
+                 (likely a coding-agent hint session); falling back to \
+                 legacy unread-scope behaviour pending phase3b resolver work"
+            );
         }
     }
     // M11-F regression fix REG-1 follow-up (codex review): wire the
