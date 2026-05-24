@@ -1534,6 +1534,7 @@ impl GatewayRuntime {
             pending_messages.clone(),
             out_tx.clone(),
         )
+        .with_session_delete_tx(session_delete_tx.clone())
         .with_data_dir(data_dir.clone());
 
         // Drop the original out_tx — factory and registry hold their own clones.
