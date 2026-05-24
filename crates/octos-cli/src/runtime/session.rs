@@ -820,11 +820,17 @@ mod tests {
             .clone();
 
         // Mirror the WS turn handler's per-turn rebuild
-        // (`api/ui_protocol.rs::15608`):
+        // (`api/ui_protocol.rs::15608`), INCLUDING the codex round-1
+        // P1 gate (`scope.workspace() == workspace_root`):
         //   let request_agent = Agent::new_shared(...).with_*(...);
         //   if let Some(scope) = session_runtime.agent.session_scope() {
-        //       request_agent = request_agent.with_session_scope(scope.clone());
+        //       if scope.workspace() == session_runtime.workspace_root.as_path() {
+        //           request_agent = request_agent.with_session_scope(scope.clone());
+        //       }
         //   }
+        // For default-layout sessions (no workspace hint) the scope's
+        // workspace matches `workspace_root` so the gate passes and
+        // the scope is propagated.
         let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
         let mut request_agent = Agent::new_shared(
             AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
@@ -833,7 +839,9 @@ mod tests {
             profile.memory.clone(),
         );
         if let Some(scope) = rt.agent.session_scope() {
-            request_agent = request_agent.with_session_scope(scope.clone());
+            if scope.workspace() == rt.workspace_root.as_path() {
+                request_agent = request_agent.with_session_scope(scope.clone());
+            }
         }
 
         let turn_scope = request_agent
@@ -850,6 +858,86 @@ mod tests {
         // points at the per-session workspace dir, not the profile root.
         assert_eq!(turn_scope.workspace(), runtime_scope.workspace());
         assert_eq!(turn_scope.root(), data_dir.as_path());
+    }
+
+    /// Phase 3-A codex round-1 P1 regression-pin: when a coding-agent
+    /// UI opens a session with an explicit `cwd` hint (the AppUI
+    /// `SessionOpenParams.cwd` path), the cached `SessionRuntime`
+    /// honours the hint for `workspace_root` and the rebound tool
+    /// registry, but `bootstrap` still builds the `SessionScope` from
+    /// the canonical `<data>/users/<id>/workspace` layout — so the
+    /// cached scope's workspace does NOT match the runtime's. The WS
+    /// turn handler MUST skip propagation in this case, because
+    /// propagating the mismatched scope would make migrated tools
+    /// (`shell`, file tools, plugins, `run_pipeline`) resolve against
+    /// the empty default workspace instead of the user-selected repo.
+    /// Fix-line: `if scope.workspace() == workspace_root` gate at
+    /// `api/ui_protocol.rs::15663-15664`.
+    ///
+    /// This test mirrors the gated rebuild and confirms the per-turn
+    /// agent observes `session_scope == None` for hint sessions —
+    /// keeping their pre-Phase-3-A unread-scope behaviour byte-for-byte.
+    #[tokio::test]
+    async fn ui_protocol_ws_turn_agent_skips_session_scope_on_workspace_hint() {
+        use octos_agent::Agent;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        // A safe SPA-shape session id (so bootstrap DOES build a
+        // scope under the default layout) PLUS a hint pointing at a
+        // different repo path — i.e. the coding-agent UI flow.
+        let session_id = "web-1779574360681-hintsx";
+        let key = SessionKey(session_id.to_string());
+        let hint_repo = tmp.path().join("coding-agent-repo");
+        std::fs::create_dir_all(&hint_repo).unwrap();
+        let rt = SessionRuntime::bootstrap(&profile, key, Some(hint_repo.clone()))
+            .await
+            .expect("bootstrap session runtime with workspace hint");
+
+        // Pre-condition: workspace_root tracks the HINT, but the cached
+        // scope was built from the default `<data>/users/<id>/workspace`
+        // layout (Phase-1 bootstrap behaviour we deliberately leave
+        // unchanged on this PR).
+        let runtime_scope = rt
+            .agent
+            .session_scope()
+            .expect("safe session id always yields a SessionScope")
+            .clone();
+        let canonical_workspace = std::fs::canonicalize(&hint_repo).unwrap();
+        let runtime_workspace_canonical = std::fs::canonicalize(&rt.workspace_root).unwrap();
+        assert_eq!(
+            runtime_workspace_canonical, canonical_workspace,
+            "workspace_root must honour the hint"
+        );
+        assert_ne!(
+            runtime_scope.workspace(),
+            rt.workspace_root.as_path(),
+            "Phase 1 design: scope still uses default <data>/users/<id>/workspace \
+             — this is the mismatch the gate at ui_protocol.rs guards against"
+        );
+
+        // Mirror the WS turn handler's per-turn rebuild WITH the gate.
+        let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
+        let mut request_agent = Agent::new_shared(
+            AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
+            profile.llm.clone(),
+            tools,
+            profile.memory.clone(),
+        );
+        if let Some(scope) = rt.agent.session_scope() {
+            if scope.workspace() == rt.workspace_root.as_path() {
+                request_agent = request_agent.with_session_scope(scope.clone());
+            }
+        }
+
+        assert!(
+            request_agent.session_scope().is_none(),
+            "per-turn agent must NOT inherit the mismatched scope when the session was \
+             opened with a workspace hint — propagating would point migrated tools at the \
+             empty default workspace instead of the user-selected repo (codex round-1 P1)",
+        );
     }
 
     #[tokio::test]

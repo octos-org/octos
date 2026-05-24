@@ -15636,12 +15636,44 @@ async fn run_standalone_turn(
     // validation, file tools' base_dir + path classification, shell +
     // spawn child CWD) would silently fall through to legacy paths —
     // re-introducing the mini5 NEW-06 contamination class on the WS
-    // chat transport. The lookup is `Option<&Arc<SessionScope>>` so
-    // legacy / channel-prefixed sessions (where Phase 1 left the
-    // field unset by design) keep their pre-Phase-1 behaviour
-    // byte-for-byte.
+    // chat transport.
+    //
+    // Phase 3-A codex round-1 P1: GATE the propagation on
+    // `scope.workspace() == session_runtime.workspace_root`. When a
+    // coding-agent UI opens a session with an explicit `cwd` hint
+    // (via SessionOpenParams.cwd or appui.default_session_cwd),
+    // `resolve_workspace_root` honours the hint while
+    // `SessionRuntime::bootstrap` still builds `SessionScope` from the
+    // canonical `<data>/users/<id>/workspace` layout — so the cached
+    // scope's workspace does NOT match the runtime's. Propagating that
+    // mismatched scope would make the migrated tools (`shell`, file
+    // tools, plugins, `run_pipeline`) resolve against the empty default
+    // workspace instead of the user-selected repo. Reconciling the
+    // bootstrap-side scope-construction with `workspace_hint` is the
+    // cleaner long-term fix (codex's "construct the scope from the
+    // effective workspace") but that flips the cached scope for hint
+    // sessions which today is unread by Phase 2 consumers — i.e., a
+    // consumer-visible change. This PR stays strictly additive: when
+    // the workspaces match (default-layout sessions — the common WS
+    // chat path that mini5 NEW-06 actually surfaces on) we propagate;
+    // when they don't (hint sessions — coding-agent flow) we skip and
+    // keep the pre-Phase-3-A `session_scope: None` behaviour the hint
+    // path was on before this PR.
     if let Some(scope) = session_runtime.agent.session_scope() {
-        request_agent = request_agent.with_session_scope(scope.clone());
+        if scope.workspace() == session_runtime.workspace_root.as_path() {
+            request_agent = request_agent.with_session_scope(scope.clone());
+        } else {
+            tracing::debug!(
+                session = %session_id.0,
+                turn = %turn_id.0,
+                scope_workspace = %scope.workspace().display(),
+                runtime_workspace = %session_runtime.workspace_root.display(),
+                "skipping SessionScope propagation onto per-turn agent: \
+                 scope workspace does not match SessionRuntime.workspace_root \
+                 (likely a coding-agent hint session); falling back to \
+                 legacy unread-scope behaviour"
+            );
+        }
     }
     // M11-F regression fix REG-1 follow-up (codex review): wire the
     // `activate_tools` back-reference on the per-turn rebuilt agent.
