@@ -319,8 +319,43 @@ pub(crate) fn repair_tool_pairs(messages: &mut Vec<Message>) -> bool {
 /// repair_tool_pairs.  It handles edge cases where tool results were lost
 /// (e.g. session write failure, crash between assistant save and tool result
 /// save, or ID mismatch after sanitization).
+///
+/// NEW-11 (orphan recovery loop): the existence check pre-collects EVERY
+/// `MessageRole::Tool` `tool_call_id` in the message list before iterating
+/// assistant rows. The original implementation only inspected the window
+/// immediately after each assistant message and would re-fabricate when
+/// `repair_message_order` failed to gather a result adjacent to its parent
+/// (e.g. cascade-fail timeout envelopes for a spawn_only `run_pipeline`
+/// that landed on the wire as Assistant rows rather than Tool rows but
+/// whose handle-ack Tool row was preserved by `repair_message_order`,
+/// leaving a structurally-resolved id that the windowed scan kept treating
+/// as "still missing"). Re-fabrication on every iteration was the
+/// observed driver of the per-turn `synthesizing missing tool result`
+/// WARN that fleet-UX soak round-9 surfaced on mini3
+/// (`web-1779655648282-3lj4a4`). Scanning globally for ANY persisted
+/// tool result (synthetic ack, success, or failure) closes the loop:
+/// once cascade-fail or the spawn_only handle has stamped a row for the
+/// id, subsequent passes silently skip it instead of inserting a fresh
+/// `[result was lost]` placeholder. The earlier
+/// `repair_message_order`/`repair_tool_pairs` passes still re-order or
+/// strip orphans where appropriate; this helper is now strictly
+/// idempotent over the input.
 pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bool {
     use std::collections::HashSet;
+
+    // NEW-11: pre-collect every persisted tool_call_id (success OR failure
+    // envelope, including the spawn_only handle Tool row inserted by the
+    // execution loop) so the per-assistant scan never re-fabricates a
+    // placeholder for an id that is already resolved somewhere in the
+    // transcript. The set is captured BEFORE we start mutating `messages`,
+    // and we add freshly-inserted placeholder ids to it as we go so a
+    // single pass cannot double-fabricate for the same id within one
+    // assistant's tool_calls list either.
+    let mut existing_globally: HashSet<String> = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
 
     let mut i = 0;
     let mut changed = false;
@@ -343,27 +378,24 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bo
             .map(|tc| (tc.id.clone(), tc.name.clone()))
             .collect();
 
-        // Collect existing tool result IDs in the window after this assistant
-        let mut existing: HashSet<String> = HashSet::new();
+        // Walk forward to locate the contiguous block of Tool rows that
+        // already follow this assistant. Placeholders for ids NOT yet
+        // resolved anywhere in the transcript are inserted at the tail
+        // of that block so the assistant -> tool result pairing stays
+        // adjacent (providers reject non-contiguous pairs).
         let mut j = i + 1;
         while j < messages.len() {
             if messages[j].role == MessageRole::Tool {
-                if let Some(ref id) = messages[j].tool_call_id {
-                    existing.insert(id.clone());
-                }
-            } else if messages[j].role == MessageRole::Assistant
-                || messages[j].role == MessageRole::User
-            {
-                break; // stop at next non-tool message
+                j += 1;
+                continue;
             }
-            j += 1;
+            break;
         }
 
-        // Synthesize placeholders for missing results
-        let insert_pos = j; // insert after existing tool results
+        let insert_pos = j;
         let mut inserted = 0;
         for (id, name) in &call_ids {
-            if !existing.contains(id) {
+            if !existing_globally.contains(id) {
                 tracing::warn!(
                     tool_call_id = %id,
                     tool_name = %name,
@@ -383,6 +415,10 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bo
                         timestamp: messages[i].timestamp,
                     },
                 );
+                // Track the id we just resolved so a later assistant
+                // referencing the same id (idempotent reload after a
+                // truncated transcript pass) does not re-synthesise.
+                existing_globally.insert(id.clone());
                 changed = true;
                 inserted += 1;
             }
@@ -769,5 +805,142 @@ mod tests {
         assert_eq!(msgs[1].tool_call_id.as_deref(), Some("tc1"));
         assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc2"));
         assert_eq!(msgs[3].role, MessageRole::User);
+    }
+
+    /// NEW-11 regression: when a spawn_only `run_pipeline` invocation
+    /// kicks off in iteration N and the cascade-fail timeout envelope
+    /// lands as a non-Tool assistant row AFTER the user's next message,
+    /// the windowed scan in the legacy `synthesize_missing_tool_results`
+    /// would still treat the spawn_only handle Tool row (sitting
+    /// adjacent to the assistant) as "missing" if `repair_message_order`
+    /// hadn't re-gathered it on a subsequent iteration. The fix's
+    /// global scan must observe that ANY persisted Tool row resolves
+    /// the id, even if it sits inside a prior conversation round.
+    #[test]
+    fn should_not_synthesize_when_tool_result_exists_anywhere_in_transcript() {
+        let mut msgs = vec![
+            sys("prompt"),
+            // Prior round: spawn_only run_pipeline kicked off. The
+            // execution loop returned a handle Tool row with the
+            // matching tool_call_id and the LLM moved on. The
+            // cascade-fail timeout envelope (persisted as Assistant
+            // by `persist_assistant_with_media`) followed asynchronously.
+            assistant_with_tools(&["call_0_120"]),
+            tool_result_msg("call_0_120"),
+            // Background completion envelope: not a Tool row.
+            Message {
+                role: MessageRole::Assistant,
+                content: "✗ run_pipeline failed: pipeline timed out after 1200s".to_string(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            },
+            user("继续追问"),
+            // Current round: LLM re-emits the SAME spawn_only id
+            // (deterministic providers can pick a stable id when the
+            // prompt + tool shape repeat). Without the global scan,
+            // the windowed look-ahead would walk past the
+            // user/assistant boundary, find no Tool row, and
+            // re-fabricate a `[result was lost]` placeholder every
+            // turn.
+            assistant_with_tools(&["call_0_120"]),
+            user("(post-turn re-rendered prior history)"),
+        ];
+        let original_len = msgs.len();
+        let changed = synthesize_missing_tool_results(&mut msgs);
+        assert!(
+            !changed,
+            "global tool-result scan must observe the prior-round handle row and skip re-fab"
+        );
+        assert_eq!(msgs.len(), original_len);
+    }
+
+    /// NEW-11 regression: repeated invocations on the SAME transcript
+    /// must converge — once a synthetic placeholder is inserted (or
+    /// the row was already there), a subsequent pass must observe the
+    /// resolution and refuse to insert a duplicate. Without this
+    /// invariant the post-context-manager `prepare_conversation_messages`
+    /// pass that fires on every iteration would emit a fresh
+    /// `[result was lost]` Tool row on every loop tick — the persist
+    /// loop that fleet-UX soak round-9 captured on mini3.
+    #[test]
+    fn should_be_idempotent_across_repeated_invocations() {
+        let mut msgs = vec![
+            sys("prompt"),
+            assistant_with_tools(&["call_orphan"]),
+            user("next question"),
+        ];
+
+        // First pass: synthesize the missing placeholder for `call_orphan`.
+        let changed_first = synthesize_missing_tool_results(&mut msgs);
+        assert!(changed_first);
+        let after_first = msgs.len();
+
+        // Second pass: the placeholder we inserted is now a Tool row in
+        // the transcript, so the global scan must observe it and skip
+        // re-fabrication.
+        let changed_second = synthesize_missing_tool_results(&mut msgs);
+        assert!(
+            !changed_second,
+            "second invocation must converge — no new placeholder for an already-resolved id"
+        );
+        assert_eq!(msgs.len(), after_first);
+
+        // Third pass for good measure.
+        let changed_third = synthesize_missing_tool_results(&mut msgs);
+        assert!(!changed_third);
+        assert_eq!(msgs.len(), after_first);
+    }
+
+    /// NEW-11 regression: when an assistant has tool_calls but only
+    /// SOME of the ids are already resolved earlier in the transcript,
+    /// only the truly-missing ids are synthesised. The resolved ids
+    /// must be skipped even though they appear ABOVE the assistant
+    /// (the spawn_only cascade-fail path can land its handle row in a
+    /// position that `repair_message_order` collapsed earlier in the
+    /// transcript).
+    #[test]
+    fn should_only_synthesize_truly_missing_when_some_resolved_above() {
+        let mut msgs = vec![
+            sys("prompt"),
+            // Earlier in the transcript, `tc_resolved` has its Tool row.
+            assistant_with_tools(&["tc_resolved"]),
+            tool_result_msg("tc_resolved"),
+            user("intermediate"),
+            // Now a new assistant references BOTH the resolved id
+            // (re-emitted by a deterministic provider) AND a fresh
+            // truly-unresolved id.
+            assistant_with_tools(&["tc_resolved", "tc_missing"]),
+            user("trailing user prompt"),
+        ];
+        let changed = synthesize_missing_tool_results(&mut msgs);
+        assert!(changed);
+        // Find the synthesised placeholder for `tc_missing`.
+        let synth_count = msgs
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::Tool
+                    && m.tool_call_id.as_deref() == Some("tc_missing")
+                    && m.content.contains("lost")
+            })
+            .count();
+        assert_eq!(synth_count, 1, "exactly one placeholder for the missing id");
+        // No duplicate placeholder for the already-resolved id.
+        let resolved_synth_count = msgs
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::Tool
+                    && m.tool_call_id.as_deref() == Some("tc_resolved")
+                    && m.content.contains("lost")
+            })
+            .count();
+        assert_eq!(
+            resolved_synth_count, 0,
+            "the resolved id keeps its original Tool row and must not gain a fabricated peer"
+        );
     }
 }
