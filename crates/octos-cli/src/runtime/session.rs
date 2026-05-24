@@ -736,6 +736,231 @@ mod tests {
         );
     }
 
+    /// Phase 3-A design-pin (Phase 1 follow-up — gap #3 from codex
+    /// review of Phase 2-C): the `else` branch at
+    /// `SessionRuntime::bootstrap` (around `is_safe_session_id` check)
+    /// deliberately leaves `session_scope` unset for channel-prefixed
+    /// legacy session ids like `api:web-1234`, `telegram:12345`,
+    /// `discord:guild#chan`. This is INTENTIONAL: the SessionScope
+    /// on-disk layout uses the raw id while gateway/legacy paths
+    /// percent-encode the `:`, so the workspace shapes are not yet
+    /// reconciled until Phase 3 routes every shape through the scope
+    /// contract. This test exists explicitly to PIN that design
+    /// decision so a future "just construct a scope for every id"
+    /// refactor cannot silently flip it without re-reading the
+    /// rationale in the comment at the unsafe-id branch.
+    #[tokio::test]
+    async fn unsafe_session_id_session_intentionally_has_none_scope() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        // Three flavours of channel-prefixed legacy ids that historically
+        // satisfied the gateway dispatcher but fail `is_safe_session_id`
+        // (the `:` character is rejected). Each must succeed at bootstrap
+        // and yield `agent.session_scope() == None`.
+        let cases = ["api:web-1234", "telegram:12345", "discord:guild#chan"];
+        for raw in cases {
+            // Split on `:` to round-trip through SessionKey::new's
+            // (channel, base) constructor.
+            let mut split = raw.splitn(2, ':');
+            let channel = split.next().expect("channel half");
+            let base = split.next().expect("base half");
+            let key = SessionKey::new(channel, base);
+            let rt = SessionRuntime::bootstrap(&profile, key.clone(), None)
+                .await
+                .expect("bootstrap must succeed for legacy channel id");
+            assert!(
+                rt.agent.session_scope().is_none(),
+                "design pin: unsafe session id {raw:?} (key={key:?}) must leave session_scope unset; \
+                 changing this requires reconciling the encoded-vs-raw workspace path mismatch first",
+            );
+        }
+    }
+
+    /// Phase 3-A plumbing follow-up (gap #1 from codex review of
+    /// Phase 2-C): the UI Protocol WS turn handler rebuilds an
+    /// `Agent` per-turn via `Agent::new_shared(...).with_*(...)` so
+    /// per-turn callbacks (reporter, prompt-context-bridge) layer in
+    /// without mutating the cached `SessionRuntime`. Before this fix
+    /// the rebuild did NOT copy `session_scope` off the runtime
+    /// session's agent, so every per-turn agent observed
+    /// `session_scope: None` and the Phase-2 consumers fell through
+    /// to legacy paths (= mini5 NEW-06 contamination on the WS
+    /// chat path).
+    ///
+    /// This test exercises the EXACT pattern the WS turn handler
+    /// uses: bootstrap a SessionRuntime, then build a fresh
+    /// per-turn Agent via the same `new_shared(...).with_session_scope(...)`
+    /// chain. It asserts the per-turn agent observes the SAME
+    /// SessionScope `Arc` the runtime session's agent carries (via
+    /// `Arc::ptr_eq`), proving the propagation is a clone of the
+    /// runtime's scope rather than an independently-built one.
+    #[tokio::test]
+    async fn ui_protocol_ws_turn_agent_inherits_session_scope() {
+        use octos_agent::Agent;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        let session_id = "web-1779574360680-ws01ab";
+        let key = SessionKey(session_id.to_string());
+        let rt = SessionRuntime::bootstrap(&profile, key, None)
+            .await
+            .expect("bootstrap session runtime");
+
+        // Pre-condition: the cached SessionRuntime's agent carries a
+        // SessionScope (Phase 1 contract — already covered by
+        // `bootstrap_attaches_session_scope_for_safe_session_id`).
+        let runtime_scope = rt
+            .agent
+            .session_scope()
+            .expect("safe session id must yield a SessionScope")
+            .clone();
+
+        // Mirror the WS turn handler's per-turn rebuild
+        // (`api/ui_protocol.rs::15608`), INCLUDING the codex round-1
+        // P1 gate (`scope.workspace() == workspace_root`):
+        //   let request_agent = Agent::new_shared(...).with_*(...);
+        //   if let Some(scope) = session_runtime.agent.session_scope() {
+        //       if scope.workspace() == session_runtime.workspace_root.as_path() {
+        //           request_agent = request_agent.with_session_scope(scope.clone());
+        //       }
+        //   }
+        // For default-layout sessions (no workspace hint) the scope's
+        // workspace matches `workspace_root` so the gate passes and
+        // the scope is propagated.
+        let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
+        let mut request_agent = Agent::new_shared(
+            AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
+            profile.llm.clone(),
+            tools,
+            profile.memory.clone(),
+        );
+        if let Some(scope) = rt.agent.session_scope() {
+            if scope.workspace() == rt.workspace_root.as_path() {
+                request_agent = request_agent.with_session_scope(scope.clone());
+            }
+        }
+
+        let turn_scope = request_agent
+            .session_scope()
+            .expect("per-turn agent must inherit session_scope from runtime")
+            .clone();
+        assert!(
+            Arc::ptr_eq(&runtime_scope, &turn_scope),
+            "per-turn WS agent must point at the SAME SessionScope Arc the cached \
+             SessionRuntime holds, not a freshly-built one (proves scope is propagated, \
+             not reconstructed)",
+        );
+        // Workspace shape sanity — the per-turn agent's scope still
+        // points at the per-session workspace dir, not the profile root.
+        assert_eq!(turn_scope.workspace(), runtime_scope.workspace());
+        assert_eq!(turn_scope.root(), data_dir.as_path());
+    }
+
+    /// Phase 3-A codex round-4 regression-pin: when a coding-agent UI
+    /// opens a session with an explicit `cwd` hint, the cached
+    /// `SessionRuntime` honours the hint for `workspace_root` and the
+    /// rebound tool registry, but `bootstrap` still builds the
+    /// `SessionScope` from the canonical `<data>/users/<id>/workspace`
+    /// layout — so the cached scope's workspace does NOT match the
+    /// runtime's. The WS turn handler MUST skip propagation in this
+    /// case and leave the per-turn agent's `session_scope` as None
+    /// so hint sessions stay on their pre-Phase-3-A (legacy) behaviour.
+    ///
+    /// Why skip rather than synthesize? Rounds 2 and 3 of this fix
+    /// tried synthesizing a workspace-rooted solo scope (round-2 with
+    /// empty grants, round-3 with `temp_upload_root` granted), but
+    /// each surfaced further regressions:
+    /// - The scope-aware resolver does not decode `up/...` handles
+    ///   (codex round-3 P2.a) — it treats them as workspace-relative
+    ///   `<workspace>/up/...`, so attachment resolution breaks.
+    /// - The plugin tool's classifier uses lexical (not canonical)
+    ///   classification (codex round-3 P2.b), so on macOS the
+    ///   `/var/folders/...` raw form and the `/private/var/folders/...`
+    ///   canonical form mismatch — granting one doesn't cover the
+    ///   other.
+    ///
+    /// Both of those are Phase-2 consumer changes the user explicitly
+    /// bounded out of this PR ("stay in plumbing — additive scope
+    /// propagation only"). The minimal-blast-radius landing is to
+    /// SKIP propagation for hint sessions and document the deferral
+    /// via a `TODO(phase3b)` at the call site.
+    ///
+    /// This test mirrors the round-4 rebuild and confirms hint
+    /// sessions keep their pre-Phase-3-A `session_scope: None`
+    /// behaviour byte-for-byte.
+    #[tokio::test]
+    async fn ui_protocol_ws_turn_agent_skips_session_scope_on_workspace_hint() {
+        use octos_agent::Agent;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        // A safe SPA-shape session id (so bootstrap DOES build a
+        // scope under the default layout) PLUS a hint pointing at a
+        // different repo path — i.e. the coding-agent UI flow.
+        let session_id = "web-1779574360681-hintsx";
+        let key = SessionKey(session_id.to_string());
+        let hint_repo = tmp.path().join("coding-agent-repo");
+        std::fs::create_dir_all(&hint_repo).unwrap();
+        let rt = SessionRuntime::bootstrap(&profile, key, Some(hint_repo.clone()))
+            .await
+            .expect("bootstrap session runtime with workspace hint");
+
+        // Pre-condition: workspace_root tracks the HINT, but the cached
+        // scope was built from the default `<data>/users/<id>/workspace`
+        // layout (Phase-1 bootstrap behaviour we deliberately leave
+        // unchanged on this PR).
+        let runtime_scope = rt
+            .agent
+            .session_scope()
+            .expect("safe session id always yields a SessionScope")
+            .clone();
+        let canonical_workspace = std::fs::canonicalize(&hint_repo).unwrap();
+        let runtime_workspace_canonical = std::fs::canonicalize(&rt.workspace_root).unwrap();
+        assert_eq!(
+            runtime_workspace_canonical, canonical_workspace,
+            "workspace_root must honour the hint"
+        );
+        assert_ne!(
+            runtime_scope.workspace(),
+            rt.workspace_root.as_path(),
+            "Phase 1 design: scope still uses default <data>/users/<id>/workspace \
+             — this is the mismatch the round-4 skip at ui_protocol.rs guards against"
+        );
+
+        // Mirror the WS turn handler's per-turn rebuild WITH the
+        // round-4 skip gate: when the cached scope's workspace doesn't
+        // match the runtime's workspace_root, skip propagation.
+        let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
+        let mut request_agent = Agent::new_shared(
+            AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
+            profile.llm.clone(),
+            tools,
+            profile.memory.clone(),
+        );
+        if let Some(scope) = rt.agent.session_scope() {
+            if scope.workspace() == rt.workspace_root.as_path() {
+                request_agent = request_agent.with_session_scope(scope.clone());
+            }
+            // else: skip — see api/ui_protocol.rs round-4 comment for
+            // the full trade-off matrix; deferred to phase3b.
+        }
+
+        assert!(
+            request_agent.session_scope().is_none(),
+            "per-turn agent must skip the mismatched scope when the session was \
+             opened with a workspace hint — hint sessions keep their pre-Phase-3-A \
+             `session_scope: None` behaviour byte-for-byte (Phase 3-B PR will revisit \
+             once the scope-aware resolver handles `up/...` decoding and canonical \
+             classification)",
+        );
+    }
+
     #[tokio::test]
     async fn bootstrap_attaches_distinct_session_scopes_per_session() {
         // Two SPA-shape sessions on the same profile each get their

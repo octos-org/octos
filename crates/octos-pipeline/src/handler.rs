@@ -775,6 +775,22 @@ impl Handler for CodergenHandler {
             worker = worker.with_parent_session_key(session_key.clone());
         }
 
+        // Phase 3-A plumbing follow-up (Phase 1 gap): propagate the
+        // parent session's `SessionScope` snapshotted into
+        // `PipelineHostContext::session_scope` (see
+        // `octos_pipeline::host_context::PipelineHostContext::from_tool_context`)
+        // onto the per-node worker. Without this every pipeline-spawned
+        // child Agent would observe `session_scope: None` and the
+        // Phase-2 consumers (file tools, shell/spawn CWD, plugin tool
+        // work_dir) inside the child would fall through to legacy
+        // paths — re-introducing the mini5 NEW-06 contamination class
+        // through `run_pipeline` even when the parent turn carried a
+        // scope. Legacy callers (CLI / unit tests where the host
+        // context is empty) stay on the `None` branch byte-for-byte.
+        if let Some(ref scope) = self.host_context.session_scope {
+            worker = worker.with_session_scope(scope.clone());
+        }
+
         // coding-blue FA-7: propagate parent's declarative compaction
         // onto every LLM-call node so the worker honours preflight +
         // post-call compaction and the policy's preserved-artifacts

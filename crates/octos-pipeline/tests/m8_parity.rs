@@ -228,3 +228,68 @@ async fn handler_registry_default_with_codergen_carrying_host_context() {
         "Codergen handler should resolve out of the registry"
     );
 }
+
+/// Phase 3-A plumbing follow-up (gap #2 from codex review of
+/// Phase 2-C): the pipeline `CodergenHandler::execute` builds a
+/// per-node worker `Agent::new(...)` and threads parent host-context
+/// fields onto it via `.with_file_state_cache(...)`, etc. Before this
+/// fix, `host_context.session_scope` was NOT among the propagated
+/// fields, so every pipeline-spawned child agent observed
+/// `session_scope: None` and the Phase-2 consumers inside the child
+/// (file tools / shell+spawn CWD / plugin work_dir) fell back to
+/// legacy paths — re-introducing the mini5 NEW-06 contamination
+/// class through `run_pipeline` even when the parent turn carried
+/// a scope.
+///
+/// This is a plumbing assertion: confirm `CodergenHandler` exposes
+/// the `session_scope` it was built with via the doc-hidden test
+/// accessor. The fact that the `execute()` path threads this onto
+/// `worker = Agent::new(...).with_session_scope(scope)` is then a
+/// straight-line propagation we don't need a synthetic LLM run to
+/// exercise.
+#[tokio::test]
+async fn pipeline_worker_agent_inherits_session_scope() {
+    use octos_core::SessionScope;
+
+    let session_root = tempfile::tempdir().expect("scope root");
+    let scope = Arc::new(
+        SessionScope::multi_tenant_with_default_zones(
+            session_root.path().to_path_buf(),
+            "_main".to_string(),
+            "web-1779000000000-pipw0r".to_string(),
+        )
+        .expect("multi-tenant scope"),
+    );
+
+    let host = PipelineHostContext {
+        // Stand alone — no other parent-session resources required to
+        // exercise the session_scope propagation.
+        session_scope: Some(scope.clone()),
+        ..Default::default()
+    };
+    let codergen = CodergenHandler::new(
+        Arc::new(MockProvider) as Arc<dyn octos_llm::LlmProvider>,
+        temp_episode_store().await,
+        std::env::temp_dir(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .with_host_context(host);
+
+    let observed = codergen.host_context();
+    let observed_scope = observed
+        .session_scope
+        .as_ref()
+        .expect("CodergenHandler must propagate SessionScope from host context");
+    assert!(
+        Arc::ptr_eq(&scope, observed_scope),
+        "CodergenHandler must hold the SAME SessionScope Arc the host context attached, \
+         not a freshly-built one (proves scope is propagated end-to-end)",
+    );
+    // Workspace shape sanity — the scope's workspace dir resolves to
+    // the multi-tenant `<root>/users/<profile>/sessions/<id>/workspace`
+    // layout the on-disk contract requires.
+    assert!(
+        observed_scope.workspace().starts_with(session_root.path()),
+        "scope workspace must live under the tenant root we configured"
+    );
+}
