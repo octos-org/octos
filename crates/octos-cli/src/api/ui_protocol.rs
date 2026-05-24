@@ -15452,6 +15452,25 @@ async fn run_standalone_turn(
                 Arc::new(tool) as Arc<dyn octos_agent::tools::Tool>
             }));
         }
+        // NEW-07 fix: mirror the gateway path (`session_actor.rs:2744-2748`)
+        // and attach the profile-scope `PipelineToolFactory` to the
+        // SpawnTool child registry so a child agent declaring
+        // `allowed_tools=["run_pipeline"]` clears the spawn preflight
+        // (`spawn.rs::ensure_subagent_tools_available`). Round-7 soak
+        // (binary `5cfd85f3`) caught mini1 `deep_research` stalling for
+        // 900s when the LLM emitted
+        // `spawn(allowed_tools=["run_pipeline"])` and preflight failed
+        // with `required tool(s) not available on this host: run_pipeline`.
+        // Phase 2-A (PR #1203) plumbed scope through `RunPipelineTool`
+        // but did not extend child-registry wiring on this path; the
+        // `pipeline_factory` field on `ProfileRuntime` is populated by
+        // `ProfileRuntime::bootstrap` (see `runtime/profile.rs`), and we
+        // clone the `Arc` here for every spawn-tool child closure
+        // invocation.
+        if let Some(pipeline_factory) = session_runtime.profile.pipeline_factory.clone() {
+            spawn_tool =
+                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
+        }
         tool_registry.register(spawn_tool);
         tool_registry.add_base_tools(["spawn", "check_background_tasks", "read_task_output"]);
 
@@ -29444,6 +29463,7 @@ ignore = []
             memory_store,
             tool_config,
             cron_service: None,
+            pipeline_factory: None,
             hook_executor: None,
         })
     }
