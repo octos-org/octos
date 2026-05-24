@@ -197,15 +197,10 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
         let expected_ids: HashSet<String> = call_ids.iter().cloned().collect();
 
         // Helper: identify the assistant that "owns" the Tool row at
-        // index `j` — i.e. the nearest preceding non-Tool message
+        // index `idx` — i.e. the nearest preceding non-Tool message
         // whose role is Assistant and whose `tool_calls` list contains
         // the tool's id. Returns `Some(idx)` when there is such an
-        // owner, or `None` if the row is stranded (no preceding
-        // matching assistant). We use this BOTH to decide whether to
-        // poach a tool row from another assistant AND to detect when
-        // a tool row is already correctly paired with the current
-        // assistant (so we can avoid the no-op remove/re-insert that
-        // would flip `changed` without altering ordering).
+        // owner, or `None` if the row is stranded.
         let owner_of = |idx: usize, messages: &[Message]| -> Option<usize> {
             let id = messages[idx].tool_call_id.clone()?;
             let mut k = idx;
@@ -229,20 +224,23 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
             }
         };
 
-        // Codex NEW-11 P2 (rev 2): gather Tool rows for the current
-        // assistant's expected ids, but cap each assistant at one
-        // consumed result per id and refuse to poach a row that is
-        // already correctly paired with a DIFFERENT assistant
-        // (earlier OR later in the transcript). Within one assistant
-        // batch the legitimate "latest retry wins" semantic is
-        // preserved.
-        //
-        // We also detect rows that are ALREADY in the correct place
-        // (adjacent to the current assistant, i.e. `owner_of(j) ==
-        // Some(i)`) and leave them untouched — re-inserting them at
-        // the same index is a no-op but would flip `changed` and
-        // trigger downstream "repair occurred" telemetry without
-        // any actual change.
+        // Codex NEW-11 P2 (rev 3): gather Tool rows for the current
+        // assistant's expected ids, removing each one to be re-inserted
+        // in `tool_calls` order below. The ONLY guard is "refuse to
+        // poach a row already paired with a DIFFERENT assistant"; any
+        // row paired with the CURRENT assistant is still removed and
+        // re-inserted so that duplicate or out-of-order rows in the
+        // same block collapse to exactly one row per id, in
+        // `tool_calls` order (codex review on rev 2 caught the
+        // out-of-order case: `assistant([tc1, tc2]), tool(tc2),
+        // tool(tc1)` must collapse to one tc1 + one tc2 in declared
+        // order, not three rows). The `changed` flag may flip even
+        // for a no-op rearrangement that happens to land in the same
+        // position — callers treat `changed` as "a normalisation pass
+        // ran", not "the wire shape differs". Tests cover both
+        // directions: `should_be_stable_when_both_assistants_already_have_adjacent_tool_rows`
+        // asserts the OUTPUT shape (not `changed`) so the contract
+        // stays correct under the duplicate / out-of-order branch.
         let mut collected: std::collections::HashMap<String, Message> =
             std::collections::HashMap::new();
         let mut j = 0;
@@ -269,21 +267,11 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
                 j += 1;
                 continue;
             }
-            if owner == Some(i) {
-                // Already correctly paired with the current assistant.
-                // Skip it: removing-then-re-inserting at the same
-                // index is a no-op that would needlessly flip
-                // `changed`. We still record it in `collected` so the
-                // re-insert phase below does NOT insert a duplicate
-                // from elsewhere (the HashMap insert keeps the LAST
-                // claim, matching the "latest retry wins" semantic).
-                collected.insert(id, messages[j].clone());
-                j += 1;
-                continue;
-            }
-            // Truly stranded (no owner) or owned-but-not-adjacent:
-            // remove and re-insert at the current assistant's adjacent
-            // slot below.
+            // Either truly stranded (owner == None) or owned by THIS
+            // assistant (owner == Some(i)). Remove and re-insert at
+            // the adjacent slot below — this also collapses
+            // duplicate / out-of-order rows in the same block to one
+            // result per id in declared order (codex P2 rev 3).
             let msg = messages.remove(j);
             changed = true;
             collected.insert(id, msg);
@@ -295,30 +283,14 @@ pub(crate) fn repair_message_order(messages: &mut Vec<Message>) -> bool {
 
         // Re-insert one result per tool_call right after the
         // assistant, in the same order as tool_calls appear in the
-        // assistant message. We skip rows that were ALREADY correctly
-        // paired (recorded in `collected` but never removed from
-        // `messages`) so we don't insert a duplicate alongside the
-        // original.
+        // assistant message.
         let mut insert_pos = i + 1;
         for id in &call_ids {
-            let Some(msg) = collected.remove(id) else {
-                continue;
-            };
-            // Detect "already adjacent" by checking if the slot we
-            // would write into already holds an identical Tool row
-            // for the same id (the `owner == Some(i)` skip path
-            // above never removed the original).
-            let already_at_target = insert_pos < messages.len()
-                && messages[insert_pos].role == MessageRole::Tool
-                && messages[insert_pos].tool_call_id.as_deref() == Some(id.as_str())
-                && messages[insert_pos].content == msg.content;
-            if already_at_target {
+            if let Some(msg) = collected.remove(id) {
+                messages.insert(insert_pos, msg);
+                changed = true;
                 insert_pos += 1;
-                continue;
             }
-            messages.insert(insert_pos, msg);
-            changed = true;
-            insert_pos += 1;
         }
 
         i = insert_pos;
@@ -1127,9 +1099,14 @@ mod tests {
     /// NEW-11 codex P2 rev-2 regression: when BOTH the earlier and
     /// later assistant referencing the same id ALREADY have
     /// adjacent Tool rows (the steady-state transcript after one
-    /// repair pass on the deterministic-id reuse case), a subsequent
-    /// pass must be a no-op — neither assistant may steal the
-    /// other's adjacent Tool row.
+    /// repair pass on the deterministic-id reuse case), the OUTPUT
+    /// pairing must survive intact across passes — the first
+    /// assistant keeps its `real handle output`, the second keeps
+    /// its `[result was lost]` placeholder, neither row is poached
+    /// by the other side. (`changed` may still flip because the
+    /// remove + same-slot re-insert flow is treated as
+    /// "normalisation ran"; the wire shape is what matters and the
+    /// contract is on the OUTPUT structure, not the bool.)
     #[test]
     fn should_be_stable_when_both_assistants_already_have_adjacent_tool_rows() {
         let mut msgs = vec![
@@ -1162,17 +1139,59 @@ mod tests {
             user("trailing"),
         ];
         let snapshot_before = msgs.clone();
-        let changed = repair_message_order(&mut msgs);
-        assert!(
-            !changed,
-            "repair_message_order must be a no-op when both assistants already have their own adjacent Tool rows"
+        // Run twice to confirm convergence.
+        let _ = repair_message_order(&mut msgs);
+        let _ = repair_message_order(&mut msgs);
+        assert_eq!(
+            msgs.len(),
+            snapshot_before.len(),
+            "no rows added/removed across repeated passes"
         );
-        assert_eq!(msgs.len(), snapshot_before.len());
-        // Spot-check the pairing survived intact.
+        // First assistant must retain its ORIGINAL tool row content.
         assert_eq!(msgs[2].role, MessageRole::Tool);
-        assert_eq!(msgs[2].content, "real handle output");
+        assert_eq!(
+            msgs[2].content, "real handle output",
+            "first assistant keeps the real handle output, not the LATER lost placeholder"
+        );
+        // Second assistant must retain its lost-placeholder content.
         assert_eq!(msgs[5].role, MessageRole::Tool);
-        assert!(msgs[5].content.contains("lost"));
+        assert!(
+            msgs[5].content.contains("lost"),
+            "second assistant keeps the lost placeholder, not the EARLIER real handle output"
+        );
+    }
+
+    /// NEW-11 codex P2 rev-3 regression: a Tool block that is
+    /// already adjacent to its assistant but contains duplicate or
+    /// out-of-order rows must collapse to exactly one row per id,
+    /// in `tool_calls` declared order. The intermediate "skip if
+    /// already adjacent" optimisation in rev 2 would have left the
+    /// duplicates in place AND inserted a fresh row alongside them.
+    #[test]
+    fn should_collapse_duplicate_or_out_of_order_tool_rows_to_one_per_id_in_declared_order() {
+        let mut msgs = vec![
+            sys("prompt"),
+            // Assistant declares tool_calls in order [tc1, tc2], but
+            // the existing Tool rows are reversed AND there is a
+            // duplicate of tc1.
+            assistant_with_tools(&["tc1", "tc2"]),
+            tool_result_msg("tc2"),
+            tool_result_msg("tc1"),
+            tool_result_msg("tc1"),
+            user("next"),
+        ];
+        repair_message_order(&mut msgs);
+        // After repair: assistant at index 1 followed by exactly one
+        // tc1 row (the LATEST per the HashMap insert semantic), then
+        // one tc2 row, then user. Total 5 rows.
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0].role, MessageRole::System);
+        assert_eq!(msgs[1].role, MessageRole::Assistant);
+        assert_eq!(msgs[2].role, MessageRole::Tool);
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc1"));
+        assert_eq!(msgs[3].role, MessageRole::Tool);
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some("tc2"));
+        assert_eq!(msgs[4].role, MessageRole::User);
     }
 
     /// NEW-11 regression: a single pass is internally idempotent
