@@ -19,7 +19,37 @@ struct ProviderInfo {
     api_key_env: &'static str,
     base_url: Option<&'static str>,
     api_type: Option<&'static str>,
+    api_types: &'static [ApiTypeOption],
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApiTypeOption {
+    value: Option<&'static str>,
+    display: &'static str,
+    description: &'static str,
+    base_url: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ApiTypeSelection {
+    api_type: Option<&'static str>,
+    base_url: Option<&'static str>,
+}
+
+const MINIMAX_API_TYPES: &[ApiTypeOption] = &[
+    ApiTypeOption {
+        value: None,
+        display: "OpenAI",
+        description: "Chat Completions API",
+        base_url: Some("https://api.minimax.io/v1"),
+    },
+    ApiTypeOption {
+        value: Some("anthropic"),
+        display: "Anthropic",
+        description: "Messages API",
+        base_url: Some("https://api.minimaxi.com/anthropic"),
+    },
+];
 
 const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
@@ -28,6 +58,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "OPENAI_API_KEY",
         base_url: None,
         api_type: None,
+        api_types: &[],
     },
     ProviderInfo {
         name: "anthropic",
@@ -35,6 +66,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "ANTHROPIC_API_KEY",
         base_url: None,
         api_type: None,
+        api_types: &[],
     },
     ProviderInfo {
         name: "gemini",
@@ -42,6 +74,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "GEMINI_API_KEY",
         base_url: None,
         api_type: None,
+        api_types: &[],
     },
     ProviderInfo {
         name: "deepseek",
@@ -49,6 +82,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "DEEPSEEK_API_KEY",
         base_url: Some("https://api.deepseek.com/v1"),
         api_type: None,
+        api_types: &[],
     },
     ProviderInfo {
         name: "moonshot",
@@ -56,6 +90,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "KIMI_API_KEY",
         base_url: Some("https://api.moonshot.ai/v1"),
         api_type: None,
+        api_types: &[],
     },
     ProviderInfo {
         name: "dashscope",
@@ -63,6 +98,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "DASHSCOPE_API_KEY",
         base_url: Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
         api_type: None,
+        api_types: &[],
     },
     ProviderInfo {
         name: "minimax",
@@ -70,6 +106,7 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "MINIMAX_API_KEY",
         base_url: Some("https://api.minimax.io/v1"),
         api_type: None,
+        api_types: MINIMAX_API_TYPES,
     },
     ProviderInfo {
         name: "zai",
@@ -77,8 +114,59 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_key_env: "ZAI_API_KEY",
         base_url: Some("https://api.z.ai/api/anthropic"),
         api_type: Some("anthropic"),
+        api_types: &[],
     },
 ];
+
+fn default_api_type_selection(info: &ProviderInfo) -> ApiTypeSelection {
+    ApiTypeSelection {
+        api_type: info.api_type,
+        base_url: info.base_url,
+    }
+}
+
+fn select_api_type(info: &ProviderInfo, raw_input: &str) -> ApiTypeSelection {
+    if info.api_types.is_empty() {
+        return default_api_type_selection(info);
+    }
+
+    let selected = if raw_input.trim().is_empty() {
+        0
+    } else {
+        match raw_input.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= info.api_types.len() => n - 1,
+            _ => 0,
+        }
+    };
+
+    let option = info.api_types[selected];
+    ApiTypeSelection {
+        api_type: option.value,
+        base_url: option.base_url.or(info.base_url),
+    }
+}
+
+fn build_config(
+    info: &ProviderInfo,
+    model: &str,
+    api_key_env: &str,
+    api_selection: ApiTypeSelection,
+) -> serde_json::Value {
+    let mut config = json!({
+        "provider": info.name,
+        "model": model,
+        "api_key_env": api_key_env
+    });
+
+    if let Some(base_url) = api_selection.base_url {
+        config["base_url"] = json!(base_url);
+    }
+    if let Some(api_type) = api_selection.api_type {
+        config["api_type"] = json!(api_type);
+    }
+
+    config
+}
 
 /// Load models from model_catalog.json, grouped by provider.
 fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
@@ -183,7 +271,7 @@ impl Executable for InitCommand {
         // Load model catalog for hints
         let catalog = load_catalog_models();
 
-        let (provider_info_idx, model, api_key_env) = if self.defaults {
+        let (provider_info_idx, model, api_key_env, api_selection) = if self.defaults {
             // Auto-detect from env vars, or prompt if none found
             let idx = detect_from_env().unwrap_or(0); // fallback to first (openai)
             let info = &PROVIDERS[idx];
@@ -195,7 +283,12 @@ impl Executable for InitCommand {
                     "anthropic" => "claude-sonnet-4-20250514".to_string(),
                     _ => "auto".to_string(),
                 });
-            (idx, default_model, info.api_key_env.to_string())
+            (
+                idx,
+                default_model,
+                info.api_key_env.to_string(),
+                default_api_type_selection(info),
+            )
         } else {
             // Interactive prompts
             println!("{}", "Configure your LLM provider".green());
@@ -245,6 +338,42 @@ impl Executable for InitCommand {
 
             let info = &PROVIDERS[idx];
 
+            let api_selection = if info.api_types.is_empty() {
+                default_api_type_selection(info)
+            } else {
+                println!();
+                println!("Available API types for {}:", info.display);
+                for (i, option) in info.api_types.iter().enumerate() {
+                    let default = if i == 0 { " - default" } else { "" };
+                    println!(
+                        "  {}. {} ({}){}",
+                        i + 1,
+                        option.display,
+                        option.description,
+                        default
+                    );
+                }
+                println!();
+                print!("Select API type [1]: ");
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let selection = select_api_type(info, &input);
+                if let Some(api_type) = selection.api_type {
+                    println!(
+                        "Selected API type: {}",
+                        api_type.to_ascii_uppercase().bold()
+                    );
+                } else {
+                    println!("Selected API type: {}", "OPENAI".bold());
+                }
+                if let Some(base_url) = selection.base_url {
+                    println!("Base URL: {base_url}");
+                }
+                selection
+            };
+
             // Model selection — show from catalog if available
             let catalog_models = catalog.get(info.name);
             let default_model = catalog_models
@@ -292,26 +421,12 @@ impl Executable for InitCommand {
                 input.trim().to_string()
             };
 
-            (idx, model, api_key_env)
+            (idx, model, api_key_env, api_selection)
         };
 
         let info = &PROVIDERS[provider_info_idx];
 
-        // Create config
-        let mut config = json!({
-            "provider": info.name,
-            "model": model,
-            "api_key_env": api_key_env
-        });
-
-        // Add base_url for providers that need it
-        if let Some(base_url) = info.base_url {
-            config["base_url"] = json!(base_url);
-        }
-        // Add api_type for non-OpenAI protocol providers
-        if let Some(api_type) = info.api_type {
-            config["api_type"] = json!(api_type);
-        }
+        let config = build_config(info, &model, &api_key_env, api_selection);
 
         // Create directory
         std::fs::create_dir_all(&config_dir)
@@ -410,5 +525,76 @@ impl Executable for InitCommand {
         println!("{}", "Ready! Run 'octos chat' to start.".green().bold());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(name: &str) -> &'static ProviderInfo {
+        PROVIDERS
+            .iter()
+            .find(|provider| provider.name == name)
+            .unwrap_or_else(|| panic!("missing provider: {name}"))
+    }
+
+    #[test]
+    fn minimax_anthropic_api_type_switches_base_url() {
+        let selection = select_api_type(provider("minimax"), "2");
+
+        assert_eq!(selection.api_type, Some("anthropic"));
+        assert_eq!(
+            selection.base_url,
+            Some("https://api.minimaxi.com/anthropic")
+        );
+    }
+
+    #[test]
+    fn minimax_blank_or_invalid_api_type_uses_openai_compatible_default() {
+        for input in ["", "0", "99", "anthropic"] {
+            let selection = select_api_type(provider("minimax"), input);
+
+            assert_eq!(selection.api_type, None);
+            assert_eq!(selection.base_url, Some("https://api.minimax.io/v1"));
+        }
+    }
+
+    #[test]
+    fn zai_default_selection_preserves_anthropic_api_type_and_base_url() {
+        let selection = default_api_type_selection(provider("zai"));
+
+        assert_eq!(selection.api_type, Some("anthropic"));
+        assert_eq!(selection.base_url, Some("https://api.z.ai/api/anthropic"));
+    }
+
+    #[test]
+    fn config_includes_api_type_when_selected() {
+        let config = build_config(
+            provider("minimax"),
+            "MiniMax-M2.7",
+            "MINIMAX_API_KEY",
+            select_api_type(provider("minimax"), "2"),
+        );
+
+        assert_eq!(config["provider"], "minimax");
+        assert_eq!(config["model"], "MiniMax-M2.7");
+        assert_eq!(config["api_key_env"], "MINIMAX_API_KEY");
+        assert_eq!(config["api_type"], "anthropic");
+        assert_eq!(config["base_url"], "https://api.minimaxi.com/anthropic");
+    }
+
+    #[test]
+    fn config_omits_api_type_for_openai_compatible_default() {
+        let config = build_config(
+            provider("minimax"),
+            "MiniMax-M2.7",
+            "MINIMAX_API_KEY",
+            select_api_type(provider("minimax"), ""),
+        );
+
+        assert_eq!(config["provider"], "minimax");
+        assert_eq!(config["base_url"], "https://api.minimax.io/v1");
+        assert!(config.get("api_type").is_none());
     }
 }
