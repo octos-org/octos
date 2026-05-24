@@ -51,6 +51,16 @@ const KNOWN_CAPTURE_BUG_PATTERNS = [
     detail: 'bottom state line rendered an animated spinner',
   },
   {
+    id: 'duplicate_spinner',
+    regex: /[\u25d0\u25d1\u25d2\u25d3].*[\u25d0\u25d1\u25d2\u25d3]/,
+    detail: 'capture rendered duplicate spinner glyphs in one row',
+  },
+  {
+    id: 'stuck_working_state',
+    regex: /^ state .*Working|Task Working|Progress .*Thinking/,
+    detail: 'final capture still shows a working/thinking state',
+  },
+  {
     id: 'removed_pane_border_overlap',
     regex: /^\u250c(Work|Progress).*\u203a|^\u250cWor \u203a|^\u250cProgress.*\u203a/,
     detail: 'input text overlapped a removed Work/Progress pane border',
@@ -91,6 +101,49 @@ const ACCEPTABLE_IDEMPOTENT_ERROR_CODES = new Set([
   'conflict',
   'profile_local_collision',
 ]);
+const CLIENT_BOOTSTRAP_METHODS = new Set([
+  'client_hello',
+  'config/capabilities/list',
+  'permission/profile/list',
+  'permission/profile/set',
+  'profile/local/create',
+  'session/hydrate',
+  'session/open',
+  'session/snapshot',
+  'session/status/read',
+  'session/workspace.get',
+  'tool/status/list',
+  'turn/interrupt',
+  'turn/start',
+]);
+const UNSUPPORTED_METHOD_RE =
+  /method not found|unsupported method|unadvertised method|unknown method|not advertised/i;
+const SECRET_PATTERNS = [
+  {
+    id: 'openai_key',
+    regex: /\bsk-[A-Za-z0-9_-]{16,}\b/g,
+  },
+  {
+    id: 'github_token',
+    regex: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g,
+  },
+  {
+    id: 'aws_access_key',
+    regex: /\bAKIA[0-9A-Z]{16}\b/g,
+  },
+  {
+    id: 'private_key',
+    regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+  },
+  {
+    id: 'bearer_token',
+    regex: /\bAuthorization:\s*Bearer\s+[A-Za-z0-9._~+/=-]{16,}/gi,
+  },
+  {
+    id: 'secret_assignment',
+    regex: /\b(?:api[_-]?key|secret|token|password)\b\s*[:=]\s*['"]?[A-Za-z0-9._~+/=-]{16,}/gi,
+  },
+];
 
 function usage() {
   return [
@@ -183,6 +236,220 @@ function makeCheck(id, passed, detail, evidence) {
     status: passed ? 'passed' : 'failed',
     detail,
     evidence,
+  };
+}
+
+function transcriptFrameEntries(artifactDir, fileName = 'appui-transcript.jsonl') {
+  const parsed = parseJsonl(artifactPath(artifactDir, fileName));
+  return {
+    parsed,
+    entries: parsed.rows
+      .map((row, index) => ({ index, row, frame: normalizeTranscriptFrame(row.value) }))
+      .filter((entry) => isPlainObject(entry.frame)),
+  };
+}
+
+function isClientRequest(entry) {
+  const direction = entry.row.value.direction;
+  if (direction === 'client_to_server' || direction === 'tx') return true;
+  if (direction === 'server_to_client' || direction === 'server_to_client_non_json' || direction === 'rx') {
+    return false;
+  }
+  return typeof entry.frame.method === 'string' && Object.prototype.hasOwnProperty.call(entry.frame, 'id');
+}
+
+function frameErrorText(frame) {
+  if (!isPlainObject(frame?.error)) return '';
+  return [
+    frame.error.code,
+    frame.error.message,
+    frame.error.data?.kind,
+    frame.error.data?.code,
+    frame.error.data?.message,
+  ]
+    .filter((value) => value !== undefined && value !== null)
+    .map(String)
+    .join(' ');
+}
+
+function collectAdvertisedMethods(value, out = new Set()) {
+  if (Array.isArray(value)) {
+    for (const item of value) collectAdvertisedMethods(item, out);
+    return out;
+  }
+  if (!isPlainObject(value)) {
+    if (typeof value === 'string' && value.includes('/')) out.add(value);
+    return out;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      ['method', 'methods', 'supported_methods', 'supportedMethods', 'rpc_methods', 'rpcMethods'].includes(key)
+    ) {
+      collectAdvertisedMethods(child, out);
+      continue;
+    }
+    if (key === 'capabilities') {
+      collectAdvertisedMethods(child, out);
+      continue;
+    }
+    if (isPlainObject(child) || Array.isArray(child)) collectAdvertisedMethods(child, out);
+  }
+  return out;
+}
+
+function summarySkipsRunValidators(artifactDir) {
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (!summary.ok) return false;
+  return ['blocked', 'skipped', 'quarantined'].includes(summary.value.status);
+}
+
+function scenarioFinalMarkers(scenario) {
+  if (!scenario.ok) return [];
+  return [
+    scenario.value.final_marker,
+    scenario.value.finalMarker,
+    scenario.value.expected_final_marker,
+  ]
+    .filter((value) => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim());
+}
+
+function scenarioAcceptance(scenario) {
+  if (!scenario.ok || !Array.isArray(scenario.value.acceptance)) return [];
+  return scenario.value.acceptance.filter((value) => typeof value === 'string');
+}
+
+function containsMarker(text, marker) {
+  const normalizedText = text.replaceAll('_', '');
+  const normalizedMarker = marker.replaceAll('_', '');
+  return text.includes(marker) || normalizedText.includes(normalizedMarker);
+}
+
+function lineContainsVisibleMarker(line, marker) {
+  if (/^\s*[›>]/.test(line) || /finish with|send one short prompt/i.test(line)) return false;
+  return containsMarker(line, marker);
+}
+
+function textContainsVisibleMarker(text, marker) {
+  return text.split('\n').some((line) => lineContainsVisibleMarker(line, marker));
+}
+
+function collectArtifactFileNames(artifactDir) {
+  if (!fs.existsSync(artifactDir) || !fs.statSync(artifactDir).isDirectory()) return [];
+  return fs
+    .readdirSync(artifactDir)
+    .filter((name) => {
+      const file = artifactPath(artifactDir, name);
+      return fs.existsSync(file) && fs.statSync(file).isFile();
+    })
+    .sort();
+}
+
+function regionForLine(id, role, rows, index, detail = null) {
+  if (index < 0 || index >= rows.length) return null;
+  return {
+    id,
+    role,
+    start_row: index + 1,
+    end_row: index + 1,
+    max_width: codepointLength(rows[index]),
+    detail,
+  };
+}
+
+function regionForRange(id, role, rows, start, end, detail = null) {
+  if (start < 0 || end < start || start >= rows.length) return null;
+  const boundedEnd = Math.min(end, rows.length - 1);
+  const slice = rows.slice(start, boundedEnd + 1);
+  return {
+    id,
+    role,
+    start_row: start + 1,
+    end_row: boundedEnd + 1,
+    max_width: slice.reduce((max, line) => Math.max(max, codepointLength(line)), 0),
+    detail,
+  };
+}
+
+function buildTerminalLayoutSnapshot(artifactDir) {
+  const terminal = readJson(artifactPath(artifactDir, 'terminal-size.json'));
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  const markers = scenarioFinalMarkers(scenario);
+  const cursorSamplesPath = artifactPath(artifactDir, 'tmux-cursor-samples.jsonl');
+  const cursorSamples = fs.existsSync(cursorSamplesPath)
+    ? parseJsonl(cursorSamplesPath)
+    : null;
+  const base = {
+    schema: 'octos.ux.terminal_layout_snapshot.v1',
+    source: 'tui-capture.txt',
+    terminal: terminal.ok
+      ? { cols: terminal.value.cols, rows: terminal.value.rows }
+      : { cols: null, rows: null },
+    capture: {
+      line_count: 0,
+      max_width: 0,
+    },
+    cursor_samples: cursorSamples
+      ? {
+        source: 'tmux-cursor-samples.jsonl',
+        count: cursorSamples.rows.length,
+        latest: cursorSamples.rows.at(-1)?.value ?? null,
+        errors: cursorSamples.errors,
+      }
+      : null,
+    regions: [],
+  };
+  if (!capture.ok) {
+    return {
+      ...base,
+      status: 'unavailable',
+      detail: `tui-capture.txt could not be read: ${capture.error}`,
+    };
+  }
+
+  const rows = captureLines(capture.text);
+  const maxWidth = rows.reduce((max, line) => Math.max(max, codepointLength(line)), 0);
+  const regions = [];
+  const push = (region) => {
+    if (region) regions.push(region);
+  };
+  const firstContent = rows.findIndex((line) => line.trim().length > 0);
+  const composer = rows.findIndex((line) => /Composer/i.test(line));
+  const status = rows.findIndex((line) => /(^|\s)state\b/i.test(line));
+  const messages = rows.findIndex((line) => /\bMessages\b/i.test(line));
+  const menu = rows.findIndex((line) => /Update Model Permissions|Set Up LLM Provider|Load provider catalog/i.test(line));
+  const approval = rows.findIndex((line) => /Approval Requested|approval denied|denied by client/i.test(line));
+  const task = rows.findIndex((line) => /Agent task|Subagents|Task Working|Progress .*Thinking|Scatter-join/i.test(line));
+  const finalAnswer = rows.findIndex((line) => (
+    markers.some((marker) => lineContainsVisibleMarker(line, marker))
+    || /Assistant:|Final answer|Done\b|completed\./i.test(line)
+  ));
+
+  if (firstContent >= 0) push(regionForLine('first_content', 'history', rows, firstContent));
+  if (messages >= 0 && composer > messages) {
+    push(regionForRange('history', 'history', rows, messages, composer - 1));
+  } else if (composer > 0) {
+    push(regionForRange('history', 'history', rows, 0, composer - 1));
+  }
+  if (composer >= 0) {
+    const composerEnd = status > composer ? status - 1 : composer;
+    push(regionForRange('composer', 'composer', rows, composer, composerEnd));
+  }
+  if (status >= 0) push(regionForLine('status', 'status', rows, status));
+  if (menu >= 0) push(regionForLine('menu', 'menu', rows, menu));
+  if (approval >= 0) push(regionForLine('approval_prompt', 'approval_prompt', rows, approval));
+  if (task >= 0) push(regionForLine('task_output', 'task_output', rows, task));
+  if (finalAnswer >= 0) push(regionForLine('final_answer', 'final_answer', rows, finalAnswer));
+
+  return {
+    ...base,
+    status: 'captured',
+    capture: {
+      line_count: rows.length,
+      max_width: maxWidth,
+    },
+    regions,
   };
 }
 
@@ -585,6 +852,89 @@ function checkAppuiTranscriptSemantic(artifactDir) {
   );
 }
 
+function checkCapabilitiesBeforeFollowups(artifactDir) {
+  const { parsed, entries } = transcriptFrameEntries(artifactDir);
+  const problems = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
+  let capabilitiesIndex = -1;
+  let firstFollowup = null;
+
+  for (const entry of entries) {
+    const frame = entry.frame;
+    const method = frame.method;
+    const result = frame.result;
+    if (
+      method === 'config/capabilities/list'
+      || (isPlainObject(result) && Array.isArray(result.capabilities))
+      || (isPlainObject(result) && isPlainObject(result.capabilities))
+    ) {
+      if (capabilitiesIndex === -1) capabilitiesIndex = entry.index;
+    }
+    if (
+      isClientRequest(entry)
+      && typeof method === 'string'
+      && method !== 'client_hello'
+      && method !== 'config/capabilities/list'
+      && firstFollowup === null
+    ) {
+      firstFollowup = { index: entry.index, method, line: entry.row.line };
+    }
+  }
+
+  if (firstFollowup && (capabilitiesIndex === -1 || capabilitiesIndex > firstFollowup.index)) {
+    problems.push(
+      `first follow-up method ${firstFollowup.method} at line ${firstFollowup.line} occurred before capabilities were advertised`,
+    );
+  }
+
+  return makeCheck(
+    'capabilities_before_followups',
+    problems.length === 0,
+    problems.length === 0
+      ? firstFollowup
+        ? `capability evidence appears before first follow-up method ${firstFollowup.method}`
+        : 'no follow-up AppUI method was called before capabilities evidence was available'
+      : `capability ordering problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
+function checkNoUnadvertisedMethodsCalled(artifactDir) {
+  const { parsed, entries } = transcriptFrameEntries(artifactDir);
+  const problems = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
+  const advertised = new Set(CLIENT_BOOTSTRAP_METHODS);
+  for (const entry of entries) {
+    if (Object.prototype.hasOwnProperty.call(entry.frame, 'result')) {
+      collectAdvertisedMethods(entry.frame.result, advertised);
+    }
+  }
+
+  const calledMethods = [];
+  for (const entry of entries) {
+    if (isClientRequest(entry) && typeof entry.frame.method === 'string') {
+      calledMethods.push({ method: entry.frame.method, line: entry.row.line });
+    }
+    const errorText = frameErrorText(entry.frame);
+    if (UNSUPPORTED_METHOD_RE.test(errorText)) {
+      problems.push(`line ${entry.row.line}: transcript contains unsupported-method error response`);
+    }
+  }
+
+  for (const call of calledMethods) {
+    if (!advertised.has(call.method)) {
+      problems.push(`line ${call.line}: method ${call.method} was called before it was advertised or allowed`);
+    }
+  }
+
+  return makeCheck(
+    'no_unadvertised_methods_called',
+    problems.length === 0,
+    problems.length === 0
+      ? `${calledMethods.length} client method call(s) were advertised or bootstrap-allowed`
+      : `unadvertised method problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
 function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
   const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
   const scenarioId = scenario.ok
@@ -643,6 +993,53 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
       ? 'tui-capture*.txt and server.log do not match known tmux UX bug patterns'
       : `known rendered-screen bug patterns found: ${problems.join('; ')}`,
     [...captureNames, 'server.log'],
+  );
+}
+
+function checkTerminalLayoutSnapshot(artifactDir) {
+  if (summarySkipsRunValidators(artifactDir)) {
+    return makeCheck(
+      'terminal_layout_snapshot',
+      true,
+      'terminal layout snapshot is not required for blocked/skipped/quarantined summaries',
+      ['summary.json'],
+    );
+  }
+
+  const snapshot = buildTerminalLayoutSnapshot(artifactDir);
+  const problems = [];
+  if (snapshot.status !== 'captured') {
+    problems.push(snapshot.detail || 'layout snapshot was not captured');
+  }
+  if (snapshot.cursor_samples?.errors?.length > 0) {
+    problems.push(`tmux cursor sample parse errors: ${snapshot.cursor_samples.errors
+      .map((entry) => `line ${entry.line}: ${entry.error}`)
+      .join('; ')}`);
+  }
+  const cols = Number(snapshot.terminal.cols);
+  const rows = Number(snapshot.terminal.rows);
+  if (!Number.isFinite(cols) || cols <= 0 || !Number.isFinite(rows) || rows <= 0) {
+    problems.push('terminal dimensions are missing or invalid');
+  } else {
+    if (snapshot.capture.max_width > cols) {
+      problems.push(`capture max width ${snapshot.capture.max_width} exceeds terminal cols ${cols}`);
+    }
+    if (snapshot.capture.line_count > rows) {
+      problems.push(`capture row count ${snapshot.capture.line_count} exceeds terminal rows ${rows}`);
+    }
+  }
+  const regionIds = new Set(snapshot.regions.map((region) => region.id));
+  for (const id of ['history', 'composer', 'status']) {
+    if (!regionIds.has(id)) problems.push(`layout snapshot missing ${id} region`);
+  }
+
+  return makeCheck(
+    'terminal_layout_snapshot',
+    problems.length === 0,
+    problems.length === 0
+      ? `captured ${snapshot.regions.length} terminal layout region(s)`
+      : `terminal layout snapshot problems: ${problems.join('; ')}`,
+    ['terminal-size.json', 'tui-capture.txt', 'tmux-cursor-samples.jsonl'],
   );
 }
 
@@ -706,6 +1103,113 @@ function checkScreenGeometryConsistent(artifactDir) {
       ? `capture fits declared terminal size ${cols}x${rows} with max width ${maxWidth} and ${lines.length} row(s)`
       : `screen geometry problems: ${problems.join('; ')}`,
     ['terminal-size.json', 'tui-capture.txt'],
+  );
+}
+
+function checkFinalAnswerVisible(artifactDir) {
+  if (summarySkipsRunValidators(artifactDir)) {
+    return makeCheck(
+      'final_answer_visible',
+      true,
+      'final-answer visibility is not required for blocked/skipped/quarantined summaries',
+      ['summary.json'],
+    );
+  }
+
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  const markers = scenarioFinalMarkers(scenario);
+  const acceptance = scenarioAcceptance(scenario);
+  const isRequired = markers.length > 0 || acceptance.includes('final_answer_visible');
+  if (!isRequired) {
+    return makeCheck(
+      'final_answer_visible',
+      true,
+      'final-answer visibility is not required for this scenario',
+      ['scenario.json'],
+    );
+  }
+
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const problems = [];
+  if (!capture.ok) {
+    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  } else if (markers.length > 0) {
+    for (const marker of markers) {
+      if (!textContainsVisibleMarker(capture.text, marker)) {
+        problems.push(`capture is missing final marker ${marker}`);
+      }
+    }
+  } else if (!/Assistant:|Final answer|Done\b|completed\./i.test(capture.text)) {
+    problems.push('capture does not show a visible assistant/final-answer line');
+  }
+
+  return makeCheck(
+    'final_answer_visible',
+    problems.length === 0,
+    problems.length === 0
+      ? 'final answer or declared final marker is visible in the terminal capture'
+      : `final-answer visibility problems: ${problems.join('; ')}`,
+    ['scenario.json', 'tui-capture.txt'],
+  );
+}
+
+function checkComposerUsable(artifactDir) {
+  if (summarySkipsRunValidators(artifactDir)) {
+    return makeCheck(
+      'composer_usable',
+      true,
+      'composer usability is not required for blocked/skipped/quarantined summaries',
+      ['summary.json'],
+    );
+  }
+
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const problems = [];
+  if (!capture.ok) {
+    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  } else {
+    if (!/Composer/i.test(capture.text)) problems.push('capture is missing the Composer region');
+    if (!/(^|\n)[^\n]*(›|>|Ask Octos|Enter send)[^\n]*/.test(capture.text)) {
+      problems.push('capture is missing a composer prompt or send affordance');
+    }
+  }
+
+  return makeCheck(
+    'composer_usable',
+    problems.length === 0,
+    problems.length === 0
+      ? 'composer region and input affordance are visible'
+      : `composer usability problems: ${problems.join('; ')}`,
+    ['tui-capture.txt'],
+  );
+}
+
+function checkSecretRedaction(artifactDir) {
+  const names = collectArtifactFileNames(artifactDir);
+  const offenders = [];
+  for (const name of names) {
+    const file = artifactPath(artifactDir, name);
+    let text = '';
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const pattern of SECRET_PATTERNS) {
+      pattern.regex.lastIndex = 0;
+      if (pattern.regex.test(text)) {
+        offenders.push(`${name}:${pattern.id}`);
+      }
+    }
+  }
+
+  return makeCheck(
+    'secret_redaction',
+    offenders.length === 0,
+    offenders.length === 0
+      ? `scanned ${names.length} retained artifact file(s) without raw secret-shaped values`
+      : `raw secret-shaped values found in retained artifacts: ${offenders.join(', ')}`,
+    names.length > 0 ? names : REQUIRED_ARTIFACTS,
   );
 }
 
@@ -1280,22 +1784,30 @@ function checkLowerSoakSummary(artifactDir) {
   );
 }
 
+const VALIDATOR_REGISTRY = [
+  ['artifact_abi', checkArtifactAbi],
+  ['appui_transcript_parseable', checkAppuiTranscriptParseable],
+  ['capabilities_before_followups', checkCapabilitiesBeforeFollowups],
+  ['no_unadvertised_methods_called', checkNoUnadvertisedMethodsCalled],
+  ['real_tmux_evidence', checkRealTmuxEvidence],
+  ['appui_transcript_semantic', checkAppuiTranscriptSemantic],
+  ['rendered_screen_no_known_bug_patterns', checkRenderedScreenNoKnownBugPatterns],
+  ['terminal_layout_snapshot', checkTerminalLayoutSnapshot],
+  ['screen_geometry_consistent', checkScreenGeometryConsistent],
+  ['final_answer_visible', checkFinalAnswerVisible],
+  ['composer_usable', checkComposerUsable],
+  ['secret_redaction', checkSecretRedaction],
+  ['permission_selection_visible_contract', checkPermissionSelectionScenario],
+  ['provider_missing_visible_contract', checkProviderMissingScenario],
+  ['approval_denial_visible_contract', checkApprovalDenialScenario],
+  ['task_subagent_tree_visible_contract', checkTaskSubagentTreeScenario],
+  ['restart_reconnect_visible_contract', checkRestartReconnectScenario],
+  ['dropped_completion_backpressure_contract', checkDroppedCompletionBackpressureScenario],
+  ['lower_soak_summary_semantic', checkLowerSoakSummary],
+];
+
 function buildValidation(artifactDir) {
-  const checks = [
-    checkArtifactAbi(artifactDir),
-    checkAppuiTranscriptParseable(artifactDir),
-    checkRealTmuxEvidence(artifactDir),
-    checkAppuiTranscriptSemantic(artifactDir),
-    checkRenderedScreenNoKnownBugPatterns(artifactDir),
-    checkScreenGeometryConsistent(artifactDir),
-    checkPermissionSelectionScenario(artifactDir),
-    checkProviderMissingScenario(artifactDir),
-    checkApprovalDenialScenario(artifactDir),
-    checkTaskSubagentTreeScenario(artifactDir),
-    checkRestartReconnectScenario(artifactDir),
-    checkDroppedCompletionBackpressureScenario(artifactDir),
-    checkLowerSoakSummary(artifactDir),
-  ];
+  const checks = VALIDATOR_REGISTRY.map(([, validator]) => validator(artifactDir));
   const failures = checks
     .filter((check) => check.status === 'failed')
     .map((check) => ({
@@ -1306,6 +1818,8 @@ function buildValidation(artifactDir) {
   return {
     schema: VALIDATION_SCHEMA,
     status: failures.length === 0 ? 'passed' : 'failed',
+    validators: VALIDATOR_REGISTRY.map(([id]) => id),
+    layout_snapshot: buildTerminalLayoutSnapshot(artifactDir),
     checks,
     failures,
   };

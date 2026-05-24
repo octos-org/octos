@@ -24,6 +24,7 @@
     "test:live:coding": "npx playwright test tests/coding-hardcases.spec.ts",
     "ux:tmux:run": "node scripts/ux-tmux-run.mjs",
     "ux:tmux:validate": "node scripts/ux-tmux-validate.mjs",
+    "ux:tmux:validate:test": "node --test tests/ux/tmux-validate.test.mjs",
     "soak:m14:codex-tool-parity": "node scripts/m14-codex-tool-parity-soak.mjs",
     "soak:m18:appui-transport-parity": "node scripts/m18-appui-transport-parity-soak.mjs",
     "matrix": "node matrix/run.mjs",
