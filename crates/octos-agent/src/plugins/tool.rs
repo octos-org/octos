@@ -910,13 +910,36 @@ impl PluginTool {
             ctx.and_then(|c| c.session_scope.as_ref()).map(|scope| {
                 match self.work_dir.as_deref() {
                     Some(wd) if !wd.starts_with(scope.workspace()) && wd.is_absolute() => {
-                        match SessionScope::solo(wd.to_path_buf(), vec![]) {
+                        // Codex round-5 P1 fix: real hinted bootstrap
+                        // rebinds `self.work_dir` to
+                        // `<hint>/skill-output`, so rooting the
+                        // ad-hoc scope at `wd` directly would
+                        // surrender the legacy workspace-root rescue
+                        // (`script_path: "script.md"` with the file
+                        // at `<hint>/script.md` would now resolve to
+                        // `<hint>/skill-output/script.md` and miss).
+                        // Promote the parent dir as the ad-hoc scope
+                        // root when `wd` looks like the standard
+                        // skill-output subdir so the workspace-root
+                        // rescue keeps working. Absolute escapes
+                        // (`/etc/passwd`) still Err because the
+                        // parent is the hinted workspace root, not
+                        // `/`.
+                        let adhoc_root = if wd.file_name().and_then(|s| s.to_str())
+                            == Some("skill-output")
+                        {
+                            wd.parent().unwrap_or(wd).to_path_buf()
+                        } else {
+                            wd.to_path_buf()
+                        };
+                        match SessionScope::solo(adhoc_root.clone(), vec![]) {
                             Ok(adhoc) => Arc::new(adhoc),
                             Err(err) => {
                                 tracing::warn!(
                                     plugin = %self.plugin_name,
                                     tool = %self.tool_def.name,
                                     work_dir = %wd.display(),
+                                    adhoc_root = %adhoc_root.display(),
                                     error = %err,
                                     "ad-hoc scope construction failed; falling back to session scope (validation may refuse legitimate hinted paths)"
                                 );
@@ -4729,6 +4752,57 @@ mod tests {
             std::path::Path::new(cwd),
             &scope_workspace,
             "approval cwd MUST reflect the effective work dir (scope.workspace() when scope-only)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn plugin_rescues_workspace_root_under_hinted_skill_output_rebind() {
+        // Codex round-5 P1 pin (Phase 2-B): real hinted bootstrap
+        // rebinds `self.work_dir = <hint>/skill-output`. The
+        // workspace-root rescue (LLM passes `script_path: "script.md"`
+        // when the file is at `<hint>/script.md`) must still resolve.
+        // Round-4 rooted the ad-hoc scope at `wd` directly, which
+        // surrendered that rescue; round-5 promotes the parent dir
+        // when `wd` ends in `skill-output`.
+        let hint = tempfile::tempdir().expect("hint");
+        let skill_output = hint.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        // The script lives at the hinted workspace ROOT, not inside
+        // `skill-output/` (mirrors the soak workflow where write_file
+        // lands the script at the workspace root).
+        let script = hint.path().join("script.md");
+        std::fs::write(&script, b"# podcast script").unwrap();
+
+        let scope_workspace = tempfile::tempdir().expect("scope workspace");
+        let scope = solo_scope_at(scope_workspace.path());
+
+        let bin = tempfile::tempdir().expect("bin");
+        let bin_path = bin.path().join("script.sh");
+        // The plugin echoes the script_path it received so the test
+        // can inspect the rewrite.
+        write_test_script(
+            &bin_path,
+            "#!/bin/sh\nINPUT=$(cat)\nVALUE=$(echo \"$INPUT\" | sed -n 's/.*\"script_path\":\"\\([^\"]*\\)\".*/\\1/p')\nprintf '{\"output\":\"%s\",\"success\":true}' \"$VALUE\"\n",
+        );
+        let tool = PluginTool::new("plug".into(), input_path_def("script_path"), bin_path)
+            .with_work_dir(skill_output.clone())
+            .with_timeout(Duration::from_secs(5));
+
+        let ctx = ctx_with_scope(scope);
+        let result = crate::tools::TOOL_CTX
+            .scope(ctx, tool.execute(&json!({"script_path": "script.md"})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success, "hinted workspace-root rescue must succeed");
+        let echoed_path = result.output.trim();
+        let echoed_canon = std::fs::canonicalize(echoed_path).expect("echoed path resolves");
+        let expected_canon = std::fs::canonicalize(&script).expect("script resolves");
+        assert_eq!(
+            echoed_canon, expected_canon,
+            "rescue must promote `<hint>/script.md` (the parent rescue), \
+             NOT rewrite to `<hint>/skill-output/script.md`"
         );
     }
 
