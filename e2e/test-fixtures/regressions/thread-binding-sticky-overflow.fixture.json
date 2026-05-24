@@ -1,0 +1,78 @@
+{
+  "schema": "octos.thread-binding-regression.v1",
+  "name": "sticky-map-three-user-overflow",
+  "records": [
+    {
+      "role": "user",
+      "content": "slow research",
+      "at_ms": 0,
+      "client_message_id": "cmid-1",
+      "thread_id": "cmid-1"
+    },
+    {
+      "role": "user",
+      "content": "stock query",
+      "at_ms": 1500,
+      "client_message_id": "cmid-2",
+      "thread_id": "cmid-2"
+    },
+    {
+      "role": "user",
+      "content": "voice list",
+      "at_ms": 3000,
+      "client_message_id": "cmid-3",
+      "thread_id": "cmid-3"
+    },
+    {
+      "role": "assistant",
+      "content": "voice answer",
+      "at_ms": 4200,
+      "response_to_client_message_id": "cmid-3",
+      "thread_id": "cmid-3"
+    },
+    {
+      "role": "tool",
+      "content": "deep research stock result",
+      "at_ms": 9000,
+      "response_to_client_message_id": "cmid-2",
+      "thread_id": "cmid-3"
+    },
+    {
+      "role": "assistant",
+      "content": "stock answer",
+      "at_ms": 11000,
+      "response_to_client_message_id": "cmid-2",
+      "thread_id": "cmid-3"
+    },
+    {
+      "role": "assistant",
+      "content": "slow research final",
+      "at_ms": 20000,
+      "response_to_client_message_id": "cmid-1",
+      "thread_id": "cmid-3"
+    }
+  ],
+  "expected_violations": [
+    {
+      "record_index": 4,
+      "role": "tool",
+      "expected_thread_id": "cmid-2",
+      "actual_thread_id": "cmid-3",
+      "response_to_client_message_id": "cmid-2"
+    },
+    {
+      "record_index": 5,
+      "role": "assistant",
+      "expected_thread_id": "cmid-2",
+      "actual_thread_id": "cmid-3",
+      "response_to_client_message_id": "cmid-2"
+    },
+    {
+      "record_index": 6,
+      "role": "assistant",
+      "expected_thread_id": "cmid-1",
+      "actual_thread_id": "cmid-3",
+      "response_to_client_message_id": "cmid-1"
+    }
+  ]
+}

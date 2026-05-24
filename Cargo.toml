@@ -193,6 +193,7 @@ tower = { version = "0.5", features = ["util"] }
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
+proptest = "1.11"
 
 # -- Release configuration --------------------------------------------------
 [workspace.metadata.release]

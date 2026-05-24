@@ -8,6 +8,7 @@
   "scripts": {
     "test": "npx playwright test",
     "test:headed": "npx playwright test --headed",
+    "test:property:thread-binding": "npx playwright test --workers=1 tests/property/thread-binding.property.ts",
     "test:m9-protocol": "npx playwright test --workers=1 tests/m9-protocol-*.spec.ts",
     "test:m9-protocol:list": "npx playwright test --list tests/m9-protocol-*.spec.ts",
     "test:tmux:m9-protocol": "cd .. && bash e2e/tmux/run.sh m9-protocol",

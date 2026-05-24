@@ -24,9 +24,7 @@ Thumbs.db
 node_modules/
 
 # Playwright/tmux test artifacts
-e2e/test-results/
-e2e/test-results-tmux/
-e2e/test-results-ux/
+e2e/test-results*/
 
 # Dashboard build output.
 #
@@ -130,4 +128,3 @@ scripts/deploy.sh
 !e2e/fixtures/compat-test-skill/manifest.json
 !e2e/fixtures/compat-test-skill/main
 tsconfig.tsbuildinfo
-e2e/test-results-matrix/
