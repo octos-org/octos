@@ -222,18 +222,28 @@ impl Tool for ShellTool {
             serde_json::from_value(args.clone()).wrap_err("invalid shell tool input")?;
 
         // Phase 2-D of the SessionScope migration: when the host has
-        // threaded a scope through `ToolContext`, use `scope.workspace()`
-        // as the child process CWD so every tool in the session shares
-        // the single filesystem contract. Without a scope (e.g.
-        // `octos chat`, unit tests, legacy callers) we keep the
-        // construction-time `self.cwd` byte-for-byte so behaviour is
-        // unchanged. The same effective CWD also feeds the
-        // `CommandPolicy::check` call so a policy that consults the
-        // working directory sees a consistent value with what the child
-        // process will observe.
+        // threaded a scope through `ToolContext`, prefer the scope's
+        // workspace so every tool in the session shares the single
+        // filesystem contract.
+        //
+        // Codex P1 (round-1, this PR): respect a hinted workspace
+        // override. `SessionRuntime` builds `session_scope` from
+        // `<data_dir>/users/<id>/workspace` independent of any
+        // `workspace_hint` supplied by the coding-agent flow, while
+        // the registry rebinds every tool's `cwd` to the *hinted*
+        // workspace via `with_workspace_root`. If `self.cwd` differs
+        // from `scope.workspace()`, the caller deliberately pointed
+        // this tool at a different workspace — honour that and keep
+        // `self.cwd`. Otherwise the migration is a no-op for the
+        // hinted-coding-agent path until Phase 3 reconciles
+        // SessionScope construction with the hinted workspace.
+        //
+        // The same effective CWD also feeds the `CommandPolicy::check`
+        // call so a policy that consults the working directory sees a
+        // consistent value with what the child process will observe.
         let effective_cwd: &Path = match ctx.session_scope.as_ref() {
-            Some(scope) => scope.workspace(),
-            None => &self.cwd,
+            Some(scope) if scope.workspace() == self.cwd.as_path() => scope.workspace(),
+            _ => &self.cwd,
         };
 
         // Check policy first
@@ -609,17 +619,23 @@ mod tests {
 
     #[tokio::test]
     async fn shell_uses_scope_workspace_when_present() {
-        // When the host has threaded a `SessionScope` onto `ToolContext`,
-        // the child process must run with CWD == `scope.workspace()` even
-        // though the `ShellTool` was constructed with a different
-        // legacy `cwd`. Without this the scope/no-scope sessions diverge
-        // and shell-spawned subprocesses can escape the session contract.
-        let scope_dir = tempfile::tempdir().unwrap();
-        let legacy_dir = tempfile::tempdir().unwrap();
+        // When the host has threaded a `SessionScope` onto `ToolContext`
+        // AND the scope's workspace matches the tool's construction-time
+        // `cwd` (the production wiring in
+        // `octos-cli/src/runtime/session.rs`: both derive from
+        // `<data_dir>/users/<id>/workspace`), the child process runs
+        // with CWD == `scope.workspace()`. This is the load-bearing
+        // case for multi-tenant SPA sessions.
+        let workspace = tempfile::tempdir().unwrap();
+        let canonical_workspace =
+            std::fs::canonicalize(workspace.path()).expect("canonicalise workspace");
 
-        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
+        // Both scope and ShellTool are constructed with the same
+        // workspace (the production wiring), so the migration takes
+        // effect and the child process sees the scope workspace.
+        let scope = octos_core::SessionScope::solo(canonical_workspace.clone(), vec![])
             .expect("scope construction");
-        let tool = ShellTool::new(legacy_dir.path());
+        let tool = ShellTool::new(&canonical_workspace);
         let ctx = ctx_with_scope(scope);
 
         let result = tool
@@ -628,28 +644,64 @@ mod tests {
             .unwrap();
         assert!(result.success, "expected success, got: {}", result.output);
 
-        // The child process should report the scope workspace, not the
-        // legacy `ShellTool::new` CWD. Canonicalise both sides so the
-        // assertion is robust to /var → /private/var symlinks on macOS.
-        let canonical_scope =
-            std::fs::canonicalize(scope_dir.path()).expect("canonicalise scope dir");
-        let canonical_legacy =
-            std::fs::canonicalize(legacy_dir.path()).expect("canonicalise legacy dir");
-
         assert!(
             result
                 .output
-                .contains(&canonical_scope.to_string_lossy().to_string()),
+                .contains(&canonical_workspace.to_string_lossy().to_string()),
             "expected scope workspace ({}) in shell output, got: {}",
-            canonical_scope.display(),
+            canonical_workspace.display(),
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_respects_hinted_workspace_over_session_scope_default() {
+        // Codex P1 regression: when the registry's tools were rebound
+        // to a hinted workspace (`workspace_hint` flow,
+        // `with_workspace_root` in `runtime/session.rs`) but
+        // `SessionScope` was built from the canonical
+        // `<data_dir>/users/<id>/workspace` (i.e. NOT the hint), the
+        // shell tool must honour the hinted `self.cwd` rather than
+        // silently relocating the child process into the default
+        // data-dir workspace. Without this guard, coding-agent
+        // sessions would run builds/tests in the wrong directory.
+        let hinted = tempfile::tempdir().unwrap();
+        let default_scope_workspace = tempfile::tempdir().unwrap();
+        let canonical_hinted = std::fs::canonicalize(hinted.path()).expect("canonicalise hinted");
+        let canonical_default_scope = std::fs::canonicalize(default_scope_workspace.path())
+            .expect("canonicalise default scope workspace");
+        assert_ne!(canonical_hinted, canonical_default_scope);
+
+        let scope = octos_core::SessionScope::solo(canonical_default_scope.clone(), vec![])
+            .expect("scope construction");
+        // ShellTool is rebound to the HINTED workspace, while the
+        // scope still points at the default — exactly the M11
+        // workspace_hint code path.
+        let tool = ShellTool::new(&canonical_hinted);
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": PWD_COMMAND}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+
+        // The hinted workspace must win — pre-fix this would have
+        // contained the default scope workspace instead.
+        assert!(
+            result
+                .output
+                .contains(&canonical_hinted.to_string_lossy().to_string()),
+            "expected hinted workspace ({}) in shell output, got: {}",
+            canonical_hinted.display(),
             result.output
         );
         assert!(
             !result
                 .output
-                .contains(&canonical_legacy.to_string_lossy().to_string()),
-            "legacy cwd ({}) leaked into shell output: {}",
-            canonical_legacy.display(),
+                .contains(&canonical_default_scope.to_string_lossy().to_string()),
+            "default scope workspace ({}) leaked into shell output: {}",
+            canonical_default_scope.display(),
             result.output
         );
     }
