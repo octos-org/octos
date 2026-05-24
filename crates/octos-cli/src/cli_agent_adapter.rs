@@ -169,7 +169,7 @@ impl CliAgentProcess {
         }
         command.envs(&config.env);
 
-        let mut child = command.spawn()?;
+        let mut child = spawn_child_with_text_file_busy_retry(&mut command)?;
         let stdout = child
             .stdout
             .take()
@@ -269,6 +269,37 @@ pub async fn run_cli_agent_command(config: CliAgentCommandConfig) -> Result<CliA
 fn exit_termination(status: ExitStatus) -> CliAgentTermination {
     CliAgentTermination::Exited {
         code: status.code(),
+    }
+}
+
+fn spawn_child_with_text_file_busy_retry(command: &mut Command) -> std::io::Result<Child> {
+    const MAX_ATTEMPTS: usize = 5;
+
+    let mut delay = Duration::from_millis(10);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match command.spawn() {
+            Err(error) if attempt < MAX_ATTEMPTS && is_text_file_busy(&error) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+
+    unreachable!("spawn retry loop returns on the final attempt")
+}
+
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        const ETXTBSY: i32 = 26;
+        error.raw_os_error() == Some(ETXTBSY)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
     }
 }
 
