@@ -3,6 +3,7 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -871,43 +872,63 @@ impl PluginTool {
         }
 
         // Phase 2-B (SessionScope migration, PR #1198 follow-up):
-        // route through `rewrite_args_with_scope` whenever the scope
-        // and the construction-time work_dir agree on a single root.
-        // The scope's `classify_lexical_path` collapses the 4-round
-        // #1186 traversal hardening + the #1189 workspace-root rescue
-        // + the bespoke `resolve_plugin_input_path` /
+        // every scoped session funnels through `rewrite_args_with_scope`,
+        // even when the registry rebound `self.work_dir` to a path
+        // that the session's actual `SessionScope` doesn't enclose
+        // (the hinted-workspace case codex round-3 P1 flagged). The
+        // scope's `classify_lexical_path` collapses the 4-round #1186
+        // traversal hardening + the #1189 workspace-root rescue + the
+        // bespoke `resolve_plugin_input_path` /
         // `absolutize_path_in_work_dir` /
         // `resolve_slides_style_in_work_dir` validators into one gate.
         //
-        // Routing policy (codex rounds 1+2+3):
+        // Routing policy (codex rounds 1+2+3+4):
         // - Scope absent: legacy rewriter (un-scoped fleet binaries,
         //   gateway sessions whose ids fail `is_safe_session_id`, all
         //   pre-Phase-1 callers).
         // - Scope present AND `self.work_dir` lives inside
         //   `scope.workspace()` (the typical un-hinted rebind: the
-        //   registry rebound `<scope.workspace>/skill-output`):
-        //   scope-aware rewriter. The rebound `self.work_dir` is the
-        //   join base for relative paths AND the rescue scan root
-        //   (so `script_path: "skill-output/foo"` still resolves
-        //   after the redundant-prefix strip).
+        //   registry rebound `<scope.workspace>/skill-output`): use
+        //   the session scope directly. The rebound `self.work_dir`
+        //   is the join base AND the rescue scan root.
         // - Scope present AND `self.work_dir` lives OUTSIDE
-        //   `scope.workspace()` (the hinted-workspace path inside
-        //   `SessionRuntime::bootstrap` where the scope is still the
-        //   profile default but the registry rebound a hint): the
-        //   scope is meaningless for this session because its
-        //   `workspace` isn't where the plugin actually runs. Fall
-        //   back to the legacy rewriter so hinted coding-agent
-        //   sessions keep working. A follow-up will reconcile
+        //   `scope.workspace()` (the hinted-workspace path in
+        //   `SessionRuntime::bootstrap` where scope is still the
+        //   profile default but registry rebound a hint): substitute
+        //   an AD-HOC solo scope rooted at `self.work_dir` so the
+        //   plugin's read/write boundary still holds (absolute escapes
+        //   like `/etc/passwd` still Err; bare `..` is still refused
+        //   by `classify_lexical_path`'s lexical normalise step). The
+        //   original session scope's `shared_zones` are NOT carried
+        //   over — they're meaningless under the hint — but the
+        //   security boundary is preserved. A follow-up will reconcile
         //   `SessionScope` construction with the hint; once that's
-        //   done this branch collapses to the scope-aware rewriter
-        //   automatically.
-        let scope_for_rewrite = ctx
-            .and_then(|c| c.session_scope.as_ref())
-            .and_then(|scope| match self.work_dir.as_deref() {
-                Some(wd) if !wd.starts_with(scope.workspace()) => None,
-                _ => Some(scope.clone()),
+        //   done this branch collapses to the no-substitution case
+        //   automatically. Round-4 codex flag fixed by replacing the
+        //   round-3 legacy fallback that dropped the scope boundary.
+        let effective_scope: Option<Arc<SessionScope>> =
+            ctx.and_then(|c| c.session_scope.as_ref()).map(|scope| {
+                match self.work_dir.as_deref() {
+                    Some(wd) if !wd.starts_with(scope.workspace()) && wd.is_absolute() => {
+                        match SessionScope::solo(wd.to_path_buf(), vec![]) {
+                            Ok(adhoc) => Arc::new(adhoc),
+                            Err(err) => {
+                                tracing::warn!(
+                                    plugin = %self.plugin_name,
+                                    tool = %self.tool_def.name,
+                                    work_dir = %wd.display(),
+                                    error = %err,
+                                    "ad-hoc scope construction failed; falling back to session scope (validation may refuse legitimate hinted paths)"
+                                );
+                                scope.clone()
+                            }
+                        }
+                    }
+                    _ => scope.clone(),
+                }
             });
-        let mut effective_args = match scope_for_rewrite.as_deref() {
+
+        let mut effective_args = match effective_scope.as_deref() {
             Some(scope) => {
                 let join_base: &std::path::Path = self
                     .work_dir
@@ -4708,6 +4729,61 @@ mod tests {
             std::path::Path::new(cwd),
             &scope_workspace,
             "approval cwd MUST reflect the effective work dir (scope.workspace() when scope-only)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn plugin_refuses_absolute_escape_in_hinted_session() {
+        // Codex round-4 P1 pin (Phase 2-B): when a scoped session has
+        // a workspace_hint whose path falls outside the session scope
+        // (the `SessionRuntime::bootstrap` reality today), the round-3
+        // routing fell back to the legacy rewriter — which accepted
+        // absolute paths anywhere on disk after `resolve_tool_path`
+        // failed. The round-4 fix substitutes an AD-HOC solo scope
+        // rooted at the hinted work_dir so the read/write boundary
+        // still holds: an `audio_path: "/etc/passwd"` from a hinted
+        // session MUST still Err.
+        let scope_workspace = tempfile::tempdir().expect("scope workspace");
+        let hinted_work_dir = tempfile::tempdir().expect("hinted work_dir");
+        // Bait file outside the hinted work_dir.
+        let bait_outside = tempfile::tempdir().expect("bait");
+        let bait_path = bait_outside.path().join("escape.txt");
+        std::fs::write(&bait_path, b"BAIT").unwrap();
+
+        let scope = solo_scope_at(scope_workspace.path());
+        // Mirror the hinted bootstrap shape: scope is at
+        // `scope_workspace`, but `self.work_dir` is the hint
+        // (`hinted_work_dir`), which is OUTSIDE `scope.workspace()`.
+        // Round-3 would have routed this through the legacy rewriter
+        // and accepted `/escape/path`. Round-4 substitutes an ad-hoc
+        // solo scope rooted at the hint, so the absolute escape Errs.
+        let bin = tempfile::tempdir().expect("bin");
+        let script = bin.path().join("script.sh");
+        write_test_script(
+            &script,
+            "#!/bin/sh\nread INPUT || true\necho '{\"output\":\"ran\",\"success\":true}'\n",
+        );
+        let tool = PluginTool::new("plug".into(), input_path_def("audio_path"), script.clone())
+            .with_work_dir(hinted_work_dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let ctx = ctx_with_scope(scope);
+        let bait_abs = bait_path.to_string_lossy().to_string();
+        let result = crate::tools::TOOL_CTX
+            .scope(ctx, tool.execute(&json!({"audio_path": bait_abs.clone()})))
+            .await
+            .expect("execute should return Ok with error envelope");
+
+        assert!(
+            !result.success,
+            "absolute out-of-scope path under hint must produce a tool error envelope (success=false), got success=true output={}",
+            result.output,
+        );
+        assert!(
+            result.output.contains(&bait_abs),
+            "tool error envelope must echo the rejected path: {}",
+            result.output
         );
     }
 
