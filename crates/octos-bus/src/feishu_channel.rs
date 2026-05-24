@@ -1674,6 +1674,8 @@ impl Channel for FeishuChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+    use tokio::sync::oneshot;
 
     fn make_channel(allowed: Vec<&str>) -> FeishuChannel {
         make_channel_with_region(allowed, "cn")
@@ -1835,6 +1837,88 @@ mod tests {
             Some("om_abc123".to_string()),
             "Feishu must preserve platform message_id for reply threading"
         );
+    }
+
+    #[derive(Clone)]
+    struct FeishuMockState {
+        reply_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<serde_json::Value>>>>,
+    }
+
+    async fn token_response() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "code": 0,
+            "tenant_access_token": "tenant-token",
+        }))
+    }
+
+    async fn capture_reply_request(
+        State(state): State<FeishuMockState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        if let Some(tx) = state.reply_tx.lock().await.take() {
+            let _ = tx.send(body);
+        }
+        Json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": "om_reply_456",
+            },
+        }))
+    }
+
+    async fn spawn_feishu_reply_mock() -> (String, oneshot::Receiver<serde_json::Value>) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let state = FeishuMockState {
+            reply_tx: Arc::new(tokio::sync::Mutex::new(Some(reply_tx))),
+        };
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(token_response),
+            )
+            .route(
+                "/open-apis/im/v1/messages/om_parent_123/reply",
+                post(capture_reply_request),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock Feishu server");
+        let addr = listener.local_addr().expect("mock server address");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server runs");
+        });
+
+        (format!("http://{addr}/open-apis"), reply_rx)
+    }
+
+    #[tokio::test]
+    async fn should_use_reply_endpoint_when_reply_to_present() {
+        let (base_url, reply_rx) = spawn_feishu_reply_mock().await;
+        let mut ch = make_channel(vec![]);
+        ch.base_url = base_url;
+
+        let sent_id = ch
+            .send_with_id(&OutboundMessage {
+                channel: "feishu".into(),
+                chat_id: "oc_chat1".into(),
+                content: "threaded response".into(),
+                reply_to: Some("om_parent_123".into()),
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("send should succeed");
+
+        assert_eq!(sent_id.as_deref(), Some("om_reply_456"));
+        let body = reply_rx.await.expect("reply endpoint should be called");
+        assert_eq!(body["msg_type"], "interactive");
+        let content = body["content"]
+            .as_str()
+            .expect("interactive content should be a JSON string");
+        let card: serde_json::Value =
+            serde_json::from_str(content).expect("card content should be JSON");
+        assert_eq!(card["elements"][0]["content"], "threaded response");
     }
 
     #[test]
