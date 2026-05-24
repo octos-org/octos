@@ -123,7 +123,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Schema version of the [`SessionScope`] shape. Bump on incompatible
 /// changes.
@@ -166,6 +166,19 @@ pub enum SessionScopeError {
     /// Granted dirs must be absolute so they can be compared
     /// unambiguously against caller paths.
     GrantedDirNotAbsolute(usize, PathBuf),
+
+    /// A shared zone provided to a multi-tenant scope is not a
+    /// strict subdir of `root`. The bare `<root>` is also rejected
+    /// — modelling the entire root as "shared" makes the
+    /// `OutOfScope` classification unreachable (codex round-1).
+    SharedZoneNotStrictSubdir { root: PathBuf, zone: PathBuf },
+
+    /// `with_granted_dir` called on a multi-tenant scope. Grants are
+    /// a Solo-mode concept; multi-tenant boundaries are enforced by
+    /// the path layout. If you need broader access in a multi-tenant
+    /// process, model that as a separate maintenance capability, not
+    /// an ordinary session grant.
+    GrantNotAllowedInMultiTenant,
 }
 
 impl std::fmt::Display for SessionScopeError {
@@ -195,6 +208,16 @@ impl std::fmt::Display for SessionScopeError {
                 "Solo.granted_dirs[{idx}] must be absolute, got: {}",
                 p.display()
             ),
+            Self::SharedZoneNotStrictSubdir { root, zone } => write!(
+                f,
+                "shared zone ({}) must be a strict subdir of root ({}); the bare root is rejected",
+                zone.display(),
+                root.display()
+            ),
+            Self::GrantNotAllowedInMultiTenant => write!(
+                f,
+                "with_granted_dir is Solo-only; multi-tenant boundaries are enforced by path layout"
+            ),
         }
     }
 }
@@ -204,41 +227,55 @@ impl std::error::Error for SessionScopeError {}
 /// Classification of a path relative to a [`SessionScope`]. Every
 /// path validator across octos must return this shape — there are no
 /// custom validation results.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Serialize` only: deserialisation would let callers bypass the
+/// constructor invariants on [`SessionScope`] (e.g. construct a
+/// classification that doesn't match the actual scope). Diagnostics
+/// emit these; consumers compare against the live scope's output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum PathClassification {
     /// Path is inside `scope.workspace`. Writes and reads allowed.
     /// This is the default-allowed zone for plugin outputs, file
     /// tools, shell, etc.
     InWorkspace,
-    /// Path is inside `scope.shared_data` (multi-tenant only).
+    /// Path is inside one of `scope.shared_zones` (multi-tenant only).
     /// Reads allowed when the caller declares intent (e.g.
     /// `recall(<dir>)`); writes refused — shared data is managed
     /// by maintenance code paths, not session workers.
-    InSharedData,
+    InSharedZone { zone: PathBuf },
     /// Path is inside one of `Solo.granted_dirs` (solo only).
     /// Reads and writes allowed; the user explicitly granted access
     /// via a Claude-Code-style permission prompt.
     InGrantedDir { granted_dir: PathBuf },
-    /// Path is inside `scope.root` but does not match a more specific
-    /// zone above. Caller MAY refuse depending on policy; most
-    /// callers should treat this as deny.
-    InRootButOutsideZones,
-    /// Path is outside `scope.root`. Refuse unconditionally — this is
-    /// either a tenant-boundary escape (multi-tenant) or a path the
-    /// user has not granted (solo).
+    /// Path is outside every declared zone (workspace, shared_zones,
+    /// granted_dirs). Refuse — this is either a tenant-boundary
+    /// escape (multi-tenant) or a path the user has not granted
+    /// (solo). The previous `InRootButOutsideZones` variant was
+    /// dropped per codex round-1 review: with `shared_data == root`
+    /// it was unreachable; with named shared zones, there are no
+    /// "almost legitimate" paths to distinguish from full escapes.
     OutOfScope,
 }
 
 /// The mode-specific portion of a [`SessionScope`]. Determines the
 /// validator's policy: strict tenant isolation vs Claude-Code-style
 /// user-managed permissions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Serialize` only — see [`SessionScope`] for the rationale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ScopeMode {
     /// Strict per-tenant + per-session isolation. The host process
     /// serves multiple tenants; each tenant gets its own root; each
     /// session inside a tenant gets its own workspace.
+    ///
+    /// `shared_zones` is the list of declared cross-session zones
+    /// inside `<root>` that LLMs may read with explicit intent (e.g.
+    /// `<root>/research/`, `<root>/skills/`). Workers MUST NOT
+    /// default to any of these as CWD. Each entry MUST be a strict
+    /// subdir of `scope.root` (validated at construction; the bare
+    /// `<root>` is rejected).
     MultiTenant {
         /// Stable tenant identifier (the `profile_id`). Used in
         /// diagnostics and to disambiguate cross-tenant leaks; the
@@ -247,6 +284,8 @@ pub enum ScopeMode {
         /// Stable session identifier within the tenant. Must satisfy
         /// [`is_safe_session_id`] when the scope is constructed.
         session_id: String,
+        /// Declared cross-session zones. See type doc.
+        shared_zones: Vec<PathBuf>,
     },
     /// Single-user mode: the user's CWD is the scope. Cross-session
     /// continuity is intentional. Permission grants extend the scope
@@ -273,37 +312,53 @@ pub enum ScopeMode {
 /// invariants enforced by constructors hold for the lifetime of the
 /// value (the type is immutable after construction; mode-specific
 /// mutations like adding a granted dir produce a new `SessionScope`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Serialize` only, no `Deserialize`: deserialisation would bypass
+/// the constructor invariants (per codex round-1 review — a `Solo`
+/// scope could deserialise with multi-tenant-shaped fields, or a
+/// relative `root` could land in production code via JSON). For
+/// diagnostics emit-only is sufficient; for any wire-input case use
+/// a separate `SessionScopeRequest` shape + `TryFrom`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionScope {
     /// Outermost boundary. No path validated against this scope
-    /// returns `PathClassification::InWorkspace` or `InSharedData`
-    /// unless it is inside `root`.
+    /// returns `PathClassification::InWorkspace`, `InSharedZone`,
+    /// or `InGrantedDir` unless it falls inside `root` (or, for
+    /// solo, inside a granted dir which may be outside `root`).
     root: PathBuf,
     /// Per-session ephemeral workspace. Workers and plugins spawn
     /// with this as their CWD. Empty at session start (for
     /// multi-tenant) or = `root` (for solo).
     workspace: PathBuf,
-    /// Cross-session persistent zone within `root`. Workers MUST
-    /// NOT default to this as a CWD. Reads allowed via declared-
-    /// intent APIs (the `recall` tool, an explicit `read_file` on a
-    /// path the LLM names). `None` in solo mode — solo has no
-    /// cross-session concept distinct from the workspace itself.
-    shared_data: Option<PathBuf>,
-    /// Mode-specific policy. See [`ScopeMode`].
+    /// Mode-specific policy. See [`ScopeMode`]. `shared_zones` is now
+    /// folded into `ScopeMode::MultiTenant` — solo has no shared zones
+    /// concept and the old `shared_data: Option<PathBuf>` modelled
+    /// that with a runtime-checked `None` instead of using the type
+    /// system. Per codex round-1: typed mode-specific fields prevent
+    /// illegal-state construction.
     mode: ScopeMode,
 }
 
+/// Canonical names of shared zones under `<root>` for the dspfac /
+/// mofa multi-tenant deploy. Callers should prefer
+/// [`SessionScope::multi_tenant_with_default_zones`] which references
+/// these; this list exists so the constants are reusable in tests
+/// and migration audits.
+pub const DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES: &[&str] = &["research", "skills"];
+
 impl SessionScope {
-    /// Construct a multi-tenant scope from the canonical layout:
+    /// Construct a multi-tenant scope from the canonical layout, with
+    /// custom shared zones.
     ///
     /// - `profile_data_dir` is `<config_dir>/profiles/<tenant_id>/data/`.
     ///   It becomes `root`.
     /// - `<root>/users/<session_id>/workspace/` becomes `workspace`.
-    /// - `root` itself becomes `shared_data` (subdirs like `skills/`
-    ///   and `research/` live there).
+    /// - Each entry in `shared_zones` MUST be a strict subdir of
+    ///   `root` (the bare `<root>` is rejected per codex round-1).
     ///
-    /// Validates that `profile_data_dir` is absolute and that
-    /// `session_id` satisfies [`is_safe_session_id`].
+    /// Validates that `profile_data_dir` is absolute, that
+    /// `session_id` satisfies [`is_safe_session_id`], and that every
+    /// `shared_zones` entry is a strict subdir of `root`.
     ///
     /// Does NOT create the workspace directory on disk. Callers
     /// (the WS turn handler or session opener) are responsible for
@@ -313,6 +368,7 @@ impl SessionScope {
         profile_data_dir: PathBuf,
         tenant_id: String,
         session_id: String,
+        shared_zones: Vec<PathBuf>,
     ) -> Result<Self, SessionScopeError> {
         if !profile_data_dir.is_absolute() {
             return Err(SessionScopeError::RootNotAbsolute(profile_data_dir));
@@ -323,25 +379,49 @@ impl SessionScope {
         if !is_safe_session_id(&session_id) {
             return Err(SessionScopeError::UnsafeSessionId(session_id));
         }
+        for zone in &shared_zones {
+            if zone == &profile_data_dir || !zone.starts_with(&profile_data_dir) {
+                return Err(SessionScopeError::SharedZoneNotStrictSubdir {
+                    root: profile_data_dir.clone(),
+                    zone: zone.clone(),
+                });
+            }
+        }
         let workspace = profile_data_dir
             .join(MULTI_TENANT_USERS_DIR_NAME)
             .join(&session_id)
             .join(MULTI_TENANT_WORKSPACE_DIR_NAME);
-        let root = profile_data_dir;
         Ok(Self {
-            shared_data: Some(root.clone()),
             workspace,
-            root,
+            root: profile_data_dir,
             mode: ScopeMode::MultiTenant {
                 tenant_id,
                 session_id,
+                shared_zones,
             },
         })
     }
 
+    /// Convenience constructor that derives shared zones from
+    /// [`DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES`]. Use this for the
+    /// stock dspfac / mofa layout; use [`Self::multi_tenant`] when
+    /// the tenant needs a different set.
+    pub fn multi_tenant_with_default_zones(
+        profile_data_dir: PathBuf,
+        tenant_id: String,
+        session_id: String,
+    ) -> Result<Self, SessionScopeError> {
+        let shared_zones = DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
+            .iter()
+            .map(|name| profile_data_dir.join(name))
+            .collect();
+        Self::multi_tenant(profile_data_dir, tenant_id, session_id, shared_zones)
+    }
+
     /// Construct a solo scope from the user's CWD. Workspace == root
-    /// (one CWD per process); no shared_data (cross-session continuity
-    /// is the user's project files in their CWD, not a separate zone).
+    /// (one CWD per process); no shared zones (cross-session
+    /// continuity is the user's project files in their CWD, not a
+    /// separate zone).
     ///
     /// Validates that `cwd` is absolute and that each entry in
     /// `granted_dirs` is absolute.
@@ -356,7 +436,6 @@ impl SessionScope {
         }
         Ok(Self {
             workspace: cwd.clone(),
-            shared_data: None,
             root: cwd,
             mode: ScopeMode::Solo { granted_dirs },
         })
@@ -370,8 +449,15 @@ impl SessionScope {
         &self.workspace
     }
 
-    pub fn shared_data(&self) -> Option<&Path> {
-        self.shared_data.as_deref()
+    /// Return the declared cross-session shared zones (multi-tenant
+    /// only). Empty slice for solo. Callers should prefer this over
+    /// reaching into [`ScopeMode::MultiTenant::shared_zones`]
+    /// directly so the API doesn't churn if the field moves.
+    pub fn shared_zones(&self) -> &[PathBuf] {
+        match &self.mode {
+            ScopeMode::MultiTenant { shared_zones, .. } => shared_zones,
+            ScopeMode::Solo { .. } => &[],
+        }
     }
 
     pub fn mode(&self) -> &ScopeMode {
@@ -379,68 +465,71 @@ impl SessionScope {
     }
 
     /// Return a new `SessionScope` with `dir` added to `granted_dirs`.
-    /// Solo-mode only; returns the scope unchanged in MultiTenant mode
-    /// (MultiTenant has no grant concept — the path layout is the
-    /// only boundary).
+    /// Solo-mode only. Calling on multi-tenant returns
+    /// [`SessionScopeError::GrantNotAllowedInMultiTenant`] per codex
+    /// round-1: silent no-op invites callers to assume the grant
+    /// applied when it didn't.
     pub fn with_granted_dir(mut self, dir: PathBuf) -> Result<Self, SessionScopeError> {
         if !dir.is_absolute() {
             return Err(SessionScopeError::GrantedDirNotAbsolute(0, dir));
         }
-        if let ScopeMode::Solo { granted_dirs } = &mut self.mode {
-            if !granted_dirs.iter().any(|d| d == &dir) {
-                granted_dirs.push(dir);
+        match &mut self.mode {
+            ScopeMode::Solo { granted_dirs } => {
+                if !granted_dirs.iter().any(|d| d == &dir) {
+                    granted_dirs.push(dir);
+                }
+                Ok(self)
             }
+            ScopeMode::MultiTenant { .. } => Err(SessionScopeError::GrantNotAllowedInMultiTenant),
         }
-        Ok(self)
     }
 
-    /// Classify `path` against this scope. The single validator that
-    /// every component must use; bespoke equivalents in the codebase
-    /// should migrate to this and be deleted.
+    /// Classify `path` against this scope using pure-lexical rules.
+    /// The single validator that every component must use; bespoke
+    /// equivalents in the codebase should migrate to this and be
+    /// deleted.
     ///
-    /// Path is normalised lexically only (no symlink resolution, no
-    /// canonicalisation that requires the path to exist). Callers
-    /// that need symlink-safe checks should additionally use
-    /// `symlink_metadata().is_file()` per the #1189 round-2 codex
-    /// finding; this validator is a logical guard, not an OS-level
-    /// one.
+    /// `lexical` = collapses `.` components, refuses `..`, does NOT
+    /// resolve symlinks or canonicalise. Callers needing symlink-safe
+    /// checks must additionally use `symlink_metadata().is_file()`
+    /// per the #1189 round-2 codex finding (or a future
+    /// `classify_resolved_path` variant when it lands).
     ///
-    /// NOTE: lexical-only classification means a symlink pointing
-    /// outside the scope returns `InWorkspace` if the symlink itself
-    /// lives in the workspace. Sandboxes provide the OS-level guard;
-    /// this method is intentionally cheap and stateless.
-    pub fn classify_path(&self, path: &Path) -> PathClassification {
+    /// Renamed from `classify_path` per codex round-1: the explicit
+    /// `_lexical_` prefix prevents callers from over-trusting this
+    /// as the filesystem boundary. Sandboxes still apply for defence
+    /// in depth.
+    pub fn classify_lexical_path(&self, path: &Path) -> PathClassification {
         // Lexical normalisation: collapse `.` components and refuse
         // any `..` we encounter. Real `..` handling belongs in the
         // caller's input validator (see #1186); by the time a path
-        // reaches `classify_path`, callers are expected to have
-        // already refused traversal sequences.
+        // reaches `classify_lexical_path`, callers are expected to
+        // have already refused traversal sequences.
         let normalised = match lexical_normalise(path) {
             Some(p) => p,
             None => return PathClassification::OutOfScope,
         };
-        // Check more specific zones first; fall back to root, then
-        // out-of-scope.
+        // Workspace is most specific — check first.
         if normalised.starts_with(&self.workspace) {
             return PathClassification::InWorkspace;
         }
-        if let ScopeMode::Solo { granted_dirs } = &self.mode {
-            for granted in granted_dirs {
-                if normalised.starts_with(granted) {
-                    return PathClassification::InGrantedDir {
-                        granted_dir: granted.clone(),
-                    };
+        match &self.mode {
+            ScopeMode::Solo { granted_dirs } => {
+                for granted in granted_dirs {
+                    if normalised.starts_with(granted) {
+                        return PathClassification::InGrantedDir {
+                            granted_dir: granted.clone(),
+                        };
+                    }
                 }
             }
-        }
-        if let Some(shared) = &self.shared_data
-            && normalised.starts_with(shared)
-            && !normalised.starts_with(&self.workspace)
-        {
-            return PathClassification::InSharedData;
-        }
-        if normalised.starts_with(&self.root) {
-            return PathClassification::InRootButOutsideZones;
+            ScopeMode::MultiTenant { shared_zones, .. } => {
+                for zone in shared_zones {
+                    if normalised.starts_with(zone) {
+                        return PathClassification::InSharedZone { zone: zone.clone() };
+                    }
+                }
+            }
         }
         PathClassification::OutOfScope
     }
@@ -499,35 +588,43 @@ mod tests {
         }
     }
 
+    fn mt_default(data: &Path, session: &str) -> SessionScope {
+        SessionScope::multi_tenant_with_default_zones(
+            data.to_path_buf(),
+            "dspfac".into(),
+            session.into(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn multi_tenant_layout_matches_handlers_rs_today() {
         let data = abs("/octos/profiles/dspfac/data");
-        let scope = SessionScope::multi_tenant(
-            data.clone(),
-            "dspfac".into(),
-            "web-1779574360679-o8x9kv".into(),
-        )
-        .unwrap();
+        let scope = mt_default(&data, "web-1779574360679-o8x9kv");
         assert_eq!(scope.root(), data);
         assert_eq!(
             scope.workspace(),
             data.join("users/web-1779574360679-o8x9kv/workspace")
         );
-        assert_eq!(scope.shared_data(), Some(data.as_path()));
+        // shared_zones is the canonical {research, skills} pair
+        assert_eq!(
+            scope.shared_zones(),
+            &[data.join("research"), data.join("skills")]
+        );
     }
 
     #[test]
-    fn solo_collapses_workspace_to_cwd_and_no_shared_data() {
+    fn solo_collapses_workspace_to_cwd_and_no_shared_zones() {
         let cwd = abs("/home/yc/my-project");
         let scope = SessionScope::solo(cwd.clone(), vec![]).unwrap();
         assert_eq!(scope.root(), cwd);
         assert_eq!(scope.workspace(), cwd);
-        assert_eq!(scope.shared_data(), None);
+        assert!(scope.shared_zones().is_empty());
     }
 
     #[test]
     fn refuses_relative_root() {
-        let err = SessionScope::multi_tenant(
+        let err = SessionScope::multi_tenant_with_default_zones(
             PathBuf::from("relative/data"),
             "dspfac".into(),
             "web-1".into(),
@@ -539,8 +636,12 @@ mod tests {
     #[test]
     fn refuses_unsafe_session_id() {
         for bad in ["../escape", "/abs", "foo/bar", "..", ".", "with space", ""] {
-            let err =
-                SessionScope::multi_tenant(abs("/data"), "dspfac".into(), bad.into()).unwrap_err();
+            let err = SessionScope::multi_tenant_with_default_zones(
+                abs("/data"),
+                "dspfac".into(),
+                bad.into(),
+            )
+            .unwrap_err();
             assert!(
                 matches!(err, SessionScopeError::UnsafeSessionId(_)),
                 "expected UnsafeSessionId for {bad:?}, got {err:?}"
@@ -549,10 +650,39 @@ mod tests {
     }
 
     #[test]
+    fn refuses_bare_root_as_shared_zone() {
+        let data = abs("/data");
+        let err = SessionScope::multi_tenant(
+            data.clone(),
+            "dspfac".into(),
+            "web-1".into(),
+            vec![data.clone()],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::SharedZoneNotStrictSubdir { .. }
+        ));
+    }
+
+    #[test]
+    fn refuses_shared_zone_outside_root() {
+        let err = SessionScope::multi_tenant(
+            abs("/data"),
+            "dspfac".into(),
+            "web-1".into(),
+            vec![abs("/elsewhere/research")],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::SharedZoneNotStrictSubdir { .. }
+        ));
+    }
+
+    #[test]
     fn accepts_topic_suffix_in_session_id() {
-        let scope =
-            SessionScope::multi_tenant(abs("/data"), "dspfac".into(), "web-123#slides".into())
-                .unwrap();
+        let scope = mt_default(&abs("/data"), "web-123#slides");
         assert!(
             scope
                 .workspace()
@@ -562,50 +692,61 @@ mod tests {
 
     #[test]
     fn classify_path_in_workspace() {
-        let scope = SessionScope::multi_tenant(
-            abs("/octos/profiles/dspfac/data"),
-            "dspfac".into(),
-            "web-1".into(),
-        )
-        .unwrap();
+        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
         let path = abs("/octos/profiles/dspfac/data/users/web-1/workspace/script.md");
-        assert_eq!(scope.classify_path(&path), PathClassification::InWorkspace);
+        assert_eq!(
+            scope.classify_lexical_path(&path),
+            PathClassification::InWorkspace
+        );
     }
 
     #[test]
-    fn classify_path_in_shared_data() {
-        let scope = SessionScope::multi_tenant(
-            abs("/octos/profiles/dspfac/data"),
-            "dspfac".into(),
-            "web-1".into(),
-        )
-        .unwrap();
-        let path = abs("/octos/profiles/dspfac/data/research/jwst/notes.md");
-        assert_eq!(scope.classify_path(&path), PathClassification::InSharedData);
+    fn classify_path_in_shared_zone_returns_zone_path() {
+        let data = abs("/octos/profiles/dspfac/data");
+        let scope = mt_default(&data, "web-1");
+        let path = data.join("research/jwst/notes.md");
+        assert_eq!(
+            scope.classify_lexical_path(&path),
+            PathClassification::InSharedZone {
+                zone: data.join("research")
+            }
+        );
+    }
+
+    #[test]
+    fn classify_path_out_of_scope_for_path_inside_root_but_outside_zones() {
+        // Per codex round-1: with named shared zones, paths under
+        // `<root>` but outside the declared zones are OutOfScope
+        // (was the dropped `InRootButOutsideZones` variant). E.g.
+        // `<root>/episodes.redb` is system internals, not a managed
+        // zone for LLM access.
+        let data = abs("/octos/profiles/dspfac/data");
+        let scope = mt_default(&data, "web-1");
+        let path = data.join("episodes.redb");
+        assert_eq!(
+            scope.classify_lexical_path(&path),
+            PathClassification::OutOfScope
+        );
     }
 
     #[test]
     fn classify_path_out_of_scope_for_other_tenant() {
-        let scope = SessionScope::multi_tenant(
-            abs("/octos/profiles/dspfac/data"),
-            "dspfac".into(),
-            "web-1".into(),
-        )
-        .unwrap();
+        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
         let path = abs("/octos/profiles/acme/data/research/secret.md");
-        assert_eq!(scope.classify_path(&path), PathClassification::OutOfScope);
+        assert_eq!(
+            scope.classify_lexical_path(&path),
+            PathClassification::OutOfScope
+        );
     }
 
     #[test]
     fn classify_path_refuses_parent_dir_components() {
-        let scope = SessionScope::multi_tenant(
-            abs("/octos/profiles/dspfac/data"),
-            "dspfac".into(),
-            "web-1".into(),
-        )
-        .unwrap();
+        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
         let path = abs("/octos/profiles/dspfac/data/users/web-1/workspace/../../../../etc/passwd");
-        assert_eq!(scope.classify_path(&path), PathClassification::OutOfScope);
+        assert_eq!(
+            scope.classify_lexical_path(&path),
+            PathClassification::OutOfScope
+        );
     }
 
     #[test]
@@ -613,7 +754,7 @@ mod tests {
         let cwd = abs("/home/yc/my-project");
         let scope = SessionScope::solo(cwd.clone(), vec![]).unwrap();
         assert_eq!(
-            scope.classify_path(&cwd.join("src/main.rs")),
+            scope.classify_lexical_path(&cwd.join("src/main.rs")),
             PathClassification::InWorkspace
         );
     }
@@ -624,7 +765,7 @@ mod tests {
         let grant = abs("/tmp/scratch");
         let scope = SessionScope::solo(cwd, vec![grant.clone()]).unwrap();
         assert_eq!(
-            scope.classify_path(&grant.join("foo.txt")),
+            scope.classify_lexical_path(&grant.join("foo.txt")),
             PathClassification::InGrantedDir {
                 granted_dir: grant.clone()
             }
@@ -636,13 +777,13 @@ mod tests {
         let cwd = abs("/home/yc/my-project");
         let scope = SessionScope::solo(cwd, vec![]).unwrap();
         assert_eq!(
-            scope.classify_path(&abs("/etc/passwd")),
+            scope.classify_lexical_path(&abs("/etc/passwd")),
             PathClassification::OutOfScope
         );
     }
 
     #[test]
-    fn with_granted_dir_is_idempotent() {
+    fn with_granted_dir_is_idempotent_in_solo() {
         let cwd = abs("/home/yc/my-project");
         let grant = abs("/tmp/scratch");
         let scope = SessionScope::solo(cwd, vec![]).unwrap();
@@ -657,15 +798,15 @@ mod tests {
     }
 
     #[test]
-    fn with_granted_dir_is_noop_in_multi_tenant() {
-        let scope = SessionScope::multi_tenant(
-            abs("/octos/profiles/dspfac/data"),
-            "dspfac".into(),
-            "web-1".into(),
-        )
-        .unwrap();
-        let scope = scope.with_granted_dir(abs("/tmp/scratch")).unwrap();
-        // mode unchanged; no granted_dirs concept in MultiTenant
-        assert!(matches!(scope.mode(), ScopeMode::MultiTenant { .. }));
+    fn with_granted_dir_errors_in_multi_tenant() {
+        // Per codex round-1: silent no-op invites callers to assume
+        // the grant applied when it didn't. MultiTenant has no grant
+        // concept; return Err instead.
+        let scope = mt_default(&abs("/octos/profiles/dspfac/data"), "web-1");
+        let err = scope.with_granted_dir(abs("/tmp/scratch")).unwrap_err();
+        assert!(matches!(
+            err,
+            SessionScopeError::GrantNotAllowedInMultiTenant
+        ));
     }
 }

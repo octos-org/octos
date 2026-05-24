@@ -23,8 +23,9 @@ pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, OutboundMessage};
 pub use message::AgentMessage;
 pub use session_scope::{
-    MULTI_TENANT_USERS_DIR_NAME, MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification,
-    SESSION_SCOPE_SCHEMA_VERSION, ScopeMode, SessionScope, SessionScopeError, is_safe_session_id,
+    DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
+    MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, SESSION_SCOPE_SCHEMA_VERSION, ScopeMode,
+    SessionScope, SessionScopeError, is_safe_session_id,
 };
 pub use task::{
     DecisionRecord, FileRecord, SESSION_SUMMARY_SCHEMA_VERSION, STALE_DECISION_PREFIX,
