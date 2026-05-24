@@ -397,6 +397,7 @@ mod tests {
             label: None,
             default_model: None,
             max_total_tokens: None,
+            default_timeout_secs: None,
             nodes: nodes.into_iter().collect::<HashMap<_, _>>(),
             edges: Vec::new(),
             subgraphs: Vec::new(),
