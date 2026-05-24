@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 use super::{
     ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
-    ToolResult,
+    ToolContext, ToolResult,
 };
 use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
@@ -147,11 +147,16 @@ fn apply_git_tool_env(cmd: &mut tokio::process::Command, command: &str) {
     }
 }
 
-fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command) {
-    if let Ok(ctx) = TOOL_CTX.try_with(|ctx| ctx.clone()) {
-        if let Some(sink) = ctx.harness_event_sink {
-            cmd.env("OCTOS_EVENT_SINK", sink);
-        }
+fn apply_harness_event_sink_env(cmd: &mut tokio::process::Command, ctx: &ToolContext) {
+    if let Some(sink) = ctx.harness_event_sink.as_deref() {
+        cmd.env("OCTOS_EVENT_SINK", sink);
+        return;
+    }
+    // Legacy callers that route through `execute()` pass `ToolContext::zero()` —
+    // the sink isn't on the typed context but may still live on the
+    // task-local `TOOL_CTX` that older executor paths populate.
+    if let Ok(Some(sink)) = TOOL_CTX.try_with(|inner| inner.harness_event_sink.clone()) {
+        cmd.env("OCTOS_EVENT_SINK", sink);
     }
 }
 
@@ -202,11 +207,47 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        // Legacy entry point: route through the typed path with a zero-value
+        // context so out-of-band callers (tests, `ToolRegistry::execute`)
+        // exercise the same Phase 2-D scope resolution as migrated callers.
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let input: ShellInput =
             serde_json::from_value(args.clone()).wrap_err("invalid shell tool input")?;
 
+        // Phase 2-D of the SessionScope migration: when the host has
+        // threaded a scope through `ToolContext`, prefer the scope's
+        // workspace so every tool in the session shares the single
+        // filesystem contract.
+        //
+        // Codex P1 (round-1, this PR): respect a hinted workspace
+        // override. `SessionRuntime` builds `session_scope` from
+        // `<data_dir>/users/<id>/workspace` independent of any
+        // `workspace_hint` supplied by the coding-agent flow, while
+        // the registry rebinds every tool's `cwd` to the *hinted*
+        // workspace via `with_workspace_root`. If `self.cwd` differs
+        // from `scope.workspace()`, the caller deliberately pointed
+        // this tool at a different workspace — honour that and keep
+        // `self.cwd`. Otherwise the migration is a no-op for the
+        // hinted-coding-agent path until Phase 3 reconciles
+        // SessionScope construction with the hinted workspace.
+        //
+        // The same effective CWD also feeds the `CommandPolicy::check`
+        // call so a policy that consults the working directory sees a
+        // consistent value with what the child process will observe.
+        let effective_cwd: &Path = match ctx.session_scope.as_ref() {
+            Some(scope) if scope.workspace() == self.cwd.as_path() => scope.workspace(),
+            _ => &self.cwd,
+        };
+
         // Check policy first
-        let decision = self.policy.check(&input.command, &self.cwd);
+        let decision = self.policy.check(&input.command, effective_cwd);
         match decision {
             Decision::Deny => {
                 tracing::warn!(command = %input.command, "command denied by policy");
@@ -248,9 +289,13 @@ impl Tool for ShellTool {
                     });
                 };
 
-                let tool_id = TOOL_CTX
-                    .try_with(|ctx| ctx.tool_id.clone())
-                    .unwrap_or_default();
+                let tool_id = if ctx.tool_id.is_empty() {
+                    TOOL_CTX
+                        .try_with(|inner| inner.tool_id.clone())
+                        .unwrap_or_default()
+                } else {
+                    ctx.tool_id.clone()
+                };
                 let decision = requester
                     .request_approval(ToolApprovalRequest {
                         tool_id,
@@ -258,7 +303,7 @@ impl Tool for ShellTool {
                         title: "Approve shell command".to_owned(),
                         body: format!("Run command: {}", input.command),
                         command: Some(input.command.clone()),
-                        cwd: Some(self.cwd.to_string_lossy().into_owned()),
+                        cwd: Some(effective_cwd.to_string_lossy().into_owned()),
                     })
                     .await;
                 if matches!(decision, ToolApprovalDecision::Deny) {
@@ -285,12 +330,12 @@ impl Tool for ShellTool {
         // Spawn the child, grab its PID, then timeout on wait_with_output().
         // If timeout fires, kill by PID to prevent orphaned processes.
         // (wait_with_output() takes ownership of child, so we save the PID first.)
-        let mut cmd = self.sandbox.wrap_command(&input.command, &self.cwd);
+        let mut cmd = self.sandbox.wrap_command(&input.command, effective_cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        apply_frontend_tool_env(&mut cmd, &self.cwd);
+        apply_frontend_tool_env(&mut cmd, effective_cwd);
         apply_git_tool_env(&mut cmd, &input.command);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
-        apply_harness_event_sink_env(&mut cmd);
+        apply_harness_event_sink_env(&mut cmd, ctx);
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -548,5 +593,170 @@ mod tests {
         assert!(contains_git_invocation("GIT_DIR=.git git status --short"));
         assert!(contains_git_invocation("env GIT_DIR=.git git status"));
         assert!(!contains_git_invocation("printf 'git diff -- notes.txt'"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2-D: SessionScope integration tests for ShellTool.
+    //
+    // The child process CWD is the load-bearing observable here — a shell
+    // command that runs `pwd` (or the `cd` cmd-builtin equivalent on
+    // Windows) must see `scope.workspace()` when the host has threaded a
+    // scope through `ToolContext`, and must see `self.cwd` (legacy
+    // behaviour) when the host has not.
+    // -----------------------------------------------------------------------
+
+    fn ctx_with_scope(scope: octos_core::SessionScope) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "shell-with-scope".to_string();
+        ctx.session_scope = Some(Arc::new(scope));
+        ctx
+    }
+
+    #[cfg(not(windows))]
+    const PWD_COMMAND: &str = "pwd";
+    #[cfg(windows)]
+    const PWD_COMMAND: &str = "cd";
+
+    #[tokio::test]
+    async fn shell_uses_scope_workspace_when_present() {
+        // When the host has threaded a `SessionScope` onto `ToolContext`
+        // AND the scope's workspace matches the tool's construction-time
+        // `cwd` (the production wiring in
+        // `octos-cli/src/runtime/session.rs`: both derive from
+        // `<data_dir>/users/<id>/workspace`), the child process runs
+        // with CWD == `scope.workspace()`. This is the load-bearing
+        // case for multi-tenant SPA sessions.
+        let workspace = tempfile::tempdir().unwrap();
+        let canonical_workspace =
+            std::fs::canonicalize(workspace.path()).expect("canonicalise workspace");
+
+        // Both scope and ShellTool are constructed with the same
+        // workspace (the production wiring), so the migration takes
+        // effect and the child process sees the scope workspace.
+        let scope = octos_core::SessionScope::solo(canonical_workspace.clone(), vec![])
+            .expect("scope construction");
+        let tool = ShellTool::new(&canonical_workspace);
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": PWD_COMMAND}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+
+        assert!(
+            result
+                .output
+                .contains(&canonical_workspace.to_string_lossy().to_string()),
+            "expected scope workspace ({}) in shell output, got: {}",
+            canonical_workspace.display(),
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_respects_hinted_workspace_over_session_scope_default() {
+        // Codex P1 regression: when the registry's tools were rebound
+        // to a hinted workspace (`workspace_hint` flow,
+        // `with_workspace_root` in `runtime/session.rs`) but
+        // `SessionScope` was built from the canonical
+        // `<data_dir>/users/<id>/workspace` (i.e. NOT the hint), the
+        // shell tool must honour the hinted `self.cwd` rather than
+        // silently relocating the child process into the default
+        // data-dir workspace. Without this guard, coding-agent
+        // sessions would run builds/tests in the wrong directory.
+        let hinted = tempfile::tempdir().unwrap();
+        let default_scope_workspace = tempfile::tempdir().unwrap();
+        let canonical_hinted = std::fs::canonicalize(hinted.path()).expect("canonicalise hinted");
+        let canonical_default_scope = std::fs::canonicalize(default_scope_workspace.path())
+            .expect("canonicalise default scope workspace");
+        assert_ne!(canonical_hinted, canonical_default_scope);
+
+        let scope = octos_core::SessionScope::solo(canonical_default_scope.clone(), vec![])
+            .expect("scope construction");
+        // ShellTool is rebound to the HINTED workspace, while the
+        // scope still points at the default — exactly the M11
+        // workspace_hint code path.
+        let tool = ShellTool::new(&canonical_hinted);
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": PWD_COMMAND}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+
+        // The hinted workspace must win — pre-fix this would have
+        // contained the default scope workspace instead.
+        assert!(
+            result
+                .output
+                .contains(&canonical_hinted.to_string_lossy().to_string()),
+            "expected hinted workspace ({}) in shell output, got: {}",
+            canonical_hinted.display(),
+            result.output
+        );
+        assert!(
+            !result
+                .output
+                .contains(&canonical_default_scope.to_string_lossy().to_string()),
+            "default scope workspace ({}) leaked into shell output: {}",
+            canonical_default_scope.display(),
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_falls_back_to_self_cwd_when_no_scope() {
+        // No scope on the context — behaviour must match the pre-Phase-2D
+        // path (child process runs with CWD == construction-time
+        // `self.cwd`). Guards the legacy `octos chat` / test-harness
+        // codepath that never plumbs a `SessionScope`.
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new(legacy_dir.path());
+        let ctx = ToolContext::zero();
+        assert!(ctx.session_scope.is_none());
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": PWD_COMMAND}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+
+        let canonical_legacy =
+            std::fs::canonicalize(legacy_dir.path()).expect("canonicalise legacy dir");
+        assert!(
+            result
+                .output
+                .contains(&canonical_legacy.to_string_lossy().to_string()),
+            "expected legacy cwd ({}) in shell output, got: {}",
+            canonical_legacy.display(),
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_safe_policy_still_denies_with_scope_present() {
+        // Codex-anticipated regression: a scope on the context must NOT
+        // weaken the `SafePolicy` denylist — `rm -rf /` is refused
+        // whether or not a scope is set. The CWD that the policy sees
+        // changes (it now sees the scope workspace), but the denylist is
+        // command-string only so the verdict is unchanged.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
+            .expect("scope construction");
+        let tool = ShellTool::new(std::env::temp_dir());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"command": "rm -rf /"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("denied"),
+            "expected deny, got: {}",
+            result.output
+        );
     }
 }

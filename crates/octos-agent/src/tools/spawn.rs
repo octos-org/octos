@@ -2484,6 +2484,16 @@ impl Tool for SpawnTool {
                 // own spawn tool calls see the higher value and the
                 // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
                 .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
+            // Phase 2-D of the SessionScope migration: propagate the
+            // parent's scope into the child Agent so the child's tools
+            // (shell, read_file, write_file, edit_file, plugin tool,
+            // pipeline workers) all see the same filesystem contract.
+            // The child runs in a sub-session of the same parent — for
+            // now it shares the parent's workspace; a future enhancement
+            // can carve out per-child subdirs if isolation is required.
+            if let Some(scope) = ctx.session_scope.as_ref() {
+                worker = worker.with_session_scope(scope.clone());
+            }
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
@@ -2776,6 +2786,13 @@ impl Tool for SpawnTool {
             // `parent_depth + 1` and the [`MAX_SPAWN_DEPTH`] gate fires
             // after a bounded number of nests.
             let child_spawn_depth = ctx.spawn_depth.saturating_add(1);
+            // Phase 2-D of the SessionScope migration: snapshot the
+            // parent's scope before crossing into the detached
+            // `tokio::spawn` task. The background child shares the
+            // parent workspace — same contract as the sync branch above
+            // — so subprocesses spawned by the child's shell tool see
+            // the same CWD the foreground would.
+            let child_session_scope = ctx.session_scope.clone();
 
             tokio::spawn(async move {
                 if let (Some(supervisor), Some(task_id)) =
@@ -2899,6 +2916,13 @@ impl Tool for SpawnTool {
                     // nesting depth + 1 so the detached child sees the
                     // higher value when its own spawn calls run.
                     .with_spawn_depth(child_spawn_depth);
+                // Phase 2-D: inherit the parent's SessionScope so the
+                // detached child sees the same filesystem contract as
+                // the sync spawn path (see `child_session_scope`
+                // snapshot at dispatch time).
+                if let Some(scope) = child_session_scope.as_ref() {
+                    worker = worker.with_session_scope(scope.clone());
+                }
                 // Keep an Arc to the child's tool registry for the
                 // post-`run_task` validator invocation below.
                 let child_tools_handle = worker.tool_registry().clone();
@@ -5309,5 +5333,291 @@ PY
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2-D: SessionScope propagation tests for SpawnTool.
+    //
+    // The migrated spawn tool reads `ctx.session_scope` and threads it
+    // onto the child Agent via `Agent::with_session_scope`. The child
+    // Agent's execution loop then plants the same scope onto every
+    // child `ToolContext` (see `agent/execution.rs`). These tests
+    // exercise that path end-to-end by mounting a recording tool on the
+    // child registry and asserting on what `execute_with_context` sees.
+    // -----------------------------------------------------------------------
+
+    /// Test-only tool that records the `session_scope.workspace()` it
+    /// observes on its `ToolContext`. Used by the Phase 2-D propagation
+    /// tests to capture what the child Agent's execution loop hands to
+    /// migrated tools. Lives only inside `#[cfg(test)]`.
+    struct ScopeRecordingTool {
+        observed: Arc<std::sync::Mutex<Option<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ScopeRecordingTool {
+        fn name(&self) -> &str {
+            "scope_probe"
+        }
+
+        fn description(&self) -> &str {
+            "test-only tool that records the session_scope it observes"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+            self.execute_with_context(&super::super::ToolContext::zero(), args)
+                .await
+        }
+
+        async fn execute_with_context(
+            &self,
+            ctx: &super::super::ToolContext,
+            _args: &serde_json::Value,
+        ) -> Result<ToolResult> {
+            let observed = ctx
+                .session_scope
+                .as_ref()
+                .map(|scope| scope.workspace().to_path_buf());
+            *self.observed.lock().unwrap_or_else(|e| e.into_inner()) = observed;
+            Ok(ToolResult {
+                output: "ok".to_string(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Mock provider that calls `scope_probe` once and then ends — drives
+    /// the child Agent through exactly one tool execution so the
+    /// recording tool sees the migrated `ToolContext`.
+    struct ScopeProbeProvider;
+
+    #[async_trait]
+    impl LlmProvider for ScopeProbeProvider {
+        async fn chat(
+            &self,
+            messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            // First call → invoke scope_probe; second call (after the
+            // probe's tool_result lands) → end the turn.
+            let probe_already_run = messages
+                .iter()
+                .any(|msg| matches!(msg.role, octos_core::MessageRole::Tool));
+            if probe_already_run {
+                Ok(octos_llm::ChatResponse {
+                    content: Some("done".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: octos_llm::StopReason::EndTurn,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            } else {
+                Ok(octos_llm::ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![octos_core::ToolCall {
+                        id: "call_scope_probe".into(),
+                        name: "scope_probe".into(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: octos_llm::StopReason::ToolUse,
+                    usage: octos_llm::TokenUsage::default(),
+                    provider_index: None,
+                })
+            }
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_propagates_scope_to_sub_agent() {
+        // When the parent `ToolContext` carries a `SessionScope`, the
+        // sync-mode sub-agent's tools must see the same scope on their
+        // own `ToolContext`. Without this, a session's filesystem
+        // contract is forgotten the moment work is delegated to a
+        // sub-agent.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
+            .expect("scope construction");
+
+        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_for_factory = observed.clone();
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(ScopeProbeProvider),
+            Arc::new(create_test_store().await),
+            scope_dir.path().to_path_buf(),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(move || {
+            Arc::new(ScopeRecordingTool {
+                observed: observed_for_factory.clone(),
+            })
+        }));
+
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "probe the scope",
+                    "mode": "sync",
+                    "allowed_tools": ["scope_probe"]
+                }),
+            )
+            .await
+            .expect("spawn returns Ok");
+        assert!(
+            result.success,
+            "expected sync spawn success: {}",
+            result.output
+        );
+
+        let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let captured = captured.expect(
+            "scope_probe must observe a SessionScope on its ToolContext — \
+             without Phase 2-D propagation the child Agent runs scope-less",
+        );
+        let canonical_expected =
+            std::fs::canonicalize(scope_dir.path()).expect("canonicalise scope dir");
+        let canonical_observed =
+            std::fs::canonicalize(&captured).expect("canonicalise observed workspace");
+        assert_eq!(
+            canonical_observed, canonical_expected,
+            "child Agent's session_scope.workspace() must match the parent's"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sub_agent_inherits_workspace_cwd() {
+        // The sync-mode child Agent's `working_dir` (passed via
+        // `TaskContext`) and the scope's workspace agree when the
+        // SpawnTool was constructed with `working_dir == scope.workspace()`.
+        // This is the production wiring (`runtime/session.rs` builds
+        // `SpawnTool::new(... working_dir == scope.workspace())`), and
+        // it's the property the Phase 2-D contract relies on: the child
+        // workspace CWD == the parent's scoped workspace, so any shell
+        // tool the child invokes runs with the right CWD even without
+        // the scope plumb.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let scope = octos_core::SessionScope::solo(scope_dir.path().to_path_buf(), vec![])
+            .expect("scope construction");
+
+        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_for_factory = observed.clone();
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        // SpawnTool's working_dir matches scope.workspace() — this is
+        // the production case.
+        let tool = SpawnTool::new(
+            Arc::new(ScopeProbeProvider),
+            Arc::new(create_test_store().await),
+            scope_dir.path().to_path_buf(),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(move || {
+            Arc::new(ScopeRecordingTool {
+                observed: observed_for_factory.clone(),
+            })
+        }));
+
+        let mut ctx = super::super::ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "probe",
+                    "mode": "sync",
+                    "allowed_tools": ["scope_probe"]
+                }),
+            )
+            .await
+            .expect("spawn ok");
+        assert!(result.success);
+
+        let captured = observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("scope_probe ran");
+        let canonical_workspace = std::fs::canonicalize(&captured).expect("canonicalise");
+        let canonical_spawn_cwd =
+            std::fs::canonicalize(scope_dir.path()).expect("canonicalise spawn cwd");
+        assert_eq!(
+            canonical_workspace, canonical_spawn_cwd,
+            "child workspace must equal the spawn cwd when SpawnTool::new \
+             was given `scope.workspace()` as its `working_dir`"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_falls_back_to_legacy_cwd_when_no_scope() {
+        // No scope on the parent context — the child Agent must keep
+        // its pre-Phase-2D behaviour byte-for-byte: `session_scope ==
+        // None`. The recording tool sees no scope. The legacy
+        // `working_dir` continues to drive every other code path
+        // (`ToolRegistry::with_builtins`, `TaskContext`).
+        let working = tempfile::tempdir().unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let observed_for_factory = observed.clone();
+
+        let (in_tx, _in_rx) = tokio::sync::mpsc::channel(16);
+        let tool = SpawnTool::new(
+            Arc::new(ScopeProbeProvider),
+            Arc::new(create_test_store().await),
+            working.path().to_path_buf(),
+            in_tx,
+        )
+        .with_child_tool_factory(Arc::new(move || {
+            Arc::new(ScopeRecordingTool {
+                observed: observed_for_factory.clone(),
+            })
+        }));
+
+        let ctx = super::super::ToolContext::zero();
+        assert!(
+            ctx.session_scope.is_none(),
+            "precondition: parent ctx has no scope"
+        );
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "task": "probe",
+                    "mode": "sync",
+                    "allowed_tools": ["scope_probe"]
+                }),
+            )
+            .await
+            .expect("spawn ok");
+        assert!(result.success);
+
+        let captured = observed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            captured.is_none(),
+            "without a parent scope the child Agent must NOT synthesise one; observed={:?}",
+            captured
+        );
     }
 }
