@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use octos_core::{PathClassification, SessionScope};
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
@@ -109,10 +108,13 @@ impl Tool for ReadFileTool {
         // threaded a scope through `ToolContext`, use it as the single
         // source of truth for base_dir + path classification. Reads are
         // permitted for `InWorkspace`, `InSharedZone`, and `InGrantedDir`;
-        // `OutOfScope` is refused. When no scope is present we keep the
-        // legacy resolver (backward compat for `octos chat` etc.).
+        // `OutOfScope` is refused. The shared helper canonicalizes the
+        // candidate before classification so ancestor symlinks can't
+        // smuggle a path out of the workspace (`O_NOFOLLOW` only
+        // protects the final component). When no scope is present we
+        // keep the legacy resolver (backward compat for `octos chat`).
         let path = match ctx.session_scope.as_ref() {
-            Some(scope) => match resolve_with_scope_for_read(scope, &input.path) {
+            Some(scope) => match super::resolve_path_for_session_scope_read(scope, &input.path) {
                 Ok(p) => p,
                 Err(reason) => {
                     return Ok(ToolResult {
@@ -270,30 +272,6 @@ fn user_range(start: Option<usize>, end: Option<usize>) -> Option<(u64, u64)> {
         start.map(|s| s as u64).unwrap_or(0),
         end.map(|e| e as u64).unwrap_or(u64::MAX),
     ))
-}
-
-/// Resolve a user-supplied path against a [`SessionScope`] for a READ
-/// operation. Relative paths anchor at `scope.workspace()`; absolute
-/// paths are accepted but must classify into one of the read-allowed
-/// zones (`InWorkspace`, `InSharedZone`, `InGrantedDir`). `OutOfScope`
-/// — including any `..` traversal that `classify_lexical_path` refuses
-/// — is rejected.
-fn resolve_with_scope_for_read(
-    scope: &SessionScope,
-    user_path: &str,
-) -> Result<PathBuf, &'static str> {
-    let candidate = PathBuf::from(user_path);
-    let absolute = if candidate.is_absolute() {
-        candidate
-    } else {
-        scope.workspace().join(candidate)
-    };
-    match scope.classify_lexical_path(&absolute) {
-        PathClassification::InWorkspace
-        | PathClassification::InSharedZone { .. }
-        | PathClassification::InGrantedDir { .. } => Ok(absolute),
-        PathClassification::OutOfScope => Err("Path outside session scope"),
-    }
 }
 
 /// True when a cached entry can satisfy the caller's request without
@@ -557,6 +535,8 @@ mod tests {
     // Phase 2-C: SessionScope integration tests for ReadFileTool.
     // -----------------------------------------------------------------------
 
+    use octos_core::SessionScope;
+
     fn ctx_with_scope(scope: SessionScope) -> ToolContext {
         let mut ctx = ToolContext::zero();
         ctx.tool_id = "read-with-scope".to_string();
@@ -669,6 +649,46 @@ mod tests {
             .unwrap();
         assert!(result.success, "expected success, got: {}", result.output);
         assert!(result.output.contains("shared notes"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_refuses_ancestor_symlink_escape() {
+        // Per codex review of the Phase 2-C commit: `O_NOFOLLOW` only
+        // guards the FINAL path component, and `classify_lexical_path`
+        // is explicitly lexical. Without our canonicalization step a
+        // path like `<workspace>/link/secret.txt`, where `link` is a
+        // symlink pointing outside the workspace, would classify as
+        // `InWorkspace` and `read_no_follow` would happily open the
+        // file at the symlink's real location.
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::fs::write(outside_dir.path().join("secret.txt"), "exfiltrated\n").unwrap();
+
+        // <scope>/link -> <outside>
+        let link_path = scope_dir.path().join("link");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "link/secret.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "ancestor-symlink escape MUST be refused, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection (canonicalized leaves the workspace), got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

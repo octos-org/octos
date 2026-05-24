@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use octos_core::{PathClassification, SessionScope};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -113,14 +112,17 @@ impl Tool for WriteFileTool {
 
         // Phase 2-C of the SessionScope migration: when the host has
         // threaded a scope through `ToolContext`, use it as the single
-        // source of truth for base_dir + path classification. WRITES are
-        // permitted only for `InWorkspace` and `InGrantedDir`;
-        // `InSharedZone` and `OutOfScope` are refused. This also fixes
-        // the path asymmetry that #1189 worked around: write_file now
-        // writes under `scope.workspace()` — the same directory that
-        // plugin tools run in — instead of the bespoke `base_dir`.
+        // source of truth for base_dir + path classification. WRITES
+        // are permitted only for `InWorkspace` and `InGrantedDir`;
+        // `InSharedZone` and `OutOfScope` are refused. The shared
+        // helper canonicalizes the candidate before classification so
+        // ancestor symlinks can't smuggle a write out of the workspace
+        // (`O_NOFOLLOW` only protects the final component). This also
+        // fixes the path asymmetry that #1189 worked around:
+        // write_file now writes under `scope.workspace()` — the same
+        // directory plugin tools run in.
         let path = match ctx.session_scope.as_ref() {
-            Some(scope) => match resolve_with_scope_for_write(scope, &input.path) {
+            Some(scope) => match super::resolve_path_for_session_scope_write(scope, &input.path) {
                 Ok(p) => p,
                 Err(reason) => {
                     return Ok(ToolResult {
@@ -182,29 +184,6 @@ impl Tool for WriteFileTool {
             file_modified: Some(path),
             ..Default::default()
         })
-    }
-}
-
-/// Resolve a user-supplied path against a [`SessionScope`] for a WRITE
-/// operation. Relative paths anchor at `scope.workspace()`; absolute
-/// paths are accepted but must classify into one of the write-allowed
-/// zones (`InWorkspace`, `InGrantedDir`). `InSharedZone` and
-/// `OutOfScope` are refused — shared zones are managed by maintenance
-/// paths, not session workers.
-fn resolve_with_scope_for_write(
-    scope: &SessionScope,
-    user_path: &str,
-) -> Result<PathBuf, &'static str> {
-    let candidate = PathBuf::from(user_path);
-    let absolute = if candidate.is_absolute() {
-        candidate
-    } else {
-        scope.workspace().join(candidate)
-    };
-    match scope.classify_lexical_path(&absolute) {
-        PathClassification::InWorkspace | PathClassification::InGrantedDir { .. } => Ok(absolute),
-        PathClassification::InSharedZone { .. } => Err("Writes to shared zones are not permitted"),
-        PathClassification::OutOfScope => Err("Path outside session scope"),
     }
 }
 
@@ -310,6 +289,7 @@ mod tests {
     // Phase 2-C: SessionScope integration tests for WriteFileTool.
     // -----------------------------------------------------------------------
 
+    use octos_core::SessionScope;
     use std::sync::Arc;
 
     fn ctx_with_scope(scope: SessionScope) -> ToolContext {
@@ -437,6 +417,50 @@ mod tests {
             !shared_target.exists(),
             "refused write must NOT have created the file"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_refuses_ancestor_symlink_escape() {
+        // Per codex review of the Phase 2-C commit: without
+        // ancestor-symlink rejection, a write to `<workspace>/link/x`
+        // (where `link` is a symlink pointing outside the workspace)
+        // would land at the symlink target — `O_NOFOLLOW` only protects
+        // the final component. The shared canonicalizing classifier
+        // closes that hole.
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let link_path = scope_dir.path().join("link");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = WriteFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "link/leaked.txt",
+                    "content": "exfiltrated\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "ancestor-symlink escape MUST be refused, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+        // The escape file MUST NOT have been created at the symlink target.
+        assert!(!outside_dir.path().join("leaked.txt").exists());
     }
 
     #[tokio::test]

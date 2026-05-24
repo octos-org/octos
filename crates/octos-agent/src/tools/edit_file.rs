@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use octos_core::{PathClassification, SessionScope};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -117,11 +116,14 @@ impl Tool for EditFileTool {
 
         // Phase 2-C of the SessionScope migration: when the host has
         // threaded a scope through `ToolContext`, use it as the single
-        // source of truth for base_dir + path classification. Same write
-        // policy as `write_file` — `InWorkspace` and `InGrantedDir`
-        // allowed; `InSharedZone` and `OutOfScope` refused.
+        // source of truth for base_dir + path classification. Same
+        // write policy as `write_file` — `InWorkspace` and
+        // `InGrantedDir` allowed; `InSharedZone` and `OutOfScope`
+        // refused. The shared helper canonicalizes the candidate before
+        // classification so ancestor symlinks can't smuggle an edit
+        // out of the workspace.
         let path = match ctx.session_scope.as_ref() {
-            Some(scope) => match resolve_with_scope_for_write(scope, &input.path) {
+            Some(scope) => match super::resolve_path_for_session_scope_write(scope, &input.path) {
                 Ok(p) => p,
                 Err(reason) => {
                     return Ok(ToolResult {
@@ -208,28 +210,6 @@ impl Tool for EditFileTool {
             file_modified: Some(path),
             ..Default::default()
         })
-    }
-}
-
-/// Resolve a user-supplied path against a [`SessionScope`] for a WRITE
-/// operation (edit_file mutates files in place, so it uses the same
-/// policy as `write_file`). Relative paths anchor at `scope.workspace()`;
-/// absolute paths must classify into `InWorkspace` or `InGrantedDir`.
-/// `InSharedZone` and `OutOfScope` are refused.
-fn resolve_with_scope_for_write(
-    scope: &SessionScope,
-    user_path: &str,
-) -> Result<PathBuf, &'static str> {
-    let candidate = PathBuf::from(user_path);
-    let absolute = if candidate.is_absolute() {
-        candidate
-    } else {
-        scope.workspace().join(candidate)
-    };
-    match scope.classify_lexical_path(&absolute) {
-        PathClassification::InWorkspace | PathClassification::InGrantedDir { .. } => Ok(absolute),
-        PathClassification::InSharedZone { .. } => Err("Writes to shared zones are not permitted"),
-        PathClassification::OutOfScope => Err("Path outside session scope"),
     }
 }
 
@@ -375,6 +355,7 @@ mod tests {
     // Phase 2-C: SessionScope integration tests for EditFileTool.
     // -----------------------------------------------------------------------
 
+    use octos_core::SessionScope;
     use std::sync::Arc;
 
     fn ctx_with_scope(scope: SessionScope) -> ToolContext {
@@ -524,6 +505,53 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&shared_file).unwrap(),
             "untouched\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_file_refuses_ancestor_symlink_escape() {
+        // Symmetric with the write_file ancestor-symlink test. Even
+        // with a real target file pre-staged at the symlink target,
+        // the scoped resolver must refuse before O_NOFOLLOW would
+        // (correctly) bail on the symlink itself.
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::fs::write(outside_dir.path().join("target.txt"), "secret\n").unwrap();
+        let link_path = scope_dir.path().join("link");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = EditFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "link/target.txt",
+                    "old_string": "secret",
+                    "new_string": "owned",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "ancestor-symlink escape MUST be refused, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+        // Real file at the symlink target must remain unchanged.
+        assert_eq!(
+            std::fs::read_to_string(outside_dir.path().join("target.txt")).unwrap(),
+            "secret\n",
         );
     }
 
