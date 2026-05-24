@@ -633,11 +633,22 @@ impl Tool for RunPipelineTool {
                     .try_with(crate::host_context::PipelineHostContext::from_tool_context)
                     .unwrap_or_default();
                 cascade_fail_orphan_node_tasks(&host_context, timeout_secs);
-                return Err(eyre::eyre!(
-                    "pipeline timed out after {}s (timeout_secs={})",
-                    timeout_secs,
-                    timeout_secs
-                ));
+                // NEW-09: surface the timeout as a `ToolResult { success: false }`
+                // rather than `Err(eyre)`. The Err arm of the spawn_only
+                // background executor in `octos-agent/src/agent/execution.rs`
+                // calls `bg_sender(...)` (so the `message/persisted` /
+                // `turn/spawn_complete` bubble IS emitted), but soak round-8
+                // observed that the harness's `isFinalArrived` heuristic
+                // missed the completion. Returning the failure-with-result
+                // shape routes the timeout through the SAME `Ok(r) if
+                // !r.success` arm that has been live-tested for every other
+                // failing spawn_only tool. The bubble shape becomes
+                // `✗ run_pipeline failed: pipeline timed out after Ns`
+                // (matching the success-path "failed" wording instead of the
+                // Err-path "error" wording), the JSONL row is persisted via
+                // the existing failure path, and downstream `read_task_output`
+                // reads see the same error text.
+                return Ok(build_pipeline_timeout_result(timeout_secs));
             }
         };
 
@@ -870,6 +881,49 @@ fn cascade_fail_orphan_node_tasks(
         );
     }
     cascaded
+}
+
+/// NEW-09 — build the canonical [`ToolResult`] returned from
+/// `RunPipelineTool::execute` when the pipeline-level timeout fires.
+///
+/// Returning `Ok(ToolResult { success: false, .. })` (rather than
+/// `Err(eyre)`) routes the timeout through the same `Ok(r) if !r.success`
+/// arm of the spawn_only background executor in
+/// `octos-agent/src/agent/execution.rs` that handles every other failing
+/// background tool. That arm:
+///
+/// 1. Marks the supervisor task `Failed` with the timeout reason.
+/// 2. Calls the registered `BackgroundResultSender` which persists the
+///    completion row to the session JSONL via
+///    `persist_assistant_with_media` and emits both `message/persisted`
+///    (legacy clients) and `turn/spawn_complete` (M10 clients).
+/// 3. The bubble surface text becomes
+///    `✗ run_pipeline failed: pipeline timed out after Ns` — matching
+///    the wording every other failing spawn_only tool produces.
+///
+/// Pre-fix, the timeout returned `Err(eyre)` which DID also call the
+/// sender via the `Err(e)` arm, but the harness's `isFinalArrived`
+/// heuristic in soak round-8 observed the timeout completion never
+/// reached the WS client; consolidating onto a single failure path
+/// eliminates the Err/Ok divergence and pins the contract test surface
+/// to one shape.
+///
+/// `files_to_send` is intentionally empty: a timed-out run produced no
+/// deliverable artifact. `structured_metadata` and `named_outputs` are
+/// `None` since no nodes executed to completion. `tokens_used` is `None`
+/// because per-node token accounting was not collected when the parent
+/// future was dropped; downstream cost-ledger callers must handle the
+/// `None` case (they already do for legacy `Err` returns).
+pub(crate) fn build_pipeline_timeout_result(timeout_secs: u64) -> ToolResult {
+    ToolResult {
+        output: format!("pipeline timed out after {timeout_secs}s"),
+        success: false,
+        tokens_used: None,
+        file_modified: None,
+        files_to_send: Vec::new(),
+        structured_metadata: None,
+        named_outputs: None,
+    }
 }
 
 /// #1020 / M17-B — write a `summary.json` carrying the
@@ -1462,6 +1516,104 @@ mod tests {
         };
         let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
         assert_eq!(cascaded, 0);
+    }
+
+    /// NEW-09 regression pin: the pipeline-level timeout MUST return
+    /// `Ok(ToolResult { success: false, output: "pipeline timed out
+    /// after Ns" })` rather than `Err(eyre)`. The spawn_only background
+    /// executor in `octos-agent/src/agent/execution.rs` then routes the
+    /// timeout through the `Ok(r) if !r.success` arm, which has been
+    /// live-tested to call `bg_sender(BackgroundResultPayload { ... })`
+    /// — persisting a `message/persisted` (legacy) and
+    /// `turn/spawn_complete` (M10) event so the WS client renders the
+    /// completion bubble and the harness's `isFinalArrived` heuristic
+    /// fires.
+    ///
+    /// Pre-fix, the timeout returned `Err(eyre)` which routed through
+    /// the `Err(e)` arm. Both arms emit a `BackgroundResultPayload`,
+    /// but soak round-8 observed the WS client never saw the
+    /// completion event for the Err path. Consolidating onto the
+    /// `Ok(r) if !r.success` arm eliminates the divergence.
+    #[test]
+    fn pipeline_timeout_returns_ok_failure_result_not_err() {
+        let result = build_pipeline_timeout_result(1200);
+        assert!(
+            !result.success,
+            "timeout result must carry success=false so the spawn_only \
+             execution branch routes through the `Ok(r) if !r.success` arm"
+        );
+        assert_eq!(
+            result.output, "pipeline timed out after 1200s",
+            "output text must carry the canonical timeout reason — the \
+             spawn_only failure arm composes the chat bubble as \
+             `✗ run_pipeline failed: <output>`"
+        );
+        assert!(
+            result.files_to_send.is_empty(),
+            "timed-out runs produce no deliverable artifact"
+        );
+        assert!(
+            result.file_modified.is_none(),
+            "no report file when no nodes completed"
+        );
+        assert!(
+            result.tokens_used.is_none(),
+            "per-node token accounting was not collected when the parent \
+             future was dropped"
+        );
+        assert!(
+            result.structured_metadata.is_none(),
+            "no per-node cost rows on the timeout path"
+        );
+        assert!(
+            result.named_outputs.is_none(),
+            "no named outputs without completed nodes"
+        );
+    }
+
+    /// NEW-09: the timeout-result output text must match what
+    /// `cascade_fail_orphan_node_tasks` writes onto the child task
+    /// `error` field. Without this invariant, a downstream
+    /// `read_task_output` against the parent task surfaces different
+    /// timeout-reason wording than the cascade-failed child rows, and
+    /// dashboards / debugging tooling lose correlation.
+    #[test]
+    fn pipeline_timeout_output_matches_cascade_failed_child_error_text() {
+        use octos_agent::task_supervisor::TaskSupervisor;
+        use std::sync::Arc;
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let parent_tcid = "tool-call-run_pipeline-timeout-correlation";
+        let parent_task =
+            supervisor.register("run_pipeline", parent_tcid, Some("session-correlation"));
+        supervisor.mark_running(&parent_task);
+        let child =
+            supervisor.register("pipeline:analyze", parent_tcid, Some("session-correlation"));
+        supervisor.mark_running(&child);
+
+        let host = crate::host_context::PipelineHostContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_tool_call_id: Some(parent_tcid.to_string()),
+            parent_session_key: Some("session-correlation".to_string()),
+            ..Default::default()
+        };
+        let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
+        assert_eq!(cascaded, 1);
+
+        let child_error = supervisor
+            .get_task(&child)
+            .expect("child task survives")
+            .error
+            .unwrap_or_default();
+
+        let timeout_result = build_pipeline_timeout_result(1200);
+        assert!(
+            child_error.contains(&timeout_result.output),
+            "child cascade-failure error ({child_error}) must contain the \
+             parent timeout result output ({}) so dashboards correlate \
+             parent + child rows on a shared reason string",
+            timeout_result.output,
+        );
     }
 
     // ───── Phase 2-A: SessionScope-aware working dir resolution ─────

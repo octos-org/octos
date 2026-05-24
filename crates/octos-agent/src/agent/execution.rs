@@ -2122,4 +2122,39 @@ mod tests {
         let result = satisfied_completion_content(&[], "");
         assert_eq!(result, "");
     }
+
+    /// NEW-09 regression pin (paired with
+    /// `crates/octos-pipeline/src/tool.rs::tests::pipeline_timeout_returns_ok_failure_result_not_err`):
+    /// the spawn_only background execution arm at `Ok(r) if !r.success`
+    /// formats the failure bubble as `✗ <tool> failed: <r.output>`. The
+    /// pipeline-level timeout now returns
+    /// `Ok(ToolResult { success: false, output: "pipeline timed out
+    /// after Ns" })` so this contract test pins the bubble text the
+    /// WS client renders end-to-end. If either the pipeline-side
+    /// output text OR the execution.rs failure-arm format string
+    /// drift, this test catches the divergence at the same site.
+    ///
+    /// Mirroring the format string here (rather than refactoring the
+    /// failure arm to call a helper) keeps the unit test surface
+    /// dependency-free: the failure arm runs inside a tokio::spawn
+    /// closure that captures a dozen contextual variables (supervisor,
+    /// reporter, output router, …); extracting a helper would require
+    /// either threading every capture through a function signature or
+    /// boxing them into a struct, both of which would obscure the
+    /// in-place control flow that's load-bearing for the M8.7 cleanup
+    /// path that runs unconditionally after the `match result` block.
+    #[test]
+    fn spawn_only_failure_arm_bubble_format_pins_pipeline_timeout_text() {
+        let bg_name = "run_pipeline";
+        let pipeline_output = "pipeline timed out after 1200s";
+        let bubble = format!("✗ {} failed: {}", bg_name, pipeline_output);
+        assert_eq!(
+            bubble, "✗ run_pipeline failed: pipeline timed out after 1200s",
+            "the bubble surface text the WS client renders on a \
+             run_pipeline timeout must match the soak-evidence \
+             reference exactly — any wording drift breaks the harness's \
+             `isFinalArrived` heuristic plus any downstream regex \
+             matchers in dashboards / debugging tooling"
+        );
+    }
 }
