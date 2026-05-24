@@ -238,6 +238,13 @@ impl Agent {
         // both stamp it onto every tool call. The spawn tool reads
         // `ctx.spawn_depth` and refuses further nesting at the cap.
         let spawn_depth = self.spawn_depth;
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // snapshot the agent's `session_scope` so the foreground and
+        // spawn_only `ToolContext` builders below thread it onto every
+        // tool call. `None` keeps pre-Phase-1 behaviour; downstream
+        // consumers (pipeline workers, file tools, plugins) come online
+        // in Phase 2.
+        let session_scope = self.session_scope.clone();
 
         tokio::spawn(async move {
             let tool_start = Instant::now();
@@ -470,6 +477,12 @@ impl Agent {
                 // Guard C (issue #607): clone the agent's spawn nesting
                 // depth into the spawn_only TOOL_CTX builder.
                 let bg_spawn_depth = spawn_depth;
+                // Phase 1 of the SessionScope migration: clone the
+                // agent's session scope into the spawn_only TOOL_CTX
+                // builder so background sub-agents see the same
+                // filesystem contract as the parent session. None
+                // keeps pre-Phase-1 behaviour.
+                let bg_session_scope = session_scope.clone();
                 let bg_session_id_for_watcher = format!("agent:{}", tc_id);
                 // M10 Phase 4: keep a copy of the task_id so the synthesized
                 // tool-result message returned to the LLM (built after this
@@ -524,6 +537,11 @@ impl Agent {
                         // sub-agents (e.g. fm_tts → spawn) see the
                         // higher value when their TOOL_CTX is read.
                         spawn_depth: bg_spawn_depth,
+                        // Phase 1 SessionScope migration: thread the
+                        // shared scope onto the spawn_only TOOL_CTX so
+                        // every background sub-agent sees the same
+                        // filesystem contract as the parent.
+                        session_scope: bg_session_scope.clone(),
                         ..ToolContext::zero()
                     };
 
@@ -1399,6 +1417,10 @@ impl Agent {
                 // when deciding whether the next nested spawn is
                 // allowed.
                 spawn_depth,
+                // Phase 1 SessionScope migration: thread the shared
+                // scope onto the foreground TOOL_CTX so tools and the
+                // pipeline host context snapshot the same handle.
+                session_scope: session_scope.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools

@@ -38,6 +38,7 @@ use eyre::Result;
 use octos_core::TokenUsage;
 
 use crate::progress::ProgressReporter;
+use octos_core::SessionScope;
 
 /// Registry of [`AgentDefinition`]-style manifests available to tools.
 ///
@@ -273,6 +274,21 @@ pub struct ToolContext {
     /// Beyond [`crate::tools::spawn::MAX_SPAWN_DEPTH`] the spawn tool
     /// refuses further nesting to bound mutual-recursion blowups.
     pub spawn_depth: u8,
+    /// Phase 1 of the [`SessionScope`] migration (PR #1198 follow-up):
+    /// the single filesystem contract for this session. Constructed at
+    /// the host entry point (`chat.rs` for solo, `serve.rs` /
+    /// `runtime/session.rs` for multi-tenant) and threaded through
+    /// `TOOL_CTX` so any tool can derive its CWD and validate paths
+    /// against the same scope.
+    ///
+    /// `Optional` because Phase 1 is additive — no consumer reads this
+    /// yet. Phase 2 PRs will migrate `RunPipelineTool.working_dir`,
+    /// plugin tool `work_dir`, file tools, shell, etc. to read from
+    /// this field; Phase 3 will retire bespoke validators like
+    /// `api_session_workspace_dirs` in favour of
+    /// [`SessionScope::workspace`]. See `octos_core::session_scope`
+    /// for the contract and migration notes.
+    pub session_scope: Option<Arc<SessionScope>>,
 }
 
 impl ToolContext {
@@ -298,6 +314,7 @@ impl ToolContext {
             cost_accountant: None,
             parent_session_key: None,
             spawn_depth: 0,
+            session_scope: None,
         }
     }
 }

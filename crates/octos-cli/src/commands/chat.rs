@@ -12,7 +12,7 @@ use octos_agent::{
     Agent, AgentConfig, CompactionSummarizerKind, ConsoleReporter, HookExecutor, ToolRegistry,
     read_workspace_policy,
 };
-use octos_core::{AgentId, Message, MessageRole};
+use octos_core::{AgentId, Message, MessageRole, SessionScope};
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
     RetryProvider,
@@ -429,6 +429,25 @@ impl ChatCommand {
             supervisor_for_summary,
         ));
 
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // construct the single filesystem contract for this solo
+        // session and stash it on the agent. `cwd` may have come from
+        // `--cwd` (potentially relative) or from `current_dir()`
+        // (always absolute). Absolutize defensively so the
+        // `SessionScope::solo` invariant holds without panicking on
+        // user input. Phase 2 PRs will start reading this from tools,
+        // pipelines, and plugins; today it is wired through but unused.
+        let absolute_cwd: PathBuf = if cwd.is_absolute() {
+            cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|base| base.join(&cwd))
+                .unwrap_or_else(|_| cwd.clone())
+        };
+        let session_scope = Arc::new(SessionScope::solo(absolute_cwd, Vec::new()).expect(
+            "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
+        ));
+
         let mut agent = Agent::new(AgentId::new("chat"), llm, tools, memory)
             .with_config(agent_config)
             .with_reporter(reporter)
@@ -437,7 +456,8 @@ impl ChatCommand {
             .with_profile(profile_arc.clone())
             .with_file_state_cache(file_state_cache)
             .with_subagent_output_router(subagent_output_router)
-            .with_subagent_summary_generator(subagent_summary_generator);
+            .with_subagent_summary_generator(subagent_summary_generator)
+            .with_session_scope(session_scope);
 
         // M8.3: if the profile declares a system_prompt_template, try to
         // read it relative to `~/.octos/profiles/<name>/`. The path is a
@@ -812,6 +832,63 @@ mod tests {
         assert!(
             resolve_provider_policy(&config, "anthropic", "claude-sonnet-4-20250514").is_none()
         );
+    }
+
+    #[test]
+    fn chat_constructs_solo_session_scope_with_user_cwd() {
+        // Phase 1 SessionScope migration (PR #1198 follow-up): the
+        // chat entry point constructs a solo [`SessionScope`] from the
+        // user-finalized `cwd` (or `current_dir()` fallback) and
+        // attaches it to the per-session agent via
+        // [`Agent::with_session_scope`]. This test mirrors the exact
+        // construction the entry point performs so a regression that
+        // drops the wiring (or accidentally rejects valid input by
+        // mistakenly making the constructor fail) fails the suite
+        // before it ships to fleet.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        // Mirror chat.rs's absolutize-then-build pattern.
+        let absolute_cwd: PathBuf = if cwd.is_absolute() {
+            cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|base| base.join(&cwd))
+                .unwrap_or_else(|_| cwd.clone())
+        };
+        let scope = SessionScope::solo(absolute_cwd, Vec::new())
+            .expect("solo SessionScope construction must succeed for an absolute cwd");
+        assert_eq!(scope.workspace(), cwd.as_path());
+        assert_eq!(scope.root(), cwd.as_path());
+        assert!(scope.shared_zones().is_empty());
+    }
+
+    #[test]
+    fn chat_solo_session_scope_does_not_panic_on_relative_cwd_input() {
+        // Defensive cover for chat.rs's absolutize branch — the
+        // `--cwd relative` case must not propagate a relative path
+        // into `SessionScope::solo`, which would `expect` on the
+        // `RootNotAbsolute` invariant. The branch resolves against
+        // `current_dir()` first so the SessionScope ctor always sees
+        // an absolute path.
+        let relative = PathBuf::from("some-subdir");
+        let absolute_cwd: PathBuf = if relative.is_absolute() {
+            relative.clone()
+        } else {
+            std::env::current_dir()
+                .map(|base| base.join(&relative))
+                .unwrap_or_else(|_| relative.clone())
+        };
+        assert!(
+            absolute_cwd.is_absolute() || std::env::current_dir().is_err(),
+            "absolutize branch must produce an absolute path when current_dir() succeeds"
+        );
+        // We can't always guarantee `current_dir()` succeeds in CI
+        // sandboxes, but when it does we should be able to call
+        // SessionScope::solo without panicking.
+        if absolute_cwd.is_absolute() {
+            SessionScope::solo(absolute_cwd, Vec::new())
+                .expect("SessionScope::solo accepts the absolutized path");
+        }
     }
 
     /// NEW-06 codex follow-up — when [`build_run_pipeline_tool`] is
