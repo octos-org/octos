@@ -15665,8 +15665,41 @@ async fn run_standalone_turn(
         if scope.workspace() == session_runtime.workspace_root.as_path() {
             request_agent = request_agent.with_session_scope(scope.clone());
         } else {
-            match octos_core::SessionScope::solo(session_runtime.workspace_root.clone(), Vec::new())
-            {
+            // Phase 3-A codex round-3 P2: the synthesized solo scope
+            // MUST grant the upload tmpdir alongside the workspace,
+            // otherwise hinted sessions lose the ability to resolve
+            // `up/...` handles and absolute paths under
+            // `octos_bus::file_handle::temp_upload_root()` through the
+            // scope-aware path resolver. Without it,
+            // `resolve_path_for_session_scope_*` would classify
+            // attachment paths as `OutOfScope` and reject them,
+            // breaking hinted coding turns that ask the agent to
+            // process an uploaded file or audio attachment.
+            //
+            // The upload root is a stable, profile-independent path
+            // (`std::env::temp_dir().join("octos-uploads")`), so
+            // granting it does not widen the boundary beyond what the
+            // legacy unscoped resolver already trusted: that resolver
+            // unconditionally allowed `canonical_path.starts_with(
+            // &upload_root)` for send_file and friends. Adding it as
+            // a `granted_dir` re-affirms that trust contract through
+            // the new scope-aware path while leaving the workspace as
+            // the primary write target.
+            let upload_root = octos_bus::file_handle::temp_upload_root();
+            let granted_dirs = if upload_root.is_absolute() {
+                vec![upload_root]
+            } else {
+                // Defensive: `temp_upload_root` returns
+                // `temp_dir().join("octos-uploads")` so it should
+                // always be absolute; bail out cleanly if a future
+                // platform tweak ever breaks the invariant rather
+                // than letting `SessionScope::solo` reject it.
+                Vec::new()
+            };
+            match octos_core::SessionScope::solo(
+                session_runtime.workspace_root.clone(),
+                granted_dirs,
+            ) {
                 Ok(synthesized) => {
                     tracing::debug!(
                         session = %session_id.0,
@@ -15677,7 +15710,7 @@ async fn run_standalone_turn(
                          cached scope's workspace does not match \
                          SessionRuntime.workspace_root (hint session); \
                          a solo scope keeps Phase-2 consumers' boundary validation \
-                         active for the user-selected repo"
+                         active for the user-selected repo + the upload tmpdir"
                     );
                     request_agent = request_agent.with_session_scope(Arc::new(synthesized));
                 }
