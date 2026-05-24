@@ -860,26 +860,32 @@ mod tests {
         assert_eq!(turn_scope.root(), data_dir.as_path());
     }
 
-    /// Phase 3-A codex round-1 P1 regression-pin: when a coding-agent
+    /// Phase 3-A codex round-2 P1 regression-pin: when a coding-agent
     /// UI opens a session with an explicit `cwd` hint (the AppUI
     /// `SessionOpenParams.cwd` path), the cached `SessionRuntime`
     /// honours the hint for `workspace_root` and the rebound tool
     /// registry, but `bootstrap` still builds the `SessionScope` from
     /// the canonical `<data>/users/<id>/workspace` layout — so the
     /// cached scope's workspace does NOT match the runtime's. The WS
-    /// turn handler MUST skip propagation in this case, because
-    /// propagating the mismatched scope would make migrated tools
-    /// (`shell`, file tools, plugins, `run_pipeline`) resolve against
-    /// the empty default workspace instead of the user-selected repo.
-    /// Fix-line: `if scope.workspace() == workspace_root` gate at
-    /// `api/ui_protocol.rs::15663-15664`.
+    /// turn handler MUST synthesize a solo scope rooted at
+    /// `workspace_root` in this case (round-2 fix). Round-1 skipped
+    /// propagation entirely, but codex correctly flagged that this
+    /// leaves hint sessions on the legacy unread-scope path where
+    /// `PluginTool` falls back to its absolute-path rewrite branch
+    /// without workspace-boundary validation — a path-escape risk for
+    /// hinted AppUI plugin calls like `audio_path=/etc/passwd`.
+    /// Fix-line: synthesize `SessionScope::solo(workspace_root, [])`
+    /// in the mismatch branch at `api/ui_protocol.rs::15663-15689`.
     ///
-    /// This test mirrors the gated rebuild and confirms the per-turn
-    /// agent observes `session_scope == None` for hint sessions —
-    /// keeping their pre-Phase-3-A unread-scope behaviour byte-for-byte.
+    /// This test mirrors the round-2 rebuild and confirms the per-turn
+    /// agent observes a solo scope whose `workspace() ==
+    /// workspace_root` (= user-selected repo) — so the migrated
+    /// consumers' boundary validation kicks in for the right tree
+    /// instead of the empty default workspace.
     #[tokio::test]
-    async fn ui_protocol_ws_turn_agent_skips_session_scope_on_workspace_hint() {
+    async fn ui_protocol_ws_turn_agent_synthesizes_workspace_scope_on_workspace_hint() {
         use octos_agent::Agent;
+        use octos_core::SessionScope;
 
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("profile-data");
@@ -915,10 +921,13 @@ mod tests {
             runtime_scope.workspace(),
             rt.workspace_root.as_path(),
             "Phase 1 design: scope still uses default <data>/users/<id>/workspace \
-             — this is the mismatch the gate at ui_protocol.rs guards against"
+             — this is the mismatch the round-2 fix at ui_protocol.rs handles"
         );
 
-        // Mirror the WS turn handler's per-turn rebuild WITH the gate.
+        // Mirror the WS turn handler's per-turn rebuild WITH the
+        // round-2 fix: when the cached scope's workspace doesn't match
+        // the runtime's workspace_root, synthesize a solo scope rooted
+        // at workspace_root and propagate THAT.
         let tools = Arc::new(rt.tools.snapshot_excluding(&[]));
         let mut request_agent = Agent::new_shared(
             AgentId::new(format!("ui-protocol-{}", uuid::Uuid::now_v7())),
@@ -929,14 +938,37 @@ mod tests {
         if let Some(scope) = rt.agent.session_scope() {
             if scope.workspace() == rt.workspace_root.as_path() {
                 request_agent = request_agent.with_session_scope(scope.clone());
+            } else {
+                let synthesized = SessionScope::solo(rt.workspace_root.clone(), Vec::new())
+                    .expect("solo scope from absolute workspace_root");
+                request_agent = request_agent.with_session_scope(Arc::new(synthesized));
             }
         }
 
+        let observed = request_agent
+            .session_scope()
+            .expect(
+                "per-turn agent MUST carry a synthesized scope for hint sessions \
+                     (round-2 fix — round-1 erroneously skipped propagation, leaving the \
+                     plugin tool's boundary check disabled)",
+            )
+            .clone();
+        assert_eq!(
+            observed.workspace(),
+            rt.workspace_root.as_path(),
+            "synthesized scope's workspace MUST be the runtime's workspace_root \
+             (= user-selected repo via hint) so Phase 2 consumers validate against \
+             the right tree, not the cached scope's empty default layout"
+        );
+        assert_eq!(
+            observed.root(),
+            rt.workspace_root.as_path(),
+            "solo scope: workspace == root == hint path"
+        );
         assert!(
-            request_agent.session_scope().is_none(),
-            "per-turn agent must NOT inherit the mismatched scope when the session was \
-             opened with a workspace hint — propagating would point migrated tools at the \
-             empty default workspace instead of the user-selected repo (codex round-1 P1)",
+            observed.shared_zones().is_empty(),
+            "solo scope must declare no cross-session shared zones — hint sessions own \
+             their workspace boundary, not a multi-tenant layout"
         );
     }
 
