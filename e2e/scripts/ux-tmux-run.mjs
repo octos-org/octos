@@ -5,9 +5,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadManifest } from '../lib/ux/scenarios.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, '..', '..');
+const defaultManifest = path.resolve(repoRoot, 'e2e', 'matrix', 'octos-ux.toml');
 const defaultScenarioId = 'stdio-happy-path';
 const requiredArtifacts = [
   'scenario.json',
@@ -21,6 +23,8 @@ const requiredArtifacts = [
   'runtime-policy-stamp.json',
   'appui-transcript.jsonl',
 ];
+const terminalSummaryStatuses = new Set(['passed', 'failed', 'blocked', 'skipped', 'quarantined']);
+const runSummaryStatuses = ['passed', 'failed', 'skipped', 'blocked', 'quarantined', 'running', 'unknown'];
 
 const scenarios = new Map([
   [
@@ -314,6 +318,31 @@ function artifactInfo(outDir, name) {
   };
 }
 
+function readJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function durationMillis(startedAt, finishedAt) {
+  if (!startedAt || !finishedAt) return null;
+  const start = Date.parse(startedAt);
+  const finish = Date.parse(finishedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(finish)) return null;
+  return Math.max(0, finish - start);
+}
+
+function loadManifestScenario(scenarioId) {
+  try {
+    const manifest = loadManifest({ path: defaultManifest });
+    return manifest.scenarios.find((scenario) => scenario.id === scenarioId) || null;
+  } catch {
+    return null;
+  }
+}
+
 function resolveContext({ scenarioId, selfTest }) {
   const scenario = scenarios.get(scenarioId);
   if (!scenario) {
@@ -321,6 +350,7 @@ function resolveContext({ scenarioId, selfTest }) {
       `unsupported scenario: ${scenarioId}. Supported scenarios: ${[...scenarios.keys()].join(', ')}`,
     );
   }
+  const manifestScenario = loadManifestScenario(scenarioId);
 
   const stamp = compactTimestamp();
   const runId =
@@ -332,6 +362,7 @@ function resolveContext({ scenarioId, selfTest }) {
   const scenarioDir = path.resolve(
     process.env.OCTOS_UX_TMUX_OUT_DIR || path.join(outRoot, runId, scenario.id),
   );
+  const runDir = path.dirname(scenarioDir);
   const runtimeRoot = path.resolve(
     process.env.OCTOS_UX_TMUX_RUNTIME_ROOT || path.join(os.tmpdir(), `octos-ux-tmux-${runKey}`),
   );
@@ -386,6 +417,7 @@ function resolveContext({ scenarioId, selfTest }) {
     runId,
     runKey,
     outRoot,
+    runDir,
     scenarioDir,
     runtimeRoot,
     dataDir,
@@ -407,6 +439,8 @@ function resolveContext({ scenarioId, selfTest }) {
     backendEnv,
     backendCommand,
     launchCommand,
+    manifestScenario,
+    validators: manifestScenario?.acceptance || [],
   };
 }
 
@@ -488,8 +522,177 @@ function collectArtifactNames(outDir) {
   });
 }
 
+function normalizedRunStatus(status) {
+  if (terminalSummaryStatuses.has(status)) return status;
+  if (status === 'starting') return 'running';
+  return 'unknown';
+}
+
+function firstFailureFrom(summary, validation) {
+  const validationFailure = Array.isArray(validation?.failures)
+    ? validation.failures[0]
+    : null;
+  if (validationFailure) {
+    return {
+      validator: validationFailure.id || null,
+      detail: validationFailure.detail || 'validator failed',
+      evidence: Array.isArray(validationFailure.evidence) ? validationFailure.evidence : [],
+    };
+  }
+
+  const failedCheck = Array.isArray(validation?.checks)
+    ? validation.checks.find((check) => check?.status === 'failed')
+    : null;
+  if (failedCheck) {
+    return {
+      validator: failedCheck.id || null,
+      detail: failedCheck.detail || 'validator failed',
+      evidence: Array.isArray(failedCheck.evidence) ? failedCheck.evidence : [],
+    };
+  }
+
+  if (Array.isArray(summary.blockers) && summary.blockers.length > 0) {
+    return {
+      validator: null,
+      detail: String(summary.blockers[0]),
+      evidence: [],
+    };
+  }
+
+  if (summary.status === 'failed' && typeof summary.message === 'string' && summary.message.length > 0) {
+    return {
+      validator: null,
+      detail: summary.message,
+      evidence: [],
+    };
+  }
+
+  return null;
+}
+
+function runScenarioSummaryRecord(summary, scenarioDir) {
+  const validation = readJsonFile(path.join(scenarioDir, 'validation.json'));
+  return {
+    scenario_id: summary.scenario_id || path.basename(scenarioDir),
+    command: summary.command || null,
+    duration_ms: Number.isInteger(summary.duration_ms) ? summary.duration_ms : null,
+    status: normalizedRunStatus(summary.status),
+    raw_status: summary.status || null,
+    mode: summary.mode || null,
+    real_tmux_launched: summary.real_tmux_launched === true,
+    placeholder_artifacts: summary.placeholder_artifacts !== false,
+    validators: Array.isArray(summary.validators) ? summary.validators : [],
+    artifact_dir: summary.artifact_dir || summary.output_dir || scenarioDir,
+    first_failure: firstFailureFrom(summary, validation),
+  };
+}
+
+function collectRunScenarioSummaries(runDir) {
+  if (!fs.existsSync(runDir) || !fs.statSync(runDir).isDirectory()) return [];
+  const records = [];
+  for (const entry of fs.readdirSync(runDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const scenarioDir = path.join(runDir, entry.name);
+    const summary = readJsonFile(path.join(scenarioDir, 'summary.json'));
+    if (!summary || typeof summary !== 'object') continue;
+    records.push(runScenarioSummaryRecord(summary, scenarioDir));
+  }
+  return records.sort((left, right) => left.scenario_id.localeCompare(right.scenario_id));
+}
+
+function buildRunSummary(ctx) {
+  const scenariosForRun = collectRunScenarioSummaries(ctx.runDir);
+  const counts = Object.fromEntries(runSummaryStatuses.map((status) => [status, 0]));
+  for (const scenario of scenariosForRun) {
+    counts[scenario.status] = (counts[scenario.status] || 0) + 1;
+  }
+  counts.total = scenariosForRun.length;
+  const notReleaseEvidence = scenariosForRun.filter((scenario) => (
+    scenario.status === 'passed'
+      && (scenario.mode !== 'run' || !scenario.real_tmux_launched || scenario.placeholder_artifacts)
+  )).length;
+  const releaseBlocking =
+    counts.failed + counts.skipped + counts.blocked + counts.running + counts.unknown + notReleaseEvidence;
+  return {
+    schema: 'octos.ux.run_summary.v1',
+    generated_at: utcNow(),
+    run_id: ctx.runId,
+    run_dir: ctx.runDir,
+    counts,
+    release_gate: {
+      passed: releaseBlocking === 0,
+      blocking_status_counts: {
+        failed: counts.failed,
+        skipped: counts.skipped,
+        blocked: counts.blocked,
+        running: counts.running,
+        unknown: counts.unknown,
+        not_release_evidence: notReleaseEvidence,
+      },
+      quarantined: counts.quarantined,
+      note: 'Skipped, blocked, failed, running, unknown, and placeholder/self-test scenarios are never counted as release-passed.',
+    },
+    scenarios: scenariosForRun,
+  };
+}
+
+function markdownStatusLabel(status) {
+  return status[0].toUpperCase() + status.slice(1);
+}
+
+function renderRunSummaryMarkdown(summary) {
+  const lines = [
+    '# Octos UX Run Summary',
+    '',
+    `Run: ${summary.run_id}`,
+    `Generated: ${summary.generated_at}`,
+    `Run directory: ${summary.run_dir}`,
+    '',
+    `Counts: passed=${summary.counts.passed} failed=${summary.counts.failed} skipped=${summary.counts.skipped} blocked=${summary.counts.blocked} quarantined=${summary.counts.quarantined} running=${summary.counts.running} unknown=${summary.counts.unknown}`,
+    `Release gate: ${summary.release_gate.passed ? 'passed' : 'not passed'}`,
+    '',
+  ];
+
+  for (const status of ['passed', 'failed', 'skipped', 'blocked', 'quarantined']) {
+    lines.push(`## ${markdownStatusLabel(status)}`, '');
+    const scenariosForStatus = summary.scenarios.filter((scenario) => scenario.status === status);
+    if (scenariosForStatus.length === 0) {
+      lines.push('- None', '');
+      continue;
+    }
+    for (const scenario of scenariosForStatus) {
+      lines.push(`- ${scenario.scenario_id}`);
+      lines.push(`  Status: ${scenario.raw_status || scenario.status}`);
+      lines.push(`  Mode: ${scenario.mode || '<unknown>'}`);
+      lines.push(`  Command: ${scenario.command || '<none>'}`);
+      lines.push(`  Duration: ${scenario.duration_ms === null ? '<unknown>' : `${scenario.duration_ms} ms`}`);
+      lines.push(`  Validators: ${scenario.validators.length === 0 ? '<none>' : scenario.validators.join(', ')}`);
+      lines.push(`  Artifact directory: ${scenario.artifact_dir}`);
+      if (scenario.first_failure) {
+        lines.push(`  First failure: ${scenario.first_failure.validator || '<runner>'}: ${scenario.first_failure.detail}`);
+      }
+    }
+    lines.push('');
+  }
+
+  return `${lines.join('\n')}\n`;
+}
+
+function refreshRunSummary(ctx) {
+  const summary = buildRunSummary(ctx);
+  writeJson(path.join(ctx.runDir, 'ux-summary.json'), summary);
+  writeText(path.join(ctx.runDir, 'ux-summary.md'), renderRunSummaryMarkdown(summary));
+}
+
 function writeArtifactSkeleton(ctx, options) {
   const generatedAt = utcNow();
+  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
+  const previousSummary = readJsonFile(summaryPath);
+  const startedAt = options.startedAt || previousSummary?.started_at || generatedAt;
+  const finishedAt = options.finishedAt !== undefined
+    ? options.finishedAt
+    : (terminalSummaryStatuses.has(options.status) ? generatedAt : null);
+  const durationMs = durationMillis(startedAt, finishedAt);
   const placeholder = options.placeholderArtifacts !== false;
   fs.mkdirSync(ctx.scenarioDir, { recursive: true });
   fs.mkdirSync(ctx.dataDir, { recursive: true });
@@ -507,6 +710,7 @@ function writeArtifactSkeleton(ctx, options) {
     transport: ctx.scenario.transport,
     run_id: ctx.runId,
     output_dir: ctx.scenarioDir,
+    run_dir: ctx.runDir,
     runtime_root: ctx.runtimeRoot,
     data_dir: ctx.dataDir,
     workspace: ctx.workdir,
@@ -517,6 +721,7 @@ function writeArtifactSkeleton(ctx, options) {
     lower_runner: ctx.lowerRunner,
     fixture_env: ctx.fixtureEnv,
     required_artifacts: requiredArtifacts,
+    validators: ctx.validators,
   });
 
   writeText(path.join(ctx.scenarioDir, 'launch-command.txt'), `${ctx.launchCommand}\n`);
@@ -583,10 +788,12 @@ function writeArtifactSkeleton(ctx, options) {
     }
   }
 
-  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
   const summary = {
     schema: 'octos.ux.summary.v1',
     generated_at: generatedAt,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    duration_ms: durationMs,
     ok: Boolean(options.ok),
     status: options.status,
     mode: options.mode,
@@ -594,7 +801,11 @@ function writeArtifactSkeleton(ctx, options) {
     blockers: options.blockers || [],
     scenario_id: ctx.scenario.id,
     run_id: ctx.runId,
+    command: ctx.launchCommand,
+    validators: ctx.validators,
+    artifact_dir: ctx.scenarioDir,
     output_dir: ctx.scenarioDir,
+    run_dir: ctx.runDir,
     placeholder_artifacts: placeholder,
     real_tmux_launched: Boolean(options.realTmuxLaunched),
     lower_runner: {
@@ -609,6 +820,7 @@ function writeArtifactSkeleton(ctx, options) {
     collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
   );
   writeJson(summaryPath, summary);
+  refreshRunSummary(ctx);
 }
 
 function validateArtifactSkeleton(ctx) {
@@ -631,12 +843,15 @@ function refreshSummaryArtifacts(ctx, validationStatus = null) {
       summary.ok = false;
       summary.status = 'failed';
       summary.message = `${summary.message}; validation failed; see validation.json`;
+      summary.finished_at = utcNow();
+      summary.duration_ms = durationMillis(summary.started_at, summary.finished_at);
     }
   }
   summary.artifacts = Object.fromEntries(
     collectArtifactNames(ctx.scenarioDir).map((name) => [name, artifactInfo(ctx.scenarioDir, name)]),
   );
   writeJson(summaryPath, summary);
+  refreshRunSummary(ctx);
 }
 
 function missingRunnerBlocker(ctx) {

@@ -28,6 +28,7 @@
     "soak:m18:appui-transport-parity": "node scripts/m18-appui-transport-parity-soak.mjs",
     "matrix": "node matrix/run.mjs",
     "ux:scenario:list": "node scripts/ux-scenario-list.mjs",
+    "ux:scenario:list:ci": "node scripts/ux-scenario-list.mjs --tier local --provider-free --json",
     "ux:scenario:list:test": "node --test tests/ux/scenario-list.test.mjs",
     "soak:m17:live-proof": "bash scripts/m17-live-proof-soak.sh run",
     "soak:m17:live-proof:validate": "bash scripts/m17-live-proof-soak.sh validate",

@@ -180,6 +180,50 @@ The focused fixture test is:
 npm --prefix e2e run test -- --workers=1 tests/m12-solo-soak-artifacts.spec.ts
 ```
 
+### M19 UX Gate Reporting
+
+Use this gate for the real-tmux UX matrix from `e2e/matrix/octos-ux.toml`.
+The list command is provider-free and backend-free, so it is safe for PR CI:
+
+```bash
+# List the CI-safe local scenarios without requiring live provider keys.
+npm --prefix e2e run ux:scenario:list:ci
+npm --prefix e2e run ux:scenario:list -- --tier local --provider-free --json
+
+# Run the artifact/validator self-test without launching tmux.
+OCTOS_UX_TMUX_OUT_ROOT=/tmp/octos-ux \
+  npm --prefix e2e run ux:tmux:run -- --self-test stdio-happy-path
+
+# Write a blocked dry-run artifact skeleton for a scenario.
+OCTOS_UX_TMUX_OUT_ROOT=/tmp/octos-ux \
+  npm --prefix e2e run ux:tmux:run -- stdio-happy-path --dry-run
+
+# Re-run validators against a scenario artifact directory.
+npm --prefix e2e run ux:tmux:validate -- \
+  /tmp/octos-ux/<run-id>/<scenario-id>
+```
+
+Per-scenario artifacts live under
+`e2e/test-results-ux/<run-id>/<scenario-id>/` unless
+`OCTOS_UX_TMUX_OUT_ROOT` or `OCTOS_UX_TMUX_OUT_DIR` overrides the path.
+Every run directory also contains:
+
+- `ux-summary.json`
+- `ux-summary.md`
+
+The run summary reports `passed`, `failed`, `skipped`, `blocked`, and
+`quarantined` separately. Each scenario entry includes the scenario id,
+launch command, duration, status, mode, validator ids, artifact directory, and
+first actionable validator failure. Release-facing summaries must not treat
+skipped, blocked, dry-run, self-test, or placeholder scenarios as passed.
+
+Recommended lanes:
+
+- PR local: `ux:scenario:list:ci` plus `ux:tmux:run -- --self-test stdio-happy-path`.
+- Nightly: local-tier provider-free real tmux runs on hosts with `octos` and `octos-tui`.
+- Soak: release-tier provider-free real tmux runs with retained artifacts.
+- Release: full release matrix; fail on `failed`, `blocked`, or `skipped`, and review any `quarantined` scenarios explicitly.
+
 ### M22 TUI Solo Onboarding Gate
 
 Use this gate for first-run TUI onboarding product-surface evidence. The full

@@ -112,6 +112,10 @@ npm --prefix e2e run ux:scenario:list -- --tier fast
 npm --prefix e2e run ux:scenario:list -- --tier local
 npm --prefix e2e run ux:scenario:list -- --tier release
 
+# CI-safe local selection: excludes live-provider scenarios.
+npm --prefix e2e run ux:scenario:list:ci
+npm --prefix e2e run ux:scenario:list -- --tier local --provider-free --json
+
 # Machine-readable output for CI. Use --silent so npm's lifecycle
 # banner ("> ux:scenario:list", "> node …") doesn't pollute stdout
 # before the JSON document. Alternatively, invoke node directly:
@@ -128,7 +132,26 @@ The command:
 - Validates the schema and reports a typed `manifest schema error` on bad input (exit code 3).
 - Classifies each scenario as `runnable`, `skipped`, `blocked`, or `quarantined` without launching tmux or any backend.
 - Prints a deterministic table sorted by scenario id.
-- With `--json`, prints a JSON document with `schema_version`, `pack`, `owner`, `tier_filter`, `summary`, and the full scenario records.
+- With `--provider-free`, excludes `provider = "live"` scenarios so PR CI can choose local, provider-free work without requiring production keys.
+- With `--json`, prints a JSON document with `schema_version`, `pack`, `owner`, `tier_filter`, `provider_filter`, `summary`, and the full scenario records.
+
+## Run summaries
+
+`npm --prefix e2e run ux:tmux:run -- <scenario-id>` writes per-scenario
+artifacts under `e2e/test-results-ux/<run-id>/<scenario-id>/` by default.
+The runner also refreshes run-level summaries in the parent run directory:
+
+- `ux-summary.json` - machine-readable `octos.ux.run_summary.v1` output with
+  separate counts for `passed`, `failed`, `skipped`, `blocked`,
+  `quarantined`, `running`, and `unknown`.
+- `ux-summary.md` - Markdown summary for PR, nightly, soak, and release
+  triage.
+
+Each scenario entry includes the scenario id, command, duration, status,
+mode, validators, artifact directory, and first validator failure when one is
+available. Release-facing summaries never count skipped, blocked, failed,
+running, unknown, self-test, dry-run, or placeholder scenarios as passed;
+quarantined scenarios are counted separately.
 
 ### Classification rules
 

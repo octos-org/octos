@@ -53,6 +53,26 @@ const REQUIRED_ARTIFACTS = [
   "validation.json",
 ];
 
+function scenarioToml({ id, provider, tier = "local" }) {
+  return [
+    "[[scenario]]",
+    `id = "${id}"`,
+    `title = "${id}"`,
+    `description = "${id}"`,
+    `tier = "${tier}"`,
+    'transport = "stdio"',
+    `provider = "${provider}"`,
+    'terminal = "80x24"',
+    'tui_binary = "octos-tui"',
+    'tmux_command = "x"',
+    'required_tools = []',
+    'required_capabilities = []',
+    'expected_artifacts = ["scenario.json"]',
+    'acceptance = ["validator.example"]',
+    "",
+  ].join("\n");
+}
+
 function makeEnv({
   tools = new Set(["tmux", "octos", "octos-tui"]),
   envVars = new Set(),
@@ -237,6 +257,35 @@ test("CLI exits 0 on a valid manifest and JSON output round-trips", () => {
   for (const s of parsed.scenarios) {
     assert.ok(["runnable", "skipped", "blocked", "quarantined"].includes(s.status));
   }
+});
+
+test("CLI provider-free mode excludes live provider scenarios", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ux-provider-free-"));
+  const manifest = join(dir, "octos-ux.toml");
+  writeFileSync(
+    manifest,
+    [
+      'schema_version = 1',
+      'pack = "octos-ux"',
+      'owner = "test"',
+      scenarioToml({ id: "fixture-case", provider: "fixture" }),
+      scenarioToml({ id: "none-case", provider: "none" }),
+      scenarioToml({ id: "live-case", provider: "live" }),
+    ].join("\n"),
+  );
+
+  const out = execFileSync(
+    process.execPath,
+    [CLI, "--manifest", manifest, "--tier", "release", "--provider-free", "--json"],
+    { encoding: "utf8" },
+  );
+  const parsed = JSON.parse(out);
+  assert.equal(parsed.provider_filter, "provider-free");
+  assert.deepEqual(
+    parsed.scenarios.map((scenario) => scenario.id).sort(),
+    ["fixture-case", "none-case"],
+  );
+  assert.ok(parsed.scenarios.every((scenario) => scenario.provider !== "live"));
 });
 
 test("CLI exits 2 on usage error", () => {

@@ -9,6 +9,7 @@
 //   npm --prefix e2e run ux:scenario:list                # full release tier
 //   npm --prefix e2e run ux:scenario:list -- --tier fast
 //   npm --prefix e2e run ux:scenario:list -- --tier local
+//   npm --prefix e2e run ux:scenario:list -- --tier local --provider-free
 //   npm --prefix e2e run ux:scenario:list -- --json
 //
 // Exit codes:
@@ -34,7 +35,12 @@ const REPO_ROOT = resolve(__dirname, "..", "..");
 const DEFAULT_MANIFEST = resolve(REPO_ROOT, "e2e", "matrix", "octos-ux.toml");
 
 function parseArgs(argv) {
-  const opts = { tier: "release", json: false, manifest: DEFAULT_MANIFEST };
+  const opts = {
+    tier: "release",
+    json: false,
+    manifest: DEFAULT_MANIFEST,
+    providerFree: false,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--tier") {
@@ -49,6 +55,8 @@ function parseArgs(argv) {
       i += 1;
     } else if (arg.startsWith("--manifest=")) {
       opts.manifest = resolve(arg.slice("--manifest=".length));
+    } else if (arg === "--provider-free") {
+      opts.providerFree = true;
     } else if (arg === "--help" || arg === "-h") {
       opts.help = true;
     } else {
@@ -67,7 +75,7 @@ class UsageError extends Error {}
 
 function usage() {
   return [
-    "Usage: ux:scenario:list [--tier fast|local|release] [--json] [--manifest path]",
+    "Usage: ux:scenario:list [--tier fast|local|release] [--provider-free] [--json] [--manifest path]",
     "",
     "Lists UX scenarios declared in e2e/matrix/octos-ux.toml without launching",
     "tmux or any backend. See e2e/ux/README.md for the manifest schema.",
@@ -171,7 +179,10 @@ function main() {
     throw err;
   }
   const env = makeEnv();
-  const filtered = filterByTier(manifest.scenarios, opts.tier);
+  const tierFiltered = filterByTier(manifest.scenarios, opts.tier);
+  const filtered = opts.providerFree
+    ? tierFiltered.filter((scenario) => scenario.provider !== "live")
+    : tierFiltered;
   // Sort by id for deterministic output.
   const sorted = [...filtered].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const rows = sorted.map((s) => {
@@ -213,6 +224,7 @@ function main() {
           pack: manifest.pack,
           owner: manifest.owner,
           tier_filter: opts.tier,
+          provider_filter: opts.providerFree ? "provider-free" : "all",
           summary,
           scenarios: rows,
         },
@@ -222,7 +234,7 @@ function main() {
     );
   } else {
     process.stdout.write(
-      `Pack: ${manifest.pack}  Owner: ${manifest.owner}  Tier filter: ${opts.tier}\n`,
+      `Pack: ${manifest.pack}  Owner: ${manifest.owner}  Tier filter: ${opts.tier}  Provider filter: ${opts.providerFree ? "provider-free" : "all"}\n`,
     );
     process.stdout.write(
       formatTable(rows, [
