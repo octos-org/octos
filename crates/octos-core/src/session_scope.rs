@@ -72,9 +72,9 @@
 //! ├── data/                         ← SessionScope.root
 //! │   ├── users/<session_id>/
 //! │   │   └── workspace/            ← SessionScope.workspace (per-session, ephemeral)
-//! │   ├── skills/                   ← SessionScope.shared_data (cross-session, persistent)
-//! │   ├── research/                 ← SessionScope.shared_data (workers MUST NOT default CWD here)
-//! │   └── episodes.redb             ← memory store (accessed via API, not as CWD)
+//! │   ├── skills/                   ← shared_zones[0] (cross-session, persistent)
+//! │   ├── research/                 ← shared_zones[1] (workers MUST NOT default CWD here)
+//! │   └── episodes.redb             ← OutOfScope (memory store accessed via API, not as CWD or path)
 //! ├── config.json
 //! └── ...
 //! ```
@@ -97,8 +97,8 @@
 //!    or env vars itself.
 //! 2. Spawns child processes with `current_dir(scope.workspace())`.
 //! 3. Validates every user/LLM-supplied path against
-//!    [`SessionScope::classify_path`] before opening it. Refuses
-//!    `PathClassification::OutOfScope`.
+//!    [`SessionScope::classify_lexical_path`] before opening it.
+//!    Refuses `PathClassification::OutOfScope`.
 //! 4. Reports outputs back to the host as `files_to_send: [...]`
 //!    listing absolute paths. The host validates each entry against
 //!    the same scope.
@@ -179,6 +179,15 @@ pub enum SessionScopeError {
     /// process, model that as a separate maintenance capability, not
     /// an ordinary session grant.
     GrantNotAllowedInMultiTenant,
+
+    /// Shared zone overlaps with the per-session `users/` subtree.
+    /// Per codex round-2: if `<root>/users` (or a descendant) were a
+    /// shared zone, classify would treat another session's workspace
+    /// files as `InSharedZone`, defeating per-session isolation.
+    SharedZoneOverlapsUsersSubtree {
+        users_subtree: PathBuf,
+        zone: PathBuf,
+    },
 }
 
 impl std::fmt::Display for SessionScopeError {
@@ -217,6 +226,15 @@ impl std::fmt::Display for SessionScopeError {
             Self::GrantNotAllowedInMultiTenant => write!(
                 f,
                 "with_granted_dir is Solo-only; multi-tenant boundaries are enforced by path layout"
+            ),
+            Self::SharedZoneOverlapsUsersSubtree {
+                users_subtree,
+                zone,
+            } => write!(
+                f,
+                "shared zone ({}) overlaps the per-session users subtree ({}); cross-session isolation requires zones live outside `users/`",
+                zone.display(),
+                users_subtree.display()
             ),
         }
     }
@@ -379,10 +397,24 @@ impl SessionScope {
         if !is_safe_session_id(&session_id) {
             return Err(SessionScopeError::UnsafeSessionId(session_id));
         }
+        let users_subtree = profile_data_dir.join(MULTI_TENANT_USERS_DIR_NAME);
         for zone in &shared_zones {
+            // Must be a strict subdir of root.
             if zone == &profile_data_dir || !zone.starts_with(&profile_data_dir) {
                 return Err(SessionScopeError::SharedZoneNotStrictSubdir {
                     root: profile_data_dir.clone(),
+                    zone: zone.clone(),
+                });
+            }
+            // Per codex round-2 P2: must NOT overlap with the per-
+            // session users subtree. If `<root>/users` (or a child)
+            // were a shared zone, cross-session workspace files
+            // would be classified as `InSharedZone`, defeating
+            // session isolation. Refuse `<root>/users` and any
+            // descendant.
+            if zone == &users_subtree || zone.starts_with(&users_subtree) {
+                return Err(SessionScopeError::SharedZoneOverlapsUsersSubtree {
+                    users_subtree: users_subtree.clone(),
                     zone: zone.clone(),
                 });
             }
@@ -678,6 +710,45 @@ mod tests {
             err,
             SessionScopeError::SharedZoneNotStrictSubdir { .. }
         ));
+    }
+
+    #[test]
+    fn refuses_shared_zone_overlapping_users_subtree() {
+        // Codex round-2 P2: if <root>/users (or a child) is a shared
+        // zone, another session's workspace files classify as
+        // InSharedZone, defeating isolation. Reject at construction.
+        let data = abs("/octos/profiles/dspfac/data");
+        for bad in [data.join("users"), data.join("users/web-7/workspace")] {
+            let err = SessionScope::multi_tenant(
+                data.clone(),
+                "dspfac".into(),
+                "web-1".into(),
+                vec![bad.clone()],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SessionScopeError::SharedZoneOverlapsUsersSubtree { .. }
+                ),
+                "expected SharedZoneOverlapsUsersSubtree for zone {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_sessions_workspace_classifies_as_out_of_scope() {
+        // End-to-end check on the P2 fix: even if a malicious
+        // constructor call had slipped past, classify_lexical_path
+        // for another session's workspace under our scope must NOT
+        // return InSharedZone or InWorkspace.
+        let data = abs("/octos/profiles/dspfac/data");
+        let scope = mt_default(&data, "web-1");
+        let other_session_workspace = data.join("users/web-2/workspace/secret.md");
+        assert_eq!(
+            scope.classify_lexical_path(&other_session_workspace),
+            PathClassification::OutOfScope
+        );
     }
 
     #[test]
