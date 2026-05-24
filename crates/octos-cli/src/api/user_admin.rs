@@ -55,29 +55,67 @@ pub struct ActionResponse {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ErrorBody {
+    pub code: &'static str,
+    pub message: String,
+}
+
+type ApiResult<T> = Result<T, (StatusCode, Json<ErrorBody>)>;
+
+fn api_error(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+) -> (StatusCode, Json<ErrorBody>) {
+    (
+        status,
+        Json(ErrorBody {
+            code,
+            message: message.into(),
+        }),
+    )
+}
+
 /// GET /api/admin/users
-pub async fn list_users(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<UsersListResponse>, StatusCode> {
-    let us = state
-        .user_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let users = us.list().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+pub async fn list_users(State(state): State<Arc<AppState>>) -> ApiResult<Json<UsersListResponse>> {
+    let us = state.user_store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "user_store_unavailable",
+            "user store is unavailable",
+        )
+    })?;
+    let users = us.list().map_err(|e| {
+        tracing::error!(error = %e, "failed to list users");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "users_list_failed",
+            "failed to list users",
+        )
+    })?;
     Ok(Json(UsersListResponse { users }))
 }
 
 /// GET /api/admin/allowed-emails
 pub async fn list_allowed_emails(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<AllowlistResponse>, StatusCode> {
-    let allowlist = state
-        .allowlist_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let entries = allowlist
-        .list()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+) -> ApiResult<Json<AllowlistResponse>> {
+    let allowlist = state.allowlist_store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "allowlist_store_unavailable",
+            "login allowlist store is unavailable",
+        )
+    })?;
+    let entries = allowlist.list().map_err(|e| {
+        tracing::error!(error = %e, "failed to list allowed emails");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "allowlist_list_failed",
+            "failed to list allowed emails",
+        )
+    })?;
     let user_store = state.user_store.as_ref();
     let mapped = entries
         .into_iter()
@@ -104,28 +142,51 @@ pub async fn list_allowed_emails(
 pub async fn add_allowed_email(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AllowlistRequest>,
-) -> Result<(StatusCode, Json<AllowlistEntryResponse>), StatusCode> {
-    let allowlist = state
-        .allowlist_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+) -> ApiResult<(StatusCode, Json<AllowlistEntryResponse>)> {
+    let allowlist = state.allowlist_store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "allowlist_store_unavailable",
+            "login allowlist store is unavailable",
+        )
+    })?;
     let email = crate::login_allowlist::normalize_email(&req.email);
-    super::admin::validate_email(&email).map_err(|_| StatusCode::BAD_REQUEST)?;
+    super::admin::validate_email(&email)
+        .map_err(|message| api_error(StatusCode::BAD_REQUEST, "invalid_email", message))?;
 
-    if allowlist
-        .contains(&email)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        return Err(StatusCode::CONFLICT);
+    if allowlist.contains(&email).map_err(|e| {
+        tracing::error!(email = %email, error = %e, "failed to check login allowlist");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "allowlist_read_failed",
+            "failed to read login allowlist",
+        )
+    })? {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "email_already_allowed",
+            format!("Email \"{email}\" is already allowlisted"),
+        ));
     }
 
     if let Some(user_store) = state.user_store.as_ref() {
         if user_store
             .get_by_email(&email)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|e| {
+                tracing::error!(email = %email, error = %e, "failed to check registered users");
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "users_read_failed",
+                    "failed to read registered users",
+                )
+            })?
             .is_some()
         {
-            return Err(StatusCode::CONFLICT);
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "email_already_registered",
+                format!("Email \"{email}\" is already registered to an account"),
+            ));
         }
     }
 
@@ -143,9 +204,14 @@ pub async fn add_allowed_email(
         claimed_user_id: None,
         claimed_at: None,
     };
-    allowlist
-        .save(&entry)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    allowlist.save(&entry).map_err(|e| {
+        tracing::error!(email = %email, error = %e, "failed to save allowed email");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "allowlist_save_failed",
+            "failed to save allowed email",
+        )
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -167,20 +233,31 @@ pub async fn add_allowed_email(
 pub async fn delete_allowed_email(
     State(state): State<Arc<AppState>>,
     Path(email): Path<String>,
-) -> Result<Json<ActionResponse>, StatusCode> {
-    let allowlist = state
-        .allowlist_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    match allowlist
-        .delete(&email)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
+) -> ApiResult<Json<ActionResponse>> {
+    let allowlist = state.allowlist_store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "allowlist_store_unavailable",
+            "login allowlist store is unavailable",
+        )
+    })?;
+    match allowlist.delete(&email).map_err(|e| {
+        tracing::error!(email = %email, error = %e, "failed to delete allowed email");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "allowlist_delete_failed",
+            "failed to delete allowed email",
+        )
+    })? {
         true => Ok(Json(ActionResponse {
             ok: true,
             message: None,
         })),
-        false => Err(StatusCode::NOT_FOUND),
+        false => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "allowed_email_not_found",
+            format!("Allowlisted email \"{email}\" was not found"),
+        )),
     }
 }
 
@@ -188,11 +265,14 @@ pub async fn delete_allowed_email(
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<ActionResponse>, StatusCode> {
-    let us = state
-        .user_store
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+) -> ApiResult<Json<ActionResponse>> {
+    let us = state.user_store.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "user_store_unavailable",
+            "user store is unavailable",
+        )
+    })?;
 
     if let Some(ref pm) = state.process_manager {
         let _ = pm.stop(&id).await;
@@ -212,11 +292,19 @@ pub async fn delete_user(
         }
         Ok(false) => {
             tracing::warn!(user_id = %id, "delete_user: user not found");
-            Err(StatusCode::NOT_FOUND)
+            Err(api_error(
+                StatusCode::NOT_FOUND,
+                "user_not_found",
+                format!("User \"{id}\" was not found"),
+            ))
         }
         Err(e) => {
             tracing::error!(user_id = %id, error = %e, "delete_user: failed to delete");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "user_delete_failed",
+                "failed to delete user",
+            ))
         }
     }
 }
@@ -224,6 +312,25 @@ pub async fn delete_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::login_allowlist::LoginAllowlistStore;
+    use crate::user_store::{UserRole, UserStore};
+
+    fn temp_user_admin_state() -> (
+        tempfile::TempDir,
+        Arc<AppState>,
+        Arc<UserStore>,
+        Arc<LoginAllowlistStore>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            user_store: Some(user_store.clone()),
+            allowlist_store: Some(allowlist_store.clone()),
+            ..AppState::empty_for_tests()
+        });
+        (dir, state, user_store, allowlist_store)
+    }
 
     #[test]
     fn users_list_response_serialize() {
@@ -252,5 +359,85 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["message"], "not found");
+    }
+
+    #[test]
+    fn error_body_serialize() {
+        let resp = ErrorBody {
+            code: "email_already_allowed",
+            message: "Email is already allowlisted".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["code"], "email_already_allowed");
+        assert_eq!(json["message"], "Email is already allowlisted");
+    }
+
+    #[tokio::test]
+    async fn add_allowed_email_conflict_reports_allowlist_reason() {
+        let (_dir, state, _user_store, allowlist_store) = temp_user_admin_state();
+        allowlist_store
+            .save(&AllowedLogin {
+                email: "taken@example.com".into(),
+                note: None,
+                created_at: Utc::now(),
+                claimed_user_id: None,
+                claimed_at: None,
+            })
+            .unwrap();
+
+        let err = match add_allowed_email(
+            State(state),
+            Json(AllowlistRequest {
+                email: "taken@example.com".into(),
+                note: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("allowlist conflict should return a structured error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1.0.code, "email_already_allowed");
+        assert_eq!(
+            err.1.0.message,
+            "Email \"taken@example.com\" is already allowlisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_allowed_email_conflict_reports_registered_user_reason() {
+        let (_dir, state, user_store, _allowlist_store) = temp_user_admin_state();
+        user_store
+            .save(&User {
+                id: "taken".into(),
+                email: "taken@example.com".into(),
+                name: "Taken User".into(),
+                role: UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = match add_allowed_email(
+            State(state),
+            Json(AllowlistRequest {
+                email: "taken@example.com".into(),
+                note: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("registered email conflict should return a structured error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1.0.code, "email_already_registered");
+        assert_eq!(
+            err.1.0.message,
+            "Email \"taken@example.com\" is already registered to an account"
+        );
     }
 }

@@ -18,6 +18,18 @@ import type {
 
 const BASE = '/api/admin'
 
+export type ApiErrorCode =
+  | 'email_already_allowed'
+  | 'email_already_registered'
+  | 'http_error'
+  | (string & {})
+
+interface StructuredErrorBody {
+  code?: unknown
+  message?: unknown
+  details?: unknown
+}
+
 /// Error thrown by the dashboard's request helpers when the server returns a
 /// non-2xx response. Carries the HTTP status code so callers can distinguish
 /// auth failures (401/403) from infrastructure errors (5xx) without
@@ -25,16 +37,52 @@ const BASE = '/api/admin'
 /// common "auth failed, hand back to the login flow" branch.
 export class ApiError extends Error {
   public readonly status: number
+  public readonly code: ApiErrorCode
+  public readonly details: unknown
 
-  constructor(status: number, message: string) {
+  constructor(
+    status: number,
+    message: string,
+    code: ApiErrorCode = 'http_error',
+    details?: unknown,
+  ) {
     super(message || `HTTP ${status}`)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
+    this.details = details
   }
 
   static isAuthError(err: unknown): boolean {
     return err instanceof ApiError && (err.status === 401 || err.status === 403)
   }
+}
+
+function parseStructuredErrorBody(text: string): StructuredErrorBody | null {
+  if (!text.trim()) return null
+
+  try {
+    const value = JSON.parse(text) as StructuredErrorBody
+    if (value && typeof value === 'object') {
+      return value
+    }
+  } catch {
+    // Non-JSON error bodies are still valid legacy responses.
+  }
+
+  return null
+}
+
+async function errorFromResponse(res: Response): Promise<ApiError> {
+  const text = await res.text()
+  const body = parseStructuredErrorBody(text)
+  if (body) {
+    const code = typeof body.code === 'string' ? body.code : 'http_error'
+    const message = typeof body.message === 'string' ? body.message : text
+    return new ApiError(res.status, message, code, body.details)
+  }
+
+  return new ApiError(res.status, text)
 }
 
 export interface SkillRegistryPackage {
@@ -66,8 +114,7 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await errorFromResponse(res)
   }
   return res.json()
 }
@@ -78,8 +125,7 @@ async function requestNoContent(path: string, opts?: RequestInit): Promise<void>
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await errorFromResponse(res)
   }
 }
 
@@ -89,8 +135,7 @@ async function publicRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await errorFromResponse(res)
   }
   return res.json()
 }
@@ -101,8 +146,7 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
     ...opts,
   })
   if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
+    throw await errorFromResponse(res)
   }
   return res.json()
 }
