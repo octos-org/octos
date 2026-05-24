@@ -147,6 +147,10 @@ pub struct InitCommand {
     /// Skip interactive prompts and use defaults.
     #[arg(long)]
     pub defaults: bool,
+
+    /// Overwrite an existing config without prompting.
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl Executable for InitCommand {
@@ -167,7 +171,13 @@ impl Executable for InitCommand {
                 "Config already exists:".yellow(),
                 config_path.display()
             );
-            if !self.defaults {
+            if self.defaults && !self.force {
+                return Err(eyre::eyre!(
+                    "refusing to overwrite existing config in --defaults mode; rerun with --force to replace {}",
+                    config_path.display()
+                ));
+            }
+            if !self.defaults && !self.force {
                 print!("Overwrite? [y/N] ");
                 io::stdout().flush()?;
 
@@ -177,6 +187,12 @@ impl Executable for InitCommand {
                     println!("Aborted.");
                     return Ok(());
                 }
+            }
+            if self.force {
+                println!(
+                    "{}",
+                    "Overwriting existing config because --force was set.".yellow()
+                );
             }
         }
 

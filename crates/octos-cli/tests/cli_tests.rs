@@ -208,6 +208,56 @@ fn test_init_defaults_uses_octos_home_when_cwd_not_provided() {
 }
 
 #[test]
+fn test_init_defaults_refuses_existing_config_without_force() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let mut first = Command::new(octos_binary());
+    clear_provider_env(&mut first);
+    let first_output = first
+        .env("ANTHROPIC_API_KEY", "test-ant-key")
+        .args(["init", "--defaults", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+    assert!(first_output.status.success());
+
+    let config_path = temp_dir.path().join(".octos").join("config.json");
+    let preserved_config = "{ \"provider\": \"preserve-me\" }\n";
+    std::fs::write(&config_path, preserved_config).unwrap();
+
+    let mut second = Command::new(octos_binary());
+    clear_provider_env(&mut second);
+    let second_output = second
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+    assert!(
+        !second_output.status.success(),
+        "second init --defaults should refuse to overwrite an existing config"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        preserved_config
+    );
+
+    let mut forced = Command::new(octos_binary());
+    clear_provider_env(&mut forced);
+    let forced_output = forced
+        .env("OPENAI_API_KEY", "test-openai-key")
+        .args(["init", "--defaults", "--force", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+    assert!(forced_output.status.success());
+
+    let forced_content = std::fs::read_to_string(&config_path).unwrap();
+    assert!(forced_content.contains("openai"));
+    assert!(!forced_content.contains("preserve-me"));
+}
+
+#[test]
 fn test_clean_no_octos_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
 
