@@ -15954,9 +15954,26 @@ async fn run_standalone_turn(
                         // persist, so we can flip
                         // `final_assistant_persisted` only on its
                         // Ok branch.
-                        let is_final_assistant_carrier = message.role == MessageRole::Assistant
-                            && message.content == response.content
-                            && !response.content.is_empty();
+                        //
+                        // NEW-10 codex round-1 P2: extended from
+                        // byte-exact equality to trimmed-equality
+                        // via `is_final_assistant_carrier_under_trimmed_equality`
+                        // so the carrier-flip stays in lockstep with
+                        // the synth-skip helper
+                        // (`final_assistant_content_already_persisted`).
+                        // Without that, a trimmed-equal iter-N row
+                        // that the synth-skip helper recognised as
+                        // the duplicate carrier would land with
+                        // `final_assistant_persisted=false`,
+                        // `final_send` would resolve to `None`, and
+                        // self-paced loops with `<<loop-next-in: ...>>`
+                        // hints in the EndTurn text would fall back
+                        // to the unsafe `.last()` history scan.
+                        let is_final_assistant_carrier =
+                            is_final_assistant_carrier_under_trimmed_equality(
+                                &message,
+                                &response.content,
+                            );
                         let preamble_assistant_content = if message.role == MessageRole::Assistant
                             && !message.content.trim().is_empty()
                         {
@@ -16994,17 +17011,123 @@ fn final_assistant_message(
     content: &str,
     reasoning_content: Option<String>,
 ) -> Option<Message> {
-    if content.is_empty()
-        || messages
-            .iter()
-            .any(|message| message.role == MessageRole::Assistant && message.content == content)
-    {
+    if content.is_empty() || final_assistant_content_already_persisted(messages, content) {
         return None;
     }
 
     let mut message = Message::assistant(content.to_owned());
     message.reasoning_content = reasoning_content;
     Some(message)
+}
+
+/// NEW-10 (Fleet-UX soak, mini3/kimi-k2.5, 2026-05-23): kimi-k2.5
+/// occasionally repeats its iter-N preamble verbatim in the EndTurn
+/// `response.content` after a fan-out of `get_weather` calls. The
+/// iter-N `response.messages` Assistant carrier (the one that holds
+/// `tool_calls`) sometimes lands with text content **trimmed-equal**
+/// to `response.content` but differing by trailing whitespace
+/// (`\n`, a frequent streaming artefact). The pre-fix byte-exact
+/// dedupe in `final_assistant_message` missed; both rows persisted;
+/// the SPA rendered two identical chat bubbles around the tool chip.
+///
+/// Strategy (codex round-1 P2 narrowing):
+///
+/// 1. **Empty-after-trim guard.** If the final content collapses to
+///    `""` after `trim()`, the caller has nothing meaningful to
+///    dedupe against — return `false` so the helper is composable
+///    in isolation. The caller's `content.is_empty()` branch
+///    remains the single source of truth for "skip synthesis".
+///
+/// 2. **Trimmed-equality ONLY**, over every prior Assistant
+///    message. Catches the actual reported pattern
+///    (whitespace-only-difference) without the false-positive risk
+///    a substring-containment check would carry. Codex round 1
+///    flagged that substring containment could suppress legitimate
+///    final answers in shapes like `iter-N="I'll verify whether
+///    <answer>..."` followed by `final="<answer>"` — `<answer>` is
+///    a substring of the iter-N text, but the iter-N row is NOT a
+///    duplicate carrier of the final answer. Restricting to
+///    trimmed-equality eliminates that ambiguity: only when the
+///    iter-N content equals the final content (modulo whitespace)
+///    can we be sure it is a duplicate render of the same answer.
+///
+/// 3. **Legitimate two-bubble flows are preserved.** When the
+///    iter-N carrier holds a preamble like "Looking that up..."
+///    and the EndTurn produces a different long answer, the two
+///    contents are not trimmed-equal — both rows persist as before
+///    and the SPA renders the preamble bubble + the answer bubble
+///    around the tool chip.
+///
+/// Round-1 P2 carrier-flip companion: callers that wire
+/// `final_assistant_persisted` (the `response.messages` persist loop
+/// in `handle_chat_turn`) MUST also use this helper's semantics
+/// when deciding whether an iter-N row counts as the final-assistant
+/// carrier — see `is_final_assistant_carrier_under_trimmed_equality`
+/// for the matching predicate. Without that, a trimmed-equal iter-N
+/// row that flipped this helper to true would land with
+/// `final_assistant_persisted=false`, the `final_send` oneshot
+/// would resolve to `None`, and self-paced loops carrying
+/// `<<loop-next-in: ...>>` hints in the EndTurn text could fall
+/// back to the unsafe `.last()` history scan.
+fn final_assistant_content_already_persisted(messages: &[Message], content: &str) -> bool {
+    let trimmed_content = content.trim();
+    if trimmed_content.is_empty() {
+        return false;
+    }
+    messages
+        .iter()
+        .any(|message| is_assistant_row_trimmed_equal(message, trimmed_content))
+}
+
+/// Trimmed-equality predicate shared between the synth-skip helper
+/// (`final_assistant_content_already_persisted`) and the persist-loop
+/// carrier flip (`is_final_assistant_carrier_under_trimmed_equality`).
+///
+/// Both call sites MUST use this same predicate, otherwise a row
+/// that the synth-skip helper recognises as a duplicate carrier
+/// would not flip `final_assistant_persisted` in the persist loop,
+/// causing the `final_send` oneshot to resolve to `None` for
+/// self-paced loops (codex round-1 P2 on PR #1231).
+///
+/// Tool rows return `false` because tool outputs render as chips,
+/// not chat bubbles, so they cannot be the source of (or target of
+/// dedupe against) a duplicate bubble.
+///
+/// Caller is responsible for trimming `trimmed_content` BEFORE the
+/// call. Passing the un-trimmed value is a silent bug: a final
+/// content of `"X "` would not match an iter-N carrier of `"X"`.
+fn is_assistant_row_trimmed_equal(message: &Message, trimmed_content: &str) -> bool {
+    message.role == MessageRole::Assistant && message.content.trim() == trimmed_content
+}
+
+/// NEW-10 codex round-1 P2 carrier-flip companion: returns true
+/// when the iter-N `message` from `response.messages` is the
+/// trimmed-equal carrier of `response_content` and the synth-skip
+/// helper (`final_assistant_content_already_persisted`) would
+/// recognise it as such.
+///
+/// The persist loop in `handle_chat_turn` calls this to decide
+/// whether to flip `final_assistant_persisted=true` after the
+/// `add_message_with_seq` Ok branch. The pre-#1231 byte-exact
+/// `message.content == response.content` check is a strict subset
+/// of this; this helper extends it to the trimmed case so callers
+/// cover the same set of rows the synth-skip helper deduplicates.
+///
+/// `response_content` is the raw (un-trimmed) value; the helper
+/// trims internally to keep both call sites in lockstep without
+/// the caller having to remember to pre-trim.
+fn is_final_assistant_carrier_under_trimmed_equality(
+    message: &Message,
+    response_content: &str,
+) -> bool {
+    if response_content.is_empty() {
+        return false;
+    }
+    let trimmed_response = response_content.trim();
+    if trimmed_response.is_empty() {
+        return false;
+    }
+    is_assistant_row_trimmed_equal(message, trimmed_response)
 }
 
 /// On the NEW-03 synthesised-spawn-only-ack skip path, pick the text
@@ -24260,6 +24383,252 @@ ignore = []
         let messages = vec![Message::assistant("world")];
 
         assert!(final_assistant_message(&messages, "world", None).is_none());
+    }
+
+    /// NEW-10 (Fleet-UX soak, mini3/kimi-k2.5): the iter-N carrier
+    /// message in `response.messages` ends with a trailing newline
+    /// (a frequent kimi-k2.5 streaming artefact) while the EndTurn
+    /// `response.content` does not. Pre-fix byte-equality dedupe
+    /// missed and BOTH rows persisted; the SPA rendered two
+    /// identical bubbles around the tool chip. The trimmed-equality
+    /// branch must close this case.
+    #[test]
+    fn final_assistant_message_skips_when_iter_n_carrier_has_trailing_whitespace() {
+        let iter_n_carrier = Message::assistant("旧金山今天天气晴朗，气温17.1°C\n");
+        let messages = vec![iter_n_carrier];
+        let final_content = "旧金山今天天气晴朗，气温17.1°C";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_none(),
+            "trimmed-equal iter-N content must be deduped against final response.content",
+        );
+    }
+
+    /// NEW-10 codex round-1 P2: substring containment is NOT a
+    /// safe dedupe signal — a prior iter-N Assistant row that
+    /// merely speculates about the final answer (e.g. "I'll verify
+    /// whether <answer>...") cannot be reliably distinguished from
+    /// a true preamble-wraps-final duplicate carrier. To avoid
+    /// suppressing legitimate final answers, dedupe is restricted
+    /// to TRIMMED EQUALITY only. This test locks in the negative
+    /// direction so a regression that re-introduces substring
+    /// matching is caught here.
+    #[test]
+    fn final_assistant_message_does_not_dedupe_when_iter_n_speculates_about_final() {
+        let final_content =
+            "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要我查询更详细的湾区天气预报吗？";
+        let iter_n_carrier = Message::assistant(format!("I'll verify whether {final_content}"));
+        let messages = vec![iter_n_carrier];
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "iter-N speculation that incidentally contains the final answer must NOT \
+             dedupe against the final response (codex round-1 P2 false-positive guard)",
+        );
+    }
+
+    /// NEW-10 codex round-1 P2: even when the iter-N carrier wraps
+    /// the final answer in a preamble verbatim ("Here's the
+    /// result: <X>" + final="<X>"), we DO NOT dedupe. Substring
+    /// containment is too ambiguous to distinguish duplicate
+    /// carriers from speculative mentions. Both rows persist; the
+    /// SPA may render two bubbles when the model produces this
+    /// shape — but a duplicate is strictly better than a missing
+    /// final answer. The actual reported NEW-10 bug
+    /// (kimi-k2.5/`get_weather`) is whitespace-only-difference,
+    /// not preamble-wrap.
+    #[test]
+    fn final_assistant_message_persists_when_iter_n_carrier_wraps_final_in_preamble() {
+        let final_content =
+            "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要我查询更详细的湾区天气预报吗？";
+        let iter_n_carrier = Message::assistant(format!("Here's the result: {final_content}"));
+        let messages = vec![iter_n_carrier];
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "preamble-wraps-final is NOT a dedupe signal — codex round-1 P2 narrowed \
+             dedupe to trimmed-equality only, so both rows must persist here",
+        );
+    }
+
+    /// NEW-10 NEGATIVE: the legitimate two-bubble flow (iter-N
+    /// emits a SHORT preamble "Looking that up..." and the EndTurn
+    /// produces a DIFFERENT long answer) must STILL render both
+    /// rows. The preamble is not trimmed-equal to the final answer,
+    /// so the dedupe helper returns false.
+    #[test]
+    fn final_assistant_message_preserves_preamble_plus_distinct_final() {
+        let preamble = Message::assistant("Looking that up...");
+        let messages = vec![preamble];
+        let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
+
+        let synthesised = final_assistant_message(&messages, final_content, None);
+        assert!(
+            synthesised.is_some(),
+            "preamble + distinct-final flow must persist BOTH rows",
+        );
+        assert_eq!(synthesised.unwrap().content, final_content);
+    }
+
+    /// NEW-10 NEGATIVE: when iter-N carrier holds tool_calls AND
+    /// genuinely-distinct text (no overlap with final), both rows
+    /// must persist. This is the bread-and-butter "two-bubble"
+    /// flow where the model narrates progress then delivers the
+    /// answer.
+    #[test]
+    fn final_assistant_message_preserves_when_iter_n_text_is_unrelated_to_final() {
+        let iter_n_carrier = Message::assistant("I'll fetch the weather data now.");
+        let messages = vec![iter_n_carrier];
+        let final_content =
+            "Based on the readings, San Francisco is sunny at 17.1°C today with 68% humidity.";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "iter-N narrative + distinct-final answer must persist BOTH rows",
+        );
+    }
+
+    /// NEW-10: bare spawn_only / tool-call-only iter-N carriers
+    /// (empty `content`) must NEVER block the final_assistant
+    /// synthesis. Empty content has nothing to dedupe against.
+    #[test]
+    fn final_assistant_message_persists_when_iter_n_carrier_has_empty_content() {
+        // The iter-N carrier exists (it held tool_calls) but its
+        // text content is empty — typical of a fan-out tool call
+        // from a non-chat model.
+        let iter_n_carrier = Message::assistant("");
+        let messages = vec![iter_n_carrier];
+        let final_content = "Here are the weather readings: 17.1°C, sunny.";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "empty iter-N carrier content cannot dedupe against the final response",
+        );
+    }
+
+    /// NEW-10 helper-level contract: empty/whitespace `content`
+    /// itself MUST return `false` from the helper so the caller's
+    /// `content.is_empty()` branch in `final_assistant_message`
+    /// remains the single source of truth for "skip synthesis".
+    #[test]
+    fn final_assistant_content_already_persisted_returns_false_for_empty_input() {
+        let messages = vec![Message::assistant("anything goes here")];
+        assert!(!final_assistant_content_already_persisted(&messages, ""));
+        assert!(!final_assistant_content_already_persisted(&messages, "   "));
+        assert!(!final_assistant_content_already_persisted(
+            &messages, "\n\t  "
+        ));
+    }
+
+    /// NEW-10: a `Tool` row whose body coincidentally contains the
+    /// final assistant content MUST NOT trigger dedupe — tool
+    /// outputs render as tool chips, not chat bubbles, so they
+    /// cannot be the source of a duplicate bubble.
+    #[test]
+    fn final_assistant_content_already_persisted_ignores_tool_rows() {
+        let tool_row = Message {
+            role: MessageRole::Tool,
+            content: "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？"
+                .to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let messages = vec![tool_row];
+        let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
+
+        assert!(
+            final_assistant_message(&messages, final_content, None).is_some(),
+            "Tool rows must not be considered when deduping the final assistant message",
+        );
+    }
+
+    /// NEW-10 codex round-1 P2 carrier flip: the persist loop's
+    /// `is_final_assistant_carrier` check must use trimmed-equality
+    /// — matching the synth-skip helper's semantics — otherwise a
+    /// trimmed-equal iter-N row that flips synth-skip would land
+    /// with `final_assistant_persisted=false`, the `final_send`
+    /// oneshot would resolve to `None`, and self-paced loops with
+    /// `<<loop-next-in: ...>>` hints in the EndTurn text would
+    /// fall back to the unsafe `.last()` history scan.
+    #[test]
+    fn final_assistant_carrier_trimmed_equality_matches_synth_skip_helper() {
+        // Trimmed-equal iter-N carrier (trailing newline diff).
+        let iter_n = Message::assistant("旧金山今天天气晴朗\n");
+        let final_content = "旧金山今天天气晴朗";
+
+        assert!(
+            is_final_assistant_carrier_under_trimmed_equality(&iter_n, final_content),
+            "trimmed-equal iter-N row MUST be recognised as the final carrier so \
+             `final_assistant_persisted` flips correctly",
+        );
+        // Sanity: the synth-skip helper recognises the SAME row
+        // (this is the lockstep invariant — codex round-1 P2).
+        assert!(
+            final_assistant_content_already_persisted(&[iter_n.clone()], final_content),
+            "synth-skip helper must recognise the same row as the carrier helper",
+        );
+    }
+
+    /// NEW-10 codex round-1 P2 carrier flip: the byte-exact case
+    /// from before this PR is preserved (subset of trimmed-equal).
+    #[test]
+    fn final_assistant_carrier_trimmed_equality_preserves_byte_exact_case() {
+        let iter_n = Message::assistant("byte-exact final answer");
+        assert!(is_final_assistant_carrier_under_trimmed_equality(
+            &iter_n,
+            "byte-exact final answer"
+        ));
+    }
+
+    /// NEW-10 codex round-1 P2 carrier flip: empty `response_content`
+    /// MUST NOT flip the carrier flag, otherwise a turn that
+    /// explicitly EndTurn'd with no text would mark an unrelated
+    /// iter-N empty-content row as the final carrier. The
+    /// `final_send` short-circuit at the call site relies on this
+    /// returning false for empty content.
+    #[test]
+    fn final_assistant_carrier_trimmed_equality_returns_false_for_empty_response() {
+        let iter_n = Message::assistant("");
+        assert!(!is_final_assistant_carrier_under_trimmed_equality(
+            &iter_n, ""
+        ));
+        assert!(!is_final_assistant_carrier_under_trimmed_equality(
+            &iter_n, "   "
+        ));
+    }
+
+    /// NEW-10 codex round-1 P2 carrier flip: User and Tool rows
+    /// MUST NOT be recognised as final-assistant carriers, even
+    /// when their content happens to trimmed-equal the final
+    /// content. This is the same role-discriminator the synth-skip
+    /// helper applies — keeping both helpers in lockstep.
+    #[test]
+    fn final_assistant_carrier_trimmed_equality_rejects_non_assistant_roles() {
+        let user_row = Message::user("matching content");
+        let tool_row = Message {
+            role: MessageRole::Tool,
+            content: "matching content".to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        assert!(!is_final_assistant_carrier_under_trimmed_equality(
+            &user_row,
+            "matching content"
+        ));
+        assert!(!is_final_assistant_carrier_under_trimmed_equality(
+            &tool_row,
+            "matching content"
+        ));
     }
 
     /// NEW-03 (codex rounds 1-3 P2): the synth-ack skip path picks
