@@ -25,6 +25,7 @@ use octos_agent::subagent_output::SubAgentOutputRouter;
 use octos_agent::subagent_summary::AgentSummaryGenerator;
 use octos_agent::task_supervisor::TaskSupervisor;
 use octos_agent::tools::ToolContext;
+use octos_core::SessionScope;
 
 /// Shared resources inherited from the parent session by a pipeline
 /// run. Each field is independently optional so legacy callers stay on
@@ -62,6 +63,13 @@ pub struct PipelineHostContext {
     /// registrations so the supervisor links the child task to the
     /// owning session.
     pub parent_session_key: Option<String>,
+    /// Phase 1 of the [`SessionScope`] migration (PR #1198 follow-up):
+    /// the single filesystem contract for the parent session. Snapshotted
+    /// from the active [`ToolContext::session_scope`] when a `run_pipeline`
+    /// tool call enters the executor; threaded down to per-node workers
+    /// so they inherit the same scope. `None` keeps the legacy pre-Phase-1
+    /// behaviour where each worker computed its own CWD.
+    pub session_scope: Option<Arc<SessionScope>>,
 }
 
 impl PipelineHostContext {
@@ -80,6 +88,7 @@ impl PipelineHostContext {
                 Some(ctx.tool_id.clone())
             },
             parent_session_key: ctx.parent_session_key.clone(),
+            session_scope: ctx.session_scope.clone(),
         }
     }
 
@@ -94,6 +103,7 @@ impl PipelineHostContext {
             && self.cost_accountant.is_none()
             && self.parent_tool_call_id.is_none()
             && self.parent_session_key.is_none()
+            && self.session_scope.is_none()
     }
 }
 
@@ -113,6 +123,7 @@ impl std::fmt::Debug for PipelineHostContext {
             .field("cost_accountant", &self.cost_accountant.is_some())
             .field("parent_tool_call_id", &self.parent_tool_call_id)
             .field("parent_session_key", &self.parent_session_key)
+            .field("session_scope", &self.session_scope.is_some())
             .finish()
     }
 }
@@ -149,6 +160,28 @@ mod tests {
         tool_ctx.file_state_cache = Some(Arc::new(FileStateCache::new()));
         let host = PipelineHostContext::from_tool_context(&tool_ctx);
         assert!(host.file_state_cache.is_some());
+        assert!(!host.is_empty());
+    }
+
+    #[test]
+    fn from_tool_context_picks_up_session_scope() {
+        // Phase 1 of the SessionScope migration: when the parent
+        // session has constructed a [`SessionScope`] at the host entry
+        // point, the pipeline host context snapshots the same handle so
+        // pipeline workers will (in Phase 2) inherit the scope instead
+        // of computing CWD from raw inputs. Today the field is wired
+        // through but unused — this test exists to prevent regressions
+        // as the consumers come online.
+        let cwd = if cfg!(windows) {
+            std::path::PathBuf::from("C:/home/yc/project")
+        } else {
+            std::path::PathBuf::from("/home/yc/project")
+        };
+        let scope = Arc::new(SessionScope::solo(cwd, vec![]).unwrap());
+        let mut tool_ctx = ToolContext::zero();
+        tool_ctx.session_scope = Some(scope);
+        let host = PipelineHostContext::from_tool_context(&tool_ctx);
+        assert!(host.session_scope.is_some());
         assert!(!host.is_empty());
     }
 }

@@ -76,6 +76,10 @@ async fn host_context_with_cache_and_supervisor() -> (
         cost_accountant: Some(accountant.clone()),
         parent_tool_call_id: Some("tool-call-w1-test".into()),
         parent_session_key: Some("session-w1".into()),
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // existing M8 parity tests stay on the legacy None path since
+        // no consumer reads the field yet.
+        session_scope: None,
     };
     (host, cache, supervisor, accountant, ledger_dir)
 }

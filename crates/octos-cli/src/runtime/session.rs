@@ -16,7 +16,7 @@ use octos_agent::{
     SubAgentOutputRouter, ToolRegistry,
 };
 use octos_bus::SessionManager;
-use octos_core::{AgentId, SessionKey};
+use octos_core::{AgentId, SessionKey, SessionScope, is_safe_session_id};
 
 use super::ProfileRuntime;
 
@@ -299,6 +299,55 @@ impl SessionRuntime {
         ));
         let file_state_cache = Arc::new(FileStateCache::new());
 
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // construct the multi-tenant filesystem contract for this
+        // session and stash it on the agent. The session id must
+        // satisfy [`is_safe_session_id`] (SPA `web-/slides-/site-`
+        // shapes pass; channel-prefixed `api:...` shapes do not). For
+        // unsafe shapes we leave the scope unset — Phase 1 is
+        // additive, no consumer reads the field yet. Phase 3 will
+        // migrate `api_session_workspace_dirs` and the related
+        // bespoke validators onto this contract; that's when the
+        // workspace shape mismatch between `SessionScope.workspace`
+        // (`<data>/users/<id>/workspace`) and the legacy encoded path
+        // (`<data>/users/<encoded id>/workspace` when the id has
+        // chars `is_safe_session_id` rejects) gets reconciled.
+        let session_id_raw = session_key.base_key().to_string();
+        let session_scope = if is_safe_session_id(&session_id_raw) {
+            match SessionScope::multi_tenant_with_default_zones(
+                profile.data_dir.clone(),
+                profile.profile_id.clone(),
+                session_id_raw.clone(),
+            ) {
+                Ok(scope) => Some(Arc::new(scope)),
+                Err(err) => {
+                    tracing::warn!(
+                        profile_id = %profile.profile_id,
+                        session = %session_key,
+                        error = %err,
+                        "SessionScope construction failed; bootstrap continues without scope (Phase 1 additive)",
+                    );
+                    None
+                }
+            }
+        } else {
+            // Codex review note (Phase-1 LOW): channel-prefixed legacy
+            // session ids (`api:web-1234`, `telegram:12345`, etc.) fail
+            // `is_safe_session_id` by design — the SessionScope on-disk
+            // layout uses the raw id, while gateway/legacy paths
+            // percent-encode the `:` before joining. Phase 3 will route
+            // every shape through the scope contract; until then, log
+            // the skip at `debug!` (not `warn!`) since this is the
+            // expected path for non-SPA channels and we don't want
+            // gateway sessions to spam warn lines.
+            tracing::debug!(
+                profile_id = %profile.profile_id,
+                session = %session_key,
+                "skipping SessionScope construction: session id outside is_safe_session_id alphabet (Phase 1 expected for channel-prefixed shapes)",
+            );
+            None
+        };
+
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
@@ -326,6 +375,13 @@ impl SessionRuntime {
         .with_subagent_summary_generator(subagent_summary_generator)
         .with_sandbox_config(sandbox.clone())
         .with_workspace_root(workspace_root.clone());
+
+        // Phase 1 of the SessionScope migration: attach the constructed
+        // scope to the per-session agent. `None` keeps pre-Phase-1
+        // behaviour byte-for-byte (no consumer reads the field yet).
+        if let Some(scope) = session_scope {
+            agent = agent.with_session_scope(scope);
+        }
 
         // M11-F regression fix REG-3: propagate the profile-scope
         // [`octos_agent::HookExecutor`] onto the per-session agent.
@@ -624,6 +680,87 @@ mod tests {
         // Plugin work dir is created and lives under workspace root.
         assert!(rt.plugin_work_dir.is_dir());
         assert!(rt.plugin_work_dir.starts_with(&rt.workspace_root));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_attaches_session_scope_for_safe_session_id() {
+        // Phase 1 of the SessionScope migration (PR #1198 follow-up):
+        // bootstrap a SPA-shape session_id (alphanumeric + `-` + `_` +
+        // `#`) and confirm the per-session agent carries a
+        // multi-tenant SessionScope. Phase 1 only asserts the field
+        // is present + the workspace shape matches
+        // `<data>/users/<id>/workspace`; no consumer reads it yet.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        let session_id = "web-1779574360679-o8x9kv";
+        let key = SessionKey(session_id.to_string());
+
+        let rt = SessionRuntime::bootstrap(&profile, key, None)
+            .await
+            .expect("bootstrap with safe SPA id");
+
+        let scope = rt
+            .agent
+            .session_scope()
+            .expect("safe session id yields a SessionScope")
+            .clone();
+        let expected_workspace = data_dir.join("users").join(session_id).join("workspace");
+        assert_eq!(scope.workspace(), expected_workspace.as_path());
+        assert_eq!(scope.root(), data_dir.as_path());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_leaves_session_scope_unset_for_unsafe_session_id() {
+        // Phase 1 contract: when the session_id contains characters
+        // outside the `is_safe_session_id` alphabet (e.g. the legacy
+        // `channel:chat_id` shape with `:`), bootstrap MUST NOT panic
+        // — it leaves the scope unset and the agent keeps pre-Phase-1
+        // behaviour. Phase 3 reconciles the encoded-path-vs-bare-id
+        // mismatch by routing every legitimate id through the scope
+        // contract.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        // SessionKey with a `:` channel prefix — fails is_safe_session_id.
+        let key = SessionKey::new("api", "web-1234");
+        let rt = SessionRuntime::bootstrap(&profile, key, None)
+            .await
+            .expect("bootstrap must succeed even when scope can't be built");
+
+        assert!(
+            rt.agent.session_scope().is_none(),
+            "channel-prefixed session ids must not produce a scope in Phase 1",
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_attaches_distinct_session_scopes_per_session() {
+        // Two SPA-shape sessions on the same profile each get their
+        // own SessionScope pointing at their own per-session workspace
+        // directory. Verifies the scope tracks `session_id`, not just
+        // the parent profile.
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = make_profile(data_dir.clone()).await;
+
+        let key_a = SessionKey("web-1779000000000-aaa".to_string());
+        let key_b = SessionKey("web-1779000000000-bbb".to_string());
+
+        let rt_a = SessionRuntime::bootstrap(&profile, key_a.clone(), None)
+            .await
+            .expect("bootstrap A");
+        let rt_b = SessionRuntime::bootstrap(&profile, key_b.clone(), None)
+            .await
+            .expect("bootstrap B");
+
+        let scope_a = rt_a.agent.session_scope().expect("scope A").clone();
+        let scope_b = rt_b.agent.session_scope().expect("scope B").clone();
+        assert_ne!(scope_a.workspace(), scope_b.workspace());
+        // Both still share the same tenant root.
+        assert_eq!(scope_a.root(), scope_b.root());
     }
 
     #[tokio::test]
