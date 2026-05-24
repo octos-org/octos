@@ -28,6 +28,22 @@
       ]
     },
     {
+      "id": "capabilities_before_followups",
+      "status": "passed",
+      "detail": "capability advertisement precedes follow-up requests at line 2",
+      "evidence": [
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "no_unadvertised_methods_called",
+      "status": "passed",
+      "detail": "all 3 advertised method gate(s) respected",
+      "evidence": [
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
       "id": "real_tmux_evidence",
       "status": "passed",
       "detail": "real tmux evidence is not required for mode=self-test status=passed",
@@ -62,6 +78,77 @@
         "terminal-size.json",
         "tui-capture.txt"
       ]
+    },
+    {
+      "id": "final_answer_visible",
+      "status": "passed",
+      "detail": "final answer/completion evidence is visible",
+      "evidence": [
+        "scenario.json",
+        "summary.json",
+        "tui-capture.txt",
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "composer_usable",
+      "status": "passed",
+      "detail": "composer label and input row are visible inside the declared terminal",
+      "evidence": [
+        "terminal-size.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "secret_redaction",
+      "status": "passed",
+      "detail": "scanned 9 retained text artifact(s) for secret leaks",
+      "evidence": [
+        "appui-transcript.jsonl",
+        "input-replay.log",
+        "launch-command.txt",
+        "runtime-policy-stamp.json",
+        "scenario.json",
+        "server.log",
+        "summary.json",
+        "terminal-size.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "terminal_layout_snapshot",
+      "status": "passed",
+      "detail": "embedded layout snapshot with 2 detected region(s) and 0 cursor sample(s)",
+      "evidence": [
+        "terminal-size.json",
+        "tui-capture.txt"
+      ],
+      "layout_snapshot": {
+        "schema": "octos.ux.terminal_layout_snapshot.v1",
+        "terminal": {
+          "cols": 120,
+          "rows": 40
+        },
+        "cursor_samples": {
+          "present": false,
+          "count": 0,
+          "samples": []
+        },
+        "regions": [
+          {
+            "name": "history",
+            "start_row": 3,
+            "end_row": 3,
+            "detected": true
+          },
+          {
+            "name": "composer",
+            "start_row": 7,
+            "end_row": 7,
+            "detected": true
+          }
+        ]
+      }
     },
     {
       "id": "permission_selection_visible_contract",
