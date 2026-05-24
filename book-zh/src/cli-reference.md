@@ -128,8 +128,8 @@ Bootstrap Files
 
 ```bash
 cargo install --path crates/octos-cli --features api
-octos serve                              # 绑定到 127.0.0.1:8080
-octos serve --host 0.0.0.0 --port 3000  # 接受外部连接
+octos serve                               # 绑定到 127.0.0.1:50080
+octos serve --host 0.0.0.0 --port 50080  # 接受外部连接
 ```
 
 功能包括：会话侧栏、聊天界面、SSE 流式传输、暗色主题。`/metrics` 端点提供 Prometheus 格式的指标（`octos_tool_calls_total`、`octos_tool_call_duration_seconds`、`octos_llm_tokens_total`）。

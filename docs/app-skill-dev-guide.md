@@ -21,7 +21,7 @@ This guide covers the full lifecycle of an Octos skill — from development to p
 | **App Store** | Apple App Store | [octos-hub](https://github.com/octos-org/octos-hub) registry |
 | **Distribution** | App Store binary delivery | Pre-built binaries in GitHub Releases |
 | **Install** | Tap "Get" | `octos skills install user/repo` |
-| **Sideload** | Ad-hoc / TestFlight | Copy to `~/.octos/skills/` directly |
+| **Sideload** | Ad-hoc / TestFlight | `octos skills --profile <profile> install ./my-skill` |
 
 ---
 
@@ -34,7 +34,7 @@ A skill is a **standalone executable** that communicates via **stdin/stdout JSON
 ```
 User message → LLM → tool_use("get_weather", {"city": "Paris"})
                         ↓
-             Gateway spawns: ~/.octos/skills/weather/main get_weather
+             Gateway spawns: ~/.octos/profiles/<profile>/data/skills/weather/main get_weather
                         ↓
              Stdin:  {"city": "Paris"}
              Stdout: {"output": "25°C, sunny", "success": true}
@@ -332,12 +332,15 @@ echo '{"param1": "hello"}' | ./my-skill/main my_tool
 # Build everything
 cargo build --release --workspace
 
-# Start the gateway
-octos gateway
+# Install into the profile you want to test
+octos skills --profile alice install ./my-skill
 
 # Verify skill loaded
-ls ~/.octos/skills/my-skill/
+ls ~/.octos/profiles/alice/data/skills/my-skill/
 # main  manifest.json  SKILL.md
+
+# Start the gateway
+octos gateway
 
 # Ask the agent to use your skill in conversation
 ```
@@ -585,7 +588,15 @@ See [`docs/SKILL_DEPLOYMENT.md`](./SKILL_DEPLOYMENT.md) for the operator-side ru
 
 ### Sideloading (Manual Install)
 
-Copy a skill directory directly — like sideloading an app:
+Install a local skill directory into the profile that should be allowed to use
+it:
+
+```bash
+octos skills --profile alice install ./my-skill --force
+```
+
+For one-off debugging you can copy the directory yourself, but keep the target
+profile-scoped:
 
 ```bash
 # Canonical: per-profile install
@@ -597,12 +608,14 @@ cp -r my-skill/ ~/.octos/skills/my-skill/
 chmod +x ~/.octos/skills/my-skill/main
 ```
 
-The global `~/.octos/skills/` directory is being retired (PR #944). New deployments should write directly to the per-profile path.
+The global `~/.octos/skills/` directory is retired for new installs. It is kept
+only as a legacy migration source; new deployments should write directly to the
+per-profile path or use `octos skills --profile <profile> install`.
 
 ### Installed Skill Layout
 
 ```
-~/.octos/skills/my-skill/
+~/.octos/profiles/alice/data/skills/my-skill/
 ├── main                # Executable binary
 ├── manifest.json       # Tool definitions
 ├── SKILL.md            # Documentation
@@ -627,12 +640,18 @@ Loading dedupes by `manifest.id` — the **first** directory scanned that contai
 
 | Priority | Location | Source |
 |----------|----------|--------|
-| 1 (highest) | `~/.octos/profiles/<profile>/data/skills/` | **Canonical** per-profile install (`octos skills install --profile <p>`; `fleet-install-skills.sh`) |
+| 1 (highest) | `~/.octos/profiles/<profile>/data/skills/` | **Canonical** per-profile install (`octos skills --profile <p> install`; `fleet-install-skills.sh`) |
 | 2 | `<project-dir>/skills/` | Project-local (development checkouts) |
 | 3 | `<project-dir>/bundled-app-skills/` | Bundled app-skills (constant `BUNDLED_APP_SKILLS_DIR` in `octos-agent/src/bootstrap.rs`; scanned by `Config::plugin_dirs_from_project`) |
 | 4 (lowest, **deprecated**) | `~/.octos/skills/` | Legacy global install — the loader emits a deprecation warning on every startup that sees this directory. See [Part 5: Install](#part-5-install) and [`docs/SKILL_DEPLOYMENT.md`](./SKILL_DEPLOYMENT.md) for the per-profile-only migration (PR #944). |
 
-**Lesson from the fleet (2026):** before PR #936 the loader registered duplicate ids twice and `ToolRegistry::register` overwrote by tool name — so a stale per-profile install could silently shadow a freshly-deployed global skill, and vice versa. Two production regressions (yangmi, douwentao) traced back to this trap before the dedup landed. On fleet upgrades, update **both** `~/.octos/skills/<x>/` *and* `<profile>/data/skills/<x>/` in lock-step until the global directory is removed.
+**Lesson from the fleet (2026):** before PR #936 the loader registered duplicate
+ids twice and `ToolRegistry::register` overwrote by tool name — so a stale
+per-profile install could silently shadow a freshly-deployed global skill, and
+vice versa. Two production regressions (yangmi, douwentao) traced back to this
+trap before the dedup landed. On fleet upgrades, migrate legacy global skills
+into the intended per-profile directories and then stop refreshing
+`~/.octos/skills/`; do not keep the two locations in lock-step.
 
 ---
 
@@ -660,7 +679,7 @@ Skill binaries can be updated without restarting the gateway:
 cargo build --release -p my-skill
 
 # Replace the binary
-cp target/release/my_skill ~/.octos/skills/my-skill/main
+cp target/release/my_skill ~/.octos/profiles/alice/data/skills/my-skill/main
 
 # Next tool call automatically uses the new binary
 ```
@@ -929,7 +948,7 @@ For skill authors with existing skills, here's what to align with as of 2026-05-
   - `has_meaningful_tts_audio` / `parse_wav_metadata` (mofa-podcast) → replace with `ValidatorSpec::AudioNonSilent` + `ValidatorSpec::MagicBytes`.
   - `poll_training_status` (mofa-fm) → replace with `ValidatorSpec::HttpProbeUntil`.
 - [ ] **For spawn-only artifact-producers, emit `named_outputs` where the harness needs to validate the output.** e.g. a `mofa_publish`-style skill must emit `{ "deploy_url": "..." }` so the harness's `HttpProbe { url_template = "${output.deploy_url}" }` can probe the live URL.
-- [ ] **Move to per-profile install.** Stop writing to `~/.octos/skills/`; use `octos skills install --profile <p>` or the fleet script.
+- [ ] **Move to per-profile install.** Stop writing to `~/.octos/skills/`; use `octos skills --profile <p> install` or the fleet script.
 - [ ] **Ship `manifest.json` `binaries.<platform>.sha256` if you publish pre-built binaries.** The installer verifies before copy.
 
 ### Backward compatibility

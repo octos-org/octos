@@ -604,9 +604,9 @@ octos cron enable <job-id> --disable
 REST API 服务器包含一个内嵌的 Web 界面：
 
 ```bash
-octos serve                              # 绑定到 127.0.0.1:8080
-octos serve --host 0.0.0.0 --port 3000  # 接受外部连接
-# 打开 http://localhost:8080
+octos serve                               # 绑定到 127.0.0.1:50080
+octos serve --host 0.0.0.0 --port 50080  # 接受外部连接
+# 打开 http://localhost:50080
 ```
 
 功能：

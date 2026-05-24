@@ -78,10 +78,10 @@ octos serve（控制面板 + 仪表盘，约 140 个 REST 端点）
 
 ```bash
 # 启动控制面板
-octos serve --host 0.0.0.0 --port 3000
+octos serve --host 0.0.0.0
 
 # 仪表盘地址：
-# http://localhost:3000
+# http://localhost:50080
 ```
 
 如果在反向代理（如 Caddy 或 Nginx）后运行，请配置转发到 serve 端口。
@@ -622,7 +622,7 @@ export PERPLEXITY_API_KEY="pplx-your-key"
 #### 通过管理 API
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/profiles \
+curl -X POST http://localhost:50080/api/admin/profiles \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-bot",
@@ -652,16 +652,16 @@ curl -X POST http://localhost:3000/api/admin/profiles \
 
 ```bash
 # 启动配置文件的 gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/start
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/start
 
 # 停止配置文件的 gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/stop
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/stop
 
 # 重启（停止 + 启动）
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/restart
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/restart
 
 # 检查状态
-curl http://localhost:3000/api/admin/profiles/my-bot/status
+curl http://localhost:50080/api/admin/profiles/my-bot/status
 ```
 
 **启动验证：** 启动端点会在启动 gateway 之前验证 LLM 提供商是否已配置。如果提供商或 API 密钥缺失，将返回错误。
@@ -671,7 +671,7 @@ curl http://localhost:3000/api/admin/profiles/my-bot/status
 更新使用 **JSON 合并** — 只有你包含的字段会被修改。所有其他字段保持不变。
 
 ```bash
-curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
+curl -X PUT http://localhost:50080/api/admin/profiles/my-bot \
   -H "Content-Type: application/json" \
   -d '{
     "name": "更新后的机器人名称",
@@ -687,7 +687,7 @@ curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
 ### 8.4 删除配置文件
 
 ```bash
-curl -X DELETE http://localhost:3000/api/admin/profiles/my-bot
+curl -X DELETE http://localhost:50080/api/admin/profiles/my-bot
 ```
 
 这将停止 gateway 进程（如果正在运行）并级联删除所有子账户。
@@ -696,17 +696,17 @@ curl -X DELETE http://localhost:3000/api/admin/profiles/my-bot
 
 ```bash
 # SSE 日志流（实时）
-curl http://localhost:3000/api/admin/profiles/my-bot/logs
+curl http://localhost:50080/api/admin/profiles/my-bot/logs
 
 # 提供商指标
-curl http://localhost:3000/api/admin/profiles/my-bot/metrics
+curl http://localhost:50080/api/admin/profiles/my-bot/metrics
 ```
 
 ### 8.6 API 总览端点
 
 ```bash
 # 获取所有配置文件的摘要
-curl http://localhost:3000/api/admin/overview
+curl http://localhost:50080/api/admin/overview
 ```
 
 返回总数、运行中/已停止数量以及每个配置文件的状态。
@@ -716,7 +716,7 @@ curl http://localhost:3000/api/admin/overview
 部署前测试提供商配置：
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/test-provider \
+curl -X POST http://localhost:50080/api/admin/test-provider \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "moonshot",
@@ -1515,18 +1515,18 @@ export LARK_FROM_ADDRESS="your-feishu-email@company.com"
 
 ```bash
 # 启动 OminiX
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/start
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/start
 
 # 检查健康状态
-curl http://localhost:3000/api/admin/platform-skills/asr/health
+curl http://localhost:50080/api/admin/platform-skills/asr/health
 
 # 下载模型
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/models/download \
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/models/download \
   -H "Content-Type: application/json" \
   -d '{"model_id": "Qwen3-ASR-1.7B-8bit"}'
 
 # 查看日志
-curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
+curl http://localhost:50080/api/admin/platform-skills/ominix-api/logs?lines=100
 ```
 
 ### 13.3 语音转录 (`voice_transcribe`)
@@ -1656,7 +1656,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # 安装到特定配置文件
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 **安装过程：**
@@ -1785,16 +1785,15 @@ requires_env: MY_API_KEY
 
 ### 14.6 技能解析顺序
 
-技能从以下目录加载（按优先级排序）：
+配置文件 gateway 按以下优先级加载技能：
 
-1. `.octos/plugins/`（旧版）
-2. `.octos/skills/`（用户安装的自定义技能）
-3. `.octos/bundled-app-skills/`（内置：news、deep-search 等）
-4. `.octos/platform-skills/`（平台：asr/tts）
-5. `~/.octos/plugins/`（全局旧版）
-6. `~/.octos/skills/`（全局自定义）
+1. `~/.octos/profiles/<profile>/data/skills/`（配置文件作用域的自定义技能）
+2. `<octos_home>/bundled-app-skills/`（内置：news、deep-search 等）
+3. `<octos_home>/platform-skills/`（管理员加载的平台技能，如 ASR/TTS）
 
-用户安装的技能覆盖同名的内置技能。
+独立项目运行还可以加载 `<project>/.octos/plugins/` 和
+`<project>/.octos/skills/`。旧的 HOME 全局目录 `~/.octos/plugins/` 和
+`~/.octos/skills/` 仅用于迁移，不再属于常规扫描路径。
 
 ### 14.7 创建自定义技能
 

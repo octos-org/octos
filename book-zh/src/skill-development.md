@@ -127,7 +127,7 @@ pub enum ValidatorSpec {
 ```
 User message → LLM → tool_use("get_weather", {"city": "Paris"})
                          ↓
-              Gateway spawns: ~/.octos/skills/weather/main get_weather
+              Gateway spawns: ~/.octos/profiles/<profile>/data/skills/weather/main get_weather
                          ↓
               Stdin:  {"city": "Paris"}
               Stdout: {"output": "Paris, France\nClear sky\n...", "success": true}
@@ -153,7 +153,7 @@ crates/app-skills/my-skill/
 启动引导后，技能安装在：
 
 ```
-~/.octos/skills/my-skill/
+~/.octos/profiles/alice/data/skills/my-skill/
 ├── main                # 可执行二进制文件（从 target/ 复制）
 ├── manifest.json       # 工具定义
 └── SKILL.md            # 文档
@@ -392,7 +392,7 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
 
 **元组格式：** `(dir_name, binary_name, skill_md, manifest_json)`
 
-- `dir_name`：`~/.octos/skills/` 下的目录名
+- `dir_name`：引导写入 `<octos_home>/bundled-app-skills/` 时使用的目录名
 - `binary_name`：`target/release/` 中的二进制文件名（必须与 Cargo.toml 中的 `[[bin]] name` 匹配）
 - `skill_md`：嵌入的 SKILL.md 内容
 - `manifest_json`：嵌入的 manifest.json 内容
@@ -431,12 +431,15 @@ echo '{"param1": "test"}' | ./target/debug/my_skill unknown_tool
 # 构建 release 版本并安装
 cargo build --release --workspace
 
-# 启动网关（技能自动引导加载）
-octos gateway
+# 安装到要测试的配置文件
+octos skills --profile alice install ./my-skill
 
 # 检查技能是否已加载
-ls ~/.octos/skills/my-skill/
+ls ~/.octos/profiles/alice/data/skills/my-skill/
 # main  manifest.json  SKILL.md
+
+# 启动网关
+octos gateway
 
 # 让 Agent 使用你的技能
 ```
@@ -672,7 +675,7 @@ fn get_smtp_config() -> SmtpConfig {
 **示例：技能目录布局**
 
 ```
-~/.octos/skills/my-style-guide/
+~/.octos/profiles/alice/data/skills/my-style-guide/
 ├── manifest.json
 ├── SKILL.md
 └── prompts/
@@ -878,8 +881,8 @@ requires_env: MY_API_KEY
 # 只构建该技能
 cargo build --release -p weather
 
-# 复制到远程服务器
-scp target/release/weather remote:~/.octos/skills/weather/main
+# 复制到远程服务器上的目标配置文件
+scp target/release/weather remote:~/.octos/profiles/alice/data/skills/weather/main
 
 # 无需重启网关 — 下次工具调用时使用新二进制文件
 ```
@@ -952,8 +955,8 @@ manage_skills(action="search", query="comic")
 
 1. `<profile-data>/skills/` — 按配置文件（最高优先级）
 2. `<project-dir>/skills/` — 项目本地
-3. `<project-dir>/bundled-skills/` — 内置应用技能
-4. `~/.octos/skills/` — 全局（最低优先级）
+3. `<project-dir>/bundled-app-skills/` — 内置应用技能
+4. `~/.octos/skills/` — 旧版全局目录，仅用于迁移
 
 ### 发布到注册表
 
@@ -1062,7 +1065,7 @@ let styles_dir = skill_dir.join("styles");
 - [ ] 添加到 `bundled_app_skills.rs` 中的 `BUNDLED_APP_SKILLS`
 - [ ] `cargo build --workspace` 成功
 - [ ] 独立测试：`echo '{"param": "value"}' | ./target/debug/my_skill my_tool`
-- [ ] 网关测试：技能出现在 `~/.octos/skills/` 中且 Agent 可以使用
+- [ ] 网关测试：技能出现在目标配置文件的 `data/skills/` 中且 Agent 可以使用
 
 ### 扩展（MCP 服务器、钩子、提示片段）
 

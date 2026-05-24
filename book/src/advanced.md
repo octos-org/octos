@@ -604,9 +604,9 @@ octos cron enable <job-id> --disable
 The REST API server includes an embedded web UI:
 
 ```bash
-octos serve                              # Binds to 127.0.0.1:8080
-octos serve --host 0.0.0.0 --port 3000  # Accept external connections
-# Open http://localhost:8080
+octos serve                               # Binds to 127.0.0.1:50080
+octos serve --host 0.0.0.0 --port 50080  # Accept external connections
+# Open http://localhost:50080
 ```
 
 Features:

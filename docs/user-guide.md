@@ -78,10 +78,10 @@ The admin dashboard is a React web application embedded in the `octos serve` bin
 
 ```bash
 # Start the control plane
-octos serve --host 0.0.0.0 --port 3000
+octos serve --host 0.0.0.0
 
 # Dashboard is available at:
-# http://localhost:3000
+# http://localhost:50080
 ```
 
 If you're running behind a reverse proxy (e.g., Caddy or Nginx), configure it to forward to the serve port.
@@ -692,7 +692,7 @@ Profiles are bot instances managed through the admin dashboard or API. Each prof
 #### Via Admin API
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/profiles \
+curl -X POST http://localhost:50080/api/admin/profiles \
   -H "Content-Type: application/json" \
   -d '{
     "id": "my-bot",
@@ -722,16 +722,16 @@ Use the Start / Stop / Restart buttons on each profile card.
 
 ```bash
 # Start a profile's gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/start
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/start
 
 # Stop a profile's gateway
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/stop
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/stop
 
 # Restart (stop + start)
-curl -X POST http://localhost:3000/api/admin/profiles/my-bot/restart
+curl -X POST http://localhost:50080/api/admin/profiles/my-bot/restart
 
 # Check status
-curl http://localhost:3000/api/admin/profiles/my-bot/status
+curl http://localhost:50080/api/admin/profiles/my-bot/status
 ```
 
 **Start validation:** The start endpoint validates that an LLM provider is configured before launching the gateway. If the provider or API key is missing, it returns an error.
@@ -741,7 +741,7 @@ curl http://localhost:3000/api/admin/profiles/my-bot/status
 Updates use **JSON merge** — only the fields you include are modified. All other fields are preserved.
 
 ```bash
-curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
+curl -X PUT http://localhost:50080/api/admin/profiles/my-bot \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Updated Bot Name",
@@ -757,7 +757,7 @@ curl -X PUT http://localhost:3000/api/admin/profiles/my-bot \
 ### 8.4 Deleting a Profile
 
 ```bash
-curl -X DELETE http://localhost:3000/api/admin/profiles/my-bot
+curl -X DELETE http://localhost:50080/api/admin/profiles/my-bot
 ```
 
 This stops the gateway process (if running) and cascades to all sub-accounts.
@@ -766,17 +766,17 @@ This stops the gateway process (if running) and cascades to all sub-accounts.
 
 ```bash
 # SSE log stream (real-time)
-curl http://localhost:3000/api/admin/profiles/my-bot/logs
+curl http://localhost:50080/api/admin/profiles/my-bot/logs
 
 # Provider metrics
-curl http://localhost:3000/api/admin/profiles/my-bot/metrics
+curl http://localhost:50080/api/admin/profiles/my-bot/metrics
 ```
 
 ### 8.6 API Overview Endpoint
 
 ```bash
 # Get summary of all profiles
-curl http://localhost:3000/api/admin/overview
+curl http://localhost:50080/api/admin/overview
 ```
 
 Returns total count, running/stopped counts, and status of each profile.
@@ -786,7 +786,7 @@ Returns total count, running/stopped counts, and status of each profile.
 Before deploying, test a provider configuration:
 
 ```bash
-curl -X POST http://localhost:3000/api/admin/test-provider \
+curl -X POST http://localhost:50080/api/admin/test-provider \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "moonshot",
@@ -1594,18 +1594,18 @@ Or via admin API:
 
 ```bash
 # Start OminiX
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/start
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/start
 
 # Check health
-curl http://localhost:3000/api/admin/platform-skills/asr/health
+curl http://localhost:50080/api/admin/platform-skills/asr/health
 
 # Download a model
-curl -X POST http://localhost:3000/api/admin/platform-skills/ominix-api/models/download \
+curl -X POST http://localhost:50080/api/admin/platform-skills/ominix-api/models/download \
   -H "Content-Type: application/json" \
   -d '{"model_id": "Qwen3-ASR-1.7B-8bit"}'
 
 # View logs
-curl http://localhost:3000/api/admin/platform-skills/ominix-api/logs?lines=100
+curl http://localhost:50080/api/admin/platform-skills/ominix-api/logs?lines=100
 ```
 
 ### 13.3 Voice Transcription (`voice_transcribe`)
@@ -1735,7 +1735,7 @@ octos skills install user/repo --branch develop
 octos skills install user/repo --force
 
 # Install into a specific profile
-octos skills install user/repo --profile my-bot
+octos skills --profile my-bot install user/repo
 ```
 
 **Installation process:**
@@ -1864,16 +1864,16 @@ The tool binary receives JSON input on stdin and outputs JSON on stdout:
 
 ### 14.6 Skill Resolution Order
 
-Skills are loaded from these directories (in priority order):
+Profile gateways load skills from these directories, in priority order:
 
-1. `.octos/plugins/` (legacy)
-2. `.octos/skills/` (user-installed custom skills)
-3. `.octos/bundled-app-skills/` (bundled: news, deep-search, etc.)
-4. `.octos/platform-skills/` (platform: asr/tts)
-5. `~/.octos/plugins/` (global legacy)
-6. `~/.octos/skills/` (global custom)
+1. `~/.octos/profiles/<profile>/data/skills/` (profile-scoped custom skills)
+2. `<octos_home>/bundled-app-skills/` (bundled: news, deep-search, etc.)
+3. `<octos_home>/platform-skills/` (admin-loaded platform skills, such as ASR/TTS)
 
-User-installed skills override bundled skills with the same name.
+Standalone project runs can also load `<project>/.octos/plugins/` and
+`<project>/.octos/skills/`. The old HOME-rooted global directories
+`~/.octos/plugins/` and `~/.octos/skills/` are migration-only and are no longer
+part of the normal scan path.
 
 ### 14.7 Creating a Custom Skill
 

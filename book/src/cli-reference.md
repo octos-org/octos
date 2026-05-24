@@ -128,8 +128,8 @@ Launch the web UI and REST API server. Requires the `api` feature flag.
 
 ```bash
 cargo install --path crates/octos-cli --features api
-octos serve                              # Binds to 127.0.0.1:8080
-octos serve --host 0.0.0.0 --port 3000  # Accept external connections
+octos serve                               # Binds to 127.0.0.1:50080
+octos serve --host 0.0.0.0 --port 50080  # Accept external connections
 ```
 
 Features: session sidebar, chat interface, SSE streaming, dark theme. A `/metrics` endpoint provides Prometheus-format metrics (`octos_tool_calls_total`, `octos_tool_call_duration_seconds`, `octos_llm_tokens_total`).
