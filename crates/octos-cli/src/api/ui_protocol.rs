@@ -15627,6 +15627,22 @@ async fn run_standalone_turn(
     if let Some(hooks) = session_runtime.profile.hook_executor.clone() {
         request_agent = request_agent.with_hooks(hooks);
     }
+    // Phase 3-A plumbing follow-up (Phase 1 gap): propagate the
+    // `SessionScope` the cached `SessionRuntime` constructed at
+    // `runtime/session.rs::bootstrap` onto this per-turn rebuilt agent.
+    // Without this, every WS turn served by `Agent::new_shared` here
+    // would observe `session_scope: None` and the Phase-2-A/B/C/D
+    // consumers (run_pipeline working dir, plugin work_dir + path
+    // validation, file tools' base_dir + path classification, shell +
+    // spawn child CWD) would silently fall through to legacy paths —
+    // re-introducing the mini5 NEW-06 contamination class on the WS
+    // chat transport. The lookup is `Option<&Arc<SessionScope>>` so
+    // legacy / channel-prefixed sessions (where Phase 1 left the
+    // field unset by design) keep their pre-Phase-1 behaviour
+    // byte-for-byte.
+    if let Some(scope) = session_runtime.agent.session_scope() {
+        request_agent = request_agent.with_session_scope(scope.clone());
+    }
     // M11-F regression fix REG-1 follow-up (codex review): wire the
     // `activate_tools` back-reference on the per-turn rebuilt agent.
     // `ProfileRuntime::bootstrap` defers non-core groups + registers
