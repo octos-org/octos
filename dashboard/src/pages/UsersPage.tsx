@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
+import ConfirmDialog from '../components/ConfirmDialog'
 import { useToast } from '../components/Toast'
 import type { AllowlistEntry, User } from '../types'
+
+interface PendingConfirm {
+  title: string
+  message: string
+  confirmLabel: string
+  onConfirm: () => Promise<void>
+}
 
 function formatDate(value: string | null | undefined): string {
   if (!value) return 'Never'
@@ -42,6 +50,7 @@ export default function UsersPage() {
   const [newNote, setNewNote] = useState('')
   const [removingEmail, setRemovingEmail] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null)
 
   const loadData = useCallback(async () => {
     try {
@@ -99,14 +108,7 @@ export default function UsersPage() {
     }
   }
 
-  const handleRemoveAllowlist = async (entry: AllowlistEntry) => {
-    const confirmed = confirm(
-      entry.registered
-        ? `Remove "${entry.email}" from the allowlist? The already-registered account will remain, but future OTP signup will no longer be pre-authorized.`
-        : `Remove "${entry.email}" from the allowlist?`,
-    )
-    if (!confirmed) return
-
+  const removeAllowlist = async (entry: AllowlistEntry) => {
     try {
       setRemovingEmail(entry.email)
       await api.deleteAllowedEmail(entry.email)
@@ -119,10 +121,18 @@ export default function UsersPage() {
     }
   }
 
-  const handleDeleteUser = async (user: User) => {
-    if (!confirm(`Delete account "${user.email}"? This will also delete the profile and stop its gateway.`)) {
-      return
-    }
+  const handleRemoveAllowlist = (entry: AllowlistEntry) => {
+    setPendingConfirm({
+      title: 'Remove Allowlisted Email',
+      message: entry.registered
+        ? `Remove "${entry.email}" from the allowlist? The already-registered account will remain, but future OTP signup will no longer be pre-authorized.`
+        : `Remove "${entry.email}" from the allowlist?`,
+      confirmLabel: 'Remove',
+      onConfirm: () => removeAllowlist(entry),
+    })
+  }
+
+  const deleteUser = async (user: User) => {
     try {
       setDeletingId(user.id)
       await api.deleteUser(user.id)
@@ -133,6 +143,22 @@ export default function UsersPage() {
     } finally {
       setDeletingId(null)
     }
+  }
+
+  const handleDeleteUser = (user: User) => {
+    setPendingConfirm({
+      title: 'Delete Account',
+      message: `Delete account "${user.email}"? This will also delete the profile and stop its gateway.`,
+      confirmLabel: 'Delete',
+      onConfirm: () => deleteUser(user),
+    })
+  }
+
+  const handleConfirmAction = async () => {
+    const action = pendingConfirm
+    if (!action) return
+    setPendingConfirm(null)
+    await action.onConfirm()
   }
 
   if (loading) {
@@ -340,6 +366,18 @@ export default function UsersPage() {
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingConfirm !== null}
+        title={pendingConfirm?.title ?? ''}
+        message={pendingConfirm?.message ?? ''}
+        confirmLabel={pendingConfirm?.confirmLabel}
+        danger
+        onConfirm={() => {
+          void handleConfirmAction()
+        }}
+        onCancel={() => setPendingConfirm(null)}
+      />
     </div>
   )
 }
