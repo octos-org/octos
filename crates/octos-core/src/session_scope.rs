@@ -72,8 +72,8 @@
 //! ├── data/                         ← SessionScope.root
 //! │   ├── users/<session_id>/
 //! │   │   └── workspace/            ← SessionScope.workspace (per-session, ephemeral)
-//! │   ├── skills/                   ← shared_zones[0] (cross-session, persistent)
-//! │   ├── research/                 ← shared_zones[1] (workers MUST NOT default CWD here)
+//! │   ├── research/                 ← shared_zones[0] (workers MUST NOT default CWD here)
+//! │   ├── skills/                   ← shared_zones[1] (cross-session, persistent)
 //! │   └── episodes.redb             ← OutOfScope (memory store accessed via API, not as CWD or path)
 //! ├── config.json
 //! └── ...
