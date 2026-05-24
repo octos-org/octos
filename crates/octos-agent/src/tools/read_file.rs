@@ -104,20 +104,40 @@ impl Tool for ReadFileTool {
             });
         }
 
-        // Resolve path (with traversal protection)
-        let path = match super::resolve_path_with_scope(
-            &self.base_dir,
-            &input.path,
-            self.filesystem_scope,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: format!("Path outside working directory: {}", input.path),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        // Phase 2-C of the SessionScope migration: when the host has
+        // threaded a scope through `ToolContext`, use it as the single
+        // source of truth for base_dir + path classification. Reads are
+        // permitted for `InWorkspace`, `InSharedZone`, and `InGrantedDir`;
+        // `OutOfScope` is refused. The shared helper canonicalizes the
+        // candidate before classification so ancestor symlinks can't
+        // smuggle a path out of the workspace (`O_NOFOLLOW` only
+        // protects the final component). When no scope is present we
+        // keep the legacy resolver (backward compat for `octos chat`).
+        let path = match ctx.session_scope.as_ref() {
+            Some(scope) => match super::resolve_path_for_session_scope_read(scope, &input.path) {
+                Ok(p) => p,
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        output: format!("{reason}: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+            None => match super::resolve_path_with_scope(
+                &self.base_dir,
+                &input.path,
+                self.filesystem_scope,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!("Path outside working directory: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
         };
 
         // Reject files larger than 10MB to prevent OOM (output is capped to 100KB
@@ -509,6 +529,193 @@ mod tests {
         assert!(a.success && b.success);
         assert!(!a.output.contains("[FILE_UNCHANGED]"));
         assert!(!b.output.contains("[FILE_UNCHANGED]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2-C: SessionScope integration tests for ReadFileTool.
+    // -----------------------------------------------------------------------
+
+    use octos_core::SessionScope;
+
+    fn ctx_with_scope(scope: SessionScope) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "read-with-scope".to_string();
+        ctx.session_scope = Some(Arc::new(scope));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn read_file_uses_scope_workspace_as_base_dir_for_relative_paths() {
+        // When a scope is present, relative paths resolve against
+        // `scope.workspace()` regardless of the legacy `base_dir`.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        std::fs::write(scope_dir.path().join("scoped.txt"), "from scope\n").unwrap();
+        std::fs::write(legacy_dir.path().join("scoped.txt"), "from legacy\n").unwrap();
+
+        // Note: legacy_dir is the tool's base_dir, but the scope's
+        // workspace is scope_dir — the latter must win.
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(legacy_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "scoped.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(
+            result.output.contains("from scope"),
+            "expected scope_dir content, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("from legacy"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_out_of_scope_path() {
+        // An absolute path outside every declared zone classifies as
+        // `OutOfScope` and must be refused.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": outside_file.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_in_workspace_path() {
+        // `InWorkspace` is the obviously-allowed zone for reads.
+        let scope_dir = tempfile::tempdir().unwrap();
+        std::fs::write(scope_dir.path().join("ok.txt"), "ok\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "ok.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(result.output.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_in_shared_zone_path() {
+        // Multi-tenant scopes expose shared zones (research/, skills/).
+        // READS into those zones are allowed (writes are not — see the
+        // write_file tests). The user's intent here is explicit:
+        // they're recalling cross-session shared state.
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_path_buf();
+        std::fs::create_dir_all(data.join("research/topic")).unwrap();
+        std::fs::create_dir_all(data.join("users/web-1/workspace")).unwrap();
+        let shared_file = data.join("research/topic/notes.md");
+        std::fs::write(&shared_file, "shared notes\n").unwrap();
+
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.clone(),
+            "dspfac".into(),
+            "web-1".into(),
+        )
+        .unwrap();
+        let tool = ReadFileTool::new(scope.workspace());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": shared_file.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(result.output.contains("shared notes"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_refuses_ancestor_symlink_escape() {
+        // Per codex review of the Phase 2-C commit: `O_NOFOLLOW` only
+        // guards the FINAL path component, and `classify_lexical_path`
+        // is explicitly lexical. Without our canonicalization step a
+        // path like `<workspace>/link/secret.txt`, where `link` is a
+        // symlink pointing outside the workspace, would classify as
+        // `InWorkspace` and `read_no_follow` would happily open the
+        // file at the symlink's real location.
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::fs::write(outside_dir.path().join("secret.txt"), "exfiltrated\n").unwrap();
+
+        // <scope>/link -> <outside>
+        let link_path = scope_dir.path().join("link");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "link/secret.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "ancestor-symlink escape MUST be refused, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection (canonicalized leaves the workspace), got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_falls_back_to_legacy_when_no_scope() {
+        // No scope on the context — behaviour must match the pre-Phase-2C
+        // path (relative resolved against `base_dir`, traversal blocked
+        // by the legacy resolver, etc.).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("legacy.txt"), "legacy ok\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let ctx = ToolContext::zero();
+        assert!(ctx.session_scope.is_none());
+
+        let ok = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "legacy.txt"}))
+            .await
+            .unwrap();
+        assert!(ok.success);
+        assert!(ok.output.contains("legacy ok"));
+
+        let bad = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "../escape.txt"}))
+            .await
+            .unwrap();
+        assert!(!bad.success);
+        assert!(bad.output.contains("outside working directory"));
     }
 
     #[tokio::test]

@@ -38,7 +38,7 @@ use eyre::Result;
 use octos_core::TokenUsage;
 
 use crate::progress::ProgressReporter;
-use octos_core::SessionScope;
+use octos_core::{PathClassification, ScopeMode, SessionScope};
 
 /// Registry of [`AgentDefinition`]-style manifests available to tools.
 ///
@@ -819,6 +819,162 @@ pub fn resolve_path_with_scope(
         return Ok(normalize_lexical(&base_dir.join(user_path)));
     }
     resolve_path(base_dir, user_path)
+}
+
+/// Resolve and classify a user-supplied path against a [`SessionScope`]
+/// for Phase 2-C file tools. Relative paths anchor at
+/// `scope.workspace()`; absolute paths are accepted but must classify
+/// inside one of the scope's zones.
+///
+/// **Symlink containment.** [`SessionScope::classify_lexical_path`] is
+/// intentionally lexical-only — a candidate like
+/// `<workspace>/symlink/out`, where `symlink` is a symbolic link
+/// pointing outside the workspace, would classify as `InWorkspace`
+/// even though the actual on-disk location is elsewhere. `O_NOFOLLOW`
+/// (applied in [`read_no_follow`] / [`write_no_follow`]) only protects
+/// the FINAL component, not symlinked ancestors. To close that gap
+/// before classification we canonicalize both the candidate and each
+/// zone root via [`canonicalize_lossy`], matching the containment
+/// guarantee `octos_bus::file_handle::resolve_tool_path` gave the
+/// pre-Phase-2C path. See PR #1201 codex review for the precise
+/// scenario (`<workspace>/link/out`).
+///
+/// Returns the (lexically-normalised, NOT canonicalized) absolute path
+/// the file tool should open. We deliberately return the lexical form
+/// so callers can pass it back to `read_no_follow`/`write_no_follow`
+/// without re-resolving — the canonicalization here is for
+/// classification only.
+pub fn resolve_path_for_session_scope_read(
+    scope: &SessionScope,
+    user_path: &str,
+) -> Result<PathBuf, &'static str> {
+    resolve_for_scope(scope, user_path, /*for_write=*/ false)
+}
+
+/// Same as [`resolve_path_for_session_scope_read`] but with the
+/// write-side policy: `InSharedZone` is refused.
+pub fn resolve_path_for_session_scope_write(
+    scope: &SessionScope,
+    user_path: &str,
+) -> Result<PathBuf, &'static str> {
+    resolve_for_scope(scope, user_path, /*for_write=*/ true)
+}
+
+fn resolve_for_scope(
+    scope: &SessionScope,
+    user_path: &str,
+    for_write: bool,
+) -> Result<PathBuf, &'static str> {
+    let candidate = PathBuf::from(user_path);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        scope.workspace().join(candidate)
+    };
+    // Refuse `..` lexically first so the subsequent canonicalize walk
+    // cannot accidentally surface inside a zone after climbing out.
+    let lex_normalised = match lexical_normalise_strict(&absolute) {
+        Some(p) => p,
+        None => return Err("Path outside session scope"),
+    };
+    match classify_canonical(scope, &lex_normalised) {
+        PathClassification::InWorkspace => Ok(lex_normalised),
+        PathClassification::InGrantedDir { .. } => Ok(lex_normalised),
+        PathClassification::InSharedZone { .. } => {
+            if for_write {
+                Err("Writes to shared zones are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
+        PathClassification::OutOfScope => Err("Path outside session scope"),
+    }
+}
+
+/// Classify a path against a scope after canonicalizing both sides.
+/// Closes the ancestor-symlink hole in
+/// [`SessionScope::classify_lexical_path`]. Returns the same
+/// [`PathClassification`] shape so callers can read it the same way.
+fn classify_canonical(scope: &SessionScope, lex_normalised_abs: &Path) -> PathClassification {
+    let canon = canonicalize_lossy(lex_normalised_abs);
+    let canon_ws = canonical_root_lossy(scope.workspace());
+    if canon.starts_with(&canon_ws) {
+        return PathClassification::InWorkspace;
+    }
+    match scope.mode() {
+        ScopeMode::Solo { granted_dirs } => {
+            for granted in granted_dirs {
+                let canon_grant = canonical_root_lossy(granted);
+                if canon.starts_with(&canon_grant) {
+                    return PathClassification::InGrantedDir {
+                        granted_dir: granted.clone(),
+                    };
+                }
+            }
+        }
+        ScopeMode::MultiTenant { .. } => {
+            for zone in scope.shared_zones() {
+                let canon_zone = canonical_root_lossy(zone);
+                if canon.starts_with(&canon_zone) {
+                    return PathClassification::InSharedZone { zone: zone.clone() };
+                }
+            }
+        }
+    }
+    PathClassification::OutOfScope
+}
+
+/// Lexical normalise (collapse `.`, refuse `..`). Mirrors the helper
+/// inside `octos_core::session_scope` so the canonicalize walk above
+/// can't absorb a traversal escape.
+fn lexical_normalise_strict(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    Some(out)
+}
+
+/// Canonicalize a path, recovering when the leaf doesn't exist yet
+/// (writes target new files). Mirrors
+/// [`octos_bus::file_handle::canonicalize_lossy`]: walks ancestors to
+/// find the longest existing prefix, canonicalizes that (resolving
+/// symlinked ancestors), and re-attaches the suffix. The input must
+/// already be lexically normalised (no `..`) so the re-attached
+/// suffix is a real would-be on-disk location.
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut existing: &Path = path;
+    let mut suffix = PathBuf::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            let mut next_suffix = PathBuf::from(name);
+            next_suffix.push(&suffix);
+            suffix = next_suffix;
+        }
+        existing = parent;
+        if let Ok(canon) = std::fs::canonicalize(existing) {
+            return canon.join(suffix);
+        }
+        if existing.as_os_str().is_empty() {
+            break;
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Canonicalize a root, falling back to the input when the root
+/// doesn't exist (rare for `scope.workspace()` but possible in tests
+/// that pass a not-yet-created directory).
+fn canonical_root_lossy(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// Syntactic path normalization (no filesystem access). Collapses `.`

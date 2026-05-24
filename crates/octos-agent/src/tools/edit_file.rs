@@ -114,20 +114,39 @@ impl Tool for EditFileTool {
             });
         }
 
-        // Resolve path (with traversal protection)
-        let path = match super::resolve_path_with_scope(
-            &self.base_dir,
-            &input.path,
-            self.filesystem_scope,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: format!("Path outside working directory: {}", input.path),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        // Phase 2-C of the SessionScope migration: when the host has
+        // threaded a scope through `ToolContext`, use it as the single
+        // source of truth for base_dir + path classification. Same
+        // write policy as `write_file` — `InWorkspace` and
+        // `InGrantedDir` allowed; `InSharedZone` and `OutOfScope`
+        // refused. The shared helper canonicalizes the candidate before
+        // classification so ancestor symlinks can't smuggle an edit
+        // out of the workspace.
+        let path = match ctx.session_scope.as_ref() {
+            Some(scope) => match super::resolve_path_for_session_scope_write(scope, &input.path) {
+                Ok(p) => p,
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        output: format!("{reason}: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+            None => match super::resolve_path_with_scope(
+                &self.base_dir,
+                &input.path,
+                self.filesystem_scope,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!("Path outside working directory: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
         };
 
         // Read current content (O_NOFOLLOW atomically rejects symlinks)
@@ -330,6 +349,250 @@ mod tests {
         let tool = EditFileTool::new("/tmp");
         assert_eq!(tool.name(), "edit_file");
         assert!(tool.tags().contains(&"fs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2-C: SessionScope integration tests for EditFileTool.
+    // -----------------------------------------------------------------------
+
+    use octos_core::SessionScope;
+    use std::sync::Arc;
+
+    fn ctx_with_scope(scope: SessionScope) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "edit-with-scope".to_string();
+        ctx.session_scope = Some(Arc::new(scope));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn edit_file_uses_scope_workspace_as_base_dir_for_relative_paths() {
+        // Relative edit path anchors at `scope.workspace()`, not the
+        // legacy `base_dir`. Pre-create the target file there.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        std::fs::write(scope_dir.path().join("doc.md"), "before\n").unwrap();
+        std::fs::write(legacy_dir.path().join("doc.md"), "decoy\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = EditFileTool::new(legacy_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "doc.md",
+                    "old_string": "before",
+                    "new_string": "after",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+
+        // Only the scope-dir copy is mutated; the legacy decoy is
+        // untouched. (Edit even refused to look at the legacy file.)
+        assert_eq!(
+            std::fs::read_to_string(scope_dir.path().join("doc.md")).unwrap(),
+            "after\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(legacy_dir.path().join("doc.md")).unwrap(),
+            "decoy\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_refuses_out_of_scope_path() {
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("target.txt");
+        std::fs::write(&outside_file, "untouched\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = EditFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": outside_file.to_string_lossy(),
+                    "old_string": "untouched",
+                    "new_string": "owned",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+        // File MUST remain unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "untouched\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_allows_in_workspace_path() {
+        let scope_dir = tempfile::tempdir().unwrap();
+        std::fs::write(scope_dir.path().join("inside.txt"), "alpha\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = EditFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "inside.txt",
+                    "old_string": "alpha",
+                    "new_string": "beta",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(scope_dir.path().join("inside.txt")).unwrap(),
+            "beta\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_refuses_write_to_shared_zone() {
+        // Multi-tenant shared zones are read-only for session workers
+        // — symmetric with `write_file_refuses_write_to_shared_zone`.
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_path_buf();
+        std::fs::create_dir_all(data.join("research/topic")).unwrap();
+        std::fs::create_dir_all(data.join("users/web-1/workspace")).unwrap();
+        let shared_file = data.join("research/topic/notes.md");
+        std::fs::write(&shared_file, "untouched\n").unwrap();
+
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.clone(),
+            "dspfac".into(),
+            "web-1".into(),
+        )
+        .unwrap();
+        let tool = EditFileTool::new(scope.workspace());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": shared_file.to_string_lossy(),
+                    "old_string": "untouched",
+                    "new_string": "owned",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("shared zone"),
+            "expected shared-zone rejection, got: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&shared_file).unwrap(),
+            "untouched\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_file_refuses_ancestor_symlink_escape() {
+        // Symmetric with the write_file ancestor-symlink test. Even
+        // with a real target file pre-staged at the symlink target,
+        // the scoped resolver must refuse before O_NOFOLLOW would
+        // (correctly) bail on the symlink itself.
+        use std::os::unix::fs::symlink;
+
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        std::fs::write(outside_dir.path().join("target.txt"), "secret\n").unwrap();
+        let link_path = scope_dir.path().join("link");
+        symlink(outside_dir.path(), &link_path).unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = EditFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "link/target.txt",
+                    "old_string": "secret",
+                    "new_string": "owned",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "ancestor-symlink escape MUST be refused, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+        // Real file at the symlink target must remain unchanged.
+        assert_eq!(
+            std::fs::read_to_string(outside_dir.path().join("target.txt")).unwrap(),
+            "secret\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_falls_back_to_legacy_when_no_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "x\n").unwrap();
+        let tool = EditFileTool::new(dir.path());
+        let ctx = ToolContext::zero();
+        assert!(ctx.session_scope.is_none());
+
+        let ok = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "ok.txt",
+                    "old_string": "x",
+                    "new_string": "y",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(ok.success);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ok.txt")).unwrap(),
+            "y\n"
+        );
+
+        let bad = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": "../escape.txt",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!bad.success);
+        assert!(bad.output.contains("outside working directory"));
     }
 
     #[tokio::test]
