@@ -3176,6 +3176,12 @@ impl ActorFactory {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
+        if let Some(user_soul) =
+            crate::soul_service::read_soul_for_session(&self.data_dir, &session_key)
+        {
+            system_prompt.push_str("\n\n## Soul\n\n");
+            system_prompt.push_str(&user_soul);
+        }
         if is_slides && !slides_generation_available {
             system_prompt.push_str(
                 "\n\n## Slides Generation Availability\n\n\

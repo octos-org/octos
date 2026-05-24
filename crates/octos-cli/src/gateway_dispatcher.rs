@@ -566,6 +566,7 @@ impl GatewayDispatcher {
     pub async fn handle_soul_command(
         &self,
         cmd: &str,
+        inbound: &InboundMessage,
         reply_channel: &str,
         reply_chat_id: &str,
     ) -> Option<DispatchResult> {
@@ -588,9 +589,10 @@ impl GatewayDispatcher {
         };
 
         let arg = cmd.strip_prefix("/soul").unwrap_or("").trim();
+        let soul_key = self.profiled_key(&inbound.channel, &inbound.chat_id, "");
 
         if arg.is_empty() || arg.eq_ignore_ascii_case("show") {
-            let reply = match crate::soul_service::read_soul(data_dir) {
+            let reply = match crate::soul_service::read_soul_for_session(data_dir, &soul_key) {
                 Some(content) => format!("🪶 Current soul:\n\n{content}"),
                 None => "No custom soul set. Using default.".to_string(),
             };
@@ -599,7 +601,7 @@ impl GatewayDispatcher {
                 .send(make_reply(reply_channel, reply_chat_id, reply))
                 .await;
         } else if arg.eq_ignore_ascii_case("reset") {
-            match crate::soul_service::remove_soul(data_dir) {
+            match crate::soul_service::remove_soul_for_session(data_dir, &soul_key) {
                 Ok(()) => {
                     let _ = self
                         .out_tx
@@ -623,9 +625,9 @@ impl GatewayDispatcher {
                 }
             }
         } else {
-            match crate::soul_service::write_soul(data_dir, arg) {
+            match crate::soul_service::write_soul_for_session(data_dir, &soul_key, arg) {
                 Ok(()) => {
-                    info!(soul_len = arg.len(), "user soul updated");
+                    info!(session = %soul_key, soul_len = arg.len(), "user soul updated");
                     let _ = self
                         .out_tx
                         .send(make_reply(
@@ -694,7 +696,7 @@ impl GatewayDispatcher {
             return r;
         }
         if let Some(r) = self
-            .handle_soul_command(cmd, reply_channel, reply_chat_id)
+            .handle_soul_command(cmd, inbound, reply_channel, reply_chat_id)
             .await
         {
             return r;
@@ -1195,6 +1197,85 @@ mod tests {
             .await;
 
         assert!(result.is_none());
+    }
+
+    // ── /soul tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_isolate_soul_by_chat_id() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let inbound_a = make_test_inbound("telegram", "100", "/soul coding helper");
+        let inbound_b = make_test_inbound("telegram", "200", "/soul writing tutor");
+
+        disp.handle_soul_command("/soul coding helper", &inbound_a, "telegram", "100")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "Soul updated. Takes effect in new sessions."
+        );
+
+        disp.handle_soul_command("/soul writing tutor", &inbound_b, "telegram", "200")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "Soul updated. Takes effect in new sessions."
+        );
+
+        disp.handle_soul_command("/soul", &inbound_a, "telegram", "100")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("coding helper"));
+
+        disp.handle_soul_command("/soul", &inbound_b, "telegram", "200")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("writing tutor"));
+
+        disp.handle_soul_command("/soul reset", &inbound_a, "telegram", "100")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "Soul reset to default. Takes effect in new sessions."
+        );
+
+        disp.handle_soul_command("/soul", &inbound_a, "telegram", "100")
+            .await;
+        assert_eq!(
+            rx.try_recv().unwrap().content,
+            "No custom soul set. Using default."
+        );
+
+        disp.handle_soul_command("/soul", &inbound_b, "telegram", "200")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("writing tutor"));
+    }
+
+    #[tokio::test]
+    async fn should_isolate_soul_by_profile_id() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let mut disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let inbound = make_test_inbound("telegram", "100", "/soul");
+
+        disp.dispatch_profile_id = Some("profile-a".to_string());
+        disp.handle_soul_command("/soul profile a", &inbound, "telegram", "100")
+            .await;
+        let _ = rx.try_recv().unwrap();
+
+        disp.dispatch_profile_id = Some("profile-b".to_string());
+        disp.handle_soul_command("/soul profile b", &inbound, "telegram", "100")
+            .await;
+        let _ = rx.try_recv().unwrap();
+
+        disp.dispatch_profile_id = Some("profile-a".to_string());
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("profile a"));
+
+        disp.dispatch_profile_id = Some("profile-b".to_string());
+        disp.handle_soul_command("/soul", &inbound, "telegram", "100")
+            .await;
+        assert!(rx.try_recv().unwrap().content.contains("profile b"));
     }
 
     // ── try_dispatch_session_command tests ───────────────────────────────
