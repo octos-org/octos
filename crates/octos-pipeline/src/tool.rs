@@ -379,9 +379,48 @@ struct Input {
     input: String,
     #[serde(default)]
     variables: serde_json::Map<String, serde_json::Value>,
-    /// Pipeline-level timeout in seconds. Default: 1800 (30 min). Max: 1800.
+    /// Pipeline-level timeout in seconds. Default: 1800 (30 min),
+    /// optionally overridden per-pipeline via the DOT graph attribute
+    /// `default_timeout_secs`. Clamped to [60, 3600].
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+/// Hard wall-clock floor on `run_pipeline` (seconds).
+///
+/// Below this value the pipeline cannot complete even the smallest
+/// 2-node graph reliably; we clamp up so a careless caller never disarms
+/// the timeout entirely.
+const PIPELINE_TIMEOUT_MIN_SECS: u64 = 60;
+
+/// Hard wall-clock ceiling on `run_pipeline` (seconds, NEW-15).
+///
+/// Raised from 1800 → 3600 to give honest deep research with crawl +
+/// synthesize on slow production LLM lanes (e.g. wisemodel
+/// kimi/MiniMax) room to finish without synthesize-node starvation.
+/// Anything above this is treated as a runaway and clamped — operators
+/// can still observe the original requested value in the bridge logs,
+/// they just don't get more than an hour per spawn_only invocation.
+const PIPELINE_TIMEOUT_MAX_SECS: u64 = 3600;
+
+/// Hard-coded fallback when neither the LLM nor the DOT graph specify
+/// a timeout. Kept at 1800s for byte-identical backward-compat with
+/// pre-NEW-15 callers.
+const PIPELINE_TIMEOUT_DEFAULT_SECS: u64 = 1800;
+
+/// Resolve the effective wall-clock timeout for a `run_pipeline` run.
+///
+/// Precedence: LLM-supplied > DOT-graph default > hard-coded 1800s.
+/// Always clamped to [`PIPELINE_TIMEOUT_MIN_SECS`,
+/// `PIPELINE_TIMEOUT_MAX_SECS`].
+///
+/// Extracted so the resolution policy can be unit-tested without
+/// constructing a full `RunPipelineTool` + `TOOL_CTX`.
+fn resolve_pipeline_timeout(llm_value: Option<u64>, dot_default: Option<u64>) -> u64 {
+    llm_value
+        .or(dot_default)
+        .unwrap_or(PIPELINE_TIMEOUT_DEFAULT_SECS)
+        .clamp(PIPELINE_TIMEOUT_MIN_SECS, PIPELINE_TIMEOUT_MAX_SECS)
 }
 
 #[async_trait]
@@ -438,7 +477,7 @@ impl Tool for RunPipelineTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Timeout in seconds. Estimate based on real execution times: simple 2-node pipeline ~3min → 300s; standard 3-node research pipeline ~8min → 600s; 5-7 topic deep research with crawl+synthesize ~15-20min → 1200s; complex multi-source analysis with many nodes ~25min → 1500s. Max: 1800. Default: 1800"
+                    "description": "Timeout in seconds. Estimate from real production execution times (kimi/MiniMax on wisemodel — frontier models may be 2-3x faster):\n- simple 2-node pipeline ~3min → 300s\n- standard 3-node research pipeline ~10min → 800s\n- 5-7 topic deep research with crawl+synthesize ~25-30min → 1800s\n- complex multi-source analysis with many nodes ~40-50min → 3000s\n- exhaustive deep research with broad fan-out ~60min → 3600s\nMax: 3600. Default: 1800 (per-pipeline DOT may override via the `default_timeout_secs` graph attribute). Prefer higher estimates on production LLM lanes — under-estimating causes synthesize-node starvation when plan_and_search consumes >60% of the wall-clock budget."
                 }
             },
             "required": ["pipeline", "input"]
@@ -587,8 +626,23 @@ impl Tool for RunPipelineTool {
             catalog_dir: Some(self.working_dir.clone()),
         };
 
-        // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].
-        let timeout_secs = input.timeout_secs.unwrap_or(1800).clamp(60, 1800);
+        // Pipeline-level timeout resolution (NEW-15):
+        // 1. LLM-supplied `timeout_secs` always wins (so an operator can
+        //    override a pipeline's baked-in default per-call).
+        // 2. Otherwise, fall back to the DOT graph's `default_timeout_secs`
+        //    attribute (set by skill authors per-pipeline — e.g.
+        //    `deep_research` ships with 2400s because its fan-out shape
+        //    consistently exceeds the historical 1800s default on
+        //    production LLM lanes).
+        // 3. Otherwise, fall back to the hard-coded 1800s.
+        // Final value is clamped to [60, 3600] — the upper bound was
+        // raised from 1800 → 3600 so honest deep research with crawl +
+        // synthesize on slow LLM lanes has room to finish without
+        // synthesize-node starvation.
+        let dot_default_timeout = crate::parser::parse_dot(&dot_content)
+            .ok()
+            .and_then(|g| g.default_timeout_secs);
+        let timeout_secs = resolve_pipeline_timeout(input.timeout_secs, dot_default_timeout);
 
         let executor = PipelineExecutor::new(config);
         let result = tokio::time::timeout(
@@ -1211,6 +1265,62 @@ mod tests {
     #[test]
     fn node_costs_metadata_returns_none_for_empty_rows() {
         assert!(node_costs_metadata(&[]).is_none());
+    }
+
+    /// NEW-15 (1): the 30-min historical default is preserved when
+    /// neither the LLM nor the DOT supply a timeout — backward-compat
+    /// guard.
+    #[test]
+    fn resolve_pipeline_timeout_defaults_to_1800_when_unspecified() {
+        assert_eq!(resolve_pipeline_timeout(None, None), 1800);
+    }
+
+    /// NEW-15 (2): an LLM-supplied value within [60, 3600] passes
+    /// through unmodified — the new ceiling no longer truncates honest
+    /// deep-research estimates at 1800s.
+    #[test]
+    fn resolve_pipeline_timeout_passes_llm_value_in_range() {
+        assert_eq!(resolve_pipeline_timeout(Some(3000), None), 3000);
+    }
+
+    /// NEW-15 (3): an LLM value above the new 3600s ceiling clamps
+    /// down — a runaway pipeline still cannot lock the session past
+    /// an hour per spawn_only invocation.
+    #[test]
+    fn resolve_pipeline_timeout_clamps_llm_value_above_ceiling() {
+        assert_eq!(resolve_pipeline_timeout(Some(5000), None), 3600);
+    }
+
+    /// NEW-15 (4): an LLM value below the 60s floor clamps up — a
+    /// careless caller cannot disarm the timeout entirely.
+    #[test]
+    fn resolve_pipeline_timeout_clamps_llm_value_below_floor() {
+        assert_eq!(resolve_pipeline_timeout(Some(10), None), 60);
+    }
+
+    /// NEW-15 (5): when the LLM does NOT supply `timeout_secs`, the
+    /// DOT graph's `default_timeout_secs` attribute wins over the
+    /// hard-coded 1800s default. This is the path that lets skill
+    /// authors ship per-pipeline realistic caps.
+    #[test]
+    fn resolve_pipeline_timeout_uses_dot_default_when_llm_omits() {
+        assert_eq!(resolve_pipeline_timeout(None, Some(2400)), 2400);
+    }
+
+    /// NEW-15 (6): the LLM's explicit `timeout_secs` always wins over
+    /// the DOT default — operators can override per-call without
+    /// editing the shipped pipeline.
+    #[test]
+    fn resolve_pipeline_timeout_llm_overrides_dot_default() {
+        assert_eq!(resolve_pipeline_timeout(Some(1500), Some(2400)), 1500);
+    }
+
+    /// NEW-15 (7): clamping applies to the DOT default too — a skill
+    /// author cannot ship a pipeline whose baked-in fallback exceeds
+    /// the new 3600s ceiling.
+    #[test]
+    fn resolve_pipeline_timeout_clamps_dot_default_above_ceiling() {
+        assert_eq!(resolve_pipeline_timeout(None, Some(7200)), 3600);
     }
 
     /// #1020 / M17-B — `build_pipeline_run_summary` MUST stamp the

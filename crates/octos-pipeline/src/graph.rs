@@ -18,6 +18,18 @@ pub struct PipelineGraph {
     /// cumulative input + output tokens reaches this cap.
     #[serde(default)]
     pub max_total_tokens: Option<u32>,
+    /// Optional per-pipeline default wall-clock timeout in seconds (NEW-15).
+    /// Set via the DOT graph attribute `default_timeout_secs`. Used by
+    /// `RunPipelineTool::execute()` as the fallback when the LLM does not
+    /// pass `timeout_secs`. Always clamped to [60, 3600] downstream.
+    ///
+    /// Rationale: the historical 1800s default starves slow-LLM-lane
+    /// pipelines (e.g. wisemodel kimi/MiniMax) where plan_and_search
+    /// consumes >60% of the budget, leaving the synthesize node with no
+    /// room. Skill authors should set this to a realistic per-pipeline
+    /// upper bound rather than rely on the LLM to estimate correctly.
+    #[serde(default)]
+    pub default_timeout_secs: Option<u64>,
     /// Nodes keyed by their ID.
     pub nodes: HashMap<String, PipelineNode>,
     /// Directed edges.
