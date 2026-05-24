@@ -68,3 +68,4 @@ workspace = true
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+proptest = { workspace = true }

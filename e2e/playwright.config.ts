@@ -12,6 +12,12 @@ import { defineConfig } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './tests',
+  testMatch: [
+    '**/*.spec.ts',
+    '**/*.test.ts',
+    '**/*.test.mjs',
+    '**/*.property.ts',
+  ],
   timeout: 60_000,
   retries: 0,
   use: {
