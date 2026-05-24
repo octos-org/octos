@@ -354,15 +354,18 @@ Client commands are JSON-RPC requests.
 
 Server notifications are JSON-RPC notifications.
 
-The logical command/event names are listed below. The machine-readable
-source of truth for this catalog is `UI_PROTOCOL_COMMAND_METHODS` and
-`UI_PROTOCOL_NOTIFICATION_METHODS` in
-[crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1075)
-(plus the server-handled `APPUI_EXTRA_METHODS` slice in
-[crates/octos-cli/src/api/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-cli/src/api/ui_protocol.rs:1)).
-Per `SRV-036`/M18-E, this list MUST stay in sync with those constants — a
-method that is dispatched and advertised in `supported_methods` but not
-named here is a spec defect.
+The logical command/event names below mirror the current wire inventory:
+
+- command source of truth:
+  `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_COMMAND_METHODS`,
+  `UI_PROTOCOL_FIRST_SERVER_METHODS`, and
+  `crates/octos-cli/src/api/ui_protocol.rs::APPUI_EXTRA_METHODS`
+- notification source of truth:
+  `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_NOTIFICATION_METHODS`
+- executable route inventory:
+  `e2e/fixtures/appui-conformance/m18-route-inventory.json`
+- human-readable wire inventory:
+  `api/OCTOS_UI_PROTOCOL_WIRE_INVENTORY_2026-05-24.md`
 
 Commands:
 
