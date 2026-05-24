@@ -437,12 +437,19 @@ impl ChatCommand {
         // `SessionScope::solo` invariant holds without panicking on
         // user input. Phase 2 PRs will start reading this from tools,
         // pipelines, and plugins; today it is wired through but unused.
+        //
+        // Codex review note (Phase-1 LOW): surface a hard error when
+        // `cwd` is relative AND `current_dir()` fails so the
+        // `SessionScope::solo` `expect` below can never fire on a
+        // relative path. Mirroring `current_dir()` failures up as
+        // `wrap_err` is consistent with the existing fallback at the
+        // top of `run_async` that constructed `cwd` the same way.
         let absolute_cwd: PathBuf = if cwd.is_absolute() {
             cwd.clone()
         } else {
             std::env::current_dir()
-                .map(|base| base.join(&cwd))
-                .unwrap_or_else(|_| cwd.clone())
+                .wrap_err("failed to absolutize --cwd: current_dir() unavailable")?
+                .join(&cwd)
         };
         let session_scope = Arc::new(SessionScope::solo(absolute_cwd, Vec::new()).expect(
             "solo CWD absolutized just above; SessionScope::solo's only invariant is absolute",
@@ -847,13 +854,17 @@ mod tests {
         // before it ships to fleet.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path().to_path_buf();
-        // Mirror chat.rs's absolutize-then-build pattern.
+        // Mirror chat.rs's absolutize-then-build pattern. The entry
+        // point propagates `current_dir()` failures via `wrap_err?`;
+        // here in the test the cwd is already absolute (`tempdir`
+        // returns an absolute path) so the relative branch is never
+        // taken.
         let absolute_cwd: PathBuf = if cwd.is_absolute() {
             cwd.clone()
         } else {
             std::env::current_dir()
-                .map(|base| base.join(&cwd))
-                .unwrap_or_else(|_| cwd.clone())
+                .expect("current_dir() in tests")
+                .join(&cwd)
         };
         let scope = SessionScope::solo(absolute_cwd, Vec::new())
             .expect("solo SessionScope construction must succeed for an absolute cwd");
@@ -867,28 +878,23 @@ mod tests {
         // Defensive cover for chat.rs's absolutize branch — the
         // `--cwd relative` case must not propagate a relative path
         // into `SessionScope::solo`, which would `expect` on the
-        // `RootNotAbsolute` invariant. The branch resolves against
-        // `current_dir()` first so the SessionScope ctor always sees
-        // an absolute path.
+        // `RootNotAbsolute` invariant. The chat entry point now
+        // bubbles `current_dir()` errors up via `wrap_err?` so the
+        // branch only ever produces an absolute path or returns Err
+        // before reaching the `SessionScope::solo` call site.
         let relative = PathBuf::from("some-subdir");
+        let base = std::env::current_dir().expect("current_dir() in tests");
         let absolute_cwd: PathBuf = if relative.is_absolute() {
             relative.clone()
         } else {
-            std::env::current_dir()
-                .map(|base| base.join(&relative))
-                .unwrap_or_else(|_| relative.clone())
+            base.join(&relative)
         };
         assert!(
-            absolute_cwd.is_absolute() || std::env::current_dir().is_err(),
-            "absolutize branch must produce an absolute path when current_dir() succeeds"
+            absolute_cwd.is_absolute(),
+            "current_dir().join(relative) must produce an absolute path"
         );
-        // We can't always guarantee `current_dir()` succeeds in CI
-        // sandboxes, but when it does we should be able to call
-        // SessionScope::solo without panicking.
-        if absolute_cwd.is_absolute() {
-            SessionScope::solo(absolute_cwd, Vec::new())
-                .expect("SessionScope::solo accepts the absolutized path");
-        }
+        SessionScope::solo(absolute_cwd, Vec::new())
+            .expect("SessionScope::solo accepts the absolutized path");
     }
 
     /// NEW-06 codex follow-up — when [`build_run_pipeline_tool`] is

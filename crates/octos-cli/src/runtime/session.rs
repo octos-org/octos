@@ -331,6 +331,20 @@ impl SessionRuntime {
                 }
             }
         } else {
+            // Codex review note (Phase-1 LOW): channel-prefixed legacy
+            // session ids (`api:web-1234`, `telegram:12345`, etc.) fail
+            // `is_safe_session_id` by design — the SessionScope on-disk
+            // layout uses the raw id, while gateway/legacy paths
+            // percent-encode the `:` before joining. Phase 3 will route
+            // every shape through the scope contract; until then, log
+            // the skip at `debug!` (not `warn!`) since this is the
+            // expected path for non-SPA channels and we don't want
+            // gateway sessions to spam warn lines.
+            tracing::debug!(
+                profile_id = %profile.profile_id,
+                session = %session_key,
+                "skipping SessionScope construction: session id outside is_safe_session_id alphabet (Phase 1 expected for channel-prefixed shapes)",
+            );
             None
         };
 
