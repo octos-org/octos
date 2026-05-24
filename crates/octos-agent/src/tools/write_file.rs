@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use octos_core::{PathClassification, SessionScope};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -110,20 +111,39 @@ impl Tool for WriteFileTool {
             });
         }
 
-        // Resolve path (with traversal protection)
-        let path = match super::resolve_path_with_scope(
-            &self.base_dir,
-            &input.path,
-            self.filesystem_scope,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: format!("Path outside working directory: {}", input.path),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        // Phase 2-C of the SessionScope migration: when the host has
+        // threaded a scope through `ToolContext`, use it as the single
+        // source of truth for base_dir + path classification. WRITES are
+        // permitted only for `InWorkspace` and `InGrantedDir`;
+        // `InSharedZone` and `OutOfScope` are refused. This also fixes
+        // the path asymmetry that #1189 worked around: write_file now
+        // writes under `scope.workspace()` — the same directory that
+        // plugin tools run in — instead of the bespoke `base_dir`.
+        let path = match ctx.session_scope.as_ref() {
+            Some(scope) => match resolve_with_scope_for_write(scope, &input.path) {
+                Ok(p) => p,
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        output: format!("{reason}: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+            None => match super::resolve_path_with_scope(
+                &self.base_dir,
+                &input.path,
+                self.filesystem_scope,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!("Path outside working directory: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
         };
 
         // Create parent directories if needed
@@ -162,6 +182,29 @@ impl Tool for WriteFileTool {
             file_modified: Some(path),
             ..Default::default()
         })
+    }
+}
+
+/// Resolve a user-supplied path against a [`SessionScope`] for a WRITE
+/// operation. Relative paths anchor at `scope.workspace()`; absolute
+/// paths are accepted but must classify into one of the write-allowed
+/// zones (`InWorkspace`, `InGrantedDir`). `InSharedZone` and
+/// `OutOfScope` are refused — shared zones are managed by maintenance
+/// paths, not session workers.
+fn resolve_with_scope_for_write(
+    scope: &SessionScope,
+    user_path: &str,
+) -> Result<PathBuf, &'static str> {
+    let candidate = PathBuf::from(user_path);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        scope.workspace().join(candidate)
+    };
+    match scope.classify_lexical_path(&absolute) {
+        PathClassification::InWorkspace | PathClassification::InGrantedDir { .. } => Ok(absolute),
+        PathClassification::InSharedZone { .. } => Err("Writes to shared zones are not permitted"),
+        PathClassification::OutOfScope => Err("Path outside session scope"),
     }
 }
 
@@ -262,6 +305,167 @@ mod tests {
     // -----------------------------------------------------------------------
     // M8.4 integration test — write invalidates the file-state cache.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Phase 2-C: SessionScope integration tests for WriteFileTool.
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+
+    fn ctx_with_scope(scope: SessionScope) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "write-with-scope".to_string();
+        ctx.session_scope = Some(Arc::new(scope));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn write_file_uses_scope_workspace_as_base_dir_for_relative_paths() {
+        // Closes the #1189 asymmetry: when a scope is present, relative
+        // writes land under `scope.workspace()`, not the legacy
+        // `base_dir`. That's the same directory plugin tools run in,
+        // so the rescue heuristic is no longer needed.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = WriteFileTool::new(legacy_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "out.txt", "content": "hi\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        // File landed in scope.workspace(), NOT the legacy base_dir.
+        assert!(scope_dir.path().join("out.txt").exists());
+        assert!(!legacy_dir.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_out_of_scope_path() {
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_target = outside_dir.path().join("escape.txt");
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = WriteFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": outside_target.to_string_lossy(),
+                    "content": "bad\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+        assert!(
+            !outside_target.exists(),
+            "refused write must NOT have created the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_allows_in_workspace_path() {
+        let scope_dir = tempfile::tempdir().unwrap();
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = WriteFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "ok.txt", "content": "ok\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        let body = std::fs::read_to_string(scope_dir.path().join("ok.txt")).unwrap();
+        assert_eq!(body, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_write_to_shared_zone() {
+        // Multi-tenant shared zones (research/, skills/) are managed
+        // by maintenance paths, not session workers. write_file MUST
+        // refuse — the symmetry hole that lets a session pollute
+        // another tenant's shared data.
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_path_buf();
+        std::fs::create_dir_all(data.join("research")).unwrap();
+        std::fs::create_dir_all(data.join("users/web-1/workspace")).unwrap();
+        let shared_target = data.join("research/poisoned.md");
+
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.clone(),
+            "dspfac".into(),
+            "web-1".into(),
+        )
+        .unwrap();
+        let tool = WriteFileTool::new(scope.workspace());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "path": shared_target.to_string_lossy(),
+                    "content": "bad\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("shared zone"),
+            "expected shared-zone rejection, got: {}",
+            result.output
+        );
+        assert!(
+            !shared_target.exists(),
+            "refused write must NOT have created the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_falls_back_to_legacy_when_no_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+        let ctx = ToolContext::zero();
+        assert!(ctx.session_scope.is_none());
+
+        let ok = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "legacy.txt", "content": "legacy\n"}),
+            )
+            .await
+            .unwrap();
+        assert!(ok.success);
+        assert!(dir.path().join("legacy.txt").exists());
+
+        let bad = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": "../escape.txt", "content": "bad"}),
+            )
+            .await
+            .unwrap();
+        assert!(!bad.success);
+        assert!(bad.output.contains("outside working directory"));
+    }
 
     #[tokio::test]
     async fn should_write_file_tool_invalidate_cache_after_write() {

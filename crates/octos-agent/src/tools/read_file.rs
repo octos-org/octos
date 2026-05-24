@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
+use octos_core::{PathClassification, SessionScope};
 use serde::Deserialize;
 
 use super::{Tool, ToolContext, ToolResult};
@@ -104,20 +105,37 @@ impl Tool for ReadFileTool {
             });
         }
 
-        // Resolve path (with traversal protection)
-        let path = match super::resolve_path_with_scope(
-            &self.base_dir,
-            &input.path,
-            self.filesystem_scope,
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(ToolResult {
-                    output: format!("Path outside working directory: {}", input.path),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+        // Phase 2-C of the SessionScope migration: when the host has
+        // threaded a scope through `ToolContext`, use it as the single
+        // source of truth for base_dir + path classification. Reads are
+        // permitted for `InWorkspace`, `InSharedZone`, and `InGrantedDir`;
+        // `OutOfScope` is refused. When no scope is present we keep the
+        // legacy resolver (backward compat for `octos chat` etc.).
+        let path = match ctx.session_scope.as_ref() {
+            Some(scope) => match resolve_with_scope_for_read(scope, &input.path) {
+                Ok(p) => p,
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        output: format!("{reason}: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
+            None => match super::resolve_path_with_scope(
+                &self.base_dir,
+                &input.path,
+                self.filesystem_scope,
+            ) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!("Path outside working directory: {}", input.path),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            },
         };
 
         // Reject files larger than 10MB to prevent OOM (output is capped to 100KB
@@ -252,6 +270,30 @@ fn user_range(start: Option<usize>, end: Option<usize>) -> Option<(u64, u64)> {
         start.map(|s| s as u64).unwrap_or(0),
         end.map(|e| e as u64).unwrap_or(u64::MAX),
     ))
+}
+
+/// Resolve a user-supplied path against a [`SessionScope`] for a READ
+/// operation. Relative paths anchor at `scope.workspace()`; absolute
+/// paths are accepted but must classify into one of the read-allowed
+/// zones (`InWorkspace`, `InSharedZone`, `InGrantedDir`). `OutOfScope`
+/// — including any `..` traversal that `classify_lexical_path` refuses
+/// — is rejected.
+fn resolve_with_scope_for_read(
+    scope: &SessionScope,
+    user_path: &str,
+) -> Result<PathBuf, &'static str> {
+    let candidate = PathBuf::from(user_path);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        scope.workspace().join(candidate)
+    };
+    match scope.classify_lexical_path(&absolute) {
+        PathClassification::InWorkspace
+        | PathClassification::InSharedZone { .. }
+        | PathClassification::InGrantedDir { .. } => Ok(absolute),
+        PathClassification::OutOfScope => Err("Path outside session scope"),
+    }
 }
 
 /// True when a cached entry can satisfy the caller's request without
@@ -509,6 +551,151 @@ mod tests {
         assert!(a.success && b.success);
         assert!(!a.output.contains("[FILE_UNCHANGED]"));
         assert!(!b.output.contains("[FILE_UNCHANGED]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2-C: SessionScope integration tests for ReadFileTool.
+    // -----------------------------------------------------------------------
+
+    fn ctx_with_scope(scope: SessionScope) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.tool_id = "read-with-scope".to_string();
+        ctx.session_scope = Some(Arc::new(scope));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn read_file_uses_scope_workspace_as_base_dir_for_relative_paths() {
+        // When a scope is present, relative paths resolve against
+        // `scope.workspace()` regardless of the legacy `base_dir`.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        std::fs::write(scope_dir.path().join("scoped.txt"), "from scope\n").unwrap();
+        std::fs::write(legacy_dir.path().join("scoped.txt"), "from legacy\n").unwrap();
+
+        // Note: legacy_dir is the tool's base_dir, but the scope's
+        // workspace is scope_dir — the latter must win.
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(legacy_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "scoped.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(
+            result.output.contains("from scope"),
+            "expected scope_dir content, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("from legacy"));
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_out_of_scope_path() {
+        // An absolute path outside every declared zone classifies as
+        // `OutOfScope` and must be refused.
+        let scope_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": outside_file.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("outside session scope"),
+            "expected scope rejection, got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_in_workspace_path() {
+        // `InWorkspace` is the obviously-allowed zone for reads.
+        let scope_dir = tempfile::tempdir().unwrap();
+        std::fs::write(scope_dir.path().join("ok.txt"), "ok\n").unwrap();
+
+        let scope = SessionScope::solo(scope_dir.path().to_path_buf(), vec![]).unwrap();
+        let tool = ReadFileTool::new(scope_dir.path());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "ok.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(result.output.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn read_file_allows_in_shared_zone_path() {
+        // Multi-tenant scopes expose shared zones (research/, skills/).
+        // READS into those zones are allowed (writes are not — see the
+        // write_file tests). The user's intent here is explicit:
+        // they're recalling cross-session shared state.
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_path_buf();
+        std::fs::create_dir_all(data.join("research/topic")).unwrap();
+        std::fs::create_dir_all(data.join("users/web-1/workspace")).unwrap();
+        let shared_file = data.join("research/topic/notes.md");
+        std::fs::write(&shared_file, "shared notes\n").unwrap();
+
+        let scope = SessionScope::multi_tenant_with_default_zones(
+            data.clone(),
+            "dspfac".into(),
+            "web-1".into(),
+        )
+        .unwrap();
+        let tool = ReadFileTool::new(scope.workspace());
+        let ctx = ctx_with_scope(scope);
+
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({"path": shared_file.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert!(result.output.contains("shared notes"));
+    }
+
+    #[tokio::test]
+    async fn read_file_falls_back_to_legacy_when_no_scope() {
+        // No scope on the context — behaviour must match the pre-Phase-2C
+        // path (relative resolved against `base_dir`, traversal blocked
+        // by the legacy resolver, etc.).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("legacy.txt"), "legacy ok\n").unwrap();
+
+        let tool = ReadFileTool::new(dir.path());
+        let ctx = ToolContext::zero();
+        assert!(ctx.session_scope.is_none());
+
+        let ok = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "legacy.txt"}))
+            .await
+            .unwrap();
+        assert!(ok.success);
+        assert!(ok.output.contains("legacy ok"));
+
+        let bad = tool
+            .execute_with_context(&ctx, &serde_json::json!({"path": "../escape.txt"}))
+            .await
+            .unwrap();
+        assert!(!bad.success);
+        assert!(bad.output.contains("outside working directory"));
     }
 
     #[tokio::test]
