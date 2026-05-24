@@ -167,7 +167,13 @@ impl Executable for InitCommand {
                 "Config already exists:".yellow(),
                 config_path.display()
             );
-            if !self.defaults {
+            if self.defaults {
+                return Err(eyre::eyre!(
+                    "octos init --defaults will not overwrite existing config at {}. \
+Run `octos init` interactively to confirm replacement.",
+                    config_path.display()
+                ));
+            } else {
                 print!("Overwrite? [y/N] ");
                 io::stdout().flush()?;
 
