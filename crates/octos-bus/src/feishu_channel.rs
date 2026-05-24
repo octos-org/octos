@@ -32,8 +32,6 @@ use futures::SinkExt;
 
 /// Token refresh interval (slightly under 2 hours).
 const TOKEN_TTL_SECS: u64 = 7000;
-/// Maximum message IDs to track for dedup.
-const MAX_SEEN_IDS: usize = 1000;
 /// Default ping interval for Feishu WS (2 minutes, matching official SDK).
 const FEISHU_PING_INTERVAL_SECS: u64 = 120;
 
@@ -46,10 +44,8 @@ const FRAME_TYPE_DATA: i32 = 1;
 
 /// Header key constants matching the official SDK.
 const HEADER_TYPE: &str = "type";
-const HEADER_MESSAGE_ID: &str = "message_id";
 const HEADER_SUM: &str = "sum";
 const HEADER_SEQ: &str = "seq";
-const HEADER_BIZ_RT: &str = "biz_rt";
 
 /// Message type constants.
 const MSG_TYPE_EVENT: &str = "event";
@@ -280,7 +276,7 @@ fn encode_varint(buf: &mut Vec<u8>, mut v: u64) {
 }
 
 fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
-    encode_varint(buf, ((field as u64) << 3) | 0); // wire type 0
+    encode_varint(buf, (field as u64) << 3); // wire type 0
     encode_varint(buf, value);
 }
 
@@ -310,29 +306,6 @@ fn new_ping_frame(service_id: i32) -> Frame {
         seq_id: 0,
         log_id: 0,
         log_id_new: String::new(),
-    }
-}
-
-/// Build a response frame echoing the incoming frame's metadata.
-fn new_response_frame(incoming: &Frame, status_code: i32, biz_rt_ms: u64) -> Frame {
-    let mut headers = incoming.headers.clone();
-    headers.push(FrameHeader {
-        key: HEADER_BIZ_RT.to_string(),
-        value: biz_rt_ms.to_string(),
-    });
-    let payload = serde_json::json!({
-        "StatusCode": status_code,
-        "headers": {},
-        "data": null,
-    });
-    Frame {
-        method: incoming.method,
-        service: incoming.service,
-        headers,
-        payload: payload.to_string().into_bytes(),
-        seq_id: incoming.seq_id,
-        log_id: incoming.log_id,
-        log_id_new: incoming.log_id_new.clone(),
     }
 }
 
@@ -1674,6 +1647,82 @@ impl Channel for FeishuChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, Method, Uri},
+        routing::post,
+    };
+
+    #[derive(Clone, Debug)]
+    struct RecordedFeishuRequest {
+        method: Method,
+        path: String,
+        query: Option<String>,
+        authorization: Option<String>,
+        body: serde_json::Value,
+    }
+
+    #[derive(Clone, Default)]
+    struct FeishuTestServerState {
+        requests: Arc<tokio::sync::Mutex<Vec<RecordedFeishuRequest>>>,
+    }
+
+    async fn feishu_token_response() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "code": 0,
+            "tenant_access_token": "test-token",
+        }))
+    }
+
+    async fn record_feishu_request(
+        State(state): State<FeishuTestServerState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        state.requests.lock().await.push(RecordedFeishuRequest {
+            method,
+            path: uri.path().to_string(),
+            query: uri.query().map(str::to_string),
+            authorization: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            body,
+        });
+        axum::Json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": "om_reply_generated",
+            },
+        }))
+    }
+
+    async fn spawn_feishu_test_server()
+    -> (String, FeishuTestServerState, tokio::task::JoinHandle<()>) {
+        let state = FeishuTestServerState::default();
+        let app = Router::new()
+            .route(
+                "/auth/v3/tenant_access_token/internal",
+                post(feishu_token_response),
+            )
+            .route("/im/v1/messages", post(record_feishu_request))
+            .route(
+                "/im/v1/messages/{message_id}/reply",
+                post(record_feishu_request),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base_url, state, handle)
+    }
 
     fn make_channel(allowed: Vec<&str>) -> FeishuChannel {
         make_channel_with_region(allowed, "cn")
@@ -1835,6 +1884,52 @@ mod tests {
             Some("om_abc123".to_string()),
             "Feishu must preserve platform message_id for reply threading"
         );
+    }
+
+    #[tokio::test]
+    async fn should_use_reply_endpoint_when_reply_to_present() {
+        let (base_url, state, server) = spawn_feishu_test_server().await;
+        let mut ch = make_channel(vec![]);
+        ch.base_url = base_url;
+
+        let reply_id = ch
+            .send_with_id(&OutboundMessage {
+                channel: "feishu".into(),
+                chat_id: "oc_chat1".into(),
+                content: "threaded answer".into(),
+                reply_to: Some("om_parent_message".into()),
+                media: vec![],
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(reply_id.as_deref(), Some("om_reply_generated"));
+        let requests = state.requests.lock().await;
+        let message_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| request.path.starts_with("/im/v1/messages"))
+            .collect();
+        assert_eq!(message_requests.len(), 1);
+        let request = message_requests[0];
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.path, "/im/v1/messages/om_parent_message/reply");
+        assert_eq!(request.query, None);
+        assert_eq!(request.authorization.as_deref(), Some("Bearer test-token"));
+        assert_eq!(request.body["msg_type"], "interactive");
+
+        let content: serde_json::Value =
+            serde_json::from_str(request.body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["elements"][0]["tag"], "markdown");
+        assert_eq!(content["elements"][0]["content"], "threaded answer");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path == "/im/v1/messages"),
+            "reply_to must not use top-level Feishu send endpoint"
+        );
+
+        server.abort();
     }
 
     #[test]
