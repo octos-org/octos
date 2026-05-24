@@ -64,6 +64,12 @@ pub struct Config {
     #[serde(default)]
     pub auth_token: Option<String>,
 
+    /// Auth credential store path. Also settable via OCTOS_AUTH_STORE.
+    /// If unset, credentials are read from OCTOS_HOME/auth.json or
+    /// ~/.octos/auth.json.
+    #[serde(default)]
+    pub auth_store_path: Option<String>,
+
     /// Gateway configuration (optional).
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
@@ -1104,6 +1110,9 @@ impl Config {
         if let Some(ref mut provider) = self.provider {
             *provider = Self::expand_env_var(provider);
         }
+        if let Some(ref mut auth_store_path) = self.auth_store_path {
+            *auth_store_path = Self::expand_env_var(auth_store_path);
+        }
     }
 
     /// Expand ${VAR_NAME} patterns in a string.
@@ -1132,7 +1141,9 @@ impl Config {
     /// Get the API key: auth store first, then environment variable.
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
         // Check auth store first.
-        if let Ok(store) = crate::auth::AuthStore::load() {
+        if let Ok(store) =
+            crate::auth::AuthStore::load_from_config_path(self.auth_store_path.as_deref())
+        {
             if let Some(cred) = store.get(provider) {
                 if !cred.is_expired() {
                     return Ok(cred.access_token.clone());
@@ -1382,6 +1393,61 @@ mod tests {
         unsafe {
             std::env::remove_var("TEST_VAR");
         }
+    }
+
+    fn auth_store_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn get_api_key_uses_configured_auth_store_path() {
+        let _guard = auth_store_env_lock().lock().unwrap();
+        let prev_auth_store = std::env::var_os(crate::auth::store::AUTH_STORE_ENV);
+        let prev_octos_home = std::env::var_os("OCTOS_HOME");
+
+        // Isolate this assertion from process-level auth store overrides.
+        // SAFETY: serialized by `auth_store_env_lock` and restored below.
+        unsafe {
+            std::env::remove_var(crate::auth::store::AUTH_STORE_ENV);
+            std::env::remove_var("OCTOS_HOME");
+        }
+
+        let observed = (|| -> Result<String> {
+            let dir = tempfile::tempdir()?;
+            let auth_path = dir.path().join("custom-auth.json");
+            let mut store = crate::auth::AuthStore::load_from_path(&auth_path)?;
+            store.set(
+                "customtest",
+                crate::auth::AuthCredential {
+                    access_token: "from-configured-auth-store".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    provider: "customtest".to_string(),
+                    auth_method: "paste_token".to_string(),
+                },
+            )?;
+
+            let config = Config {
+                auth_store_path: Some(auth_path.display().to_string()),
+                ..Default::default()
+            };
+            config.get_api_key("customtest")
+        })();
+
+        // SAFETY: serialized by `auth_store_env_lock`; restore the process env
+        // before asserting so panics do not leak the test override.
+        match prev_auth_store {
+            Some(value) => unsafe { std::env::set_var(crate::auth::store::AUTH_STORE_ENV, value) },
+            None => unsafe { std::env::remove_var(crate::auth::store::AUTH_STORE_ENV) },
+        }
+        match prev_octos_home {
+            Some(value) => unsafe { std::env::set_var("OCTOS_HOME", value) },
+            None => unsafe { std::env::remove_var("OCTOS_HOME") },
+        }
+
+        assert_eq!(observed.unwrap(), "from-configured-auth-store");
     }
 
     #[test]

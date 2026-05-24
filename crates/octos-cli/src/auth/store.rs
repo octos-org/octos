@@ -1,11 +1,15 @@
-//! Auth credential storage at ~/.octos/auth.json (mode 0600).
+//! Auth credential storage (mode 0600).
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
+
+/// Environment variable that overrides the auth credential store path.
+pub const AUTH_STORE_ENV: &str = "OCTOS_AUTH_STORE";
 
 /// A stored authentication credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +45,19 @@ pub struct AuthStore {
 impl AuthStore {
     /// Load the auth store from disk (or create empty).
     pub fn load() -> Result<Self> {
-        let path = Self::store_path()?;
+        Self::load_from_path(Self::store_path()?)
+    }
+
+    /// Load the auth store from a config-provided path, falling back to the
+    /// environment/default resolver when config does not provide one.
+    pub fn load_from_config_path(path: Option<&str>) -> Result<Self> {
+        let path = Self::store_path_with_config(path)?;
+        Self::load_from_path(path)
+    }
+
+    /// Load the auth store from an explicit path (or create empty).
+    pub fn load_from_path(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
         let data = if path.exists() {
             let content = std::fs::read_to_string(&path).wrap_err("failed to read auth store")?;
             serde_json::from_str(&content).wrap_err("failed to parse auth store")?
@@ -108,10 +124,46 @@ impl AuthStore {
         Ok(())
     }
 
-    /// Path: ~/.octos/auth.json
+    /// Path priority:
+    /// 1. `OCTOS_AUTH_STORE`
+    /// 2. `OCTOS_HOME/auth.json`
+    /// 3. `~/.octos/auth.json`
     fn store_path() -> Result<PathBuf> {
-        let home =
-            dirs::home_dir().ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
+        Self::store_path_with_config(None)
+    }
+
+    /// Path priority:
+    /// 1. `OCTOS_AUTH_STORE`
+    /// 2. `auth_store_path` from config
+    /// 3. `OCTOS_HOME/auth.json`
+    /// 4. `~/.octos/auth.json`
+    fn store_path_with_config(config_path: Option<&str>) -> Result<PathBuf> {
+        let auth_store = std::env::var_os(AUTH_STORE_ENV);
+        let octos_home = std::env::var_os("OCTOS_HOME");
+        Self::store_path_from_parts(
+            auth_store.as_deref(),
+            config_path,
+            octos_home.as_deref(),
+            dirs::home_dir(),
+        )
+    }
+
+    fn store_path_from_parts(
+        auth_store: Option<&OsStr>,
+        config_path: Option<&str>,
+        octos_home: Option<&OsStr>,
+        home: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        if let Some(path) = auth_store.filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(path));
+        }
+        if let Some(path) = config_path.map(str::trim).filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(path));
+        }
+        if let Some(home) = octos_home.filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(home).join("auth.json"));
+        }
+        let home = home.ok_or_else(|| eyre::eyre!("cannot determine home directory"))?;
         Ok(home.join(".octos").join("auth.json"))
     }
 }
@@ -234,5 +286,83 @@ mod tests {
                 Some("refresh")
             );
         }
+    }
+
+    #[test]
+    fn load_from_path_reads_custom_store() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("custom-auth.json");
+
+        {
+            let mut store = AuthStore::load_from_path(&path).unwrap();
+            store
+                .set(
+                    "customtest",
+                    AuthCredential {
+                        access_token: "from-custom-store".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                        provider: "customtest".to_string(),
+                        auth_method: "paste_token".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let store = AuthStore::load_from_path(&path).unwrap();
+        assert_eq!(
+            store
+                .get("customtest")
+                .map(|cred| cred.access_token.as_str()),
+            Some("from-custom-store")
+        );
+    }
+
+    #[test]
+    fn store_path_prefers_auth_store_env_over_config() {
+        let path = AuthStore::store_path_from_parts(
+            Some(OsStr::new("/tmp/env-auth.json")),
+            Some("/tmp/config-auth.json"),
+            Some(OsStr::new("/tmp/octos-home")),
+            Some(PathBuf::from("/tmp/home")),
+        )
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/env-auth.json"));
+    }
+
+    #[test]
+    fn store_path_uses_config_path_before_octos_home() {
+        let path = AuthStore::store_path_from_parts(
+            None,
+            Some(" /tmp/config-auth.json "),
+            Some(OsStr::new("/tmp/octos-home")),
+            Some(PathBuf::from("/tmp/home")),
+        )
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/config-auth.json"));
+    }
+
+    #[test]
+    fn store_path_uses_octos_home_before_legacy_home() {
+        let path = AuthStore::store_path_from_parts(
+            None,
+            None,
+            Some(OsStr::new("/tmp/octos-home")),
+            Some(PathBuf::from("/tmp/home")),
+        )
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/octos-home").join("auth.json"));
+    }
+
+    #[test]
+    fn store_path_falls_back_to_legacy_home() {
+        let path =
+            AuthStore::store_path_from_parts(None, None, None, Some(PathBuf::from("/tmp/home")))
+                .unwrap();
+
+        assert_eq!(path, PathBuf::from("/tmp/home/.octos/auth.json"));
     }
 }

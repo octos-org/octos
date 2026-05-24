@@ -1552,6 +1552,7 @@ pub(crate) fn config_from_profile(
                 feishu_region: e.feishu_region.clone(),
             }),
         auth_token: None,
+        auth_store_path: None,
         adaptive_routing: profile.config.adaptive_routing.clone(),
         voice: None,
         mode: Default::default(),
