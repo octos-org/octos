@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -157,13 +157,15 @@ const scenarios = new Map([
 
 function usage() {
   return `Usage:
-  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run]
+  node e2e/scripts/ux-tmux-run.mjs <scenario-id> [--dry-run] [--keep-session] [--no-validate]
   node e2e/scripts/ux-tmux-run.mjs --self-test [${defaultScenarioId}]
 
 Options:
-  --dry-run      Write the artifact skeleton without launching tmux.
-  --self-test    Write and validate the artifact skeleton without launching tmux.
-  --help         Show this help.
+  --dry-run       Write the artifact skeleton without launching tmux.
+  --keep-session  Leave tmux sessions running after a real run.
+  --no-validate   Skip automatic ux:tmux:validate after a dry or real run.
+  --self-test     Write and validate the artifact skeleton without launching tmux.
+  --help          Show this help.
 
 Scenarios:
   ${[...scenarios.keys()].join(', ')}
@@ -180,6 +182,8 @@ Environment:
 function parseArgs(argv) {
   let scenarioId = null;
   let dryRun = false;
+  let keepSession = false;
+  let noValidate = false;
   let selfTest = false;
   let help = false;
 
@@ -187,6 +191,10 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--keep-session') {
+      keepSession = true;
+    } else if (arg === '--no-validate') {
+      noValidate = true;
     } else if (arg === '--self-test' || arg === 'self-test') {
       selfTest = true;
     } else if (arg === '--scenario') {
@@ -211,6 +219,8 @@ function parseArgs(argv) {
   return {
     scenarioId: scenarioId || defaultScenarioId,
     dryRun,
+    keepSession,
+    noValidate,
     selfTest,
     help,
   };
@@ -353,6 +363,7 @@ function resolveContext({ scenarioId, selfTest }) {
   const cols = positiveIntegerEnv('OCTOS_UX_TMUX_COLS', scenario.id === 'narrow-layout' ? 80 : 120);
   const rows = positiveIntegerEnv('OCTOS_UX_TMUX_ROWS', scenario.id === 'narrow-layout' ? 24 : 40);
   const port = positiveIntegerEnv('OCTOS_UX_TMUX_PORT', stablePortForRunId(runKey));
+  const fakeOpenAiPort = positiveIntegerEnv('OCTOS_UX_TMUX_FAKE_OPENAI_PORT', port + 1);
   const profileId = process.env.OCTOS_UX_TMUX_PROFILE || 'coding';
   const sessionId =
     process.env.OCTOS_UX_TMUX_SESSION_ID || `${profileId}:local:ux:${scenario.id}:${runId}`;
@@ -398,6 +409,7 @@ function resolveContext({ scenarioId, selfTest }) {
     cols,
     rows,
     port,
+    fakeOpenAiPort,
     websocketEndpoint,
     authToken,
     profileId,
@@ -639,6 +651,24 @@ function refreshSummaryArtifacts(ctx, validationStatus = null) {
   writeJson(summaryPath, summary);
 }
 
+function skipValidation(ctx) {
+  const summaryPath = path.join(ctx.scenarioDir, 'summary.json');
+  if (fs.existsSync(summaryPath)) {
+    const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+    summary.validation_status = 'skipped';
+    summary.validation_skipped = true;
+    summary.artifacts = Object.fromEntries(
+      collectArtifactNames(ctx.scenarioDir).map((name) => [
+        name,
+        artifactInfo(ctx.scenarioDir, name),
+      ]),
+    );
+    writeJson(summaryPath, summary);
+  }
+  console.log(`Validation skipped (--no-validate): ${ctx.scenarioDir}`);
+  return 0;
+}
+
 function missingRunnerBlocker(ctx) {
   if (!fs.existsSync(ctx.lowerRunner)) {
     return `octos-tui tmux runner is missing: ${ctx.lowerRunner}`;
@@ -866,11 +896,107 @@ function runnerSteps(ctx) {
   if (ctx.scenario.runner === 'task-subagent-tree') {
     return ['start', 'drive-task-subagent-tree', 'drive-solo'];
   }
+  if (ctx.scenario.runner === 'onboarding-solo') {
+    return ['start', 'drive-solo', 'send-turn'];
+  }
   return ['start', 'drive-solo'];
 }
 
-function runLowerRunner(ctx) {
+function sleep(seconds) {
+  spawnSync('sleep', [String(seconds)]);
+}
+
+function waitForTcp(host, port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const script = [
+    'import socket, sys',
+    `host=${JSON.stringify(host)}`,
+    `port=${Number(port)}`,
+    's=socket.socket()',
+    's.settimeout(0.2)',
+    'try:',
+    '    s.connect((host, port))',
+    'except OSError:',
+    '    sys.exit(1)',
+    'finally:',
+    '    s.close()',
+  ].join('\n');
+  while (Date.now() < deadline) {
+    const probe = spawnSync('python3', ['-c', script], { stdio: 'ignore' });
+    if (probe.status === 0) return true;
+    sleep(0.1);
+  }
+  return false;
+}
+
+function startScenarioFakeOpenAi(ctx) {
+  if (ctx.scenario.runner !== 'onboarding-solo' || !ctx.scenario.finalMarker) {
+    return null;
+  }
+  const fakeServer = path.join(ctx.tuiRepo, 'scripts', 'fake-openai-server.py');
+  if (!fs.existsSync(fakeServer)) {
+    throw new Error(`fake OpenAI server is missing: ${fakeServer}`);
+  }
+  fs.mkdirSync(ctx.scenarioDir, { recursive: true });
+  const logPath = path.join(ctx.scenarioDir, 'fake-openai.log');
+  const logFd = fs.openSync(logPath, 'a');
+  const child = spawn('python3', [
+    fakeServer,
+    '--host',
+    '127.0.0.1',
+    '--port',
+    String(ctx.fakeOpenAiPort),
+    '--content',
+    `\`${ctx.scenario.finalMarker}\``,
+  ], {
+    cwd: ctx.tuiRepo,
+    stdio: ['ignore', logFd, logFd],
+  });
+  if (!waitForTcp('127.0.0.1', ctx.fakeOpenAiPort, 5_000)) {
+    child.kill('SIGTERM');
+    fs.closeSync(logFd);
+    throw new Error(`fake OpenAI server did not become ready on port ${ctx.fakeOpenAiPort}`);
+  }
+  return {
+    stop() {
+      child.kill('SIGTERM');
+      fs.closeSync(logFd);
+    },
+  };
+}
+
+function captureContainsFinalAnswerMarker(text, marker) {
+  const normalizedMarker = marker.replaceAll('_', '');
+  return text.split('\n').some((line) => {
+    const normalizedLine = line.replaceAll('_', '');
+    if (!line.includes(marker) && !normalizedLine.includes(normalizedMarker)) return false;
+    return !/^\s*[›>]/.test(line) && !/finish with|send one short prompt/i.test(line);
+  });
+}
+
+function waitForFinalMarker(ctx, action) {
+  if (!ctx.scenario.finalMarker) return 0;
+  const deadline = Date.now() + Number(process.env.OCTOS_UX_TMUX_FINAL_MARKER_WAIT_MS || 20_000);
+  const capturePath = path.join(ctx.scenarioDir, 'tui-capture.txt');
+  while (Date.now() < deadline) {
+    const capture = action('capture', false);
+    if (capture.error) throw capture.error;
+    if (capture.status !== 0) return capture.status || 1;
+    if (fs.existsSync(capturePath)) {
+      const text = fs.readFileSync(capturePath, 'utf8');
+      if (captureContainsFinalAnswerMarker(text, ctx.scenario.finalMarker)) {
+        return 0;
+      }
+    }
+    sleep(1);
+  }
+  console.error(`final marker was not visible in tui-capture.txt: ${ctx.scenario.finalMarker}`);
+  return 1;
+}
+
+function runLowerRunner(ctx, options = {}) {
   const shouldInitProfileLlm = ctx.scenario.runner === 'provider-missing' ? '0' : '1';
+  const fakeOpenAiBaseUrl = `http://127.0.0.1:${ctx.fakeOpenAiPort}/v1`;
   const env = {
     ...process.env,
     OCTOS_REPO: repoRoot,
@@ -890,6 +1016,14 @@ function runLowerRunner(ctx) {
     OCTOS_TUI_SOAK_LOCAL_USERNAME: process.env.OCTOS_TUI_SOAK_LOCAL_USERNAME || ctx.profileId,
     OCTOS_TUI_SOAK_LOCAL_EMAIL: process.env.OCTOS_TUI_SOAK_LOCAL_EMAIL || `${ctx.profileId}@example.invalid`,
     OCTOS_TUI_SOAK_API_KEY: process.env.OCTOS_TUI_SOAK_API_KEY || 'octos-m19-placeholder-key',
+    OCTOS_TUI_SOAK_PROMPT: process.env.OCTOS_TUI_SOAK_PROMPT || ctx.scenario.prompt || '',
+    OCTOS_TUI_SOAK_TURN_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TURN_WAIT_SECS || '12',
+    OCTOS_TUI_SOAK_EXPECT_BASE_URL: process.env.OCTOS_TUI_SOAK_EXPECT_BASE_URL || fakeOpenAiBaseUrl,
+    OCTOS_TUI_SOAK_EXPECT_ROUTE: process.env.OCTOS_TUI_SOAK_EXPECT_ROUTE || 'm19-fake-openai',
+    OCTOS_TUI_SOAK_EXPECT_MODEL: process.env.OCTOS_TUI_SOAK_EXPECT_MODEL || 'gpt-4o-mini',
+    OCTOS_TUI_SOAK_EXPECT_FAMILY: process.env.OCTOS_TUI_SOAK_EXPECT_FAMILY || 'openai',
+    OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV:
+      process.env.OCTOS_TUI_SOAK_EXPECT_API_KEY_ENV || 'OCTOS_M19_FAKE_OPENAI_KEY',
     OCTOS_TUI_SOAK_INIT_PROFILE_LLM:
       process.env.OCTOS_TUI_SOAK_INIT_PROFILE_LLM || shouldInitProfileLlm,
     OCTOS_TUI_SOAK_PORT: String(ctx.port),
@@ -902,7 +1036,9 @@ function runLowerRunner(ctx) {
       || (ctx.scenario.transport === 'websocket' ? '4' : '1'),
     OCTOS_TUI_SOAK_TUI_WAIT_SECS: process.env.OCTOS_TUI_SOAK_TUI_WAIT_SECS || '2',
     OCTOS_TUI_SOAK_EXIT_HOLD_SECS: process.env.OCTOS_TUI_SOAK_EXIT_HOLD_SECS || '30',
-    OCTOS_M9_PROTOCOL_FIXTURES: '1',
+    OCTOS_M9_PROTOCOL_FIXTURES:
+      process.env.OCTOS_M9_PROTOCOL_FIXTURES
+      || (ctx.scenario.runner === 'onboarding-solo' ? '0' : '1'),
     ...ctx.fixtureEnv,
   };
 
@@ -913,39 +1049,47 @@ function runLowerRunner(ctx) {
   });
 
   let status = 0;
-  if (ctx.scenario.runner === 'restart-reconnect') {
-    status = runRestartReconnectScenario(ctx, action, env);
-  } else if (ctx.scenario.runner === 'dropped-completion-backpressure') {
-    status = runDroppedCompletionBackpressureScenario(ctx, action, env);
-  } else {
-    for (const step of runnerSteps(ctx)) {
-      if (status !== 0) break;
-      const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
-        ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
-        : {};
-      const result = action(step, true, stepEnv);
-      if (result.error) throw result.error;
-      if (result.status !== 0) status = result.status || 1;
-      if (step === 'start' && status === 0) {
-        if (ctx.scenario.transport === 'websocket' && !tmuxHasSession(ctx.sessionName)) {
-          console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
-          const fallbackStatus = launchWebsocketTuiFallback(ctx, env);
-          if (fallbackStatus !== 0) status = fallbackStatus;
+  let fakeServer = null;
+  try {
+    fakeServer = startScenarioFakeOpenAi(ctx);
+    if (ctx.scenario.runner === 'restart-reconnect') {
+      status = runRestartReconnectScenario(ctx, action, env);
+    } else if (ctx.scenario.runner === 'dropped-completion-backpressure') {
+      status = runDroppedCompletionBackpressureScenario(ctx, action, env);
+    } else {
+      for (const step of runnerSteps(ctx)) {
+        if (status !== 0) break;
+        const stepEnv = ctx.scenario.runner === 'provider-missing' && step === 'drive-solo'
+          ? { OCTOS_TUI_SOAK_INIT_PROFILE_LLM: '1' }
+          : {};
+        const result = action(step, true, stepEnv);
+        if (result.error) throw result.error;
+        if (result.status !== 0) status = result.status || 1;
+        if (step === 'start' && status === 0) {
+          if (ctx.scenario.transport === 'websocket' && !tmuxHasSession(ctx.sessionName)) {
+            console.error(`TUI session ${ctx.sessionName} was missing after lower runner start; relaunching real websocket TUI`);
+            const fallbackStatus = launchWebsocketTuiFallback(ctx, env);
+            if (fallbackStatus !== 0) status = fallbackStatus;
+          }
+          resizeTmuxWindow(ctx);
         }
-        resizeTmuxWindow(ctx);
+        if (step === 'send-turn' && status === 0) {
+          status = waitForFinalMarker(ctx, action);
+        }
       }
     }
+
+    const capture = action('capture');
+    if (capture.error && status === 0) throw capture.error;
+    if (capture.status !== 0 && status === 0) status = capture.status || 1;
+
+    return status;
+  } finally {
+    if (!options.keepSession && process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
+      action('stop', false);
+    }
+    if (fakeServer) fakeServer.stop();
   }
-
-  const capture = action('capture');
-  if (capture.error && status === 0) throw capture.error;
-  if (capture.status !== 0 && status === 0) status = capture.status || 1;
-
-  if (process.env.OCTOS_UX_TMUX_KEEP_SESSION !== '1') {
-    action('stop', false);
-  }
-
-  return status;
 }
 
 function runValidation(ctx) {
@@ -959,7 +1103,7 @@ function runValidation(ctx) {
   return status;
 }
 
-function realMode(ctx) {
+function realMode(ctx, options = {}) {
   if (!ctx.scenario.runner) {
     const blocker = ctx.scenario.blockedMessage || `scenario ${ctx.scenario.id} has no real tmux runner yet`;
     writeArtifactSkeleton(ctx, {
@@ -971,7 +1115,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -987,7 +1131,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${runnerBlocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -1003,7 +1147,7 @@ function realMode(ctx) {
       placeholderArtifacts: true,
       realTmuxLaunched: false,
     });
-    const validationStatus = runValidation(ctx);
+    const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
     console.error(`${blocker}\nArtifacts: ${ctx.scenarioDir}`);
     return validationStatus === 0 ? 2 : validationStatus;
   }
@@ -1019,7 +1163,7 @@ function realMode(ctx) {
 
   let status = 1;
   try {
-    status = runLowerRunner(ctx);
+    status = runLowerRunner(ctx, { keepSession: options.keepSession });
   } finally {
     writeArtifactSkeleton(ctx, {
       mode: 'run',
@@ -1030,12 +1174,12 @@ function realMode(ctx) {
       realTmuxLaunched: true,
     });
   }
-  const validationStatus = runValidation(ctx);
+  const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
   console.log(`UX tmux artifacts: ${ctx.scenarioDir}`);
   return status === 0 ? validationStatus : status;
 }
 
-function dryRun(ctx) {
+function dryRun(ctx, options = {}) {
   writeArtifactSkeleton(ctx, {
     mode: 'dry-run',
     status: 'blocked',
@@ -1044,7 +1188,7 @@ function dryRun(ctx) {
     placeholderArtifacts: true,
     realTmuxLaunched: false,
   });
-  const validationStatus = runValidation(ctx);
+  const validationStatus = options.noValidate ? skipValidation(ctx) : runValidation(ctx);
   console.log(`Dry run wrote UX tmux artifact skeleton: ${ctx.scenarioDir}`);
   return validationStatus;
 }
@@ -1076,8 +1220,8 @@ function main() {
 
   const ctx = resolveContext(args);
   if (args.selfTest) return selfTest(ctx);
-  if (args.dryRun) return dryRun(ctx);
-  return realMode(ctx);
+  if (args.dryRun) return dryRun(ctx, { noValidate: args.noValidate });
+  return realMode(ctx, { keepSession: args.keepSession, noValidate: args.noValidate });
 }
 
 try {
