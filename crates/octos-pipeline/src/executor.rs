@@ -3462,4 +3462,49 @@ mod tests {
             })
             .await;
     }
+
+    /// Phase 2-A integration — the `working_dir` set on
+    /// [`ExecutorConfig`] must flow all the way down through
+    /// [`PipelineExecutor::build_codergen`] onto the per-node
+    /// [`CodergenHandler`]'s `working_dir`. This is the wire that
+    /// `RunPipelineTool::execute` rides when it swaps the tool's
+    /// pinned working dir for `scope.workspace()`. If this regresses,
+    /// the mini5 NEW-06 fix silently goes dead even though the
+    /// resolver still computes the right CWD.
+    ///
+    /// `make_test_config` opens its own runtime so it can't be called
+    /// from inside `#[tokio::test]`; we mirror the `make_capped_config`
+    /// pattern (async test + async config builder) so we share the
+    /// outer runtime.
+    #[tokio::test]
+    async fn build_codergen_propagates_executor_working_dir_to_handler() {
+        let custom_wd = tempfile::tempdir().expect("temp dir");
+        let mut config = ExecutorConfig {
+            default_provider: Arc::new(MockProvider),
+            provider_router: None,
+            memory: Arc::new(create_test_store().await),
+            working_dir: PathBuf::from("/tmp"),
+            provider_policy: None,
+            plugin_dirs: vec![],
+            plugin_require_signed: false,
+            status_bridge: None,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_parallel_workers: 8,
+            max_pipeline_fanout_total: None,
+            checkpoint_store: None,
+            hook_executor: None,
+            workspace_context: crate::context::PipelineContext::default(),
+            host_context: crate::host_context::PipelineHostContext::default(),
+            embedder: None,
+        };
+        config.working_dir = custom_wd.path().to_path_buf();
+        let executor = PipelineExecutor::new(config);
+        let codergen = executor.build_codergen_for_test();
+        assert_eq!(
+            codergen.working_dir_for_test(),
+            custom_wd.path(),
+            "CodergenHandler must inherit ExecutorConfig.working_dir so the \
+             Phase 2-A scope override actually reaches per-node worker CWDs"
+        );
+    }
 }

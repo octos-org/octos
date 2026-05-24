@@ -16,7 +16,7 @@ use crate::context::PipelineContext;
 use crate::discovery::PipelineDiscovery;
 use crate::executor::{ExecutorConfig, PipelineExecutor, PipelineResult, PipelineStatusBridge};
 use crate::run_dir::{PipelineRunSummary, RunDir};
-use octos_core::TokenUsage;
+use octos_core::{SessionScope, TokenUsage};
 
 /// #1020 / M17-B — reason string stamped onto every pipeline run's
 /// `summary.json` because pipeline workers do not yet propagate the
@@ -24,6 +24,68 @@ use octos_core::TokenUsage;
 /// to confirm the acceptance bullet is satisfied.
 pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
     "pipeline workers don't yet propagate ContextManager (M17-B)";
+
+/// Phase 2-A of the [`SessionScope`] migration (load-bearing follow-up
+/// to PR #1199 / Phase 1).
+///
+/// Resolves the effective working directory pipeline workers should
+/// spawn into, given the tool-level fallback (`tool_working_dir`) and
+/// the parent session's optional [`SessionScope`].
+///
+/// * When the parent session attached a scope via [`ToolContext::session_scope`]
+///   (snapshotted into [`PipelineHostContext::session_scope`]),
+///   workers spawn into `scope.workspace()` so per-session reads stay
+///   isolated to that session's ephemeral workspace dir. This is the
+///   root cause fix for the mini5 NEW-06 cross-session contamination
+///   bug: today's `RunPipelineTool` pins `working_dir` at construction
+///   time (profile-level `data/`), so pipeline workers `read_file` and
+///   `list_dir` against 200+ stale `.md` files from prior sessions.
+/// * When no scope is present (legacy callers — CLI, unit tests, hosts
+///   that haven't migrated yet), fall back to the tool's
+///   `working_dir`. Behaviour is byte-for-byte identical to pre-Phase-2-A.
+///
+/// Also creates the workspace dir on disk when it doesn't exist, so a
+/// freshly minted session can spawn workers without the caller having
+/// to pre-create directories. Per the Phase 1 spec doc, this is the
+/// caller's responsibility — the scope itself never does I/O. We do it
+/// here (at the `RunPipelineTool` boundary) rather than inside the
+/// executor so any callers of `PipelineExecutor::run(...)` direct stay
+/// on the pre-Phase-2-A path.
+///
+/// `create_dir_all` failures fall back to the tool-level working dir
+/// and emit a WARN — the production pipeline should not regress its
+/// user-visible outcome on a transient filesystem error (e.g. quota
+/// hit on first session creation). Per-session isolation is the
+/// happy-path invariant; the fallback preserves legacy behaviour as a
+/// safety net.
+///
+/// [`ToolContext::session_scope`]: octos_agent::tools::ToolContext::session_scope
+/// [`PipelineHostContext::session_scope`]: crate::host_context::PipelineHostContext::session_scope
+pub(crate) fn resolve_pipeline_working_dir(
+    tool_working_dir: &std::path::Path,
+    session_scope: Option<&SessionScope>,
+) -> PathBuf {
+    let Some(scope) = session_scope else {
+        return tool_working_dir.to_path_buf();
+    };
+    let workspace = scope.workspace().to_path_buf();
+    if let Err(error) = std::fs::create_dir_all(&workspace) {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            error = %error,
+            tool_working_dir = %tool_working_dir.display(),
+            "phase2a: failed to create session workspace; falling back to tool working_dir \
+             (pipeline workers will NOT be session-isolated for this run)"
+        );
+        return tool_working_dir.to_path_buf();
+    }
+    tracing::debug!(
+        workspace = %workspace.display(),
+        tool_working_dir = %tool_working_dir.display(),
+        "phase2a: pipeline workers will spawn in session-scoped workspace"
+    );
+    workspace
+}
 
 /// Tool that runs DOT-based pipelines.
 pub struct RunPipelineTool {
@@ -436,11 +498,23 @@ impl Tool for RunPipelineTool {
             .try_with(crate::host_context::PipelineHostContext::from_tool_context)
             .unwrap_or_default();
 
+        // Phase 2-A: resolve the effective working dir for the
+        // executor. When the host context carries a [`SessionScope`]
+        // (Phase 1 wiring), every per-node worker spawns into the
+        // session's ephemeral workspace dir instead of the tool-level
+        // (profile-level) `data/` dir. The helper also ensures the
+        // workspace exists on disk before any worker tries to CWD into
+        // it. When no scope is present we fall back to the tool's
+        // working dir — byte-for-byte identical to pre-Phase-2-A
+        // behaviour.
+        let effective_working_dir =
+            resolve_pipeline_working_dir(&self.working_dir, host_context.session_scope.as_deref());
+
         let config = ExecutorConfig {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
             memory: self.memory.clone(),
-            working_dir: self.working_dir.clone(),
+            working_dir: effective_working_dir,
             provider_policy: self.provider_policy.clone(),
             plugin_dirs: self.plugin_dirs.clone(),
             plugin_require_signed: self.plugin_require_signed,
@@ -1343,5 +1417,178 @@ mod tests {
         };
         let cascaded = cascade_fail_orphan_node_tasks(&host, 1200);
         assert_eq!(cascaded, 0);
+    }
+
+    // ───── Phase 2-A: SessionScope-aware working dir resolution ─────
+    //
+    // The mini5 NEW-06 contamination bug had the same root cause every
+    // round: `RunPipelineTool` pins `working_dir` at construction time
+    // to the profile-level `data/` dir, so per-node workers spawn with
+    // CWD == profile data and `read_file`-loop on 200+ stale `.md`
+    // files from prior sessions. Phase 1 (#1199) plumbed `SessionScope`
+    // through host contexts but did not consume it; Phase 2-A flips
+    // `RunPipelineTool::execute` over to the scope's `workspace()` when
+    // present. These tests pin the resolver semantics so the wiring
+    // doesn't silently regress as more callers (Phase 2-B, 2-C, 2-D)
+    // come online.
+
+    /// Phase 2-A acceptance — when the parent host context attaches a
+    /// `SessionScope`, the pipeline executor's `working_dir` MUST be
+    /// the scope's `workspace()`, not the tool's pinned `working_dir`.
+    /// This is the load-bearing fix for mini5 NEW-06: workers no
+    /// longer see other sessions' `read_file` surface.
+    #[test]
+    fn pipeline_worker_uses_session_scope_workspace_when_present() {
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let session_root = tempfile::tempdir().expect("temp dir");
+        let scope =
+            SessionScope::solo(session_root.path().to_path_buf(), vec![]).expect("solo scope");
+
+        let resolved = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        assert_eq!(
+            resolved,
+            scope.workspace(),
+            "scope present must override tool-level working_dir"
+        );
+        assert_ne!(
+            resolved, tool_wd,
+            "session-scoped path must NOT equal tool's profile-level working_dir"
+        );
+    }
+
+    /// Backward-compat — legacy callers (CLI, unit tests, hosts not
+    /// yet migrated to attach a `SessionScope`) keep their pre-Phase-2-A
+    /// behaviour byte-for-byte. The tool's `working_dir` is returned
+    /// verbatim and NO directory is created.
+    #[test]
+    fn pipeline_worker_falls_back_to_self_working_dir_when_no_scope() {
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let resolved = resolve_pipeline_working_dir(&tool_wd, None);
+        assert_eq!(
+            resolved, tool_wd,
+            "no scope must fall back to tool-level working_dir (pre-Phase-2-A behaviour)"
+        );
+    }
+
+    /// Phase 2-A acceptance — the scope's `workspace()` may not exist
+    /// on disk yet at run-pipeline time (the Phase 1 scope wiring is
+    /// types-only; it never does I/O). The resolver MUST create the
+    /// dir so workers can spawn without `current_dir(...)` ENOENT
+    /// errors. Per the Phase 1 spec doc, this is the caller's
+    /// responsibility — `SessionScope` itself stays I/O-free.
+    #[test]
+    fn pipeline_creates_session_workspace_dir_on_demand() {
+        let tenant_root = tempfile::tempdir().expect("temp dir");
+        // Manually craft a scope whose workspace() points into a
+        // not-yet-existing subdirectory so we can assert the helper
+        // creates it.
+        let scope = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-phase2a".into(),
+            "session-fresh".into(),
+            vec![],
+        )
+        .expect("multi-tenant scope");
+        let workspace = scope.workspace().to_path_buf();
+        assert!(
+            !workspace.exists(),
+            "precondition: workspace should not exist before resolver runs"
+        );
+
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let resolved = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        assert_eq!(resolved, workspace, "resolver returns the scoped workspace");
+        assert!(
+            workspace.exists(),
+            "resolver must create the workspace dir on disk so worker spawn does not ENOENT"
+        );
+        assert!(
+            workspace.is_dir(),
+            "resolver must create a directory, not a file"
+        );
+    }
+
+    /// Multiple workers spawned in the same session (same scope) MUST
+    /// share the same workspace CWD. This is what gives in-session
+    /// continuity: writes from one node are visible to the next.
+    #[test]
+    fn pipeline_workers_in_same_session_share_workspace() {
+        let tenant_root = tempfile::tempdir().expect("temp dir");
+        let scope = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-share".into(),
+            "session-share".into(),
+            vec![],
+        )
+        .expect("multi-tenant scope");
+
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+        let first = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        let second = resolve_pipeline_working_dir(&tool_wd, Some(&scope));
+        assert_eq!(
+            first, second,
+            "two resolver calls with the same scope must return the same workspace CWD"
+        );
+        assert_eq!(first, scope.workspace());
+    }
+
+    /// The contamination-fixing assertion — two distinct sessions
+    /// (same tenant root, same tool-level working_dir) MUST resolve to
+    /// DIFFERENT workspaces. This is exactly the mini5 NEW-06 path:
+    /// without this, the second session's pipeline workers would
+    /// `read_file` 200+ `.md` files from the first session's runs and
+    /// hallucinate cross-domain content (the JWST query producing an
+    /// Intel/Tim Cook report).
+    #[test]
+    fn pipeline_workers_in_different_sessions_have_isolated_workspaces() {
+        let tenant_root = tempfile::tempdir().expect("temp dir");
+        let tool_wd = std::path::PathBuf::from(if cfg!(windows) {
+            "C:/profile/data"
+        } else {
+            "/profile/data"
+        });
+
+        let scope_a = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-iso".into(),
+            "session-a".into(),
+            vec![],
+        )
+        .expect("scope a");
+        let scope_b = SessionScope::multi_tenant(
+            tenant_root.path().to_path_buf(),
+            "tenant-iso".into(),
+            "session-b".into(),
+            vec![],
+        )
+        .expect("scope b");
+
+        let cwd_a = resolve_pipeline_working_dir(&tool_wd, Some(&scope_a));
+        let cwd_b = resolve_pipeline_working_dir(&tool_wd, Some(&scope_b));
+        assert_ne!(
+            cwd_a, cwd_b,
+            "two sessions on the same tenant MUST have isolated workspace CWDs — \
+             this is the load-bearing assertion for the mini5 NEW-06 fix"
+        );
+        // Both must be under the tenant root so per-tenant audit trails
+        // still work; only the per-session segment differs.
+        assert!(cwd_a.starts_with(tenant_root.path()));
+        assert!(cwd_b.starts_with(tenant_root.path()));
     }
 }
