@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+use octos_core::{PathClassification, SessionScope};
+
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{
     OCTOS_EVENT_SINK_ENV, OCTOS_HARNESS_SESSION_ID_ENV, OCTOS_HARNESS_TASK_ID_ENV,
@@ -510,6 +512,145 @@ impl PluginTool {
         }
     }
 
+    /// Phase 2-B of the SessionScope migration (PR #1198 follow-up to
+    /// the bespoke #1186 / #1189 path-traversal saga): scope-aware
+    /// rewriter. Replaces the entire `resolve_plugin_input_path` ->
+    /// `has_unsafe_components_parent_only` -> `absolutize_path_in_work_dir`
+    /// chain with a single
+    /// [`SessionScope::classify_lexical_path`] call per argument.
+    ///
+    /// Policy:
+    /// - Input keys (`audio_path`, `file_path`, `input`, `script_path`,
+    ///   `video_path`, `text_path`, per-slide `source_image`): allow
+    ///   `InWorkspace`, `InSharedZone` (multi-tenant read), `InGrantedDir`
+    ///   (solo read). Refuse `OutOfScope`.
+    /// - Output keys (`out`, `slide_dir`): allow `InWorkspace`,
+    ///   `InGrantedDir`. Refuse `InSharedZone` (shared zones are
+    ///   read-only) and `OutOfScope`.
+    /// - `style`: same as input-path keys (it may resolve into
+    ///   `<workspace>/styles/<name>.toml` or to an absolute path).
+    ///
+    /// After classification, paths land as ABSOLUTE strings in the
+    /// rewritten args, so the spawned plugin (with
+    /// `cmd.current_dir(scope.workspace())`) reads exactly what the
+    /// host validated. `..` and other unsafe components are refused by
+    /// `classify_lexical_path` itself (lexical normalise refuses
+    /// `ParentDir`).
+    ///
+    /// Caller (`prepare_effective_args`) is responsible for picking
+    /// this path vs `rewrite_workspace_file_args` based on whether a
+    /// scope was threaded through the [`ToolContext`].
+    fn rewrite_args_with_scope(
+        &self,
+        args: &serde_json::Value,
+        scope: &SessionScope,
+    ) -> Result<serde_json::Value, eyre::Report> {
+        let workspace = scope.workspace();
+        let Some(obj) = args.as_object() else {
+            return Ok(args.clone());
+        };
+
+        let mut rewritten = serde_json::Map::with_capacity(obj.len());
+        for (key, value) in obj {
+            if matches!(
+                key.as_str(),
+                "audio_path" | "file_path" | "input" | "script_path" | "video_path" | "text_path"
+            ) {
+                if let Some(path) = value.as_str() {
+                    let absolute = absolutise_against_workspace(path, workspace);
+                    let resolved = classify_for_intent(scope, &absolute, path, PathIntent::Read)?;
+                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                    continue;
+                }
+            }
+            if matches!(key.as_str(), "out" | "slide_dir") {
+                if let Some(path) = value.as_str() {
+                    let absolute = absolutise_against_workspace(path, workspace);
+                    let resolved = classify_for_intent(scope, &absolute, path, PathIntent::Write)?;
+                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                    continue;
+                }
+            }
+            if key == "style" {
+                if let Some(style) = value.as_str() {
+                    if self.tool_def.name.starts_with("mofa_") {
+                        if let Some(normalized) = normalize_mofa_style_name(style) {
+                            rewritten.insert(key.clone(), serde_json::Value::String(normalized));
+                            continue;
+                        }
+                    }
+                    // Same routing as `resolve_slides_style_in_work_dir`:
+                    // if the style value looks like a path (absolute or
+                    // contains a separator), classify it as an input
+                    // path. Otherwise probe `<workspace>/styles/<style>.toml`
+                    // and only rewrite when it exists; otherwise leave
+                    // unchanged so the plugin can fall back to its own
+                    // style registry (matching the legacy `Ok(None)`
+                    // branch in `resolve_slides_style_in_work_dir`).
+                    let trimmed = style.trim();
+                    if trimmed.is_empty() {
+                        rewritten.insert(key.clone(), value.clone());
+                        continue;
+                    }
+                    let candidate = std::path::Path::new(trimmed);
+                    let looks_like_path =
+                        candidate.is_absolute() || trimmed.contains('/') || trimmed.contains('\\');
+                    if looks_like_path {
+                        let absolute = absolutise_against_workspace(trimmed, workspace);
+                        let resolved =
+                            classify_for_intent(scope, &absolute, trimmed, PathIntent::Read)?;
+                        rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                        continue;
+                    }
+                    let filename = if trimmed.ends_with(".toml") {
+                        trimmed.to_string()
+                    } else {
+                        format!("{trimmed}.toml")
+                    };
+                    let probe = workspace.join("styles").join(filename);
+                    if probe.exists() {
+                        rewritten.insert(
+                            key.clone(),
+                            serde_json::Value::String(probe.to_string_lossy().into_owned()),
+                        );
+                        continue;
+                    }
+                }
+            }
+            if key == "slides" {
+                if let Some(slides) = value.as_array() {
+                    let mut rewritten_slides = Vec::with_capacity(slides.len());
+                    for slide in slides {
+                        let Some(slide_obj) = slide.as_object() else {
+                            rewritten_slides.push(slide.clone());
+                            continue;
+                        };
+                        let mut rewritten_slide = slide_obj.clone();
+                        if let Some(source_image) = slide_obj
+                            .get("source_image")
+                            .and_then(|value| value.as_str())
+                        {
+                            let absolute = absolutise_against_workspace(source_image, workspace);
+                            let resolved = classify_for_intent(
+                                scope,
+                                &absolute,
+                                source_image,
+                                PathIntent::Read,
+                            )?;
+                            rewritten_slide
+                                .insert("source_image".into(), serde_json::Value::String(resolved));
+                        }
+                        rewritten_slides.push(serde_json::Value::Object(rewritten_slide));
+                    }
+                    rewritten.insert(key.clone(), serde_json::Value::Array(rewritten_slides));
+                    continue;
+                }
+            }
+            rewritten.insert(key.clone(), value.clone());
+        }
+        Ok(serde_json::Value::Object(rewritten))
+    }
+
     fn rewrite_workspace_file_args(
         &self,
         args: &serde_json::Value,
@@ -658,7 +799,19 @@ impl PluginTool {
             }
         }
 
-        let mut effective_args = self.rewrite_workspace_file_args(&effective_args)?;
+        // Phase 2-B (SessionScope migration, PR #1198 follow-up):
+        // route through `rewrite_args_with_scope` when a session scope
+        // is threaded via the `ToolContext`. The scope's
+        // `classify_lexical_path` collapses the 4-round #1186 traversal
+        // hardening + the #1189 workspace-root rescue + the bespoke
+        // `resolve_plugin_input_path` / `absolutize_path_in_work_dir` /
+        // `resolve_slides_style_in_work_dir` validators into one gate.
+        // Without a scope (legacy callers) keep the existing rewriter
+        // chain unchanged for backward compatibility.
+        let mut effective_args = match ctx.and_then(|c| c.session_scope.as_ref()) {
+            Some(scope) => self.rewrite_args_with_scope(&effective_args, scope.as_ref())?,
+            None => self.rewrite_workspace_file_args(&effective_args)?,
+        };
         if self.tool_def.name == "mofa_slides" {
             if let Some(obj) = effective_args.as_object_mut() {
                 if !obj.contains_key("out")
@@ -708,7 +861,17 @@ impl PluginTool {
         effective_args: &serde_json::Value,
         output: &str,
         files_to_send: &mut Vec<std::path::PathBuf>,
+        effective_work_dir: Option<&std::path::Path>,
     ) -> Option<std::path::PathBuf> {
+        // Phase 2-B (SessionScope migration): prefer the effective work
+        // dir (= `scope.workspace()` when a scope was threaded) over
+        // the construction-time `self.work_dir`. Falls back to the
+        // legacy `self.work_dir` when no scope was supplied so the
+        // backward-compat path is unchanged.
+        let work_dir_owned: Option<std::path::PathBuf> = effective_work_dir
+            .map(|p| p.to_path_buf())
+            .or_else(|| self.work_dir.clone());
+        let work_dir = work_dir_owned.as_deref();
         let out_file = effective_args
             .get("out")
             .and_then(|v| v.as_str())
@@ -718,7 +881,7 @@ impl PluginTool {
                     return Some(path);
                 }
                 let candidates: Vec<std::path::PathBuf> = [
-                    self.work_dir.as_ref().map(|d| d.join(&path)),
+                    work_dir.map(|d| d.join(&path)),
                     std::env::current_dir().ok().map(|d| d.join(&path)),
                 ]
                 .into_iter()
@@ -727,7 +890,7 @@ impl PluginTool {
                 candidates
                     .into_iter()
                     .find(|c| c.exists())
-                    .or_else(|| self.work_dir.as_ref().map(|d| d.join(&path)))
+                    .or_else(|| work_dir.map(|d| d.join(&path)))
                     .or_else(|| std::env::current_dir().ok().map(|d| d.join(&path)))
                     .or(Some(path))
             });
@@ -740,7 +903,7 @@ impl PluginTool {
                         if path.exists() {
                             return Some(path.clone());
                         }
-                        let in_work = self.work_dir.as_ref().map(|d| d.join(&path));
+                        let in_work = work_dir.map(|d| d.join(&path));
                         let in_cwd = std::env::current_dir().ok().map(|d| d.join(&path));
                         in_work
                             .clone()
@@ -870,6 +1033,72 @@ fn value_kind_label(value: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Phase 2-B (SessionScope migration): caller-declared intent used by
+/// [`classify_for_intent`] to enforce per-zone read/write rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathIntent {
+    /// Plugin will read this path (input keys + `source_image` +
+    /// path-shaped `style`). Shared zones (multi-tenant) are readable
+    /// with explicit intent; granted dirs (solo) are readable.
+    Read,
+    /// Plugin will write this path (`out`, `slide_dir`). Shared zones
+    /// are refused per the [`PathClassification::InSharedZone`]
+    /// contract; only the per-session workspace and solo granted dirs
+    /// accept writes.
+    Write,
+}
+
+/// Lexically join `raw_path` against `workspace` when relative; return
+/// it unchanged when already absolute. Mirrors
+/// [`absolutize_path_in_work_dir`] but without the `..` guard — the
+/// downstream [`SessionScope::classify_lexical_path`] already refuses
+/// `ParentDir` components via its lexical normalisation step.
+fn absolutise_against_workspace(raw_path: &str, workspace: &std::path::Path) -> std::path::PathBuf {
+    let candidate = std::path::Path::new(raw_path);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        workspace.join(candidate)
+    }
+}
+
+/// Classify `absolute` against `scope` and refuse based on the
+/// caller-declared [`PathIntent`]. Returns the absolute path as a
+/// string on accept; returns a structured `eyre::Report` (echoing the
+/// `raw_path` the LLM passed) on refuse. The error message mirrors the
+/// "escapes plugin work dir" wording from the bespoke validators so the
+/// LLM and downstream test harnesses see consistent diagnostics.
+fn classify_for_intent(
+    scope: &SessionScope,
+    absolute: &std::path::Path,
+    raw_path: &str,
+    intent: PathIntent,
+) -> Result<String, eyre::Report> {
+    let classification = scope.classify_lexical_path(absolute);
+    match (&classification, intent) {
+        // Workspace: read + write both allowed.
+        (PathClassification::InWorkspace, _) => Ok(absolute.to_string_lossy().into_owned()),
+        // Solo granted dirs: read + write both allowed (the user has
+        // explicitly granted access).
+        (PathClassification::InGrantedDir { .. }, _) => Ok(absolute.to_string_lossy().into_owned()),
+        // Shared zones: read allowed (multi-tenant explicit intent);
+        // write refused per the `InSharedZone` doc contract.
+        (PathClassification::InSharedZone { .. }, PathIntent::Read) => {
+            Ok(absolute.to_string_lossy().into_owned())
+        }
+        (PathClassification::InSharedZone { zone }, PathIntent::Write) => Err(eyre::eyre!(
+            "path '{raw_path}' rejected: shared zone '{}' is read-only — writes refused per SessionScope policy",
+            zone.display()
+        )),
+        // Out of scope: refuse for both intents. Echo the raw path so
+        // the LLM sees what was refused (matches the round-3/4
+        // bespoke-validator error contract).
+        (PathClassification::OutOfScope, _) => Err(eyre::eyre!(
+            "path '{raw_path}' rejected: escapes plugin work dir"
+        )),
     }
 }
 
@@ -1486,8 +1715,25 @@ impl Tool for PluginTool {
         // Set working directory so relative paths in tool args (e.g.
         // input="slides/my-deck/script.js") resolve against the per-user
         // workspace — the same directory that write_file/read_file use.
-        // OCTOS_WORK_DIR is kept for backward compat with plugins that read it.
-        if let Some(ref dir) = self.work_dir {
+        // OCTOS_WORK_DIR is kept for backward compat with plugins that
+        // read it.
+        //
+        // Phase 2-B (SessionScope migration, PR #1198 follow-up): when
+        // the host threaded a `SessionScope` via `ToolContext`, override
+        // the construction-time `self.work_dir` with `scope.workspace()`.
+        // This unifies write_file's base_dir with the plugin CWD (the
+        // #1189 workspace-root rescue becomes redundant in the scope
+        // path because both sides see the same `scope.workspace()`),
+        // and ensures the per-session ephemeral workspace exists on
+        // disk before spawn (`SessionScope::multi_tenant` constructors
+        // intentionally don't `create_dir_all` — that's the spawner's
+        // responsibility per the type doc).
+        let effective_work_dir = ctx
+            .as_ref()
+            .and_then(|c| c.session_scope.as_ref())
+            .map(|scope| scope.workspace().to_path_buf())
+            .or_else(|| self.work_dir.clone());
+        if let Some(ref dir) = effective_work_dir {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 tracing::warn!(
                     dir = %dir.display(),
@@ -1756,8 +2002,13 @@ impl Tool for PluginTool {
             // Auto-deliver output file when plugin didn't report it.
             // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
-                self.detect_output_file(&effective_args, &output, &mut files_to_send)
-                    .await
+                self.detect_output_file(
+                    &effective_args,
+                    &output,
+                    &mut files_to_send,
+                    effective_work_dir.as_deref(),
+                )
+                .await
             } else {
                 file_modified
             };
@@ -1783,7 +2034,12 @@ impl Tool for PluginTool {
 
         let mut files_to_send = Vec::new();
         let file_modified = self
-            .detect_output_file(&effective_args, &output, &mut files_to_send)
+            .detect_output_file(
+                &effective_args,
+                &output,
+                &mut files_to_send,
+                effective_work_dir.as_deref(),
+            )
             .await;
 
         Ok(ToolResult {
@@ -4041,5 +4297,380 @@ mod tests {
         let result = tool.execute(&json!({})).await.expect("execute should ok");
         assert!(result.success);
         assert!(result.named_outputs.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 2-B SessionScope migration tests (PR #1198 follow-up).
+    //
+    // These pin the new scope-aware code path. They collapse the
+    // bespoke `resolve_plugin_input_path` / `absolutize_path_in_work_dir`
+    // / `resolve_slides_style_in_work_dir` validators behind a single
+    // `classify_lexical_path` gate so the 4-round #1186 traversal
+    // hardening + the #1189 workspace-root rescue have one home.
+    //
+    // The legacy fallback path (no scope) is independently exercised
+    // by the existing `rewrite_workspace_file_args_*` tests above,
+    // plus the `legacy_workspace_root_rescue_still_works_when_no_scope`
+    // pin further down which calls the resolver directly.
+    // ---------------------------------------------------------------
+
+    fn input_path_def(key: &str) -> PluginToolDef {
+        PluginToolDef {
+            name: format!("phase2b_{key}_tool"),
+            description: "Phase 2-B fixture".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {key: {"type": "string"}}
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        }
+    }
+
+    fn solo_scope_at(root: &std::path::Path) -> SessionScope {
+        SessionScope::solo(root.to_path_buf(), vec![]).expect("build solo scope")
+    }
+
+    fn multi_tenant_scope_at(
+        data: &std::path::Path,
+        tenant: &str,
+        session: &str,
+        shared_zones: Vec<std::path::PathBuf>,
+    ) -> SessionScope {
+        SessionScope::multi_tenant(
+            data.to_path_buf(),
+            tenant.into(),
+            session.into(),
+            shared_zones,
+        )
+        .expect("build multi-tenant scope")
+    }
+
+    fn ctx_with_scope(scope: SessionScope) -> ToolContext {
+        let mut ctx = ToolContext::zero();
+        ctx.session_scope = Some(Arc::new(scope));
+        ctx
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn plugin_uses_scope_workspace_when_present() {
+        // Phase 2-B contract: when a `SessionScope` is threaded via the
+        // `ToolContext`, the plugin must spawn with `OCTOS_WORK_DIR =
+        // scope.workspace()` regardless of what was passed at
+        // construction. The workspace dir is created on the fly so
+        // `SessionScope::multi_tenant`'s no-create-on-construction
+        // promise still holds and the spawner can take care of it.
+        let data = tempfile::tempdir().expect("data dir");
+        // Use a session id that has not been created yet — Phase 2-B
+        // must `create_dir_all(scope.workspace())` before spawn.
+        let scope = multi_tenant_scope_at(data.path(), "dspfac", "web-phase2b", vec![]);
+        let session_workspace = scope.workspace().to_path_buf();
+        assert!(
+            !session_workspace.exists(),
+            "test fixture sanity: workspace must not pre-exist"
+        );
+
+        // Build a fake construction-time work_dir that is DIFFERENT
+        // from the scope workspace, so we can assert the override wins.
+        let bogus_construction_work_dir = tempfile::tempdir().expect("construction dir");
+        let script_path = bogus_construction_work_dir.path().join("script.sh");
+        // Script echoes its CWD via `pwd` inside the JSON envelope so
+        // the test can inspect it.
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
+        );
+
+        let def = make_tool_def("scope_cwd", "echo CWD");
+        let tool = PluginTool::new("plug".into(), def, script_path)
+            .with_work_dir(bogus_construction_work_dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let ctx = ctx_with_scope(scope);
+        let result = crate::tools::TOOL_CTX
+            .scope(ctx, tool.execute(&json!({})))
+            .await
+            .expect("execute should succeed");
+
+        assert!(result.success, "scope-aware execute should succeed");
+        assert!(
+            session_workspace.exists(),
+            "Phase 2-B must create scope.workspace() before spawn"
+        );
+        // macOS prefixes tempdirs with `/private`, so canonicalise both
+        // sides before comparing (the shell's `pwd` resolves symlinks).
+        let actual = std::fs::canonicalize(result.output.trim())
+            .expect("CWD echoed by plugin should resolve");
+        let expected = std::fs::canonicalize(&session_workspace)
+            .expect("scope workspace should resolve after create_dir_all");
+        assert_eq!(
+            actual, expected,
+            "plugin CWD must equal scope.workspace(), not construction work_dir"
+        );
+        // Anchor against the bogus construction work_dir to make sure
+        // the override actually took effect.
+        let bogus = std::fs::canonicalize(bogus_construction_work_dir.path())
+            .expect("construction work_dir resolve");
+        assert_ne!(
+            actual, bogus,
+            "scope override must beat construction-time work_dir"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn plugin_falls_back_to_self_work_dir_when_no_scope() {
+        // Backward compat: legacy callers (no scope threaded) must keep
+        // the construction-time `self.work_dir` as the plugin's CWD.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
+        );
+
+        let def = make_tool_def("legacy_cwd", "echo CWD");
+        let tool = PluginTool::new("plug".into(), def, script_path)
+            .with_work_dir(dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        // No scope threaded — execute via the default `TOOL_CTX::zero`
+        // shape (the global TOOL_CTX::try_with returns Err so the
+        // legacy path is taken).
+        let result = tool
+            .execute(&json!({}))
+            .await
+            .expect("execute should succeed");
+        assert!(result.success);
+        let actual = std::fs::canonicalize(result.output.trim())
+            .expect("CWD echoed by plugin should resolve");
+        let expected = std::fs::canonicalize(dir.path()).expect("construction dir should resolve");
+        assert_eq!(
+            actual, expected,
+            "no-scope path must use construction-time work_dir"
+        );
+    }
+
+    #[test]
+    fn plugin_refuses_out_of_scope_input_path() {
+        // Phase 2-B: with scope, every input-path key (`audio_path`,
+        // `file_path`, `input`, `script_path`, `video_path`,
+        // `text_path`) MUST refuse paths that `classify_lexical_path`
+        // resolves to `OutOfScope`. This collapses the round-1..round-4
+        // bespoke `..`-guards into one gate.
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        // Bait file outside the workspace — escape attempts would
+        // otherwise resolve here.
+        let outside = tempfile::tempdir().expect("outside dir");
+        let bait = outside.path().join("passwd");
+        std::fs::write(&bait, b"ROOT:x:0:0::/root:/bin/sh").unwrap();
+
+        let scope = solo_scope_at(workspace.path());
+        let tool = PluginTool::new(
+            "plug".into(),
+            input_path_def("audio_path"),
+            PathBuf::from("/bin/true"),
+        );
+
+        let outside_abs = outside.path().join("passwd").to_string_lossy().into_owned();
+        for raw in [
+            "../passwd",
+            "../../etc/passwd",
+            "foo/../../bar",
+            outside_abs.as_str(),
+        ] {
+            let err = tool
+                .rewrite_args_with_scope(&json!({"audio_path": raw}), &scope)
+                .expect_err(&format!("scope refuse must Err for {raw:?}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(raw),
+                "error must echo the rejected raw path: {msg}",
+            );
+        }
+        let _ = bait;
+    }
+
+    #[test]
+    fn plugin_refuses_out_of_scope_output_path() {
+        // Phase 2-B: output-path keys (`out`, `slide_dir`) must refuse
+        // `OutOfScope` paths with the same one-shot
+        // `classify_lexical_path` gate. Collapses the round-4
+        // `absolutize_path_in_work_dir` Err contract on output keys
+        // into the unified scope policy.
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let scope = solo_scope_at(workspace.path());
+
+        let def = PluginToolDef {
+            name: "phase2b_output_tool".to_string(),
+            description: "fixture".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out": {"type": "string"},
+                    "slide_dir": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+
+        for (key, raw) in [
+            ("out", "../sneaky"),
+            ("slide_dir", "../escape"),
+            ("out", ".."),
+            ("slide_dir", "subdir/../../../escape"),
+        ] {
+            let err = tool
+                .rewrite_args_with_scope(&json!({ key: raw }), &scope)
+                .expect_err(&format!("output key {key:?} with {raw:?} must Err"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(raw),
+                "error for {key:?}={raw:?} must echo offending path: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_reads_from_shared_zone_research_dir_when_scope_present() {
+        // Phase 2-B: multi-tenant `shared_zones` (e.g. `<root>/research/`,
+        // `<root>/skills/`) classify as `InSharedZone`. The plugin tool
+        // must allow READ from those zones with explicit intent —
+        // input-path keys carry read intent by construction. Mirrors
+        // the `PathClassification::InSharedZone` doc contract.
+        let data = tempfile::tempdir().expect("data dir");
+        let research = data.path().join("research");
+        std::fs::create_dir_all(&research).expect("create research zone");
+        let report = research.join("dossier.md");
+        std::fs::write(&report, b"# shared dossier").unwrap();
+
+        let scope = multi_tenant_scope_at(
+            data.path(),
+            "dspfac",
+            "web-read-shared",
+            vec![research.clone()],
+        );
+
+        let tool = PluginTool::new(
+            "plug".into(),
+            input_path_def("input"),
+            PathBuf::from("/bin/true"),
+        );
+
+        let rewritten = tool
+            .rewrite_args_with_scope(
+                &json!({"input": report.to_string_lossy().to_string()}),
+                &scope,
+            )
+            .expect("read from shared zone must succeed");
+        assert_eq!(
+            rewritten["input"].as_str().unwrap(),
+            report.to_string_lossy().to_string(),
+            "shared-zone read must pass through as absolute path"
+        );
+    }
+
+    #[test]
+    fn plugin_refuses_write_to_shared_zone() {
+        // Phase 2-B: `InSharedZone` doc contract says reads allowed,
+        // writes refused. Output-path keys (`out`, `slide_dir`) must
+        // therefore Err when the path lands in a shared zone.
+        let data = tempfile::tempdir().expect("data dir");
+        let research = data.path().join("research");
+        std::fs::create_dir_all(&research).expect("create research zone");
+
+        let scope = multi_tenant_scope_at(
+            data.path(),
+            "dspfac",
+            "web-write-shared",
+            vec![research.clone()],
+        );
+
+        let def = PluginToolDef {
+            name: "phase2b_write_shared".to_string(),
+            description: "fixture".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"out": {"type": "string"}}
+            }),
+            spawn_only: false,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
+
+        let write_target = research.join("forbidden_output.pptx");
+        let raw = write_target.to_string_lossy().to_string();
+        let err = tool
+            .rewrite_args_with_scope(&json!({"out": raw.clone()}), &scope)
+            .expect_err("writes to shared zone must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&raw),
+            "error must echo the rejected raw path: {msg}"
+        );
+        assert!(
+            msg.contains("shared zone") && msg.contains("read-only"),
+            "error must explain shared-zone read-only policy: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_root_rescue_still_works_when_no_scope() {
+        // Backward compat: when NO scope is threaded, the legacy
+        // `resolve_plugin_input_path` chain (including the #1189
+        // workspace-root rescue for plugins chrooted to
+        // `<workspace>/skill-output/`) must still rescue
+        // `<workspace>/<basename>` candidates. This pin makes sure the
+        // Phase 2-B migration didn't accidentally delete the legacy
+        // fallback that production fleet binaries still rely on.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_output = workspace.path().join("skill-output");
+        std::fs::create_dir_all(&skill_output).unwrap();
+        let script = workspace.path().join("script.md");
+        std::fs::write(&script, b"# script").unwrap();
+
+        // Resolver-level rescue still kicks in.
+        let resolved = resolve_plugin_input_path("script.md", &skill_output)
+            .expect("workspace-root rescue must still resolve");
+        assert_eq!(std::path::Path::new(&resolved), &script);
+
+        // End-to-end via `rewrite_workspace_file_args` (the legacy
+        // entry point used when `prepare_effective_args` sees no
+        // scope on the ToolContext).
+        let def = PluginToolDef {
+            name: "podcast_generate".to_string(),
+            description: "Podcast generator".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"script_path": {"type": "string"}}
+            }),
+            spawn_only: true,
+            env: vec![],
+            risk: None,
+            spawn_only_message: None,
+            concurrency_class: None,
+        };
+        let tool = PluginTool::new("mofa-podcast".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(skill_output.clone());
+        let rewritten = tool
+            .rewrite_workspace_file_args(&json!({"script_path": "script.md"}))
+            .expect("legacy rewrite must succeed");
+        assert_eq!(
+            rewritten["script_path"].as_str().unwrap(),
+            script.to_string_lossy().to_string(),
+            "legacy rescue must continue to bridge workspace-root scripts"
+        );
     }
 }
