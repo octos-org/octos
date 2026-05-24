@@ -198,18 +198,25 @@ impl RunPipelineTool {
     fn build_workspace_context_with_host(
         &self,
         host: &crate::host_context::PipelineHostContext,
+        effective_working_dir: &std::path::Path,
     ) -> PipelineContext {
-        let policy = match octos_agent::workspace_policy::read_workspace_policy(&self.working_dir) {
-            Ok(policy) => policy,
-            Err(error) => {
-                tracing::warn!(
-                    working_dir = %self.working_dir.display(),
-                    error = %error,
-                    "run_pipeline: failed to read workspace policy; running legacy path"
-                );
-                None
-            }
-        };
+        // Phase 2-A (codex review of #1203, P2) — when a scoped run
+        // overrides `working_dir` onto a per-session workspace, the
+        // workspace policy (validators + compaction) may live under
+        // that scope dir, NOT the profile-level tool root. AppUI /
+        // runtime sessions provision the policy file inside the
+        // session workspace; reading from `self.working_dir` (the
+        // profile root) would miss it and the session would run
+        // without its declared validators or compaction policy.
+        //
+        // Resolution order: (1) policy under the effective working
+        // dir (scope when present), (2) policy under the tool's
+        // profile root (legacy / shared policy). Falling back to the
+        // profile root preserves pre-Phase-2-A behaviour for
+        // non-scoped callers (where `effective_working_dir == self.working_dir`).
+        let policy = self
+            .read_workspace_policy_for_session(effective_working_dir)
+            .or_else(|| self.read_workspace_policy_for_session(&self.working_dir));
         let mut ctx = PipelineContext::new();
         if let Some(policy) = policy {
             ctx = ctx.with_policy(policy);
@@ -228,6 +235,30 @@ impl RunPipelineTool {
             ctx = ctx.with_contract_id(contract_id);
         }
         ctx
+    }
+
+    /// Read a workspace policy from a candidate root, downgrading
+    /// errors to a WARN + `None` (mirrors the legacy
+    /// `build_workspace_context_with_host` behaviour). Lifted out so
+    /// the scope-aware lookup can try the session workspace first and
+    /// fall back to the profile root without duplicating the
+    /// error-handling shape.
+    fn read_workspace_policy_for_session(
+        &self,
+        candidate: &std::path::Path,
+    ) -> Option<octos_agent::workspace_policy::WorkspacePolicy> {
+        match octos_agent::workspace_policy::read_workspace_policy(candidate) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(
+                    candidate = %candidate.display(),
+                    error = %error,
+                    "run_pipeline: failed to read workspace policy from candidate root; \
+                     trying fallback or running legacy path"
+                );
+                None
+            }
+        }
     }
 
     /// Add the global octos-home skills directory as a search path.
@@ -510,6 +541,13 @@ impl Tool for RunPipelineTool {
         let effective_working_dir =
             resolve_pipeline_working_dir(&self.working_dir, host_context.session_scope.as_deref());
 
+        // Build the workspace_context BEFORE moving `effective_working_dir`
+        // into the struct literal — the policy lookup reads from the
+        // effective root (scope-aware) so scoped sessions pick up
+        // validators + compaction declared inside their workspace.
+        let workspace_context =
+            self.build_workspace_context_with_host(&host_context, &effective_working_dir);
+
         let config = ExecutorConfig {
             default_provider: self.default_provider.clone(),
             provider_router: self.provider_router.clone(),
@@ -531,7 +569,7 @@ impl Tool for RunPipelineTool {
             // reservation for free. When no policy is present the
             // context is empty and the executor stays on the legacy
             // path.
-            workspace_context: self.build_workspace_context_with_host(&host_context),
+            workspace_context,
             host_context,
             // NEW-06 fix: thread the parent embedder onto every pipeline
             // worker Agent so episodic memory recall stays on the
@@ -540,6 +578,13 @@ impl Tool for RunPipelineTool {
             // configured), workers stay on the cwd-only fallback path —
             // identical to pre-fix behaviour.
             embedder: self.embedder.clone(),
+            // Phase 2-A (codex review of #1203, P2) — keep model
+            // catalog / `pipeline_models.json` reads anchored to the
+            // PROFILE data dir even when `working_dir` was swapped to
+            // the per-session workspace. Without this split, scoped
+            // runs silently lose strong/fast model defaults and cost
+            // projections fall back to the minimum estimate.
+            catalog_dir: Some(self.working_dir.clone()),
         };
 
         // Pipeline-level timeout: default 1800s (30 min), clamped to [60, 1800].

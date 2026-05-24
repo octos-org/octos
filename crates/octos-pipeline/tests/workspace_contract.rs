@@ -165,6 +165,7 @@ fn base_config(dir: &TempDir, memory: Arc<EpisodeStore>, ctx: PipelineContext) -
         workspace_context: ctx,
         host_context: octos_pipeline::host_context::PipelineHostContext::default(),
         embedder: None,
+        catalog_dir: None,
     }
 }
 
