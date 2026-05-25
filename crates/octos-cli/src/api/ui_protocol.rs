@@ -31337,11 +31337,13 @@ ignore = []
     /// process-wide static map AND the process-wide prune
     /// throttle. Running them in parallel under
     /// `cargo test --test-threads=N` would let one test's prune
-    /// or insert race another's assertion. Serialise via a static
-    /// `Mutex` (NOT a Tokio mutex — the lock spans only synchronous
-    /// setup/teardown across awaits, but we don't `await` while
-    /// holding it; the tokio::test loop manages async after the
-    /// guard drops).
+    /// or insert race another's assertion. Serialise via a
+    /// `tokio::sync::Mutex` whose owned guard each test holds for
+    /// its entire body across `await` points (so we get a true
+    /// inter-test serialisation, not just sync setup serialisation).
+    /// A std `Mutex` would not work here because tokio tests
+    /// suspend across `.await`; that would either deadlock or
+    /// require parking a worker thread on the lock.
     fn new16_cursor_test_lock() -> Arc<tokio::sync::Mutex<()>> {
         static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
         LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
