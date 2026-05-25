@@ -1423,11 +1423,17 @@ fn active_turns_registry() -> SharedActiveTurns {
 /// so cross-session collisions are vanishingly unlikely, but the
 /// composite key keeps the contract explicit.
 ///
-/// Entries are NOT garbage-collected per-turn — the long-running
-/// server may accumulate them across many turns. The map is bounded
-/// in practice by active sessions; if this becomes a concern, the
-/// follow-up is to evict entries when a turn-end event fires (the
-/// active-turns registry already tracks turn lifetimes).
+/// Entries are garbage-collected at the end of each turn, after
+/// the per-turn `agent_task.await` has joined (or been aborted) in
+/// `run_standalone_turn`. This is OUTSIDE the session-manager
+/// critical section that holds the cursor read/write sites, so a
+/// queued same-`(session, turn)` re-entry serialised on the
+/// session lock can still observe the advanced cursor before the
+/// outer GC runs. The codex round-2 review on NEW-16 mandated this
+/// placement; doing the GC inside the persist block evicts the
+/// state before the second invocation can read it, defeating the
+/// guard for the queued case AND leaking on abort/panic paths
+/// inside the persist block.
 type TurnPersistCursors = Arc<TokioMutex<HashMap<(String, String), usize>>>;
 
 fn turn_persist_cursors() -> TurnPersistCursors {
@@ -16232,22 +16238,16 @@ async fn run_standalone_turn(
                             }
                         }
                     }
-                    // NEW-16 codex review P2: garbage-collect the cursor
-                    // entry for this `(session, turn)` pair now that the
-                    // persist block has completed. The cursor is a
-                    // re-entry guard; once both the indexed-log loop and
-                    // the synthetic-final-row branch are done, the entry
-                    // is no longer needed. Without this, the map would
-                    // grow unbounded with every turn on a long-running
-                    // server. Eviction happens under the existing
-                    // session lock so it cannot race a concurrent
-                    // re-entry from THIS turn — and the keying is
-                    // `(session, turn)` so it cannot collide with
-                    // distinct turns either.
-                    {
-                        let mut c = persist_cursors.lock().await;
-                        c.remove(&cursor_key);
-                    }
+                    // NEW-16 codex round-2 P1: do NOT GC the cursor
+                    // here. Eviction has moved to the OUTER scope
+                    // (after `agent_task.await` joins / abort path)
+                    // so that a queued same-`(session, turn)` re-entry
+                    // serialised on the session lock can still observe
+                    // the advanced cursor. GC'ing inside the session
+                    // critical section that holds the lock would
+                    // delete the state before the re-entry could
+                    // acquire the lock and read it, defeating the
+                    // guard for the queued case.
                 }
                 // #1158 codex P2 rev3 follow-up: distinguish two
                 // shapes of "empty captured reply":
@@ -16489,6 +16489,23 @@ async fn run_standalone_turn(
     }
 
     let _ = agent_task.await;
+
+    // NEW-16 codex round-2 P1+P2: garbage-collect the per-turn
+    // persist cursor here, AFTER the agent task has joined (or been
+    // aborted above). This is OUTSIDE the session-manager lock the
+    // persist block held, so any queued same-`(session, turn)`
+    // re-entry serialised on that lock got to observe the advanced
+    // cursor before we removed it. This also closes the
+    // abort-leak path the round-2 P2 review flagged: even on
+    // `agent_task.abort()`, the join completes and we still run
+    // through here. Eviction is keyed by `(session_id.0,
+    // turn_id.0)` so it cannot mistakenly evict a sibling turn's
+    // entry.
+    {
+        let cursors = turn_persist_cursors();
+        let mut c = cursors.lock().await;
+        c.remove(&(session_id.0.clone(), turn_id.0.to_string()));
+    }
 
     // Wave4-A: emit a final `router/status` snapshot adjacent to
     // `turn/completed` so clients see the actual provider that ran
@@ -31311,9 +31328,15 @@ ignore = []
         }
     }
 
-    /// NEW-16 codex review P2: cursor entries MUST be removed from
-    /// the registry once the persist block completes so the map does
-    /// not grow unbounded on a long-running server.
+    /// NEW-16 codex review round-1 P2 + round-2 P1+P2: cursor
+    /// entries are evicted in the OUTER scope of `run_standalone_turn`,
+    /// after `agent_task.await` joins (or is aborted). Eviction
+    /// happens OUTSIDE the session-manager critical section the
+    /// persist block held — so a queued same-`(session, turn)`
+    /// re-entry serialised on that lock can still observe the
+    /// advanced cursor before the outer GC runs. The eviction also
+    /// covers the abort/panic path (because `agent_task.await`
+    /// returns after `agent_task.abort()` too).
     #[tokio::test]
     async fn new16_turn_persist_cursor_is_evicted_after_turn_completes() {
         let cursors = super::turn_persist_cursors();
@@ -31321,17 +31344,23 @@ ignore = []
         let turn_id = format!("test-turn-{}", uuid::Uuid::new_v4());
         let key = (session_id.clone(), turn_id.clone());
 
-        // Simulate the persist loop populating the cursor.
+        // Simulate the persist block populating the cursor while
+        // holding the sessions lock.
         {
             let mut c = cursors.lock().await;
             c.insert(key.clone(), 5);
         }
-        // Confirm it landed.
+        // While the persist block holds the sessions lock, the
+        // cursor is observable — a queued same-`(session, turn)`
+        // invocation waiting on the sessions lock would see this on
+        // its next read. Confirm it's there.
         {
             let c = cursors.lock().await;
             assert_eq!(c.get(&key).copied(), Some(5));
         }
-        // Simulate the GC at end of persist loop.
+        // Simulate the OUTER-scope GC at end of `run_standalone_turn`,
+        // AFTER `agent_task.await` joins. By this point any queued
+        // same-turn re-entry's persist block has already completed.
         {
             let mut c = cursors.lock().await;
             c.remove(&key);
@@ -31341,8 +31370,9 @@ ignore = []
             let c = cursors.lock().await;
             assert!(
                 c.get(&key).is_none(),
-                "cursor entry MUST be evicted after persist block completes \
-                 (codex round-1 P2 — prevents unbounded map growth)"
+                "cursor entry MUST be evicted after the per-turn agent_task \
+                 joins (codex round-2 P2 — covers normal + abort/panic paths \
+                 and keeps the map bounded on a long-running server)"
             );
         }
     }
