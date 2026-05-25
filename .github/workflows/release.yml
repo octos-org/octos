@@ -226,7 +226,7 @@ jobs:
           # Copy whichever platform bundles were built
           find artifacts -name 'octos-bundle-*' -exec cp {} release-assets/ \;
           # Always include install scripts
-          cp scripts/install.sh scripts/install.ps1 scripts/octos-doctor.sh release-assets/
+          cp scripts/install.sh scripts/install.ps1 scripts/deploy.ps1 scripts/octos-doctor.sh release-assets/
           echo "Assets to upload:"
           ls -la release-assets/
 

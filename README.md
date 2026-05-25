@@ -163,6 +163,26 @@ This wraps three host-side steps:
 - `scripts/frp/setup-frps.sh` — installs and configures `frps`
 - `scripts/frp/setup-caddy.sh` — configures public routing and wildcard HTTPS
 
+Windows Server targets use the PowerShell deploy script from an operator machine
+with OpenSSH access to the server:
+
+```powershell
+.\scripts\deploy.ps1 `
+    -HostName win.example.com `
+    -User Administrator `
+    -Version latest `
+    -RemoteRoot 'C:\octos' `
+    -ServiceName OctosServe
+```
+
+Run the same command with `-DryRun` first to print the remote commands without
+connecting. The script deploys the `octos-bundle-x86_64-pc-windows-msvc.zip`
+release bundle, installs `octos.exe` under `C:\octos\bin`, stores runtime data in
+`C:\octos\data`, writes logs under `C:\octos\logs`, and registers `OctosServe` as
+an auto-start Windows service through NSSM. Use `-LocalBundle <zip>` to deploy a
+locally built bundle over `scp`, and `-Uninstall [-Purge]` to remove the service
+and optionally delete the remote install root.
+
 Recommended DNS split:
 
 - `octos.example.com` and `*.octos.example.com` for the portal and tenant dashboards
