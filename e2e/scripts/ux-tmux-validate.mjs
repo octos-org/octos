@@ -33,6 +33,42 @@ const VALID_DIRECTIONS = new Set([
   'rx',
 ]);
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const FOLLOWUP_METHODS_REQUIRING_CAPABILITIES = new Set([
+  'profile/local/create',
+  'permission/profile/list',
+  'permission/profile/set',
+  'session/open',
+  'session/status/read',
+  'session/workspace.get',
+  'tool/status/list',
+  'turn/start',
+]);
+const CAPABILITY_METHODS = new Set([
+  'client_hello',
+  'config/capabilities/list',
+]);
+const SECRET_PATTERNS = [
+  {
+    id: 'anthropic_api_key',
+    regex: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/,
+  },
+  {
+    id: 'openai_api_key',
+    regex: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/,
+  },
+  {
+    id: 'github_token',
+    regex: /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/,
+  },
+  {
+    id: 'slack_token',
+    regex: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/,
+  },
+  {
+    id: 'bearer_token',
+    regex: /\bBearer\s+[A-Za-z0-9._~+/-]{24,}\b/,
+  },
+];
 
 const KNOWN_CAPTURE_BUG_PATTERNS = [
   {
@@ -175,6 +211,11 @@ function codepointLength(text) {
 
 function sortedStrings(values) {
   return [...new Set(values)].sort();
+}
+
+function scenarioId(value) {
+  if (!isPlainObject(value)) return '';
+  return String(value.id || value.scenario_id || value.name || '');
 }
 
 function makeCheck(id, passed, detail, evidence) {
@@ -420,6 +461,49 @@ function normalizeTranscriptFrame(value) {
   return null;
 }
 
+function transcriptFrameRows(artifactDir, name = 'appui-transcript.jsonl') {
+  const parsed = parseJsonl(artifactPath(artifactDir, name));
+  const frameRows = parsed.rows
+    .map((row) => ({ row, frame: normalizeTranscriptFrame(row.value), direction: row.value.direction }))
+    .filter((entry) => isPlainObject(entry.frame));
+  return { parsed, frameRows };
+}
+
+function isClientRequest(entry) {
+  return (
+    typeof entry.frame.method === 'string'
+    && Object.prototype.hasOwnProperty.call(entry.frame, 'id')
+    && (
+      entry.direction === 'client_to_server'
+      || entry.direction === 'tx'
+      || entry.direction === undefined
+    )
+  );
+}
+
+function frameAdvertisedMethods(frame) {
+  const candidates = [
+    frame.result?.capabilities?.supported_methods,
+    frame.result?.supported_methods,
+    frame.result?.capabilities?.methods,
+    frame.result?.methods,
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate
+        .filter((method) => typeof method === 'string' && method.length > 0);
+    }
+  }
+  return [];
+}
+
+function frameHasCapabilityEvidence(frame) {
+  if (!Object.prototype.hasOwnProperty.call(frame, 'result')) return false;
+  if (Array.isArray(frame.result?.capabilities)) return frame.result.capabilities.length > 0;
+  if (isPlainObject(frame.result?.capabilities)) return Object.keys(frame.result.capabilities).length > 0;
+  return frameAdvertisedMethods(frame).length > 0;
+}
+
 function checkAppuiTranscriptParseable(artifactDir) {
   const parsed = parseJsonl(artifactPath(artifactDir, 'appui-transcript.jsonl'));
   const shapeErrors = parsed.rows.flatMap((row) => validateFrameShape(row));
@@ -457,6 +541,356 @@ function checkAppuiTranscriptParseable(artifactDir) {
       : `transcript parse problems: ${problems.join('; ')}`,
     ['appui-transcript.jsonl'],
   );
+}
+
+function checkCapabilitiesBeforeFollowups(artifactDir) {
+  const { parsed, frameRows } = transcriptFrameRows(artifactDir);
+  const problems = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
+  let capabilityEvidence = null;
+  let firstFollowup = null;
+
+  for (const entry of frameRows) {
+    if (!capabilityEvidence && frameHasCapabilityEvidence(entry.frame)) {
+      capabilityEvidence = entry;
+    }
+    if (
+      isClientRequest(entry)
+      && FOLLOWUP_METHODS_REQUIRING_CAPABILITIES.has(entry.frame.method)
+    ) {
+      firstFollowup = entry;
+      break;
+    }
+  }
+
+  if (firstFollowup && !capabilityEvidence) {
+    problems.push(
+      `line ${firstFollowup.row.line}: ${firstFollowup.frame.method} was called before any capability advertisement`,
+    );
+  }
+
+  return makeCheck(
+    'capabilities_before_followups',
+    problems.length === 0,
+    problems.length === 0
+      ? (firstFollowup
+        ? `capability evidence appears before first follow-up method ${firstFollowup.frame.method}`
+        : 'transcript has no follow-up methods requiring capability negotiation')
+      : `capability ordering problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
+function checkNoUnadvertisedMethodsCalled(artifactDir) {
+  const { parsed, frameRows } = transcriptFrameRows(artifactDir);
+  const problems = parsed.errors.map((entry) => `line ${entry.line}: ${entry.error}`);
+  const advertisedMethods = new Set();
+  let advertisedAtLine = null;
+
+  for (const entry of frameRows) {
+    for (const method of frameAdvertisedMethods(entry.frame)) {
+      advertisedMethods.add(method);
+      advertisedAtLine ??= entry.row.line;
+    }
+  }
+
+  if (advertisedMethods.size > 0) {
+    for (const entry of frameRows) {
+      if (!isClientRequest(entry)) continue;
+      const method = entry.frame.method;
+      if (CAPABILITY_METHODS.has(method)) continue;
+      if (!advertisedMethods.has(method)) {
+        problems.push(`line ${entry.row.line}: client called unadvertised method ${method}`);
+      }
+    }
+  }
+
+  return makeCheck(
+    'no_unadvertised_methods_called',
+    problems.length === 0,
+    problems.length === 0
+      ? (advertisedMethods.size > 0
+        ? `all client RPC calls are in the ${advertisedMethods.size}-method advertised set from line ${advertisedAtLine}`
+        : 'no supported_methods advertisement found; unadvertised-method enforcement skipped for this fixture')
+      : `unadvertised method problems: ${problems.join('; ')}`,
+    ['appui-transcript.jsonl'],
+  );
+}
+
+function captureArtifactNames(artifactDir) {
+  if (!fs.existsSync(artifactDir)) return ['tui-capture.txt'];
+  const names = fs
+    .readdirSync(artifactDir)
+    .filter((name) => /^tui-capture.*\.txt$/.test(name))
+    .sort();
+  if (!names.includes('tui-capture.txt')) names.unshift('tui-capture.txt');
+  return names;
+}
+
+function readCaptureTexts(artifactDir) {
+  return captureArtifactNames(artifactDir).map((name) => ({
+    name,
+    ...readText(artifactPath(artifactDir, name)),
+  }));
+}
+
+function checkFinalAnswerVisible(artifactDir) {
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
+  const problems = [];
+  if (!summary.ok) {
+    problems.push(`summary.json is not parseable JSON: ${summary.error}`);
+  }
+  if (!scenario.ok) {
+    problems.push(`scenario.json is not parseable JSON: ${scenario.error}`);
+  }
+  if (problems.length > 0) {
+    return makeCheck(
+      'final_answer_visible',
+      false,
+      `final-answer visibility problems: ${problems.join('; ')}`,
+      ['summary.json', 'scenario.json', 'tui-capture.txt'],
+    );
+  }
+  if (summary.value.mode !== 'run' || ['blocked', 'skipped', 'quarantined'].includes(summary.value.status)) {
+    return makeCheck(
+      'final_answer_visible',
+      true,
+      `final-answer visibility is not required for mode=${summary.value.mode ?? '<unset>'} status=${summary.value.status ?? '<unset>'}`,
+      ['summary.json', 'tui-capture.txt'],
+    );
+  }
+
+  const marker = String(
+    scenario.value.final_marker
+      || summary.value.final_marker
+      || summary.value.expected_final_marker
+      || '',
+  );
+  const captures = readCaptureTexts(artifactDir);
+  for (const capture of captures) {
+    if (!capture.ok) {
+      problems.push(`${capture.name} could not be read: ${capture.error}`);
+    }
+  }
+  const visibleText = captures
+    .filter((capture) => capture.ok)
+    .map((capture) => capture.text)
+    .join('\n');
+  const normalizedVisibleText = visibleText.replaceAll('_', '');
+  if (marker) {
+    const normalizedMarker = marker.replaceAll('_', '');
+    if (!visibleText.includes(marker) && !normalizedVisibleText.includes(normalizedMarker)) {
+      problems.push(`no TUI capture contains final marker ${marker}`);
+    }
+  } else if (!/(Assistant:|Final answer|Done|Ready)/i.test(visibleText)) {
+    problems.push('no TUI capture contains an assistant/final/done/ready line');
+  }
+  if (CAPTURE_STUCK_RUNNING_PATTERN.test(visibleText)) {
+    problems.push('capture still shows a running/working state instead of a visible terminal answer');
+  }
+
+  return makeCheck(
+    'final_answer_visible',
+    problems.length === 0,
+    problems.length === 0
+      ? (marker
+        ? `final marker ${marker} is visible in retained TUI capture artifacts`
+        : 'retained TUI capture artifacts contain terminal assistant/done/ready evidence')
+      : `final-answer visibility problems: ${problems.join('; ')}`,
+    captures.map((capture) => capture.name),
+  );
+}
+
+function checkComposerUsable(artifactDir) {
+  const summary = readJson(artifactPath(artifactDir, 'summary.json'));
+  if (summary.ok && ['blocked', 'skipped', 'quarantined'].includes(summary.value.status)) {
+    return makeCheck(
+      'composer_usable',
+      true,
+      `composer usability is not required for status=${summary.value.status}`,
+      ['summary.json', 'tui-capture.txt'],
+    );
+  }
+
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  const terminal = readJson(artifactPath(artifactDir, 'terminal-size.json'));
+  const problems = [];
+  if (!capture.ok) {
+    problems.push(`tui-capture.txt could not be read: ${capture.error}`);
+  }
+  if (!terminal.ok) {
+    problems.push(`terminal-size.json is not parseable JSON: ${terminal.error}`);
+  }
+  if (problems.length > 0) {
+    return makeCheck(
+      'composer_usable',
+      false,
+      `composer usability problems: ${problems.join('; ')}`,
+      ['terminal-size.json', 'tui-capture.txt'],
+    );
+  }
+
+  const lines = captureLines(capture.text);
+  const composerIndex = lines.findIndex((line) => /(^|\s)Composer(\s|$)/.test(line));
+  const promptIndex = lines.findIndex((line) => /^\s*[>›]/.test(line));
+  const stateIndex = lines.findIndex((line) => /^\s*state\s+/i.test(line));
+  const maxWidth = lines.reduce((max, line) => Math.max(max, codepointLength(line)), 0);
+  const { cols, rows } = terminal.value;
+
+  if (composerIndex < 0) {
+    problems.push('capture is missing the Composer control row');
+  }
+  if (promptIndex < 0) {
+    problems.push('capture is missing an input prompt row');
+  }
+  if (composerIndex >= 0 && promptIndex >= 0 && promptIndex < composerIndex) {
+    problems.push('input prompt appears above the Composer row');
+  }
+  if (stateIndex >= 0 && promptIndex >= 0 && promptIndex > stateIndex) {
+    problems.push('input prompt is hidden below the bottom state row');
+  }
+  if (Number.isInteger(rows) && lines.length > rows) {
+    problems.push(`capture has ${lines.length} rendered row(s), expected at most ${rows}`);
+  }
+  if (Number.isInteger(cols) && maxWidth > cols) {
+    problems.push(`capture has a ${maxWidth}-column line, expected at most ${cols}`);
+  }
+
+  return makeCheck(
+    'composer_usable',
+    problems.length === 0,
+    problems.length === 0
+      ? `composer row and input prompt are visible within ${cols}x${rows} capture bounds`
+      : `composer usability problems: ${problems.join('; ')}`,
+    ['terminal-size.json', 'tui-capture.txt'],
+  );
+}
+
+function listArtifactFiles(root) {
+  const out = [];
+  const stack = [''];
+  while (stack.length > 0 && out.length < 512) {
+    const relDir = stack.pop();
+    const absDir = path.join(root, relDir);
+    let entries;
+    try {
+      entries = fs.readdirSync(absDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const rel = path.join(relDir, entry.name);
+      const abs = path.join(root, rel);
+      if (entry.isDirectory()) {
+        stack.push(rel);
+      } else if (entry.isFile()) {
+        out.push({ rel, abs });
+      }
+    }
+  }
+  return out.sort((left, right) => left.rel.localeCompare(right.rel));
+}
+
+function checkSecretRedaction(artifactDir) {
+  const problems = [];
+  const files = listArtifactFiles(artifactDir)
+    .filter((file) => !file.rel.endsWith('validation.json'));
+  for (const file of files) {
+    let stat;
+    try {
+      stat = fs.statSync(file.abs);
+    } catch (error) {
+      problems.push(`${file.rel} could not be statted: ${error.message}`);
+      continue;
+    }
+    if (stat.size > 1024 * 1024) continue;
+    const read = readText(file.abs);
+    if (!read.ok) {
+      problems.push(`${file.rel} could not be read: ${read.error}`);
+      continue;
+    }
+    const lines = read.text.split('\n');
+    for (let index = 0; index < lines.length; index += 1) {
+      for (const pattern of SECRET_PATTERNS) {
+        if (pattern.regex.test(lines[index])) {
+          problems.push(`${pattern.id} in ${file.rel} at line ${index + 1}`);
+          break;
+        }
+      }
+    }
+  }
+
+  return makeCheck(
+    'secret_redaction',
+    problems.length === 0,
+    problems.length === 0
+      ? `scanned ${files.length} retained artifact file(s) without matching common secret-token patterns`
+      : `retained artifact secret-redaction problems: ${problems.join('; ')}`,
+    files.map((file) => file.rel),
+  );
+}
+
+function buildLayoutSnapshot(artifactDir) {
+  const terminal = readJson(artifactPath(artifactDir, 'terminal-size.json'));
+  const capture = readText(artifactPath(artifactDir, 'tui-capture.txt'));
+  if (!terminal.ok || !capture.ok) {
+    return {
+      schema: 'octos.ux.layout_snapshot.v1',
+      status: 'unavailable',
+      problems: [
+        ...(!terminal.ok ? [`terminal-size.json: ${terminal.error}`] : []),
+        ...(!capture.ok ? [`tui-capture.txt: ${capture.error}`] : []),
+      ],
+      evidence: ['terminal-size.json', 'tui-capture.txt'],
+    };
+  }
+
+  const lines = captureLines(capture.text);
+  const composerIndex = lines.findIndex((line) => /(^|\s)Composer(\s|$)/.test(line));
+  const promptIndex = lines.findIndex((line) => /^\s*[>›]/.test(line));
+  const stateIndex = lines.findIndex((line) => /^\s*state\s+/i.test(line));
+  const approvalIndex = lines.findIndex((line) => /Approval Requested|Approve|Deny/i.test(line));
+  const menuIndex = lines.findIndex((line) => /Update Model Permissions|Set Up LLM Provider|Choose Profile/i.test(line));
+  const taskIndex = lines.findIndex((line) => /Task|Subagents|Progress|Working/i.test(line));
+  const maxWidth = lines.reduce((max, line) => Math.max(max, codepointLength(line)), 0);
+  const regions = [];
+
+  function addRegion(name, startIndex, endIndex, detectedBy) {
+    if (startIndex < 0 || endIndex < startIndex) return;
+    regions.push({
+      name,
+      start_row: startIndex + 1,
+      end_row: endIndex + 1,
+      detected_by: detectedBy,
+      preview: lines[startIndex]?.trim().slice(0, 120) ?? '',
+    });
+  }
+
+  const firstControlIndex = [composerIndex, promptIndex, stateIndex]
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0] ?? lines.length;
+  addRegion('history', 0, Math.max(0, firstControlIndex - 1), 'before first control row');
+  addRegion('task_or_progress', taskIndex, taskIndex, 'task/progress regex');
+  addRegion('approval_prompt', approvalIndex, approvalIndex, 'approval regex');
+  addRegion('menu', menuIndex, menuIndex, 'menu regex');
+  addRegion('composer', composerIndex, composerIndex, 'Composer row');
+  addRegion('input_prompt', promptIndex, promptIndex, 'input prompt row');
+  addRegion('status', stateIndex, stateIndex, 'state row');
+
+  return {
+    schema: 'octos.ux.layout_snapshot.v1',
+    status: 'available',
+    terminal: {
+      cols: terminal.value.cols,
+      rows: terminal.value.rows,
+    },
+    observed: {
+      rows: lines.length,
+      max_width: maxWidth,
+    },
+    regions,
+    evidence: ['terminal-size.json', 'tui-capture.txt'],
+  };
 }
 
 function checkRealTmuxEvidence(artifactDir) {
@@ -587,16 +1021,8 @@ function checkAppuiTranscriptSemantic(artifactDir) {
 
 function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
   const scenario = readJson(artifactPath(artifactDir, 'scenario.json'));
-  const scenarioId = scenario.ok
-    ? (scenario.value.id || scenario.value.scenario_id || '')
-    : '';
-  const captureNames = fs.existsSync(artifactDir)
-    ? fs
-      .readdirSync(artifactDir)
-      .filter((name) => /^tui-capture.*\.txt$/.test(name))
-      .sort()
-    : ['tui-capture.txt'];
-  if (!captureNames.includes('tui-capture.txt')) captureNames.unshift('tui-capture.txt');
+  const id = scenario.ok ? scenarioId(scenario.value) : '';
+  const captureNames = captureArtifactNames(artifactDir);
   const serverLog = readText(artifactPath(artifactDir, 'server.log'));
   const problems = [];
   let mainCaptureText = '';
@@ -613,7 +1039,7 @@ function checkRenderedScreenNoKnownBugPatterns(artifactDir) {
     }
     for (const pattern of KNOWN_CAPTURE_BUG_PATTERNS) {
       if (
-        scenarioId === 'restart-reconnect'
+        id === 'restart-reconnect'
         && pattern.id === 'appui_error_text_visible'
         && /UI protocol disconnected[\s\S]*UI protocol reconnected/.test(capture.text)
       ) {
@@ -1281,13 +1707,19 @@ function checkLowerSoakSummary(artifactDir) {
 }
 
 function buildValidation(artifactDir) {
+  const layoutSnapshot = buildLayoutSnapshot(artifactDir);
   const checks = [
     checkArtifactAbi(artifactDir),
     checkAppuiTranscriptParseable(artifactDir),
+    checkCapabilitiesBeforeFollowups(artifactDir),
+    checkNoUnadvertisedMethodsCalled(artifactDir),
     checkRealTmuxEvidence(artifactDir),
     checkAppuiTranscriptSemantic(artifactDir),
     checkRenderedScreenNoKnownBugPatterns(artifactDir),
     checkScreenGeometryConsistent(artifactDir),
+    checkFinalAnswerVisible(artifactDir),
+    checkComposerUsable(artifactDir),
+    checkSecretRedaction(artifactDir),
     checkPermissionSelectionScenario(artifactDir),
     checkProviderMissingScenario(artifactDir),
     checkApprovalDenialScenario(artifactDir),
@@ -1306,6 +1738,7 @@ function buildValidation(artifactDir) {
   return {
     schema: VALIDATION_SCHEMA,
     status: failures.length === 0 ? 'passed' : 'failed',
+    layout_snapshot: layoutSnapshot,
     checks,
     failures,
   };

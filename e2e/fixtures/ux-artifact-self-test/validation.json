@@ -1,6 +1,52 @@
 {
   "schema": "octos.ux.validation.v1",
   "status": "passed",
+  "layout_snapshot": {
+    "schema": "octos.ux.layout_snapshot.v1",
+    "status": "available",
+    "terminal": {
+      "cols": 120,
+      "rows": 40
+    },
+    "observed": {
+      "rows": 10,
+      "max_width": 40
+    },
+    "regions": [
+      {
+        "name": "history",
+        "start_row": 1,
+        "end_row": 6,
+        "detected_by": "before first control row",
+        "preview": "Octos TUI"
+      },
+      {
+        "name": "composer",
+        "start_row": 7,
+        "end_row": 7,
+        "detected_by": "Composer row",
+        "preview": "Composer"
+      },
+      {
+        "name": "input_prompt",
+        "start_row": 8,
+        "end_row": 8,
+        "detected_by": "input prompt row",
+        "preview": ">"
+      },
+      {
+        "name": "status",
+        "start_row": 10,
+        "end_row": 10,
+        "detected_by": "state row",
+        "preview": "state Ready"
+      }
+    ],
+    "evidence": [
+      "terminal-size.json",
+      "tui-capture.txt"
+    ]
+  },
   "checks": [
     {
       "id": "artifact_abi",
@@ -23,6 +69,22 @@
       "id": "appui_transcript_parseable",
       "status": "passed",
       "detail": "parsed 5 JSONL entries; methods=client_hello, session/open, turn/completed; responses=2",
+      "evidence": [
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "capabilities_before_followups",
+      "status": "passed",
+      "detail": "capability evidence appears before first follow-up method session/open",
+      "evidence": [
+        "appui-transcript.jsonl"
+      ]
+    },
+    {
+      "id": "no_unadvertised_methods_called",
+      "status": "passed",
+      "detail": "no supported_methods advertisement found; unadvertised-method enforcement skipped for this fixture",
       "evidence": [
         "appui-transcript.jsonl"
       ]
@@ -58,6 +120,40 @@
       "status": "passed",
       "detail": "screen geometry checks are not required for mode=self-test status=passed",
       "evidence": [
+        "summary.json",
+        "terminal-size.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "final_answer_visible",
+      "status": "passed",
+      "detail": "final-answer visibility is not required for mode=self-test status=passed",
+      "evidence": [
+        "summary.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "composer_usable",
+      "status": "passed",
+      "detail": "composer row and input prompt are visible within 120x40 capture bounds",
+      "evidence": [
+        "terminal-size.json",
+        "tui-capture.txt"
+      ]
+    },
+    {
+      "id": "secret_redaction",
+      "status": "passed",
+      "detail": "scanned 9 retained artifact file(s) without matching common secret-token patterns",
+      "evidence": [
+        "appui-transcript.jsonl",
+        "input-replay.log",
+        "launch-command.txt",
+        "runtime-policy-stamp.json",
+        "scenario.json",
+        "server.log",
         "summary.json",
         "terminal-size.json",
         "tui-capture.txt"

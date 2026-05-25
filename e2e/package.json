@@ -29,6 +29,7 @@
     "matrix": "node matrix/run.mjs",
     "ux:scenario:list": "node scripts/ux-scenario-list.mjs",
     "ux:scenario:list:test": "node --test tests/ux/scenario-list.test.mjs",
+    "ux:tmux:validate:test": "node --test tests/ux/tmux-validate.test.mjs",
     "soak:m17:live-proof": "bash scripts/m17-live-proof-soak.sh run",
     "soak:m17:live-proof:validate": "bash scripts/m17-live-proof-soak.sh validate",
     "soak:m17:live-proof:self-test": "bash scripts/m17-live-proof-soak.sh self-test"
