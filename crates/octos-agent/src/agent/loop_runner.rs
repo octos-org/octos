@@ -433,7 +433,13 @@ impl Agent {
                     iteration,
                     "loop retry: compacting context before retry"
                 );
-                self.maybe_run_turn_compaction(messages, iteration);
+                if let Err(error) = self.maybe_run_turn_compaction(messages, iteration) {
+                    tracing::warn!(
+                        error = %error,
+                        "loop retry: compaction preservation failed; bailing"
+                    );
+                    return LoopErrorAction::Bail;
+                }
                 self.prepare_prompt_with_context_manager(
                     messages,
                     PromptContextPhase::Retry,
@@ -816,7 +822,7 @@ impl Agent {
                     // LLM call when a compaction policy is wired and the
                     // context already exceeds the declared threshold.
                     if iteration == 1 {
-                        self.maybe_run_preflight_compaction(&mut messages);
+                        self.maybe_run_preflight_compaction(&mut messages)?;
                     }
                     // Harness M8.5 tier 1: cheap in-place stale/oversized
                     // tool-result pruning. Runs every iteration (including
@@ -829,7 +835,7 @@ impl Agent {
                     // runner sees the final shape of the conversation (after
                     // tool-pair repair + system-message normalization). This
                     // also feeds the validator rail on subsequent iterations.
-                    self.maybe_run_turn_compaction(&mut messages, iteration);
+                    self.maybe_run_turn_compaction(&mut messages, iteration)?;
                     self.prepare_prompt_with_context_manager(
                         &mut messages,
                         if iteration == 1 {

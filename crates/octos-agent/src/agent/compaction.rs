@@ -93,15 +93,18 @@ impl Agent {
     /// legacy declarative runner must not mutate the same prompt vector first.
     /// Also no-op when no [`crate::compaction::CompactionRunner`] is attached,
     /// preserving legacy extractive behaviour for every existing caller.
-    pub(super) fn maybe_run_preflight_compaction(&self, messages: &mut Vec<Message>) {
+    pub(super) fn maybe_run_preflight_compaction(
+        &self,
+        messages: &mut Vec<Message>,
+    ) -> eyre::Result<()> {
         if self.prompt_context_manager.is_some() {
-            return;
+            return Ok(());
         }
         let Some(runner) = self.compaction_runner.as_ref() else {
-            return;
+            return Ok(());
         };
         if runner.needs_preflight(messages).is_none() {
-            return;
+            return Ok(());
         }
         let outcome = runner.run(messages, CompactionPhase::Preflight);
         info!(
@@ -114,7 +117,7 @@ impl Agent {
             summarizer = outcome.summarizer_kind,
             "harness M6.3 compaction preflight fired"
         );
-        self.enforce_preservation(messages, CompactionPhase::Preflight);
+        self.enforce_preservation(messages, CompactionPhase::Preflight)
     }
 
     /// M8.5 tier 1: cheap per-turn micro-compaction.  Runs the
@@ -172,17 +175,21 @@ impl Agent {
     /// active when a [`crate::compaction::CompactionRunner`] is wired; a
     /// no-op otherwise so every caller that does not wire the contract keeps
     /// the existing behaviour byte-for-byte.
-    pub(super) fn maybe_run_turn_compaction(&self, messages: &mut Vec<Message>, iteration: u32) {
+    pub(super) fn maybe_run_turn_compaction(
+        &self,
+        messages: &mut Vec<Message>,
+        iteration: u32,
+    ) -> eyre::Result<()> {
         if self.prompt_context_manager.is_some() {
-            return;
+            return Ok(());
         }
         let Some(runner) = self.compaction_runner.as_ref() else {
-            return;
+            return Ok(());
         };
         // Skip the very first iteration when the preflight path already ran
         // — preflight emits its own events and enforces preservation.
         if iteration == 1 {
-            return;
+            return Ok(());
         }
         let outcome = runner.run(messages, CompactionPhase::TurnEnd);
         if outcome.performed {
@@ -196,8 +203,9 @@ impl Agent {
                 summarizer = outcome.summarizer_kind,
                 "harness M6.3 compaction per-turn pass"
             );
-            self.enforce_preservation(messages, CompactionPhase::TurnEnd);
+            self.enforce_preservation(messages, CompactionPhase::TurnEnd)?;
         }
+        Ok(())
     }
 
     /// Ask the caller-owned context bridge to prepare the final model prompt.
@@ -250,16 +258,21 @@ impl Agent {
     }
 
     /// Run the post-compaction validator rail against the declared
-    /// `preserved_artifacts` + `preserved_invariants`. Failures emit a warning
-    /// so operators can surface a typed block upstream; the current loop does
-    /// not abort mid-turn because M0 guarantees the legacy extractive path
-    /// would have been a no-op for the same inputs.
-    fn enforce_preservation(&self, messages: &[Message], phase: CompactionPhase) {
+    /// `preserved_artifacts` + `preserved_invariants`.
+    ///
+    /// Missing required preservation entries are fail-closed: the caller
+    /// aborts the turn instead of sending a prompt that already lost a declared
+    /// invariant.
+    fn enforce_preservation(
+        &self,
+        messages: &[Message],
+        phase: CompactionPhase,
+    ) -> eyre::Result<()> {
         let Some(runner) = self.compaction_runner.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(workspace) = self.compaction_workspace.as_ref() else {
-            return;
+            return Ok(());
         };
         match runner.check_preserved(messages, workspace) {
             Ok(ledger) => {
@@ -276,10 +289,17 @@ impl Agent {
                         "phase" => phase.as_str().to_string(),
                     )
                     .increment(missing.len() as u64);
+                    eyre::bail!(
+                        "compaction preservation validator failed during {}: missing declared artifacts/invariants: {}",
+                        phase.as_str(),
+                        missing.join(",")
+                    );
                 }
+                Ok(())
             }
             Err(err) => {
                 warn!(error = %err, "harness M6.3 compaction validator failed");
+                Err(err.wrap_err("compaction preservation validator failed"))
             }
         }
     }
