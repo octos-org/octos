@@ -54,6 +54,9 @@ run_swarm_app() {
 }
 
 run_hosted_fast() {
+  python3 scripts/lint-tool-descriptions.py --self-test
+  python3 scripts/lint-tool-descriptions.py
+
   cargo fmt --all -- --check
   cargo clippy --workspace -- -D warnings
   cargo test --workspace

@@ -119,6 +119,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Tool description exclusivity lint
+        run: |
+          python3 scripts/lint-tool-descriptions.py --self-test
+          python3 scripts/lint-tool-descriptions.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
