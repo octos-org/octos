@@ -190,10 +190,14 @@ tar = "0.4"
 
 tower = { version = "0.5", features = ["util"] }
 
+# URL parsing
+url = "2"
+
 # Testing
 tokio-test = "0.4"
 tempfile = "3"
 proptest = "1.11"
+wiremock = "0.6"
 
 # -- Release configuration --------------------------------------------------
 [workspace.metadata.release]

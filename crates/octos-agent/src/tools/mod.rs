@@ -648,6 +648,7 @@ pub mod diff_edit;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
+pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
@@ -696,6 +697,7 @@ pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
+pub use http::HttpTool;
 pub use list_dir::ListDirTool;
 pub use manage_skills::ManageSkillsTool;
 pub use mcp_agent::{
