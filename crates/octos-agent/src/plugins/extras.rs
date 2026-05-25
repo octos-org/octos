@@ -311,6 +311,8 @@ mod tests {
             prompts: None,
             hardware_lifecycle: None,
             tool_discovery: octos_plugin::ToolDiscovery::Static,
+            required_safety_tier: crate::permissions::SafetyTier::default(),
+            tool_overrides: HashMap::new(),
         };
         let extras = resolve_extras(&manifest, Path::new("/skills/test"));
         assert!(extras.mcp_servers.is_empty());
@@ -341,6 +343,8 @@ mod tests {
             }),
             hardware_lifecycle: None,
             tool_discovery: octos_plugin::ToolDiscovery::Static,
+            required_safety_tier: crate::permissions::SafetyTier::default(),
+            tool_overrides: HashMap::new(),
         };
         let extras = resolve_extras(&manifest, dir.path());
         assert_eq!(extras.prompt_fragments.len(), 2);

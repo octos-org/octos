@@ -54,6 +54,18 @@ pub struct PluginManifest {
     /// a localhost bridge.
     #[serde(default)]
     pub tool_discovery: ToolDiscovery,
+    /// Skill-level safety tier. Applies to all of this skill's tools UNLESS
+    /// overridden by an entry in `tool_overrides` or the catalog's per-tool
+    /// `safety_tier`. Defaults to `Observe` (read-only). Robots should set
+    /// this to `safe_motion` at minimum.
+    #[serde(default)]
+    pub required_safety_tier: crate::permissions::SafetyTier,
+
+    /// Per-verb safety tier overrides. Keyed by tool name. Lower priority
+    /// than catalog tiers (the catalog is authoritative when present), higher
+    /// priority than `required_safety_tier`.
+    #[serde(default)]
+    pub tool_overrides: HashMap<String, crate::permissions::SafetyTier>,
 }
 
 impl PluginManifest {
@@ -911,5 +923,56 @@ mod tests {
             }
             other => panic!("expected Http, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn required_safety_tier_defaults_to_observe() {
+        let json = r#"{ "name": "s", "version": "0.1.0" }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            manifest.required_safety_tier,
+            crate::permissions::SafetyTier::Observe
+        ));
+    }
+
+    #[test]
+    fn required_safety_tier_parses_explicit_value() {
+        let json = r#"{
+            "name": "s", "version": "0.1.0",
+            "required_safety_tier": "safe_motion"
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            manifest.required_safety_tier,
+            crate::permissions::SafetyTier::SafeMotion
+        ));
+    }
+
+    #[test]
+    fn tool_overrides_parses() {
+        let json = r#"{
+            "name": "s", "version": "0.1.0",
+            "tool_overrides": {
+                "robot.estop": "emergency_override",
+                "vendor.x.y.motion.set_action": "safe_motion"
+            }
+        }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.tool_overrides.len(), 2);
+        assert!(matches!(
+            manifest.tool_overrides["robot.estop"],
+            crate::permissions::SafetyTier::EmergencyOverride
+        ));
+        assert!(matches!(
+            manifest.tool_overrides["vendor.x.y.motion.set_action"],
+            crate::permissions::SafetyTier::SafeMotion
+        ));
+    }
+
+    #[test]
+    fn tool_overrides_absent_means_empty() {
+        let json = r#"{ "name": "s", "version": "0.1.0" }"#;
+        let manifest: PluginManifest = serde_json::from_str(json).unwrap();
+        assert!(manifest.tool_overrides.is_empty());
     }
 }
