@@ -246,6 +246,41 @@ async fn install_with_static_tool_discovery_unchanged() {
     assert_eq!(registry.len(), 1);
 }
 
+/// Important #2 fix: activate_skill's Static branch must load ONLY the target
+/// skill, not its siblings. The previous implementation scanned the parent
+/// directory, which pulled in every neighbour as a side-effect.
+#[cfg(unix)]
+#[tokio::test]
+async fn activate_skill_static_does_not_register_sibling_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two skills in the same parent dir.
+    for name in ["skill-a", "skill-b"] {
+        let skill = dir.path().join(name);
+        std::fs::create_dir_all(&skill).unwrap();
+        let manifest = json!({
+            "name": name,
+            "version": "0.1.0",
+            "tools": [{"name": format!("{name}.tool"), "description": "x"}],
+        });
+        write_manifest(&skill, manifest);
+        write_script(&skill, name, r#"echo '{"output": "ok", "success": true}'"#);
+    }
+
+    let mut registry = ToolRegistry::new();
+    let result = activate_skill(&mut registry, &dir.path().join("skill-a"), &[]).await;
+    assert!(result.is_ok(), "{:?}", result.err());
+
+    // ONLY skill-a's tool should be present.
+    assert!(
+        registry.get_tool("skill-a.tool").is_some(),
+        "primary skill-a.tool missing"
+    );
+    assert!(
+        registry.get_tool("skill-b.tool").is_none(),
+        "sibling skill-b.tool leaked into registry"
+    );
+}
+
 // ─── E: uninstall runs shutdown phase ────────────────────────────────────────
 
 /// `run_shutdown_phase` executes the shutdown lifecycle steps before removal.

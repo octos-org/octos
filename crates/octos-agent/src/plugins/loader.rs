@@ -2237,7 +2237,7 @@ pub struct SkillActivateResult {
 pub async fn activate_skill(
     registry: &mut ToolRegistry,
     skill_dir: &Path,
-    _extra_env: &[(String, String)],
+    extra_env: &[(String, String)],
 ) -> Result<SkillActivateResult> {
     use octos_plugin::{LifecyclePhase, NoSandbox};
 
@@ -2290,13 +2290,25 @@ pub async fn activate_skill(
     let mut tool_names = Vec::new();
     match &manifest.tool_discovery {
         ToolDiscovery::Static => {
-            // Delegate to the existing binary-protocol scan. `load_into`
-            // expects "skills directories" each containing per-skill
-            // subdirectories, so we pass the skill dir's parent. After
-            // this call, every static tool declared in the manifest is
-            // registered in `registry`.
-            let parent = skill_dir.parent().unwrap_or(skill_dir).to_path_buf();
-            PluginLoader::load_into(registry, &[parent], _extra_env).await?;
+            // Important #2 fix from PR #1260 review: load ONLY this skill,
+            // not its parent directory. The previous `load_into(&[parent])`
+            // scanned every sibling skill folder as a side-effect, leaking
+            // their tools into the registry on install.
+            //
+            // Note: `extras` (MCP servers, hooks, prompts) are intentionally
+            // NOT resolved here — `activate_skill`'s contract is tool
+            // registration only; extras flow through
+            // `PluginLoader::load_into_with_options` at runtime startup. If
+            // a use case requires extras at install time, it should go
+            // through a different code path.
+            let (tools, extras) = PluginLoader::load_plugin(skill_dir, extra_env)?;
+            for tool in tools {
+                let name = tool.name().to_string();
+                registry.mark_as_plugin(&name);
+                tool_names.push(name);
+                registry.register(tool);
+            }
+            let _ = extras;
         }
         ToolDiscovery::Http { base_url } => {
             // Important #1 fix from PR #1260 review: use the same helper as
