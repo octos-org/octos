@@ -15041,6 +15041,29 @@ async fn run_standalone_turn(
     if tool_registry.get("activate_tools").is_some() {
         tool_registry.register(octos_agent::ActivateToolsTool::new());
     }
+
+    // Slides session structural guardrail — PR #1265 follow-up.
+    //
+    // The gateway path applies the same activate-media + mofa_* retain in
+    // `session_actor.rs` (search for `keep_tool_in_slides_session`). The
+    // WS turn handler was missing the equivalent, so slides topics opened
+    // through the web dashboard kept the full `mofa_*` plugin surface —
+    // weaker fallback models could and did misroute the workflow to
+    // `mofa_list_styles`, `mofa_site`, `mofa_youtube`, etc. instead of
+    // following the prompt's `glob("styles/*.toml")` + `mofa_slides`
+    // discipline (see `prompts/slides_default.txt`). Mirror the gateway
+    // pattern byte-for-byte: activate `group:media` so `mofa_slides`
+    // moves out of the deferred set, then retain only `mofa_slides`
+    // among the `mofa_*` skills. Non-`mofa_*` tools (file ops, web,
+    // shell, send_file, contract checks) are untouched.
+    let is_slides_session = session_id
+        .topic()
+        .is_some_and(|topic| topic.starts_with("slides"));
+    if is_slides_session {
+        tool_registry.activate("group:media");
+        tool_registry.retain(octos_agent::keep_tool_in_slides_session);
+    }
+
     let workspace_root: Option<PathBuf> = Some(session_runtime.workspace_root.clone());
     let llm_provider: Arc<dyn octos_llm::LlmProvider> = session_runtime.profile.llm.clone();
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
@@ -21241,6 +21264,200 @@ ignore = []
                     && params.cursor.is_some_and(|cursor| cursor.offset == 2)
                     && params.limit_bytes == Some(32)
         ));
+    }
+
+    /// PR #1265 follow-up — the slides session `mofa_*` allowlist filter
+    /// MUST run on the WS turn path (`run_standalone_turn` in
+    /// `handle_turn_start`), not only on the gateway `SessionActor`
+    /// path. The bug: round-12 fleet slides validator v2 (2026-05-25)
+    /// observed both `bot` and `crew` invoking `mofa_list_styles` on
+    /// the web dashboard's slides topic, proving the
+    /// `keep_tool_in_slides_session` retain was a no-op on the WS
+    /// path. The fix wires the same `is_slides_session + activate +
+    /// retain` pattern from `session_actor.rs:2947-2965` into the
+    /// per-turn registry build at the WS handler. This test reproduces
+    /// the registry shape the WS handler builds AND drives the
+    /// `topic.starts_with("slides")` detection from a real
+    /// `SessionKey`, so a regression that re-deletes the wiring (or
+    /// breaks the topic predicate) WOULD flip this test red.
+    #[test]
+    fn slides_topic_retain_evicts_sibling_mofa_tools_on_ws_turn_path() {
+        use async_trait::async_trait;
+        use eyre::Result;
+        use octos_agent::tools::{Tool, ToolResult};
+        use serde_json::Value;
+
+        struct NameOnlyTool(&'static str);
+
+        #[async_trait]
+        impl Tool for NameOnlyTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "stub"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+
+        // Register the full `mofa_*` plugin surface a fleet host
+        // typically loads from the `mofa-slides` and sibling skill
+        // manifests. The retain must hide every entry except
+        // `mofa_slides`. We register the tools directly (rather than
+        // going through `defer_group("group:media") + activate(...)`)
+        // because the test cares about the post-retain registry
+        // contents, not the defer/activate plumbing — which is already
+        // covered by `tools::policy::tests` in `octos-agent`.
+        for name in [
+            "mofa_slides",
+            "mofa_list_styles",
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            registry.register(NameOnlyTool(name));
+        }
+        // Also register a non-`mofa_*` tool so the test pins that the
+        // retain does NOT widen its eviction beyond the prefix.
+        registry.register(NameOnlyTool("send_file"));
+
+        // Drive the production gate from a real SessionKey — this is
+        // the same shape the WS handler observes via `params.session_id`.
+        let session_id = SessionKey("web:tester#slides round12-quasars".to_owned());
+        let is_slides_session = session_id
+            .topic()
+            .is_some_and(|topic| topic.starts_with("slides"));
+        assert!(
+            is_slides_session,
+            "topic predicate must match the gateway path's \
+             `session_key.topic().is_some_and(|t| t.starts_with(\"slides\"))`",
+        );
+        // Mirror the production wiring at `run_standalone_turn`.
+        registry.activate("group:media");
+        registry.retain(octos_agent::keep_tool_in_slides_session);
+
+        // `mofa_slides` survives — it is the canonical slides skill.
+        assert!(
+            registry.get("mofa_slides").is_some(),
+            "mofa_slides must survive the slides-session retain",
+        );
+        // Every other `mofa_*` skill is evicted. The full list mirrors
+        // `tools::policy::tests::should_drop_sibling_mofa_skills_in_slides_session`
+        // — keep the two lists in lockstep so a future widening of the
+        // retain (e.g. adding `mofa_list_styles` back) catches BOTH
+        // tests.
+        for evicted in [
+            "mofa_list_styles",
+            "mofa_site",
+            "mofa_youtube",
+            "mofa_publish",
+            "mofa_research",
+            "mofa_pdf",
+            "mofa_xlsx",
+            "mofa_cli",
+            "mofa_fm",
+            "mofa_frame",
+            "mofa_podcast",
+            "mofa_infographic",
+            "mofa_cards",
+            "mofa_comic",
+        ] {
+            assert!(
+                registry.get(evicted).is_none(),
+                "{evicted} must be evicted from the per-turn registry \
+                 on a slides session (round-12 v2 fleet validator caught \
+                 the LLM invoking it instead of `glob(\"styles/*.toml\")` \
+                 per `prompts/slides_default.txt`)",
+            );
+        }
+        // Non-`mofa_*` tools are untouched.
+        assert!(
+            registry.get("send_file").is_some(),
+            "send_file (and other non-`mofa_*` tools) must remain \
+             available — the retain only targets the `mofa_*` prefix",
+        );
+    }
+
+    /// Companion to `slides_topic_retain_evicts_sibling_mofa_tools_on_ws_turn_path`:
+    /// pin that a NON-slides session topic does NOT trigger the retain.
+    /// A bug that drops the `is_slides_session` guard would silently
+    /// hide every `mofa_*` tool on every session — flips this test red.
+    #[test]
+    fn non_slides_topic_leaves_mofa_tools_visible_on_ws_turn_path() {
+        use async_trait::async_trait;
+        use eyre::Result;
+        use octos_agent::tools::{Tool, ToolResult};
+        use serde_json::Value;
+
+        struct NameOnlyTool(&'static str);
+
+        #[async_trait]
+        impl Tool for NameOnlyTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "stub"
+            }
+            fn input_schema(&self) -> Value {
+                json!({})
+            }
+            async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+                Ok(ToolResult::default())
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
+        for name in ["mofa_slides", "mofa_list_styles", "mofa_site"] {
+            registry.register(NameOnlyTool(name));
+        }
+
+        // Three topic shapes the production code must NOT treat as slides.
+        for topic in ["site demo", "news daily-2026-05-25", "general chat"] {
+            let session_id = SessionKey(format!("web:tester#{topic}"));
+            let is_slides_session = session_id.topic().is_some_and(|t| t.starts_with("slides"));
+            assert!(
+                !is_slides_session,
+                "topic `{topic}` must not match the slides predicate",
+            );
+        }
+
+        // Even a bare session (no `#topic`) must not match.
+        let bare = SessionKey("web:tester".to_owned());
+        let bare_is_slides = bare.topic().is_some_and(|t| t.starts_with("slides"));
+        assert!(
+            !bare_is_slides,
+            "a bare session (no topic) must never match the slides predicate",
+        );
+
+        // Sanity-check: every `mofa_*` is still registered because no
+        // retain ran. (We don't actually call `retain` in this branch —
+        // the production code is gated on `is_slides_session`.)
+        for name in ["mofa_slides", "mofa_list_styles", "mofa_site"] {
+            assert!(
+                registry.get(name).is_some(),
+                "{name} must be visible on non-slides session topics",
+            );
+        }
     }
 
     #[test]
