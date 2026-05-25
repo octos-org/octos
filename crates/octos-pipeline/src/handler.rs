@@ -183,6 +183,26 @@ impl ProgressReporter for PipelineNodeReporter {
                     self.node_id, self.model, iteration
                 )
             }
+            ProgressEvent::LlmStatus { message, iteration } => {
+                format!(
+                    "{} [{}]: {} (iteration {})",
+                    self.node_id, self.model, message, iteration
+                )
+            }
+            ProgressEvent::ActivityTimeoutReached { limit, .. } => {
+                format!(
+                    "{} [{}]: activity timeout after {}s",
+                    self.node_id,
+                    self.model,
+                    limit.as_secs()
+                )
+            }
+            ProgressEvent::TaskInterrupted { iterations } => {
+                format!(
+                    "{} [{}]: interrupted after {} iteration(s)",
+                    self.node_id, self.model, iterations
+                )
+            }
             // Bug 3 / Gap 3.3 — per-node cost updates from inner agents must
             // reach the parent SSE stream. The legacy `_ => return` arm
             // swallowed these silently, leaving the W1.G4 CostBreakdown
@@ -839,7 +859,39 @@ impl Handler for CodergenHandler {
             "executing codergen node"
         );
 
-        match worker.run_task(&task).await {
+        let run_task = worker.run_task(&task);
+        let result = if let Some(timeout_secs) = node.timeout_secs.filter(|secs| *secs > 0) {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), run_task).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let message = format!(
+                        "Node '{}' timed out after {timeout_secs}s while waiting for worker '{}'",
+                        node.id, worker_id
+                    );
+                    warn!(
+                        node = %node.id,
+                        worker = %worker_id,
+                        timeout_secs,
+                        "pipeline codergen worker hard timeout"
+                    );
+                    crate::executor::report_progress(&format!(
+                        "{} [{}]: timed out after {}s; cancelling stalled worker",
+                        node.id, resolved_model, timeout_secs
+                    ));
+                    return Ok(NodeOutcome {
+                        node_id: node.id.clone(),
+                        status: OutcomeStatus::Error,
+                        content: message,
+                        token_usage: TokenUsage::default(),
+                        files_modified: vec![],
+                    });
+                }
+            }
+        } else {
+            run_task.await
+        };
+
+        match result {
             Ok(result) => {
                 if !result.files_modified.is_empty() {
                     info!(
