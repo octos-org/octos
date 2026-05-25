@@ -496,6 +496,10 @@ impl LifecycleExecutor {
         for var in BLOCKED_ENV_VARS {
             cmd.env_remove(var);
         }
+        // Export OCTOS_SKILL_DIR so SKILL.md `init:`/`shutdown:` commands can
+        // reference paths relative to the skill's installed location, e.g.
+        //   cd "$OCTOS_SKILL_DIR" && dora up && dora start dataflows/foo.yaml
+        cmd.env("OCTOS_SKILL_DIR", &self.cwd);
         cmd.kill_on_drop(true);
 
         // On Unix, put the child into its own process group so we can
@@ -688,5 +692,30 @@ mod tests {
         ] {
             assert!(BLOCKED_ENV_VARS.contains(&var), "missing {var}");
         }
+    }
+
+    #[tokio::test]
+    async fn run_phase_injects_octos_skill_dir_env() {
+        // Build an executor whose cwd is a tempdir; the step writes
+        // $OCTOS_SKILL_DIR to a file we can read back.
+        let dir = tempfile::tempdir().unwrap();
+        let skill_path = dir.path().to_path_buf();
+        let out_file = skill_path.join("captured.txt");
+        let out_str = out_file.to_string_lossy().to_string();
+
+        let executor = LifecycleExecutor::new(Box::new(NoSandbox), skill_path.clone());
+        let steps = vec![LifecycleStep {
+            label: "capture env".into(),
+            command: format!(r#"printf '%s' "$OCTOS_SKILL_DIR" > "{out_str}""#),
+            timeout_ms: 5_000,
+            retries: 0,
+            critical: true,
+        }];
+
+        let result = executor.run_phase(LifecyclePhase::Init, &steps).await;
+        assert!(result.success, "phase failed: {:?}", result.error);
+
+        let captured = std::fs::read_to_string(&out_file).unwrap();
+        assert_eq!(captured, skill_path.to_string_lossy());
     }
 }
