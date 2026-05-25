@@ -37,6 +37,11 @@ pub struct DoraToolMapping {
     /// `BridgeConfig::from_json` rather than silently defaulting to `Observe`.
     #[serde(default)]
     pub safety_tier: SafetyTier,
+    /// Optional explicit override of the bridge tool's concurrency class.
+    /// When `None`, falls back to the per-tier default in
+    /// `Tool::concurrency_class` (Observe→Safe, anything else→Exclusive).
+    #[serde(default)]
+    pub concurrency_class: Option<ConcurrencyClass>,
     /// Optional JSON Schema for the tool's input. When `None`, a permissive
     /// `{"type":"object","additionalProperties":true}` is used.
     #[serde(default)]
@@ -120,6 +125,9 @@ impl Tool for DoraToolBridge {
     /// parallel-friendly `Safe` class; every higher tier is `Exclusive` so
     /// the agent's batch dispatcher serialises them.
     fn concurrency_class(&self) -> ConcurrencyClass {
+        if let Some(explicit) = self.mapping.concurrency_class {
+            return explicit;
+        }
         match self.mapping.safety_tier {
             SafetyTier::Observe => ConcurrencyClass::Safe,
             SafetyTier::SafeMotion | SafetyTier::FullActuation | SafetyTier::EmergencyOverride => {
@@ -168,6 +176,7 @@ mod tests {
             description: "Navigate robot to a waypoint".to_string(),
             bridge_base_url: "http://127.0.0.1:8765".to_string(),
             safety_tier: SafetyTier::SafeMotion,
+            concurrency_class: None,
             input_schema: None,
             timeout_secs: 60,
             dora_node_id: None,
@@ -199,6 +208,25 @@ mod tests {
     fn should_expose_declared_safety_tier() {
         let bridge = DoraToolBridge::new(sample_mapping()).unwrap();
         assert_eq!(bridge.required_safety_tier(), SafetyTier::SafeMotion);
+    }
+
+    #[test]
+    fn concurrency_class_override_supersedes_tier_default() {
+        let mut mapping = sample_mapping();
+        // sample_mapping is SafeMotion → would default to Exclusive.
+        mapping.concurrency_class = Some(ConcurrencyClass::Safe);
+        let bridge = DoraToolBridge::new(mapping).unwrap();
+        assert!(matches!(bridge.concurrency_class(), ConcurrencyClass::Safe));
+    }
+
+    #[test]
+    fn concurrency_class_falls_back_to_tier_default_when_unset() {
+        let bridge = DoraToolBridge::new(sample_mapping()).unwrap();
+        // SafeMotion → Exclusive.
+        assert!(matches!(
+            bridge.concurrency_class(),
+            ConcurrencyClass::Exclusive
+        ));
     }
 
     #[test]
@@ -272,6 +300,7 @@ mod tests {
             description: "heartbeat".into(),
             bridge_base_url: server.uri(),
             safety_tier: SafetyTier::Observe,
+            concurrency_class: None,
             timeout_secs: 5,
             input_schema: None,
             dora_node_id: None,

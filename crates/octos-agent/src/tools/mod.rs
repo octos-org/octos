@@ -394,7 +394,8 @@ pub enum ToolProgress {
 ///   serially in call order. A single error from an exclusive call cancels
 ///   the remaining peers so the LLM sees the cascade instead of continuing
 ///   to mutate state on a doomed path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConcurrencyClass {
     /// Read-only / side-effect-free. Can run in parallel with any other
     /// `Safe` tool call without observable interference.
