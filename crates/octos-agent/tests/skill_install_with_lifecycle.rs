@@ -11,8 +11,10 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use octos_agent::permissions::SafetyTier;
 use octos_agent::plugins::{activate_skill, run_shutdown_phase};
 use octos_agent::tools::ToolRegistry;
+use octos_agent::tools::robot_groups;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -139,17 +141,40 @@ async fn install_aborts_when_critical_preflight_step_fails() {
 
 /// Skills with `tool_discovery=Http` register discovered tools via GET /tools,
 /// and a round-trip call (POST /tools/<name>) succeeds.
+///
+/// Also asserts that all three safety_tier resolution paths land correctly in
+/// `robot_groups` end-to-end through the install path — proving the
+/// install-path/runtime-path unification from commit 8e8460ce:
+///   1. catalog `safety_tier` wins
+///   2. `tool_overrides` beats manifest default when catalog omits the tier
+///   3. manifest `required_safety_tier` is the fallback
 #[tokio::test]
 async fn install_with_http_discovery_registers_http_tools() {
     let server = MockServer::start().await;
 
-    // Mock the discovery endpoint.
+    // Mock the discovery endpoint with three tools spanning all tier paths.
+    // Tool names are uniquely prefixed (`install3.*`) to avoid colliding with
+    // the global `robot_groups` state used by `runtime_http_discovery.rs`.
     Mock::given(method("GET"))
         .and(path("/tools"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             {
-                "name": "robot.ping",
-                "description": "Ping the robot",
+                // (1) catalog `safety_tier` present — should win.
+                "name": "install3.observe.read",
+                "description": "Read a sensor",
+                "safety_tier": "observe",
+                "input_schema": {"type": "object"}
+            },
+            {
+                // (2) no catalog tier, present in tool_overrides — override wins.
+                "name": "install3.estop",
+                "description": "Emergency stop",
+                "input_schema": {"type": "object"}
+            },
+            {
+                // (3) no catalog tier, no override — manifest default fallback.
+                "name": "install3.motion.go",
+                "description": "Move the arm",
                 "input_schema": {"type": "object"}
             }
         ])))
@@ -158,7 +183,7 @@ async fn install_with_http_discovery_registers_http_tools() {
 
     // Mock the execution endpoint (called after registration, from the test).
     Mock::given(method("POST"))
-        .and(path("/tools/robot.ping"))
+        .and(path("/tools/install3.observe.read"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "ok": true,
             "code": "0",
@@ -176,6 +201,8 @@ async fn install_with_http_discovery_registers_http_tools() {
     let manifest = json!({
         "name": "http-skill",
         "version": "0.1.0",
+        "required_safety_tier": "safe_motion",
+        "tool_overrides": { "install3.estop": "emergency_override" },
         "tool_discovery": {"type": "http", "base_url": base_url}
     });
     write_manifest(&skill_dir, manifest);
@@ -185,14 +212,40 @@ async fn install_with_http_discovery_registers_http_tools() {
     assert!(result.is_ok(), "activate_skill failed: {:?}", result.err());
 
     let activated = result.unwrap();
-    assert_eq!(activated.tool_names, vec!["robot.ping"]);
     assert!(
-        registry.get("robot.ping").is_some(),
-        "tool should be registered"
+        activated
+            .tool_names
+            .contains(&"install3.observe.read".to_string()),
+        "expected install3.observe.read in {:?}",
+        activated.tool_names
+    );
+    assert!(
+        activated.tool_names.contains(&"install3.estop".to_string()),
+        "expected install3.estop in {:?}",
+        activated.tool_names
+    );
+    assert!(
+        activated
+            .tool_names
+            .contains(&"install3.motion.go".to_string()),
+        "expected install3.motion.go in {:?}",
+        activated.tool_names
+    );
+    assert!(
+        registry.get("install3.observe.read").is_some(),
+        "install3.observe.read should be registered"
+    );
+    assert!(
+        registry.get("install3.estop").is_some(),
+        "install3.estop should be registered"
+    );
+    assert!(
+        registry.get("install3.motion.go").is_some(),
+        "install3.motion.go should be registered"
     );
 
-    // Execute the tool via the registry to verify round-trip.
-    let tool = registry.get("robot.ping").unwrap();
+    // Execute one tool via the registry to verify HTTP round-trip still works.
+    let tool = registry.get("install3.observe.read").unwrap();
     let exec_result = tool.execute(&json!({})).await.unwrap();
     assert!(
         exec_result.success,
@@ -203,6 +256,24 @@ async fn install_with_http_discovery_registers_http_tools() {
         exec_result.output.contains("pong"),
         "unexpected output: {}",
         exec_result.output
+    );
+
+    // Tier resolution must work end-to-end through the install path.
+    let snap = robot_groups::snapshot();
+    assert_eq!(
+        snap.tier_of("install3.observe.read"),
+        Some(SafetyTier::Observe),
+        "catalog safety_tier should win"
+    );
+    assert_eq!(
+        snap.tier_of("install3.estop"),
+        Some(SafetyTier::EmergencyOverride),
+        "tool_overrides should win over manifest default when catalog omits tier"
+    );
+    assert_eq!(
+        snap.tier_of("install3.motion.go"),
+        Some(SafetyTier::SafeMotion),
+        "manifest required_safety_tier is the fallback"
     );
 }
 
