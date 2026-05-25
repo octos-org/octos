@@ -12,6 +12,7 @@ import type {
   SoloLoginResult,
   SoloCreateResult,
   User,
+  UserRole,
   AllowlistEntry,
   SharedMetrics,
   MonitorStatus,
@@ -235,6 +236,12 @@ export const api = {
 
   // User management (admin)
   listUsers: () => request<{ users: User[] }>('/users'),
+
+  updateUserRole: (id: string, role: UserRole) =>
+    request<User>(`/users/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role }),
+    }),
 
   listAllowedEmails: () => request<{ entries: AllowlistEntry[] }>('/allowed-emails'),
 

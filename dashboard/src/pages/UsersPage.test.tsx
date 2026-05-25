@@ -2,7 +2,7 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import UsersPage from './UsersPage'
-import type { AllowlistEntry, User } from '../types'
+import type { AllowlistEntry, User, UserRole } from '../types'
 
 const mockApi = vi.hoisted(() => ({
   listAllowedEmails: vi.fn(),
@@ -10,6 +10,7 @@ const mockApi = vi.hoisted(() => ({
   addAllowedEmail: vi.fn(),
   deleteAllowedEmail: vi.fn(),
   deleteUser: vi.fn(),
+  updateUserRole: vi.fn(),
 }))
 
 const mockToast = vi.hoisted(() => vi.fn())
@@ -243,5 +244,57 @@ describe('UsersPage bulk account management', () => {
     expect(mockToast).toHaveBeenCalledWith('1 deleted, 1 failed', 'error')
     expect(screen.getByLabelText(/select user admin@example\.com/i)).not.toBeChecked()
     expect(screen.getByLabelText(/select user user@example\.com/i)).toBeChecked()
+  })
+})
+
+describe('UsersPage role management', () => {
+  function userWithRole(role: UserRole): User {
+    return {
+      id: 'alice',
+      email: 'alice@example.com',
+      name: 'Alice',
+      role,
+      created_at: '2026-05-24T00:00:00Z',
+      last_login_at: null,
+    }
+  }
+
+  function renderPage(users: User[]) {
+    mockApi.listAllowedEmails.mockResolvedValue({ entries: [] })
+    mockApi.listUsers.mockResolvedValue({ users })
+    return render(<UsersPage />)
+  }
+
+  beforeEach(() => {
+    mockApi.updateUserRole.mockResolvedValue(userWithRole('admin'))
+    vi.stubGlobal('confirm', vi.fn(() => true))
+  })
+
+  it.each([
+    ['Promote', 'user', 'admin', 'Promote account "alice@example.com" to admin?'],
+    ['Demote', 'admin', 'user', 'Demote account "alice@example.com" to regular user?'],
+  ] as const)(
+    'confirms and sends %s role changes',
+    async (buttonLabel, currentRole, nextRole, confirmMessage) => {
+      const actor = userEvent.setup()
+      renderPage([userWithRole(currentRole)])
+
+      await actor.click(await screen.findByRole('button', { name: buttonLabel }))
+
+      await waitFor(() => {
+        expect(window.confirm).toHaveBeenCalledWith(confirmMessage)
+        expect(mockApi.updateUserRole).toHaveBeenCalledWith('alice', nextRole)
+      })
+    },
+  )
+
+  it('does not update a role when confirmation is declined', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => false))
+    const actor = userEvent.setup()
+    renderPage([userWithRole('user')])
+
+    await actor.click(await screen.findByRole('button', { name: 'Promote' }))
+
+    expect(mockApi.updateUserRole).not.toHaveBeenCalled()
   })
 })
