@@ -37,6 +37,7 @@ pub struct GatewayDispatcher {
     pub(crate) active_sessions: Arc<RwLock<ActiveSessionStore>>,
     pub(crate) pending_messages: PendingMessages,
     pub(crate) out_tx: mpsc::Sender<OutboundMessage>,
+    pub(crate) session_delete_tx: Option<mpsc::UnboundedSender<String>>,
     /// Profile ID used for building profiled session keys (None = main profile).
     pub(crate) dispatch_profile_id: Option<String>,
     /// Profile data directory for per-user files (soul.md, etc.).
@@ -55,9 +56,20 @@ impl GatewayDispatcher {
             active_sessions,
             pending_messages,
             out_tx,
+            session_delete_tx: None,
             dispatch_profile_id: None,
             data_dir: None,
         }
+    }
+
+    /// Notify the gateway runtime when slash-command deletion clears a session
+    /// so the matching in-memory actor is stopped before the next message.
+    pub fn with_session_delete_notifier(
+        mut self,
+        session_delete_tx: mpsc::UnboundedSender<String>,
+    ) -> Self {
+        self.session_delete_tx = Some(session_delete_tx);
+        self
     }
 
     /// Set the dispatch profile ID for profiled session key construction.
@@ -75,6 +87,12 @@ impl GatewayDispatcher {
     /// Build a profiled session key for the given channel/chat/topic.
     fn profiled_key(&self, channel: &str, chat_id: &str, topic: &str) -> SessionKey {
         build_profiled_session_key(self.dispatch_profile_id.as_deref(), channel, chat_id, topic)
+    }
+
+    fn notify_session_deleted(&self, session_key: &SessionKey) {
+        if let Some(tx) = &self.session_delete_tx {
+            let _ = tx.send(session_key.to_string());
+        }
     }
 
     /// Flush pending (buffered) messages for a session key, delivering them
@@ -462,6 +480,7 @@ impl GatewayDispatcher {
                 let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, &current_topic);
                 match self.session_mgr.lock().await.clear(&del_key).await {
                     Ok(()) => {
+                        self.notify_session_deleted(&del_key);
                         self.active_sessions
                             .write()
                             .await
@@ -485,6 +504,7 @@ impl GatewayDispatcher {
             let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             match self.session_mgr.lock().await.clear(&del_key).await {
                 Ok(()) => {
+                    self.notify_session_deleted(&del_key);
                     self.active_sessions
                         .write()
                         .await
@@ -1046,6 +1066,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_notify_runtime_when_named_session_deleted() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let disp = disp.with_session_delete_notifier(delete_tx);
+        let inbound = make_test_inbound("telegram", "123", "/delete old");
+
+        let result = disp
+            .handle_delete_command("/delete old", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Deleted session: old");
+        assert_eq!(
+            delete_rx.try_recv().unwrap(),
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "telegram", "123", "old").to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn should_delete_named_session_with_short_alias() {
         let (tx, mut rx) = mpsc::channel(16);
         let (disp, _, _tmp) = setup_dispatcher(tx);
@@ -1078,6 +1119,33 @@ mod tests {
         assert!(matches!(result, Some(DispatchResult::Handled)));
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.content, "Deleted session: research");
+    }
+
+    #[tokio::test]
+    async fn should_notify_runtime_when_current_named_session_deleted() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (delete_tx, mut delete_rx) = mpsc::unbounded_channel();
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let disp = disp.with_session_delete_notifier(delete_tx);
+        let inbound = make_test_inbound("telegram", "123", "/delete");
+        disp.active_sessions
+            .write()
+            .await
+            .switch_to("telegram:123", "research")
+            .unwrap();
+
+        let result = disp
+            .handle_delete_command("/delete", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Deleted session: research");
+        assert_eq!(
+            delete_rx.try_recv().unwrap(),
+            SessionKey::with_profile_topic(MAIN_PROFILE_ID, "telegram", "123", "research")
+                .to_string()
+        );
     }
 
     #[tokio::test]
