@@ -1028,8 +1028,10 @@ mod tests {
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,
     };
+    use crate::runtime::SessionRuntime;
     use chrono::Utc;
     use octos_agent::SandboxConfig;
+    use octos_core::SessionKey;
     use std::collections::HashMap;
 
     /// Build a minimal `UserProfile` with no LLM contract. M11-D
@@ -1567,6 +1569,101 @@ mod tests {
             "plugin_dirs should include `<octos_home>/plugins`; got: {:?}",
             rt.plugin_dirs
         );
+    }
+
+    /// Issue #87: sub-account profile skill loading must not strand the
+    /// runtime without `shell` or a usable `activate_tools` back-reference.
+    /// The original report showed a sub-account bot that had loaded skills
+    /// but could not call any tool, including `activate_tools`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subaccount_skill_loading_preserves_shell_and_activate_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _key = ScopedEnvKey::set("OCTOS_ISSUE_87_SUBACCOUNT_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let octos_home = tmp.path().join("octos-home");
+        let data_dir = octos_home.join("profiles").join("mofa-child").join("data");
+        let skill_dir = data_dir.join("skills").join("issue-87-probe");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        std::fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
+                "name": "issue-87-probe",
+                "version": "1.0",
+                "tools": [
+                    {"name": "issue_87_probe", "description": "Issue #87 profile skill probe"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let exec_path = skill_dir.join("issue-87-probe");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\":\"ok\",\"success\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut profile = fixture_profile("mofa-child", "OCTOS_ISSUE_87_SUBACCOUNT_KEY");
+        profile.parent_id = Some("mofa-parent".to_string());
+        profile.public_subdomain = Some("mofa-child-public".to_string());
+
+        let rt =
+            ProfileRuntime::bootstrap(&profile, &data_dir, Some(&octos_home), BootstrapRole::Serve)
+                .await
+                .expect("sub-account profile bootstrap should succeed");
+
+        assert!(
+            rt.tool_specs.get("issue_87_probe").is_some(),
+            "per-profile skill tool must load for sub-account profiles"
+        );
+        assert!(
+            rt.tool_specs.get("shell").is_some(),
+            "sub-account skill loading must not drop the shell tool"
+        );
+        assert!(
+            rt.tool_specs.get("activate_tools").is_some(),
+            "sub-account skill loading must leave activate_tools available"
+        );
+
+        let profile_runtime = Arc::new(rt);
+        let session_a =
+            SessionRuntime::bootstrap(&profile_runtime, SessionKey::new("api", "issue-87-a"), None)
+                .await
+                .expect("session A bootstrap");
+        let session_b =
+            SessionRuntime::bootstrap(&profile_runtime, SessionKey::new("api", "issue-87-b"), None)
+                .await
+                .expect("session B bootstrap");
+
+        for session in [&session_a, &session_b] {
+            assert!(
+                session.tools.get("shell").is_some(),
+                "session {} must retain shell after workspace rebind",
+                session.session_key
+            );
+            let activate_tools = session
+                .tools
+                .get("activate_tools")
+                .expect("session activate_tools");
+            let result = activate_tools
+                .execute(&serde_json::json!({"tools": ["shell"]}))
+                .await
+                .expect("activate_tools must be wired to the session registry");
+            assert!(
+                result.success,
+                "activate_tools should be able to resolve shell for {}; got: {}",
+                session.session_key, result.output
+            );
+            assert!(
+                result.output.contains("shell"),
+                "activate_tools output should name shell for {}; got: {}",
+                session.session_key,
+                result.output
+            );
+        }
     }
 
     /// Section B (codex review round-3): the host's `plugins.require_signed`
