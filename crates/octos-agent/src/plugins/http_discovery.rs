@@ -96,8 +96,24 @@ pub async fn fetch_http_tool_catalog(base_url: &str) -> Result<Vec<HttpToolEntry
         ));
     }
 
-    let entries: Vec<HttpToolEntry> = serde_json::from_slice(&bytes)
+    // Accept both response shapes: bare array `[...]` (legacy / wiremock fixtures)
+    // and the SPEC-V1 1.1 envelope `{"tools": [...]}` returned by the
+    // octos-robot-skills bridge. Falling back keeps the parser robust to either
+    // wire-contract evolution without forcing all clients to migrate together.
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum CatalogResponse {
+        Envelope { tools: Vec<HttpToolEntry> },
+        Bare(Vec<HttpToolEntry>),
+    }
+
+    let response: CatalogResponse = serde_json::from_slice(&bytes)
         .map_err(|e| eyre!("failed to parse tool catalog from {url}: {e}"))?;
+
+    let entries = match response {
+        CatalogResponse::Envelope { tools } => tools,
+        CatalogResponse::Bare(entries) => entries,
+    };
 
     Ok(entries)
 }
@@ -254,5 +270,34 @@ mod tests {
             Some(crate::permissions::SafetyTier::EmergencyOverride)
         );
         assert_eq!(entries[1].safety_tier, None);
+    }
+
+    /// Manual smoke against the real bridge (octos-robot-skills `GET /tools`)
+    /// surfaced this: the bridge wraps entries in a `{"tools": [...]}` envelope
+    /// while the previous parser only accepted a bare array. The fix makes the
+    /// parser accept both shapes so the wire-contract evolution does not force
+    /// all clients to migrate atomically.
+    #[tokio::test]
+    async fn fetch_accepts_envelope_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tools"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tools": [
+                    {"name": "vendor.agibot.a2.motion.set_action", "description": "Set action", "safety_tier": "safe_motion"},
+                    {"name": "robot.heartbeat", "description": "Heartbeat", "safety_tier": "observe"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let entries = fetch_http_tool_catalog(&server.uri()).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "vendor.agibot.a2.motion.set_action");
+        assert_eq!(
+            entries[0].safety_tier,
+            Some(crate::permissions::SafetyTier::SafeMotion)
+        );
+        assert_eq!(entries[1].name, "robot.heartbeat");
     }
 }
